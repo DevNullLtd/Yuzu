@@ -44,6 +44,13 @@ const json& plugin_docs_doc() {
     return doc;
 }
 
+/// Every Developer fragment is admin-only, like the page: the admin gate first (it writes its own
+/// 403 and denial row), then the twin's `Infrastructure:Read`. On the RBAC-off default the flat
+/// Read gate admits any authenticated caller, so it cannot be the only check here.
+bool gate(const Deps& deps, const httplib::Request& req, httplib::Response& res) {
+    return deps.admin_fn(req, res) && deps.perm_fn(req, res, "Infrastructure", "Read");
+}
+
 std::string query_filter(const httplib::Request& req) {
     return req.has_param("q") ? clean_filter(req.get_param_value("q")) : std::string{};
 }
@@ -61,7 +68,7 @@ void register_developer_routes(HttpRouteSink& sink, Deps deps) {
 
     sink.Get("/fragments/settings/developer/api",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
+                 if (!gate(deps, req, res))
                      return;
                  std::size_t n = 0;
                  const auto& doc = routes_doc();
@@ -72,14 +79,14 @@ void register_developer_routes(HttpRouteSink& sink, Deps deps) {
 
     sink.Get("/fragments/settings/developer/routes",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
+                 if (!gate(deps, req, res))
                      return;
                  send_html(res, render_routes_table(routes_doc(), query_filter(req)));
              });
 
     sink.Get("/fragments/settings/developer/permissions",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
+                 if (!gate(deps, req, res))
                      return;
                  constexpr const char* kFail =
                      "The permission catalogue could not be read. This is not an empty list.";
@@ -88,13 +95,14 @@ void register_developer_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  }
                  try {
-                     // Same probe the REST route does: the role grid is the
+                     // Same decision the REST route makes: the role grid is the
                      // authorization topology and is gated by UserManagement:Read.
-                     // A throwaway response absorbs the denial; the taxonomy
-                     // still renders, with a denied note for the grid.
-                     httplib::Response probe;
+                     // Only a draw-time decision, so it uses the non-auditing probe
+                     // (a denial row on every load would fill the audit log); the taxonomy
+                     // still renders, with a denied note for the grid. No probe wired
+                     // means no grid.
                      const bool include_roles =
-                         deps.perm_fn(req, probe, "UserManagement", "Read");
+                         deps.probe_fn && deps.probe_fn(req, "UserManagement", "Read");
                      const auto built = build_permissions_catalog(*deps.rbac_store, include_roles);
                      send_html(res, render_permissions_table(
                                         json::parse(built.json, nullptr, false), query_filter(req)));
@@ -106,7 +114,7 @@ void register_developer_routes(HttpRouteSink& sink, Deps deps) {
 
     sink.Get("/fragments/settings/developer/plugins",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
+                 if (!gate(deps, req, res))
                      return;
                  send_html(res, render_plugins_table(plugin_docs_doc()));
              });
@@ -115,7 +123,7 @@ void register_developer_routes(HttpRouteSink& sink, Deps deps) {
     // under the registry lock, so it is fetched only when the operator asks.
     sink.Get("/fragments/settings/developer/plugins/observed",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
+                 if (!gate(deps, req, res))
                      return;
                  if (!deps.registry) {
                      send_html(res, render_state("fail", "The list of plugins reported by devices "

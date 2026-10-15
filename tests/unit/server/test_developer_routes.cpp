@@ -34,16 +34,20 @@ struct DeveloperHarness {
     bool allow_perm{true};
     bool deny_user_mgmt{false}; ///< deny only the UserManagement:Read grid probe
     std::string last_securable, last_operation;
-    int perm_calls{0};
+    int perm_calls{0};  ///< auditing gate calls (perm_fn)
+    int probe_calls{0}; ///< non-auditing probe calls (probe_fn)
+    int admin_calls{0};
 
     // A real (empty) registry: build_plugins_catalog only reads help_json().
     detail::EventBus bus;
     yuzu::MetricsRegistry metrics;
     detail::AgentRegistry registry{bus, metrics};
 
-    explicit DeveloperHarness(bool with_registry = true, RbacStore* rbac = nullptr) {
+    explicit DeveloperHarness(bool with_registry = true, RbacStore* rbac = nullptr,
+                              bool with_probe = true) {
         developer::Deps deps;
         deps.admin_fn = [this](const httplib::Request&, httplib::Response& res) {
+            ++admin_calls;
             if (allow_admin)
                 return true;
             res.status = 403;
@@ -54,16 +58,21 @@ struct DeveloperHarness {
             ++perm_calls;
             last_securable = s;
             last_operation = o;
-            if (deny_user_mgmt && s == "UserManagement") {
-                res.status = 403;
-                return false;
-            }
             if (allow_perm)
                 return true;
             res.status = 403;
             res.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
             return false;
         };
+        if (with_probe) {
+            deps.probe_fn = [this](const httplib::Request&, const std::string& s,
+                                   const std::string& o) {
+                ++probe_calls;
+                last_securable = s;
+                last_operation = o;
+                return !(deny_user_mgmt && s == "UserManagement");
+            };
+        }
         deps.rbac_store = rbac;
         deps.registry = with_registry ? &registry : nullptr;
         developer::register_developer_routes(sink, std::move(deps));
@@ -120,7 +129,7 @@ TEST_CASE("developer page template: no inline handlers, hx-on, eval or innerHTML
     CHECK_FALSE(has(body, "unsafe-eval"));
 }
 
-TEST_CASE("developer fragments gate on Infrastructure:Read and answer no-store",
+TEST_CASE("developer fragments gate on admin then Infrastructure:Read and answer no-store",
           "[developer][routes]") {
     const char* kPaths[] = {
         "/fragments/settings/developer/api",
@@ -139,12 +148,26 @@ TEST_CASE("developer fragments gate on Infrastructure:Read and answer no-store",
         CHECK(h.last_operation == "Read");
         CHECK(ok->get_header_value("Cache-Control") == "no-store");
 
+        // Infrastructure:Read alone is not enough: a caller the admin gate refuses (the RBAC-off
+        // default admits any authenticated caller to the flat Read gate) gets nothing, and the
+        // Read gate and every builder behind it are never reached.
+        DeveloperHarness n;
+        n.allow_admin = false;
+        auto not_admin = n.sink.Get(path);
+        REQUIRE(not_admin);
+        CHECK(not_admin->status == 403);
+        CHECK(n.admin_calls == 1);
+        CHECK(n.perm_calls == 0);
+        CHECK(n.probe_calls == 0);
+        CHECK_FALSE(has(not_admin->body, "<table"));
+
         DeveloperHarness d;
         d.allow_perm = false;
         auto denied = d.sink.Get(path);
         REQUIRE(denied);
         CHECK(denied->status == 403);
         CHECK(d.perm_calls == 1); // gate first; no probe, no work for a denied caller
+        CHECK(d.probe_calls == 0);
     }
 }
 
@@ -179,6 +202,7 @@ TEST_CASE("developer permissions fragment: unavailable store is a fixed sentence
     CHECK(has(r->body, "could not be read. This is not an empty list."));
     CHECK_FALSE(has(r->body, "<table"));
     CHECK(h.perm_calls == 1); // never reaches the UserManagement:Read probe
+    CHECK(h.probe_calls == 0);
 }
 
 TEST_CASE("developer plugins fragments: build-embedded list needs no registry; observed degrades",
@@ -212,7 +236,10 @@ TEST_CASE("developer permissions fragment: live RBAC catalogue with the role gri
     auto r = h.sink.Get("/fragments/settings/developer/permissions");
     REQUIRE(r);
     CHECK(r->status == 200);
-    CHECK(h.perm_calls == 2); // Infrastructure:Read gate, then the UserManagement:Read probe
+    // The Infrastructure:Read gate audits; the grid's UserManagement:Read check is the
+    // non-auditing probe, so a denied caller leaves no denial row per page load.
+    CHECK(h.perm_calls == 1);
+    CHECK(h.probe_calls == 1);
     CHECK(h.last_securable == "UserManagement");
     CHECK(has(r->body, "<table"));
     CHECK(has(r->body, "Administrator")); // a seeded role, from the live store
@@ -234,6 +261,23 @@ TEST_CASE("developer permissions fragment: denied UserManagement:Read keeps the 
     CHECK(r->status == 200); // the probe denial never 403s the fragment
     CHECK(has(r->body, "securable types"));
     CHECK(has(r->body, "UserManagement:Read"));
+    CHECK_FALSE(has(r->body, "<table"));
+    CHECK_FALSE(has(r->body, "Administrator"));
+    CHECK(h.perm_calls == 1); // the denial went to the probe, never the auditing gate
+    CHECK(h.probe_calls == 1);
+}
+
+TEST_CASE("developer permissions fragment: no probe wired withholds the grid",
+          "[developer][routes][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, developer_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+
+    DeveloperHarness h(/*with_registry=*/true, &rbac, /*with_probe=*/false);
+    auto r = h.sink.Get("/fragments/settings/developer/permissions");
+    REQUIRE(r);
+    CHECK(r->status == 200);
     CHECK_FALSE(has(r->body, "<table"));
     CHECK_FALSE(has(r->body, "Administrator"));
 }

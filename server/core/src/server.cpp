@@ -19988,9 +19988,9 @@ private:
         discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
                                           instruction_store_.get(), &registry_);
 
-        // System > Developer and API (read-only): page + four fragments over the
-        // shared discovery builders above. Each fragment takes its twin's own
-        // Infrastructure:Read gate; the page is admin-only like /settings.
+        // System > Developer and API (read-only): page + five fragments over the
+        // shared discovery builders above. The page and every fragment are admin-only like
+        // /settings; a fragment then also takes its twin's own Infrastructure:Read gate.
         {
             HttplibRouteSink developer_sink{*web_server_};
             yuzu::server::developer::register_developer_routes(
@@ -20001,6 +20001,11 @@ private:
                             return require_admin(req, res);
                         },
                     .perm_fn = perm_fn,
+                    .probe_fn =
+                        [this](const httplib::Request& req, const std::string& type,
+                               const std::string& op) {
+                            return auth_routes_->has_permission(req, type, op);
+                        },
                     .rbac_store = rbac_store_.get(),
                     .registry = &registry_,
                 });
