@@ -378,7 +378,7 @@ std::string discovery_form(const MockIdp& idp, const std::string& issuer = {}) {
 }
 } // namespace
 
-TEST_CASE("Settings OIDC: a saved issuer is discovered lazily, the first login reaches the IdP's "
+TEST_CASE("Settings OIDC: a saved issuer is discovered lazily - the first login reaches the IdP's "
           "own authorization endpoint",
           "[settings][oidc][oidc_discovery]") {
     // The hot-reload site used to derive `{issuer}/authorize` and pre-set it, so discovery never

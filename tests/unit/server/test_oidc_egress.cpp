@@ -89,7 +89,7 @@ TEST_CASE("OIDC egress: a loopback IdP is refused by default and sees no request
     }
 }
 
-TEST_CASE("OIDC egress: with the operator switch on, the same loopback IdP works",
+TEST_CASE("OIDC egress: with the operator switch on - the same loopback IdP works",
           "[oidc][oidc_egress]") {
     MockIdp idp;
     auto doc = OidcProvider::fetch_discovery_document(idp.base(), false, true, 2000);
@@ -124,7 +124,7 @@ TEST_CASE("OIDC egress: link-local and cloud-metadata targets are refused even w
     }
 }
 
-TEST_CASE("OIDC egress: a real host name goes through the OS resolver, no test seam",
+TEST_CASE("OIDC egress: a real host name goes through the OS resolver - no test seam",
           "[oidc][oidc_egress][security]") {
     // Every other name test installs the resolver seam, so on a platform whose OS resolver
     // needs its own handling (Windows: GetAddrInfoExW with its own list type and deleter) the
@@ -148,7 +148,21 @@ TEST_CASE("OIDC egress: a real host name goes through the OS resolver, no test s
     CHECK(idp.discovery_calls.load() == 1);
 }
 
-TEST_CASE("OIDC egress: a name is resolved, every answer classified, and the connect is pinned",
+TEST_CASE("OIDC egress: a host name the real OS resolver cannot resolve is its own fixed failure",
+          "[oidc][oidc_egress]") {
+    // RFC 6761: ".invalid" never resolves. This runs the real resolver (the seam is not set), so
+    // the failure return of resolve_host_addresses is covered on every platform, with or without
+    // a network. A lookup that times out inside the 1 s budget reads the same.
+    MockIdp idp;
+    auto doc = OidcProvider::fetch_discovery_document("http://yuzu-no-such-host.invalid:1", false,
+                                                      true, 1000);
+    REQUIRE_FALSE(doc.has_value());
+    CHECK(doc.error().find("the host name did not resolve") != std::string::npos);
+    CHECK(idp.discovery_calls.load() == 0);
+    CHECK(idp.jwks_calls.load() == 0);
+}
+
+TEST_CASE("OIDC egress: a name is resolved - every answer classified - and the connect is pinned",
           "[oidc][oidc_egress][security]") {
     MockIdp idp;
     const std::string issuer = "http://idp.test:" + std::to_string(idp.port);
@@ -169,7 +183,12 @@ TEST_CASE("OIDC egress: a name is resolved, every answer classified, and the con
         REQUIRE(allowed.has_value());
         CHECK(idp.discovery_calls.load() == 1);
     }
-    SECTION("a refused answer in a mixed list is skipped, not connected to") {
+    SECTION("control: a mixed list still reaches its permitted address") {
+        // A no-regression control, not a proof that the refused address is dropped: an unpinned
+        // refused address would fail its connect and fall through to the permitted one, so this
+        // stays green either way. The proof is the single-class sections (a link-local-only answer
+        // below is refused with nothing connected). No refusal is logged here: the provider logs
+        // one only when no permitted address is left, so there is no log line to assert.
         ResolverGuard resolver([](const std::string&) -> std::vector<std::string> {
             return {"169.254.169.254", "127.0.0.1"};
         });
@@ -214,7 +233,7 @@ TEST_CASE("OIDC egress: a name is resolved, every answer classified, and the con
     }
 }
 
-TEST_CASE("OIDC egress: plain http to a public address is refused, whatever the operator switch",
+TEST_CASE("OIDC egress: plain http to a public address is refused - whatever the operator switch",
           "[oidc][oidc_egress][security]") {
     // No case connects to a public address: every refusal happens before a socket exists, and the
     // https side of the rule is pinned as a pure decision in test_oidc_egress_policy.cpp.
@@ -243,7 +262,9 @@ TEST_CASE("OIDC egress: plain http to a public address is refused, whatever the 
         CHECK(idp.discovery_calls.load() == 0);
         CHECK(idp.jwks_calls.load() == 0);
     }
-    SECTION("a public address in a mixed plain-http answer is skipped, not connected to") {
+    SECTION("control: a public address in a mixed plain-http answer leaves the permitted one") {
+        // A no-regression control (see the mixed-list control above): the discriminators are the
+        // public-only sections, which are refused with the cleartext reason before any socket.
         ResolverGuard resolver([](const std::string&) -> std::vector<std::string> {
             return {"93.184.216.34", "127.0.0.1"};
         });
@@ -296,7 +317,7 @@ TEST_CASE("OIDC egress: plain http to a public address is refused, whatever the 
     }
 }
 
-TEST_CASE("OIDC egress: an endpoint on another host is vetted when it is used, not when the "
+TEST_CASE("OIDC egress: an endpoint on another host is vetted when it is used - not when the "
           "issuer was",
           "[oidc][oidc_egress][security]") {
     // The issuer is the loopback mock IdP (allowed here), but the document points the signing
@@ -359,6 +380,19 @@ TEST_CASE("OIDC egress: the provider warns once at construction about an issuer 
         const auto logs = warnings(provider_cfg("https://169.254.169.254", true));
         CHECK(logs.find("refused class (link-local)") != std::string::npos);
         CHECK(logs.find("never allowed") != std::string::npos);
+    }
+    SECTION("a plain-http issuer at a public IP literal is a refused class, switch or not") {
+        for (const bool allow : {false, true}) {
+            CAPTURE(allow);
+            const auto logs = warnings(provider_cfg("http://8.8.8.8:8080", allow));
+            CHECK(logs.find("refused class (public)") != std::string::npos);
+            CHECK(logs.find("plain http to a public address is never allowed") !=
+                  std::string::npos);
+            CHECK(logs.find("unless the server runs with") == std::string::npos);
+        }
+        // Control: the same address over https is not a refused class.
+        CHECK(warnings(provider_cfg("https://8.8.8.8", false)).find("refused class") ==
+              std::string::npos);
     }
     SECTION("http on a non-loopback host warns that the trust root and the secret are in the "
             "clear") {

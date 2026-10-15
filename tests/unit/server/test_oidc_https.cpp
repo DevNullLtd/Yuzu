@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 // A real httplib acceptor thread crashes the ThreadSanitizer build (#438); see the MockIdp banner.
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN
@@ -52,6 +53,12 @@ struct TlsIdp {
     int port{0};
     std::atomic<int> discovery_calls{0};
     std::atomic<int> jwks_calls{0};
+
+    /// The server name the last /jwks client asked for in its TLS hello (empty for an IP).
+    std::string jwks_sni() {
+        std::lock_guard lk(sni_mu);
+        return sni_seen;
+    }
 
     TlsIdp() {
         std::filesystem::create_directories(tmp.path);
@@ -72,7 +79,11 @@ struct TlsIdp {
                                          R"(/token","jwks_uri":")" + base() + R"(/jwks"})",
                                      "application/json");
                  });
-        svr->Get("/jwks", [this](const httplib::Request&, httplib::Response& res) {
+        svr->Get("/jwks", [this](const httplib::Request& req, httplib::Response& res) {
+            {
+                std::lock_guard lk(sni_mu);
+                sni_seen = req.sni();
+            }
             jwks_calls.fetch_add(1);
             res.set_content(yuzu::server::test::jwks_json("tls-kid"), "application/json");
         });
@@ -95,6 +106,9 @@ struct TlsIdp {
     std::string base() const { return "https://127.0.0.1:" + std::to_string(port); }
 
 private:
+    std::mutex sni_mu;
+    std::string sni_seen;
+
     static void write(const std::filesystem::path& p, const std::string& text) {
         std::ofstream f(p, std::ios::binary | std::ios::trunc);
         f << text;
@@ -150,7 +164,7 @@ void check_fetched(const FetchOutcome& out) {
 
 } // namespace
 
-TEST_CASE("OIDC https: certificate verification is honored, and skip_tls_verify opts out of it",
+TEST_CASE("OIDC https: certificate verification is honored - and skip_tls_verify opts out of it",
           "[oidc][oidc_discovery][oidc_https][security]") {
     TlsIdp idp;
 
@@ -201,6 +215,41 @@ TEST_CASE("OIDC https: certificate verification is honored, and skip_tls_verify 
         const auto flow = provider.start_auth_flow();
         CHECK(flow.url.starts_with(idp.base() + "/authorize?"));
     }
+}
+
+TEST_CASE(
+    "OIDC https: a host name pinned to a vetted address still names the host in the TLS hello",
+    "[oidc][oidc_discovery][oidc_https][security]") {
+    // The egress policy resolves the name and pins the connect to the vetted numeric address
+    // (httplib `set_hostname_addr_map`). Server-name indication and certificate verification must
+    // still use the NAME, never the pinned address: the fetch below can only reach the server
+    // through the pin (the OS knows no "idp.test"), and the server records the SNI it was sent.
+    struct ResolverGuard {
+        ResolverGuard() {
+            OidcProvider::set_resolver_for_test(
+                [](const std::string&) -> std::vector<std::string> { return {"127.0.0.1"}; });
+        }
+        ~ResolverGuard() { OidcProvider::set_resolver_for_test({}); }
+        ResolverGuard(const ResolverGuard&) = delete;
+        ResolverGuard& operator=(const ResolverGuard&) = delete;
+    };
+    TlsIdp idp;
+    ResolverGuard resolver;
+    // The throwaway CA is untrusted, so the chain is not verified here (QE8-2: the name check on a
+    // verified chain is not observable without a certificate for the name, which the shared
+    // fixture does not mint); the SNI the client sends is.
+    auto body = OidcProvider::http_get_bounded(
+        "https://idp.test:" + std::to_string(idp.port) + "/jwks",
+        /*skip_tls_verify=*/true, /*allow_private_networks=*/true, 5000);
+    REQUIRE(body.has_value());
+    CHECK(idp.jwks_calls.load() == 1);
+    CHECK(idp.jwks_sni() == "idp.test");
+
+    // Control: an IP-literal URL sends no SNI (RFC 6066), so the assertion above is not vacuous.
+    auto literal = OidcProvider::http_get_bounded(idp.base() + "/jwks", /*skip_tls_verify=*/true,
+                                                  /*allow_private_networks=*/true, 5000);
+    REQUIRE(literal.has_value());
+    CHECK(idp.jwks_sni().empty());
 }
 
 // The decisive Windows question (#5692 CH-5a): does the https fetch work from an httplib worker

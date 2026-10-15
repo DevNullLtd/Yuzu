@@ -15,7 +15,10 @@
 #include <string>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <winsock2.h> // before any windows.h
+#include <ws2tcpip.h> // inet_pton (a pure string parser: no WSAStartup needed)
+#else
 #include <arpa/inet.h>
 #endif
 
@@ -302,7 +305,6 @@ TEST_CASE("OIDC egress: the literal parser is strict and leaves odd spellings to
     CHECK(classify_text("1:2:3:4:5:6:1.2.3.4") == AddressClass::OtherNonGlobal);
 }
 
-#ifndef _WIN32
 TEST_CASE("OIDC egress: the literal parser agrees with the OS parser on what it accepts",
           "[oidc][oidc_egress]") {
     // Anything the strict parser accepts, inet_pton must read as the same bytes: a disagreement
@@ -342,7 +344,6 @@ TEST_CASE("OIDC egress: the literal parser agrees with the OS parser on what it 
     in6_addr os6{};
     CHECK(::inet_pton(AF_INET6, "1:2:3:4:5:6:7::8", &os6) == 0); // the parser also refuses it
 }
-#endif
 
 TEST_CASE("OIDC egress: class names are fixed labels that carry no address",
           "[oidc][oidc_egress]") {

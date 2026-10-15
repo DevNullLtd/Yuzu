@@ -1550,9 +1550,10 @@ TEST_CASE("OIDC discovery: a document missing a field this caller does not need 
     CHECK(idp.jwks_calls.load() == 0);
 }
 
-TEST_CASE("OIDC discovery: the negative cache expires - a failed attempt is retried once its window "
-          "ends, and a recovered IdP is then cached",
-          "[oidc][oidc_discovery]") {
+TEST_CASE(
+    "OIDC discovery: the negative cache expires - a failed attempt is retried once its window "
+    "ends - and a recovered IdP is then cached",
+    "[oidc][oidc_discovery]") {
     MockIdp idp;
     idp.with([](MockIdp& m) { m.discovery_status = 500; });
     OidcProvider provider(discovery_cfg(idp));
@@ -1583,7 +1584,7 @@ TEST_CASE("OIDC discovery: a failing JWKS refetch keeps the keys already cached"
 }
 
 TEST_CASE("OIDC discovery: cached keys are dropped after the hard maximum key age when the JWKS "
-          "endpoint stays down, and come back when it answers",
+          "endpoint stays down - and come back when it answers",
           "[oidc][oidc_discovery][jwt]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
@@ -1622,8 +1623,40 @@ TEST_CASE("OIDC discovery: cached keys are dropped after the hard maximum key ag
     CHECK(idp.jwks_calls.load() == recovered);
 }
 
+TEST_CASE("OIDC discovery: a fetch that adopts no keys does not renew the cached keys' age",
+          "[oidc][oidc_discovery][jwt]") {
+    // A kid miss forces a refetch while the cache is 50 minutes old. Neither an empty key set
+    // nor an unparseable body is a stored key set, so neither may renew the last-success stamp:
+    // 20 minutes later the keys are 70 minutes old and are refused. (Red if the stamp is
+    // written before the empty-set return in fetch_jwks, or on any non-adopting outcome.)
+    const std::pair<const char*, const char*> kAnswers[] = {
+        {"an empty key set", R"({"keys":[]})"},
+        {"an unparseable 200 body", "this is not json"},
+    };
+    for (const auto& [what, body] : kAnswers) {
+        CAPTURE(what);
+        MockIdp idp;
+        const auto cfg = discovery_cfg(idp);
+        OidcProvider provider(cfg);
+        REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+        CHECK(idp.jwks_calls.load() == 1);
+
+        provider.set_jwks_key_age_for_test(std::chrono::minutes(50));
+        idp.with([body](MockIdp& m) { m.jwks_body = body; });
+        (void)provider.verify_jwt_signature(signed_token(cfg, "never-published"));
+        CHECK(idp.jwks_calls.load() == 2); // the kid miss really refetched
+        // Non-vacuity: the cached key survived the answer (inside the ceiling, no new fetch).
+        REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+        CHECK(idp.jwks_calls.load() == 2);
+
+        // 70 minutes after the last real success: the key is no longer trusted.
+        provider.age_jwks_keys_for_test(std::chrono::minutes(20));
+        CHECK_FALSE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    }
+}
+
 TEST_CASE(
-    "OIDC discovery: a token naming a kid the key set lacks is refused, never checked against "
+    "OIDC discovery: a token naming a kid the key set lacks is refused - never checked against "
     "another key; a token with no kid still uses the first key",
     "[oidc][oidc_discovery][jwt]") {
     MockIdp idp;
@@ -1649,8 +1682,9 @@ TEST_CASE(
     CHECK(r.error() == "JWT kid is not a non-empty string");
 }
 
-TEST_CASE("OIDC discovery: a failed attempt is remembered, two logins inside the window cost ONE GET",
-          "[oidc][oidc_discovery]") {
+TEST_CASE(
+    "OIDC discovery: a failed attempt is remembered - two logins inside the window cost ONE GET",
+    "[oidc][oidc_discovery]") {
     MockIdp idp;
     idp.with([](MockIdp& m) { m.discovery_status = 500; });
     OidcProvider provider(discovery_cfg(idp));
@@ -1659,7 +1693,7 @@ TEST_CASE("OIDC discovery: a failed attempt is remembered, two logins inside the
     CHECK(idp.discovery_calls.load() == 1);
 }
 
-TEST_CASE("OIDC discovery: a slow IdP is cut off by the timeout seam, not a real 5 s wait",
+TEST_CASE("OIDC discovery: a slow IdP is cut off by the timeout seam - not a real 5 s wait",
           "[oidc][oidc_discovery]") {
     MockIdp idp;
     idp.with([](MockIdp& m) { m.discovery_delay_ms = 150; });
@@ -1757,9 +1791,10 @@ TEST_CASE("OIDC discovery: a caller arriving mid-fetch fails fast instead of wai
     CHECK(idp.discovery_calls.load() == 1);
 }
 
-TEST_CASE("OIDC discovery: signature checks use the discovered JWKS - an unknown kid refetches once, "
-          "and a rotated kid then verifies",
-          "[oidc][oidc_discovery][jwt]") {
+TEST_CASE(
+    "OIDC discovery: signature checks use the discovered JWKS - an unknown kid refetches once - "
+    "and a rotated kid then verifies",
+    "[oidc][oidc_discovery][jwt]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
     OidcProvider provider(cfg);
@@ -1779,7 +1814,7 @@ TEST_CASE("OIDC discovery: signature checks use the discovered JWKS - an unknown
     CHECK(idp.discovery_calls.load() == 1);
 }
 
-TEST_CASE("OIDC discovery: a JWKS that cannot be fetched is the fixed jwks token, never a pass",
+TEST_CASE("OIDC discovery: a JWKS that cannot be fetched is the fixed jwks token - never a pass",
           "[oidc][oidc_discovery][jwt][security]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
@@ -1949,7 +1984,7 @@ TEST_CASE("OIDC discovery: an issuer with a path prefix is fetched under that pr
     }
 }
 
-TEST_CASE("OIDC http_get_bounded: a query on a bare-host URL is part of the path, not the host",
+TEST_CASE("OIDC http_get_bounded: a query on a bare-host URL is part of the path - not the host",
           "[oidc][oidc_discovery]") {
     MockIdp idp;
     // `http://127.0.0.1:<port>?x=1` is the authority `127.0.0.1:<port>` and the path "/?x=1".
@@ -2193,7 +2228,8 @@ TEST_CASE("OIDC discovery: an https server dripping TLS handshake bytes cannot h
     CHECK(in_time); // false = the fetch outlived the bound by 8 s: the unbounded handshake
     CHECK_FALSE(doc.has_value());
     CHECK(elapsed >= std::chrono::seconds(1));
-    CHECK(elapsed < std::chrono::seconds(7)); // nominal 2 s; slack for a loaded shared runner
+    // No upper bound on `elapsed`: a missing watchdog ends at the 10 s limit above and fails
+    // `in_time`, and a ceiling closer than that only flakes on a loaded shared runner.
     CHECK(drip.accepted() >= 1);
 }
 
@@ -2223,7 +2259,8 @@ TEST_CASE("OIDC discovery: the JWKS fetch is bounded the same way against a drip
     REQUIRE_FALSE(verdict.has_value());
     CHECK(verdict.error() == OidcProvider::kJwksUnavailable);
     CHECK(elapsed >= std::chrono::seconds(1));
-    CHECK(elapsed < std::chrono::seconds(7)); // nominal 2 s; slack for a loaded shared runner
+    // No upper bound on `elapsed`: a missing watchdog ends at the 10 s limit above and fails
+    // `in_time`, and a ceiling closer than that only flakes on a loaded shared runner.
 }
 
 // ── Descriptor exhaustion fails closed (#5692, Gate 8 passes 2 and 4) ────────
@@ -2757,7 +2794,7 @@ TEST_CASE("OIDC discovery: a refused connection fails closed", "[oidc][oidc_disc
 
 // These need no acceptor (a refused loopback port, or no network at all), so they also run under
 // ThreadSanitizer, which is where the locking around the lazy discovery is exercised.
-TEST_CASE("OIDC discovery: concurrent starts, signature checks and seam calls against a dead IdP "
+TEST_CASE("OIDC discovery: concurrent starts - signature checks and seam calls against a dead IdP "
           "all get the fixed errors",
           "[oidc][oidc_discovery][security]") {
     OidcConfig cfg;
@@ -2879,7 +2916,7 @@ TEST_CASE("OIDC discovery: an endpoint authority must be a well-formed host[:por
     CHECK(accepted("https://idp.test:00080/x")); // leading zeros, still 80
 }
 
-TEST_CASE("OIDC discovery: an endpoint over 2048 bytes is refused, 2048 is accepted",
+TEST_CASE("OIDC discovery: an endpoint over 2048 bytes is refused - 2048 is accepted",
           "[oidc][oidc_discovery][security]") {
     const std::string iss = "https://idp.test";
     const std::string prefix = "https://idp.test/";
@@ -2930,6 +2967,56 @@ TEST_CASE("OIDC discovery: an issuer with a query or a fragment is refused befor
     }
 }
 
+TEST_CASE("OIDC discovery: a host name with a byte outside ASCII is refused wherever it appears",
+          "[oidc][oidc_discovery][security]") {
+    // The egress check resolves the host as UTF-8 while the Windows token POST widens each byte on
+    // its own, so the two would ask for different names. An internationalized name is configured
+    // in its punycode form instead; the shared authority check refuses the raw bytes everywhere.
+    const std::string host = "idp.ex\xC3\xA4mple"; // U+00E4 in UTF-8
+    SECTION("an issuer") {
+        for (const char* scheme : {"https://", "http://"}) {
+            auto r = OidcProvider::fetch_discovery_document(std::string(scheme) + host, false,
+                                                            /*allow_private_networks=*/true);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == "the issuer has no well-formed host");
+        }
+    }
+    SECTION("a discovered endpoint") {
+        for (const char* field : {"authorization_endpoint", "token_endpoint", "jwks_uri"}) {
+            CAPTURE(field);
+            auto r = OidcProvider::parse_discovery_document(
+                doc_with(field, "https://" + host + "/x"), "https://idp.test");
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error().starts_with(field));
+            CHECK(r.error().find("is not an absolute https URL") != std::string::npos);
+        }
+    }
+    SECTION("a configured endpoint") {
+        auto r = OidcProvider::http_get_bounded("https://" + host + "/jwks", false,
+                                                /*allow_private_networks=*/true);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == "not an http or https URL");
+
+        OidcConfig cfg;
+        cfg.issuer = "https://idp.test";
+        cfg.client_id = "c";
+        cfg.redirect_uri = "http://localhost/cb";
+        cfg.authorization_endpoint = "https://idp.test/authorize"; // the start needs no network
+        cfg.token_endpoint = "https://" + host + "/token";
+        OidcProvider provider(cfg);
+        const auto flow = provider.start_auth_flow();
+        auto cb = provider.handle_callback(
+            "code", yuzu::server::test::url_query_param(flow.url, "state"), flow.binding_secret);
+        REQUIRE_FALSE(cb.has_value());
+        CHECK(cb.error().find("token endpoint") != std::string::npos);
+    }
+    SECTION("control: the same name in ASCII (punycode) is accepted") {
+        auto r = OidcProvider::parse_discovery_document(
+            doc_with("jwks_uri", "https://xn--idp-ex-mple-9db.test/x"), "https://idp.test");
+        CHECK(r.has_value());
+    }
+}
+
 TEST_CASE("OIDC discovery: a URL with an absurd authority never reaches the HTTP client",
           "[oidc][oidc_discovery][security]") {
     const auto r = OidcProvider::http_get_bounded("https://" + std::string(200 * 1024, 'a') + "/x",
@@ -2943,7 +3030,7 @@ TEST_CASE("OIDC discovery: a URL with an absurd authority never reaches the HTTP
 #ifndef _WIN32
 // Windows posts the token request through WinHTTP, which has no httplib URL regex to overflow.
 TEST_CASE("OIDC token exchange: a configured token endpoint with an impossible port is a failed "
-          "callback, not a throw",
+          "callback - not a throw",
           "[oidc][oidc_discovery][security]") {
     for (const char* endpoint : {"https://idp.test:99999999999/token",
                                  "https://user@idp.test/token", "ftp://idp.test/t"}) {
@@ -3016,7 +3103,7 @@ TEST_CASE("OIDC discovery: a control byte alone makes an endpoint unacceptable",
     }
 }
 
-TEST_CASE("OIDC discovery: the Unicode line breaks NEL, U+2028 and U+2029 make an endpoint "
+TEST_CASE("OIDC discovery: the Unicode line breaks NEL - U+2028 and U+2029 make an endpoint "
           "unacceptable",
           "[oidc][oidc_discovery][security]") {
     const std::string iss = "https://idp.test";
@@ -3054,8 +3141,9 @@ TEST_CASE("OIDC discovery: a configured issuer with a space or control byte is r
     }
 }
 
-TEST_CASE("OIDC discovery: a configured endpoint with a space or control byte is refused, not sent",
-          "[oidc][oidc_discovery][security]") {
+TEST_CASE(
+    "OIDC discovery: a configured endpoint with a space or control byte is refused - not sent",
+    "[oidc][oidc_discovery][security]") {
     OidcConfig cfg;
     cfg.issuer = "https://idp.test";
     cfg.client_id = "c";
@@ -3340,10 +3428,11 @@ TEST_CASE("OIDC discovery: endpoints must be absolute and carry the issuer's own
                                                        "HTTPS://idp.test"));
 }
 
-TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test, "
-          "add_test_pending_flow, set_http_timeouts_for_test, "
-          "set_discovery_negative_cache_for_test, set_resolver_for_test, "
-          "set_jwks_key_age_for_test or pending_flow_count_for_test (source pin)",
+TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test - "
+          "add_test_pending_flow - set_http_timeouts_for_test - "
+          "set_discovery_negative_cache_for_test - set_resolver_for_test - "
+          "set_jwks_key_age_for_test - age_jwks_keys_for_test or pending_flow_count_for_test "
+          "(source pin)",
           "[oidc][oidc_binding][source_pin]") {
     // The seams are public members of the production class and the first makes the binding
     // digest fail. Their only legitimate callers are tests; any file under server/core/src other
@@ -3355,6 +3444,7 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
                                              "set_discovery_negative_cache_for_test",
                                              "set_resolver_for_test",
                                              "set_jwks_key_age_for_test",
+                                             "age_jwks_keys_for_test",
                                              "pending_flow_count_for_test"};
     std::size_t scanned = 0;
     const fs::path src_dir = fs::path(YUZU_SERVER_SRC_DIR);
@@ -3392,7 +3482,7 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
     CHECK(scanned > 100); // non-vacuity
 }
 
-TEST_CASE("OIDC discovery: the in-flight mark is set once, cleared only by an RAII guard created "
+TEST_CASE("OIDC discovery: the in-flight mark is set once - cleared only by an RAII guard created "
           "straight after it (source pin)",
           "[oidc][oidc_discovery][source_pin]") {
     // A throw between the mark and a manual clear (an allocation failure in a handler, say)
@@ -3459,14 +3549,17 @@ TEST_CASE("OIDC discovery: the in-flight mark is set once, cleared only by an RA
 
 // ── The fetch bounds, by name (#5692 QE-2) ───────────────────────────────────
 
-TEST_CASE("OIDC: the 5 s per-operation timeout, the 2x total bound and the 30 s negative cache are "
-          "pinned by name",
-          "[oidc][oidc_discovery]") {
+TEST_CASE(
+    "OIDC: the 5 s per-operation timeout - the 2x total bound and the 30 s negative cache are "
+    "pinned by name",
+    "[oidc][oidc_discovery]") {
     // The values the user manual and the header promise. A silent edit fails here, and the scan
     // below proves the code uses the constants rather than a second copy of the number.
     STATIC_REQUIRE(OidcProvider::kHttpOperationTimeoutMs == 5000);
     STATIC_REQUIRE(OidcProvider::kHttpTotalBoundMultiplier == 2);
     STATIC_REQUIRE(OidcProvider::kDiscoveryNegativeCacheMs == 30000);
+    STATIC_REQUIRE(OidcProvider::kJwksMaxKeyAge == std::chrono::hours(1));
+    STATIC_REQUIRE(OidcProvider::kJwksCacheTtl == OidcProvider::kJwksMaxKeyAge);
 
     const auto read = [](const char* name) {
         std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / name, std::ios::binary);
@@ -3533,7 +3626,7 @@ CallbackOutcome run_callback(yuzu::server::test::MockIdp& idp, OidcProvider& pro
 } // namespace
 
 TEST_CASE(
-    "OIDC callback: an id_token header of the wrong type is a refused sign-in, not an exception",
+    "OIDC callback: an id_token header of the wrong type is a refused sign-in - not an exception",
     "[oidc][oidc_discovery][security]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
@@ -3565,7 +3658,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "OIDC callback: a token-endpoint error body of the wrong type is a refused sign-in, not an "
+    "OIDC callback: a token-endpoint error body of the wrong type is a refused sign-in - not an "
     "exception",
     "[oidc][oidc_discovery][security]") {
     MockIdp idp;
@@ -3595,7 +3688,7 @@ TEST_CASE(
     CHECK(named.result->error() == "token endpoint error: invalid_grant");
 }
 
-TEST_CASE("OIDC callback: an aud claim of the wrong type is a refused sign-in, not an exception",
+TEST_CASE("OIDC callback: an aud claim of the wrong type is a refused sign-in - not an exception",
           "[oidc][oidc_discovery][security]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
@@ -3688,7 +3781,7 @@ TEST_CASE("OIDC JWKS: a document with no usable keys does not displace the cache
 
 // ── One malformed key does not discard its siblings (#5692 C7) ───────────────
 
-TEST_CASE("OIDC JWKS: a key with a member of the wrong type is skipped, its siblings are kept",
+TEST_CASE("OIDC JWKS: a key with a member of the wrong type is skipped - its siblings are kept",
           "[oidc][oidc_discovery][security]") {
     // jwks_json() is one well-formed RSA key under `kid`; splice the malformed keys before it.
     const auto with_bad = [](const std::string& bad_keys) {
@@ -3759,7 +3852,7 @@ TEST_CASE("OIDC JWKS: a served set whose every key is malformed keeps the no-usa
 
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN
 
-TEST_CASE("OIDC discovery: an issuer carrying NEL, LS and PS in a failed document reaches the "
+TEST_CASE("OIDC discovery: an issuer carrying NEL - LS and PS in a failed document reaches the "
           "'discovery failed' log line neutralized",
           "[oidc][oidc_discovery][security]") {
     // A document whose `issuer` differs from the configured one is refused with a message that

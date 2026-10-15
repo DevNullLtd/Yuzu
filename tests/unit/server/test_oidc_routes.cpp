@@ -176,7 +176,7 @@ TEST_CASE("OIDC callback — IdP error response increments yuzu_auth_oidc_login_
 }
 
 TEST_CASE("OIDC callback — an IdP error with line breaks cannot forge a log line or an audit "
-          "detail, and the response is unchanged",
+          "detail - and the response is unchanged",
           "[pg][oidc][auth_routes][log_fold][security]") {
     OidcRoutesFixture fix;
     fix.oidc_provider = std::make_unique<oidc::OidcProvider>(make_minimal_oidc_config());
@@ -720,7 +720,7 @@ TEST_CASE("OIDC discovery route: a full login works with endpoints and JWKS from
     CHECK(rig.idp.jwks_calls.load() == 1);
 }
 
-TEST_CASE("OIDC discovery route: discovery down at login start answers 500 with no cookie, no "
+TEST_CASE("OIDC discovery route: discovery down at login start answers 500 with no cookie - no "
           "redirect and no stored flow",
           "[pg][oidc][oidc_discovery][auth_routes]") {
     DiscoveryRig rig;
@@ -736,9 +736,10 @@ TEST_CASE("OIDC discovery route: discovery down at login start answers 500 with 
     CHECK(body["error"].value("code", 0) == 500);
 }
 
-TEST_CASE("OIDC discovery route: discovery down at the callback is a refused sign-in, audited as a "
-          "failure, with no session",
-          "[pg][oidc][oidc_discovery][auth_routes]") {
+TEST_CASE(
+    "OIDC discovery route: discovery down at the callback is a refused sign-in - audited as a "
+    "failure - with no session",
+    "[pg][oidc][oidc_discovery][auth_routes]") {
     DiscoveryRig rig(/*explicit_authorize=*/true); // the start needs no discovery
     rig.idp.with([](yuzu::server::test::MockIdp& m) { m.discovery_status = 500; });
     Browser a;
@@ -771,7 +772,7 @@ std::string forged_jwt(const std::string& header_json, const std::string& payloa
 } // namespace
 
 TEST_CASE(
-    "OIDC binding route: IdP JSON of the wrong type is a failed sign-in that is audited, counted "
+    "OIDC binding route: IdP JSON of the wrong type is a failed sign-in that is audited - counted "
     "and spends the binding cookie",
     "[pg][oidc][oidc_binding][oidc_discovery][auth_routes]") {
     BindingRig rig;
@@ -830,7 +831,7 @@ TEST_CASE(
 // (ADR-0007 fail-safe). The callback must treat that as a failed sign-in: no cookie, no ok audit
 // row, no ok counter.
 TEST_CASE(
-    "OIDC binding route: a session that cannot be persisted is a failed sign-in, not a success",
+    "OIDC binding route: a session that cannot be persisted is a failed sign-in - not a success",
     "[pg][oidc][oidc_binding][auth_routes]") {
     BindingRig rig;
     yuzu::server::SessionStore store{*rig.fix.audit_pool};

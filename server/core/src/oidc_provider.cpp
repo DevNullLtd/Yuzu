@@ -596,6 +596,34 @@ constexpr std::size_t kHttpMaxBody = 256 * 1024;
 // ── WinHTTP helper (Windows only) ────────────────────────────────────────────
 
 #ifdef _WIN32
+namespace {
+// Owns the three HINTERNETs of one WinHTTP request. Declared session, connect, request, so the
+// destructor closes them request first, then connect, then session, on every return path
+// (early failure, the size cap and success alike). Move-only: a copy would double-close.
+struct WinHttpHandles {
+    HINTERNET session = nullptr;
+    HINTERNET connect = nullptr;
+    HINTERNET request = nullptr;
+
+    WinHttpHandles() = default;
+    WinHttpHandles(const WinHttpHandles&) = delete;
+    WinHttpHandles& operator=(const WinHttpHandles&) = delete;
+    WinHttpHandles(WinHttpHandles&& other) noexcept
+        : session(std::exchange(other.session, nullptr)),
+          connect(std::exchange(other.connect, nullptr)),
+          request(std::exchange(other.request, nullptr)) {}
+    WinHttpHandles& operator=(WinHttpHandles&&) = delete;
+    ~WinHttpHandles() {
+        if (request)
+            WinHttpCloseHandle(request);
+        if (connect)
+            WinHttpCloseHandle(connect);
+        if (session)
+            WinHttpCloseHandle(session);
+    }
+};
+} // namespace
+
 static std::string winhttp_post(const std::string& url, const std::string& form_body,
                                 const std::string& auth_header = {}) {
     // Parse URL into components
@@ -618,82 +646,87 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
         return {};
     }
 
-    HINTERNET session = WinHttpOpen(L"Yuzu-Server/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) {
+    WinHttpHandles h;
+    h.session = WinHttpOpen(L"Yuzu-Server/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!h.session) {
         spdlog::error("WinHTTP: WinHttpOpen failed: {}", GetLastError());
         return {};
     }
 
-    HINTERNET connect = WinHttpConnect(session, host, uc.nPort, 0);
-    if (!connect) {
+    h.connect = WinHttpConnect(h.session, host, uc.nPort, 0);
+    if (!h.connect) {
         spdlog::error("WinHTTP: WinHttpConnect failed: {}", GetLastError());
-        WinHttpCloseHandle(session);
         return {};
     }
 
     DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET request = WinHttpOpenRequest(connect, L"POST", path, nullptr, WINHTTP_NO_REFERER,
-                                           WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!request) {
+    h.request = WinHttpOpenRequest(h.connect, L"POST", path, nullptr, WINHTTP_NO_REFERER,
+                                   WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!h.request) {
         spdlog::error("WinHTTP: WinHttpOpenRequest failed: {}", GetLastError());
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
+        return {};
+    }
+
+    // Never follow a redirect. The token endpoint was vetted against the egress policy before
+    // this call; WinHTTP's default policy would follow a 3xx to a host that was never vetted
+    // (including an internal one). A 3xx now comes back as a (non-JSON) body that the caller
+    // fails to parse, so the sign-in fails closed. If the policy cannot be set, fail too.
+    DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    if (!WinHttpSetOption(h.request, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy,
+                          sizeof(redirect_policy))) {
+        spdlog::error("WinHTTP: could not disable redirects: {}", GetLastError());
         return {};
     }
 
     // Add Authorization header if provided (HTTP Basic auth for client credentials)
     if (!auth_header.empty()) {
         std::wstring wauth(auth_header.begin(), auth_header.end());
-        WinHttpAddRequestHeaders(request, wauth.c_str(), static_cast<DWORD>(wauth.size()),
+        WinHttpAddRequestHeaders(h.request, wauth.c_str(), static_cast<DWORD>(wauth.size()),
                                  WINHTTP_ADDREQ_FLAG_ADD);
     }
 
     const wchar_t* content_type = L"Content-Type: application/x-www-form-urlencoded";
-    BOOL ok = WinHttpSendRequest(request, content_type, -1L, const_cast<char*>(form_body.data()),
+    BOOL ok = WinHttpSendRequest(h.request, content_type, -1L, const_cast<char*>(form_body.data()),
                                  static_cast<DWORD>(form_body.size()),
                                  static_cast<DWORD>(form_body.size()), 0);
     if (!ok) {
         spdlog::error("WinHTTP: WinHttpSendRequest failed: {}", GetLastError());
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
         return {};
     }
 
-    ok = WinHttpReceiveResponse(request, nullptr);
+    ok = WinHttpReceiveResponse(h.request, nullptr);
     if (!ok) {
         spdlog::error("WinHTTP: WinHttpReceiveResponse failed: {}", GetLastError());
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
         return {};
     }
 
     std::string response;
-    DWORD bytes_available = 0;
-    do {
-        WinHttpQueryDataAvailable(request, &bytes_available);
-        if (bytes_available > 0) {
-            std::vector<char> buf(bytes_available);
-            DWORD bytes_read = 0;
-            WinHttpReadData(request, buf.data(), bytes_available, &bytes_read);
-            response.append(buf.data(), bytes_read);
-            // Same cap as the POSIX client: an oversize reply is a failure (empty), not a
-            // reason to keep growing.
-            if (response.size() > kHttpMaxBody) {
-                spdlog::error("WinHTTP: response exceeds {} bytes, aborting", kHttpMaxBody);
-                WinHttpCloseHandle(request);
-                WinHttpCloseHandle(connect);
-                WinHttpCloseHandle(session);
-                return {};
-            }
+    for (;;) {
+        // Reset every pass: a failed query must not leave the previous count behind and spin.
+        DWORD bytes_available = 0;
+        if (!WinHttpQueryDataAvailable(h.request, &bytes_available)) {
+            spdlog::error("WinHTTP: WinHttpQueryDataAvailable failed: {}", GetLastError());
+            return {};
         }
-    } while (bytes_available > 0);
-
-    WinHttpCloseHandle(request);
-    WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
+        if (bytes_available == 0)
+            break;
+        std::vector<char> buf(bytes_available);
+        DWORD bytes_read = 0;
+        if (!WinHttpReadData(h.request, buf.data(), bytes_available, &bytes_read)) {
+            spdlog::error("WinHTTP: WinHttpReadData failed: {}", GetLastError());
+            return {};
+        }
+        if (bytes_read == 0)
+            break;
+        response.append(buf.data(), bytes_read);
+        // Same cap as the POSIX client: an oversize reply is a failure (empty), not a
+        // reason to keep growing.
+        if (response.size() > kHttpMaxBody) {
+            spdlog::error("WinHTTP: response exceeds {} bytes, aborting", kHttpMaxBody);
+            return {};
+        }
+    }
 
     spdlog::info("WinHTTP: POST {} -> {} bytes", ::yuzu::log_key_token(url), response.size());
     return response;
@@ -713,7 +746,8 @@ constexpr std::size_t kMaxIdpUrlBytes = 2048;
 // and throws on a port that does not fit an int, so this keeps such values away from it. The
 // bracketed form takes hexadecimal digits and ':' only, the same class httplib's regex accepts
 // (a dotted IPv4-mapped form such as [::ffff:1.2.3.4] is refused here: httplib would otherwise
-// treat the whole string as a plain-http host name).
+// treat the whole string as a plain-http host name). The host is ASCII: an IDN is given as
+// punycode.
 bool authority_well_formed(std::string_view authority) {
     constexpr std::size_t kMaxHostBytes = 253;
     std::string_view host;
@@ -747,6 +781,12 @@ bool authority_well_formed(std::string_view authority) {
     }
     if (host.empty() || host.size() > kMaxHostBytes)
         return false;
+    // ASCII only: the egress pre-check resolves the name as UTF-8, while the Windows token POST
+    // widens each byte on its own, so a byte >= 0x80 could make the two ask for different names.
+    // An internationalized name is configured in its punycode (xn--) form.
+    for (const char c : host)
+        if (static_cast<unsigned char>(c) >= 0x80)
+            return false;
     if (has_port) {
         if (port.empty() || port.size() > 5)
             return false;
@@ -889,6 +929,10 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
         PADDRINFOEXW result{};
         HANDLE cancel{};
         std::wstring name;
+        Request() = default;
+        // Owns a HANDLE and a resolver-allocated list, and is referenced by the OS while pending.
+        Request(const Request&) = delete;
+        Request& operator=(const Request&) = delete;
         ~Request() {
             if (result != nullptr)
                 ::FreeAddrInfoExW(result);
@@ -919,12 +963,15 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
         if (::WaitForSingleObject(request->overlapped.hEvent,
                                   static_cast<DWORD>(timeout_sec) * 1000U) != WAIT_OBJECT_0) {
             ::GetAddrInfoExCancel(&request->cancel);
-            // The cancelled lookup still completes into `overlapped` and `result`; they must
+            // The canceled lookup still completes into `overlapped` and `result`; they must
             // outlive that completion. It follows a cancel promptly, so wait for it briefly; if it
             // does not arrive, LEAK the request (one small allocation) rather than free memory the
             // resolver may still write to.
-            if (::WaitForSingleObject(request->overlapped.hEvent, 5000) != WAIT_OBJECT_0)
+            if (::WaitForSingleObject(request->overlapped.hEvent, 5000) != WAIT_OBJECT_0) {
+                spdlog::warn("OIDC egress: the resolver did not acknowledge a canceled lookup; "
+                             "leaking one request");
                 (void)request.release();
+            }
             return false;
         }
         rc = ::GetAddrInfoExOverlappedResult(&request->overlapped);
@@ -934,12 +981,16 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
     // Walk the REAL list type: ADDRINFOEXW, whose ai_next sits after the blob fields.
     for (const ADDRINFOEXW* ai = request->result; ai != nullptr; ai = ai->ai_next) {
         ResolvedAddress address;
-        if (ai->ai_family == AF_INET && ai->ai_addr != nullptr) {
+        // ai_family names the sockaddr type ai_addr points at (the documented Winsock contract),
+        // and ai_addrlen is checked before the address bytes are read.
+        if (ai->ai_family == AF_INET && ai->ai_addr != nullptr &&
+            ai->ai_addrlen >= sizeof(sockaddr_in)) {
             address.family = AF_INET;
             std::memcpy(address.bytes.data(),
                         &reinterpret_cast<const sockaddr_in*>(ai->ai_addr)->sin_addr, 4);
             out.push_back(address);
-        } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr) {
+        } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr &&
+                   ai->ai_addrlen >= sizeof(sockaddr_in6)) {
             address.family = AF_INET6;
             std::memcpy(address.bytes.data(),
                         &reinterpret_cast<const sockaddr_in6*>(ai->ai_addr)->sin6_addr, 16);
@@ -962,16 +1013,23 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
         return false;
     struct Freer {
         struct addrinfo* p;
+        Freer(struct addrinfo* list) : p(list) {}
+        Freer(const Freer&) = delete;
+        Freer& operator=(const Freer&) = delete;
         ~Freer() { ::freeaddrinfo(p); }
     } freer{result};
     for (const struct addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
         ResolvedAddress address;
-        if (ai->ai_family == AF_INET && ai->ai_addr != nullptr) {
+        // ai_family names the sockaddr type ai_addr points at (the documented BSD sockets
+        // contract), and ai_addrlen is checked before the address bytes are read.
+        if (ai->ai_family == AF_INET && ai->ai_addr != nullptr &&
+            ai->ai_addrlen >= sizeof(sockaddr_in)) {
             address.family = AF_INET;
             std::memcpy(address.bytes.data(),
                         &reinterpret_cast<const sockaddr_in*>(ai->ai_addr)->sin_addr, 4);
             out.push_back(address);
-        } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr) {
+        } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr &&
+                   ai->ai_addrlen >= sizeof(sockaddr_in6)) {
             address.family = AF_INET6;
             std::memcpy(address.bytes.data(),
                         &reinterpret_cast<const sockaddr_in6*>(ai->ai_addr)->sin6_addr, 16);
@@ -1131,7 +1189,7 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
         // CONNECT moves on to the next permitted address (no request was sent, so a retry is
         // safe); any other outcome is final.
         const auto pins = vet_egress_target(target->host, config_.allow_private_networks,
-                                            target->cleartext, 10000);
+                                            target->cleartext, kHttpOperationTimeoutMs);
         if (!pins) {
             spdlog::error("OIDC token exchange: request refused: {}", pins.error());
             return std::unexpected(std::string("token endpoint request failed: ") + pins.error());
@@ -1577,6 +1635,11 @@ void OidcProvider::set_jwks_key_age_for_test(std::chrono::seconds age) {
     jwks_last_success_ = jwks_fetched_at_ - age;
 }
 
+void OidcProvider::age_jwks_keys_for_test(std::chrono::seconds more) {
+    std::lock_guard lock(jwks_mu_);
+    jwks_last_success_ -= more;
+}
+
 // ── Discovery (#5692) ────────────────────────────────────────────────────────
 
 namespace {
@@ -1704,10 +1767,13 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme,
 // and a SOCKET is a plain number that httplib closes and Windows may hand out again, so the
 // watchdog never keeps httplib's value. `adopt` takes a PRIVATE duplicate of the socket
 // (WSADuplicateSocketW + WSASocketW from the protocol info), a second handle on the same kernel
-// socket that only this object closes. Measured on Windows: shutdown() (SD_RECEIVE or SD_BOTH) on
-// the duplicate or on the original does NOT wake a thread blocked in select(), which is where
-// httplib waits during the handshake, but CancelIoEx() on the duplicate does (select() returns
-// WSAEINTR at once; 6 of 6 runs), without touching the connection.
+// socket that only this object closes. Measured on Windows in a standalone experiment with
+// select(): shutdown() (SD_RECEIVE or SD_BOTH) on the duplicate or on the original does NOT wake
+// the waiter, but CancelIoEx() on the duplicate does (select() returned WSAEINTR at once; 6 of 6
+// runs), without touching the connection. That experiment is not the evidence for this class:
+// httplib 0.37.1 waits with WSAPoll on Windows (httplib.h poll_wrapper, behind select_impl and
+// wait_until_socket_is_ready), not select(). The evidence that the cut ends a stalled handshake
+// through httplib's real wait is the end-to-end Windows drip test (test_oidc_provider.cpp).
 #ifndef _WIN32
 class RequestDeadlineWatchdog {
 public:
@@ -1812,8 +1878,11 @@ private:
 // The cut is CancelIoEx() on the duplicate plus shutdown(SD_BOTH). Neither persists on a socket
 // that is not connected yet, so the 50 ms re-issue is what cuts a connect that completes after the
 // deadline. If the cancel did not release the request after 10 re-issues (500 ms), the duplicate
-// is closed with SO_LINGER {1, 0}, an abortive close that resets the connection (measured: wakes
-// select() as readable). Only the duplicate is ever closed here, never httplib's own SOCKET.
+// is closed with SO_LINGER {1, 0}, an abortive close that resets the connection (measured with
+// select(): wakes it as readable). The escalation count restarts for each duplicate `adopt`
+// installs, so a candidate socket taken after an escalation can escalate too, and once the
+// duplicate is gone later ticks have nothing to cut. Only the duplicate is ever closed here,
+// never httplib's own SOCKET.
 class RequestDeadlineWatchdog {
 public:
     explicit RequestDeadlineWatchdog(std::chrono::milliseconds budget)
@@ -1862,6 +1931,7 @@ public:
             return;
         }
         dup_.reset(dup);
+        cuts_ = 0; // a new socket gets its own escalation count
         if (expired_)
             cut_locked();
     }
@@ -1881,17 +1951,19 @@ private:
         }
     };
 
-    // Under `mu_`. Cancels what the request thread is waiting on (select(), recv()) and shuts the
-    // connection down; escalates to an abortive close of the duplicate if that did not end it.
+    // Under `mu_`. Cancels what the request thread is waiting on (the poll wait, recv()) and shuts
+    // the connection down; escalates to an abortive close of the duplicate if that did not end it.
     void cut_locked() noexcept {
         if (dup_.s == INVALID_SOCKET)
             return;
+        // A SOCKET made by WSASocketW (here, from the duplicated protocol info) is an IFS handle on
+        // the supported Windows versions, so it is a valid HANDLE for CancelIoEx.
         ::CancelIoEx(reinterpret_cast<HANDLE>(dup_.s), nullptr);
         ::shutdown(dup_.s, SD_BOTH);
         if (++cuts_ == kEscalateAfterCuts) {
-            linger abort{1, 0};
-            ::setsockopt(dup_.s, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&abort),
-                         sizeof(abort));
+            linger reset_on_close{1, 0};
+            ::setsockopt(dup_.s, SOL_SOCKET, SO_LINGER,
+                         reinterpret_cast<const char*>(&reset_on_close), sizeof(reset_on_close));
             dup_.reset(); // closesocket(): RST for the connection; httplib's own SOCKET is
                           // untouched
         }
@@ -2203,14 +2275,19 @@ OidcProvider::OidcProvider(OidcConfig config) : config_(std::move(config)) {
     namespace egress = ::yuzu::server::oidc::egress;
     if (const auto url = split_http_url(config_.issuer)) {
         const auto literal = egress::classify_literal(url->host);
-        if (literal &&
-            egress::decision(*literal, config_.allow_private_networks) != egress::Verdict::Allow) {
-            const bool flag_helps = egress::decision(*literal, true) == egress::Verdict::Allow;
+        // The scheme matters: plain http to a public address is refused whatever the switch says.
+        const bool cleartext = url->cleartext;
+        if (literal && egress::decision(*literal, config_.allow_private_networks, cleartext) !=
+                           egress::Verdict::Allow) {
+            const bool flag_helps =
+                egress::decision(*literal, true, cleartext) == egress::Verdict::Allow;
             spdlog::warn("OIDC egress: the issuer host of {} is an IP address in a refused class "
                          "({}); every OIDC request to it will be refused{}",
                          ::yuzu::log_key_token(config_.issuer), egress::class_name(*literal),
                          flag_helps ? " unless the server runs with --oidc-allow-private-networks"
-                                    : " (this class is never allowed)");
+                         : (cleartext && *literal == egress::AddressClass::Public)
+                             ? " (plain http to a public address is never allowed; use https)"
+                             : " (this class is never allowed)");
         }
         // A plain-http issuer sends the JWKS (the ID token signature trust root) and the client
         // secret in the clear; fine for a loopback lab, an authentication bypass on a network an
