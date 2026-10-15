@@ -1,0 +1,13 @@
+# DEX Applications stability read model Resource Ledger (governance Gate 1)
+
+Production-code ledger for the Applications stability read and the cohort-floor change, kept here so the ownership analysis is retrievable with the change. Files: `server/core/src/guaranteed_state_store.{hpp,cpp}` (`dex_app_stability_checked`), `dex_read_model.{hpp,cpp}`, `dex_json_detail.hpp`, `dex_types.hpp`, `dex_api.{hpp,cpp}`, `dex_api_local.hpp`, and the REST and MCP handlers in `rest_api_v1.cpp` and `mcp_server.cpp`; the floor value in `dex_perf_model.hpp` and its consumers.
+
+## Resource Ledger (C++)
+- New store read: `GuaranteedStateStore::dex_app_stability_checked` runs through the existing `dex_read_checked` helper: one bounded pooled lease, one statement, released on every path by the helper; the result is a `pg::PgResult` (move-only RAII owner over `PGresult`), read only while alive and copied into value types (`std::string`, `int64_t` through the existing null-safe `strtoll` helper) before return. The only early return between acquire and release is the `status != PGRES_TUPLES_OK` branch, which returns `std::nullopt` (a typed failure), never an empty list.
+- Static state: one function-local `static DegradeSampler` (two relaxed atomics), the same per-call-site pattern as the sibling reads; thread-safe initialisation.
+- No new file descriptor, HANDLE, SOCKET, `FILE*`, sqlite object, OpenSSL object, BCrypt handle, allocated C string, mapped library, temp-file path, subprocess, shell string, thread, lock or retained callback is acquired, owned or released.
+- `DexScorePolicyFn` is a `std::function` held by value by `LocalDexApi` (non-copyable), called once per `apps()` request; the returned policy is a by-value `DexScorePolicy` bound to a `const&` that lives to the end of the full expression. The shutdown ordering is unchanged: `web_server_->stop()` joins the web thread before the store is destroyed, so no handler can reach the API after it dies; the captures of `fleet_fn` and `policy_fn` are subject to the same ordering.
+- Model assembly (`dex_apps_model_from_rows`) is pure: a local `std::map` of positions into the result vector, used only before the sorts, no references kept across the reorder.
+- Integer hazards: counts are non-negative `int64_t` from `COUNT`/`SUM(...)::bigint` (an overflow in SQL errors and degrades the read); the one in-process sum (`crashes + hangs`) is guarded by a non-negative check and cannot overflow from SQL-produced values.
+- Floor change: `kDexCohortFloor` is only used in comparisons; nothing divides by it or subtracts it.
+- Tests (harness only): memory-only fixtures and ephemeral Postgres databases cloned from a template; PG-gated cases skip without a DSN; no sleeps, no process spawns.
