@@ -274,7 +274,7 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
         if (std::holds_alternative<Unavailable>(d.revoke_detail))
             detail = "(unavailable)";
         else if (std::holds_alternative<Withheld>(d.revoke_detail))
-            detail = "(withheld: needs the AuditLog:Read permission)";
+            detail = "(withheld: needs the AuditLog:Read permission, or it could not be confirmed)";
         else if (const auto& s = std::get<std::string>(d.revoke_detail); !s.empty())
             detail = esc(s);
         if (d.revoke_truncated) {

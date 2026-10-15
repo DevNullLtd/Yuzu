@@ -223,7 +223,7 @@ TEST_CASE("tokens page authz: a plain user with RBAC off sees only their own tok
     CHECK(r.denied_rows() == 0);
 }
 
-TEST_CASE("tokens page authz: RBAC on, ApiTokenManager sees own tokens only (the filter follows "
+TEST_CASE("tokens page authz: RBAC on and ApiTokenManager sees own tokens only (the filter follows "
           "the account role, not the grant)",
           "[pg][access-tokens][authz]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
@@ -245,7 +245,7 @@ TEST_CASE("tokens page authz: RBAC on, ApiTokenManager sees own tokens only (the
     CHECK(r.principal_reads == 0);
 }
 
-TEST_CASE("principals authz: RBAC on, an account administrator WITHOUT EnginePrincipal:Read is "
+TEST_CASE("principals authz: RBAC on and an account administrator WITHOUT EnginePrincipal:Read is "
           "refused before any read (the REST twin's decision)",
           "[pg][access-tokens][authz]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
@@ -262,8 +262,8 @@ TEST_CASE("principals authz: RBAC on, an account administrator WITHOUT EnginePri
     CHECK(r.denied_rows() == 0);
 }
 
-TEST_CASE("principals authz: RBAC on, a non-administrator holding EnginePrincipal:Read is admitted "
-          "and, lacking AuditLog:Read, told not to run the REST check",
+TEST_CASE("principals authz: RBAC on and a non-administrator holding EnginePrincipal:Read is admitted "
+          "and told not to run the REST check without AuditLog:Read",
           "[pg][access-tokens][authz]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
     Rig r{db_.dsn()};
@@ -282,7 +282,7 @@ TEST_CASE("principals authz: RBAC on, a non-administrator holding EnginePrincipa
     CHECK(r.denied_rows() == 0);
 }
 
-TEST_CASE("tokens page authz: RBAC on, a user with no ApiToken:Read is refused with no token read "
+TEST_CASE("tokens page authz: RBAC on and a user with no ApiToken:Read is refused with no token read "
           "and no denial row",
           "[pg][access-tokens][authz]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
@@ -346,5 +346,20 @@ TEST_CASE("users page authz: a refused cookie session leaves no denial row; a re
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(r.user_reads == 1);
+    CHECK(r.denied_rows() == 1);
+}
+
+TEST_CASE("principals authz: a plain API-token bearer is refused by the real gate and keeps its denial row",
+          "[pg][access-tokens][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    // RBAC off: EnginePrincipal:Read is floored to administrators. A non-administrator's token is
+    // not a browser session, so the quiet probe does not withhold its denial row.
+    auto raw = r.api_tokens->create_token("alice-api", "alice", now_epoch() + 3600);
+    REQUIRE(raw.has_value());
+    const auto res = r.get_bearer(kPrincipals, *raw);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(r.principal_reads == 0);
     CHECK(r.denied_rows() == 1);
 }

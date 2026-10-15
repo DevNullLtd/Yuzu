@@ -364,7 +364,10 @@ counted in `yuzu_auth_topology_floor_denied_total{permission}`, separate
 > auditing permission gate. An ordinary non-admin call therefore increments this counter and writes
 > an `auth.permission_required` `denied` row for a permission the caller never asked for. Until
 > #2829 lands, do **not** alert on this counter alone as evidence of someone probing the
-> authorization topology — correlate with the route in the audit row first.
+> authorization topology — correlate with the route in the audit row first. The Access
+> principals fragments (`/fragments/access/principals/*`) are a further source: they probe
+> `EnginePrincipal:Read` on every page view, a floored refusal moves this counter, and for a
+> browser session no audit row accompanies the increment.
 from an ordinary legacy-fallback denial, so a spike in floored denials is
 visible without grepping audit-log text.
 

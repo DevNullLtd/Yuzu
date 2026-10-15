@@ -69,7 +69,7 @@ struct Harness {
     // gates
     bool perm_allow{true};
     std::set<std::string> perm_deny;  // "Securable:Op" refused even when perm_allow
-    int deny_status{403};             // status a refusal writes (503 = degraded RBAC read)
+    int revoke_calls{0};
     std::vector<std::pair<std::string, std::string>> perm_calls;
     // audit
     bool audit_ok{true};
@@ -111,7 +111,7 @@ struct Harness {
             perm_calls.emplace_back(t, o);
             if (perm_allow && !perm_deny.contains(t + ":" + o))
                 return true;
-            res.status = deny_status;
+            res.status = 403;
             res.set_content(kDenyBody, "application/json");
             return false;
         };
@@ -138,7 +138,10 @@ struct Harness {
         };
         d.active_credentials_fn = [this](const std::string&) { return creds; };
         d.principal_roles_fn = [this](const std::string&) { return roles; };
-        d.revoke_detail_fn = [this](const std::string&) { return revoke_detail; };
+        d.revoke_detail_fn = [this](const std::string&) {
+            ++revoke_calls;
+            return revoke_detail;
+        };
         return d;
     }
     void wire() { access_tokens::register_access_tokens_routes(sink, deps()); }
@@ -517,19 +520,14 @@ TEST_CASE("principals routes: the audit trail's text and the REST check need Aud
     auto res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("withheld: needs the AuditLog:Read permission"));
+    CHECK_THAT(res->body, ContainsSubstring("withheld: needs the AuditLog:Read permission, or it could not be confirmed"));
     CHECK_THAT(res->body, !ContainsSubstring("operator typed reason"));
     // ... and the list tells the script not to call the loud REST check.
     res = h.sink.dispatch("GET", "/fragments/access/principals/list");
     REQUIRE(res);
     CHECK_THAT(res->body, ContainsSubstring("data-check=\"0\""));
 
-    // A degraded RBAC read is "unavailable", never worded as a missing permission.
-    h.deny_status = 503;
-    res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
-    REQUIRE(res);
-    CHECK_THAT(res->body, ContainsSubstring("(unavailable)"));
-    CHECK_THAT(res->body, !ContainsSubstring("withheld"));
+    CHECK(h.revoke_calls == 0);  // the audit store is not asked at all
 
     h.perm_deny.clear();
     res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
@@ -576,6 +574,9 @@ TEST_CASE("tokens routes: server.cpp binds the quiet probe, rbac view and checke
     CHECK_THAT(blk, ContainsSubstring("list_all_principal_roles_checked()"));
     CHECK_THAT(blk, ContainsSubstring("get_principal_roles_checked(\"engine\", id)"));
     CHECK_THAT(text.substr(end, 1500), ContainsSubstring("revoke_detail_from(std::move(*events))"));
+    // One row past the window, or `truncated` could never be set (the 201/200 boundary).
+    CHECK_THAT(text.substr(end, 1500),
+               ContainsSubstring("q.limit = yuzu::server::access_tokens::kRevokeHistoryQueryLimit"));
 }
 
 // The fragments are swapped into #tokens-body / #principals-body, so their header and body are

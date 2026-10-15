@@ -5,6 +5,7 @@
 #include "access_tokens_render.hpp"
 #include "access_tokens_ui.hpp"
 #include "http_route_sink.hpp"
+#include "rest_a4_envelope_http.hpp"
 #include "rest_audit.hpp"
 
 #include <spdlog/spdlog.h>
@@ -23,15 +24,12 @@ namespace access_tokens {
 namespace {
 
 // A scratch probe of `securable:Read`: the page asks "may this caller see X" to decide what to
-// draw; a refusal is not an error and writes no response. A 503 (the RBAC read degraded) is
-// reported apart from a refusal so it is never worded as a missing permission.
-enum class Probe { Allowed, Refused, Unavailable };
-
-Probe probe_read(const Deps& d, const httplib::Request& req, const char* securable) {
+// draw; a refusal is not an error and writes no response. For a browser session the real gate
+// answers a degraded RBAC read with the same 403 as a missing grant, so "no" below means "no
+// grant, or the grant could not be confirmed"; the wording says both.
+bool may_read(const Deps& d, const httplib::Request& req, const char* securable) {
     httplib::Response scratch;
-    if (d.perm_fn(req, scratch, securable, "Read"))
-        return Probe::Allowed;
-    return scratch.status == 503 ? Probe::Unavailable : Probe::Refused;
+    return d.perm_fn(req, scratch, securable, "Read");
 }
 
 constexpr const char* kHtml = "text/html; charset=utf-8";
@@ -53,7 +51,7 @@ bool deny_engine_session(const Deps& d, const auth::Session& s, const httplib::R
                                         engine ? "engine_session_denied" : "mcp_session_denied");
     res.status = 403;
     res.set_header("Cache-Control", "no-store");
-    res.set_content(R"({"error":{"code":403,"message":"this credential cannot access this endpoint"}})",
+    res.set_content(detail::a4_denial(res, 403, "this credential cannot access this endpoint"),
                     "application/json");
     return true;
 }
@@ -135,7 +133,7 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  }
                  PrincipalsView view;
-                 view.can_run_check = probe_read(deps, req, "AuditLog") == Probe::Allowed;
+                 view.can_run_check = may_read(deps, req, "AuditLog");
                  view.rows = std::move(*rows);
                  // The store returns oldest first; the cap banner promises the newest.
                  std::ranges::reverse(view.rows);
@@ -197,11 +195,8 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                  d.revoke_detail = std::string{};
                  if (d.row.lifecycle_state != "active") {
                      // The free text is the audit trail's: AuditLog:Read, as GET /api/v1/audit.
-                     if (const auto audit = probe_read(deps, req, "AuditLog"); audit != Probe::Allowed) {
-                         if (audit == Probe::Unavailable)
-                             d.revoke_detail = Unavailable{};
-                         else
-                             d.revoke_detail = Withheld{};
+                     if (!may_read(deps, req, "AuditLog")) {
+                         d.revoke_detail = Withheld{};
                      } else if (auto rd = deps.revoke_detail_fn(id); rd) {
                          d.revoke_detail = std::move(rd->text);
                          d.revoke_truncated = rd->truncated;

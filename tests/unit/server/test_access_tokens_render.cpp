@@ -238,7 +238,7 @@ TEST_CASE("principal detail: states and revoked block", "[access-tokens][render]
     // Withheld is its own state (never "not recorded"); it hides the text it was handed.
     d.revoke_detail = Withheld{};
     html = render_principal_detail(d, d.row.principal_id);
-    CHECK_THAT(html, ContainsSubstring("withheld: needs the AuditLog:Read permission"));
+    CHECK_THAT(html, ContainsSubstring("withheld: needs the AuditLog:Read permission, or it could not be confirmed"));
     CHECK_THAT(html, !ContainsSubstring("(not recorded)"));
     CHECK_THAT(html, !ContainsSubstring("oldest success"));
 

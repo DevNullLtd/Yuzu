@@ -133,7 +133,7 @@
       var n = root ? root.dataset.count : '';
       if (n === '' || n === undefined) { setNote([]); return; }
       if (root.dataset.check === '1') checkNoAdmin(n);
-      else setNote([noteBox('Running the no-administrator check needs the AuditLog:Read permission.')]);
+      else setNote([noteBox('Running the no-administrator check needs the AuditLog:Read permission, or it could not be confirmed.')]);
     }
   });
 
