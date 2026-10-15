@@ -156,7 +156,9 @@ TEST_CASE("OIDC egress: a name is resolved, every answer classified, and the con
         ResolverGuard resolver([](const std::string&) -> std::vector<std::string> {
             return {"::1", "127.0.0.1"}; // the mock IdP listens on 127.0.0.1 only
         });
-        auto doc = OidcProvider::fetch_discovery_document(issuer, false, true, 2000);
+        // Windows takes about 2 s to refuse a connect to a closed loopback port, so the first
+        // address alone can use a 2 s budget; give the section room for the second address.
+        auto doc = OidcProvider::fetch_discovery_document(issuer, false, true, 10000);
         REQUIRE(doc.has_value());
         CHECK(idp.discovery_calls.load() == 1);
     }

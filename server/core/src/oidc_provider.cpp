@@ -1521,7 +1521,10 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme,
 // and a SOCKET is a plain number that httplib closes and Windows may hand out again, so the
 // watchdog never keeps httplib's value. `adopt` takes a PRIVATE duplicate of the socket
 // (WSADuplicateSocketW + WSASocketW from the protocol info), a second handle on the same kernel
-// socket that only this object closes, and shutdown() on it acts on the socket httplib is using.
+// socket that only this object closes. Measured on Windows: shutdown() (SD_RECEIVE or SD_BOTH) on
+// the duplicate or on the original does NOT wake a thread blocked in select(), which is where
+// httplib waits during the handshake, but CancelIoEx() on the duplicate does (select() returns
+// WSAEINTR at once; 6 of 6 runs), without touching the connection.
 #ifndef _WIN32
 class RequestDeadlineWatchdog {
 public:
@@ -1623,9 +1626,11 @@ private:
 // up front (a handle, not a descriptor-table slot, is what a duplicate costs), so `reserved()` is
 // always true and a duplicate that cannot be taken sets `failed()`: the caller refuses the answer
 // with the same fixed error as the POSIX dup2 failure. Windows has no SIGPIPE, so SD_BOTH is safe.
-// shutdown() of a socket that is not connected yet fails with WSAENOTCONN and is assumed not to
-// persist (unmeasured), so the 50 ms re-issue is what cuts a connect that completes after the
-// deadline.
+// The cut is CancelIoEx() on the duplicate plus shutdown(SD_BOTH). Neither persists on a socket
+// that is not connected yet, so the 50 ms re-issue is what cuts a connect that completes after the
+// deadline. If the cancel did not release the request after 10 re-issues (500 ms), the duplicate
+// is closed with SO_LINGER {1, 0}, an abortive close that resets the connection (measured: wakes
+// select() as readable). Only the duplicate is ever closed here, never httplib's own SOCKET.
 class RequestDeadlineWatchdog {
 public:
     explicit RequestDeadlineWatchdog(std::chrono::milliseconds budget)
@@ -1675,7 +1680,7 @@ public:
         }
         dup_.reset(dup);
         if (expired_)
-            ::shutdown(dup_.s, SD_BOTH);
+            cut_locked();
     }
 
 private:
@@ -1693,6 +1698,22 @@ private:
         }
     };
 
+    // Under `mu_`. Cancels what the request thread is waiting on (select(), recv()) and shuts the
+    // connection down; escalates to an abortive close of the duplicate if that did not end it.
+    void cut_locked() noexcept {
+        if (dup_.s == INVALID_SOCKET)
+            return;
+        ::CancelIoEx(reinterpret_cast<HANDLE>(dup_.s), nullptr);
+        ::shutdown(dup_.s, SD_BOTH);
+        if (++cuts_ == kEscalateAfterCuts) {
+            linger abort{1, 0};
+            ::setsockopt(dup_.s, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&abort),
+                         sizeof(abort));
+            dup_.reset(); // closesocket(): RST for the connection; httplib's own SOCKET is
+                          // untouched
+        }
+    }
+
     void run() {
         using namespace std::chrono_literals;
         std::unique_lock lock(mu_);
@@ -1700,16 +1721,18 @@ private:
             return; // the request finished first
         expired_ = true;
         do {
-            if (dup_.s != INVALID_SOCKET)
-                ::shutdown(dup_.s, SD_BOTH);
+            cut_locked();
         } while (!cv_.wait_for(lock, 50ms, [this] { return done_; }));
     }
+
+    static constexpr int kEscalateAfterCuts = 10;
 
     mutable std::mutex mu_;
     std::condition_variable cv_;
     bool done_{false};
     bool expired_{false};
     bool failed_{false};
+    int cuts_{0};
     const std::chrono::steady_clock::time_point deadline_;
     OwnedSocket dup_;
     std::thread thread_; // last: starts running once every member above exists
