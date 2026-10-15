@@ -1,18 +1,21 @@
 /**
  * @file test_access_tokens_authz.cpp
- * @brief [pg] persona matrix for the Tokens and principals page, driven through the REAL
- *        AuthRoutes gates (require_auth / require_admin / require_permission) over a real
+ * @brief [pg] persona matrix for the Access pages (Tokens and principals; Users), driven through
+ *        the REAL AuthRoutes gates (require_auth / probe_admin / probe_permission) over a real
  *        RbacStore, ApiTokenStore and AuditStore. test_access_tokens_routes.cpp stubs the
  *        gates; this file is what proves the wiring admits and refuses the right callers.
  *
  * Personas (cookie sessions unless stated): Administrator (RBAC off), plain user (RBAC off),
- * RBAC-on user holding ApiTokenManager, RBAC-on user holding nothing, an administrator's
- * MCP-tier bearer. For each: the token filter actually applied, whether the principal list
- * is admitted, and the denied-access rows written.
+ * RBAC-on user holding ApiTokenManager, RBAC-on user holding nothing, RBAC-on account
+ * administrator WITHOUT EnginePrincipal:Read, RBAC-on non-administrator WITH it (Viewer), an
+ * administrator's MCP-tier bearer. For each: the token filter actually applied, whether the
+ * principal list is admitted (EnginePrincipal:Read, as the REST twin), and the denied-access
+ * rows written (none for a refused cookie session: the panels auto-load).
  *
  * Needs YUZU_TEST_POSTGRES_DSN (SKIPs without it); run serially.
  */
 
+#include "access_routes.hpp"
 #include "access_tokens_routes.hpp"
 #include "audit_store.hpp"
 #include "auth_routes.hpp"
@@ -70,6 +73,7 @@ struct Rig {
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     std::unique_ptr<AuthRoutes> ar;
     int principal_reads{0};
+    int user_reads{0};
     yuzu::server::test::TestRouteSink sink;  // LAST: handlers capture `this`
 
     explicit Rig(const std::string& dsn)
@@ -93,11 +97,8 @@ struct Rig {
         d.auth_fn = [this](const httplib::Request& q, httplib::Response& r) {
             return ar->require_auth(q, r);
         };
-        d.admin_fn = [this](const httplib::Request& q, httplib::Response& r) {
-            return ar->require_admin(q, r);
-        };
         d.perm_fn = [this](const httplib::Request& q, httplib::Response& r, const std::string& t,
-                           const std::string& o) { return ar->require_permission(q, r, t, o); };
+                           const std::string& o) { return ar->probe_permission(q, r, t, o); };
         d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
                         const std::string&, const std::string&, const std::string&) { return true; };
         d.rbac_enforced_fn = [this] { return rbac_enforcement_in_effect(&rbac); };
@@ -121,10 +122,27 @@ struct Rig {
         d.principal_roles_fn = [](const std::string&) -> std::expected<std::vector<PrincipalRole>, std::string> {
             return std::vector<PrincipalRole>{};
         };
-        d.revoke_detail_fn = [](const std::string&) -> std::expected<std::string, std::string> {
-            return std::string{};
+        d.revoke_detail_fn = [](const std::string&) -> std::expected<access_tokens::RevokeDetail, std::string> {
+            return access_tokens::RevokeDetail{};
         };
         access_tokens::register_access_tokens_routes(sink, std::move(d));
+
+        access::Deps u;
+        u.auth_fn = [this](const httplib::Request& q, httplib::Response& r) {
+            return ar->require_auth(q, r);
+        };
+        u.admin_fn = [this](const httplib::Request& q, httplib::Response& r) {
+            return ar->probe_admin(q, r);
+        };
+        u.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&) { return true; };  // unused by the Users routes
+        u.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                        const std::string&, const std::string&, const std::string&) { return true; };
+        u.list_users_fn = [this]() -> std::expected<std::vector<auth::UserEntry>, std::string> {
+            ++user_reads;
+            return std::vector<auth::UserEntry>{};
+        };
+        access::register_access_routes(sink, std::move(u));
     }
 
     std::unique_ptr<httplib::Response> get_cookie(const std::string& path, const std::string& token) {
@@ -169,18 +187,18 @@ TEST_CASE("tokens page authz: Administrator with RBAC off sees every owner and t
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(r.principal_reads == 1);
+    CHECK_THAT(res->body, ContainsSubstring("data-check=\"1\""));  // holds AuditLog:Read
     CHECK(r.denied_rows() == 0);
 }
 
 TEST_CASE("tokens page authz: a plain user with RBAC off sees only their own tokens and is "
-          "refused the principals with one audited denial",
+          "refused the principals with no audit row",
           "[pg][access-tokens][authz]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
     Rig r{db_.dsn()};
     const auto cookie = r.auth_mgr.create_local_session_for_test("alice", auth::Role::user, true);
 
-    // Opening the page and loading the token list writes no denied row: the principals are
-    // never requested for this caller (the page script keys on data-effective-admin).
+    // Opening the page and loading the token list writes no denied row.
     auto res = r.get_cookie("/access/tokens", cookie);
     REQUIRE(res);
     CHECK(res->status == 200);
@@ -193,14 +211,16 @@ TEST_CASE("tokens page authz: a plain user with RBAC off sees only their own tok
     CHECK_THAT(res->body, ContainsSubstring("data-effective-admin=\"0\""));
     CHECK(r.denied_rows() == 0);
 
-    // A hand-crafted request is refused by the loud gate, before any read.
+    // The page loads the principals panel for everyone: the gate (EnginePrincipal:Read, floored
+    // to administrators with RBAC off) refuses before any read, and a refused cookie session
+    // leaves no denial row because the panel auto-loads.
     for (const char* p : {kPrincipals, kDetail}) {
         res = r.get_cookie(p, cookie);
         REQUIRE(res);
         CHECK(res->status == 403);
     }
     CHECK(r.principal_reads == 0);
-    CHECK(r.denied_rows() == 2);
+    CHECK(r.denied_rows() == 0);
 }
 
 TEST_CASE("tokens page authz: RBAC on, ApiTokenManager sees own tokens only (the filter follows "
@@ -221,12 +241,49 @@ TEST_CASE("tokens page authz: RBAC on, ApiTokenManager sees own tokens only (the
 
     res = r.get_cookie(kPrincipals, cookie);
     REQUIRE(res);
-    CHECK(res->status == 403);  // admin_fn, not EnginePrincipal:Read: grants do not admit
+    CHECK(res->status == 403);  // ApiTokenManager carries no EnginePrincipal:Read
     CHECK(r.principal_reads == 0);
 }
 
-TEST_CASE("tokens page authz: RBAC on, a user with no ApiToken:Read gets the loud denial and no "
-          "token read",
+TEST_CASE("principals authz: RBAC on, an account administrator WITHOUT EnginePrincipal:Read is "
+          "refused before any read (the REST twin's decision)",
+          "[pg][access-tokens][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    const auto cookie = r.auth_mgr.create_local_session_for_test("root", auth::Role::admin, true);
+
+    for (const char* p : {kPrincipals, kDetail}) {
+        const auto res = r.get_cookie(p, cookie);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    CHECK(r.principal_reads == 0);
+    CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("principals authz: RBAC on, a non-administrator holding EnginePrincipal:Read is admitted "
+          "and, lacking AuditLog:Read, told not to run the REST check",
+          "[pg][access-tokens][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    // Seeded Viewer holds EnginePrincipal:Read; give a role with that only, to isolate it.
+    REQUIRE(r.rbac.create_role({"PrincipalReader", "reads engine principals", false}).has_value());
+    REQUIRE(r.rbac.set_permission({"PrincipalReader", "EnginePrincipal", "Read", "allow"}).has_value());
+    REQUIRE(r.rbac.assign_role({"user", "alice", "PrincipalReader"}).has_value());
+    const auto cookie = r.auth_mgr.create_local_session_for_test("alice", auth::Role::user, true);
+
+    auto res = r.get_cookie(kPrincipals, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(r.principal_reads == 1);
+    CHECK_THAT(res->body, ContainsSubstring("data-check=\"0\""));  // no AuditLog:Read
+    CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("tokens page authz: RBAC on, a user with no ApiToken:Read is refused with no token read "
+          "and no denial row",
           "[pg][access-tokens][authz]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
     Rig r{db_.dsn()};
@@ -237,7 +294,7 @@ TEST_CASE("tokens page authz: RBAC on, a user with no ApiToken:Read gets the lou
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK_THAT(res->body, !ContainsSubstring("bob-ci"));
-    CHECK(r.denied_rows() == 1);
+    CHECK(r.denied_rows() == 0);  // the panel auto-loads: a refused cookie session is not audited
 }
 
 TEST_CASE("tokens page authz: an administrator's MCP-tier bearer gets own tokens only and no "
@@ -259,6 +316,35 @@ TEST_CASE("tokens page authz: an administrator's MCP-tier bearer gets own tokens
 
     res = r.get_bearer(kPrincipals, *raw);
     REQUIRE(res);
-    CHECK(res->status == 403);  // require_admin refuses every mcp_tier token
+    CHECK(res->status == 403);  // never an MCP-tier bearer, whatever the grant
     CHECK(r.principal_reads == 0);
+}
+
+TEST_CASE("users page authz: a refused cookie session leaves no denial row; a refused token does",
+          "[pg][access][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    constexpr const char* kUsers = "/fragments/access/users/list";
+
+    const auto alice = r.auth_mgr.create_local_session_for_test("alice", auth::Role::user, true);
+    auto res = r.get_cookie(kUsers, alice);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(r.user_reads == 0);
+    CHECK(r.denied_rows() == 0);
+
+    const auto root = r.auth_mgr.create_local_session_for_test("root", auth::Role::admin, true);
+    res = r.get_cookie(kUsers, root);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(r.user_reads == 1);
+
+    // An administrator's MCP-tier bearer is refused by the admin gate and keeps its denial row.
+    auto raw = r.api_tokens->create_token("root-mcp", "root", now_epoch() + 3600, "", "readonly");
+    REQUIRE(raw.has_value());
+    res = r.get_bearer(kUsers, *raw);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(r.user_reads == 1);
+    CHECK(r.denied_rows() == 1);
 }

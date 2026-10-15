@@ -42,9 +42,9 @@ extern const char* const kAccessTokensTemplate =
       <section class="panel" id="panel-principals">
         <div class="hd"><h2>Engine principals</h2></div>
         <div id="principals-note" class="strip" role="status" aria-live="polite"></div>
-        <div id="principals-body"
+        <div id="principals-body" hx-get="/fragments/access/principals/list" hx-trigger="load" hx-swap="innerHTML"
              data-src="/fragments/access/principals/list"
-             data-denied="Engine principals need the Administrator account role."
+             data-denied="Engine principals need the EnginePrincipal:Read permission."
              data-unavailable="The principal store did not answer, so the list is unknown. This is not an empty list.">
           <div class="pb"><p class="hint">Loading...</p></div>
         </div>
@@ -52,7 +52,7 @@ extern const char* const kAccessTokensTemplate =
     </div>
     <div class="side2" id="side-principal"
          data-src="/fragments/access/principals/detail"
-         data-denied="Engine principals need the Administrator account role."
+         data-denied="Engine principals need the EnginePrincipal:Read permission."
          data-unavailable="This principal could not be read.">
       <section class="panel"><div class="empty"><b>No principal selected.</b><span>Select a principal from the list.</span></div></section>
     </div>

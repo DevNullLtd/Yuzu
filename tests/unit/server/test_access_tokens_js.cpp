@@ -72,15 +72,16 @@ TEST_CASE("tokens glue: every URL sink takes a fixed path, and data reaches it o
     // Retry re-sends the remembered id, also encoded; the filter is the clamped literal.
     CHECK_THAT(js, ContainsSubstring("'?id=' + encodeURIComponent(lastPrincipalId)"));
     CHECK_THAT(js, ContainsSubstring("TOKENS + '?state=' + tokensState"));
-    // A failed token list must not be reported as "you lack the administrator role".
-    CHECK_THAT(js, ContainsSubstring("if (!root) {"));
 }
 
-TEST_CASE("tokens glue: principals are requested only for an effective administrator",
+TEST_CASE("tokens glue: panels load independently and the REST check is keyed on the server",
           "[access-tokens][js]") {
     const std::string& js = yuzu::server::kYuzuTokensJs;
-    CHECK_THAT(js, ContainsSubstring("dataset.effectiveAdmin === '1'"));
-    CHECK_THAT(js, ContainsSubstring("principalsAsked"));
+    // The no-admin REST route's own gate is loud: only call it when the fragment says the caller
+    // holds AuditLog:Read. No panel waits on another.
+    CHECK_THAT(js, ContainsSubstring("root.dataset.check === '1'"));
+    CHECK_THAT(js, !ContainsSubstring("effectiveAdmin"));
+    CHECK_THAT(js, !ContainsSubstring("principalsAsked"));
     // Ids reach a URL only through encodeURIComponent.
     CHECK_THAT(js, ContainsSubstring("encodeURIComponent(id)"));
     // The error handlers are keyed on the panel's own data attributes and send 401 to login.
@@ -132,7 +133,8 @@ TEST_CASE("tokens page: the template's sentences are byte-equal to the renderer'
     CHECK_THAT(t, ContainsSubstring("data-denied=\"" + std::string(kPrincipalsDenied) + "\""));
     CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kPrincipalsUnavailable) + "\""));
     CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kDetailUnavailable) + "\""));
-    // Principals and the detail panel are NOT load-triggered: the script asks only for admins.
+    // The token and principal lists load on their own; the detail panel only on selection.
     CHECK_THAT(t, ContainsSubstring("hx-get=\"/fragments/access/tokens/list\" hx-trigger=\"load\""));
-    CHECK_THAT(t, !ContainsSubstring("hx-get=\"/fragments/access/principals"));
+    CHECK_THAT(t, ContainsSubstring("hx-get=\"/fragments/access/principals/list\" hx-trigger=\"load\""));
+    CHECK_THAT(t, !ContainsSubstring("hx-get=\"/fragments/access/principals/detail"));
 }

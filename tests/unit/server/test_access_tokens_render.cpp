@@ -234,6 +234,31 @@ TEST_CASE("principal detail: states and revoked block", "[access-tokens][render]
     CHECK_THAT(render_principal_detail(d, d.row.principal_id), ContainsSubstring("(not recorded)"));
     d.revoke_detail = Unavailable{};
     CHECK_THAT(render_principal_detail(d, d.row.principal_id), ContainsSubstring("(unavailable)"));
+
+    // Withheld is its own state (never "not recorded"); it hides the text it was handed.
+    d.revoke_detail = Withheld{};
+    html = render_principal_detail(d, d.row.principal_id);
+    CHECK_THAT(html, ContainsSubstring("withheld: needs the AuditLog:Read permission"));
+    CHECK_THAT(html, !ContainsSubstring("(not recorded)"));
+    CHECK_THAT(html, !ContainsSubstring("oldest success"));
+
+    // A full history window says the detail may not be the original.
+    d.revoke_detail = std::string("credentials_revoked=0 (retry)");
+    d.revoke_truncated = true;
+    html = render_principal_detail(d, d.row.principal_id);
+    CHECK_THAT(html, ContainsSubstring("credentials_revoked=0 (retry)"));
+    CHECK_THAT(html, ContainsSubstring("oldest success among the newest 200"));
+}
+
+TEST_CASE("principals render: data-check tells the script whether to run the REST check",
+          "[access-tokens][render]") {
+    PrincipalsView v;
+    v.rows = {principal("live")};
+    v.roles = std::vector<PrincipalRole>{};
+    CHECK_THAT(render_principals_list(v), ContainsSubstring("data-check=\"0\""));
+    v.can_run_check = true;
+    CHECK_THAT(render_principals_list(v), ContainsSubstring("data-check=\"1\""));
+    CHECK_THAT(render_principals_list(Unavailable{}), ContainsSubstring("data-check=\"0\""));
 }
 
 TEST_CASE("principal detail: unreadable credentials and roles are not 'none'",

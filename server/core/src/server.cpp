@@ -15464,10 +15464,8 @@ private:
             inline_sink,
             yuzu::server::access_tokens::Deps{
                 .auth_fn = auth_fn,
-                .admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
-                    return require_admin(req, res);
-                },
-                .perm_fn = perm_fn,
+                // Quiet probes (no denial row for a cookie session): the panels auto-load.
+                .perm_fn = draw_perm_fn,
                 .audit_fn = audit_fn,
                 .rbac_enforced_fn = [this]() { return rbac_enforcement_in_effect(rbac_store_.get()); },
                 .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
@@ -15507,18 +15505,20 @@ private:
                     return rbac_store_->get_principal_roles_checked("engine", id);
                 },
                 .revoke_detail_fn = [this](const std::string& id)
-                    -> std::expected<std::string, std::string> {
+                    -> std::expected<yuzu::server::access_tokens::RevokeDetail, std::string> {
                     if (!audit_store_)
                         return std::unexpected(std::string("audit store not configured"));
                     AuditQuery q;
                     q.target_type = "EnginePrincipal";
                     q.target_id = id;
                     q.action = "engine_principal.revoke";
-                    q.limit = 200;  // newest first; the original committed revoke is picked below
+                    q.limit = yuzu::server::access_tokens::kRevokeHistoryWindow;  // newest first
                     auto events = audit_store_->query(q);
                     if (!events)
                         return std::unexpected(std::string("audit store did not answer"));
-                    return yuzu::server::access_tokens::committed_revoke_detail(*events);
+                    return yuzu::server::access_tokens::RevokeDetail{
+                        yuzu::server::access_tokens::committed_revoke_detail(*events),
+                        static_cast<int>(events->size()) >= q.limit};
                 },
             });
 

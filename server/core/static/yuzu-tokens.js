@@ -5,9 +5,9 @@
  *   principal-select   load one principal's detail into #side-principal
  *   reload             Retry on a failed panel: re-fetch the target's data-src
  *
- * Principals and the no-admin check are requested ONLY when the token list's root says the
- * caller is an effective administrator (data-effective-admin="1"). Anyone else would be
- * refused by the loud admin gate, and each refusal writes an audit row, so they are not asked.
+ * Each panel loads on its own and is gated by its own fragment (quiet probes: a refused cookie
+ * session writes no audit row). The no-admin REST check runs only when the principals fragment
+ * says the caller holds AuditLog:Read (data-check="1"), because that route's own gate is loud.
  * All server text goes in with textContent.
  */
 (function () {
@@ -16,7 +16,6 @@
   var TOKENS = '/fragments/access/tokens/list';
   var NO_ADMIN = '/api/v1/engine-principals/audit/no-admin';
   var AUDIT_FAILED = 'An audit record for this read could not be saved. The data shown is still current.';
-  var principalsAsked = false;
   var tokensState = 'active';
   var lastPrincipalId = '';
 
@@ -27,13 +26,6 @@
     return n;
   }
   function byId(id) { return document.getElementById(id); }
-
-  function waitBox(target) {
-    var box = el('div', 'empty');
-    box.appendChild(el('b', null, 'Waiting for the token list'));
-    box.appendChild(el('span', null, 'Principals load once the token list has loaded. Retry the token list above.'));
-    target.replaceChildren(box);
-  }
 
   function deniedBox(target) {
     var box = el('div', 'empty');
@@ -132,35 +124,16 @@
       });
   }
 
-  // ---- load sequencing -----------------------------------------------------------------
-  function afterTokens() {
-    var root = byId('tokens-root');
-    var admin = root && root.dataset.effectiveAdmin === '1';
-    var body = byId('principals-body');
-    // No root means the token list itself failed: whether this caller is an administrator is
-    // unknown, so do not claim they lack the role.
-    if (!root) {
-      if (body) waitBox(body);
-      return;
-    }
-    if (!admin) {
-      if (body) deniedBox(body);
-      return;
-    }
-    if (principalsAsked) return;
-    principalsAsked = true;
-    ajax(body.dataset.src, 'principals-body');
-  }
-
+  // ---- load handling -------------------------------------------------------------------
   document.body.addEventListener('htmx:afterSwap', function (e) {
     var t = e.detail.target;
     if (!t) return;
-    if (t.id === 'tokens-body') afterTokens();
     if (t.id === 'principals-body') {
       var root = byId('principals-root');
       var n = root ? root.dataset.count : '';
       if (n === '' || n === undefined) { setNote([]); return; }
-      checkNoAdmin(n);
+      if (root.dataset.check === '1') checkNoAdmin(n);
+      else setNote([noteBox('Running the no-administrator check needs the AuditLog:Read permission.')]);
     }
   });
 
@@ -182,14 +155,12 @@
     var s = e.detail.xhr.status;
     if (s === 401) { location.assign('/login'); return; }
     if (s === 403) deniedBox(t); else unavailableBox(t);
-    if (t.id === 'tokens-body') afterTokens();
   });
 
   document.body.addEventListener('htmx:sendError', function (e) {
     var t = e.detail.target;
     if (!t || !t.hasAttribute('data-denied')) return;
     unavailableBox(t);
-    if (t.id === 'tokens-body') afterTokens();
   });
 
   document.addEventListener('click', function (e) {

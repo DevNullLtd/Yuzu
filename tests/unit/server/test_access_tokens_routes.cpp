@@ -7,7 +7,7 @@
  *   - the token filter: "" (every owner) only for a cookie administrator; an MCP-tier admin
  *     session gets its own tokens (mutation probe: drop the `mcp_tier.empty()` clause);
  *   - an empty session username can never reach the every-owner filter;
- *   - the loud admin gate and the engine belt run BEFORE any principal store read;
+ *   - the EnginePrincipal:Read gate and the engine/MCP belt run BEFORE any principal store read;
  *   - an unanswered store is a 200 red box, never an empty table, and its text is log-only;
  *   - a malformed principal id costs no store read;
  *   - fragment audit rows match the REST twin's verbs, and a dropped row sets Sec-Audit-Failed
@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -67,9 +68,8 @@ struct Harness {
     auth::Session session;
     // gates
     bool perm_allow{true};
-    bool admin_allow{true};
+    std::set<std::string> perm_deny;  // "Securable:Op" refused even when perm_allow
     std::vector<std::pair<std::string, std::string>> perm_calls;
-    int admin_calls{0};
     // audit
     bool audit_ok{true};
     std::vector<std::string> audit_actions;
@@ -85,7 +85,7 @@ struct Harness {
     std::expected<std::optional<EnginePrincipalRow>, std::string> got{principal("bot")};
     std::expected<std::vector<ApiToken>, std::string> creds{std::vector<ApiToken>{}};
     std::expected<std::vector<PrincipalRole>, std::string> roles{std::vector<PrincipalRole>{}};
-    std::expected<std::string, std::string> revoke_detail{std::string{}};
+    std::expected<access_tokens::RevokeDetail, std::string> revoke_detail{access_tokens::RevokeDetail{}};
     yuzu::server::test::TestRouteSink sink;
 
     Harness() {
@@ -104,18 +104,10 @@ struct Harness {
             }
             return session;
         };
-        d.admin_fn = [this](const httplib::Request&, httplib::Response& res) {
-            ++admin_calls;
-            if (admin_allow)
-                return true;
-            res.status = 403;
-            res.set_content(kDenyBody, "application/json");
-            return false;
-        };
         d.perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string& t,
                            const std::string& o) {
             perm_calls.emplace_back(t, o);
-            if (perm_allow)
+            if (perm_allow && !perm_deny.contains(t + ":" + o))
                 return true;
             res.status = 403;
             res.set_content(kDenyBody, "application/json");
@@ -155,7 +147,7 @@ TEST_CASE("tokens routes: registration fails fast when any dependency is unbound
           "[access-tokens][routes]") {
     using Member = std::function<void(access_tokens::Deps&)>;
     const std::vector<Member> unbind = {
-        [](auto& d) { d.auth_fn = nullptr; },       [](auto& d) { d.admin_fn = nullptr; },
+        [](auto& d) { d.auth_fn = nullptr; },
         [](auto& d) { d.perm_fn = nullptr; },       [](auto& d) { d.audit_fn = nullptr; },
         [](auto& d) { d.rbac_enforced_fn = nullptr; }, [](auto& d) { d.now_fn = nullptr; },
         [](auto& d) { d.list_tokens_fn = nullptr; }, [](auto& d) { d.list_principals_fn = nullptr; },
@@ -188,7 +180,6 @@ TEST_CASE("tokens routes: the page redirects without a session and makes no gate
     CHECK(res->status == 200);
     CHECK(res->get_header_value("Cache-Control") == "no-store");
     CHECK_THAT(res->body, ContainsSubstring("/fragments/access/tokens/list"));
-    CHECK(h.admin_calls == 0);
     CHECK(h.perm_calls.empty());
     CHECK(h.token_filters.empty());
     CHECK(h.principal_list_calls == 0);
@@ -230,7 +221,6 @@ TEST_CASE("tokens routes: the token filter is every-owner only for a cookie admi
         // The ApiToken:Read gate ran first, and it is the only gate on this fragment.
         REQUIRE(h.perm_calls.size() == 1);
         CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"ApiToken", "Read"});
-        CHECK(h.admin_calls == 0);
     }
 }
 
@@ -305,29 +295,34 @@ TEST_CASE("tokens routes: an unanswered token store is a 200 red box and its tex
     CHECK(h.audit_actions.empty());  // token reads write no audit row (as the twin)
 }
 
-TEST_CASE("principals routes: the admin gate and the engine belt run before any read",
+TEST_CASE("principals routes: the EnginePrincipal:Read gate and the engine/MCP belt run before any read",
           "[access-tokens][routes]") {
     for (const char* path : {"/fragments/access/principals/list",
                              "/fragments/access/principals/detail?id=engine:bot"}) {
         INFO(path);
         {
             Harness h;
-            h.admin_allow = false;
+            h.perm_deny.insert("EnginePrincipal:Read");
             h.wire();
             const auto res = h.sink.dispatch("GET", path);
             REQUIRE(res);
             CHECK(res->status == 403);
             CHECK(res->body == kDenyBody);
+            // The EnginePrincipal securable is the only gate asked (not the account role).
+            CHECK(h.perm_calls ==
+                  std::vector<std::pair<std::string, std::string>>{{"EnginePrincipal", "Read"}});
             CHECK(h.principal_list_calls == 0);
             CHECK(h.get_calls.empty());
             CHECK(h.audit_actions.empty());
         }
-        for (const char* shape : {"principal_kind", "auth_source"}) {
+        for (const char* shape : {"principal_kind", "auth_source", "mcp_tier"}) {
             Harness h;
             if (std::string(shape) == "principal_kind")
                 h.session.principal_kind = "engine";
-            else
+            else if (std::string(shape) == "auth_source")
                 h.session.auth_source = "engine_token";
+            else
+                h.session.mcp_tier = "readonly";  // an admin-owned MCP bearer that holds the grant
             h.wire();
             const auto res = h.sink.dispatch("GET", path);
             REQUIRE(res);
@@ -488,9 +483,9 @@ TEST_CASE("principals routes: the revoke audit lookup runs for revoked principal
     h.wire();
     // Active: no lookup. (Counted through a wrapper registered on a second sink.)
     auto d = h.deps();
-    d.revoke_detail_fn = [&](const std::string&) -> std::expected<std::string, std::string> {
+    d.revoke_detail_fn = [&](const std::string&) -> std::expected<access_tokens::RevokeDetail, std::string> {
         ++calls;
-        return std::string("credentials_revoked=1");
+        return access_tokens::RevokeDetail{"credentials_revoked=1", true};
     };
     yuzu::server::test::TestRouteSink s2;
     access_tokens::register_access_tokens_routes(s2, d);
@@ -498,11 +493,39 @@ TEST_CASE("principals routes: the revoke audit lookup runs for revoked principal
     REQUIRE(res);
     CHECK(calls == 1);
     CHECK_THAT(res->body, ContainsSubstring("credentials_revoked=1"));
+    CHECK_THAT(res->body, ContainsSubstring("oldest success among the newest 200"));  // truncated flag carried
 
     h.got = std::optional<EnginePrincipalRow>{principal("bot", "active")};
     res = s2.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
     REQUIRE(res);
     CHECK(calls == 1);
+}
+
+TEST_CASE("principals routes: the audit trail's text and the REST check need AuditLog:Read",
+          "[access-tokens][routes]") {
+    Harness h;
+    h.got = std::optional<EnginePrincipalRow>{principal("bot", "revoked")};
+    h.revoke_detail = access_tokens::RevokeDetail{"operator typed reason", false};
+    h.perm_deny.insert("AuditLog:Read");
+    h.wire();
+    // Without AuditLog:Read the detail is withheld and the audit store is not asked.
+    auto res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("withheld: needs the AuditLog:Read permission"));
+    CHECK_THAT(res->body, !ContainsSubstring("operator typed reason"));
+    // ... and the list tells the script not to call the loud REST check.
+    res = h.sink.dispatch("GET", "/fragments/access/principals/list");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("data-check=\"0\""));
+
+    h.perm_deny.clear();
+    res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("operator typed reason"));
+    res = h.sink.dispatch("GET", "/fragments/access/principals/list");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("data-check=\"1\""));
 }
 
 TEST_CASE("tokens routes: the static glue is served uncached as JavaScript",
@@ -517,7 +540,7 @@ TEST_CASE("tokens routes: the static glue is served uncached as JavaScript",
     CHECK_THAT(res->body, ContainsSubstring("principal-select"));
 }
 
-TEST_CASE("tokens routes: server.cpp binds the real admin gate, rbac view and checked reads",
+TEST_CASE("tokens routes: server.cpp binds the quiet probe, rbac view and checked reads",
           "[access-tokens][routes]") {
     // Every case above stubs the gate and would pass with a permissive lambda; pin the wiring.
 #ifndef YUZU_SERVER_SRC_DIR
@@ -533,13 +556,13 @@ TEST_CASE("tokens routes: server.cpp binds the real admin gate, rbac view and ch
     const auto end = text.find("revoke_detail_fn", at);
     REQUIRE(end != std::string::npos);
     const std::string blk = text.substr(at, end - at);
-    CHECK_THAT(blk, ContainsSubstring("return require_admin(req, res);"));
+    CHECK_THAT(blk, ContainsSubstring(".perm_fn = draw_perm_fn"));
+    CHECK_THAT(blk, !ContainsSubstring("require_admin"));
     CHECK_THAT(blk, ContainsSubstring("rbac_enforcement_in_effect(rbac_store_.get())"));
     CHECK_THAT(blk, ContainsSubstring("list_all_checked(true)"));
     CHECK_THAT(blk, ContainsSubstring("list_active_for_principal_checked(id)"));
     CHECK_THAT(blk, ContainsSubstring("list_all_principal_roles_checked()"));
     CHECK_THAT(blk, ContainsSubstring("get_principal_roles_checked(\"engine\", id)"));
-    CHECK_THAT(blk, ContainsSubstring(".perm_fn = perm_fn"));
     CHECK_THAT(text.substr(end, 1500), ContainsSubstring("committed_revoke_detail(*events)"));
 }
 

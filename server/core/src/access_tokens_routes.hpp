@@ -11,10 +11,11 @@
 ///   /static/yuzu-tokens.js                 the page's client glue
 ///
 /// No mutating route is added and none is called from this page: creating, rotating and
-/// revoking stay in Settings. The principal fragments use the Administrator account role
-/// (the Settings panel's gate; RBAC grants are not consulted, so this can differ from the
-/// REST twin's EnginePrincipal:Read in both directions). The all-owner token view is a
-/// cookie-session administrator view with no REST twin.
+/// revoking stay in Settings. The principal fragments are gated on `EnginePrincipal:Read`, the
+/// REST twin's securable (floored to administrators while RBAC is off), and refuse engine and
+/// MCP-tier credentials. Every gate is a QUIET probe (no denial row for a cookie session: the
+/// panels auto-load). The all-owner token view is a cookie-session administrator view with no
+/// REST twin.
 
 #include <yuzu/server/auth.hpp>
 
@@ -27,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "access_tokens_render.hpp"
 #include "api_token_store.hpp"
 #include "engine_principal_store.hpp"
 #include "rbac_store.hpp"
@@ -40,9 +42,6 @@ namespace access_tokens {
 struct Deps {
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
-    /// The LOUD admin gate (`require_admin`): on false it has already written the 403 and its
-    /// audit row. Refuses MCP-tier and service-scoped tokens.
-    using AdminFn = std::function<bool(const httplib::Request&, httplib::Response&)>;
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                       const std::string&, const std::string&)>;
     using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
@@ -52,7 +51,9 @@ struct Deps {
     using Read = std::function<std::expected<T, std::string>()>;
 
     AuthFn auth_fn;
-    AdminFn admin_fn;
+    /// `AuthRoutes::probe_permission`: `require_permission`'s decision, 403 already written on
+    /// false, the denial row withheld for a cookie session only. Used for ApiToken:Read,
+    /// EnginePrincipal:Read and (as a scratch probe) AuditLog:Read.
     PermFn perm_fn;
     AuditFn audit_fn;
     /// RBAC enforcement in effect (fail-closed view), shown to the page as a data attribute.
@@ -71,7 +72,8 @@ struct Deps {
     std::function<std::expected<std::vector<PrincipalRole>, std::string>(const std::string&)>
         principal_roles_fn;
     /// Revoked principals: the `engine_principal.revoke` audit detail ("" = none recorded).
-    std::function<std::expected<std::string, std::string>(const std::string&)> revoke_detail_fn;
+    /// Only called when the caller holds AuditLog:Read.
+    std::function<std::expected<RevokeDetail, std::string>(const std::string&)> revoke_detail_fn;
 };
 
 /// Throws `std::invalid_argument` when any `Deps` member is unbound.

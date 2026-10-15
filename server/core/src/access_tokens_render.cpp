@@ -182,13 +182,14 @@ std::string render_tokens_list(const std::variant<TokensView, Unavailable>& v, c
 std::string render_principals_list(const std::variant<PrincipalsView, Unavailable>& v) {
     const auto* view = std::get_if<PrincipalsView>(&v);
     if (!view)
-        return "<div id=\"principals-root\" data-count=\"\">" +
+        return "<div id=\"principals-root\" data-count=\"\" data-check=\"0\">" +
                failbox("Engine principals could not be read.", kPrincipalsUnavailable, kRetryPrincipals) +
                "</div>";
 
     // data-count is the number of rows rendered below (the strip words it as "listed below").
     std::string out = "<div id=\"principals-root\" data-count=\"" +
-                      std::to_string(std::min(view->rows.size(), kRenderCap)) + "\">";
+                      std::to_string(std::min(view->rows.size(), kRenderCap)) + "\" data-check=\"" +
+                      (view->can_run_check ? "1" : "0") + "\">";
     if (view->rows.empty())
         return out + empty_box("No engine principals.",
                                "Engine principals are named identities for automation and agentic workers.") +
@@ -262,8 +263,14 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
         std::string detail = "(not recorded)";
         if (std::holds_alternative<Unavailable>(d.revoke_detail))
             detail = "(unavailable)";
+        else if (std::holds_alternative<Withheld>(d.revoke_detail))
+            detail = "(withheld: needs the AuditLog:Read permission)";
         else if (const auto& s = std::get<std::string>(d.revoke_detail); !s.empty())
             detail = esc(s);
+        if (d.revoke_truncated)
+            detail += " <span class=\"hint\">(more than " + std::to_string(kRevokeHistoryWindow) +
+                      " revoke events: this is the oldest success among the newest " +
+                      std::to_string(kRevokeHistoryWindow) + ", not necessarily the original)</span>";
         out += kv("Revocation detail", detail);
     }
     out += "</div>";

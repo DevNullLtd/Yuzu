@@ -22,6 +22,13 @@ namespace access_tokens {
 
 namespace {
 
+// A scratch probe of `securable:Read`: the page asks "may this caller see X" to decide what to
+// draw; a refusal is not an error and writes no response.
+bool may_read(const Deps& d, const httplib::Request& req, const char* securable) {
+    httplib::Response scratch;
+    return d.perm_fn(req, scratch, securable, "Read");
+}
+
 constexpr const char* kHtml = "text/html; charset=utf-8";
 
 void respond_fragment(httplib::Response& res, const std::string& body) {
@@ -30,26 +37,28 @@ void respond_fragment(httplib::Response& res, const std::string& body) {
     res.set_content(body, kHtml);
 }
 
-// An engine credential carries mcp_tier=readonly, which `admin_fn` already refuses. This is
-// the belt for a future engine auth path (same posture as the REST lifecycle routes).
+// Engine credentials (the REST lifecycle routes' belt) and MCP-tier bearers never read the
+// principals through this cookie-session page, whatever grants they hold. A denial is audited.
 bool deny_engine_session(const Deps& d, const auth::Session& s, const httplib::Request& req,
                          httplib::Response& res, const char* action) {
-    if (s.principal_kind != "engine" && s.auth_source != "engine_token")
+    const bool engine = s.principal_kind == "engine" || s.auth_source == "engine_token";
+    if (!engine && s.mcp_tier.empty())
         return false;
     (void)detail::emit_behavioral_audit(d.audit_fn, req, res, action, "denied", "EnginePrincipal", "",
-                                        "engine_session_denied");
+                                        engine ? "engine_session_denied" : "mcp_session_denied");
     res.status = 403;
     res.set_header("Cache-Control", "no-store");
-    res.set_content(R"({"error":{"code":403,"message":"engine principals cannot access this endpoint"}})",
+    res.set_content(R"({"error":{"code":403,"message":"this credential cannot access this endpoint"}})",
                     "application/json");
     return true;
 }
 
-// The loud admin gate, then the session, then the engine belt. Nothing is read before this
-// returns a session. `action` names the audit verb a denial is recorded under.
+// The EnginePrincipal:Read gate (the REST twin's), then the session, then the engine/MCP belt.
+// Nothing is read before this returns a session. `action` names the audit verb a denial is
+// recorded under.
 std::optional<auth::Session> gate_principals(const Deps& d, const httplib::Request& req,
                                              httplib::Response& res, const char* action) {
-    if (!d.admin_fn(req, res))
+    if (!d.perm_fn(req, res, "EnginePrincipal", "Read"))
         return std::nullopt;
     auto session = d.auth_fn(req, res);
     if (!session)
@@ -62,7 +71,7 @@ std::optional<auth::Session> gate_principals(const Deps& d, const httplib::Reque
 } // namespace
 
 void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
-    if (!deps.auth_fn || !deps.admin_fn || !deps.perm_fn || !deps.audit_fn || !deps.rbac_enforced_fn ||
+    if (!deps.auth_fn || !deps.perm_fn || !deps.audit_fn || !deps.rbac_enforced_fn ||
         !deps.now_fn || !deps.list_tokens_fn || !deps.list_principals_fn || !deps.all_roles_fn ||
         !deps.get_principal_fn || !deps.active_credentials_fn || !deps.principal_roles_fn ||
         !deps.revoke_detail_fn)
@@ -121,6 +130,7 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  }
                  PrincipalsView view;
+                 view.can_run_check = may_read(deps, req, "AuditLog");
                  view.rows = std::move(*rows);
                  // The store returns oldest first; the cap banner promises the newest.
                  std::ranges::reverse(view.rows);
@@ -181,10 +191,15 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                  }();
                  d.revoke_detail = std::string{};
                  if (d.row.lifecycle_state != "active") {
-                     if (auto rd = deps.revoke_detail_fn(id); rd)
-                         d.revoke_detail = std::move(*rd);
-                     else
+                     // The free text is the audit trail's: AuditLog:Read, as GET /api/v1/audit.
+                     if (!may_read(deps, req, "AuditLog")) {
+                         d.revoke_detail = Withheld{};
+                     } else if (auto rd = deps.revoke_detail_fn(id); rd) {
+                         d.revoke_detail = std::move(rd->text);
+                         d.revoke_truncated = rd->truncated;
+                     } else {
                          d.revoke_detail = Unavailable{};
+                     }
                  }
                  (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, "engine_principal.get",
                                                      "success", "EnginePrincipal", id, "");
