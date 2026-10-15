@@ -379,28 +379,45 @@ PLUGIN_DIR="{root}/plugins"; MANIFEST="{root}/package-files.list"; HASHES="{root
         # uh8-4 split the receipt reader out of adopt_receipted_plugins.
         function = "\n".join(script_function(source, name) for name in
                              ("receipt_plugin_entries", "adopt_receipted_plugins")).replace("/usr/sbin/pkgutil", "pkgutil")
-        for receipt, status, expected in (
-            ("usr/local/lib/yuzu/plugins/tar.dylib\nusr/local/lib/other.dylib\n", 0, "plugins/tar.dylib\n"),
-            ("usr/local/lib/yuzu/plugins/sub/evil.dylib\n", 0, None),
-            ("usr/local/lib/yuzu/plugins/../evil.dylib\n", 0, None),
-            ("usr/local/lib/yuzu/plugins/a\tb.dylib\n", 0, None),
-            ("usr/local/lib/yuzu/plugins/.hidden.dylib\n", 0, None),
+        # (receipt listing, --pkg-info status, --files status, manifest, succeeds)
+        for receipt, info_status, files_status, expected, succeeds in (
+            ("usr/local/lib/yuzu/plugins/tar.dylib\nusr/local/lib/other.dylib\n", 0, 0, "plugins/tar.dylib\n", True),
+            ("usr/local/lib/yuzu/plugins/sub/evil.dylib\n", 0, 0, None, False),
+            ("usr/local/lib/yuzu/plugins/../evil.dylib\n", 0, 0, None, False),
+            ("usr/local/lib/yuzu/plugins/a\tb.dylib\n", 0, 0, None, False),
+            ("usr/local/lib/yuzu/plugins/.hidden.dylib\n", 0, 0, None, False),
             # AppleDouble metadata a build host leaves in the receipt is skipped (xp-15).
-            ("usr/local/lib/yuzu/plugins/._tar.dylib\nusr/local/lib/yuzu/plugins/tar.dylib\n", 0, "plugins/tar.dylib\n"),
-            ("usr/local/lib/yuzu/plugins/tar.dylib\n", 1, None),
+            ("usr/local/lib/yuzu/plugins/._tar.dylib\nusr/local/lib/yuzu/plugins/tar.dylib\n", 0, 0,
+             "plugins/tar.dylib\n", True),
+            # No receipt at all: nothing to adopt, not an error.
+            ("usr/local/lib/yuzu/plugins/tar.dylib\n", 1, 0, None, True),
+            # uh8r4-1: a receipt that exists but cannot be listed is an error, never
+            # "no receipt" (which would disown its plugins).
+            ("usr/local/lib/yuzu/plugins/tar.dylib\n", 0, 1, None, False),
         ):
-            with self.subTest(receipt=receipt, status=status), tempfile.TemporaryDirectory(prefix="yuzu_test_receipt_") as temporary:
+            with self.subTest(receipt=receipt, info_status=info_status, files_status=files_status), \
+                    tempfile.TemporaryDirectory(prefix="yuzu_test_receipt_") as temporary:
                 root = Path(temporary)
                 (root / "plugins").mkdir()
                 (root / "plugins/third-party.dylib").write_bytes(b"unmanaged")
-                harness = PREAMBLE + '''pkgutil() { [[ "$1" == --files && "$2" == com.yuzu.agent ]] || exit 99; printf '%s' "$RECEIPT"; return "$RECEIPT_STATUS"; }
+                harness = PREAMBLE + '''pkgutil() {
+    [[ "$2" == com.yuzu.agent ]] || exit 99
+    case "$1" in
+        --pkg-info) return "$INFO_STATUS" ;;
+        --files) printf '%s' "$RECEIPT"; return "$FILES_STATUS" ;;
+        *) exit 99 ;;
+    esac
+}
 ''' + function + "\nadopt_receipted_plugins\n"
                 result = subprocess.run(["bash", "-c", harness], text=True, capture_output=True,
                                         env={**os.environ, "YUZU_LIB": temporary, "RECEIPT": receipt,
-                                             "RECEIPT_STATUS": str(status)})
+                                             "INFO_STATUS": str(info_status), "FILES_STATUS": str(files_status)})
                 manifest = root / "package-files.list"
                 self.assertEqual(manifest.read_text() if manifest.exists() else None, expected)
-                self.assertEqual(result.returncode == 0, expected is not None or status == 1)
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                if files_status:
+                    self.assertIn("cannot list the Installer receipt's files", result.stderr)
+                self.assertEqual(sorted(p.name for p in root.iterdir() if p.name.startswith(".legacy-manifest")), [])
                 self.assertEqual((root / "plugins/third-party.dylib").read_bytes(), b"unmanaged")
 
     @macos_userland
@@ -1221,6 +1238,109 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         self.assertEqual(result.restores, 0, result.stderr)  # type: ignore[attr-defined]
         self.assertEqual(result.missing, 0, result.stderr)  # type: ignore[attr-defined]
         self.assertIn("could not retire the legacy development app", result.stderr)
+
+    @posix_shell
+    def test_stale_manifest_rederivation_fails_when_the_receipt_cannot_be_listed(self) -> None:
+        # Governance uh8r4-1: --pkg-info says the receipt exists, so a failing --files
+        # is an error, never "no receipt" (which wrote a header-less manifest that
+        # disowned the receipt's plugins and wedged every later install).
+        digest = "a" * 64
+        shasum = f'shasum() {{ echo "{digest}  $3"; }}\n'
+        for files_ok in (False, True):
+            with self.subTest(files_ok=files_ok), tempfile.TemporaryDirectory(prefix="yuzu_test_stale_unlisted_") as temporary:
+                root = Path(temporary)
+                lib = root / "ul/lib/yuzu"
+                (lib / "plugins").mkdir(parents=True)
+                (lib / "plugins/a.dylib").write_text("a")
+                manifest = "# package-version 2.0\nplugins/a.dylib\n"
+                hashes = f"{digest}  plugins/a.dylib\n"
+                (lib / "package-files.list").write_text(manifest)
+                (lib / "package-files.sha256").write_text(hashes)
+                stubs = (self._pkgutil_stub(root, version="1.0", files_ok=files_ok) + shasum
+                         + "RECEIPT='usr/local/lib/yuzu/plugins/a.dylib\n'\n")
+                result = self._installer_harness(
+                    root, "preinstall", ("receipt_plugin_entries", "discard_stale_manifest"),
+                    "discard_stale_manifest\necho DONE\n", stubs=stubs)
+                if files_ok:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((lib / "package-files.list").read_text(), "plugins/a.dylib\n")
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("DONE", result.stdout)
+                    self.assertIn("cannot list the Installer receipt's files", result.stderr)
+                    self.assertEqual((lib / "package-files.list").read_text(), manifest)
+                    self.assertEqual((lib / "package-files.sha256").read_text(), hashes)
+                for pattern in (".still-owned.*", ".rederived-manifest.*", ".rederived-hashes.*"):
+                    self.assertEqual(list(lib.glob(pattern)), [], pattern)
+
+    @posix_shell
+    def test_preinstall_refuses_a_lane_switch_away_from_an_untrusted_loose_install(self) -> None:
+        # Governance uh8r4-2: an installed loose-lane agent must be restorable into
+        # /usr/local/bin if a switch to the bundle lane fails, so that directory must
+        # be trusted first. The installed lane comes from root-owned state (the mode
+        # file, else a receipt = a pre-mode-file loose package), never /usr/local/bin.
+        pre = (BUILD_PKG.parent / "preinstall").read_text()
+        start = pre.index('installed_lane=""\n')
+        # Anchored on the next statement, so mutating the refusal itself fails
+        # behaviourally rather than by slicing.
+        end = pre.index('secure_payload_parent "$APP_ROOT" 755\n', start)
+        block = pre[start:end].replace("/usr/sbin/pkgutil", "pkgutil")
+        tree = pre.index('require_trusted_code_tree "$PACKAGE_MODE" || exit 1\n')
+        self.assertEqual(pre[tree:start].count("\n"), 6, pre[tree:start])  # right after the tree check
+        cases = (
+            # (mode file, receipt, package, /usr/local/bin trusted, planted agent, proceeds)
+            ("loose", False, "bundle", False, False, False),
+            ("loose", False, "loose", False, False, True),     # same lane: the chain check covers it
+            ("bundle", False, "bundle", False, False, True),
+            (None, True, "bundle", False, False, False),      # receipt, no mode file: loose
+            (None, False, "bundle", False, False, True),      # fresh host
+            ("loose", False, "bundle", True, False, True),
+            ("bundle", False, "bundle", False, True, True),   # a planted agent changes nothing
+            (None, False, "bundle", False, True, True),
+        )
+        for mode_file, receipt, package, trusted, planted, proceeds in cases:
+            with self.subTest(mode_file=mode_file, receipt=receipt, package=package, trusted=trusted, planted=planted), \
+                    tempfile.TemporaryDirectory(prefix="yuzu_test_lane_switch_") as temporary:
+                root = Path(temporary)
+                lib = root / "ul/lib/yuzu"
+                lib.mkdir(parents=True)
+                (root / "ul/bin").mkdir(parents=True)
+                if mode_file is not None:
+                    (lib / "package-mode").write_text(mode_file + "\n")
+                if planted:
+                    (root / "ul/bin/yuzu-agent").write_text("planted")
+                result = self._installer_harness(
+                    root, "preinstall", ("acl_grants_write", "code_directory_trusted"),
+                    f"PACKAGE_MODE={package}\n" + block + "echo PROCEEDED\n",
+                    modes={} if trusted else {root / "ul/bin": 775},
+                    stubs=self._pkgutil_stub(root, info_ok=receipt))
+                self.assertEqual(result.returncode == 0, proceeds, result.stderr)
+                self.assertEqual("PROCEEDED" in result.stdout, proceeds)
+                self.assertEqual("fix it before switching lanes" in result.stderr, not proceeds)
+
+    @posix_shell
+    def test_a_failing_step_inside_legacy_retirement_is_reported(self) -> None:
+        # Governance uh8r4-5: the caller's `||` turns errexit off inside
+        # retire_legacy_app, so each step returns its own failure; otherwise a failed
+        # move ran on silently and the WARNING never printed. Still no restore.
+        post = (BUILD_PKG.parent / "postinstall").read_text()
+        start = post.index("\nretire_legacy_app", post.index("# The previous development bundle lived below")) + 1
+        tail = post[start:post.index('echo "$outcome"\n', start)]
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_retire_fail_") as temporary:
+            root = Path(temporary)
+            (root / "data/YuzuAgent.app").mkdir(parents=True)
+            (root / "state/quarantine").mkdir(parents=True)
+            body = ("\n".join(script_function(post, name) for name in
+                               ("legacy_app_is_managed", "quarantine_legacy_app", "retire_legacy_app")) + "\n"
+                    + f'STATE_DIR="{root}/state"; DATA_DIR="{root}/data"; LEGACY_APP="$DATA_DIR/YuzuAgent.app"\n'
+                    + f'recovery="{root}/state/install-recovery.TEST"; mkdir -p "$recovery"\n'
+                    + "mv() { return 1; }\nfinish_recovery() { :; }\nPROMOTION_ARMED=1\n" + tail + "echo TAIL-DONE\n")
+            result = self._promotion_exit(body)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("TAIL-DONE", result.stdout)
+            self.assertIn("could not retire the legacy development app", result.stderr)
+            self.assertEqual(result.restores, 0, result.stderr)  # type: ignore[attr-defined]
+            self.assertTrue((root / "data/YuzuAgent.app").is_dir())
 
     @posix_shell
     def test_promotion_failure_announces_the_restore_before_running_it(self) -> None:
@@ -2306,6 +2426,8 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn("DONE", result.stdout)
                 self.assertIn("cannot hash", result.stderr)
+                # uh8r4-4: the message says what to do.
+                self.assertIn("make it readable by root or remove it, then retry", result.stderr)
                 self.assertEqual((lib / "package-files.list").read_text(), manifest)
                 self.assertEqual((lib / "package-files.sha256").read_text(), hashes)
                 for pattern in (".still-owned.*", ".rederived-manifest.*", ".rederived-hashes.*"):
@@ -3281,34 +3403,64 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 self.assertIn(f"LOST={lost}", result.stdout)
 
     # ── Governance con8-4: uninstall after a rollback removes plugins by name ──
+    def _uninstall_receipt_block(self) -> str:
+        """uninstall.sh's one read of the receipt database (governance U-1, uh8r4-3),
+        from RECEIPT_PRESENT=0 through its closing fi, with the stubbed pkgutil,
+        never this host's real receipt database."""
+        source = (BUILD_PKG.parent / "uninstall.sh").read_text()
+        start = source.index("RECEIPT_PRESENT=0\n")
+        end = source.index("\nfi\n", source.index('RECEIPT_VERSION="$(awk', start)) + 4
+        return source[start:end].replace("/usr/sbin/pkgutil", "pkgutil")
+
+    @staticmethod
+    def _pkgutil_stub(root: Path, *, pkgs_ok: bool = True, listed: bool = True, info_ok: bool = True,
+                      version: str = "1.0", files_ok: bool = True) -> str:
+        """A logged pkgutil: --pkgs lists com.yuzu.agent when `listed`; --files prints $RECEIPT."""
+        pkgs = ("return 1" if not pkgs_ok else
+                "printf '%s\\n' com.apple.pkg.Core" + (" com.yuzu.agent" if listed else ""))
+        info = f"printf 'package-id: com.yuzu.agent\\nversion: {version}\\n'" if info_ok else "return 1"
+        files = 'printf "%s" "${RECEIPT:-}"' if files_ok else "return 1"
+        return (f'pkgutil() {{ echo "$*" >> "{root}/pkgutil.log"; case "$1" in '
+                f'--pkgs) {pkgs} ;; --pkg-info) {info} ;; --files) {files} ;; --forget) return 0 ;; '
+                f'*) return 99 ;; esac; }}\n')
+
     def _uninstall_plugin_block(self) -> str:
         source = (BUILD_PKG.parent / "uninstall.sh").read_text()
-        receipt = source.index("RECEIPT_PRESENT=0\n")
-        receipt_block = source[receipt:source.index("\n", source.index("RECEIPT_PRESENT=1", receipt)) + 1]
         start = source.index('if [[ ! -f "$MANIFEST" ]]; then\n')
-        # The stubbed pkgutil, never this host's real receipt database.
-        return (receipt_block + source[start:source.index("\nfi\n", start) + 4]).replace("/usr/sbin/pkgutil", "pkgutil")
+        return self._uninstall_receipt_block() + \
+            source[start:source.index("\nfi\n", start) + 4].replace("/usr/sbin/pkgutil", "pkgutil")
 
     @posix_shell
     def test_uninstall_forgets_only_a_receipt_it_confirmed(self) -> None:
-        # Governance U-1: a transient `pkgutil --pkg-info` failure must not reach
-        # `pkgutil --forget`; the real forget line is guarded by the run's own check.
+        # Governance U-1, uh8r4-3: the receipt database is read once, before anything
+        # is removed. A missing receipt is not an error; an unreadable database or an
+        # unreadable listed receipt stops the uninstall; the real forget line runs only
+        # for a receipt this run confirmed.
         source = (BUILD_PKG.parent / "uninstall.sh").read_text()
-        receipt = source.index("RECEIPT_PRESENT=0\n")
-        receipt_block = source[receipt:source.index("\n", source.index("RECEIPT_PRESENT=1", receipt)) + 1]
+        block_at = source.index("RECEIPT_PRESENT=0\n")
+        self.assertLess(block_at, source.index("\nensure_state_dir\n"))
+        self.assertLess(block_at, source.index("\nclear_recovery_state\n"))
         forget = next(line for line in source.splitlines()
                       if "pkgutil --forget com.yuzu.agent" in line and not line.lstrip().startswith("#")) + "\n"
-        for info_ok, forgets in ((True, True), (False, False)):
-            with self.subTest(info_ok=info_ok), tempfile.TemporaryDirectory(prefix="yuzu_test_forget_") as temporary:
+        for case, options, completes, forgets, message in (
+                ("listed and readable", {}, True, True, None),
+                ("not listed", {"listed": False}, True, False, None),
+                ("listed, --pkg-info fails", {"info_ok": False}, False, False,
+                 "cannot read the Yuzu Agent Installer receipt"),
+                ("database unreadable", {"pkgs_ok": False}, False, False,
+                 "cannot read the Installer receipt database")):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(prefix="yuzu_test_forget_") as temporary:
                 root = Path(temporary)
-                info = "return 0" if info_ok else "return 1"
-                stub = (f'pkgutil() {{ echo "$*" >> "{root}/pkgutil.log"; case "$1" in '
-                        f'--pkg-info) {info} ;; *) return 0 ;; esac; }}\n')
-                result = subprocess.run([PKG_SHELL, "-c", PREAMBLE + stub + receipt_block.replace("/usr/sbin/pkgutil", "pkgutil")
-                                         + forget + "echo DONE\n"], capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                log = (root / "pkgutil.log").read_text()
+                result = subprocess.run([PKG_SHELL, "-c", PREAMBLE + self._pkgutil_stub(root, **options)
+                                         + self._uninstall_receipt_block() + forget + "echo DONE\n"],
+                                        capture_output=True, text=True)
+                log = (root / "pkgutil.log").read_text() if (root / "pkgutil.log").exists() else ""
+                self.assertEqual(result.returncode == 0, completes, result.stderr)
+                self.assertEqual("DONE" in result.stdout, completes)
                 self.assertEqual("--forget com.yuzu.agent" in log, forgets, log)
+                if message:
+                    self.assertIn(message, result.stderr)
+                    self.assertIn("nothing was removed", result.stderr)
 
     @posix_shell
     def test_restore_lane_comes_from_the_snapshot_only(self) -> None:
@@ -3367,9 +3519,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                                 "modified.dylib": hashlib.sha256(b"what the package shipped").hexdigest()}
                     (lib / "package-files.sha256").write_text(
                         "".join(f"{digest}  plugins/{plugin}\n" for plugin, digest in recorded.items()))
-                stubs = (f'pkgutil() {{ case "$1" in --pkg-info) printf "package-id: com.yuzu.agent\\n'
-                         f'version: {installed}\\n" ;; --files) printf "%s" "$RECEIPT" ;; *) return 99 ;; esac; }}\n'
-                         f"RECEIPT='{receipt}'\n")
+                stubs = self._pkgutil_stub(root, version=installed) + f"RECEIPT='{receipt}'\n"
                 result = self._installer_harness(
                     root, "uninstall.sh",
                     ("plugin_hash_matches", "remove_managed_plugins", "manifest_is_stale", "remove_receipted_plugins"),
@@ -3399,9 +3549,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 if manifest is not None:
                     (root / "ul/lib/yuzu/package-files.list").write_text(
                         f"# package-version {manifest}\nplugins/other.dylib\n")
-                info = ("printf 'package-id: com.yuzu.agent\\nversion: 1.0\\n'" if receipt_exists else "return 1")
-                stubs = (f'pkgutil() {{ echo "$*" >> "{root}/pkgutil.log"; case "$1" in '
-                         f'--pkg-info) {info} ;; --files) return 1 ;; *) return 0 ;; esac; }}\n')
+                stubs = self._pkgutil_stub(root, listed=receipt_exists, files_ok=False)
                 body = self._uninstall_plugin_block() + "pkgutil --forget com.yuzu.agent\necho FORGOT\n"
                 result = self._installer_harness(
                     root, "uninstall.sh",
@@ -3421,25 +3569,26 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
 
     @posix_shell
     def test_uninstall_manifest_staleness_is_read_from_its_version_header(self) -> None:
-        for first_line, installed, pkg_status, stale in (
-                ("# package-version 2.0", "1.0", 0, True),
-                ("# package-version 1.0", "1.0", 0, False),
-                ("plugins/x.dylib", "1.0", 0, False),          # older manifest: no header
-                ("# package-version 2.0", "", 0, False),        # receipt without a version
-                ("# package-version 2.0", "1.0", 1, False)):    # no receipt at all
-            with self.subTest(first_line=first_line, installed=installed, pkg_status=pkg_status), \
+        # uh8r4-3: compared with the version read once at the start, never a second
+        # pkgutil call that could fail on its own.
+        for first_line, receipt_version, stale in (
+                ("# package-version 2.0", "1.0", True),
+                ("# package-version 1.0", "1.0", False),
+                ("plugins/x.dylib", "1.0", False),          # older manifest: no header
+                ("# package-version 2.0", "", False)):      # no receipt, or one without a version
+            with self.subTest(first_line=first_line, receipt_version=receipt_version), \
                     tempfile.TemporaryDirectory(prefix="yuzu_test_stale_check_") as temporary:
                 root = Path(temporary)
                 lib = root / "ul/lib/yuzu"
                 lib.mkdir(parents=True)
                 (lib / "package-files.list").write_text(first_line + "\n")
-                stubs = (f'pkgutil() {{ [[ "$1" == --pkg-info ]] || return 99; '
-                         f'printf "version: {installed}\\n"; return {pkg_status}; }}\n')
+                stubs = self._pkgutil_stub(root) + f'RECEIPT_VERSION="{receipt_version}"\n'
                 result = self._installer_harness(
                     root, "uninstall.sh", ("manifest_is_stale",),
                     "if manifest_is_stale; then echo STALE; else echo CURRENT; fi\n", stubs=stubs)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), "STALE" if stale else "CURRENT")
+                self.assertFalse((root / "pkgutil.log").exists(), "manifest_is_stale must not call pkgutil")
 
     # ── Governance con8-10: the "preserved" line survives the snapshot's removal ──
     @posix_shell

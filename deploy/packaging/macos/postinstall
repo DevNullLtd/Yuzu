@@ -331,15 +331,16 @@ quarantine_legacy_app() {
 retire_legacy_app() {
     local retired="$recovery/legacy-retired.app"
     [[ ! -e "$LEGACY_APP" && ! -L "$LEGACY_APP" ]] && return 0
-    quarantine_legacy_app "$retired"   # a leftover from an interrupted earlier run
-    mv "$LEGACY_APP" "$retired"
+    # Explicit returns: the caller's `||` turns errexit off in here (uh8r4-5).
+    quarantine_legacy_app "$retired" || return 1   # a leftover from an interrupted earlier run
+    mv "$LEGACY_APP" "$retired" || return 1
     if legacy_app_is_managed "$retired"; then
-        rm -rf "${retired:?}"
+        rm -rf "${retired:?}" || return 1
         echo "Removed the retired development YuzuAgent.app from $DATA_DIR (its identity was verified)" >&2
     else
         # The replacement daemon has already passed health observation: do not
         # roll back a healthy install because of code the package does not own.
-        quarantine_legacy_app "$retired"
+        quarantine_legacy_app "$retired" || return 1
     fi
 }
 

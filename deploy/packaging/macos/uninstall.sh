@@ -184,13 +184,12 @@ stop_service() {
 # Either way they are removed by name, from the manifest and from the
 # Installer receipt (con8-4).
 manifest_is_stale() {
-    local recorded installed
+    local recorded
     [[ -f "$MANIFEST" ]] || return 1
     recorded="$(awk 'NR == 1 && $1 == "#" && $2 == "package-version" {print $3}' "$MANIFEST")"
     [[ -n "$recorded" ]] || return 1
-    installed="$(/usr/sbin/pkgutil --pkg-info com.yuzu.agent 2>/dev/null)" || return 1
-    installed="$(awk '/^version: / {print $2; exit}' <<<"$installed")"
-    [[ -n "$installed" && "$installed" != "$recorded" ]]
+    # The version read once at the start, never a second pkgutil call (uh8r4-3).
+    [[ -n "$RECEIPT_VERSION" && "$RECEIPT_VERSION" != "$recorded" ]]
 }
 
 remove_receipted_plugins() {
@@ -229,8 +228,20 @@ clear_recovery_state() {
 # Whether the Installer receipt exists, read once: `pkgutil --forget` below runs
 # only for a receipt confirmed here, so a transient failure can never forget
 # a receipt whose plugins were not removed (governance U-1).
+# A missing receipt and an unreadable one are told apart, and an unreadable one
+# stops the uninstall before anything is removed (governance uh8r4-3).
 RECEIPT_PRESENT=0
-if /usr/sbin/pkgutil --pkg-info com.yuzu.agent >/dev/null 2>&1; then RECEIPT_PRESENT=1; fi
+RECEIPT_VERSION=""
+receipt_ids="$(/usr/sbin/pkgutil --pkgs 2>/dev/null)" || {
+    echo "ERROR: cannot read the Installer receipt database; nothing was removed, retry" >&2
+    exit 1; }
+if grep -Fqx com.yuzu.agent <<<"$receipt_ids"; then
+    RECEIPT_PRESENT=1
+    receipt_info="$(/usr/sbin/pkgutil --pkg-info com.yuzu.agent 2>/dev/null)" || {
+        echo "ERROR: cannot read the Yuzu Agent Installer receipt; nothing was removed, retry" >&2
+        exit 1; }
+    RECEIPT_VERSION="$(awk '/^version: / {print $2; exit}' <<<"$receipt_info")"
+fi
 ensure_state_dir
 clear_recovery_state
 stop_service || echo "WARNING: Yuzu Agent is still unloading; its code is removed anyway" >&2

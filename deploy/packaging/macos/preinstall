@@ -406,7 +406,7 @@ discard_stale_manifest() {
             [[ -n "$name" && "$name" != */* && "$name" != .* ]] || continue
             [[ -f "$PLUGIN_DIR/$name" && ! -L "$PLUGIN_DIR/$name" ]] || continue
             actual="$(shasum -a 256 "$PLUGIN_DIR/$name")" || {
-                echo "ERROR: cannot hash $PLUGIN_DIR/$name while re-deriving plugin ownership" >&2
+                echo "ERROR: cannot hash $PLUGIN_DIR/$name while re-deriving plugin ownership; make it readable by root or remove it, then retry" >&2
                 rm -f "${kept:?}" "${combined:?}" "${combined_hashes:?}"
                 return 1; }
             [[ "${actual%% *}" != "$digest" ]] || printf '%s\n' "$relative" >> "$kept"
@@ -429,7 +429,7 @@ discard_stale_manifest() {
         name="${relative#plugins/}"
         [[ -f "$PLUGIN_DIR/$name" && ! -L "$PLUGIN_DIR/$name" ]] || continue
         actual="$(shasum -a 256 "$PLUGIN_DIR/$name")" || {
-            echo "ERROR: cannot hash $PLUGIN_DIR/$name while re-deriving plugin ownership" >&2
+            echo "ERROR: cannot hash $PLUGIN_DIR/$name while re-deriving plugin ownership; make it readable by root or remove it, then retry" >&2
             rm -f "${combined:?}" "${combined_hashes:?}"
             return 1; }
         printf '%s  %s\n' "${actual%% *}" "$relative" >> "$combined_hashes"
@@ -450,7 +450,12 @@ copy_if_present() {
 # no receipt and 1 on an unsafe entry.
 receipt_plugin_entries() {
     local output="$1" receipt relative name
-    receipt="$(/usr/sbin/pkgutil --files com.yuzu.agent 2>/dev/null)" || return 2
+    /usr/sbin/pkgutil --pkg-info com.yuzu.agent >/dev/null 2>&1 || return 2
+    # The receipt exists, so failing to list it is an error, never "no receipt"
+    # (governance uh8r4-1): that would disown the receipt's plugins.
+    receipt="$(/usr/sbin/pkgutil --files com.yuzu.agent 2>/dev/null)" || {
+        echo "ERROR: cannot list the Installer receipt's files; retry the install" >&2
+        return 1; }
     while IFS= read -r relative; do
         case "$relative" in
             usr/local/lib/yuzu/plugins/._*)
@@ -753,6 +758,21 @@ done
 # in it, must be trusted before the payload lands (governance sec-2, ch-4,
 # ch-5, G8-S1).
 require_trusted_code_tree "$PACKAGE_MODE" || exit 1
+# The installed agent's own lane matters too: if it is the loose lane, a failed
+# switch to the bundle lane must be able to restore it into /usr/local/bin, so
+# that directory must be trusted before anything changes (governance uh8r4-2).
+# The lane is read from root-owned state: the mode file, or for packages
+# before it (all loose) the Installer receipt; never from /usr/local/bin.
+installed_lane=""
+if [[ -f "$YUZU_LIB/package-mode" && ! -L "$YUZU_LIB/package-mode" ]]; then
+    installed_lane="$(cat "$YUZU_LIB/package-mode")"
+elif /usr/sbin/pkgutil --pkg-info com.yuzu.agent >/dev/null 2>&1; then
+    installed_lane=loose
+fi
+if [[ "$installed_lane" == loose && "$PACKAGE_MODE" != loose ]] && ! code_directory_trusted "$LOOSE_BIN"; then
+    echo "ERROR: the installed agent runs from $LOOSE_BIN, which is not root-owned and protected from other accounts; fix it before switching lanes. The active service was left unchanged" >&2
+    exit 1
+fi
 secure_payload_parent "$APP_ROOT" 755
 secure_payload_parent "$YUZU_LIB" 755
 # Leftovers of an interrupted manifest re-derivation (governance uh8-4).
