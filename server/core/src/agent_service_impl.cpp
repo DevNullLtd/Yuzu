@@ -571,7 +571,7 @@ enrolled:
     // normal reconnect backoff. The PG failure detail stays server-side (spdlog only).
     if (auto reg_result = registry_.register_agent(info); !reg_result) {
         spdlog::error("Register: register_agent failed for '{}': {}", safe_agent_id,
-                      reg_result.error());
+                      ::yuzu::log_key_token(reg_result.error()));
         return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                             "registration temporarily unavailable");
     }
@@ -1406,8 +1406,9 @@ grpc::Status AgentServiceImpl::Subscribe(
             }
 
         } else {
-            spdlog::info("Command {} completed: status={}, exit_code={}", resp.command_id(),
-                         static_cast<int>(resp.status()), resp.exit_code());
+            spdlog::info("Command {} completed: status={}, exit_code={}",
+                         ::yuzu::log_id_token(resp.command_id()), static_cast<int>(resp.status()),
+                         resp.exit_code());
 
             // Store completion response
             if (response_store_) {
@@ -1723,8 +1724,9 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             analytics_store->emit(std::move(ae));
         }
     } else {
-        spdlog::info("[gateway] Command {} completed: status={}, exit_code={}", resp.command_id(),
-                     static_cast<int>(resp.status()), resp.exit_code());
+        spdlog::info("[gateway] Command {} completed: status={}, exit_code={}",
+                     ::yuzu::log_id_token(resp.command_id()), static_cast<int>(resp.status()),
+                     resp.exit_code());
 
         if (response_store_) {
             auto gw_plugin = extract_plugin(resp.command_id());

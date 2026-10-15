@@ -1195,7 +1195,7 @@ gw_enrolled:
     auto reg_result = registry_.register_agent(info);
     if (!reg_result) {
         spdlog::error("ProxyRegister: register_agent failed for '{}': {}", safe_agent_id,
-                      reg_result.error());
+                      ::yuzu::log_key_token(reg_result.error()));
         return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                             "registration temporarily unavailable");
     }
@@ -2527,7 +2527,8 @@ GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* context,
         // the RPC). A solicited reply reaching this path is a gateway routing bug.
         spdlog::warn("[gateway] ForwardGuardianMessage: not an unsolicited guardian event "
                      "(plugin='{}', command_id='{}') from agent {} — dropping",
-                     resp.plugin(), resp.command_id(), ::yuzu::log_id_token(agent_id));
+                     ::yuzu::log_id_token(resp.plugin()), ::yuzu::log_id_token(resp.command_id()),
+                     ::yuzu::log_id_token(agent_id));
         response->set_acknowledged(true);
         return grpc::Status::OK;
     }
