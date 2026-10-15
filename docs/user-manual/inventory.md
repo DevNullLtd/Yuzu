@@ -613,25 +613,43 @@ place, **Hardware** and **Software**, each its own page:
   - **Sync now.** The button at the top of the page asks devices to re-send their
     installed-software inventory now instead of waiting for the ~24 h cadence. A dialog
     offers three choices: **This device** (offered while the Host box names a listed host),
-    **Devices matching a scope expression or group** (a scope expression, previewed through
-    `POST /api/v1/scope/preview` so the confirm step can say how many devices match, or
-    `group:<id>`), and **Whole fleet**. After you confirm, the page says how many devices
-    were asked to sync and how many were skipped. It calls `POST /api/v1/hardware/sync`,
-    which needs `Execution:Execute`, reaches only the devices that grant covers, and skips
-    devices that are offline or whose agent is older than 0.13.1 (the toast counts both).
-    **Whole fleet** also needs a fleet-wide `Execution:Execute` grant; a
-    management-group-scoped operator is refused (`403`) and should pick a group or a scope
-    instead. One request reaches at most 500 devices (`413` above that, counted after the
-    skips: narrow the scope). A group, scope or fleet run is limited to one per operator per
-    60 seconds (`429` with `Retry-After`) and one at a time per server process (`409`); a
-    single device is exempt. A server clock that steps backwards cannot lock an operator out:
-    a last-run time in the future is ignored. Both limits are held in each server process, not across a
-    cluster: with several active servers (active-active) each one allows its own run and
-    keeps its own per-operator cooldown, and every run is still bounded by the 500-device
-    cap. The request is audited as `inventory.sync.request` before
-    anything is sent, and is refused if the audit row cannot be written. `202` means the
-    request was sent, not that the devices have synced: the page's figures change when each
-    device reports back.
+    **Devices matching a scope expression or group** (a scope expression, or `group:<id>`),
+    and **Whole fleet**. For a scope expression the Review step previews the match count
+    through `POST /api/v1/scope/preview`; that route needs `Infrastructure:Read`, so if it is
+    refused the dialog goes on to the confirm step without a count. After you confirm, a
+    notice says how many devices were asked to sync and how many were skipped. It calls
+    `POST /api/v1/hardware/sync`.
+    - **Who may.** The route needs `Execution:Execute`, checked as a **global** grant (or
+      RBAC off). An operator whose `Execution:Execute` is limited to management groups is
+      refused with `403` for every choice, including a single device. The route also
+      confines its targets to the caller's own `Execution:Execute` visible set and refuses
+      **Whole fleet** (`403`) unless that set is unfiltered; with a global grant neither
+      changes the outcome today, and both stay in place as defence in depth for when the
+      gate becomes scope-aware.
+    - **Which devices.** Only agents attached to the server that handles the request are
+      contacted. Offline devices, agents older than 0.13.1 and devices that are connected to
+      a *different* server (active-active) are skipped and counted separately in the notice
+      and the `202` body; a device on another server is reported as such, never as offline.
+      One request reaches at most 500 devices (`413` above that, counted after the skips:
+      narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
+      up to 256 bytes.
+    - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds
+      (`429` with `Retry-After`) and one at a time per server process (`409`); a single device
+      is exempt from both. A `409` can follow a slow agent connection: the server sends to its
+      targets one after another, and a stalled agent stream holds the run until its write fails
+      (bounded by the gRPC keepalive, about 80 seconds). A server clock that steps backwards
+      cannot lock an operator out: a last-run time in the future is ignored. Both limits are
+      held in each server process, not across a cluster: with several active servers every
+      one allows its own run and keeps its own per-operator cooldown, and each run is still
+      bounded by the 500-device cap. One run can make up to 500 agents upload their
+      inventory at nearly the same moment; see the connection-pool note in
+      [Server administration](server-admin.md).
+    - **Audit and result.** The request is audited as `inventory.sync.request` before
+      anything is sent, and is refused if the audit row cannot be written. `202` means the
+      request was sent, not that the devices have synced: the page's figures change when each
+      device reports back. In the `202` body `agents_reached` is the number of agents that
+      accepted the request; the audit row's `reached` is the number the run planned to send
+      to.
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
