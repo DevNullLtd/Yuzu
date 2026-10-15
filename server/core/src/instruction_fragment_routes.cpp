@@ -242,6 +242,11 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
             if (wired)
                 html += instruction_extras::render_library_filter_form(
                     q.name_filter, q.plugin_filter, q.type_filter);
+            // Host for the per-definition templates panel (loaded by the row's Templates
+            // button). Directly under the toolbar, above the table: below a 100-row table it
+            // loaded off-screen and the click looked like it did nothing.
+            if (show_approval)
+                html += "<div id=\"ox-templates\"></div>";
 
             if (defs.empty()) {
                 html += "<div class=\"empty-state\">No instruction definitions yet.";
@@ -286,7 +291,8 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                         html += "<button type=\"button\" class=\"btn btn-secondary btn-sm\" "
                                 "hx-get=\"/fragments/instructions/templates?id=" +
                                 url_encode(d.id) +
-                                "\" hx-target=\"#ox-templates\" hx-swap=\"innerHTML\">"
+                                "\" hx-target=\"#ox-templates\" "
+                                "hx-swap=\"innerHTML show:#ox-templates:top\">"
                                 "Templates</button> "
                                 "<button type=\"button\" class=\"btn btn-secondary btn-sm\" "
                                 "data-ox=\"export\" data-def-id=\"" +
@@ -326,9 +332,6 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
             }
             html += instruction_extras::render_library_foot(limit, truncated);
             html += "</section>";
-            // Host for the per-definition templates panel (loaded by hx-get above).
-            if (show_approval)
-                html += "<div id=\"ox-templates\"></div>";
 
             if (probe_sets) {
                 if (!show_sets) {

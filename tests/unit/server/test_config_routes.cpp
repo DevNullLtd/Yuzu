@@ -75,6 +75,11 @@ struct MockHarness {
 
     bool auth_allow{true};
     std::string auth_username{"alice"};
+    // The session's OWN role. perm_fn admits a JIT-elevated session on its own, so an
+    // "elevated" caller is perm_allow=true with session_role=user.
+    auth::Role session_role{auth::Role::admin};
+    bool session_elevated{false};  // a real, active JIT elevation on the session
+    std::string session_mcp_tier;  // non-empty models an MCP-tier bearer token
     /// Token callers are exempt from the same-site gate, so the existing cases keep working;
     /// the cross-site cases set a cookie source ("local") explicitly.
     std::string auth_source{"api_token"};
@@ -104,6 +109,10 @@ struct MockHarness {
             }
             auth::Session s;
             s.username = auth_username;
+            s.role = session_role;
+            s.mcp_tier = session_mcp_tier;
+            if (session_elevated)
+                s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
             s.auth_source = auth_source;
             return s;
         };
@@ -687,6 +696,122 @@ TEST_CASE("config_routes: PUT a secret key never leaks the raw value into the au
     for (const auto& a : h.audits)
         CHECK(a.detail.find("super-secret-value") == std::string::npos);
     CHECK(h.audits[1].detail == "value=" + std::string(RuntimeConfigStore::redacted_placeholder()));
+}
+
+// ── An elevated-only session cannot write the sign-in provider keys ──────────
+//
+// perm_fn admits a JIT-elevated session for any securable. The oidc_* keys decide who becomes
+// an administrator at an SSO login (oidc_admin_group is read from the stored value at the next
+// start), so those keys need the caller's OWN administrator role; every other key stays
+// writable under Infrastructure:Write.
+
+TEST_CASE("config_routes: an elevated-only session cannot write any oidc_* key; "
+          "nothing is stored",
+          "[pg][server][routes][config_routes][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.session_role = auth::Role::user; // admitted by perm_fn only through the elevation
+    h.session_elevated = true;
+    h.wire();
+
+    // The guard is a prefix match; build the key list from the store's allow-list so a new
+    // oidc_* key is exercised too (and the count pins that the list did not silently shrink).
+    std::vector<std::string> keys;
+    for (const auto& k : RuntimeConfigStore::allowed_keys())
+        if (k.starts_with("oidc_"))
+            keys.push_back(k);
+    REQUIRE(keys.size() == 6);
+
+    for (const auto& key : keys) {
+        INFO(key);
+        h.audits.clear();
+        auto res = h.sink.Put("/api/config/" + key, R"({"value":"x"})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("own administrator role") != std::string::npos);
+        // The standard error envelope: a correlation id in the body and in the header.
+        const auto refused = body(res->body);
+        CHECK(refused["error"]["code"] == 403);
+        CHECK(refused["error"].contains("correlation_id"));
+        CHECK(refused["error"].contains("retry_after_ms"));
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "config.update");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].target_id == key);
+        CHECK(h.audits[0].detail == "elevated_session_oidc_setting_blocked");
+        CHECK(w.store.get_value(key).empty()); // nothing persisted
+    }
+}
+
+TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder and an admin-minted "
+          "MCP token are refused for oidc_* keys with a distinct audit detail",
+          "[pg][server][routes][config_routes][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    // A custom/service role holding Infrastructure:Write: perm_fn admits, own role is user.
+    h.session_role = auth::Role::user;
+    auto res = h.sink.Put("/api/config/oidc_admin_group", R"({"value":"g"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(body(res->body)["error"].contains("correlation_id"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].detail == "admin_role_required_oidc_setting_blocked");
+
+    // A supervised MCP token minted by an administrator carries the creator's role (admin);
+    // the settings route refuses it through require_admin, so this route must too.
+    h.audits.clear();
+    h.session_role = auth::Role::admin;
+    h.session_mcp_tier = "supervised";
+    res = h.sink.Put("/api/config/oidc_admin_group", R"({"value":"g"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(w.store.get_value("oidc_admin_group").empty());
+}
+
+TEST_CASE("config_routes: an elevated-only session can still write non-oidc keys; an "
+          "administrator can write the oidc_* keys",
+          "[pg][server][routes][config_routes][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.session_role = auth::Role::user;
+    h.session_elevated = true;
+    h.wire();
+
+    auto res = h.sink.Put("/api/config/response_retention_days", R"({"value":"120"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.cfg.response_retention_days == 120);
+    res = h.sink.Put("/api/config/heartbeat_timeout", R"({"value":"300"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    // The caller's own role is admin (a local account, or an IdP-mapped SSO session).
+    h.session_role = auth::Role::admin;
+    h.session_elevated = false;
+    for (const auto& [key, value] :
+         std::vector<std::pair<std::string, std::string>>{{"oidc_issuer", "https://idp.example"},
+                                                          {"oidc_client_id", "cid"},
+                                                          {"oidc_redirect_uri", "https://x/cb"},
+                                                          {"oidc_admin_group", "group-1"},
+                                                          {"oidc_skip_tls_verify", "false"}}) {
+        INFO(key);
+        res = h.sink.Put("/api/config/" + key, R"({"value":")" + value + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(w.store.get_value(key) == value);
+    }
+    res = h.sink.Put("/api/config/oidc_client_secret", R"({"value":"s3cret"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

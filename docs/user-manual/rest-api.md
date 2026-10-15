@@ -245,7 +245,7 @@ Every request is checked against a per-route body-size cap **before authenticati
 | Status | Meaning |
 |---|---|
 | `413` | The body's **declared `Content-Length`** exceeds the resolved cap for this route's class. |
-| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Two classes refuse an unmeasurable body today: `/mcp/` and `upload_session`** (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes) — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
+| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Three classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes) and `hardware`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
 | `415` | The request carries a `Content-Encoding` header set to anything other than `identity` (case-insensitive). Refused **unconditionally, on every route class, regardless of `requires_measurable`** — unlike the framing rule above, this does not depend on a per-class opt-in. Why: this build compiles `CPPHTTPLIB_BROTLI_SUPPORT`, httplib decompresses transparently and enforces only its 100 MiB global limit against the **decompressed** size, so `Content-Length` on a compressed body measures the wrong thing and a sub-cap compressed body can expand to ~100 MiB before anything downstream sees it. No Yuzu route accepts a compressed request body today, so this costs a conforming client nothing — send the body identity-encoded by **omitting `Content-Encoding` entirely**. Do **not** send `Content-Encoding: identity` explicitly: `has_non_identity_content_encoding` correctly admits it past this gate (it isn't a compressed encoding), but httplib's own body reader then calls `create_decompressor("identity")` — which matches none of gzip/deflate/br/zstd, returns null, and httplib answers a bare `415` itself (`httplib.h`'s `prepare_content_receiver`), before this gate, any route handler, or the A4/SCIM envelope code ever runs. That response carries none of the structure this section promises — no A4 envelope, no `correlation_id`, no `yuzu_body_cap_rejected_total` increment. Until that gap is closed at the code level, the only conforming way to send an identity-encoded body is to omit the header. |
 
 All three responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved) — **except the `scim` class**, which publishes SCIM's own RFC 7644 §3.12 error shape (`schemas`/`status`/`detail`) on `application/scim+json` instead of the generic envelope (`scim::error()`, `scim_json.hpp:192`; wired into all three status codes above in `server.cpp`'s pre-routing handler). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first. **This is not purely a timing change for every affected class.** For most (response templates, CA import), an earlier rejection at the same byte count is the entire effect. SCIM is **no longer** an exception to that either (fixed as part of this change, D7): the pre-routing rejection's SCIM shape matches the wording of the handler's own (now-superseded, and unreachable — the pre-routing cap and the handler check the identical 64 KiB threshold, so the pre-routing gate always wins first) `413` check exactly, and extends the same shape to the `411`/`415` cases the handler-level check never covered.
@@ -273,7 +273,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 
 | Method | Path prefix | Cap | `path_class` | Notes |
 |---|---|---|---|---|
-| any | `/mcp/` | 4 MiB | `mcp` | One of two classes with `requires_measurable=true` — see the 411 row above. |
+| any | `/mcp/` | 4 MiB | `mcp` | One of three classes with `requires_measurable=true` — see the 411 row above. |
 | POST | `/api/v1/bundles` | 70 MiB | `bundles` | Sized to the live-query bundle route's own computed 64 MiB parameter-byte floor plus JSON overhead headroom. |
 | any | `/api/v1/uploads` | 8 MiB | `upload_session` | The other `requires_measurable=true` class. Exact mirror of the PR1.6a chunked-receive protocol's own `kDefaultChunkMaxBytes` (`upload_grant_parsers.hpp`), bound to it by a `static_assert` in `file_retrieval_routes.cpp` so the two cannot drift. Any method — the session-open POST, chunk PUT, status GET, commit POST, and cancel DELETE all share this class; only the chunk PUT carries a large body, but scoping to PUT alone would silently drop the sibling verbs to the 4 MiB catch-all. |
 | any | `/api/v1/plugin-config` | 256 KiB | `plugin_config` | † The store's own grammar caps a config value at 8 KiB and a secret plaintext at 64 KiB (`plugin_config_parsers.hpp`); 256 KiB covers the larger of the two plus JSON framing/escaping headroom, while keeping an unauthenticated flood against this surface two orders of magnitude under the 4 MiB catch-all. Any method — PUT config/secret writes, DELETE carries no body, GET/list are bodyless. |
@@ -302,7 +302,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/instructions/yaml` | 3076 KiB | `instruction_yaml` | † The handler checks the FORM-DECODED `yaml_source` field at 1048576 chars (`instruction_yaml.cpp:165`); 3× worst-case percent-encoding of that value, plus 4 KiB flat headroom for field-name framing and the `id` field (save only). |
 | POST | `/api/instructions/validate-yaml` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | POST | `/fragments/instructions/yaml-preview` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
-| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` carries a body (a single short `source` enum token); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
+| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` and `POST /api/v1/hardware/sync` carry a body (a short `source` enum token, and for the fan-out a scope token or an expression of at most 1,024 bytes); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any | `/api/v1/rbac/roles/` | 4 KiB | `rbac_role_assignment` | A2 global human role assignment — see "Fleet-Wide Role Assignment" below. `POST .../assignments` body is `{principal_type, principal_id}`, two short strings; `DELETE .../assignments/{principal_id}` carries none. Any method — the DELETE sibling shares this literal prefix once past the role-name path segment. |
 | any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/users` | 16 KiB | `users` | The local-account user subtree: `POST .../me/password` and `POST .../{name}/password` (#5342) plus the bodyless `.../unlock` and the small `.../elevation-eligibility`. The largest legitimate body is two passwords at the 1024-byte policy maximum; worst-case JSON escaping puts that near 12.3 KiB, so 16 KiB admits every policy-conformant request. Any method, because the bodyless siblings share the prefix. |
@@ -445,7 +445,7 @@ existence-oracle closure exactly).
 
 ### Hardware
 
-The Hardware CI list and single-device CI record: the two read routes of the OpenAPI tag `Hardware`, followed by a short entry for the on-demand sync `POST /api/v1/hardware/{id}/sync`. Both read routes are audited on a served read, and with `result=failure` when the device roster could not be read.
+The Hardware CI list and single-device CI record: the two read routes of the OpenAPI tag `Hardware`, followed by short entries for the on-demand syncs `POST /api/v1/hardware/{id}/sync` (one device) and `POST /api/v1/hardware/sync` (a scope or the fleet). Both read routes are audited on a served read, and with `result=failure` when the device roster could not be read.
 
 #### `GET /api/v1/hardware`
 
@@ -488,9 +488,17 @@ One device's CI record: identity, device-CI blob, installed software and tags, e
 
 ---
 
+#### `POST /api/v1/hardware/sync`
+
+Requests an on-demand software-inventory sync for a device, a scope or the whole fleet (the Software page's **Sync now**). **Permission:** `Execution:Execute`, checked as a global grant: an operator whose `Execution:Execute` is limited to management groups is refused with `403` for every scope kind. The route also confines its targets to the caller's own `Execution:Execute` visible set and refuses the whole fleet (`"scope":"__all__"`) unless that set is unfiltered (`403`); with a global grant neither changes the outcome today, and both are defence in depth for when the gate becomes scope-aware. The body names the targets with exactly one of `scope` (`__all__`, `group:<id>` or a device id, up to 256 bytes) or `scope_expression` (a scope expression, up to 1,024 bytes); `source` may only be `installed_software`.
+
+A run reaches agents attached to **this server process** only. `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability). Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing. `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents below 0.13.1 are skipped and counted in `skipped_version`. At most 500 devices are reached per request (`413`). A group, scope or fleet run is limited to one per operator per 60 seconds (`429`, `Retry-After`) (an attempt refused for exceeding 500 devices, or with no live target, counts as a run; a send every device refused does not) and one at a time (`409`; the slot is a 120 s lease a later run can take over, but only while fewer than three stalled runs are alive, after which `409` persists until one of them unwinds or the server restarts), both per server process rather than cluster-wide (with several active servers each allows its own run, still bounded by the 500-device cap); a single named device is exempt. The `202` body carries counts only (`requested`, `agents_reached`, `skipped_offline`, `skipped_version`) plus `command_id`, never device ids. A server that is missing a required component answers `500` and writes a `result=failure` audit row. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site, otherwise it is refused with `403` and a `csrf.denied` audit row; API-token and MCP-token callers are exempt. Who is reached is decided at send time by the `dispatch_confined_arms` system-reserved arm, which intersects the target list with the caller's own `Execution:Execute` visible set. The MCP tool `sync_hardware_software` is the twin of this route and shares its cooldown and its single in-flight run. The request, statuses and bounds are in the OpenAPI document. **Audit:** `inventory.sync.request`, written before dispatch (see [audit-log.md](audit-log.md)).
+
+---
+
 #### `POST /api/v1/hardware/{id}/sync`
 
-Requests an on-demand agent sync for one device. **Permission:** `Execution:Execute` scoped to the device. The body, the `202` and the `409` are described in the OpenAPI document. A device id longer than 256 bytes or containing a byte below `0x20` is a `400`, answered before the permission check and with no audit row (the same id rule as `GET /api/v1/hardware/{id}`, including the registration note there). **Audit:** `inventory.sync.request` (see [audit-log.md](audit-log.md)).
+Requests an on-demand agent sync for one device. **Permission:** `Execution:Execute` scoped to the device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The body, the `202` and the `409` are described in the OpenAPI document. A device id longer than 256 bytes or containing a byte below `0x20` is a `400`, answered before the permission check and with no audit row (the same id rule as `GET /api/v1/hardware/{id}`, including the registration note there). **Audit:** `inventory.sync.request` (see [audit-log.md](audit-log.md)).
 
 ---
 
@@ -1778,7 +1786,7 @@ curl -s -X POST \
 
 Grant or revoke a user's **JIT-admin-elevation eligibility** — who may activate a time-boxed admin elevation via `POST /api/v1/elevate` (SOC 2 CC6.3/CC6.6). This is the per-user `users.elevation_eligible` flag, distinct from holding standing admin and enumerable for access reviews. See [JIT Admin Elevation](#jit-admin-elevation) below and `docs/auth-architecture.md` "JIT admin elevation".
 
-**Permission:** admin (or an active elevation) **+ MFA step-up**. **Self-grant is blocked** — an operator cannot set their own eligibility (another admin must).
+**Permission:** admin **+ MFA step-up** (an active elevation suffices only to revoke). **Self-grant is blocked** — an operator cannot set their own eligibility (another admin must). **Granting** (`eligible=true`) needs the caller's own administrator role: a session that is administrator only through an elevation gets `403` (audit `user.elevation_eligibility.set / denied / elevated_session_eligibility_grant_blocked`). Revoking is still open to an elevated session.
 
 **Body:** `{"eligible": <bool>}`.
 
@@ -1804,9 +1812,9 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 **Response (200):** `{"status":"ok"}`.
 
-**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated, or MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — not admin, self-grant, or a SAML session (step-up is not available for SAML sessions); `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
+**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated, or MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — not admin, self-grant, a grant (`eligible=true`) from a session that is administrator only through an elevation, or a SAML session (step-up is not available for SAML sessions); `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
 
-**Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` on a 403).
+**Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` or `elevated_session_eligibility_grant_blocked` on a 403).
 
 ---
 
@@ -2073,7 +2081,10 @@ Quarantine a device.
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
 
-Release a device from quarantine.
+Release a device from quarantine. This ends the server's quarantine **record** only: it does
+**not** remove the device's firewall rules. To lift those, run the quarantine plugin's release
+instruction (`security.quarantine.release`, "Release Device from Quarantine") from the Instructions
+page or through `execute_instruction`.
 
 **Permission:** `Security:Execute`, scoped per-device (see the note above)
 
@@ -3692,7 +3703,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `api_token.create` | API token created |
 | `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
 | `user.create` | Local account created. `result` ∈ {`success`, `denied`}. Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 bytes), `too_long` (400 — more than 1024 bytes, #5342). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
-| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`, `failure`, `partial`}. Denied detail values: `self_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `last_administrator_blocked` (409), `inactive_promotion_refused` (409). `result=failure` with detail `store_failure` (503, no retry hint) when the guarded write did not complete (this replaces the former `denied` / `db_failure` 500), and `result=partial` with detail `role_changed session_wipe_failed=true old_role=<role> new_role=<role>` (503, no retry hint) when the role changed but session cleanup failed. `inactive_promotion_refused` is a store-level rule: the route answers `user_not_found` (404) for an inactive account, so the 409 can occur only when the account is deactivated between the route's lookup and the write. `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role - recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
+| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`, `failure`, `partial`}. Denied detail values: `self_role_change_blocked` (403), `elevated_session_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `last_administrator_blocked` (409), `inactive_promotion_refused` (409). `result=failure` with detail `store_failure` (503, no retry hint) when the guarded write did not complete (this replaces the former `denied` / `db_failure` 500), and `result=partial` with detail `role_changed session_wipe_failed=true old_role=<role> new_role=<role>` (503, no retry hint) when the role changed but session cleanup failed. `inactive_promotion_refused` is a store-level rule: the route answers `user_not_found` (404) for an inactive account, so the 409 can occur only when the account is deactivated between the route's lookup and the write. `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role - recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
 | `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`, `failure`, `partial`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404), `owns_active_engine_principal` (409), `last_administrator_blocked` (409, nothing revoked: the early form). The LATE form is `result=partial` (credentials were revoked and the account stays active), detail `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary. `failure` detail `store_failure ...` (503), or `identity_link_resolution_failed` / `api_token_store_unavailable`; `partial` detail `account_deactivated session_wipe_failed=true ...` (503) or the revoke summary with `api_tokens_db_error=true` (500). |
 | `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`; the principal is the caller on every row, including those written after its own session was revoked. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service sessions_revoked=<N> provisional_mfa_cleared=<true\|false>`, written in the same transaction as the change (no separate `session.revoke_all` row). Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `wrong_current`, `account_locked`, `sso_only_local_disabled`, `verify_transient`, `not_found`, `conflict`, `store_unavailable`, `audit_unavailable`. A malformed body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. Never carries the password or its length. |
 | `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`, principal = the caller. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user> sessions_revoked=<N> provisional_mfa_cleared=<true\|false>` (no separate `session.revoke_all` row), plus — only when a lockout existed — an `auth.lockout.cleared` row (`result=ok`, `detail=password_reset`), both in the same transaction as the reset. Denied/error detail tokens: `token_session`, `csrf`, `durable_admin_required`, `admin_gate_unavailable`, `self_target`, `break_glass_target`, `not_found`, `not_local`, `store_unavailable`, `audit_unavailable`. A malformed username or body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. |
@@ -4110,7 +4121,7 @@ Create a new policy fragment from YAML.
 }
 ```
 
-**Response (400):** YAML missing required fields, oversized payload, invalid CEL compliance expression. Body is `{"error": "<reason>"}`.
+**Response (400):** YAML missing required fields, oversized payload, invalid CEL compliance expression, or an explicit `id` that is longer than 128 characters, holds a character other than letters, digits, `.`, `_` and `-`, or consists only of dots. Body is `{"error": "<reason>"}`.
 
 **Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
 
@@ -4231,7 +4242,7 @@ Create a new policy from YAML.
 }
 ```
 
-**Response (400):** YAML missing required fields, unknown `fragment_id`, invalid scope expression. Body is `{"error": "<reason>"}`.
+**Response (400):** YAML missing required fields, unknown `fragment_id`, invalid scope expression, or an explicit `id` that is longer than 128 characters, holds a character other than letters, digits, `.`, `_` and `-`, or consists only of dots. Body is `{"error": "<reason>"}`.
 
 **Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body.
 
@@ -4751,7 +4762,7 @@ keys with a stored override, so a key can appear in `config` without appearing i
 
 Update a single runtime configuration value. The key must be one of the allowed runtime-configurable keys.
 
-**Permission:** `Infrastructure:Write`
+**Permission:** `Infrastructure:Write`. Writing an `oidc_*` key also needs the caller's own administrator role (the local account role, or the role mapped from the identity provider) from an interactive session: any session whose own role is not `admin` (an administrator only through a temporary elevation, or a non-administrator holding `Infrastructure:Write`) and any MCP-tier token gets `403` and the audit row `config.update / denied`, detail `elevated_session_oidc_setting_blocked` (elevation) or `admin_role_required_oidc_setting_blocked`. Every other key stays writable under `Infrastructure:Write`.
 
 **Audit:** audit-first (ADR-0033 section 9, no audit row, no mutation). An `attempted` `config.update` row is written before anything changes; if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and the key is neither stored nor applied. A `success` row follows a change, or a `failure` row a store refusal. If only that outcome row is lost the change stays applied and the `200` carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)). Each accepted call therefore leaves two rows.
 
@@ -4816,17 +4827,19 @@ most keys:
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
   appear to have no effect - because it has none. Manage auto-approve through its own rules API.
-- **OIDC keys (see note)** - persisted only, and **a restart does not apply them either.** The
-  `OidcProvider` is constructed early in server startup (`server.cpp:1894`) from CLI/environment
-  configuration, whereas the stored runtime-config overrides are not read until much later in the
-  same startup (`server.cpp:3466`); nothing rebuilds the provider afterwards. So a value written
+- **OIDC keys (see note)** - persisted only for the provider, and **a restart does not rebuild it from
+  them.** The `OidcProvider` is constructed early in server startup from CLI/environment
+  configuration, whereas the stored runtime-config overrides are applied later in the same startup
+  (`apply_runtime_config_overrides()`); nothing rebuilds the provider afterwards. So a value written
   through this API never reaches the live provider, on this boot or any later one.
   **Only Settings -> OIDC (`POST /api/settings/oidc`) applies OIDC settings**, because that handler
   constructs a new provider and swaps it in - but that swap is **process-local**. The startup path
-  DOES read these keys out of the store, just too late to matter - the provider is already built and
-  nothing rebuilds it - so a restart runs on whatever the command line or environment supplies. To
+  DOES read these keys out of the store, just too late to matter to the provider - it is already built and
+  nothing rebuilds it - so a restart builds the provider from whatever the command line or environment supplies. To
   change OIDC durably, update that value as well as saving through Settings. This matters most for a credential rotation: a `PUT` of
   `oidc_client_secret` returns `"applied": true` meaning *persisted and accepted*, never *in use*.
+  The stored `oidc_admin_group` is the exception: it does take effect after a restart, which is why
+  writing any `oidc_*` key needs your own administrator role.
 
 **Request body:**
 
@@ -4873,10 +4886,11 @@ another OIDC field, restart first so the process is not holding the old value.
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
 > 'value' in request body", `400` "invalid JSON body", `400` "request body nests too deeply"
-> (over 32 levels, `kMcpMaxJsonDepth`), and a `503` "runtime config store unavailable"
+> (over 32 levels, `kMcpMaxJsonDepth`), a `403` "changing sign-in provider settings needs your own
+> administrator role" (an `oidc_*` key written by a session whose own role is not `admin`), and a `503` "runtime config store unavailable"
 > when the runtime-config store is unavailable (`GET` and `PUT` now share the identical message; an
 > earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
-> deliberate distinction, and has been unified). Note `503` is emitted by **both** sources, so status
+> deliberate distinction, and has been unified). Note `503` and `403` are emitted by **both** sources, so status
 > alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
 > it, on every status. Two refusals added with the audit-first and same-site gates use the A4 envelope
 > (`correlation_id` present): `403` `cross-site request refused` and `503` `audit log unavailable; the
@@ -4927,7 +4941,7 @@ client secret contains `<redacted>`, rotate it at the IdP to a value that does n
 { "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
 ```
 
-**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error).
+**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error). A refused `oidc_*` write (the caller's own role is not `admin`) emits `config.update` / `denied` (detail `elevated_session_oidc_setting_blocked` or `admin_role_required_oidc_setting_blocked`), stores nothing and is not preceded by an `attempted` row.
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
@@ -9497,7 +9511,7 @@ outcome's granularity.
 
 **`POST /api/settings/oidc`** — Save OIDC / Entra ID SSO configuration.
 
-- **Permission:** Admin only
+- **Permission:** Admin only, on the caller's own account (the local account role, or the administrator role mapped from the identity provider). A session that is administrator only through a temporary elevation gets `403`; audit `oidc.configure / denied / elevated_session_oidc_change_blocked`.
 - **Request body (form-encoded):**
 
 | Field | Type | Required | Description |
@@ -9510,7 +9524,7 @@ outcome's granularity.
 | `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 - **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success.
-- **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts to that value. Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
+- **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts the provider to that value (the stored `oidc_admin_group` still applies after a restart; see [When a change takes effect](#when-a-change-takes-effect)). Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
 **`POST /api/settings/oidc/test`** — Test OIDC discovery connectivity.
 
@@ -9565,7 +9579,7 @@ Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration c
 | `content` | string | Yes | PEM-encoded content (must contain `-----BEGIN`) |
 
 - **Response:** Re-rendered TLS Settings fragment (HTMX). Returns toast notification on success.
-- **Effect:** Writes PEM content to the server cert directory. Key files are set to 0600 permissions. Config is updated immediately; HTTPS cert hot-reload will pick up changes within the polling interval.
+- **Effect:** Writes PEM content to the server cert directory. A `key` is created owner-only (0600) and replaced atomically by rename (a symlink at the destination is replaced, not followed); a certificate directory the server creates is 0700, and an existing directory's mode is left as it is. Config is updated immediately; HTTPS cert hot-reload will pick up changes within the polling interval.
 
 ---
 
@@ -9753,7 +9767,7 @@ Create a new local account.
 Change the role of an existing user. Dedicated endpoint introduced in
 v0.12.0 to give role transitions their own audit chain (governance C1).
 
-- **Permission:** Admin only
+- **Permission:** Admin, on the caller's own account (the local account role, or the administrator role mapped from the identity provider). A session that is administrator only through a temporary elevation gets `403`.
 - **Request body (JSON):**
 
 ```json
@@ -9773,6 +9787,8 @@ The `role` field must be exactly `admin` or `user`.
   Each branch emits `user.role_change / denied / <reason>`.
 
 - **Response (403):** Self-target rejected. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Cannot change your own role","level":"error"}}`. Audit `user.role_change / denied / self_role_change_blocked`. To demote yourself, create a second admin, log out, log in as the second admin, and use this endpoint to demote the first.
+
+- **Response (403):** The caller is an administrator only through a temporary elevation (their own account role is not `admin`). Audit `user.role_change / denied / elevated_session_role_change_blocked`. Changing an account role needs the caller's own administrator role.
 
 - **Response (404):** `:username` does not match any persisted user. Audit `user.role_change / denied / user_not_found`.
 

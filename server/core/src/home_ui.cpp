@@ -17,7 +17,7 @@ namespace {
 // The fifteen screens, exactly as the design's table names them (name, link,
 // sentence) and with the nav's own icons. `key` doubles as the `next` key.
 constexpr Screen kOperate[] = {
-    {"dashboard", "Dashboard", "/", "Ask every device a question and watch the answers arrive.",
+    {"dashboard", "Console", "/", "Ask every device a question and watch the answers arrive.",
      "M4 17l6-6-6-6 M12 19h8"},
     {"instructions", "Instructions", "/instructions",
      "A library of questions and actions, with approval where it matters.",
@@ -37,7 +37,7 @@ constexpr Screen kPosture[] = {
      "M3 12a9 9 0 109-9 M3 4v5h5 M12 7v5l3 2"},
 };
 constexpr Screen kEstate[] = {
-    {"devices", "Devices", "/devices", "Every device, with tags, properties and quarantine.",
+    {"devices", "Devices", "/devices", "Every device, with tags and properties.",
      "M3 4h18v12H3z M8 20h8 M12 16v4"},
     {"hardware", "Hardware", "/hardware", "CPU, memory, disks and firmware across the fleet.",
      "M7 7h10v10H7z M9 3v4 M15 3v4 M9 17v4 M15 17v4 M3 9h4 M3 15h4 M17 9h4 M17 15h4"},
@@ -85,6 +85,7 @@ constexpr std::string_view kHead = R"HTM(<!DOCTYPE html>
 <title>Yuzu</title>
 <link rel="icon" href="data:,"><link rel="stylesheet" href="/static/yuzu.css">
 <script src="/static/htmx.js"></script>
+<script>try{var t=localStorage.getItem('yuzu-theme');if(/^(slate|navy|jade|light|light-baby|light-hot)$/.test(t))document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
 </head><body>
 <div class="land">
 <header class="lh"><a class="brand" href="/home" aria-label="Yuzu home">Yuzu<i></i></a>)HTM";
@@ -97,13 +98,13 @@ constexpr std::string_view kLedeOut =
     "Yuzu runs on your own servers. Sign in to see the estate, run instructions on it and "
     "review what changed.";
 constexpr std::string_view kLedeIn =
-    "Yuzu runs on your own servers. Open the Dashboard to ask your first question, or pick an "
+    "Yuzu runs on your own servers. Open the Console to ask your first question, or pick an "
     "area below.";
 constexpr std::string_view kMfaNote =
     "If two-factor is on for your account, you will be asked for a code next. Forgot your "
     "password, or need an account? Ask a Yuzu administrator.";
 constexpr std::string_view kSignedInLine =
-    "You are signed in. Open the Dashboard, or pick an area below.";
+    "You are signed in. Open the Console, or pick an area below.";
 
 static_assert(kHead.size() < 15000 && kHeadline.size() < 15000,
               "MSVC C2026: keep every raw string literal under the 16,380-byte cap");
@@ -169,7 +170,7 @@ void append_sign_in(std::string& out, const LandingView& v) {
 }
 
 void append_signed_in(std::string& out, const LandingView& v, const std::string& host) {
-    const std::string_view label = v.next ? v.next->name : "Dashboard";
+    const std::string_view label = v.next ? v.next->name : "Console";
     const std::string_view href = v.next ? v.next->href : "/";
     out += R"(<section class="panel login" id="signed-in" aria-label="Signed in">)"
            R"(<div class="hd"><h2>Signed in</h2><div class="end"><span class="sub mono">)";
@@ -232,7 +233,8 @@ std::string render_landing(const LandingView& v) {
     out += R"(<span class="srv">)";
     // The page is reachable without a session, so the server name and the running
     // version (what an attacker looks up CVEs against) are shown to a signed-in
-    // user only: a signed-out visitor sees the brand, the form and the tiles.
+    // user only: a signed-out visitor sees the brand, the headline and the form, and the
+    // tiles (the screens behind the sign-in) only once signed in.
     if (v.who) {
         out += host;
         if (!host.empty())
@@ -250,7 +252,8 @@ std::string render_landing(const LandingView& v) {
     else
         append_sign_in(out, v);
     out += "</div></section>";
-    append_tiles(out);
+    if (v.who)
+        append_tiles(out);
     out += "</div>\n";
     if (!v.who)
         out += login_ui::sign_in_script();

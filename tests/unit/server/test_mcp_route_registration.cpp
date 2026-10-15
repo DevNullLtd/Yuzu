@@ -252,6 +252,58 @@ std::size_t find_live_call(const std::string& src, const std::string& call) {
 }
 } // namespace
 
+TEST_CASE("mcp route registration: wiring -- server.cpp wires the software sync runner before "
+          "register_routes",
+          "[server][routes][mcp]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const auto reg = find_live_call(src, "mcp_server_->register_routes(");
+    const auto run =
+        find_live_call(src, "mcp_server_->set_software_sync_runner(software_sync_runner())");
+    REQUIRE(reg != std::string::npos);
+    REQUIRE(run != std::string::npos);
+    CHECK(run < reg);
+}
+
+// The fleet "Sync now" composition cannot be built in a unit test (it lives in ServerImpl), so the
+// two guarantees the unit tests cannot see are pinned on the source: (1) the Runner's send goes
+// through the dispatch_confined_arms system-reserved arm, so reach is decided by the seam; (2) REST
+// and MCP receive the SAME memoised Runner, so one cooldown and one in-flight lease bind both.
+TEST_CASE("mcp route registration: wiring -- the sync runner is one shared instance whose send goes "
+          "through the confined-dispatch seam",
+          "[server][routes][mcp]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    // (1) the Runner env dispatches via push_sync_now_confined, which calls the seam helper.
+    CHECK(find_live_call(src, "return push_sync_now_confined(") != std::string::npos);
+    const auto confined = find_live_call(src, "push_sync_now_confined(const auth::Session& sess");
+    REQUIRE(confined != std::string::npos);
+    // The helper call sits inside push_sync_now_confined, before the next member function.
+    const auto seam = src.find("yuzu::server::dispatch_system_reserved_ids(", confined);
+    REQUIRE(seam != std::string::npos);
+    CHECK(seam - confined < 2500);
+    // The confined-dispatch arm has exactly one production caller: its containment-gate bypass is
+    // for the read-only __sync__.now push only, and a second caller would inherit it.
+    {
+        auto count = std::size_t{0};
+        for (auto at = src.find("dispatch_system_reserved_ids("); at != std::string::npos;
+             at = src.find("dispatch_system_reserved_ids(", at + 1))
+            ++count;
+        CHECK(count == 1);
+    }
+    // (2) one memoised runner handed to both surfaces.
+    CHECK(find_live_call(src, "if (!sync_runner_) {") != std::string::npos);
+    CHECK(find_live_call(src, ".sync_runner = software_sync_runner()") != std::string::npos);
+    CHECK(find_live_call(src, "mcp_server_->set_software_sync_runner(software_sync_runner())") !=
+          std::string::npos);
+    // Exactly one construction site: a second would be a second cooldown.
+    const auto first = src.find("software_sync::Runner>(std::move(env))");
+    REQUIRE(first != std::string::npos);
+    CHECK(src.find("software_sync::Runner>(std::move(env))", first + 1) == std::string::npos);
+}
+
 TEST_CASE("mcp route registration: wiring -- server.cpp wires the deployment store and "
           "the discovery reader before register_routes",
           "[server][routes][mcp]") {

@@ -139,7 +139,7 @@ std::string render_routes_table(const json& doc, std::string_view q_raw) {
         return render_state("empty", "No operation matches \"" + clean_filter(q_raw) + "\".");
 
     const std::size_t shown = std::min(match.size(), kRoutesCap);
-    std::string h = "<p class=\"hint\" style=\"padding:10px 16px\">REST v1 only. The dashboard's own "
+    std::string h = "<p class=\"hint\" style=\"padding:10px 16px\">REST v1 only. The Console's own "
                     "routes (/api/..., /fragments/...) are not listed.</p>";
     h += table_open("Method", "Path", "Tags");
     for (std::size_t i = 0; i < shown; ++i) {
