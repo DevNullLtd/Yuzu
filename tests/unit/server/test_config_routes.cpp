@@ -41,10 +41,13 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <optional>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -453,6 +456,86 @@ TEST_CASE("config_routes: PUT from a cookie session needs a same-site Origin or 
     auto token = h.sink.dispatch("PUT", path, R"({"value":"121"})", "application/json", {});
     REQUIRE(token);
     CHECK(token->status == 200);
+}
+
+TEST_CASE("config_routes: PUT same-site gate sits after the permission gate and before the body",
+          "[pg][server][routes][config_routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.auth_source = "local";
+    h.cfg.csrf_trusted_origins = {"https://proxy.example"};
+    h.wire();
+    const std::string path = "/api/config/response_retention_days";
+    const std::unordered_map<std::string, std::string> foreign{{"Host", "yuzu.example"},
+                                                               {"Origin", "https://evil.example"}};
+
+    // An unauthorised caller gets the permission 403, not the cross-site refusal or a row.
+    h.perm_allow = false;
+    auto unauth = h.sink.dispatch("PUT", path, "not json", "application/json", foreign);
+    REQUIRE(unauth);
+    CHECK(unauth->status == 403);
+    CHECK(unauth->body.find("denied") != std::string::npos);
+    CHECK(h.audits.empty());
+    h.perm_allow = true;
+
+    // A foreign browser write is refused before its (malformed) body is looked at.
+    auto cross = h.sink.dispatch("PUT", path, "not json", "application/json", foreign);
+    REQUIRE(cross);
+    CHECK(cross->status == 403);
+    CHECK(cross->body.find("cross-site") != std::string::npos);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "csrf.denied");
+
+    // A same-site Referer with no Origin is admitted; so is a configured trusted origin.
+    auto referer = h.sink.dispatch("PUT", path, R"({"value":"120"})", "application/json",
+                                   {{"Host", "yuzu.example"},
+                                    {"Referer", "https://yuzu.example/settings/general"}});
+    REQUIRE(referer);
+    CHECK(referer->status == 200);
+    auto trusted = h.sink.dispatch("PUT", path, R"({"value":"121"})", "application/json",
+                                   {{"Host", "internal:8080"}, {"Origin", "https://proxy.example"}});
+    REQUIRE(trusted);
+    CHECK(trusted->status == 200);
+    CHECK(h.cfg.response_retention_days == 121);
+}
+
+TEST_CASE("config: LiveSeconds copies and assigns by value and is safe across threads",
+          "[server][config_routes][concurrency]") {
+    yuzu::server::Config a;
+    CHECK(a.session_timeout.count() == 90);
+    a.session_timeout = std::chrono::seconds(45);
+    yuzu::server::Config b = a; // Config is passed and copied by value
+    CHECK(b.session_timeout.count() == 45);
+    b.session_timeout = std::chrono::seconds(60);
+    a = b;
+    CHECK(static_cast<std::chrono::seconds>(a.session_timeout) == std::chrono::seconds(60));
+
+    // One writer and several readers/copiers on fixed iteration counts (no sleeps): every value
+    // seen is one that was written. Under the CI sanitizer leg a plain seconds member races here.
+    yuzu::server::Config shared;
+    shared.session_timeout = std::chrono::seconds(30);
+    std::atomic<bool> bad{false};
+    std::thread writer([&] {
+        for (int i = 0; i < 20000; ++i)
+            shared.session_timeout = std::chrono::seconds(i % 2 ? 30 : 90);
+    });
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 3; ++t)
+        readers.emplace_back([&] {
+            for (int i = 0; i < 20000; ++i) {
+                const auto v = shared.session_timeout.count();
+                const yuzu::server::Config copy = shared;
+                const auto c = copy.session_timeout.count();
+                if ((v != 30 && v != 90) || (c != 30 && c != 90))
+                    bad = true;
+            }
+        });
+    writer.join();
+    for (auto& r : readers)
+        r.join();
+    CHECK_FALSE(bad.load());
 }
 
 TEST_CASE("config_routes: PUT a non-numeric value for an integer key is a 400, cfg untouched, "

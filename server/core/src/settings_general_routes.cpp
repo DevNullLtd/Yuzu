@@ -1,6 +1,7 @@
 #include "settings_general_routes.hpp"
 
-#include "web_utils.hpp" // html_escape
+#include "runtime_config_store.hpp" // kMinHeartbeatTimeoutSeconds: the one source of the floor
+#include "web_utils.hpp"            // html_escape
 
 #include <array>
 #include <string_view>
@@ -30,8 +31,8 @@ bool is_settable(std::string_view level) {
     return false;
 }
 
-constexpr std::string_view kHeartbeatHint =
-    "Seconds, 30 or more. Default 90. Applies to agents connected directly to this server, from its next "
+constexpr std::string_view kHeartbeatHintTail =
+    ". Default 90. Applies to agents connected directly to this server, from its next "
     "sweep. Agents behind a gateway are not covered. Other server replicas keep their own value "
     "and pick the stored one up when they restart.";
 constexpr std::string_view kLogLevelHint =
@@ -49,6 +50,7 @@ std::string chip(std::string_view label, const std::string& value_html) {
 std::string render_general_runtime(const RuntimeView& v) {
     const std::string level = normalise_level(v.log_level);
     const std::string hb = std::to_string(v.heartbeat_seconds);
+    const std::string floor = std::to_string(kMinHeartbeatTimeoutSeconds);
     const bool off = !v.store_available;
 
     std::string html = "<form id=\"general-runtime-form\" class=\"form\" novalidate"
@@ -60,12 +62,12 @@ std::string render_general_runtime(const RuntimeView& v) {
 
     html += "<div class=\"row2\"><div class=\"fld\"><label for=\"gen-heartbeat\">Agent heartbeat "
             "timeout (seconds)</label><input class=\"in\" id=\"gen-heartbeat\" "
-            "name=\"heartbeat_timeout\" type=\"number\" min=\"30\" step=\"1\" "
+            "name=\"heartbeat_timeout\" type=\"number\" min=\"" + floor + "\" step=\"1\" "
             "inputmode=\"numeric\" value=\"" +
             hb + "\" aria-describedby=\"gen-heartbeat-hint\"" + (off ? " disabled" : "") +
-            "><span class=\"hint\" id=\"gen-heartbeat-hint\">" + std::string(kHeartbeatHint) +
+            "><span class=\"hint\" id=\"gen-heartbeat-hint\">" + "Seconds, " + floor + " or more" + std::string(kHeartbeatHintTail) +
             "</span><span class=\"field-err\" id=\"gen-heartbeat-err\" role=\"alert\" hidden>"
-            "Enter a whole number of seconds, 30 or more.</span></div>";
+            "Enter a whole number of seconds, " + floor + " or more.</span></div>";
 
     html += "<div class=\"fld\"><label for=\"gen-log-level\">Log level</label><select "
             "id=\"gen-log-level\" name=\"log_level\" aria-describedby=\"gen-log-level-hint\"" +

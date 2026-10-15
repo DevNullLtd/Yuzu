@@ -379,8 +379,9 @@ TEST_CASE("general page: both confirms and the audit-failure header are present"
                                        "(about every 15 seconds). It is "));
     CHECK_THAT(html, ContainsSubstring("Agents behind a gateway and other server replicas are not "
                                        "affected by this setting."));
-    // The server refuses under 30 s, so the page rejects it before any confirm.
-    CHECK_THAT(html, ContainsSubstring("parseInt(v, 10) < 30"));
+    // The server refuses under its floor (the input's min attribute), so the page rejects it
+    // before any confirm.
+    CHECK_THAT(html, ContainsSubstring("parseInt(v, 10) < parseInt(hb.min, 10)"));
     CHECK_THAT(html, !ContainsSubstring("is below the default agent heartbeat interval"));
     CHECK_THAT(html, ContainsSubstring("will take up to "));
     CHECK_THAT(html, ContainsSubstring("changed since you opened this page"));

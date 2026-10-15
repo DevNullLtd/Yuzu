@@ -13958,7 +13958,16 @@ private:
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
                 try {
-                    cfg_.session_timeout = std::chrono::seconds(std::stoi(e.value));
+                    // A value stored before the 30 s floor existed would make every directly
+                    // connected agent flap; keep the default instead and say so.
+                    const int stored = std::stoi(e.value);
+                    if (stored < kMinHeartbeatTimeoutSeconds)
+                        spdlog::warn("Ignoring stored heartbeat_timeout {}: below the {} second "
+                                     "minimum; using {} seconds",
+                                     stored, kMinHeartbeatTimeoutSeconds,
+                                     cfg_.session_timeout.count());
+                    else
+                        cfg_.session_timeout = std::chrono::seconds(stored);
                 } catch (...) {}
             } else if (e.key == "response_retention_days") {
                 try {
