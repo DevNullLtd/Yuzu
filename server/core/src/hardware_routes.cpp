@@ -14,6 +14,7 @@
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
 
+#include <yuzu/protective_actions.hpp> // protective::is_quarantine_control_plugin
 #include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
 
 #include <nlohmann/json.hpp>
@@ -891,6 +892,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const std::optional<std::string> manifest =
                 deps_.manifest_fn ? deps_.manifest_fn(plugin.name) : std::nullopt;
             for (const auto& action : plugin.actions) {
+                // Hidden with the rest of the containment UI: a Run button on the quarantine
+                // plugin's own actions is a quarantine control. REST, MCP and the Instructions
+                // page are unchanged.
+                if (!deps_.containment_ui &&
+                    yuzu::protective::is_quarantine_control_plugin(plugin.name, action))
+                    continue;
                 HwActionRow row;
                 row.plugin = plugin.name;
                 row.action = action;

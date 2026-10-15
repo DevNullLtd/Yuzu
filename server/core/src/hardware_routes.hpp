@@ -324,8 +324,8 @@ public:
         /// = no pill and no banner (the panel and lens have their own routes).
         QuarantineListFn quarantine_list_fn;
         /// Show every quarantine/containment control on the Hardware pages. False: no pill,
-        /// row link, banner, panel, tab or lens, and no list-time quarantine read. The default is
-        /// kContainmentUi.
+        /// row link, banner, panel, tab or lens, no list-time quarantine read, and the quarantine
+        /// plugin's rows are left out of the Actions lens. The default is kContainmentUi.
         bool containment_ui{kContainmentUi};
         /// POST /api/v1/hardware/sync — the Software page's fleet/group/scope "Sync now".
         /// `sync_perm_fn` is the type-level Execution:Execute gate (it writes the 401/403).
