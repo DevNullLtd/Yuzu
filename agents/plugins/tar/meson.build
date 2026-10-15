@@ -80,8 +80,8 @@ elif host_machine.system() == 'linux'
   endif
 elif host_machine.system() == 'darwin'
   # Endpoint Security process stream (tar_proc_es). The probe is hoisted to the
-  # top-level meson.build (A0, endpoint_security_dep/_deps/_args) -- TAR is one
-  # of two consumers (agent-core's es_client.hpp is the other), so it just
+  # top-level meson.build (A0, endpoint_security_dep/_deps/_args) -- TAR shares
+  # it with agent-core (es_client.hpp) and the test executables, so it just
   # threads the shared result through rather than probing independently. See
   # docs/darwin-compat.md's EndpointSecurity pitfalls-table row.
   tar_deps += endpoint_security_deps

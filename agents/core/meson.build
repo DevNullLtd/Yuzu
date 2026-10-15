@@ -73,9 +73,10 @@ elif host_machine.system() == 'darwin'
   agent_platform_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'],
                                      include_type: 'system')
   # Endpoint Security (A0): shared top-level probe (meson.build), consumed
-  # here for agent-core's pure ES helpers (es_client.hpp). Empty lists on a
-  # CLT-only host -- no behaviour change until a later slice adds a real
-  # ES-dependent agent-core TU.
+  # here for agent-core's pure ES helpers (es_client.hpp). Both the Command
+  # Line Tools and Xcode SDKs ship ES, so these lists are normally non-empty and
+  # agent-core links libEndpointSecurity/libbsm although no agent-core TU calls
+  # ES yet; that is harmless (no entitlement is needed to link, only to run).
   agent_platform_deps += endpoint_security_deps
   agent_platform_args += endpoint_security_args
 endif
