@@ -553,6 +553,11 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
         }
     }
 
+    if (key == "heartbeat_timeout" && std::stoi(value) < kMinHeartbeatTimeoutSeconds)
+        return std::unexpected("heartbeat_timeout must be at least " +
+                               std::to_string(kMinHeartbeatTimeoutSeconds) +
+                               " seconds (the default agent heartbeat interval)");
+
     if (key == "auto_approve_enabled" || key == "plugin_signing_required") {
         if (value != "true" && value != "false")
             return std::unexpected("value must be 'true' or 'false'");

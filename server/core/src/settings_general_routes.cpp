@@ -31,7 +31,7 @@ bool is_settable(std::string_view level) {
 }
 
 constexpr std::string_view kHeartbeatHint =
-    "Seconds. Default 90. Applies to agents connected directly to this server, from its next "
+    "Seconds, 30 or more. Default 90. Applies to agents connected directly to this server, from its next "
     "sweep. Agents behind a gateway are not covered. Other server replicas keep their own value "
     "and pick the stored one up when they restart.";
 constexpr std::string_view kLogLevelHint =
@@ -60,12 +60,12 @@ std::string render_general_runtime(const RuntimeView& v) {
 
     html += "<div class=\"row2\"><div class=\"fld\"><label for=\"gen-heartbeat\">Agent heartbeat "
             "timeout (seconds)</label><input class=\"in\" id=\"gen-heartbeat\" "
-            "name=\"heartbeat_timeout\" type=\"number\" min=\"1\" step=\"1\" "
+            "name=\"heartbeat_timeout\" type=\"number\" min=\"30\" step=\"1\" "
             "inputmode=\"numeric\" value=\"" +
             hb + "\" aria-describedby=\"gen-heartbeat-hint\"" + (off ? " disabled" : "") +
             "><span class=\"hint\" id=\"gen-heartbeat-hint\">" + std::string(kHeartbeatHint) +
             "</span><span class=\"field-err\" id=\"gen-heartbeat-err\" role=\"alert\" hidden>"
-            "Enter a whole number of seconds, 1 or more.</span></div>";
+            "Enter a whole number of seconds, 30 or more.</span></div>";
 
     html += "<div class=\"fld\"><label for=\"gen-log-level\">Log level</label><select "
             "id=\"gen-log-level\" name=\"log_level\" aria-describedby=\"gen-log-level-hint\"" +

@@ -153,6 +153,12 @@ struct RuntimeConfigEntry {
 /// kInstructionStoreDbErrorPrefix` for the same convention.
 inline constexpr std::string_view kRuntimeConfigDbErrorPrefix = kDbErrorPrefix;
 
+/// Smallest `heartbeat_timeout` (seconds) the store accepts. The default agent heartbeat interval
+/// is 30 s (`yuzu::agent::Config::heartbeat_interval`), so a shorter window marks every directly
+/// connected agent offline between two heartbeats, repeatedly. The generic route is open to a
+/// script, so the floor lives here, not only in the General page.
+inline constexpr int kMinHeartbeatTimeoutSeconds = 30;
+
 class RuntimeConfigStore {
 public:
     /// Borrows the shared pool and the CALLER'S OWN `SecretCodec` instance

@@ -228,7 +228,6 @@ constexpr char kScript[] = R"HTM(<script>
       ' seconds are disconnected and shown offline at the next sweep (about every 15 seconds). It is ' +
       now + ' seconds now' + (qual ? ' (' + qual + ')' : '') +
       '. Agents behind a gateway and other server replicas are not affected by this setting.';
-    if (n < 30) t += ' ' + n + ' seconds is below the default agent heartbeat interval (30 s): every directly connected agent will be disconnected repeatedly.';
     if (n > now) t += ' A connection that dies without closing will take up to ' + n + ' seconds to be noticed.';
     return t + ' Change it?';
   }
@@ -300,7 +299,7 @@ constexpr char kScript[] = R"HTM(<script>
     var v = hb.value.trim(), loadedHb = f.dataset.loadedHeartbeat, loadedLl = f.dataset.loadedLogLevel;
     var hbChanged = v !== loadedHb, llChanged = ll.value !== loadedLl;
     if (!hbChanged && !llChanged) return;
-    if (hbChanged && (!/^[0-9]+$/.test(v) || parseInt(v, 10) < 1)) {
+    if (hbChanged && (!/^[0-9]+$/.test(v) || parseInt(v, 10) < 30)) {
       var err = $('gen-heartbeat-err');
       if (err) err.hidden = false;
       return;

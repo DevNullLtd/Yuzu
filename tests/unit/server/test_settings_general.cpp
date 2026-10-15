@@ -60,6 +60,7 @@ TEST_CASE("general: runtime form shows the live values and enables Save only via
     const auto html = render_general_runtime({.heartbeat_seconds = 75, .log_level = "info"});
     CHECK_THAT(html, ContainsSubstring("name=\"heartbeat_timeout\""));
     CHECK_THAT(html, ContainsSubstring("value=\"75\""));
+    CHECK_THAT(html, ContainsSubstring("min=\"30\"")); // the server's floor
     CHECK_THAT(html, ContainsSubstring("data-loaded-heartbeat=\"75\""));
     CHECK_THAT(html, ContainsSubstring("<option value=\"info\" selected>info</option>"));
     // Nothing to save until a field changes.
@@ -378,7 +379,9 @@ TEST_CASE("general page: both confirms and the audit-failure header are present"
                                        "(about every 15 seconds). It is "));
     CHECK_THAT(html, ContainsSubstring("Agents behind a gateway and other server replicas are not "
                                        "affected by this setting."));
-    CHECK_THAT(html, ContainsSubstring("is below the default agent heartbeat interval (30 s)"));
+    // The server refuses under 30 s, so the page rejects it before any confirm.
+    CHECK_THAT(html, ContainsSubstring("parseInt(v, 10) < 30"));
+    CHECK_THAT(html, !ContainsSubstring("is below the default agent heartbeat interval"));
     CHECK_THAT(html, ContainsSubstring("will take up to "));
     CHECK_THAT(html, ContainsSubstring("changed since you opened this page"));
     CHECK_THAT(html, ContainsSubstring("could not re-check the current value"));
@@ -388,7 +391,8 @@ TEST_CASE("general page: both confirms and the audit-failure header are present"
     CHECK_THAT(html, ContainsSubstring("lvl === 'warn' || lvl === 'error'"));
     // The live value is re-read immediately before the heartbeat confirm.
     CHECK_THAT(html, ContainsSubstring("fetch('/api/config', "));
-    // Audit is best-effort: the header is read and a banner shown (review A4).
+    // A lost outcome row (the attempted row exists, the change is applied): the header is read
+    // and a banner shown (review A4).
     CHECK_THAT(html, ContainsSubstring("Sec-Audit-Failed"));
     CHECK_THAT(html, ContainsSubstring("Audit write failed."));
     // Feedback is a sibling of the reloading section, not inside it (review A6).
