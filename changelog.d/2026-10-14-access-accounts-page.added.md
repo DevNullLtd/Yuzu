@@ -3,5 +3,5 @@
   beside a panel for the selected account. It re-surfaces what Settings shows today without
   adding any action: adding, removing and changing accounts stays in Settings. An account
   store that does not answer is shown as a red "could not be read" message with Retry, never
-  as an empty list. Opening the page as a non-administrator records up to two
-  administrator-required denials in the audit log (one per panel).
+  as an empty list. Opening the page as a non-administrator writes no audit row; the panels
+  are refused quietly. A refused API or MCP token is still recorded as an administrator-required denial.

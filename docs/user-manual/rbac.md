@@ -420,8 +420,9 @@ SCIM) and its account role. Adding, removing and changing accounts is done in **
 
 - **Who can see it.** Any signed-in user can open the page. The two panels need the
   Administrator account role; for anyone else each panel says it is not available to their
-  account. Each refused panel load is recorded in the audit log as an administrator-required
-  denial, so a non-administrator opening the page leaves up to two such rows.
+  account. A refused browser session writes no audit row (the panels load automatically, so
+  a row per page view would fill the log with denials); a refused API or MCP token that
+  reaches the panel URL is recorded as an administrator-required denial.
 - **Account role versus RBAC role.** The account role (`admin` or `user`) is the legacy role:
   it decides who can open Settings and what applies while RBAC enforcement is off. RBAC roles
   apply once enforcement is on, and are managed through the RBAC API.
@@ -839,7 +840,7 @@ curl -s -b cookies.txt -X POST \
 
 ## Tokens and principals page
 
-The read-only `/access/tokens` page shows API tokens and engine principals. Its token list uses `ApiToken:Read` and is scoped to the caller's own tokens unless the caller is an administrator on a cookie session; an administrator's API, MCP or service-scoped token gets its own tokens only. The principal list and detail use the administrator account role (the Settings panel's gate), not `EnginePrincipal:Read`: RBAC grants are not consulted, so an RBAC-on Viewer who can call the REST routes does not see principals on this page, and an account administrator without that grant does. Role assignment for engine principals is shown here; assigning is not.
+The read-only `/access/tokens` page shows API tokens and engine principals. Its token list uses `ApiToken:Read` and is scoped to the caller's own tokens unless the caller is an administrator on a cookie session; an administrator's API, MCP or service-scoped token gets its own tokens only. The principal list and detail use `EnginePrincipal:Read`, the same permission as `GET /api/v1/engine-principals` (administrators only while RBAC is disabled; an ordinary grant once it is enabled): with RBAC on, an account administrator without that grant is refused and a non-administrator who holds it is admitted. Engine and MCP-tier credentials are refused whatever they hold. A refused browser session writes no audit row, because the panels load automatically. A revoked principal's free-text revocation detail comes from the audit trail and is shown only to callers who also hold `AuditLog:Read`; others see it marked withheld. The no-administrator check above the list also needs `AuditLog:Read` and is skipped, with a note, without it. Role assignment for engine principals is shown here; assigning is not.
 
 ## Examples
 

@@ -9721,7 +9721,7 @@ The following endpoints are under `/api/` (without the `v1` prefix). They predat
 
 ### Access — Users
 
-These endpoints back the read-only **Access → Users** page (`/access/users`). They return HTMX fragments, not the JSON envelope, and require an admin session. Neither one changes anything, and neither writes a success audit row; a refusal is audited by the admin gate (`auth.admin_required`).
+These endpoints back the read-only **Access → Users** page (`/access/users`). They return HTMX fragments, not the JSON envelope, and require an admin session. Neither one changes anything, and neither writes a success audit row. A refused browser session writes no denial row either (the panels load automatically); a refused API or MCP token is audited by the admin gate (`auth.admin_required`).
 
 **`GET /fragments/access/users/list`**
 
