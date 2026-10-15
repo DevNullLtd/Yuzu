@@ -28,8 +28,9 @@ void unavailable(httplib::Response& res, const char* message) {
 /// rows, whose loss never changes the response (the `attempted` row is the gate).
 void note_audit(const NotificationRoutes::AuditFn& audit_fn, const httplib::Request& req,
                 const char* action, const char* result, const char* target_type,
-                const std::string& target_id, const char* detail) {
-    (void)detail::try_persist_audit(audit_fn, req, action, result, target_type, target_id, detail);
+                const std::string& target_id, const char* detail_text) {
+    (void)detail::try_persist_audit(audit_fn, req, action, result, target_type, target_id,
+                                    detail_text);
 }
 
 /// Cookie-authorised writes need a same-site Origin/Referer (token callers are exempt); see

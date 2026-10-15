@@ -188,15 +188,6 @@ enum class SsoOnlyLocalGate : std::uint8_t {
                       ///< state could not be read — fail CLOSED): never evaluate PBKDF2
 };
 
-/// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
-///
-/// AuthRoutes owns the core authentication/authorization/audit primitives that
-/// are used throughout the server: require_auth, require_admin, require_permission,
-/// require_scoped_permission, audit_log, emit_event, etc.
-///
-/// ServerImpl creates an AuthRoutes instance early, then builds lightweight lambda
-/// callbacks from its public methods to inject into RestApiV1, McpServer,
-/// SettingsRoutes, and its own remaining route handlers.
 /// Whether a probe may withhold this caller's denial rows. Only an interactive cookie session
 /// qualifies (local, OIDC or SAML sign-in); an API/MCP/engine token or an engine principal that
 /// reaches a panel URL is anomalous and keeps the auditing behaviour, so a revoked or
@@ -207,6 +198,15 @@ enum class SsoOnlyLocalGate : std::uint8_t {
     return s.auth_source == "local" || s.auth_source == "oidc" || s.auth_source == "saml";
 }
 
+/// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
+///
+/// AuthRoutes owns the core authentication/authorization/audit primitives that
+/// are used throughout the server: require_auth, require_admin, require_permission,
+/// require_scoped_permission, audit_log, emit_event, etc.
+///
+/// ServerImpl creates an AuthRoutes instance early, then builds lightweight lambda
+/// callbacks from its public methods to inject into RestApiV1, McpServer,
+/// SettingsRoutes, and its own remaining route handlers.
 class AuthRoutes {
 public:
     AuthRoutes(Config& cfg, auth::AuthManager& auth_mgr, RbacStore* rbac_store,

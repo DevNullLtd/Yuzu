@@ -508,6 +508,63 @@ TEST_CASE("probe_fleet_read / probe_permission: the gate's verdict with no denia
     }
 }
 
+TEST_CASE("probe_permission / probe_fleet_read: a token caller keeps its denial row while a cookie "
+          "sign-in does not (mutation: install the probe scope unconditionally)",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    yuzu::server::ApiTokenStore tokens{*fix.audit_pool};
+    REQUIRE(tokens.is_open());
+    REQUIRE(fix.auth_mgr.upsert_user("tess", "password1234", auth::Role::user));
+    const auto expiry = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() +
+                        3600;
+    auto raw = tokens.create_token("probe-token", "tess", expiry);
+    REQUIRE(raw.has_value());
+    AuthRoutes ar(fix.cfg, fix.auth_mgr, &fix.rbac_store, &tokens, fix.audit_store.get(),
+                  /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr, /*analytics_store=*/nullptr,
+                  fix.oidc_mu, fix.oidc_provider);
+    const AuditQuery perm_rows{.action = "auth.permission_required", .limit = 20};
+    const AuditQuery fleet_rows{.action = "auth.fleet_read_required", .limit = 20};
+    auto count = [&](const AuditQuery& q) {
+        auto r = fix.audit_store->query(q);
+        REQUIRE(r.has_value());
+        return r->size();
+    };
+
+    httplib::Request bearer;
+    bearer.headers.emplace("Authorization", "Bearer " + *raw);
+
+    httplib::Response r1;
+    CHECK_FALSE(ar.probe_permission(bearer, r1, "Execution", "Execute"));
+    CHECK(count(perm_rows) == 1); // the token caller's denial is on the record
+
+    httplib::Response r2;
+    CHECK_FALSE(ar.probe_fleet_read(bearer, r2, "Infrastructure", "Write").has_value());
+    CHECK(count(fleet_rows) == 1);
+
+    // The same questions from an interactive cookie sign-in add nothing.
+    auto cookie = fix.session_request("cora", auth::Role::user);
+    httplib::Response r3, r4;
+    CHECK_FALSE(ar.probe_permission(cookie, r3, "Execution", "Execute"));
+    CHECK_FALSE(ar.probe_fleet_read(cookie, r4, "Infrastructure", "Write").has_value());
+    CHECK(count(perm_rows) == 1);
+    CHECK(count(fleet_rows) == 1);
+}
+
+TEST_CASE("probe_fleet_read: an elevated session is admitted exactly as the gate admits it, "
+          "with the same scope",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    auto req = fix.elevated_session_request("elena");
+    httplib::Response a, b;
+    auto probed = fix.ar->probe_fleet_read(req, a, "Infrastructure", "Read");
+    auto gated = fix.ar->require_fleet_read(req, b, "Infrastructure", "Read");
+    REQUIRE(gated.has_value()); // guard: a vacuous both-denied must not pass
+    REQUIRE(probed.has_value());
+    CHECK(probed->visible_for_query() == gated->visible_for_query());
+}
+
 TEST_CASE("denial_row_may_be_withheld: only an interactive cookie sign-in qualifies",
           "[authz][probe]") {
     auto session = [](const char* source, const char* kind) {

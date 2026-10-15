@@ -93,6 +93,22 @@ const R = ids['shell-bell'], list = ids['shell-bell-list'], chip = ids['shell-be
   await tick();
   ok(fetches[before].u === '/api/notifications/7/read' && fetches[before].m === 'POST', 'second click POSTs read');
 
+  // a cross-site 403 on an action names the remedy and keeps the buttons usable; any other 403 is read-only
+  {
+    const act = () => list.children[0].children[3].children[0];
+    let b = act();
+    b.click(); queue.push({ status: 403, body: { error: { message: 'cross-site request refused' } } });
+    b.click(); await tick();
+    ok(note.textContent.includes('refused as cross-site') && note.textContent.includes('--csrf-trusted-origin'), 'cross-site 403 names the remedy');
+    ok(!note.textContent.includes('can view notifications but not change'), 'cross-site 403 is not reported as read-only');
+    ok(act().disabled === false, 'cross-site 403 leaves the buttons usable');
+    b = act();
+    b.click(); queue.push({ status: 403, body: { error: { message: 'permission denied: Infrastructure:Write' } } });
+    b.click(); await tick();
+    ok(note.textContent.includes('can view notifications but not change'), 'plain 403 is read-only');
+    ok(act().disabled === true, 'plain 403 disables the buttons');
+  }
+
   // idle gate: > 5 min without input, a foregrounded tab must not fetch until input
   const n0 = fetches.length;
   now += 300001; fire('visibilitychange'); await tick();

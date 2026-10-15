@@ -72,6 +72,7 @@ struct NotificationHarness {
     NotificationStore* store{nullptr};
     bool perm_allow{true};
     bool audit_persists{true};
+    bool throw_after_first_audit{false};
     std::string auth_source{"local"}; // a cookie session unless a test says otherwise
     std::vector<std::string> trusted_origins;
     std::vector<AuditCall> audit_calls;
@@ -104,6 +105,8 @@ struct NotificationHarness {
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
             audit_calls.push_back({action, result, target_type, target_id, detail});
+            if (throw_after_first_audit && audit_calls.size() > 1)
+                throw std::runtime_error("audit store down");
             return audit_persists;
         };
         auto resolve_fn = [this](const httplib::Request&) -> std::optional<auth::Session> {
@@ -526,7 +529,7 @@ TEST_CASE("bell routes: a store that cannot get a connection answers 503 with th
 
 // ── Gate order, Referer and trusted origins, input edges (governance round) ──
 
-TEST_CASE("bell POSTs: the permission gate answers first (no csrf.denied row), a Referer-only "
+TEST_CASE("bell POSTs: the permission gate answers first with no csrf.denied row; a Referer-only "
           "same-site call and a trusted origin are accepted",
           "[notification_routes][pg][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
@@ -571,7 +574,7 @@ TEST_CASE("bell POSTs: the permission gate answers first (no csrf.denied row), a
     }
 }
 
-TEST_CASE("bell routes: an id that does not fit int64 is a 404 with nothing audited, and a "
+TEST_CASE("bell routes: an id that does not fit int64 is a 404 with nothing audited; a "
           "negative limit or offset is a 400 not an outage",
           "[notification_routes][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
@@ -603,5 +606,24 @@ TEST_CASE("bell routes: an id that does not fit int64 is a 404 with nothing audi
     CHECK(padded->status == 200);
     REQUIRE(h.audit_calls.size() == 2);
     CHECK(h.audit_calls[0].target_id == std::to_string(id));
+    CHECK(h.audit_calls[1].target_id == std::to_string(id));
+    CHECK(h.audit_calls[1].result == "success");
 }
 
+TEST_CASE("bell POSTs: a throwing audit function after the attempted row cannot turn an applied "
+          "change into a 500",
+          "[notification_routes][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
+    PgWired w{db.dsn()};
+    NotificationHarness h;
+    h.store = &w.store;
+    h.throw_after_first_audit = true;
+    h.wire();
+    auto id = w.store.create("info", "t", "m");
+    REQUIRE(id > 0);
+
+    auto res = h.sink.Post("/api/notifications/" + std::to_string(id) + "/read", "");
+    REQUIRE(res);
+    CHECK(res->status == 200); // the change applied; losing the outcome row does not change that
+    CHECK(w.store.list_unread().empty());
+}
