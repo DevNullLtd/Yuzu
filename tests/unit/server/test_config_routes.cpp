@@ -335,7 +335,7 @@ TEST_CASE("config_routes: PUT an integer key round-trips into cfg AND the store,
 }
 
 TEST_CASE("config_routes: PUT refuses the change when the attempted audit row cannot be "
-          "written (no audit row, no mutation)",
+          "written - no audit row, no mutation",
           "[pg][server][routes][config_routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
     PgWired w{db.dsn()};
@@ -378,6 +378,9 @@ TEST_CASE("config_routes: PUT flags a lost outcome row with Sec-Audit-Failed and
     CHECK(body(res->body)["applied"] == true);
     CHECK(h.cfg.response_retention_days == 121);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    REQUIRE(h.audits.size() == 2); // the lost row is the outcome row, not the attempted one
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].result == "success");
 }
 
 TEST_CASE("config_routes: PUT a rejected value leaves an attempted and a failure row",
@@ -394,6 +397,16 @@ TEST_CASE("config_routes: PUT a rejected value leaves an attempted and a failure
     REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[1].result == "failure");
+    // The failure row carries the operator-written refusal, never the submitted value.
+    CHECK(h.audits[1].detail.find("one of") != std::string::npos);
+    CHECK(h.audits[1].detail.find("loud") == std::string::npos);
+
+    // A key that names no setting is refused before any audit row.
+    h.audits.clear();
+    auto unknown = h.sink.Put("/api/config/not_a_setting", R"({"value":"1"})");
+    REQUIRE(unknown);
+    CHECK(unknown->status == 400);
+    CHECK(h.audits.empty());
 }
 
 TEST_CASE("config_routes: PUT heartbeat_timeout enforces the 30 second floor at the boundary",
@@ -522,6 +535,7 @@ TEST_CASE("config: LiveSeconds copies and assigns by value and is safe across th
             shared.session_timeout = std::chrono::seconds(i % 2 ? 30 : 90);
     });
     std::vector<std::thread> readers;
+    readers.reserve(3); // no throw between the writer starting and the joins
     for (int t = 0; t < 3; ++t)
         readers.emplace_back([&] {
             for (int i = 0; i < 20000; ++i) {
@@ -536,6 +550,12 @@ TEST_CASE("config: LiveSeconds copies and assigns by value and is safe across th
     for (auto& r : readers)
         r.join();
     CHECK_FALSE(bad.load());
+
+    // A heartbeat stored before the floor existed is raised to it, never dropped or lowered.
+    CHECK(clamp_heartbeat_timeout(1) == kMinHeartbeatTimeoutSeconds);
+    CHECK(clamp_heartbeat_timeout(29) == kMinHeartbeatTimeoutSeconds);
+    CHECK(clamp_heartbeat_timeout(30) == 30);
+    CHECK(clamp_heartbeat_timeout(120) == 120);
 }
 
 TEST_CASE("config_routes: PUT a non-numeric value for an integer key is a 400, cfg untouched, "

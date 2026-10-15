@@ -82,7 +82,7 @@ document.body.addEventListener('htmx:responseError', function (e) {
   var s = d.xhr.status;
   if (s === 401) { window.location.href = '/login'; return; }
   var msg = 'Could not be read. This is not an empty list.';
-  if (s === 403) msg = 'Needs the Infrastructure:Read permission.';
+  if (s === 403) msg = 'Administrators only, and needs the Infrastructure:Read permission.';
   else if (s === 429) msg = 'Too many requests. Try again in a moment.';
   var n = document.createElement('div');
   n.className = 'note warn';

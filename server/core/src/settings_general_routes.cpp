@@ -32,7 +32,7 @@ bool is_settable(std::string_view level) {
 }
 
 constexpr std::string_view kHeartbeatHintTail =
-    ". Default 90. Applies to agents connected directly to this server, from its next "
+    ". Default 90. Keep it well above the agents' own heartbeat interval (30 s by default): an agent whose heartbeat is a moment late is dropped. Applies to agents connected directly to this server, from its next "
     "sweep. Agents behind a gateway are not covered. Other server replicas keep their own value "
     "and pick the stored one up when they restart.";
 constexpr std::string_view kLogLevelHint =

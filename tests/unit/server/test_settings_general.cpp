@@ -396,6 +396,8 @@ TEST_CASE("general page: both confirms and the audit-failure header are present"
     // and a banner shown (review A4).
     CHECK_THAT(html, ContainsSubstring("Sec-Audit-Failed"));
     CHECK_THAT(html, ContainsSubstring("Audit write failed."));
+    // A cross-site refusal names the remedy for a Host-rewriting proxy.
+    CHECK_THAT(html, ContainsSubstring("--csrf-trusted-origin"));
     // Feedback is a sibling of the reloading section, not inside it (review A6).
     const auto section = html.find("id=\"general-runtime-section\"");
     const auto feedback = html.find("id=\"general-runtime-feedback\"");

@@ -2,6 +2,7 @@
 
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "rest_a4_envelope_http.hpp" // detail::a4_error
 #include "rest_audit.hpp"        // detail::try_persist_audit / emit_behavioral_audit
 #include "runtime_config_store.hpp"
 #include "runtime_config_view.hpp" // build_overrides_json
@@ -104,9 +105,7 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             (void)detail::try_persist_audit(deps.audit_fn, req, "csrf.denied", "denied", "Endpoint",
                                             "config", "cross-site or header-less browser write refused");
             res.status = 403;
-            res.set_content(
-                R"({"error":{"code":403,"message":"cross-site request refused"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
             return;
         }
 
@@ -166,6 +165,17 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
+        // An unknown key is refused here, before any audit row, so a junk key leaves no
+        // attempted/failure pair. The store repeats the check as the authority.
+        if (!RuntimeConfigStore::is_allowed_key(key)) {
+            res.status = 400;
+            res.set_content(
+                nlohmann::json({{"error", "key '" + key + "' is not a configurable runtime setting"}})
+                    .dump(),
+                "application/json");
+            return;
+        }
+
         // ADR-0033 section 9, "no audit row, no mutation": an `attempted` row is written before
         // anything is changed, and a row that cannot be stored refuses the change. The outcome
         // row follows. The attempted row carries no value (a secret key's value never reaches an
@@ -173,18 +183,24 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         if (!detail::emit_behavioral_audit(deps.audit_fn, req, res, "config.update", "attempted",
                                            "RuntimeConfig", key, "")) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"audit log unavailable; the change was not made"},)"
-                R"("meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "audit log unavailable; the change was not made",
+                                             detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                                 .remediation = "retry the request"}),
+                            "application/json");
             return;
         }
 
         auto result = deps.runtime_config_store->set(key, value, session->username);
         if (!result) {
             // Best effort: the attempted row is already durable, and the response does not change.
+            // A refusal of the value is operator-written text (no value, no secret); a database
+            // failure may have committed before the acknowledgement was lost, so it is not
+            // recorded as "not applied".
+            const bool db_failure = result.error().starts_with(kRuntimeConfigDbErrorPrefix);
             (void)detail::try_persist_audit(deps.audit_fn, req, "config.update", "failure",
-                                            "RuntimeConfig", key, "not applied");
+                                            "RuntimeConfig", key,
+                                            db_failure ? "store error; outcome unknown"
+                                                       : result.error());
             // A genuine DB/crypto failure (kRuntimeConfigDbErrorPrefix) is a
             // 503 with a generic message -- never echo the internal detail
             // to the caller; caller-input validation (unknown key, bad

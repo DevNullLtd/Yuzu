@@ -159,6 +159,13 @@ inline constexpr std::string_view kRuntimeConfigDbErrorPrefix = kDbErrorPrefix;
 /// script, so the floor lives here, not only in the General page.
 inline constexpr int kMinHeartbeatTimeoutSeconds = 30;
 
+/// A `heartbeat_timeout` stored before the floor existed, as the boot loader applies it: raised to
+/// the floor rather than dropped, so the operator's intent (a short window) is kept as nearly as
+/// the floor allows.
+[[nodiscard]] constexpr int clamp_heartbeat_timeout(int stored) noexcept {
+    return stored < kMinHeartbeatTimeoutSeconds ? kMinHeartbeatTimeoutSeconds : stored;
+}
+
 class RuntimeConfigStore {
 public:
     /// Borrows the shared pool and the CALLER'S OWN `SecretCodec` instance

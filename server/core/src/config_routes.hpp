@@ -25,8 +25,8 @@
 ///
 /// Routes (2) — gate in parens:
 ///   GET /api/config             (perm_fn Infrastructure:Read)
-///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN
-///                                 auth_fn for the audit-attributed
+///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN the
+///                                 store-open 503, THEN auth_fn for the audit-attributed
 ///                                 username and the same-site check, THEN
 ///                                 body parsing and integer-key validation)
 ///

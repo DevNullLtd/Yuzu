@@ -13959,15 +13959,16 @@ private:
             } else if (e.key == "heartbeat_timeout") {
                 try {
                     // A value stored before the 30 s floor existed would make every directly
-                    // connected agent flap; keep the default instead and say so.
+                    // connected agent flap; raise it to the floor and say how to clear it.
                     const int stored = std::stoi(e.value);
-                    if (stored < kMinHeartbeatTimeoutSeconds)
-                        spdlog::warn("Ignoring stored heartbeat_timeout {}: below the {} second "
-                                     "minimum; using {} seconds",
-                                     stored, kMinHeartbeatTimeoutSeconds,
-                                     cfg_.session_timeout.count());
-                    else
-                        cfg_.session_timeout = std::chrono::seconds(stored);
+                    const int applied = clamp_heartbeat_timeout(stored);
+                    if (applied != stored)
+                        spdlog::warn("Stored heartbeat_timeout {} is below the {} second minimum; "
+                                     "using {} seconds. PUT /api/config/heartbeat_timeout with a "
+                                     "value of {} or more to replace the stored one.",
+                                     stored, kMinHeartbeatTimeoutSeconds, applied,
+                                     kMinHeartbeatTimeoutSeconds);
+                    cfg_.session_timeout = std::chrono::seconds(applied);
                 } catch (...) {}
             } else if (e.key == "response_retention_days") {
                 try {

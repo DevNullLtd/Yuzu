@@ -253,6 +253,7 @@ constexpr char kScript[] = R"HTM(<script>
 
   function errText(status, parsed) {
     if (status === 401) return 'Your session has expired. Sign in again.';
+    if (status === 403 && /cross-site/.test(parsed || '')) return parsed + '. Behind a reverse proxy that rewrites the Host header, start the server with --csrf-trusted-origin.';
     return parsed || ('The server answered ' + status + '.');
   }
   function put(key, value) {

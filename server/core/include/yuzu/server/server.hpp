@@ -37,6 +37,7 @@ public:
 
 private:
     std::atomic<std::int64_t> v_;
+    static_assert(std::atomic<std::int64_t>::is_always_lock_free);
 };
 
 struct Config {
