@@ -892,24 +892,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     };
     sink.Get("/readyz", readyz_handler);
 
-    // -- Plaintext redirect listener probes (#5906) -----------------------------
-    // The four probe paths ALSO register on the HTTP->HTTPS redirect listener, on
-    // the SAME handler objects as the main sink (/health through a second thin
-    // closure over the ONE health_body). Two deliberate differences, stated in
-    // the header banner:
-    //   D6a - NO session lookup on the plaintext port: the closure hands
-    //         health_body a hard `false`, so `system.*`, `agents.pending` and
-    //         `executions.*` never travel over plaintext even when the request
-    //         carries a valid session cookie. deps.resolve_session_fn is not
-    //         called here.
-    //   D6b - every answer is 503 while the HTTPS listener is not bound or has
-    //         exited. The gate exists because this listener runs on its own
-    //         thread and would otherwise report healthy for a server whose only
-    //         real listener failed to bind. The guarantee is "bound and not yet
-    //         exited", not "accepting": httplib keeps is_running() true while
-    //         requests already accepted before a fatal accept error drain, so the
-    //         gate can answer 200 for that window (new connections are refused
-    //         throughout it).
+    // Plaintext redirect listener probes (#5906): posture, D6a/D6b and the drain-window
+    // caveat are in the AUTH POSTURE banner in health_routes.hpp.
     if (deps.plaintext_probe_sink) {
         auto plain_health = [health_body](const httplib::Request& req, httplib::Response& res) {
             health_body(req, res, /*is_authenticated=*/false);

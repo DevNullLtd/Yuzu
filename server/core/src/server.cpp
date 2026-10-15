@@ -15707,17 +15707,11 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .fleet_read_fn = draw_fleet_read_fn, // HM-2 /fragments/dashboard/health (draw-time)
-                             // #5906: the four probes also answer on the redirect listener.
-                             // web_server_->is_running() is set after a successful bind at the
-                             // top of httplib's listen_internal (httplib.h:11268) and cleared
-                             // when it returns (11269), so a failed bind, startup before
-                             // accept, and a completed shutdown all read "not serving". It
-                             // means "bound and not yet exited", not "accepting": after a fatal
-                             // accept error httplib closes the listening socket (11307-11310)
-                             // and breaks to task_queue->shutdown() (11330), so requests
-                             // already in flight drain with the flag still true while new
-                             // connections are refused. httplib 0.37.1 exposes no finer
-                             // signal, and web_thread_done_ is set only after that same drain.
+                             // #5906: is_running() is set after a successful bind (httplib.h:11268)
+                             // and cleared on return (11269), so a failed bind, pre-accept
+                             // startup and a completed shutdown all read "not serving". No finer
+                             // signal in httplib 0.37.1; web_thread_done_ is set only after the
+                             // drain (caveat: AUTH POSTURE banner, health_routes.hpp).
                              .plaintext_probe_sink = redirect_sink.get(),
                              .main_listener_serving_fn =
                                  [this] { return web_server_ && web_server_->is_running(); },

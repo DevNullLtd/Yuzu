@@ -2,7 +2,6 @@
 
 #include <yuzu/server/auth.hpp>
 
-#include <cstdlib>
 #include <ostream>
 #include <string>
 
@@ -31,7 +30,7 @@ std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) 
 }
 #endif
 
-HealthcheckOutcome probe_once(const HealthcheckTarget& t, const HealthcheckDeadlines& d) {
+HealthcheckOutcome probe_once(const HealthcheckTarget& t, int max_total_ms) {
     // Heap client + explicit reset before return: httplib 0.37.1's SSLClient
     // destructor can crash after a failed handshake (same workaround as
     // oidc_provider.cpp).
@@ -45,14 +44,18 @@ HealthcheckOutcome probe_once(const HealthcheckTarget& t, const HealthcheckDeadl
         client = std::make_unique<httplib::ClientImpl>(t.host, t.port);
         client->set_follow_location(false);
     }
-    // Deadline composition: connect_sec bounds the TCP connect, read/write bound
-    // each TLS handshake step, and the whole-request max timeout (httplib.h:9906-9950)
-    // bounds the request phase as a whole. No single knob covers all three in
-    // 0.37.1; the sum is sized to stay under compose's 5 s on loopback.
-    client->set_connection_timeout(d.connect_sec, 0);
-    client->set_write_timeout(d.write_sec, 0);
-    client->set_read_timeout(d.read_sec, 0);
-    client->set_max_timeout(d.max_total_ms);
+    // Deadline composition: the connect timeout bounds the TCP connect, read/write
+    // bound each TLS handshake step, and the whole-request max timeout
+    // (httplib.h:9906-9950) bounds the request phase as a whole. No single knob
+    // covers all three in 0.37.1; the sum is sized to stay under compose's 5 s on
+    // loopback.
+    constexpr int kConnectSec = 1;
+    constexpr int kWriteSec = 1;
+    constexpr int kReadSec = 2;
+    client->set_connection_timeout(kConnectSec, 0);
+    client->set_write_timeout(kWriteSec, 0);
+    client->set_read_timeout(kReadSec, 0);
+    client->set_max_timeout(max_total_ms);
 
     HealthcheckOutcome out;
     const auto r = client->Get(t.path);
@@ -78,11 +81,11 @@ int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag
 #endif
     const auto target =
         resolve_healthcheck_target(cfg, path, auth::default_cert_dir(), kTlsSupported);
-    const auto outcome = probe_once(target, HealthcheckDeadlines{});
+    const auto outcome = probe_once(target);
     const int code = healthcheck_exit_code(outcome);
     if (code != 0)
         diag << healthcheck_diagnostic(target, outcome) << '\n';
-    return code == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return code;
 }
 
 } // namespace yuzu::server::healthcheck

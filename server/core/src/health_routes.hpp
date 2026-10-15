@@ -122,7 +122,6 @@
 
 #include <httplib.h>
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -206,14 +205,8 @@ namespace health {
 /// The closed set of unauthenticated probe paths (the recorded ADR-1005
 /// exception). ONE definition: the main listener's pre-routing chokepoint and
 /// the plaintext redirect listener both test membership through it.
-inline constexpr std::array<std::string_view, 4> kProbePaths{"/livez", "/readyz", "/health",
-                                                             "/api/health"};
-
 [[nodiscard]] constexpr bool is_probe_path(std::string_view p) {
-    for (const auto k : kProbePaths)
-        if (p == k)
-            return true;
-    return false;
+    return p == "/livez" || p == "/readyz" || p == "/health" || p == "/api/health";
 }
 
 /// True for a request the plaintext redirect listener serves instead of

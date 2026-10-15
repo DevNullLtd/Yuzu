@@ -251,7 +251,7 @@ TEST_CASE("healthcheck: default-CA mode verifies a leaf issued by the install CA
     auto srv = tls_server(tmp.path, leaf);
 
     const auto t = tls_target(srv->port, tmp.path / "default-ca.pem", false);
-    const auto out = probe_once(t, HealthcheckDeadlines{});
+    const auto out = probe_once(t);
     CHECK(out.status == 200);
     CHECK(healthcheck_exit_code(out) == 0);
     CHECK(healthcheck_diagnostic(t, out).empty());
@@ -301,15 +301,13 @@ TEST_CASE("healthcheck: operator mode anchors on the server certificate itself (
     write_file(tmp.path / "anchor.pem", leaf.cert_pem);
     auto srv = tls_server(tmp.path, leaf);
 
-    const auto ok = probe_once(tls_target(srv->port, tmp.path / "anchor.pem", true),
-                               HealthcheckDeadlines{});
+    const auto ok = probe_once(tls_target(srv->port, tmp.path / "anchor.pem", true));
     CHECK(ok.status == 200);
     CHECK(healthcheck_exit_code(ok) == 0);
 
     // Control: the same anchor WITHOUT partial-chain must fail, proving the flag is
     // what admits the leaf in the case above.
-    const auto control = probe_once(tls_target(srv->port, tmp.path / "anchor.pem", false),
-                                    HealthcheckDeadlines{});
+    const auto control = probe_once(tls_target(srv->port, tmp.path / "anchor.pem", false));
     CHECK(control.status == 0);
     CHECK(healthcheck_exit_code(control) == 1);
     CHECK(control.error.find("verification") != std::string::npos);
@@ -327,7 +325,7 @@ TEST_CASE("healthcheck: a leaf from another CA is refused with the OpenSSL reaso
     auto srv = tls_server(tmp.path, leaf);
 
     const auto t = tls_target(srv->port, tmp.path / "other-ca.pem", false);
-    const auto out = probe_once(t, HealthcheckDeadlines{});
+    const auto out = probe_once(t);
     CHECK(out.status == 0);
     CHECK(healthcheck_exit_code(out) == 1);
     CHECK(out.error.find("verification") != std::string::npos);
@@ -345,8 +343,7 @@ TEST_CASE("healthcheck: an expired leaf is refused and the reason says so",
     write_file(tmp.path / "default-ca.pem", ca.cert_pem);
     auto srv = tls_server(tmp.path, leaf);
 
-    const auto out = probe_once(tls_target(srv->port, tmp.path / "default-ca.pem", false),
-                                HealthcheckDeadlines{});
+    const auto out = probe_once(tls_target(srv->port, tmp.path / "default-ca.pem", false));
     CHECK(out.status == 0);
     CHECK(healthcheck_exit_code(out) == 1);
     CHECK(out.error.find("expired") != std::string::npos);
@@ -382,7 +379,7 @@ TEST_CASE("healthcheck: a stalled responder is cut off by the whole-request ceil
     } releaser{mu, cv, release};
 
     const auto t0 = std::chrono::steady_clock::now();
-    const auto out = probe_once(plain_target(srv.port), HealthcheckDeadlines{1, 1, 2, 200});
+    const auto out = probe_once(plain_target(srv.port), /*max_total_ms=*/200);
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     CHECK(out.status == 0);
     CHECK_FALSE(out.error.empty());
@@ -403,7 +400,7 @@ TEST_CASE("healthcheck: a redirect is reported as the answer and never followed"
     });
     srv.start();
 
-    const auto out = probe_once(plain_target(srv.port), HealthcheckDeadlines{});
+    const auto out = probe_once(plain_target(srv.port));
     CHECK(out.status == 301);
     CHECK(healthcheck_exit_code(out) == 1);
     CHECK(target_hits.load() == 0);
@@ -417,7 +414,7 @@ TEST_CASE("healthcheck: --no-https shape probes a plain listener and exits 0 on 
     });
     srv.start();
 
-    const auto out = probe_once(plain_target(srv.port), HealthcheckDeadlines{});
+    const auto out = probe_once(plain_target(srv.port));
     CHECK(out.status == 200);
     CHECK(healthcheck_exit_code(out) == 0);
 }
