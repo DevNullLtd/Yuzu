@@ -343,6 +343,8 @@ if [[ "$SKIP_AUTH" == "false" ]]; then
     http_get "$SERVER_URL/api/v1/me"
     assert_eq "GET /api/v1/me with cookie returns 200" "200" "$HTTP_STATUS"
     assert_contains "GET /api/v1/me contains 'admin'" "admin" "$HTTP_BODY"
+    assert_contains "GET /api/v1/me reports effective_role" "effective_role" "$HTTP_BODY"
+    assert_contains "GET /api/v1/me reports can_access_settings" "can_access_settings" "$HTTP_BODY"
 
     # POST /logout
     http_post "$SERVER_URL/logout" "" "application/json"
@@ -488,6 +490,10 @@ log "═════════════════════════
 # GET /api/v1/rbac/roles -> 200
 http_get "$SERVER_URL/api/v1/rbac/roles"
 assert_eq "GET /api/v1/rbac/roles returns 200" "200" "$HTTP_STATUS"
+
+# GET /api/v1/rbac/roles/{unknown}/permissions -> 404 (not an empty 200)
+http_get "$SERVER_URL/api/v1/rbac/roles/NoSuchRoleE2E/permissions"
+assert_eq "GET /api/v1/rbac/roles/{unknown}/permissions returns 404" "404" "$HTTP_STATUS"
 
 # POST /api/v1/rbac/check -> 200
 http_post "$SERVER_URL/api/v1/rbac/check" \
@@ -1139,6 +1145,8 @@ log "═════════════════════════
 SETTINGS_FRAGMENTS=(
     "/fragments/settings/tls"
     "/fragments/settings/users"
+    "/fragments/access/users/list"
+    "/fragments/access/users/detail"
     "/fragments/settings/tokens"
     "/fragments/settings/pending"
     "/fragments/settings/auto-approve"
@@ -1151,6 +1159,11 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/https"
     "/fragments/settings/analytics"
     "/fragments/settings/data-retention"
+    "/fragments/settings/developer/api"
+    "/fragments/settings/developer/routes"
+    "/fragments/settings/developer/permissions"
+    "/fragments/settings/developer/plugins"
+    "/fragments/settings/developer/plugins/observed"
     "/fragments/settings/mcp"
     "/fragments/settings/nvd"
     "/fragments/settings/directory"
@@ -1158,12 +1171,21 @@ SETTINGS_FRAGMENTS=(
     "/fragments/schedules?view=page"
     "/fragments/workflow-runs"
     "/fragments/workflow-runs/e2e-no-such-run"
+    "/fragments/settings/general-runtime"
+    "/fragments/settings/analytics-events"
+    "/fragments/access/tokens/list"
+    "/fragments/access/principals/list"
+    "/fragments/access/principals/detail"
 )
 
 for frag in "${SETTINGS_FRAGMENTS[@]}"; do
     http_get "$SERVER_URL$frag"
     assert_status_any "GET $frag" "$HTTP_STATUS" 200 403 404
 done
+
+# System pages: an admin session gets the page; a non-admin is redirected to /.
+http_get "$SERVER_URL/settings/general"
+assert_status_any "GET /settings/general" "$HTTP_STATUS" 200 302
 
 log ""
 

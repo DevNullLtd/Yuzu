@@ -44,7 +44,10 @@ std::string json_array_to_csv(const std::string& json_str) {
             } else if (it->is_string()) {
                 csv += csv_escape(it->get<std::string>());
             } else {
-                csv += it->dump();
+                // Non-string cell (number, bool, object, array): quote-only.
+                // neutralize_formula must NOT run here -- it would turn -5
+                // into '-5 and corrupt numeric columns.
+                csv += csv_quote(it->dump());
             }
         }
         csv += "\r\n";

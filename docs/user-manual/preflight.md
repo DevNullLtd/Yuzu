@@ -100,9 +100,9 @@ pass/fail gate (unlike pre-flight's go/no-go). An AI colleague driving the rollo
 reads the same numbers over MCP and makes the call.
 
 Real canaries are small — two or three devices — so Verify deliberately has **no
-minimum cohort size**: a small paired set is shown with an *"indicative"* note rather
-than hidden. Because that means reading a handful of named machines' data, the
-comparison is **recorded in the audit log**. The aggregate is shown without any
+minimum cohort size**: a paired set of any size is shown with its exact figures (no
+"indicative" label is rendered at the one-device floor). Because that means reading
+named machines' data, the comparison is **recorded in the audit log**. The aggregate is shown without any
 per-machine identity; the **per-machine pairs** are behind a separate *"Show
 per-machine pairs"* click, so opening that view is a deliberate, separately-audited
 action.

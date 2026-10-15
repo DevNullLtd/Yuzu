@@ -26,8 +26,11 @@
 # Why kerl (not apt / esl-erlang):
 #   apt/esl tracks one version system-wide; kerl is per-user, version-
 #   isolated, and matches what scripts/ensure-erlang.sh already probes
-#   for. Bumping in the future is `./kerl build <newver> <newver>` plus
-#   editing one PATH line.
+#   for. Bumping in the future is re-running this script with
+#   OTP_VERSION=<newver>: it rewrites .path itself, and Meson finds the
+#   kerl install on its own. <newver> must satisfy the build's pin (28.4
+#   or later 28.x); a new major is a pin change first (docs/erlang-gateway-
+#   build.md, "Changing the Erlang/OTP pin").
 #
 # Usage:
 #   bash scripts/runner-ops/upgrade-erlang-linux.sh [--yes] [--no-restart]

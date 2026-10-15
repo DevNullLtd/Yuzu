@@ -102,7 +102,7 @@ echarts_embed = custom_target(
   input: 'vendor/echarts.min.js',
   output: 'echarts_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -122,7 +122,7 @@ three_embed = custom_target(
   input: 'vendor/three.module.min.js',
   output: 'three_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -135,7 +135,7 @@ three_orbit_embed = custom_target(
   input: 'vendor/three-orbit-controls.js',
   output: 'three_orbit_controls_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -153,7 +153,7 @@ yuzu_viz_js_embed = custom_target(
   input: 'static/yuzu-viz.js',
   output: 'yuzu_viz_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -173,7 +173,7 @@ yuzu_viz_host_js_embed = custom_target(
   input: 'static/yuzu-viz-host.js',
   output: 'yuzu_viz_host_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -188,11 +188,39 @@ yuzu_dialog_js_embed = custom_target(
   input: 'static/yuzu-dialog.js',
   output: 'yuzu_dialog_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
     'YuzuDialogJs',
+  ],
+)
+
+# Access pages (Phase 2): client glue for /access/*. Symbol: kYuzuAccessJs (std::string).
+yuzu_access_js_embed = custom_target(
+  'yuzu_access_js_bundle',
+  input: 'static/yuzu-access.js',
+  output: 'yuzu_access_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuAccessJs',
+  ],
+)
+
+# Tokens and principals page (Phase 2): client glue. Symbol: kYuzuTokensJs (std::string).
+yuzu_tokens_js_embed = custom_target(
+  'yuzu_tokens_js_bundle',
+  input: 'static/yuzu-tokens.js',
+  output: 'yuzu_tokens_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuTokensJs',
   ],
 )
 
@@ -203,7 +231,7 @@ yuzu_operate_js_embed = custom_target(
   input: 'static/yuzu-operate.js',
   output: 'yuzu_operate_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -218,7 +246,7 @@ yuzu_operate_extras_js_embed = custom_target(
   input: 'static/yuzu-operate-extras.js',
   output: 'yuzu_operate_extras_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -232,7 +260,7 @@ yuzu_estate_js_embed = custom_target(
   input: 'static/yuzu-estate.js',
   output: 'yuzu_estate_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -246,7 +274,7 @@ yuzu_device_data_js_embed = custom_target(
   input: 'static/yuzu-device-data.js',
   output: 'yuzu_device_data_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -259,7 +287,7 @@ cytoscape_js_embed = custom_target(
   input: 'static/cytoscape.min.js',
   output: 'cytoscape_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -277,7 +305,7 @@ yuzu_css_embed = custom_target(
   input: 'static/yuzu.css',
   output: 'yuzu_css_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -303,7 +331,7 @@ foreach symbol, file : plex_fonts
     input: 'vendor/ibm-plex/' + file,
     output: symbol.to_lower() + '_bundle.cpp',
     command: [
-      find_program('python3', 'python'),
+      yuzu_python,
       files('scripts/embed_binary.py'),
       '@INPUT@',
       '@OUTPUT@',
@@ -323,7 +351,7 @@ endforeach
 # filesystem fallback at runtime), so a missing PyYAML used to silently
 # produce a binary with an empty Instructions tab. Probe at configure
 # time so the failure surfaces here rather than mid-compile.
-embed_python = find_program('python3', 'python')
+embed_python = yuzu_python
 _yaml_probe = run_command(embed_python, '-c', 'import yaml', check: false)
 if _yaml_probe.returncode() != 0
   error(
@@ -448,7 +476,8 @@ yuzu_key_provider_dep = declare_dependency(
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
-   yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_viz_host_js_embed, yuzu_access_js_embed, yuzu_tokens_js_embed,
+   cytoscape_js_embed, yuzu_operate_js_embed,
    yuzu_dialog_js_embed, yuzu_operate_extras_js_embed, yuzu_estate_js_embed,
    yuzu_device_data_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
@@ -476,10 +505,18 @@ yuzu_server_core_lib = static_library(
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
+    'src/access_render.cpp', # Access pages (Phase 2): pure HTML renderers for /access/users
+    'src/access_ui.cpp', # Access pages: the Users page template
+    'src/access_routes.cpp', # Access pages: /access/users + its two fragments + static glue
+    'src/access_tokens_render.cpp', # Tokens and principals page: pure renderers
+    'src/access_tokens_ui.cpp', # Tokens and principals page: template
+    'src/access_tokens_routes.cpp', # Tokens and principals page: /access/tokens + fragments + glue
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
     'src/settings_model.cpp', # #4028 — shared REST/fragment Settings read-twin builders
+    'src/settings_general_routes.cpp', # System "General and appearance": page + 2 UI fragments
+    'src/settings_general_ui.cpp',
     'src/plugin_signing_helpers.cpp',
     'src/nvd_db.cpp',
     'src/nvd_version.cpp',
@@ -685,6 +722,10 @@ yuzu_server_core_lib = static_library(
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
     'src/discover_routes.cpp', # A2 discovery surface: /api/v1/discover/* (Issue 17.1)
+    'src/settings_data_ui.cpp', # System > Data and retention page template (SYS-4)
+    'src/developer_render.cpp', # System > Developer and API: pure renderers (SYS-4)
+    'src/developer_routes.cpp', # System > Developer and API: page + fragments (SYS-4)
+    'src/developer_ui.cpp', # System > Developer and API page template (SYS-4)
     'src/enrollment_directory_model.cpp', # #4031: shared row builders — directory/enrollment/OIDC-config read twins
     'src/enrollment_directory_routes.cpp', # #4031: REST v1 read twins — /api/v1/{directory,enrollment,settings/oidc}
     'src/viz_routes.cpp',
