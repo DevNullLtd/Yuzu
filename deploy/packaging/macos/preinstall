@@ -17,8 +17,9 @@ if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
     # Lock this shell's own descriptor, so the lock lasts exactly as long as
     # this script: with a separate lockf wrapper process, killing the wrapper
     # released the lock while the script ran on (governance uh8-6). An older
-    # lockf without the descriptor form fails with another status; the wrapper
-    # form is the fallback there. 75 is lockf's timeout, kept short so this
+    # lockf without the descriptor form fails with another status; perl's
+    # flock on the same descriptor is the fallback there, and the wrapper form
+    # only the last resort. 75 is lockf's timeout, kept short so this
     # message appears well within the time Installer allows a script (sre8-2).
     exec 9>>"$TRANSITION_LOCK"
     lock_status=0
@@ -521,15 +522,14 @@ require_started() {
 # the snapshot's lane must be absent, or real, root-owned, not group/world
 # writable and free of write-granting ACLs. Otherwise it refuses and keeps its
 # pointer for a later run, and never writes or deletes through a directory
-# another account controls (governance S8-1, uh8r3-1). /usr/local/bin counts
-# only for loose-lane code, which the bundle lane leaves alone (uh8r3-4).
+# another account controls (governance S8-1, uh8r3-1). The lane comes from
+# the root-only snapshot alone, never from entries another account could
+# create (S8r4-1, S8r4-2): only a snapshot with loose-lane code makes
+# /usr/local/bin a restore target, and then it must be trusted (uh8r3-4).
 require_trusted_restore_targets() {
     local recovery="$1" path
     RESTORE_LANE=bundle
-    if [[ -e "$recovery/loose/yuzu-agent" || -e "$LOOSE_BIN/yuzu-agent" || -L "$LOOSE_BIN/yuzu-agent" || \
-          -e "$LOOSE_BIN/.yuzu-agent.incoming" || -L "$LOOSE_BIN/.yuzu-agent.incoming" ]]; then
-        RESTORE_LANE=loose
-    fi
+    [[ ! -d "$recovery/loose" ]] || RESTORE_LANE=loose
     for path in /usr/local /usr/local/lib "$YUZU_LIB" "$PLUGIN_DIR" "$(dirname "$APP_ROOT")" "$APP_ROOT" \
                 "$(dirname "$PLIST")"; do
         code_directory_trusted "$path" || {
@@ -608,9 +608,13 @@ recover_interrupted_promotion() {
         "$recovery/package-files.sha256"
     rm -f "$PLIST" "$YUZU_LIB/package-mode" "$YUZU_LIB/package-files.list" "$YUZU_LIB/package-files.sha256"
     rm -rf "$APP_ROOT/YuzuAgent.app"
-    if [[ "$RESTORE_LANE" == loose ]]; then
+    # A bundle-lane snapshot can meet loose code a promotion had already laid
+    # down; remove it only from a trusted /usr/local/bin, otherwise report it.
+    if [[ "$RESTORE_LANE" == loose ]] || code_directory_trusted "$LOOSE_BIN"; then
         rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" \
               "$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"
+    else
+        echo "WARNING: left any Yuzu agent files in $LOOSE_BIN in place: the directory is not protected from other accounts" >&2
     fi
     rm -f /usr/local/lib/libyuzu_agent_core.dylib
     [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || \

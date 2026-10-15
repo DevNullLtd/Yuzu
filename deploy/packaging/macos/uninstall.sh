@@ -17,8 +17,9 @@ if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
     # Lock this shell's own descriptor, so the lock lasts exactly as long as
     # this script: with a separate lockf wrapper process, killing the wrapper
     # released the lock while the script ran on (governance uh8-6). An older
-    # lockf without the descriptor form fails with another status; the wrapper
-    # form is the fallback there. 75 is lockf's timeout, kept short so this
+    # lockf without the descriptor form fails with another status; perl's
+    # flock on the same descriptor is the fallback there, and the wrapper form
+    # only the last resort. 75 is lockf's timeout, kept short so this
     # message appears well within the time Installer allows a script (sre8-2).
     exec 9>>"$TRANSITION_LOCK"
     lock_status=0
@@ -194,7 +195,7 @@ manifest_is_stale() {
 
 remove_receipted_plugins() {
     local receipt relative name
-    /usr/sbin/pkgutil --pkg-info com.yuzu.agent >/dev/null 2>&1 || return 0
+    [[ "$RECEIPT_PRESENT" == 1 ]] || return 0
     # A receipt that exists but cannot be listed must stop the uninstall before
     # `pkgutil --forget`, or its plugins are orphaned (governance uh8r3-3).
     receipt="$(/usr/sbin/pkgutil --files com.yuzu.agent 2>/dev/null)" || {
@@ -225,6 +226,11 @@ clear_recovery_state() {
     done
 }
 
+# Whether the Installer receipt exists, read once: `pkgutil --forget` below runs
+# only for a receipt confirmed here, so a transient failure can never forget
+# a receipt whose plugins were not removed (governance U-1).
+RECEIPT_PRESENT=0
+if /usr/sbin/pkgutil --pkg-info com.yuzu.agent >/dev/null 2>&1; then RECEIPT_PRESENT=1; fi
 ensure_state_dir
 clear_recovery_state
 stop_service || echo "WARNING: Yuzu Agent is still unloading; its code is removed anyway" >&2
@@ -256,7 +262,7 @@ rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/.yuzu-agent.incoming" \
       "$YUZU_LIB/merge-launchd-plist.py" \
       "$YUZU_LIB/merge-launchd-plist.js" \
       "$YUZU_LIB/plugin-signing-policy.json" "$YUZU_LIB/uninstall.sh"
-pkgutil --forget com.yuzu.agent >/dev/null 2>&1 || true
+[[ "$RECEIPT_PRESENT" != 1 ]] || pkgutil --forget com.yuzu.agent >/dev/null 2>&1 || true
 # The state root holds only recovery state and the quarantine. Remove it when
 # nothing was quarantined; otherwise keep it and say where (co-5).
 if [[ -d "$STATE_DIR/quarantine" ]] && [[ -n "$(ls -A "$STATE_DIR/quarantine")" ]]; then

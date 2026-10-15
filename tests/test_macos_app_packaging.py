@@ -1599,14 +1599,12 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         # updater's rollback file and marker (governance ch-4, rd-5).
         pattern = re.escape(clear_lanes).replace(re.escape("\\\n          "), r"\\\n\s+")
         self.assertEqual(len(re.findall(pattern, postinstall)), 1)  # promotion
-        # Recovery clears the loose lane only when the snapshot or the host has
-        # loose code, so it never deletes through a bundle lane's /usr/local/bin
-        # (uh8r3-4); the legacy core-library location is cleared either way.
-        recovery_lanes = ('    if [[ "$RESTORE_LANE" == loose ]]; then\n'
+        # Recovery clears the loose lane on a loose-lane snapshot, or from a
+        # trusted /usr/local/bin; never through an untrusted one (uh8r3-4,
+        # S8r4-1); the legacy core-library location is cleared either way.
+        recovery_lanes = ('    if [[ "$RESTORE_LANE" == loose ]] || code_directory_trusted "$LOOSE_BIN"; then\n'
                           '        rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" \\\n'
-                          '              "$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"\n'
-                          '    fi\n'
-                          '    rm -f /usr/local/lib/libyuzu_agent_core.dylib\n')
+                          '              "$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"\n')
         self.assertEqual(postinstall.count(recovery_lanes), 1)
         self.assertEqual(preinstall.count(recovery_lanes), 1)
         self.assertIn('"$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"', uninstall)
@@ -3285,8 +3283,59 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
     # ── Governance con8-4: uninstall after a rollback removes plugins by name ──
     def _uninstall_plugin_block(self) -> str:
         source = (BUILD_PKG.parent / "uninstall.sh").read_text()
+        receipt = source.index("RECEIPT_PRESENT=0\n")
+        receipt_block = source[receipt:source.index("\n", source.index("RECEIPT_PRESENT=1", receipt)) + 1]
         start = source.index('if [[ ! -f "$MANIFEST" ]]; then\n')
-        return source[start:source.index("\nfi\n", start) + 4]
+        # The stubbed pkgutil, never this host's real receipt database.
+        return (receipt_block + source[start:source.index("\nfi\n", start) + 4]).replace("/usr/sbin/pkgutil", "pkgutil")
+
+    @posix_shell
+    def test_uninstall_forgets_only_a_receipt_it_confirmed(self) -> None:
+        # Governance U-1: a transient `pkgutil --pkg-info` failure must not reach
+        # `pkgutil --forget`; the real forget line is guarded by the run's own check.
+        source = (BUILD_PKG.parent / "uninstall.sh").read_text()
+        receipt = source.index("RECEIPT_PRESENT=0\n")
+        receipt_block = source[receipt:source.index("\n", source.index("RECEIPT_PRESENT=1", receipt)) + 1]
+        forget = next(line for line in source.splitlines()
+                      if "pkgutil --forget com.yuzu.agent" in line and not line.lstrip().startswith("#")) + "\n"
+        for info_ok, forgets in ((True, True), (False, False)):
+            with self.subTest(info_ok=info_ok), tempfile.TemporaryDirectory(prefix="yuzu_test_forget_") as temporary:
+                root = Path(temporary)
+                info = "return 0" if info_ok else "return 1"
+                stub = (f'pkgutil() {{ echo "$*" >> "{root}/pkgutil.log"; case "$1" in '
+                        f'--pkg-info) {info} ;; *) return 0 ;; esac; }}\n')
+                result = subprocess.run([PKG_SHELL, "-c", PREAMBLE + stub + receipt_block.replace("/usr/sbin/pkgutil", "pkgutil")
+                                         + forget + "echo DONE\n"], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                log = (root / "pkgutil.log").read_text()
+                self.assertEqual("--forget com.yuzu.agent" in log, forgets, log)
+
+    @posix_shell
+    def test_restore_lane_comes_from_the_snapshot_only(self) -> None:
+        # Governance S8r4-1/S8r4-2: entries another account can create in
+        # /usr/local/bin never decide the lane; any loose-lane code in the root-only
+        # snapshot (even the core library alone) makes it the loose lane.
+        for script in ("preinstall", "postinstall"):
+            for case, snapshot_files, live_files, lane in (
+                    ("bundle snapshot, planted live agent", [], ["yuzu-agent"], "bundle"),
+                    ("snapshot with only the core library", ["libyuzu_agent_core.dylib"], [], "loose"),
+                    ("loose snapshot", ["yuzu-agent"], [], "loose"),
+                    ("bundle snapshot", [], [], "bundle")):
+                with self.subTest(script=script, case=case), \
+                        tempfile.TemporaryDirectory(prefix="yuzu_test_restore_lane_") as temporary:
+                    root = Path(temporary)
+                    recovery = self._recovery_layout(root)
+                    for name in snapshot_files:
+                        (recovery / "loose").mkdir(exist_ok=True)
+                        (recovery / "loose" / name).write_text("previous")
+                    for name in live_files:
+                        (root / "ul/bin" / name).write_text("planted")
+                    result = self._installer_harness(
+                        root, script, ("acl_grants_write", "code_directory_trusted", "require_trusted_restore_targets"),
+                        f'require_trusted_restore_targets "{recovery}"\necho "LANE=$RESTORE_LANE"\n',
+                        modes=self._recovery_modes(root))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"LANE={lane}", result.stdout)
 
     @macos_userland
     def test_uninstall_removes_plugins_by_name_when_the_manifest_is_stale(self) -> None:
