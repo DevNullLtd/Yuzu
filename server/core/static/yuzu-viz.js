@@ -303,7 +303,7 @@ function buildCube(machine) {
   });
   const cube = new THREE.Mesh(geom, mat);
   // Outline: a wireframe overlay reads better than just the translucent
-  // shell against a dark grid. Subtle, same colour as the cube.
+  // shell against a dark grid. Clear (opacity .75), same colour as the cube.
   const wire = new THREE.LineSegments(
     new THREE.EdgesGeometry(geom),
     new THREE.LineBasicMaterial({color: color, transparent: true, opacity: 0.75}));
@@ -1332,8 +1332,8 @@ function mount() {
         if (isExternal) {
           // Tiny ring marker at the end of the stub so external dests
           // are visible (a bare line into empty space is easy to miss
-          // on a dense canvas). Same warm colour family as cubes for
-          // unknown OS so it reads as "out of fleet" not "another tier".
+          // on a dense canvas). Same grey as the cubes of an unknown OS
+          // so it reads as "out of fleet" not "another tier".
           const ringGeom = new THREE.RingGeometry(0.22, 0.36, 16);
           const ringMat = new THREE.MeshBasicMaterial({
             color: 0x9199a6, transparent: true, opacity: 0.7, side: THREE.DoubleSide

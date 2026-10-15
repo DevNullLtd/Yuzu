@@ -64,6 +64,9 @@ extern const char* const kLoginHtml =
       background: var(--surface2); border: 1px solid var(--line2); border-radius: var(--rad-panel);
     }
     .enroll-secret-label { margin-bottom: 2px; font-size: 12.5px; color: var(--mut); }
+    .enroll-secret-gap { margin-top: 0.5rem; }
+    .enroll-otpauth { display: block; word-break: break-all; }
+    .enroll-qr { justify-content: center; margin: 0 0 8px 0; }
     .enroll-secret code { font-family: var(--mds-font-family-mono); font-size: 12.5px; color: var(--ink); }
     /* The QR image carries its own white ground and quiet zone, so it is only clipped to the control radius. */
     .enroll-qr-box { overflow: hidden; border-radius: var(--rad-ctl); line-height: 0; }
@@ -116,7 +119,7 @@ extern const char* const kLoginHtml =
       <div class="subtitle">Multi-factor authentication is required. Scan this with your
         authenticator app, then enter the 6-digit code it shows to finish signing in.</div>
       <input type="hidden" id="enroll-pending-token">
-      <div id="enroll-qr" style="display:none;justify-content:center;margin:0 0 8px 0">
+      <div id="enroll-qr" class="enroll-qr" style="display:none">
         <div class="enroll-qr-box"></div>
       </div>
       <div id="enroll-qr-hint" class="enroll-qr-hint" style="display:none">
@@ -124,8 +127,8 @@ extern const char* const kLoginHtml =
       <div class="enroll-secret">
         <div class="enroll-secret-label">Base32 secret (manual entry)</div>
         <code id="enroll-secret"></code>
-        <div class="enroll-secret-label" style="margin-top:0.5rem">otpauth URI</div>
-        <code id="enroll-otpauth" style="display:block;word-break:break-all"></code>
+        <div class="enroll-secret-label enroll-secret-gap">otpauth URI</div>
+        <code id="enroll-otpauth" class="enroll-otpauth"></code>
       </div>
       <div class="field">
         <label for="enroll-code">Verification code</label>

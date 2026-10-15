@@ -49,11 +49,11 @@ const char* class_label(DispatchClass c) {
 
 const char* class_css(DispatchClass c) {
     switch (c) {
-        case DispatchClass::ReadOnly: return "hw-badge ro";
-        case DispatchClass::Mutating: return "hw-badge mut";
-        case DispatchClass::Destructive: return "hw-badge dst";
+        case DispatchClass::ReadOnly: return "pill ok";
+        case DispatchClass::Mutating: return "pill warn";
+        case DispatchClass::Destructive: return "pill bad";
     }
-    return "hw-badge";
+    return "pill";
 }
 
 std::string field_html(const ActionFormField& f) {
@@ -135,10 +135,6 @@ std::string render_hardware_actions_lens(const std::string& agent_id, const std:
   .hw-act-hdr{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
   .hw-act-name{font-family:var(--mds-font-family-mono);font-size:12.5px;color:var(--ink)}
   .hw-act-desc{flex:1;color:var(--mut);font-size:13px}
-  .hw-badge{padding:1px 8px;border-radius:3px;font-size:12.5px;font-weight:500;white-space:nowrap}
-  .hw-badge.ro{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
-  .hw-badge.mut,.hw-badge.warn{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
-  .hw-badge.dst{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
   .hw-fld{margin:10px 0}
   .hw-fld label{display:block;margin-bottom:5px;color:var(--ink2);font-size:13px;font-weight:500}
   .hw-fld input,.hw-fld select,.hw-fld textarea{min-width:220px;height:var(--ctl);padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font-size:14px}
@@ -195,12 +191,12 @@ std::string render_hardware_actions_lens(const std::string& agent_id, const std:
             h += "<span class=\"" + std::string(class_css(row.cap->dispatch_class)) + "\">" +
                  class_label(row.cap->dispatch_class) + "</span>";
             if (row.cap->mutability == Mutability::Irreversible)
-                h += "<span class=\"hw-badge warn\">Irreversible</span>";
+                h += "<span class=\"pill warn\">Irreversible</span>";
             if (row.cap->execute_gate != ExecuteGate::None &&
                 row.cap->execute_gate != ExecuteGate::Unspecified)
-                h += "<span class=\"hw-badge warn\">Approval-gated</span>";
+                h += "<span class=\"pill warn\">Approval-gated</span>";
         } else {
-            h += "<span class=\"hw-badge warn\">" +
+            h += "<span class=\"pill warn\">" +
                  std::string(row.ambiguous ? "Ambiguous" : "Unclassified") + "</span>";
         }
         h += "<span class=\"hw-act-desc\">" + esc(row.description) + "</span></div>";

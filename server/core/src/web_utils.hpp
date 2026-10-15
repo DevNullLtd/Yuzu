@@ -906,7 +906,7 @@ inline std::string truncate_utf8(std::string_view s, std::size_t max_chars) {
 // scope) the bar renders a single hatched/empty cell so the row doesn't look
 // like a successful zero-agent run.
 //
-// Color tokens: Cisco Momentum success/error/stable/text-tertiary. Theme-
+// Color tokens: Cisco Momentum success/error/info/text-tertiary. Theme-
 // agnostic — light and dark mode both read the same SVG via CSS vars.
 // ============================================================================
 
@@ -955,7 +955,7 @@ inline std::string render_status_sparkbar(int succeeded, int failed,
     Seg segs[4] = {
         {succeeded, "var(--mds-color-bg-success-emphasis,var(--green))"},
         {failed,    "var(--mds-color-theme-indicator-error,var(--red))"},
-        {running,   "var(--mds-color-theme-indicator-stable,var(--accent))"},
+        {running,   "var(--mds-color-theme-indicator-info,var(--info))"},
         {pending,   "var(--mds-color-theme-text-tertiary,var(--muted))"},
     };
     int widths[4] = {0, 0, 0, 0};
