@@ -1551,6 +1551,46 @@ TEST_CASE("OIDC discovery: a failing JWKS refetch keeps the keys already cached"
     CHECK(idp.jwks_calls.load() == 2);
 }
 
+TEST_CASE("OIDC discovery: cached keys are dropped after the hard maximum key age when the JWKS "
+          "endpoint stays down, and come back when it answers",
+          "[oidc][oidc_discovery][jwt]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    CHECK(idp.jwks_calls.load() == 1);
+    idp.with([](MockIdp& m) { m.jwks_status = 503; }); // the IdP's JWKS endpoint goes away
+
+    // Inside the ceiling the cached key still verifies and nothing is refetched (a failed
+    // attempt re-arms the retry timer, which the seam keeps fresh).
+    provider.set_jwks_key_age_for_test(std::chrono::hours(23));
+    CHECK(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    CHECK(idp.jwks_calls.load() == 1);
+
+    // Past it the key is no longer trusted, even though the retry timer is fresh: the fetch is
+    // tried (and fails), and the verification is refused with the fixed unavailable token.
+    provider.set_jwks_key_age_for_test(std::chrono::hours(25));
+    auto stale = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == std::string(OidcProvider::kJwksUnavailable));
+    const int after_drop = idp.jwks_calls.load();
+    CHECK(after_drop > 1); // the dropped cache was refetched (and the fetch failed)
+
+    // While the IdP stays down every login tries again (the cache is empty now) and is refused.
+    CHECK_FALSE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    const int while_down = idp.jwks_calls.load();
+    CHECK(while_down > after_drop);
+
+    // The IdP answers again: the next login refetches, verifies, and the key is trusted anew,
+    // so a further login is served from the cache without another GET.
+    idp.with([](MockIdp& m) { m.jwks_status = 200; });
+    CHECK(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    const int recovered = idp.jwks_calls.load();
+    CHECK(recovered > while_down);
+    CHECK(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    CHECK(idp.jwks_calls.load() == recovered);
+}
+
 TEST_CASE("OIDC discovery: a failed attempt is remembered, two logins inside the window cost ONE GET",
           "[oidc][oidc_discovery]") {
     MockIdp idp;
@@ -3244,8 +3284,8 @@ TEST_CASE("OIDC discovery: endpoints must be absolute and carry the issuer's own
 
 TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test, "
           "add_test_pending_flow, set_http_timeouts_for_test, "
-          "set_discovery_negative_cache_for_test, set_resolver_for_test or "
-          "pending_flow_count_for_test (source pin)",
+          "set_discovery_negative_cache_for_test, set_resolver_for_test, "
+          "set_jwks_key_age_for_test or pending_flow_count_for_test (source pin)",
           "[oidc][oidc_binding][source_pin]") {
     // The seams are public members of the production class and the first makes the binding
     // digest fail. Their only legitimate callers are tests; any file under server/core/src other
@@ -3256,6 +3296,7 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
                                              "set_http_timeouts_for_test",
                                              "set_discovery_negative_cache_for_test",
                                              "set_resolver_for_test",
+                                             "set_jwks_key_age_for_test",
                                              "pending_flow_count_for_test"};
     std::size_t scanned = 0;
     const fs::path src_dir = fs::path(YUZU_SERVER_SRC_DIR);

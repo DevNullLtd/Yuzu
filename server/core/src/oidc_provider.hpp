@@ -237,11 +237,11 @@ public:
     /// this instance's binding SHA-256 fail exactly as a broken crypto provider would;
     /// `add_test_pending_flow` plants a pending flow with a chosen binding hash (hex), bypassing
     /// `start_auth_flow`, so the stored-hash validation can be driven with a value no honest
-    /// flow stores. TEST-ONLY: none of the six test seams in this block (these two,
+    /// flow stores. TEST-ONLY: none of the seven test seams in this block (these two,
     /// `set_http_timeouts_for_test`, `set_discovery_negative_cache_for_test`,
-    /// `set_resolver_for_test` and `pending_flow_count_for_test`) has a production caller, and
-    /// tests/unit/server/ test_oidc_provider.cpp pins (source scan) that no other file in
-    /// server/core/src references them.
+    /// `set_resolver_for_test`, `set_jwks_key_age_for_test` and `pending_flow_count_for_test`) has
+    /// a production caller, and tests/unit/server/ test_oidc_provider.cpp pins (source scan) that
+    /// no other file in server/core/src references them.
     void set_binding_digest_failure_for_test(bool fail);
     void add_test_pending_flow(const std::string& state, std::string binding_hash);
     /// Test-only seam: replaces the 5 s per-operation connect/read/write timeouts of every IdP
@@ -260,6 +260,10 @@ public:
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);
+    /// Test-only seam: pretends the cached signing keys were last fetched successfully `age`
+    /// ago, while the retry timer stays fresh (as after a failed refetch), so a test can drive
+    /// the hard maximum key age without waiting. Same source-scan pin.
+    void set_jwks_key_age_for_test(std::chrono::seconds age);
     /// Test-only seam: how many authorization flows are pending (a failed start must leave 0
     /// and a refused callback leaves the count unchanged). Same source-scan pin.
     std::size_t pending_flow_count_for_test() const;
@@ -381,8 +385,9 @@ private:
     /// Stamps `jwks_fetched_at_` on EVERY attempt, so while the cache holds keys a failing IdP is
     /// retried once per cache TTL rather than once per login. An EMPTY cache and every kid miss
     /// still refetch on every call (#1900). Cached keys are trusted until the next SUCCESSFUL
-    /// fetch replaces them (this was already so before discovery): a retired key therefore keeps
-    /// verifying while jwks_uri stays unreachable (tracked under #1900/#1901).
+    /// fetch replaces them, but never for longer than `kJwksMaxKeyAge` after the last success
+    /// (#1901 UP-5): past that the cache is dropped and every login refetches until the IdP
+    /// answers, so a key the IdP retired cannot keep verifying through a long outage.
     bool fetch_jwks();
 
     OidcConfig config_;
@@ -402,8 +407,11 @@ private:
     // JWKS cache for JWT signature verification (G2-SEC-A1-001)
     mutable std::mutex jwks_mu_;
     std::vector<CachedJwk> jwks_cache_;
-    std::chrono::steady_clock::time_point jwks_fetched_at_;
+    std::chrono::steady_clock::time_point jwks_fetched_at_;     // last ATTEMPT (retry timer)
+    std::chrono::steady_clock::time_point jwks_last_success_{}; // last stored key set
     static constexpr auto kJwksCacheTtl = std::chrono::hours(1);
+    /// Hard ceiling on how long cached keys are trusted without a successful refetch.
+    static constexpr auto kJwksMaxKeyAge = std::chrono::hours(24);
 
     static constexpr auto kChallengeTtl = std::chrono::minutes(10);
 };

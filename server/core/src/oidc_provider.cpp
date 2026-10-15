@@ -1198,9 +1198,9 @@ bool OidcProvider::fetch_jwks() {
         // per TTL, not once per login. An EMPTY cache and every kid miss still refetch on every
         // call (#1900). Cached keys are trusted until the next SUCCESSFUL fetch replaces them
         // (not "one more TTL": the failed fetch leaves the cache untouched, as it did before
-        // discovery), so a retired key keeps verifying while jwks_uri stays unreachable. Tracked
-        // under #1900/#1901 (a hard maximum key age); the alternative here is hammering a dead
-        // IdP on every request.
+        // discovery), but only until kJwksMaxKeyAge after the last success: verify_jwt_signature
+        // drops an older cache, so a retired key cannot keep verifying through a long outage
+        // (#1901 UP-5). The alternative to stamping here is hammering a dead IdP on every request.
         std::lock_guard lock(jwks_mu_);
         jwks_fetched_at_ = std::chrono::steady_clock::now();
     }
@@ -1234,6 +1234,7 @@ bool OidcProvider::fetch_jwks() {
     }
     jwks_cache_ = std::move(*keys);
     jwks_fetched_at_ = std::chrono::steady_clock::now();
+    jwks_last_success_ = jwks_fetched_at_;
     spdlog::info("OidcProvider: cached {} JWKS signing keys", jwks_cache_.size());
     return true;
 }
@@ -1280,7 +1281,19 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
     bool fetch_failed = false;
     {
         std::lock_guard lock(jwks_mu_);
-        auto age = std::chrono::steady_clock::now() - jwks_fetched_at_;
+        const auto now = std::chrono::steady_clock::now();
+        // Hard maximum key age: keys not refreshed by a SUCCESSFUL fetch within kJwksMaxKeyAge are
+        // no longer trusted, however recently a failed attempt re-armed the retry timer. Dropping
+        // the cache makes it empty, so the fetch below runs on this and every later login until
+        // the IdP answers (#1901 UP-5).
+        if (!jwks_cache_.empty() && now - jwks_last_success_ > kJwksMaxKeyAge) {
+            spdlog::error("OidcProvider: the {} cached signing keys were last fetched more than {} "
+                          "hours ago and the JWKS endpoint has not answered since; dropping them",
+                          jwks_cache_.size(),
+                          std::chrono::duration_cast<std::chrono::hours>(kJwksMaxKeyAge).count());
+            jwks_cache_.clear();
+        }
+        auto age = now - jwks_fetched_at_;
         if (jwks_cache_.empty() || age > kJwksCacheTtl) {
             // Need to fetch — release lock first (fetch acquires its own)
         } else {
@@ -1389,7 +1402,14 @@ bool OidcProvider::add_test_jwks_key(const std::string& kid, const std::string& 
     // Mark the cache fresh so verify_jwt_signature uses the injected key without
     // attempting a (test-absent) network fetch.
     jwks_fetched_at_ = std::chrono::steady_clock::now();
+    jwks_last_success_ = jwks_fetched_at_;
     return true;
+}
+
+void OidcProvider::set_jwks_key_age_for_test(std::chrono::seconds age) {
+    std::lock_guard lock(jwks_mu_);
+    jwks_fetched_at_ = std::chrono::steady_clock::now();
+    jwks_last_success_ = jwks_fetched_at_ - age;
 }
 
 // ── Discovery (#5692) ────────────────────────────────────────────────────────
