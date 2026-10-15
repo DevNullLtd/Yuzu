@@ -40,8 +40,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
   probes that fetch `/home` still receive `200`.
 - **The Hardware pages no longer show quarantine controls.** The Quarantine link, the
   Quarantined pill, the Quarantined devices panel, the containment banner and tab, and the
-  quarantine plugin's rows in the Actions lens are hidden until the approval workflow
-  lands. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
+  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
   plugin and the role-gated quarantine instructions on the Instructions page all work as
   before, and server-side enforcement does not depend on the UI. While the controls are
   hidden, use `GET /api/v1/quarantine` to list records. `DELETE /api/v1/quarantine/{agent_id}`
