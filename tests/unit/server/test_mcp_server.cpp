@@ -17657,7 +17657,8 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
             R"({"offset":-1})", R"({"principal":42})", R"({"target_id":"x"})" /* no target_type */,
             R"({"principal":")" + std::string(257, 'p') + R"("})",
             R"({"target_type":"t","target_id":")" + std::string(513, 'i') + R"("})",
-            R"({"since":9,"until":3})"};
+            R"({"since":9,"until":3})", R"({"principal":"a\u0000b"})", R"({"target_id":7})",
+            R"({"target_type":"T","target_id":"a\u0000b"})"};
         for (const std::string& bad : bads) {
             INFO(bad.substr(0, 60));
             auto body = call(bad);
@@ -17668,6 +17669,16 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
             CHECK(data["retry_after_ms"].is_null());
             CHECK_FALSE(data["remediation"].is_null());
         }
+    }
+
+    SECTION("the limits count characters, not bytes: 256 two-byte characters are accepted") {
+        std::string wide;
+        for (int i = 0; i < 256; ++i)
+            wide += "\xC3\xA9"; // U+00E9, two bytes each: 512 bytes, 256 characters
+        auto ok = call(R"({"principal":")" + wide + R"("})");
+        CHECK(ok.contains("result"));
+        auto over = call(R"({"principal":")" + wide + "\xC3\xA9" + R"("})");
+        CHECK(over.contains("error"));
     }
 
     SECTION("the filter limits are inclusive: 256 and 512 characters are accepted") {
@@ -17688,6 +17699,22 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
         CHECK_FALSE(data["remediation"].is_null());
         CHECK_FALSE(body.contains("result"));
     }
+}
+
+TEST_CASE("MCP query_audit_log: an unconfigured audit store is an A4 error, not a bare one",
+          "[mcp][audit][a5]") {
+    McpTestServer ts; // no audit_store_for_test
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":77,)"
+                       R"("params":{"name":"query_audit_log","arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    const auto& data = body["error"]["data"];
+    CHECK_FALSE(data["correlation_id"].get<std::string>().empty());
+    CHECK(data["retry_after_ms"].is_null());
+    CHECK_FALSE(data["remediation"].is_null());
+    CHECK_FALSE(body.contains("result"));
 }
 
 TEST_CASE("MCP audit surfaces gate on exactly AuditLog:Read (#5771: the pair the "

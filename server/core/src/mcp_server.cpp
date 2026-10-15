@@ -132,10 +132,17 @@
 namespace yuzu::server::mcp {
 namespace {
 
-// Published as `maxLength` on query_audit_log's string filters (A5 item 3) and enforced by the handler.
+// `maxLength` of query_audit_log's string filters: published in its schema (A5) and enforced by the
+// handler in characters (UTF-8 code points), as JSON Schema counts them. Keep the schema literal in
+// step with these.
 constexpr std::size_t kAuditFilterMaxLen = 256;
 constexpr std::size_t kAuditTargetIdMaxLen = 512;
 
+/// UTF-8 code points in `v` (every byte that is not a continuation byte starts one).
+inline std::size_t utf8_length(const std::string& v) {
+    return static_cast<std::size_t>(std::count_if(
+        v.begin(), v.end(), [](unsigned char c) { return (c & 0xC0) != 0x80; }));
+}
 
 // ── Lightweight JSON string builder (same pattern as rest_api_v1.cpp) ─────
 // Uses direct string building to avoid nlohmann template-instantiation bloat.
@@ -8568,11 +8575,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
-                    if (v->size() > kAuditFilterMaxLen) {
-                        res.set_content(a4_error(kInvalidParams,
-                                                 "string filters are limited to 256 characters",
-                                                 "use the exact value; no audit field is longer"),
-                                        "application/json");
+                    if (utf8_length(*v) > kAuditFilterMaxLen) {
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "string filters are limited to " +
+                                         std::to_string(kAuditFilterMaxLen) + " characters",
+                                     "pass the exact value, which is shorter"),
+                            "application/json");
                         return;
                     }
                 }
@@ -8608,10 +8617,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                if (target_id_opt->size() > kAuditTargetIdMaxLen) {
-                    res.set_content(a4_error(kInvalidParams, "target_id is limited to 512 characters",
-                                             "use the exact id; no audit target is longer"),
-                                    "application/json");
+                if (utf8_length(*target_id_opt) > kAuditTargetIdMaxLen) {
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "target_id is limited to " + std::to_string(kAuditTargetIdMaxLen) +
+                                     " characters",
+                                 "pass the exact id, which is shorter"),
+                        "application/json");
                     return;
                 }
                 aq.target_id = *target_id_opt;
@@ -8669,7 +8681,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                       tool_result_split(arr.str(),
                                                          JObj()
                                                              .raw("entries", arr.str())
-                                                             .raw("has_more", has_more ? "true" : "false")
+                                                             .raw("has_more",
+                                                                  has_more ? "true" : "false")
                                                              .str(),
                                                          kObjectOutputSchema)),
                     "application/json");

@@ -999,8 +999,9 @@ TEST_CASE("AuditLog:Read floor: a non-admin is refused 403 on filtered and malfo
     REQUIRE_FALSE(user_headers.at("Cookie").empty());
     REQUIRE_FALSE(admin_headers.at("Cookie").empty());
 
-    // Each query is a 400 for an admitted caller (bad paging bound, unparseable bound,
-    // inverted window, target_id without target_type) except the last, a valid filter.
+    // Each query is a 400 for an admitted caller (bad paging bound, unparseable bound, inverted or
+    // negative window, a NUL in a string filter, target_id without target_type) except the
+    // last, a valid filter.
     const std::vector<std::pair<std::string, int>> queries = {
         {"/api/audit?offset=10001", 400},
         {"/api/audit?since=abc", 400},
