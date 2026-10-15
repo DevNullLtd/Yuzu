@@ -181,10 +181,15 @@ pkgutil() { [[ "$1" == --files && "$2" == com.yuzu.agent ]] || exit 99; printf '
         function = source[start:source.index("\n}", start) + 2]
         with tempfile.TemporaryDirectory(prefix="yuzu_test_data_dir_") as temporary:
             data = Path(temporary) / "data"
-            harness = "set -eu\nrequire_trusted_directory() { return 0; }\nchown() { echo CHOWN; }\n" + function + "\nensure_data_directory\n"
-            def invoke():
-                return subprocess.run(["bash", "-c", harness], text=True, capture_output=True,
-                                      env={**os.environ, "DATA_DIR": str(data)})
+            check_start = source.index("require_trusted_data_directory() {")
+            function = source[check_start:source.index("\n}", check_start) + 2] + "\n" + function
+            # The installer runs as root; the fixture reports the data directory's owner as
+            # FAKE_UID (default root) so ownership can be exercised without privileges.
+            fake_stat = 'stat() { if [[ "$2" == "%u" ]]; then echo "${FAKE_UID:-0}"; else command stat "$@"; fi; }\n'
+            harness = "set -eu\n" + fake_stat + "require_trusted_directory() { return 0; }\nchown() { echo CHOWN; }\n" + function + "\nensure_data_directory\n"
+            def invoke(**extra):
+                return subprocess.run([PKG_SHELL, "-c", harness], text=True, capture_output=True,
+                                      env={**os.environ, "DATA_DIR": str(data), **extra})
             result = invoke()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(data.stat().st_mode & 0o777, 0o750)
@@ -201,9 +206,27 @@ pkgutil() { [[ "$1" == --files && "$2" == com.yuzu.agent ]] || exit 99; printf '
             self.assertEqual(sentinel.read_bytes(), b"existing data")
             link = Path(temporary) / "link"
             link.symlink_to(data, target_is_directory=True)
-            result = subprocess.run(["bash", "-c", harness], text=True, capture_output=True,
+            result = subprocess.run([PKG_SHELL, "-c", harness], text=True, capture_output=True,
                                     env={**os.environ, "DATA_DIR": str(link)})
             self.assertNotEqual(result.returncode, 0)
+            # PR #4482 review: an existing data root that is not root-owned, or is
+            # group/world writable, is refused and left exactly as it was.
+            for mode, uid in ((0o777, "0"), (0o770, "0"), (0o750, "501")):
+                data.chmod(mode)
+                before = data.stat()
+                result = invoke(FAKE_UID=uid)
+                self.assertNotEqual(result.returncode, 0, f"mode {oct(mode)} uid {uid} was accepted")
+                self.assertIn("must be root-owned and not group/world writable", result.stderr)
+                self.assertEqual(data.stat().st_mode, before.st_mode)
+                self.assertEqual(sentinel.read_bytes(), b"existing data")
+            data.chmod(0o710)
+
+    def test_preinstall_refuses_an_untrusted_data_directory_before_staging(self) -> None:
+        preinstall = (BUILD_PKG.parent / "preinstall").read_text()
+        check = preinstall.index('require_trusted_data_directory || exit 1')
+        self.assertLess(check, preinstall.index('secure_payload_parent "$APP_ROOT" 755'))
+        self.assertLess(check, preinstall.index('write_recovery_phase "$RECOVERY" prepared'))
+        self.assertLess(preinstall.index('require_trusted_data_directory() {'), check)
 
     def test_provisioning_udid_is_not_substituted_with_hardware_uuid(self) -> None:
         hardware_uuid = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"

@@ -102,12 +102,27 @@ preserve_or_create_directory() {
     chown root:wheel "$path"
 }
 
+require_trusted_data_directory() {
+    local owner mode
+    owner="$(stat -f '%u' "$DATA_DIR")"
+    mode="$(stat -f '%Lp' "$DATA_DIR")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || {
+        echo "ERROR: existing data directory must be root-owned and not group/world writable: $DATA_DIR" >&2
+        echo "       (owner uid $owner, mode $mode). The installer never changes it; fix it or remove it, then retry." >&2
+        return 1; }
+}
+
 ensure_data_directory() {
-    # FDA/EDR policy may intentionally own an existing data root. Never chmod,
-    # chown, or replace it; only create the missing launchd working directory.
+    # FDA/EDR policy may intentionally own an existing data root's contents and
+    # permissions. Never chmod, chown, or replace it; only create the missing
+    # launchd working directory. It is still the root daemon's --data-dir and
+    # WorkingDirectory, so it must meet the same bar as every other operational
+    # directory: a user-created, group/world-writable root is refused, never
+    # silently adopted (PR #4482 review).
     if [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then
         [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || {
             echo "ERROR: data path is not a real directory" >&2; return 1; }
+        require_trusted_data_directory || return 1
         return 0
     fi
     require_trusted_directory "$(dirname "$DATA_DIR")" || return 1

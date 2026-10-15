@@ -58,7 +58,9 @@ The bundle LaunchDaemon runs as root, retains external plugins, and always passe
 `--no-auto-update`. The sealed app is in the package-owned, root-owned
 `/Library/Application Support/YuzuAgent/YuzuAgent.app`; data stays in
 `/Library/Application Support/Yuzu` and is never ownership-reset or removed by
-this lane. Logs, configuration, and trust anchors also remain outside the sealed
+this lane. Because it is the root daemon's data and working directory, an existing one
+must already be root-owned and not group- or world-writable; otherwise installation
+stops before anything is staged, and the directory is left exactly as it was. Logs, configuration, and trust anchors also remain outside the sealed
 app, with existing configuration and certificate-directory ownership and modes
 preserved.
 When upgrading an earlier development build that placed `YuzuAgent.app` below

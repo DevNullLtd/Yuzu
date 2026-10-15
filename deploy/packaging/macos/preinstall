@@ -93,12 +93,27 @@ write_recovery_phase() {
 # their ownership without accepting a symlink before the privileged extraction.
 # The Yuzu data directory may be provisioned by EDR/FDA policy with a
 # non-package owner. Never change it: stage sealed code in its own trusted root.
+require_trusted_data_directory() {
+    local owner mode
+    owner="$(stat -f '%u' "$DATA_DIR")"
+    mode="$(stat -f '%Lp' "$DATA_DIR")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || {
+        echo "ERROR: existing data directory must be root-owned and not group/world writable: $DATA_DIR" >&2
+        echo "       (owner uid $owner, mode $mode). The installer never changes it; fix it or remove it, then retry." >&2
+        return 1; }
+}
+if [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then
+    [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || {
+        echo "ERROR: data path is not a real directory: $DATA_DIR" >&2; exit 1; }
+    require_trusted_data_directory || exit 1
+fi
 secure_payload_parent "$APP_ROOT" 755
 secure_payload_parent "$YUZU_LIB" 755
 if [[ -e "$YUZU_LIB/plugins" || -L "$YUZU_LIB/plugins" ]]; then
     require_trusted_directory "$YUZU_LIB/plugins"
 fi
 ensure_state_dir
+
 
 remove_managed_plugins() {
     local manifest="$1" relative plugin
