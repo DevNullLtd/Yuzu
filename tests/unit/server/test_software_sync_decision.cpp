@@ -11,8 +11,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -24,6 +27,42 @@ namespace {
 ss::Candidate cand(std::string id, std::optional<std::string> v) { return {std::move(id), std::move(v)}; }
 
 bool floor_ok(std::string_view v) { return agent_supports_sync_now(v); }
+
+using Ids = std::vector<std::string>;
+
+authz::VisibleSet visible_of(Ids ids) {
+    return authz::VisibleSet{std::unordered_set<std::string>(ids.begin(), ids.end())};
+}
+
+// Fakes for the three store reads. Every call is counted so a test can prove a read did (or did
+// not) happen, and what it was asked.
+struct Fakes {
+    Ids all{"a", "b", "c"};
+    std::optional<Ids> group{Ids{"a", "b", "c"}};
+    ss::ScopeExpansion scope{.matched = Ids{"a", "b", "c"}};
+    int all_calls = 0, group_calls = 0, scope_calls = 0;
+    std::string last_group, last_expr;
+
+    ss::Expansion expansion() {
+        ss::Expansion ex;
+        ex.all_ids = [this] {
+            ++all_calls;
+            return all;
+        };
+        ex.group_members = [this](const std::string& id) {
+            ++group_calls;
+            last_group = id;
+            return group;
+        };
+        ex.scope_matches = [this](const std::string& e) {
+            ++scope_calls;
+            last_expr = e;
+            return scope;
+        };
+        return ex;
+    }
+    int reads() const { return all_calls + group_calls + scope_calls; }
+};
 
 } // namespace
 
@@ -286,4 +325,162 @@ TEST_CASE("sync summary: counts only, never a per-device list", "[server][softwa
     CHECK(j["requested_at"] == 1700000000);
     for (const auto& [k, v] : j.items())
         CHECK_FALSE(v.is_array());
+}
+
+// ── target resolution: confinement and every fail-closed branch ───────────────────
+
+TEST_CASE("sync resolve: every expanding arm is confined to the caller's visible set",
+          "[server][software_sync][security]") {
+    const ss::Selector arms[] = {{DispatchArm::Broadcast, "__all__"},
+                                 {DispatchArm::Group, "group:finance"},
+                                 {DispatchArm::Scope, R"(ostype == "windows")"}};
+    for (const auto& sel : arms) {
+        INFO(dispatch_arm_label(sel.arm));
+        Fakes f; // each expansion yields {a, b, c}
+        const auto r = ss::resolve_targets(sel, visible_of({"a", "c"}), f.expansion());
+        CHECK(r.status == ss::Resolved::Status::Ok);
+        CHECK(r.ids == Ids{"a", "c"}); // b is dropped, order kept
+        CHECK_FALSE(r.caller_unfiltered);
+    }
+}
+
+TEST_CASE("sync resolve: present-but-empty visible set is deny-all, nullopt is unfiltered",
+          "[server][software_sync][security]") {
+    Fakes f;
+    const ss::Selector sel{DispatchArm::Broadcast, "__all__"};
+
+    const auto none = ss::resolve_targets(sel, authz::deny_all(), f.expansion());
+    CHECK(none.status == ss::Resolved::Status::Ok); // a confined answer, not a failure
+    CHECK(none.ids.empty());
+    CHECK_FALSE(none.caller_unfiltered);
+
+    const auto all = ss::resolve_targets(sel, authz::VisibleSet{}, f.expansion()); // nullopt
+    CHECK(all.status == ss::Resolved::Status::Ok);
+    CHECK(all.ids == Ids{"a", "b", "c"});
+    CHECK(all.caller_unfiltered);
+}
+
+TEST_CASE("sync resolve: an Ids-arm device the caller cannot see is dropped, never reported",
+          "[server][software_sync][security]") {
+    Fakes f;
+    const ss::Selector sel{DispatchArm::Ids, "hidden-host"};
+
+    const auto hidden = ss::resolve_targets(sel, visible_of({"a"}), f.expansion());
+    CHECK(hidden.status == ss::Resolved::Status::Ok);
+    CHECK(hidden.ids.empty()); // same answer as for a device that does not exist
+    CHECK(hidden.detail.empty());
+    CHECK(f.reads() == 0); // a named device needs no expansion at all
+
+    const auto seen = ss::resolve_targets(sel, visible_of({"hidden-host"}), f.expansion());
+    CHECK(seen.ids == Ids{"hidden-host"});
+    CHECK(ss::resolve_targets(sel, authz::VisibleSet{}, f.expansion()).ids == Ids{"hidden-host"});
+    CHECK(ss::resolve_targets(sel, authz::deny_all(), f.expansion()).ids.empty());
+}
+
+TEST_CASE("sync resolve: broadcast reads the fleet once and nothing else", "[server][software_sync]") {
+    Fakes f;
+    f.all = {"x", "y"};
+    const auto r = ss::resolve_targets({DispatchArm::Broadcast, "__all__"}, authz::VisibleSet{}, f.expansion());
+    CHECK(r.ids == Ids{"x", "y"});
+    CHECK(f.all_calls == 1);
+    CHECK(f.group_calls == 0);
+    CHECK(f.scope_calls == 0);
+}
+
+TEST_CASE("sync resolve: a group asks the store for the id after the prefix, and a degraded store aborts",
+          "[server][software_sync][security]") {
+    Fakes f;
+    f.group = Ids{"m1", "m2"};
+    const auto ok = ss::resolve_targets({DispatchArm::Group, "group:finance"}, authz::VisibleSet{}, f.expansion());
+    CHECK(ok.status == ss::Resolved::Status::Ok);
+    CHECK(ok.ids == Ids{"m1", "m2"});
+    CHECK(f.last_group == "finance");
+
+    // A group that genuinely has no members is an empty Ok, not an abort...
+    f.group = Ids{};
+    const auto empty = ss::resolve_targets({DispatchArm::Group, "group:finance"}, authz::VisibleSet{}, f.expansion());
+    CHECK(empty.status == ss::Resolved::Status::Ok);
+    CHECK(empty.ids.empty());
+
+    // ...but an absent or degraded group store is "could not resolve", never an empty group.
+    f.group = std::nullopt;
+    const auto bad = ss::resolve_targets({DispatchArm::Group, "group:finance"}, authz::VisibleSet{}, f.expansion());
+    CHECK(bad.status == ss::Resolved::Status::Aborted);
+    CHECK(bad.detail == "db_degraded");
+    CHECK(bad.ids.empty());
+
+    // A Group arm whose expression lost its prefix never reaches the store.
+    Fakes g;
+    const auto odd = ss::resolve_targets({DispatchArm::Group, "finance"}, authz::VisibleSet{}, g.expansion());
+    CHECK(odd.status == ss::Resolved::Status::Aborted);
+    CHECK(g.group_calls == 0);
+}
+
+TEST_CASE("sync resolve: a scope is invalid, aborted, or matched - and only matched is Ok",
+          "[server][software_sync][security]") {
+    const ss::Selector sel{DispatchArm::Scope, R"(tag:prod AND ostype == "linux")"};
+    Fakes f;
+
+    f.scope = {.matched = Ids{"a", "b"}};
+    const auto ok = ss::resolve_targets(sel, authz::VisibleSet{}, f.expansion());
+    CHECK(ok.status == ss::Resolved::Status::Ok);
+    CHECK(ok.ids == Ids{"a", "b"});
+    CHECK(f.last_expr == sel.expr);
+
+    f.scope = {.matched = Ids{}}; // matched nothing: a real, empty answer
+    const auto none = ss::resolve_targets(sel, authz::VisibleSet{}, f.expansion());
+    CHECK(none.status == ss::Resolved::Status::Ok);
+    CHECK(none.ids.empty());
+
+    f.scope = {.parse_error = "unexpected token"};
+    const auto invalid = ss::resolve_targets(sel, authz::VisibleSet{}, f.expansion());
+    CHECK(invalid.status == ss::Resolved::Status::InvalidScope);
+    CHECK(invalid.detail == "unexpected token");
+    CHECK(invalid.ids.empty());
+
+    f.scope = {.abort_detail = "owner_check_failed"};
+    const auto aborted = ss::resolve_targets(sel, authz::VisibleSet{}, f.expansion());
+    CHECK(aborted.status == ss::Resolved::Status::Aborted); // NOT an empty Ok
+    CHECK(aborted.detail == "owner_check_failed");
+    CHECK(aborted.ids.empty());
+
+    f.scope = {}; // aborted with no reason given
+    const auto unknown = ss::resolve_targets(sel, authz::VisibleSet{}, f.expansion());
+    CHECK(unknown.status == ss::Resolved::Status::Aborted);
+    CHECK(unknown.detail == "unknown");
+}
+
+TEST_CASE("sync resolve: an abort still reports the caller's filter state, with no ids",
+          "[server][software_sync][security]") {
+    Fakes f;
+    f.group = std::nullopt;
+    const auto confined = ss::resolve_targets({DispatchArm::Group, "group:g"}, visible_of({"a"}), f.expansion());
+    CHECK(confined.status == ss::Resolved::Status::Aborted);
+    CHECK_FALSE(confined.caller_unfiltered);
+    CHECK(confined.ids.empty());
+    const auto open = ss::resolve_targets({DispatchArm::Group, "group:g"}, authz::VisibleSet{}, f.expansion());
+    CHECK(open.caller_unfiltered);
+}
+
+TEST_CASE("sync resolve: no target, or an unwired store read, is Aborted - never an empty Ok",
+          "[server][software_sync][security]") {
+    Fakes f;
+    const auto none = ss::resolve_targets({DispatchArm::None, ""}, authz::VisibleSet{}, f.expansion());
+    CHECK(none.status == ss::Resolved::Status::Aborted);
+    CHECK(none.ids.empty());
+    CHECK(f.reads() == 0);
+
+    const ss::Expansion unwired{}; // every callable empty
+    for (const auto& sel : {ss::Selector{DispatchArm::Broadcast, "__all__"},
+                            ss::Selector{DispatchArm::Group, "group:g"},
+                            ss::Selector{DispatchArm::Scope, "ostype == \"linux\""}}) {
+        INFO(dispatch_arm_label(sel.arm));
+        const auto r = ss::resolve_targets(sel, authz::VisibleSet{}, unwired);
+        CHECK(r.status == ss::Resolved::Status::Aborted);
+        CHECK(r.detail == "unwired");
+        CHECK(r.ids.empty());
+    }
+    // A named device needs no store, so an unwired expansion does not stop it.
+    CHECK(ss::resolve_targets({DispatchArm::Ids, "h"}, authz::VisibleSet{}, unwired).status ==
+          ss::Resolved::Status::Ok);
 }

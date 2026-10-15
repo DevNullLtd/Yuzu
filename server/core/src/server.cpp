@@ -18568,33 +18568,27 @@ private:
                              .sync_resolve_fn =
                                  [this](const auth::Session& sess,
                                         const software_sync::Selector& sel) -> software_sync::Resolved {
-                                     software_sync::Resolved out; // status defaults to Aborted
-                                     const auto visible = derive_exec_visible(sess);
-                                     out.caller_unfiltered = !visible.has_value();
-                                     std::vector<std::string> ids;
-                                     switch (sel.arm) {
-                                     case DispatchArm::Ids:
-                                         ids.push_back(sel.expr);
-                                         break;
-                                     case DispatchArm::Broadcast:
-                                         ids = registry_.all_ids();
-                                         break;
-                                     case DispatchArm::Group: {
-                                         // A missing or degraded group store is "could not
-                                         // resolve", never an empty group.
-                                         const auto members =
-                                             mgmt_group_store_
-                                                 ? mgmt_group_store_->get_members_checked(sel.expr.substr(6))
-                                                 : std::nullopt;
-                                         if (!members) {
-                                             out.detail = "db_degraded";
-                                             return out;
-                                         }
+                                     // Only the store reads live here; the confinement and every
+                                     // fail-closed branch are software_sync::resolve_targets.
+                                     software_sync::Expansion ex;
+                                     ex.all_ids = [this] { return registry_.all_ids(); };
+                                     ex.group_members =
+                                         [this](const std::string& group_id)
+                                         -> std::optional<std::vector<std::string>> {
+                                         if (!mgmt_group_store_)
+                                             return std::nullopt;
+                                         const auto members = mgmt_group_store_->get_members_checked(group_id);
+                                         if (!members)
+                                             return std::nullopt;
+                                         std::vector<std::string> ids;
+                                         ids.reserve(members->size());
                                          for (const auto& m : *members)
                                              ids.push_back(m.agent_id);
-                                         break;
-                                     }
-                                     case DispatchArm::Scope: {
+                                         return ids;
+                                     };
+                                     ex.scope_matches =
+                                         [this, &sess](const std::string& expression)
+                                         -> software_sync::ScopeExpansion {
                                          // The same ladder a real dispatch uses (alias -> owner
                                          // check -> parse -> registry evaluation, fail closed).
                                          const std::string role = auth::role_to_string(sess.role);
@@ -18610,7 +18604,7 @@ private:
                                                                             reason);
                                          };
                                          auto ladder = yuzu::server::resolve_scope_targets(
-                                             sel.expr, sess.username, result_set_store_.get(),
+                                             expression, sess.username, result_set_store_.get(),
                                              [&](const yuzu::scope::Expression& parsed) {
                                                  return registry_.evaluate_scope(
                                                      parsed, tag_store_.get(),
@@ -18618,26 +18612,17 @@ private:
                                                      result_set_store_.get(), sess.username);
                                              },
                                              audit);
-                                         if (ladder.parse_error) {
-                                             out.status = software_sync::Resolved::Status::InvalidScope;
-                                             out.detail = *ladder.parse_error;
-                                             return out;
-                                         }
-                                         if (!ladder.matched) {
-                                             out.detail = ladder.abort_reason
-                                                              ? to_string(*ladder.abort_reason)
-                                                              : "unknown";
-                                             return out;
-                                         }
-                                         ids = std::move(*ladder.matched);
-                                         break;
-                                     }
-                                     case DispatchArm::None:
+                                         software_sync::ScopeExpansion out;
+                                         out.parse_error = std::move(ladder.parse_error);
+                                         out.matched = std::move(ladder.matched);
+                                         if (!out.matched && !out.parse_error)
+                                             out.abort_detail = ladder.abort_reason
+                                                                    ? to_string(*ladder.abort_reason)
+                                                                    : "unknown";
                                          return out;
-                                     }
-                                     out.ids = yuzu::server::authz::filter_to_scope(ids, visible);
-                                     out.status = software_sync::Resolved::Status::Ok;
-                                     return out;
+                                     };
+                                     return software_sync::resolve_targets(sel, derive_exec_visible(sess),
+                                                                            ex);
                                  },
                              // push_sync_now for every target; the agent ignores stagger for
                              // `__sync__.now`, so the herd is bounded by the route's 500-target

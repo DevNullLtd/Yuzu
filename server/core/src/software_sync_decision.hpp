@@ -19,8 +19,10 @@
 ///
 /// Nothing here authorises anything. Execution:Execute is checked by the route; targets
 /// arrive already intersected with the caller's Execution:Execute visible set by
-/// `Resolved` (server.cpp), and `fleet_wide_denied` only decides who may NAME the fleet.
+/// `resolve_targets` (server.cpp only supplies the store reads it calls), and
+/// `fleet_wide_denied` only decides who may NAME the fleet.
 
+#include "authz_model.hpp"           // authz::VisibleSet, authz::filter_to_scope (std-only header)
 #include "dispatch_target_shape.hpp" // DispatchArm, classify_dispatch_arm, kBroadcastScope
 
 #include <yuzu/log_token.hpp>
@@ -30,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -182,6 +185,92 @@ struct DispatchResult {
     std::size_t sent{0};
     std::string command_id;
 };
+
+/// What a scope-expression expansion reported: exactly the outcomes the ADR-0036 ladder has.
+/// `matched` is nullopt for both an invalid expression (`parse_error` set) and an abort
+/// (`abort_detail` names why) - a caller must never read either as "matched nothing".
+struct ScopeExpansion {
+    std::optional<std::vector<std::string>> matched;
+    std::optional<std::string> parse_error;
+    std::string abort_detail;
+};
+
+/// The store reads `resolve_targets` needs, injected so the confinement rules around them are
+/// testable with fakes. An EMPTY callable is a missing dependency and resolves to Aborted
+/// (fail closed), never to an empty target list.
+struct Expansion {
+    std::function<std::vector<std::string>()> all_ids;
+    /// nullopt == the group store is absent or degraded (distinct from a group with no members).
+    std::function<std::optional<std::vector<std::string>>(const std::string& group_id)> group_members;
+    std::function<ScopeExpansion(const std::string& expression)> scope_matches;
+};
+
+/// Expand a selector to the devices it names and confine them to `visible` (the caller's own
+/// Execution:Execute set; nullopt == unfiltered, present-but-empty == deny-all). Only `Ok`
+/// carries ids, and an `Ok` result is already confined: a device the caller cannot see is
+/// dropped here and never reported. Anything the expansion could not answer (an unwired or
+/// degraded store, an aborted scope, no target at all) is `Aborted`, never an empty `Ok`;
+/// an invalid expression is `InvalidScope`. `caller_unfiltered` is set from `visible` on every
+/// path so the route can apply the fleet-wide rule.
+[[nodiscard]] inline Resolved resolve_targets(const Selector& sel, const authz::VisibleSet& visible,
+                                              const Expansion& ex) {
+    Resolved out; // status defaults to Aborted: each early return below refuses to guess
+    out.caller_unfiltered = !visible.has_value();
+    std::vector<std::string> ids;
+    switch (sel.arm) {
+    case DispatchArm::Ids:
+        ids.push_back(sel.expr);
+        break;
+    case DispatchArm::Broadcast:
+        if (!ex.all_ids) {
+            out.detail = "unwired";
+            return out;
+        }
+        ids = ex.all_ids();
+        break;
+    case DispatchArm::Group: {
+        if (!ex.group_members) {
+            out.detail = "unwired";
+            return out;
+        }
+        if (!sel.expr.starts_with("group:")) {
+            out.detail = "bad_selector";
+            return out;
+        }
+        auto members = ex.group_members(sel.expr.substr(6));
+        if (!members) {
+            out.detail = "db_degraded";
+            return out;
+        }
+        ids = std::move(*members);
+        break;
+    }
+    case DispatchArm::Scope: {
+        if (!ex.scope_matches) {
+            out.detail = "unwired";
+            return out;
+        }
+        auto r = ex.scope_matches(sel.expr);
+        if (r.parse_error) {
+            out.status = Resolved::Status::InvalidScope;
+            out.detail = std::move(*r.parse_error);
+            return out;
+        }
+        if (!r.matched) {
+            out.detail = r.abort_detail.empty() ? std::string("unknown") : std::move(r.abort_detail);
+            return out;
+        }
+        ids = std::move(*r.matched);
+        break;
+    }
+    case DispatchArm::None:
+        out.detail = "no_target";
+        return out;
+    }
+    out.ids = authz::filter_to_scope(ids, visible);
+    out.status = Resolved::Status::Ok;
+    return out;
+}
 
 // ── partition ─────────────────────────────────────────────────────────────────────
 
