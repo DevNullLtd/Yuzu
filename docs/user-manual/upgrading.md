@@ -405,11 +405,12 @@ fragments (the deployment, device, hardware, DEX, pre-flight and TAR process-tre
 clamped to a fixed range per poll (1 to 100000 on the deployment and pre-flight polls, at most 50 on
 the others), and values parsed from stored rows, agent output or server configuration rather than
 from a request. Numeric path segments matched by a `(\d+)`
-pattern (notification read/dismiss, the webhook routes, the auto-approve rule index) now answer
-`404` for an id that does not fit a signed 64-bit integer; they used to fail with `500`.
+pattern (notification read/dismiss and the webhook routes) now answer `404` for an id that does
+not fit a signed 64-bit integer; they used to fail with `500`. The auto-approve rule index answers
+`200` with an audited `denied` row (`rule_not_found`) and changes nothing.
 
 **What to do.** Send whole integers, and omit a parameter to get its default. No configuration or
-data migration is needed, but and optionally list API tokens with `expires_at=0` and enrollment tokens minted before the upgrade. During a rolling upgrade, replicas on the old and new build answer a
+data migration is needed, but review Settings > Auto-Approve for `ip_subnet` rules with a sign or an odd prefix (they match nothing, so those agents go to the pending queue), and optionally list API tokens with `expires_at=0` and enrollment tokens minted before the upgrade. During a rolling upgrade, replicas on the old and new build answer a
 malformed value differently (`200` versus `400`).
 
 ## Changed: a degraded execution-statistics read is a 503, not an empty 200 (#4644)

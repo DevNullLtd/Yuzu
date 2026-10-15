@@ -288,8 +288,9 @@ counter on the live-snapshot poll fragments (the deployment, device, hardware, D
 TAR process-tree polls), which is clamped to a fixed range per poll (`1` to `100000` on the
 deployment and pre-flight polls, at most `50` on the others); and values that are parsed from stored rows, agent output or server
 configuration rather than from a request. Numeric path segments matched by a `(\d+)` pattern
-(`/api/notifications/{id}/read`, `/dismiss`, the webhook routes and the auto-approve rule index)
-answer `404` for an id that does not fit a signed 64-bit integer; they used to throw and answer
+(`/api/notifications/{id}/read`, `/dismiss` and the webhook routes) answer `404` for an id that
+does not fit a signed 64-bit integer (the auto-approve rule index answers `200` with an audited
+`denied` row and changes nothing); they used to throw and answer
 `500`.
 
 ---
