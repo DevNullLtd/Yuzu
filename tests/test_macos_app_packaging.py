@@ -556,11 +556,11 @@ class PackagingStructureTests(unittest.TestCase):
         "preinstall": ("plugin_hash_matches", "remove_managed_plugins", "quarantine_legacy_app",
                        "acl_grants_write", "code_directory_chain_trusted", "require_started", "stop_service",
                        "restart_restored_service", "recover_interrupted_promotion", "copy_back",
-                       "restore_missing_live_files", "require_real_restore_targets", "code_directory_trusted"),
+                       "restore_missing_live_files", "require_trusted_restore_targets", "code_directory_trusted"),
         "postinstall": ("recovery_path", "plugin_hash_matches", "remove_managed_plugins", "quarantine_legacy_app",
                         "acl_grants_write", "code_directory_chain_trusted", "require_started", "stop_service",
                         "restart_restored_service", "finish_recovery", "restore_previous",
-                        "require_real_restore_targets", "code_directory_trusted"),
+                        "require_trusted_restore_targets", "code_directory_trusted"),
     }
 
     def _installer_harness(self, root: Path, script: str, names: tuple[str, ...], body: str, *,
@@ -745,7 +745,11 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 self.assertNotIn("bootstrap", self._launchctl_log(root))
 
     @posix_shell
-    def test_recovery_does_not_start_a_loose_agent_from_an_untrusted_directory(self) -> None:
+    def test_recovery_refuses_an_untrusted_loose_lane_before_writing(self) -> None:
+        # Governance uh8r3-1: recovery runs before this install's trust checks, so it
+        # checks first. A loose-lane snapshot over a group-writable /usr/local/bin is
+        # neither restored into nor started from: nothing is written, the agent is
+        # not touched, and the pointer stays for a run after the directory is fixed.
         for script in ("preinstall", "postinstall"):
             with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_loose_recover_") as temporary:
                 root = Path(temporary)
@@ -753,11 +757,76 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 (root / "launchctl.state").write_text(RUNNING)
                 result = self._restore(root, script, recovery,
                                        modes=self._recovery_modes(root, **{"ul/bin": 775}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("RESTORED", result.stdout)
+                self.assertIn(f"{root / 'ul/bin'} is not a real, root-owned directory", result.stderr)
+                self.assertFalse((root / "ul/bin/yuzu-agent").exists())
+                self.assertEqual(self._launchctl_log(root), "")
+                self.assertTrue((root / "state/current-recovery").exists())
+
+    @posix_shell
+    def test_recovery_refuses_an_untrusted_package_directory_and_leaves_it_untouched(self) -> None:
+        # Governance uh8r3-1: a group-writable plugin directory (any lane). Nothing
+        # written into it, nothing deleted from it, the pointer kept.
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_untrusted_dir_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root)
+                (recovery / "yuzu/plugins").mkdir(parents=True)
+                (recovery / "yuzu/plugins/tar.dylib").write_bytes(b"previous plugin")
+                plugins = root / "ul/lib/yuzu/plugins"
+                (plugins / "listed.dylib").write_bytes(b"current plugin")
+                (root / "ul/lib/yuzu/package-files.list").write_text("plugins/listed.dylib\n")
+                before = sorted(p.name for p in plugins.iterdir())
+                result = self._restore(root, script, recovery,
+                                       modes=self._recovery_modes(root, **{"ul/lib/yuzu/plugins": 775}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{plugins} is not a real, root-owned directory", result.stderr)
+                self.assertEqual(sorted(p.name for p in plugins.iterdir()), before)
+                self.assertEqual((plugins / "listed.dylib").read_bytes(), b"current plugin")
+                self.assertTrue((root / "ul/lib/yuzu/package-files.list").exists())
+                self.assertEqual(self._launchctl_log(root), "")
+                self.assertTrue((root / "state/current-recovery").exists())
+
+    @macos_userland
+    def test_recovery_refuses_a_package_directory_with_a_write_acl(self) -> None:
+        # Governance uh8r3-1 with G8-S7: a write-granting ACL counts as untrusted too.
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_untrusted_acl_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root)
+                yuzu_lib = root / "ul/lib/yuzu"
+                subprocess.run(["chmod", "+a", "everyone allow add_file,write", str(yuzu_lib)], check=True)
+                try:
+                    result = self._restore(root, script, recovery)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"{yuzu_lib} is not a real, root-owned directory", result.stderr)
+                    self.assertEqual(self._launchctl_log(root), "")
+                    self.assertFalse((root / "LaunchDaemons/com.yuzu.agent.plist").exists())
+                finally:
+                    subprocess.run(["chmod", "-N", str(yuzu_lib)], check=False)
+
+    @posix_shell
+    def test_bundle_lane_recovery_leaves_a_symlinked_loose_directory_alone(self) -> None:
+        # Governance uh8r3-4: the bundle lane does not use /usr/local/bin, so a link
+        # there neither blocks its recovery nor is deleted through.
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_bundle_bin_link_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root)
+                elsewhere = root / "elsewhere"
+                elsewhere.mkdir()
+                for name in ("yuzu-agent.old", ".yuzu-update-verified", "libyuzu_agent_core.dylib"):
+                    (elsewhere / name).write_text("not ours")
+                (root / "ul/bin").rmdir()
+                (root / "ul/bin").symlink_to(elsewhere)
+                (root / "launchctl.state").write_text(RUNNING)
+                result = self._restore(root, script, recovery)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("RESTORED", result.stdout)
-                self.assertIn("did not start it", result.stderr)
-                self.assertEqual((root / "ul/bin/yuzu-agent").read_text(), "previous loose agent")
-                self.assertNotIn("bootstrap", self._launchctl_log(root))
+                self.assertEqual(sorted(p.name for p in elsewhere.iterdir()),
+                                 [".yuzu-update-verified", "libyuzu_agent_core.dylib", "yuzu-agent.old"])
+                self.assertEqual((root / "LaunchDaemons/com.yuzu.agent.plist").read_text(), "previous definition")
 
     @posix_shell
     def test_recovery_starts_only_a_service_that_was_running(self) -> None:
@@ -811,9 +880,37 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 plugins.symlink_to(elsewhere)
                 result = self._restore(root, script, recovery)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("refusing to restore into symlinked", result.stderr)
+                self.assertIn(f"{plugins} is not a real, root-owned directory", result.stderr)
+                self.assertIn("The agent may be stopped", result.stderr)
                 self.assertEqual(list(elsewhere.iterdir()), [])
                 self.assertNotIn("bootout", self._launchctl_log(root))
+                # The pointer stays, so a later run recovers once the link is gone.
+                self.assertTrue((root / "state/current-recovery").exists())
+                self.assertEqual((recovery / "phase").read_text(), "promoting\n")
+
+    @posix_shell
+    def test_recovery_restores_a_disable_override_even_when_the_restart_fails(self) -> None:
+        # Governance uh8r3-6: the restart enables the job; if the restored agent will
+        # not stay up, the administrator's disable override is still put back.
+        for script in ("preinstall", "postinstall"):
+            for disabled in (True, False):
+                with self.subTest(script=script, disabled=disabled), \
+                        tempfile.TemporaryDirectory(prefix="yuzu_test_restore_disabled_fail_") as temporary:
+                    root = Path(temporary)
+                    recovery = self._recovery_layout(root)
+                    if disabled:
+                        (recovery / "service-was-disabled").touch()
+                    (root / "launchctl.state").write_text("state = spawn scheduled\n")
+                    result = self._restore(root, script, recovery)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("did not stay running", result.stderr)
+                    log = self._launchctl_log(root)
+                    self.assertIn("enable system/com.yuzu.agent", log)
+                    if disabled:
+                        self.assertIn("\ndisable system/com.yuzu.agent", log)
+                        self.assertLess(log.index("bootstrap system"), log.index("\ndisable system/com.yuzu.agent"))
+                    else:
+                        self.assertNotIn("\ndisable system/com.yuzu.agent", log)
 
     @posix_shell
     def test_recovery_restores_an_administrators_disable_override(self) -> None:
@@ -929,7 +1026,8 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         stubs = options.pop("stubs", "")
         if stub_recovery:
             stubs += ('recover_interrupted_promotion() { echo "RECOVER $1" >> "$STATE_DIR/../recover.log"; }\n'
-                      'restore_missing_live_files() { echo "MISSING $1" >> "$STATE_DIR/../recover.log"; }\n')
+                      'restore_missing_live_files() { echo "MISSING $1" >> "$STATE_DIR/../recover.log"; }\n'
+                      'require_trusted_restore_targets() { echo "TRUST $1" >> "$STATE_DIR/../recover.log"; }\n')
         options.setdefault("modes", self._recovery_modes(root))
         return self._installer_harness(root, "preinstall", names,
                                        self._preinstall_recovery_block() + "echo PROCEEDED\n",
@@ -946,10 +1044,36 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("PROCEEDED", result.stdout)
                 log = root / "recover.log"
+                # A prepared snapshot's copy-back is preceded by the trust check (uh8r3-1);
+                # a promoting one's runs inside recover_interrupted_promotion.
                 self.assertEqual(log.read_text() if log.exists() else "",
-                                 f"RECOVER {recovery}\n" if recovers else f"MISSING {recovery}\n")
+                                 f"RECOVER {recovery}\n" if recovers
+                                 else f"TRUST {recovery}\nMISSING {recovery}\n")
                 self.assertFalse((root / "state/current-recovery").exists())
                 self.assertFalse(recovery.exists())
+
+    @posix_shell
+    def test_preinstall_prepared_branch_refuses_an_untrusted_directory_before_copying_back(self) -> None:
+        # Governance uh8r3-1: the prepared branch's copy-back checks first. An
+        # untrusted plugin directory exits the run with the pointer kept and copies
+        # nothing back (the live definition stays missing until a fixed run).
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_prepared_untrusted_") as temporary:
+            root = Path(temporary)
+            recovery = self._recovery_layout(root, phase="prepared")
+            result = self._run_recovery_block(root, stub_recovery=False,
+                                              modes=self._recovery_modes(root, **{"ul/lib/yuzu/plugins": 775}))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("PROCEEDED", result.stdout)
+            self.assertIn("is not a real, root-owned directory", result.stderr)
+            self.assertFalse((root / "LaunchDaemons/com.yuzu.agent.plist").exists())
+            self.assertTrue((root / "state/current-recovery").exists())
+            self.assertTrue(recovery.exists())
+            # Fixed, the same run restores the missing definition and discards the snapshot.
+            fixed = self._run_recovery_block(root, stub_recovery=False)
+            self.assertEqual(fixed.returncode, 0, fixed.stderr)
+            self.assertIn("PROCEEDED", fixed.stdout)
+            self.assertEqual((root / "LaunchDaemons/com.yuzu.agent.plist").read_text(), "previous definition")
+            self.assertFalse(recovery.exists())
 
     @posix_shell
     def test_preinstall_recovery_with_an_unhealthy_service_is_not_repeated(self) -> None:
@@ -1066,7 +1190,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         post = (BUILD_PKG.parent / "postinstall").read_text()
         # Anchored on markers the guarded lines are not part of, so deleting the
         # disarm or the completion flag fails behaviourally, not by slicing.
-        start = post.index("\nretire_legacy_app\n", post.index("# The previous development bundle lived below")) + 1
+        start = post.index("\nretire_legacy_app", post.index("# The previous development bundle lived below")) + 1
         tail = post[start:post.index('echo "$outcome"\n', start)]
         for name, finish, restores, missing, succeeds in (
                 ("clean", ":", 0, 0, True),
@@ -1080,6 +1204,43 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 self.assertEqual(result.missing, missing, result.stderr)  # type: ignore[attr-defined]
                 self.assertEqual(result.returncode == 0, succeeds, result.stderr)
                 self.assertEqual("TAIL-DONE" in result.stdout, succeeds)
+
+    @posix_shell
+    def test_a_failed_legacy_retirement_never_rolls_back_a_healthy_install(self) -> None:
+        # Governance uh8-3: retiring the old development app is housekeeping after the
+        # new agent is healthy; its failure warns and the install still completes,
+        # with no snapshot restore (which every retry would otherwise repeat).
+        post = (BUILD_PKG.parent / "postinstall").read_text()
+        start = post.index("\nretire_legacy_app", post.index("# The previous development bundle lived below")) + 1
+        tail = post[start:post.index('echo "$outcome"\n', start)]
+        body = ('retire_legacy_app() { mv /nonexistent/a /nonexistent/b; }\n'
+                'finish_recovery() { :; }\nrecovery=/nonexistent\nPROMOTION_ARMED=1\n' + tail + 'echo TAIL-DONE\n')
+        result = self._promotion_exit(body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TAIL-DONE", result.stdout)
+        self.assertEqual(result.restores, 0, result.stderr)  # type: ignore[attr-defined]
+        self.assertEqual(result.missing, 0, result.stderr)  # type: ignore[attr-defined]
+        self.assertIn("could not retire the legacy development app", result.stderr)
+
+    @posix_shell
+    def test_promotion_failure_announces_the_restore_before_running_it(self) -> None:
+        # Governance uh8-5: if the restore stops part-way, the log's last line says a
+        # restore was under way, not nothing at all.
+        post = (BUILD_PKG.parent / "postinstall").read_text()
+        harness = (PREAMBLE + script_function(post, "on_exit")
+                   + 'restore_previous() { echo "RESTORE-OUTPUT" >&2; }\n'
+                   + 'restore_missing_live_files() { echo "MISSING-OUTPUT" >&2; }\n'
+                   + "INSTALL_COMPLETED=0\nPROMOTION_ARMED=0\ntrap on_exit EXIT\nPROMOTION_ARMED=1\nfalse\n")
+        result = subprocess.run([PKG_SHELL, "-c", harness], text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installation failed; restoring the previous package state", result.stderr)
+        announce = result.stderr.index("installation failed; restoring the previous package state")
+        self.assertLess(announce, result.stderr.index("RESTORE-OUTPUT"))
+        # A refusal before promotion restores nothing from the snapshot and says so not.
+        refusal = subprocess.run([PKG_SHELL, "-c", harness.replace("PROMOTION_ARMED=1\nfalse\n", "false\n")],
+                                 text=True, capture_output=True)
+        self.assertNotIn("restoring the previous package state", refusal.stderr)
+        self.assertIn("MISSING-OUTPUT", refusal.stderr)
 
     def test_installer_scripts_run_with_pipefail(self) -> None:
         for name in ("preinstall", "postinstall", "uninstall.sh"):
@@ -1098,7 +1259,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         self.assertLess(trap, phase)
         self.assertLess(phase, armed)
         disarmed = post.index("PROMOTION_ARMED=0\nfinish_recovery \"$recovery\"\nINSTALL_COMPLETED=1\n")
-        self.assertLess(post.index("\nretire_legacy_app\n", armed), disarmed)
+        self.assertLess(post.index("\nretire_legacy_app", armed), disarmed)
 
     # ── Governance sec-2: the whole /usr/local chain, both lanes ───────────────
     @macos_userland
@@ -1437,8 +1598,17 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         # Promotion and restore (postinstall) and recovery (preinstall) also drop the
         # updater's rollback file and marker (governance ch-4, rd-5).
         pattern = re.escape(clear_lanes).replace(re.escape("\\\n          "), r"\\\n\s+")
-        self.assertEqual(len(re.findall(pattern, postinstall)), 2)
-        self.assertEqual(len(re.findall(pattern, preinstall)), 1)
+        self.assertEqual(len(re.findall(pattern, postinstall)), 1)  # promotion
+        # Recovery clears the loose lane only when the snapshot or the host has
+        # loose code, so it never deletes through a bundle lane's /usr/local/bin
+        # (uh8r3-4); the legacy core-library location is cleared either way.
+        recovery_lanes = ('    if [[ "$RESTORE_LANE" == loose ]]; then\n'
+                          '        rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" \\\n'
+                          '              "$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"\n'
+                          '    fi\n'
+                          '    rm -f /usr/local/lib/libyuzu_agent_core.dylib\n')
+        self.assertEqual(postinstall.count(recovery_lanes), 1)
+        self.assertEqual(preinstall.count(recovery_lanes), 1)
         self.assertIn('"$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"', uninstall)
         self.assertIn('remove_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('harden_managed_plugins "$MANIFEST"', postinstall)
@@ -2109,6 +2279,40 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
             self.assertEqual((lib / "package-files.list").read_text(), "# package-version 2.0\nplugins/a.dylib\n")
             self.assertEqual((lib / "package-files.sha256").read_text(), "stale hashes\n")
 
+    @posix_shell
+    def test_stale_manifest_rederivation_stops_when_a_plugin_cannot_be_hashed(self) -> None:
+        # Governance uh8r3-2: a failed hash in either loop must not silently disown a
+        # plugin (which later reads as a third-party collision). The run fails, the
+        # stale pair stays for the next run, and no temporary is left behind.
+        pkgutil = ('pkgutil() { [[ "$1" == --pkg-info ]] || return 1; '
+                   "printf 'package-id: com.yuzu.agent\\nversion: 1.0\\n'; }\n")
+        receipt = 'receipt_plugin_entries() { printf \'plugins/b.dylib\\n\' >> "$1"; }\n'
+        digest = "a" * 64
+        for failing_call, loop in ((1, "still-owned"), (2, "re-derived hashes")):
+            with self.subTest(loop=loop), tempfile.TemporaryDirectory(prefix="yuzu_test_stale_hash_fail_") as temporary:
+                root = Path(temporary)
+                lib = root / "ul/lib/yuzu"
+                (lib / "plugins").mkdir(parents=True)
+                (lib / "plugins/a.dylib").write_text("a")
+                (lib / "plugins/b.dylib").write_text("b")
+                manifest = "# package-version 2.0\nplugins/a.dylib\n"
+                hashes = f"{digest}  plugins/a.dylib\n"
+                (lib / "package-files.list").write_text(manifest)
+                (lib / "package-files.sha256").write_text(hashes)
+                shasum = (f'shasum() {{ local n; n=$(cat "{root}/hash-calls" 2>/dev/null || echo 0); '
+                          f'n=$((n + 1)); echo "$n" > "{root}/hash-calls"; '
+                          f'[[ "$n" != {failing_call} ]] || return 1; echo "{digest}  $3"; }}\n')
+                result = self._installer_harness(
+                    root, "preinstall", ("discard_stale_manifest",), "discard_stale_manifest\necho DONE\n",
+                    stubs=pkgutil + receipt + shasum)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("DONE", result.stdout)
+                self.assertIn("cannot hash", result.stderr)
+                self.assertEqual((lib / "package-files.list").read_text(), manifest)
+                self.assertEqual((lib / "package-files.sha256").read_text(), hashes)
+                for pattern in (".still-owned.*", ".rederived-manifest.*", ".rederived-hashes.*"):
+                    self.assertEqual(list(lib.glob(pattern)), [], pattern)
+
     # ── Governance g8ch-B1 / g8ch-L2: bootout returns before the job is gone ────
     @posix_shell
     def test_stop_service_waits_for_launchd_to_unload_the_job(self) -> None:
@@ -2535,9 +2739,10 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
     _WRAPPER = ('        exec /usr/bin/lockf -k -t 120 "$TRANSITION_LOCK" \\\n'
                 '            /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"\n')
 
-    def _lock_preamble(self, name: str, lock: Path) -> str:
+    def _lock_preamble(self, name: str, lock: Path, perl: str = "/usr/bin/perl") -> str:
         """The script's real lock preamble against a fixture lock path; lockf is
-        resolved through PATH (a test may define a function), the wrapper re-exec
+        resolved through PATH (a test may define a function), perl is the given
+        path (a missing one disables the flock fallback), the wrapper re-exec
         reports WRAPPER instead of re-running the script, and LOCKED marks falling
         through with the lock held on fd 9."""
         source = (BUILD_PKG.parent / name).read_text()
@@ -2547,6 +2752,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         self.assertIn(self._WRAPPER, preamble, name)
         preamble = (preamble.replace(self._WRAPPER, '        echo WRAPPER; exit 0\n')
                     .replace("/usr/bin/lockf -s -t 120 9", "lockf -s -t 120 9")
+                    .replace("/usr/bin/perl", shlex.quote(perl))
                     .replace("TRANSITION_LOCK=/var/db/.yuzu-agent-transition.lock",
                              f"TRANSITION_LOCK={shlex.quote(str(lock))}"))
         return preamble + "echo LOCKED\n"
@@ -2607,33 +2813,77 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
 
     @posix_shell
     def test_transition_lock_falls_back_or_refuses_on_lockf_status(self) -> None:
+        # uh8-6: lockf's descriptor form first; then perl's flock on the same fd;
+        # only with neither, the wrapper form. A timeout (75) from either refuses.
         for name in ("preinstall", "postinstall", "uninstall.sh"):
-            for status, outcome in ((64, "WRAPPER"), (2, "WRAPPER"), (75, "REFUSED")):
-                with self.subTest(script=name, status=status), \
+            for status, perl, outcome in ((64, "missing", "WRAPPER"), (2, "missing", "WRAPPER"),
+                                          (75, "real", "REFUSED"), (64, "exit 75", "REFUSED"),
+                                          (64, "exit 2", "WRAPPER"), (64, "real", "LOCKED")):
+                with self.subTest(script=name, status=status, perl=perl), \
                         tempfile.TemporaryDirectory(prefix="yuzu_test_lock_status_") as temporary:
-                    lock = Path(temporary) / "transition.lock"
+                    root = Path(temporary)
+                    lock = root / "transition.lock"
+                    perl_path = {"missing": str(root / "no-perl"), "real": "/usr/bin/perl"}.get(perl)
+                    if perl_path is None:
+                        perl_path = str(root / "fake-perl")
+                        Path(perl_path).write_text(f"#!/bin/sh\necho PERL-CALLED >&2\n{perl}\n")
+                        Path(perl_path).chmod(0o755)
                     lockf = f"lockf() {{ return {status}; }}\n"
                     # A descriptor still open at the wrapper means the fallback leaked it.
                     probe_fd = 'echo "FD9=$( { true >&9; } 2>/dev/null && echo open || echo closed)"\n'
-                    script = self._lock_preamble(name, lock).replace(
+                    script = self._lock_preamble(name, lock, perl=perl_path).replace(
                         '        echo WRAPPER; exit 0\n', '        ' + probe_fd + '        echo WRAPPER; exit 0\n')
                     result = self._run_lock(lockf + script)
-                    self.assertNotIn("LOCKED", result.stdout)
                     if outcome == "WRAPPER":
                         self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertNotIn("LOCKED", result.stdout)
                         self.assertIn("WRAPPER", result.stdout)
                         self.assertIn("FD9=closed", result.stdout)
+                    elif outcome == "LOCKED":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn("LOCKED", result.stdout)
+                        self.assertNotIn("WRAPPER", result.stdout)
                     else:
                         self.assertNotEqual(result.returncode, 0)
+                        self.assertNotIn("LOCKED", result.stdout)
                         self.assertNotIn("WRAPPER", result.stdout)
                         self.assertIn("did not finish within 2 minutes", result.stderr)
+                    # lockf's own timeout never consults perl.
+                    if status == 75:
+                        self.assertNotIn("PERL-CALLED", result.stderr)
+
+    @posix_shell
+    def test_transition_lock_perl_fallback_holds_the_scripts_own_descriptor(self) -> None:
+        # uh8-6: with a lockf lacking the descriptor form, perl flocks fd 9 itself.
+        # The lock outlives the perl process (the script's fd 9 shares the open
+        # file), blocks a concurrent locker while the script runs, and is free
+        # once the script exits. No wrapper process exists to be killed.
+        probe = ("/usr/bin/perl -MFcntl=:flock -e "
+                 "'open(my $f, \">>\", $ARGV[0]) or exit 2; exit(flock($f, LOCK_EX | LOCK_NB) ? 0 : 75)' ")
+        for name in ("preinstall", "postinstall", "uninstall.sh"):
+            with self.subTest(script=name), tempfile.TemporaryDirectory(prefix="yuzu_test_lock_perl_") as temporary:
+                lock = Path(temporary) / "transition.lock"
+                held = (f'second=0; {probe}{shlex.quote(str(lock))} || second=$?\n'
+                        'echo "SECOND=$second"\n')
+                result = self._run_lock("lockf() { return 64; }\n" + self._lock_preamble(name, lock) + held)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("LOCKED", result.stdout)
+                self.assertNotIn("WRAPPER", result.stdout)
+                self.assertIn("SECOND=75", result.stdout)
+                after = subprocess.run(["/bin/sh", "-c", probe + shlex.quote(str(lock))])
+                self.assertEqual(after.returncode, 0)
 
     # ── Governance rd-n2: a pre-promotion refusal puts back missing live files ─
     @posix_shell
     def test_refusal_restores_only_missing_live_files_from_a_prepared_snapshot(self) -> None:
-        names = ("recovery_path", "copy_back", "restore_missing_live_files")
-        for phase, pointer, restores in (("prepared", True, True), ("promoting", True, False), ("prepared", False, False)):
-            with self.subTest(phase=phase, pointer=pointer), \
+        names = ("recovery_path", "copy_back", "restore_missing_live_files", "acl_grants_write",
+                 "code_directory_trusted", "require_trusted_restore_targets")
+        # The last case: a group-writable /usr/local/bin with a loose snapshot. The
+        # copy-back never writes through a directory another account controls
+        # (uh8r3-1); the next preinstall retries once it is fixed.
+        for phase, pointer, restores, untrusted in (("prepared", True, True, False), ("promoting", True, False, False),
+                                                    ("prepared", False, False, False), ("prepared", True, False, True)):
+            with self.subTest(phase=phase, pointer=pointer, untrusted=untrusted), \
                     tempfile.TemporaryDirectory(prefix="yuzu_test_missing_live_") as temporary:
                 root = Path(temporary)
                 recovery = self._recovery_layout(root, phase=phase, loose=True)
@@ -2649,9 +2899,10 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 (lib / "package-files.list").write_text("live manifest\n")
                 if not pointer:
                     (root / "state/current-recovery").unlink()
+                extra = {"ul/bin": 775} if untrusted else {}
                 result = self._installer_harness(root, "postinstall", names,
                                                  "restore_missing_live_files\necho DONE\n",
-                                                 modes=self._recovery_modes(root))
+                                                 modes=self._recovery_modes(root, **extra))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("DONE", result.stdout)
                 live = {root / "LaunchDaemons/com.yuzu.agent.plist": "previous definition",
@@ -3080,6 +3331,46 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 self.assertEqual("predates the installed package" in result.stderr, name == "stale manifest")
 
     @posix_shell
+    def test_uninstall_stops_before_forgetting_a_receipt_it_cannot_list(self) -> None:
+        # Governance uh8r3-3: a receipt that exists but cannot be listed must stop the
+        # uninstall before `pkgutil --forget`, or its plugins are orphaned and the next
+        # install refuses them as third-party. No receipt at all is not an error.
+        uninstall = (BUILD_PKG.parent / "uninstall.sh").read_text()
+        block_at = uninstall.index('if [[ ! -f "$MANIFEST" ]]; then\n')
+        self.assertLess(block_at, uninstall.index("pkgutil --forget com.yuzu.agent"))
+        for name, manifest, receipt_exists, stops in (
+                ("no manifest, unlistable receipt", None, True, True),
+                ("stale manifest, unlistable receipt", "2.0", True, True),
+                ("no manifest, no receipt", None, False, False)):
+            with self.subTest(case=name), tempfile.TemporaryDirectory(prefix="yuzu_test_uninstall_receipt_") as temporary:
+                root = Path(temporary)
+                plugins = root / "ul/lib/yuzu/plugins"
+                plugins.mkdir(parents=True)
+                (plugins / "old.dylib").write_text("old")
+                if manifest is not None:
+                    (root / "ul/lib/yuzu/package-files.list").write_text(
+                        f"# package-version {manifest}\nplugins/other.dylib\n")
+                info = ("printf 'package-id: com.yuzu.agent\\nversion: 1.0\\n'" if receipt_exists else "return 1")
+                stubs = (f'pkgutil() {{ echo "$*" >> "{root}/pkgutil.log"; case "$1" in '
+                         f'--pkg-info) {info} ;; --files) return 1 ;; *) return 0 ;; esac; }}\n')
+                body = self._uninstall_plugin_block() + "pkgutil --forget com.yuzu.agent\necho FORGOT\n"
+                result = self._installer_harness(
+                    root, "uninstall.sh",
+                    ("plugin_hash_matches", "remove_managed_plugins", "manifest_is_stale", "remove_receipted_plugins"),
+                    body, stubs=stubs)
+                log = (root / "pkgutil.log").read_text() if (root / "pkgutil.log").exists() else ""
+                if stops:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("cannot list the Installer receipt's files", result.stderr)
+                    self.assertNotIn("--forget", log)
+                    self.assertNotIn("FORGOT", result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("FORGOT", result.stdout)
+                    self.assertNotIn("--files", log)
+                self.assertTrue((plugins / "old.dylib").exists())
+
+    @posix_shell
     def test_uninstall_manifest_staleness_is_read_from_its_version_header(self) -> None:
         for first_line, installed, pkg_status, stale in (
                 ("# package-version 2.0", "1.0", 0, True),
@@ -3105,7 +3396,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
     @posix_shell
     def test_preserved_line_prints_after_an_upgrade_only(self) -> None:
         post = (BUILD_PKG.parent / "postinstall").read_text()
-        start = post.index("\nretire_legacy_app\n", post.index("# The previous development bundle lived below")) + 1
+        start = post.index("\nretire_legacy_app", post.index("# The previous development bundle lived below")) + 1
         tail = post[start:]
         for name, upgrade in (("upgrade", True), ("fresh install", False)):
             with self.subTest(case=name), tempfile.TemporaryDirectory(prefix="yuzu_test_preserved_") as temporary:

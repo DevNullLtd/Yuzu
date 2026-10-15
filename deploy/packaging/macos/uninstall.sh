@@ -18,14 +18,27 @@ if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
     # this script: with a separate lockf wrapper process, killing the wrapper
     # released the lock while the script ran on (governance uh8-6). An older
     # lockf without the descriptor form fails with another status; the wrapper
-    # form is the fallback there. 75 is lockf's timeout, kept well under
-    # Installer's own 600 s script limit so this message can appear (sre8-2).
+    # form is the fallback there. 75 is lockf's timeout, kept short so this
+    # message appears well within the time Installer allows a script (sre8-2).
     exec 9>>"$TRANSITION_LOCK"
     lock_status=0
     /usr/bin/lockf -s -t 120 9 2>/dev/null || lock_status=$?
     if [[ "$lock_status" == 75 ]]; then
         echo "ERROR: another Yuzu Agent package transition did not finish within 2 minutes; retry" >&2
         exit 1
+    fi
+    if [[ "$lock_status" != 0 && "$lock_status" != 75 && -x /usr/bin/perl ]]; then
+        # The same descriptor lock through perl's flock, for a lockf without the
+        # descriptor form (governance uh8-6): the wrapper form below can be
+        # released by killing the wrapper while this script runs on.
+        lock_status=0
+        /usr/bin/perl -MFcntl=:flock -e \
+            'open(my $f, ">>&=", 9) or exit 2; for (1 .. 120) { exit 0 if flock($f, LOCK_EX | LOCK_NB); sleep 1 } exit 75' \
+            || lock_status=$?
+        if [[ "$lock_status" == 75 ]]; then
+            echo "ERROR: another Yuzu Agent package transition did not finish within 2 minutes; retry" >&2
+            exit 1
+        fi
     fi
     if [[ "$lock_status" != 0 ]]; then
         exec 9>&-
@@ -181,7 +194,12 @@ manifest_is_stale() {
 
 remove_receipted_plugins() {
     local receipt relative name
-    receipt="$(/usr/sbin/pkgutil --files com.yuzu.agent 2>/dev/null)" || return 0
+    /usr/sbin/pkgutil --pkg-info com.yuzu.agent >/dev/null 2>&1 || return 0
+    # A receipt that exists but cannot be listed must stop the uninstall before
+    # `pkgutil --forget`, or its plugins are orphaned (governance uh8r3-3).
+    receipt="$(/usr/sbin/pkgutil --files com.yuzu.agent 2>/dev/null)" || {
+        echo "ERROR: cannot list the Installer receipt's files; nothing was forgotten, retry" >&2
+        return 1; }
     while IFS= read -r relative; do
         case "$relative" in
             usr/local/lib/yuzu/plugins/._*) ;;

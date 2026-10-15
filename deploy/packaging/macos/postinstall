@@ -20,14 +20,27 @@ if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
     # this script: with a separate lockf wrapper process, killing the wrapper
     # released the lock while the script ran on (governance uh8-6). An older
     # lockf without the descriptor form fails with another status; the wrapper
-    # form is the fallback there. 75 is lockf's timeout, kept well under
-    # Installer's own 600 s script limit so this message can appear (sre8-2).
+    # form is the fallback there. 75 is lockf's timeout, kept short so this
+    # message appears well within the time Installer allows a script (sre8-2).
     exec 9>>"$TRANSITION_LOCK"
     lock_status=0
     /usr/bin/lockf -s -t 120 9 2>/dev/null || lock_status=$?
     if [[ "$lock_status" == 75 ]]; then
         echo "ERROR: another Yuzu Agent package transition did not finish within 2 minutes; retry" >&2
         exit 1
+    fi
+    if [[ "$lock_status" != 0 && "$lock_status" != 75 && -x /usr/bin/perl ]]; then
+        # The same descriptor lock through perl's flock, for a lockf without the
+        # descriptor form (governance uh8-6): the wrapper form below can be
+        # released by killing the wrapper while this script runs on.
+        lock_status=0
+        /usr/bin/perl -MFcntl=:flock -e \
+            'open(my $f, ">>&=", 9) or exit 2; for (1 .. 120) { exit 0 if flock($f, LOCK_EX | LOCK_NB); sleep 1 } exit 75' \
+            || lock_status=$?
+        if [[ "$lock_status" == 75 ]]; then
+            echo "ERROR: another Yuzu Agent package transition did not finish within 2 minutes; retry" >&2
+            exit 1
+        fi
     fi
     if [[ "$lock_status" != 0 ]]; then
         exec 9>&-
@@ -580,16 +593,29 @@ verify_incoming_loose_code() {
     done
 }
 
-# Recovery writes only into real directories: a symlinked package directory is
-# refused by name, never written through (governance S8-1). The installer
-# never creates one, so a link here was placed by someone.
-require_real_restore_targets() {
-    local path
-    for path in "$LOOSE_BIN" /usr/local/lib "$YUZU_LIB" "$PLUGIN_DIR" "$APP_ROOT" /Library/LaunchDaemons; do
-        [[ ! -L "$path" ]] || {
-            echo "ERROR: refusing to restore into symlinked $path; remove the link and retry" >&2
+# Recovery writes into and deletes from the code directories before this run's
+# trust checks, so it applies them itself first: every directory it touches for
+# the snapshot's lane must be absent, or real, root-owned, not group/world
+# writable and free of write-granting ACLs. Otherwise it refuses and keeps its
+# pointer for a later run, and never writes or deletes through a directory
+# another account controls (governance S8-1, uh8r3-1). /usr/local/bin counts
+# only for loose-lane code, which the bundle lane leaves alone (uh8r3-4).
+require_trusted_restore_targets() {
+    local recovery="$1" path
+    RESTORE_LANE=bundle
+    if [[ -e "$recovery/loose/yuzu-agent" || -e "$LOOSE_BIN/yuzu-agent" || -L "$LOOSE_BIN/yuzu-agent" || \
+          -e "$LOOSE_BIN/.yuzu-agent.incoming" || -L "$LOOSE_BIN/.yuzu-agent.incoming" ]]; then
+        RESTORE_LANE=loose
+    fi
+    for path in /usr/local /usr/local/lib "$YUZU_LIB" "$PLUGIN_DIR" "$(dirname "$APP_ROOT")" "$APP_ROOT" \
+                "$(dirname "$PLIST")"; do
+        code_directory_trusted "$path" || {
+            echo "ERROR: an interrupted Yuzu Agent install was not recovered: $path is not a real, root-owned directory protected from other accounts. The agent may be stopped. Make $path root-owned, remove group/world write and any ACL (chmod -N), then install again." >&2
             return 1; }
     done
+    [[ "$RESTORE_LANE" != loose ]] || code_directory_trusted "$LOOSE_BIN" || {
+        echo "ERROR: an interrupted Yuzu Agent install was not recovered: $LOOSE_BIN is not a real, root-owned directory protected from other accounts. The agent may be stopped. Fix it, then install again." >&2
+        return 1; }
 }
 
 # A directory a restored agent may run code from: absent, or real, root-owned,
@@ -641,6 +667,9 @@ restart_restored_service() {
         fi
         return 0
     fi
+    if [[ -e "$recovery/service-was-disabled" ]]; then
+        launchctl disable "system/com.yuzu.agent" || true
+    fi
     echo "WARNING: restored the previous agent, but it did not stay running. Installing a package is the remedy; recovery is complete." >&2
 }
 
@@ -659,7 +688,7 @@ restore_previous() {
     phase="$(cat "$recovery/phase" 2>/dev/null || true)"
     # Before promotion nothing active has changed: there is nothing to restore.
     [[ "$phase" == promoting ]] || return 0
-    require_real_restore_targets || return 1
+    require_trusted_restore_targets "$recovery" || return 1
     stop_service || echo "WARNING: Yuzu Agent is still unloading; restoring anyway" >&2
     # Clear both lanes and the generated plist first: recovery must restore an
     # exact prior package state, including the prior "no installed agent" case.
@@ -670,8 +699,11 @@ restore_previous() {
         "$recovery/incoming-package-files.sha256" "$recovery/package-files.sha256"
     rm -f "$MANIFEST" "$HASHES"
     rm -rf "$APP" "$INCOMING_APP"
-    rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib \
-          "$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"
+    if [[ "$RESTORE_LANE" == loose ]]; then
+        rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" \
+              "$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"
+    fi
+    rm -f /usr/local/lib/libyuzu_agent_core.dylib
     [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || \
         ditto "$recovery/LaunchDaemons/com.yuzu.agent.plist" "$PLIST"
     [[ ! -d "$recovery/YuzuAgent.app" ]] || ditto "$recovery/YuzuAgent.app" "$APP"
@@ -711,6 +743,9 @@ restore_missing_live_files() {
     local recovery entry
     recovery="$(recovery_path 2>/dev/null)" || return 0
     [[ "$(cat "$recovery/phase" 2>/dev/null || true)" == prepared ]] || return 0
+    # Never through a directory another account controls (uh8r3-1); the next
+    # preinstall retries once it is fixed.
+    require_trusted_restore_targets "$recovery" || return 0
     copy_back "$recovery/LaunchDaemons/com.yuzu.agent.plist" "$PLIST"
     copy_back "$recovery/YuzuAgent.app" "$APP"
     copy_back "$recovery/loose/yuzu-agent" "$LOOSE_BIN/yuzu-agent"
@@ -738,6 +773,9 @@ on_exit() {
     [[ "$INSTALL_COMPLETED" == 1 ]] && return 0
     if [[ "${PROMOTION_ARMED:-0}" == 1 ]]; then
         PROMOTION_ARMED=0
+        # If this is the last line in the log, the restore stopped part-way; the
+        # next package run finishes it from the snapshot (governance uh8-5).
+        echo "ERROR: installation failed; restoring the previous package state" >&2
         restore_previous
     else
         restore_missing_live_files
@@ -909,7 +947,7 @@ fi
 # The previous development bundle lived below the EDR data root. Remove only
 # that package-owned child after the replacement is in place; recovery retains
 # a copy until this transition is fully durable.
-retire_legacy_app
+retire_legacy_app || echo "WARNING: could not retire the legacy development app; it was left in place" >&2
 upgraded=0
 [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || upgraded=1
 PROMOTION_ARMED=0
