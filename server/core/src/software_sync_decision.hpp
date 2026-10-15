@@ -440,7 +440,7 @@ inline void stamp(std::unordered_map<std::string, std::int64_t>& state, const st
 [[nodiscard]] inline nlohmann::json summary_json(const Counts& c, const std::string& command_id,
                                                  std::int64_t requested_at) {
     return {{"requested", c.requested},
-            {"reached", c.reached},
+            {"agents_reached", c.reached}, // the name /api/command and the per-device route use
             {"skipped_offline", c.skipped_offline},
             {"skipped_version", c.skipped_version},
             {"command_id", command_id},

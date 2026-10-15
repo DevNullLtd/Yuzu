@@ -334,7 +334,8 @@ TEST_CASE("sync summary: counts only, never a per-device list", "[server][softwa
                                     "__sync__-fleet-1-ab", 1700000000);
     CHECK(j.size() == 7);
     CHECK(j["requested"] == 12);
-    CHECK(j["reached"] == 7);
+    CHECK(j["agents_reached"] == 7);
+    CHECK_FALSE(j.contains("reached")); // the dispatch routes call it agents_reached
     CHECK(j["skipped_offline"] == 3);
     CHECK(j["skipped_version"] == 2);
     CHECK(j["command_id"] == "__sync__-fleet-1-ab");

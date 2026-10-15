@@ -171,7 +171,7 @@ TEST_CASE("sync route: a fleet run is 202 with counts only, audited before anyth
     REQUIRE_FALSE(body.is_discarded());
     const auto& d = body["data"];
     CHECK(d["requested"] == 4);
-    CHECK(d["reached"] == 2);
+    CHECK(d["agents_reached"] == 2);
     CHECK(d["skipped_offline"] == 1);
     CHECK(d["skipped_version"] == 1);
     CHECK(d["command_id"] == "__sync__-fleet-test");
@@ -232,7 +232,7 @@ TEST_CASE("sync route: nothing live to reach is 202 with reached 0, audited no_a
     REQUIRE(res->status == 202);
     const auto d = parse(res->body)["data"];
     CHECK(d["requested"] == 3);
-    CHECK(d["reached"] == 0);
+    CHECK(d["agents_reached"] == 0);
     CHECK(d["skipped_offline"] == 3);
     CHECK(h.dispatch_calls == 0);
     CHECK(h.audited("no_agents"));
@@ -415,7 +415,7 @@ TEST_CASE("sync route: 501 reachable devices is 413 with the count, 500 is allow
         auto res = h.post(R"({"scope":"__all__"})");
         REQUIRE(res);
         CHECK(res->status == 202);
-        CHECK(parse(res->body)["data"]["reached"] == 500);
+        CHECK(parse(res->body)["data"]["agents_reached"] == 500);
         CHECK(h.dispatched.size() == 500);
     }
 }
@@ -431,7 +431,7 @@ TEST_CASE("sync route: the cap counts devices that will be sent to, not devices 
     CHECK(res->status == 202);
     const auto d = parse(res->body)["data"];
     CHECK(d["requested"] == 700);
-    CHECK(d["reached"] == 400);
+    CHECK(d["agents_reached"] == 400);
     CHECK(d["skipped_offline"] == 300);
 }
 
@@ -619,7 +619,7 @@ TEST_CASE("sync route: a partly refused send reports only what was accepted", "[
     CHECK(res->status == 202);
     const auto d = parse(res->body)["data"];
     CHECK(d["requested"] == 5);
-    CHECK(d["reached"] == 3);
+    CHECK(d["agents_reached"] == 3);
     CHECK(d["skipped_offline"] == 2);
 }
 

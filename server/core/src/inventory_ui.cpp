@@ -945,11 +945,11 @@ function swSyncDone(r) {
     if (typeof showToast === 'function') showToast(r.message || ('Sync request failed (' + r.status + ')'), 'error');
     return;
   }
-  msg = 'Sync requested for ' + d.reached + ' device' + (d.reached === 1 ? '' : 's');
+  msg = 'Sync requested for ' + d.agents_reached + ' device' + (d.agents_reached === 1 ? '' : 's');
   if (d.skipped_offline) skip.push(d.skipped_offline + ' offline');
   if (d.skipped_version) skip.push(d.skipped_version + ' on an agent older than 0.13.1');
   if (skip.length) msg += ' (skipped: ' + skip.join(', ') + ')';
-  if (typeof showToast === 'function') showToast(msg, d.reached ? 'success' : 'warning');
+  if (typeof showToast === 'function') showToast(msg, d.agents_reached ? 'success' : 'warning');
 }
 function swSync() {
   var D = window.YuzuDialog;

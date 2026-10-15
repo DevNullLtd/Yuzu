@@ -377,7 +377,7 @@ TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out reques
     CHECK(keys == std::set<std::string>{"202", "400", "401", "403", "409", "413", "429", "500", "503"});
     // The 202 shape names the four counts and carries no per-device list.
     const std::string accepted = op["responses"]["202"].value("description", "");
-    for (const char* field : {"requested", "reached", "skipped_offline", "skipped_version", "command_id"})
+    for (const char* field : {"requested", "agents_reached", "skipped_offline", "skipped_version", "command_id"})
         CHECK(accepted.find(field) != std::string::npos);
     // The 429 leg names its Retry-After and the 413 leg its cap.
     CHECK(op["responses"]["429"].value("description", "").find("Retry-After") != std::string::npos);
