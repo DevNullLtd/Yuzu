@@ -265,6 +265,22 @@ public:
                                       const std::string& securable_type,
                                       const std::string& operation);
 
+    /// `has_permission` with the gate's own response kept: `res` receives the 401/403/503 that
+    /// `require_permission` would write, so a caller can tell "denied" from "store unavailable"
+    /// while still recording no denial row. Same NEVER-a-gate rule as `has_permission`.
+    [[nodiscard]] bool probe_permission(const httplib::Request& req, httplib::Response& res,
+                                        const std::string& securable_type,
+                                        const std::string& operation);
+
+    /// `has_permission`'s twin for the fleet-read gate: `require_fleet_read`'s own decision path
+    /// (so the verdict and the scope cannot drift from the gate's), with its
+    /// `auth.fleet_read_required` denial rows withheld. For a page that decides what to DRAW from
+    /// the caller's scope; the request that returns the data still passes the loud gate.
+    /// `res` receives the gate's 401/403/503 and is meant to be a scratch response.
+    [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
+    probe_fleet_read(const httplib::Request& req, httplib::Response& res,
+                     const std::string& securable_type, const std::string& operation);
+
     /// The MCP tier/approval belt (#5047) — extracted verbatim from
     /// `require_permission`'s `mcp_tier` branch so a route that has its OWN
     /// primary authorization gate (e.g. the result-set write routes' owner

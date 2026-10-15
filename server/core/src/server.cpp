@@ -12112,6 +12112,19 @@ private:
         return {true, result->visible_for_query()};
     }
 
+    /// `require_fleet_read` for a page that only decides what to DRAW (the Dashboard panels):
+    /// the same decision and scope, but the denial row is withheld (`AuthRoutes::probe_fleet_read`),
+    /// so a Viewer's page load does not fill the audit log. Never the gate for a data request.
+    yuzu::server::authz::FleetReadGate probe_fleet_read(const httplib::Request& req,
+                                                         httplib::Response& res,
+                                                         const std::string& securable_type,
+                                                         const std::string& operation) {
+        auto result = auth_routes_->probe_fleet_read(req, res, securable_type, operation);
+        if (!result)
+            return {};
+        return {true, result->visible_for_query()};
+    }
+
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
     /// extracted verbatim from the `/api/command` handler so the MCP dispatch path
     /// (execute_instruction / execute_bundle) can intersect against the SAME
@@ -15300,6 +15313,16 @@ private:
                                     const std::string& op) -> yuzu::server::authz::FleetReadGate {
             return require_fleet_read(req, res, type, op);
         };
+        // Draw-time variants for the Dashboard: same decision path, no denial audit row
+        // (a page that renders panels per caller must not write rows for what it merely
+        // chose not to draw). The loud `fleet_read_fn`/`perm_fn` stay on every data request.
+        auto draw_fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                         const std::string& type, const std::string& op)
+            -> yuzu::server::authz::FleetReadGate { return probe_fleet_read(req, res, type, op); };
+        auto draw_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                   const std::string& type, const std::string& op) -> bool {
+            return auth_routes_->probe_permission(req, res, type, op);
+        };
         // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
         // device drills). SAME policy as get_visible_agents_json / the /devices list:
         // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
@@ -15551,7 +15574,7 @@ private:
                              .auth_fn = auth_fn,
                              .resolve_session_fn = resolve_session_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
-                             .fleet_read_fn = fleet_read_fn, // HM-2 /fragments/dashboard/health
+                             .fleet_read_fn = draw_fleet_read_fn, // HM-2 /fragments/dashboard/health (draw-time)
                              .cfg = &cfg_,
                              .metrics = &metrics_,
                              .registry = &registry_,
@@ -18315,8 +18338,8 @@ private:
             home::Deps{
                 .auth_fn = auth_fn,
                 .deny_service_scoped_fn = deny_service_scoped_fn,
-                .fleet_read_fn = fleet_read_fn,
-                .perm_fn = perm_fn,
+                .fleet_read_fn = draw_fleet_read_fn,
+                .perm_fn = draw_perm_fn,
                 .now_fn = []() -> std::int64_t {
                     return std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
@@ -18344,8 +18367,12 @@ private:
                     std::int64_t online = c->live;
                     if (auto known = registry_.known_agent_count())
                         online = static_cast<std::int64_t>(*known);
-                    const auto p = partition_fleet_state(c->total, online, c->stale);
-                    return home::EstateCounts{c->total, p.online, p.not_seen, p.offline};
+                    // The registry can know agents the store has no row for; widen rather
+                    // than clamp, or a live fleet reads as "no devices" (and is cached).
+                    const auto r = reconcile_fleet_estate(c->total, online, c->stale);
+                    home::EstateCounts e{r.total, r.online, r.not_seen, r.offline};
+                    e.at_least = r.lower_bound;
+                    return e;
                 },
                 .compliance_fn = [compliance_api]() -> std::optional<home::ComplianceFigure> {
                     if (!compliance_api)
@@ -18411,8 +18438,8 @@ private:
             yuzu::server::home_panels::Deps hp;
             hp.auth_fn = auth_fn;
             hp.deny_service_scoped_fn = deny_service_scoped_fn;
-            hp.fleet_read_fn = fleet_read_fn;
-            hp.perm_fn = perm_fn;
+            hp.fleet_read_fn = draw_fleet_read_fn;
+            hp.perm_fn = draw_perm_fn;
             // One cached read of every policy's counts; NOT confined, and only
             // called when the gate returned `scope == nullopt`.
             hp.policies_fn = [compliance_api]() {

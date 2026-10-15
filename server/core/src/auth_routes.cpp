@@ -679,8 +679,21 @@ bool AuthRoutes::service_scope_admits(std::string_view securable_type,
 bool AuthRoutes::has_permission(const httplib::Request& req, const std::string& securable_type,
                                 const std::string& operation) {
     httplib::Response discarded; // require_permission writes its 403/503 here, never to the page
+    return probe_permission(req, discarded, securable_type, operation);
+}
+
+bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response& res,
+                                  const std::string& securable_type,
+                                  const std::string& operation) {
     const AuditProbeScope probe;
-    return require_permission(req, discarded, securable_type, operation);
+    return require_permission(req, res, securable_type, operation);
+}
+
+std::expected<authz::ListAuthority, authz::GateFailure>
+AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res,
+                             const std::string& securable_type, const std::string& operation) {
+    const AuditProbeScope probe;
+    return require_fleet_read(req, res, securable_type, operation);
 }
 
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,

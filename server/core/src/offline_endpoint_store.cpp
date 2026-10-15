@@ -141,6 +141,20 @@ FleetStatePartition partition_fleet_state(std::int64_t total, std::int64_t onlin
     return p;
 }
 
+FleetEstateReading reconcile_fleet_estate(std::int64_t total, std::int64_t online,
+                                          std::int64_t stale) noexcept {
+    total = std::max<std::int64_t>(total, 0);
+    online = std::max<std::int64_t>(online, 0);
+    FleetEstateReading r;
+    r.lower_bound = online > total;
+    r.total = std::max(total, online);
+    const auto p = partition_fleet_state(r.total, online, stale);
+    r.online = p.online;
+    r.not_seen = p.not_seen;
+    r.offline = p.offline;
+    return r;
+}
+
 OfflineEndpointStore::OfflineEndpointStore(pg::PgPool& pool) : pool_(pool) {
     auto lease = pool_.acquire();
     if (!lease) {

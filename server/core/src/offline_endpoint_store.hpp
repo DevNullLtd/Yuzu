@@ -149,8 +149,25 @@ struct FleetStatePartition {
 /// the sum is always `max(total, 0)`. Over-states `not_seen` by the number of
 /// online-and-stale rows (a connected agent whose heartbeat row lags). An
 /// `online` above `total` is clamped, which hides agents the store holds no
-/// row for (failed presence upserts, or rows outside the roster window).
+/// row for (failed presence upserts, or rows outside the roster window); a page that
+/// states a figure uses `reconcile_fleet_estate` below instead.
 [[nodiscard]] FleetStatePartition partition_fleet_state(std::int64_t total, std::int64_t online,
+                                                        std::int64_t stale) noexcept;
+
+/// The Estate figure a page may state. `partition_fleet_state` clamps an `online` above `total`,
+/// which silently drops connected agents the store holds no row for (a failed presence upsert,
+/// or a row outside the roster window); with an empty table that clamp turned a live fleet into
+/// {0,0,0,0} and the page said "No devices have reported". Here an `online` above `total`
+/// WIDENS the total to `online` and sets `lower_bound`, so the figure never understates what the
+/// registry already proves is connected.
+struct FleetEstateReading {
+    std::int64_t total{0};
+    std::int64_t online{0};
+    std::int64_t not_seen{0};
+    std::int64_t offline{0};
+    bool lower_bound{false}; ///< the store is behind the registry; every figure is "at least"
+};
+[[nodiscard]] FleetEstateReading reconcile_fleet_estate(std::int64_t total, std::int64_t online,
                                                         std::int64_t stale) noexcept;
 
 class OfflineEndpointStore {

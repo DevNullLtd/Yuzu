@@ -82,6 +82,7 @@ std::vector<OfflineEndpoint> stale_ok(OfflineEndpointStore& s, std::chrono::seco
 using yuzu::server::FleetPlatform;
 using yuzu::server::fleet_platform_of;
 using yuzu::server::partition_fleet_state;
+using yuzu::server::reconcile_fleet_estate;
 
 TEST_CASE("fleet_platform_of puts every spelling in exactly one bucket", "[offline][fleet]") {
     for (const char* os : {"windows", "Windows", "WIN", "win"})
@@ -126,6 +127,43 @@ TEST_CASE("partition_fleet_state: segments always sum to the clamped total", "[o
         CHECK(q.online == 0);
         CHECK(q.not_seen == 0);
         CHECK(q.offline == 7);
+    }
+}
+
+TEST_CASE("reconcile_fleet_estate: a connected agent is never reported as an empty fleet",
+          "[offline][fleet]") {
+    SECTION("registry knows an agent the store has no row for: total widens, flagged lower bound") {
+        // The failed-presence-upsert shape from the PR #5859 review: SQL total 0, registry 1.
+        const auto r = reconcile_fleet_estate(0, 1, 0);
+        CHECK(r.total == 1);
+        CHECK(r.online == 1);
+        CHECK(r.not_seen == 0);
+        CHECK(r.offline == 0);
+        CHECK(r.lower_bound);
+    }
+    SECTION("online above a non-empty total widens too, and the parts still sum") {
+        const auto r = reconcile_fleet_estate(5, 9, 3);
+        CHECK(r.total == 9);
+        CHECK(r.online == 9);
+        CHECK(r.online + r.not_seen + r.offline == r.total);
+        CHECK(r.lower_bound);
+    }
+    SECTION("an honest store is passed through unflagged") {
+        const auto r = reconcile_fleet_estate(100, 60, 30);
+        CHECK(r.total == 100);
+        CHECK(r.online == 60);
+        CHECK(r.not_seen == 30);
+        CHECK(r.offline == 10);
+        CHECK_FALSE(r.lower_bound);
+        const auto z = reconcile_fleet_estate(0, 0, 0);
+        CHECK(z.total == 0);
+        CHECK_FALSE(z.lower_bound);
+    }
+    SECTION("negative inputs never produce a negative figure") {
+        const auto r = reconcile_fleet_estate(-4, -1, -2);
+        CHECK(r.total == 0);
+        CHECK(r.online == 0);
+        CHECK_FALSE(r.lower_bound);
     }
 }
 

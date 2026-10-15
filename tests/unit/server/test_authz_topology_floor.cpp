@@ -456,6 +456,53 @@ TEST_CASE("has_permission: gives require_permission's verdict and writes no deni
     }
 }
 
+TEST_CASE("probe_fleet_read / probe_permission: the gate's verdict, no denial row (PR #5859 "
+          "review; mutation: drop the AuditProbeScope in either and the row counts fail)",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    const AuditQuery fleet_rows{.action = "auth.fleet_read_required", .limit = 10};
+    const AuditQuery perm_rows{.action = "auth.permission_required", .limit = 10};
+
+    SECTION("a denied fleet-read probe writes no row; the gate writes one") {
+        auto req = fix.session_request("quin", auth::Role::user);
+        httplib::Response probe_res;
+        // A non-Read operation is the gate's deterministic, audited refusal.
+        auto probed = fix.ar->probe_fleet_read(req, probe_res, "Infrastructure", "Write");
+        CHECK_FALSE(probed.has_value());
+        CHECK(probe_res.status == 403); // the response is still written, for the caller to read
+        auto after_probe = fix.audit_store->query(fleet_rows);
+        REQUIRE(after_probe.has_value());
+        CHECK(after_probe->empty());
+
+        httplib::Response gate_res;
+        auto gated = fix.ar->require_fleet_read(req, gate_res, "Infrastructure", "Write");
+        CHECK_FALSE(gated.has_value());
+        auto after_gate = fix.audit_store->query(fleet_rows);
+        REQUIRE(after_gate.has_value());
+        CHECK(after_gate->size() == 1);
+    }
+
+    SECTION("the probe admits exactly when the gate does") {
+        auto req = fix.session_request("rae", auth::Role::user);
+        httplib::Response a, b;
+        auto probed = fix.ar->probe_fleet_read(req, a, "Infrastructure", "Read");
+        auto gated = fix.ar->require_fleet_read(req, b, "Infrastructure", "Read");
+        CHECK(probed.has_value() == gated.has_value());
+        if (probed && gated)
+            CHECK(probed->visible_for_query() == gated->visible_for_query());
+    }
+
+    SECTION("probe_permission keeps the gate's status and writes no row") {
+        auto req = fix.session_request("sam", auth::Role::user);
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->probe_permission(req, res, "Execution", "Execute"));
+        CHECK(res.status == 403);
+        auto rows = fix.audit_store->query(perm_rows);
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+    }
+}
+
 // ── 10. Securable seeding ─────────────────────────────────────────────────
 
 TEST_CASE("RbacStore::seed_defaults: EnginePrincipal is seeded with Administrator+Viewer Read",
