@@ -1,16 +1,14 @@
 #include "healthcheck_probe.hpp"
+#include "file_utils.hpp"
 
 #include <yuzu/server/auth.hpp>
 
 #include <csignal>
 #include <exception>
-#include <fstream>
 #include <future>
-#include <iterator>
 #include <ostream>
 #include <stdexcept>
 #include <string>
-#include <system_error>
 #include <thread>
 
 namespace yuzu::server::healthcheck {
@@ -23,8 +21,8 @@ std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) 
         return nullptr;
     auto c = std::make_unique<httplib::SSLClient>(t.host, t.port);
     // SSL_CTX_new can fail (a broken OPENSSL_CONF); httplib then leaves the context null and
-    // the dereferences below would crash with no diagnostic. run_healthcheck's worker turns
-    // this into exit 1 plus one `exception:` line.
+    // the dereferences below would crash with no diagnostic. run_healthcheck turns this
+    // exception into exit 1 plus one `exception:` line.
     if (!c->is_valid())
         throw std::runtime_error("TLS context unavailable");
     // The anchor goes in through the CA-file setter or the PEM one, NEVER httplib's
@@ -33,30 +31,21 @@ std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) 
     // connect. Both of ours skip that merge and load ONLY the anchor, which is the whole trust
     // decision (the server's own install CA, or the operator's --https-cert). The [live]
     // containment test counts the store after a connect.
-    bool anchored = false;
-    if (t.partial_chain) {
-        // Operator mode (D4): the anchor is the server certificate itself, the FIRST
-        // certificate in the --https-cert file. The set_ca_cert_path branch below hands httplib
-        // the whole file, and a full-chain file would then also trust its issuing intermediate
-        // (PARTIAL_CHAIN accepts a chain ending there), letting any sibling leaf pass with
-        // hostname checking off. An unreadable or certificate-less file falls through to
-        // set_ca_cert_path so the failure is httplib's own `SSL certificate loading failed`,
-        // which names the anchor.
-        std::ifstream f(t.trust_anchor, std::ios::binary);
-        const auto pem = first_pem_certificate(
-            std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()));
-        if (!pem.empty()) {
-            c->load_ca_cert_store(pem.data(), pem.size());
-            anchored = true;
-        }
-    }
-    if (!anchored)
-        c->set_ca_cert_path(t.trust_anchor.string());
     auto* ctx = static_cast<SSL_CTX*>(c->tls_context());
+    std::string pem;
     if (t.partial_chain) {
-        // The anchor may be non-self-signed, so its issuer is absent from the store.
+        // Operator mode (D4): the anchor is the FIRST certificate of the file only (see
+        // first_pem_certificate); PARTIAL_CHAIN because it may be non-self-signed. An unreadable
+        // or certificate-less file falls back to set_ca_cert_path, so the failure is httplib's own
+        // `SSL certificate loading failed` naming the anchor. Both loaders add to the ctx's
+        // existing store, so the flag order is irrelevant.
         X509_STORE_set_flags(SSL_CTX_get_cert_store(ctx), X509_V_FLAG_PARTIAL_CHAIN);
+        pem = first_pem_certificate(detail::read_file_contents(t.trust_anchor));
     }
+    if (pem.empty())
+        c->set_ca_cert_path(t.trust_anchor.string());
+    else
+        c->load_ca_cert_store(pem.data(), pem.size());
     c->enable_server_certificate_verification(true);
     c->enable_server_hostname_verification(false);
     c->set_follow_location(false);
@@ -114,8 +103,7 @@ HealthcheckOutcome probe_once(const HealthcheckTarget& t, int max_total_ms) {
 }
 
 std::optional<HealthcheckOutcome> probe_bounded(std::chrono::milliseconds deadline,
-                                                std::function<HealthcheckOutcome()> probe,
-                                                ProbeSpawn spawn) {
+                                                std::function<HealthcheckOutcome()> probe) {
     // The packaged_task owns the probe and co-owns the shared state with `done`, so an
     // abandoned worker (deadline first) can finish long after this frame is gone. Unlike a
     // std::async future, a packaged_task future does not block in its destructor.
@@ -125,16 +113,9 @@ std::optional<HealthcheckOutcome> probe_bounded(std::chrono::milliseconds deadli
     // (#5906). Detach is inherent, since the worker is blocked in an uncancellable OpenSSL or
     // name-resolution call and a joining destructor would block on it. Between construction and
     // the terminal join-or-detach the only statement is wait_for on a valid future, which cannot
-    // throw, so no path leaves a joinable thread to terminate the process.
-    std::thread worker;
-    try {
-        worker = spawn(std::move(task));
-    } catch (const std::system_error& e) {
-        // A pids/thread limit hit at startup: report it as the probe's answer (exit 1 plus
-        // one line) instead of letting the exception reach main.
-        return HealthcheckOutcome{.status = 0,
-                                  .error = std::string{"cannot start probe thread: "} + e.what()};
-    }
+    // throw, so no path leaves a joinable thread to terminate the process. If the constructor
+    // throws (a pids/thread limit), no thread exists; run_healthcheck turns that into exit 1.
+    std::thread worker(std::move(task));
     if (done.wait_for(deadline) != std::future_status::ready) {
         worker.detach();
         return std::nullopt;
@@ -160,20 +141,20 @@ int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag
     const auto target =
         resolve_healthcheck_target(cfg, path, auth::default_cert_dir(), kTlsSupported);
     // The worker owns its copy of `probe` and `target`, so abandoning it (deadline first) is safe.
-    const auto outcome = probe_bounded(
-        deadline, [probe = std::move(probe), target]() -> HealthcheckOutcome {
-            try {
-                return probe(target);
-            } catch (const std::exception& e) {
-                // httplib can throw: 0.37.1 reserves res.body on a peer-claimed Content-Length
-                // before its payload ceiling applies (std::bad_alloc). The exit contract is
-                // exit 1 plus one line, never an abort.
-                return HealthcheckOutcome{.status = 0,
-                                          .error = std::string{"exception: "} + e.what()};
-            } catch (...) {
-                return HealthcheckOutcome{.status = 0, .error = "unknown exception"};
-            }
+    // probe_bounded rethrows what the probe threw (httplib can throw: 0.37.1 reserves res.body on
+    // a peer-claimed Content-Length before its payload ceiling applies, std::bad_alloc) and a
+    // failed thread start (std::system_error). The exit contract is exit 1 plus one line for
+    // either, never an abort.
+    std::optional<HealthcheckOutcome> outcome;
+    try {
+        outcome = probe_bounded(deadline, [probe = std::move(probe), target] {
+            return probe(target);
         });
+    } catch (const std::exception& e) {
+        outcome = HealthcheckOutcome{.status = 0, .error = std::string{"exception: "} + e.what()};
+    } catch (...) {
+        outcome = HealthcheckOutcome{.status = 0, .error = "unknown exception"};
+    }
     const HealthcheckOutcome timed_out{
         .status = 0, .error = "timed out after " + std::to_string(deadline.count()) + " ms"};
     const HealthcheckOutcome& result = outcome ? *outcome : timed_out;

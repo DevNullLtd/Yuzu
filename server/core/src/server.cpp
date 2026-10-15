@@ -15436,24 +15436,18 @@ private:
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         if (cfg_.https_enabled && cfg_.https_redirect) {
             redirect_server_ = std::make_unique<httplib::Server>();
-            // Eager fixed pool, not httplib's default dynamic one (as web_server_ above): the
-            // default grows by spawning a std::thread inside enqueue on the accept loop with no
-            // handler, so a thread-create failure under load would std::terminate; base == max
-            // kills that branch by construction, and a failure to spawn the pool happens at boot,
-            // before any traffic. The size is httplib's own default MAXIMUM (4 x max(8, hw-1)),
-            // so concurrent-connection capacity is exactly what it was.
+            // Eager fixed pool, as web_server_ (rationale at its pool: the default dynamic pool
+            // spawns on the accept loop with no handler); size = httplib's default MAXIMUM
+            // (4 x max(8, hw-1)), so capacity is unchanged.
             const std::size_t redirect_pool = CPPHTTPLIB_THREAD_POOL_MAX_COUNT;
             redirect_server_->new_task_queue = [redirect_pool] {
                 return new httplib::ThreadPool(redirect_pool, redirect_pool);
             };
             yuzu::server::health::install_plaintext_redirect_pre_routing(
                 *redirect_server_, cfg_.web_address, cfg_.https_port);
-            // The main listener's SOC2-C1 response headers, minus HSTS (RFC 6797 s7.2: no STS
-            // over a non-secure transport) and upgrade-insecure-requests, plus the request
-            // counter. Not the main handler's other work: no engine-class stash is ever written
-            // on these workers (principal_class_resolved reduces to the presentation class), no
-            // quota slot is admitted, and no CORS applies to a listener that only redirects or
-            // answers the four probes.
+            // Five security headers (no HSTS) + request counter, per
+            // install_plaintext_post_routing's contract; principal_class_resolved reduces to the
+            // presentation class on these workers (no engine-class stash is written here).
             yuzu::server::health::install_plaintext_post_routing(
                 *redirect_server_,
                 security::HeaderBundle::make(cfg_.csp_extra_sources, /*https_enabled=*/false),

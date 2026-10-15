@@ -637,9 +637,7 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // Compare with all whitespace removed so a clang-format re-wrap of a call site
     // can neither redden nor greenwash the tripwire.
     const auto squeeze = [](std::string s) {
-        s.erase(std::remove_if(s.begin(), s.end(),
-                               [](unsigned char c) { return std::isspace(c) != 0; }),
-                s.end());
+        std::erase_if(s, [](unsigned char c) { return std::isspace(c) != 0; });
         return s;
     };
     const auto flat = squeeze(src);

@@ -12,12 +12,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <functional>
-#include <future>
 #include <iosfwd>
 #include <memory>
 #include <optional>
 #include <string_view>
-#include <thread>
 
 namespace yuzu::server::healthcheck {
 
@@ -53,37 +51,28 @@ inline constexpr int kRequestMs = 3000; ///< whole-request ceiling (probe_once d
 [[nodiscard]] HealthcheckOutcome probe_once(const HealthcheckTarget& target,
                                             int max_total_ms = kRequestMs);
 
-/// The worker-thread factory probe_bounded calls.
-using ProbeSpawn = std::thread (*)(std::packaged_task<HealthcheckOutcome()>&&);
-
-/// Starts the probe worker; the production `spawn` of probe_bounded. A test injects a spawn
-/// that throws to prove the thread-creation failure path, which cannot be forced portably.
-inline std::thread start_probe_thread(std::packaged_task<HealthcheckOutcome()>&& task) {
-    return std::thread(std::move(task));
-}
-
 /// Runs `probe` on a worker thread and waits up to `deadline` for it. Returns
 /// its outcome if it finished, or nullopt if the deadline came first, in which
 /// case the worker is detached: it is blocked inside httplib/OpenSSL, which
 /// offers no cancellation. The caller must not return into code that tears
 /// down process state (exit via std::_Exit); the worker owns everything it
-/// touches, so abandoning it is safe until then. If `spawn` throws
-/// std::system_error the result is a present outcome (status 0, "cannot start probe
-/// thread: ..."), never an exception.
+/// touches, so abandoning it is safe until then. May throw: what `probe` threw
+/// is stored by the packaged_task and rethrown here once the worker is joined (one
+/// thrown after the deadline stays in the abandoned shared state, never terminate),
+/// and starting the worker throws std::system_error when a thread limit is hit.
 [[nodiscard]] std::optional<HealthcheckOutcome>
-probe_bounded(std::chrono::milliseconds deadline, std::function<HealthcheckOutcome()> probe,
-              ProbeSpawn spawn = &start_probe_thread);
+probe_bounded(std::chrono::milliseconds deadline, std::function<HealthcheckOutcome()> probe);
 
 /// Entry point for `yuzu-server --healthcheck`. Writes one diagnostic line to
 /// `diag` on failure and nothing on success; returns the process exit code. The
 /// whole probe is cut off at `deadline` (a timeout calls `hard_exit`, which does
-/// not return in production). An exception thrown by `probe` is reported as a
-/// failure (exit 1, one line naming it). The three trailing parameters are the injection
-/// points a test drives; the defaults ARE production: `probe_once`,
-/// `kProbeDeadline` and `std::_Exit`. On POSIX it also sets SIGPIPE to ignored
-/// before the first socket write (see healthcheck_probe.cpp). `std::_Exit` is the same
-/// primitive ServerImpl::stop() uses to force-exit past a wedged web thread: the abandoned
-/// worker captures state that normal teardown would destroy under it.
+/// not return in production). An exception thrown by `probe`, or a failure to start
+/// the probe thread, is reported as a failure (exit 1, one line naming it). The three
+/// trailing parameters are the injection points a test drives; the defaults ARE
+/// production: `probe_once`, `kProbeDeadline` and `std::_Exit`. On POSIX it also sets
+/// SIGPIPE to ignored before the first socket write (see healthcheck_probe.cpp). `std::_Exit` is
+/// the same primitive ServerImpl::stop() uses to force-exit past a wedged web thread: the
+/// abandoned worker captures state that normal teardown would destroy under it.
 [[nodiscard]] int run_healthcheck(
     const Config& cfg, std::string_view path, std::ostream& diag,
     std::function<HealthcheckOutcome(const HealthcheckTarget&)> probe =
