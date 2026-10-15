@@ -336,6 +336,54 @@ TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the
     CHECK(perms.value("description", "").find("retry_after_ms") != std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out request and every refusal",
+          "[openapi][hardware][sync_fanout]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& paths = spec["paths"];
+
+    // The collection route is its own path, distinct from the per-device one.
+    REQUIRE(paths.contains("/hardware/sync"));
+    REQUIRE(paths.contains("/hardware/{id}/sync"));
+    REQUIRE(paths["/hardware/sync"].contains("post"));
+    CHECK_FALSE(paths["/hardware/sync"].contains("get"));
+    const auto& op = paths["/hardware/sync"]["post"];
+
+    REQUIRE(op.contains("tags"));
+    CHECK(op["tags"][0] == "Hardware");
+    const std::string description = op.value("description", "");
+    CHECK(description.find("Execution:Execute") != std::string::npos);
+    CHECK(description.find("500") != std::string::npos);
+
+    // Request body: required, JSON, with the three documented properties.
+    REQUIRE(op.contains("requestBody"));
+    CHECK(op["requestBody"]["required"] == true);
+    REQUIRE(op["requestBody"]["content"].contains("application/json"));
+    const auto& props = op["requestBody"]["content"]["application/json"]["schema"]["properties"];
+    REQUIRE(props.contains("scope"));
+    REQUIRE(props.contains("scope_expression"));
+    REQUIRE(props.contains("source"));
+    CHECK(props["scope"]["type"] == "string");
+    CHECK(props["scope_expression"]["type"] == "string");
+    CHECK(props["scope_expression"]["maxLength"] == 1024);
+    CHECK(props["source"]["enum"] == json::array({"installed_software"}));
+    CHECK(props.size() == 3);
+
+    // Every status the route can answer, no more and no fewer.
+    REQUIRE(op.contains("responses"));
+    std::set<std::string> keys;
+    for (auto it = op["responses"].begin(); it != op["responses"].end(); ++it)
+        keys.insert(it.key());
+    CHECK(keys == std::set<std::string>{"202", "400", "401", "403", "409", "413", "429", "503"});
+    // The 202 shape names the four counts and carries no per-device list.
+    const std::string accepted = op["responses"]["202"].value("description", "");
+    for (const char* field : {"requested", "reached", "skipped_offline", "skipped_version", "command_id"})
+        CHECK(accepted.find(field) != std::string::npos);
+    // The 429 leg names its Retry-After and the 413 leg its cap.
+    CHECK(op["responses"]["429"].value("description", "").find("Retry-After") != std::string::npos);
+    CHECK(op["responses"]["413"].value("description", "").find("500") != std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query parameter and "
           "response shape (#5294)",
           "[openapi][plugin_config][5294]") {
