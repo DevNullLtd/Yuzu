@@ -133,13 +133,12 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  // The analytics event carries scheme+host only: a Slack-style
                  // URL path is a bearer secret and the stream can leave the host.
                  // The audit row follows the same rule (scheme+host plus a
-                 // fingerprint, ADR-0010 Decision 4). History: gov Gate 2 security-guardian / Gate 4 consistency-auditor
-                 // (PR #3563 full-PR review): record the URL in the audit
-                 // detail, not just the id — a compromise-and-cleanup
-                 // attacker who creates a webhook, exfiltrates data to it,
-                 // then deletes it must not be able to erase every durable
-                 // record of WHERE the data went. Matches the sibling
-                 // hardening already applied to `offload_routes.cpp`.
+                 // fingerprint, ADR-0010 Decision 4). It records WHERE the
+                 // data goes, not just the id (PR #3563 review): a
+                 // compromise-and-cleanup attacker who creates a webhook,
+                 // exfiltrates to it, then deletes it must not be able to
+                 // erase every durable record of the destination. Matches
+                 // the hardening in `offload_routes.cpp`.
                  audit_fn(req, "webhook.create", "success", "webhook", std::to_string(id),
                           url_audit_detail(url));
                  if (emit_event_fn)

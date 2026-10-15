@@ -70,6 +70,7 @@ struct WebhookRouteHarness {
     yuzu::test::WebhookStorePg store;
     bool perm_grant{true};
     bool audit_persists{true}; // false: the audit sink reports a failed write
+    std::string auth_source{"local"}; // the session's source: "local" = cookie, "api_token" = token
     std::vector<AuditRecord> audit_log;
     std::vector<nlohmann::json> emitted; // "webhook.created" payloads
     yuzu::server::test::TestRouteSink sink;
@@ -97,10 +98,10 @@ struct WebhookRouteHarness {
             audit_log.push_back({a, r, tt, ti, d});
             return audit_persists;
         };
-        auto resolve_fn = [](const httplib::Request&) -> std::optional<auth::Session> {
+        auto resolve_fn = [this](const httplib::Request&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "tester";
-            s.auth_source = "local"; // a cookie session, so the same-site gate applies
+            s.auth_source = auth_source; // "local" by default: a cookie session, gate applies
             return s;
         };
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
@@ -450,4 +451,58 @@ TEST_CASE("REST webhooks[pg]: GET /:id/deliveries empty list", "[rest][webhook][
     REQUIRE(j.contains("deliveries"));
     CHECK(j["deliveries"].is_array());
     CHECK(j["deliveries"].empty());
+}
+
+TEST_CASE("REST webhooks[pg]: a token caller needs no Origin",
+          "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    h.auth_source = "api_token";
+    h.sink.default_headers = {{"Host", "yuzu.test"}}; // no Origin, no Referer
+    auto post = h.sink.Post("/api/webhooks", R"({"url":"https://example.com/hook"})");
+    REQUIRE(post);
+    CHECK(post->status == 200);
+    const auto id = nlohmann::json::parse(post->body)["id"].get<int64_t>();
+    auto del = h.sink.Delete("/api/webhooks/" + std::to_string(id));
+    REQUIRE(del);
+    CHECK(del->status == 200);
+}
+
+TEST_CASE("WriteGate: cookie writes need a same-site or trusted Origin, token writes need none",
+          "[rest][webhook][security]") {
+    std::string source = "local";
+    std::vector<std::string> audited;
+    WriteGate gate{[&](const httplib::Request&) -> std::optional<auth::Session> {
+                       auth::Session s;
+                       s.auth_source = source;
+                       return s;
+                   },
+                   {"https://admin.example"}};
+    const WebhookRoutes::AuditFn audit_fn = [&](const httplib::Request&, const std::string& action,
+                                                const std::string&, const std::string&,
+                                                const std::string&, const std::string&) -> bool {
+        audited.push_back(action);
+        return true;
+    };
+    auto refused = [&](std::initializer_list<std::pair<const char*, const char*>> headers) {
+        httplib::Request req;
+        for (const auto& [k, v] : headers)
+            req.set_header(k, v);
+        httplib::Response res;
+        const bool r = gate.refuse_cross_site(audit_fn, req, res, "/x");
+        CHECK((r == (res.status == 403)));
+        return r;
+    };
+    CHECK_FALSE(refused({{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}}));
+    CHECK_FALSE(refused({{"Host", "yuzu.test"}, {"Origin", "https://admin.example"}})); // trusted
+    CHECK(refused({{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}}));
+    CHECK(refused({{"Host", "yuzu.test"}})); // a cookie write with neither header
+    CHECK(audited.size() == 2); // each refusal leaves a csrf.denied row
+    source = "api_token";
+    CHECK_FALSE(refused({{"Host", "yuzu.test"}}));
+    CHECK_FALSE(refused({{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}}));
+    // An unwired resolver reads as a cookie session: the gate stays closed.
+    WriteGate unwired;
+    httplib::Request req;
+    httplib::Response res;
+    CHECK(unwired.refuse_cross_site(audit_fn, req, res, "/x"));
 }

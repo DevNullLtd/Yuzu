@@ -253,6 +253,20 @@ TEST_CASE("sync routes: directory panel reads status, count, groups and roles",
     CHECK(h.users_reads == 0); // the user list is never read for the panel
 }
 
+TEST_CASE("sync routes: a failed directory count renders total unavailable, never an invented total",
+          "[integrations][routes]") {
+    Harness h;
+    DirectoryUser u;
+    u.display_name = "Ada";
+    // The route asks for one past the cap; the store returned that many.
+    h.users = std::vector<DirectoryUser>(kUsersShown + 1, u);
+    h.user_count = std::unexpected(ReadError::failed);
+    auto res = h.get("/fragments/settings/directory-sync/users");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("more exist (total unavailable)."));
+    CHECK(!has(res->body, " of "));
+}
+
 TEST_CASE("sync routes: users fragment is audited and fails closed", "[integrations][routes]") {
     Harness h;
     DirectoryUser u;

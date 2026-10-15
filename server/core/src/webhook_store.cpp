@@ -359,7 +359,7 @@ WebhookStore::create_webhook(const std::string& url, const std::string& event_ty
         if (!enc.has_value()) {
             // Encrypt failure aborts here — never write plaintext, never
             // write anything at all (ADR-0010 encrypt-failure semantics).
-            spdlog::error("WebhookStore::create_webhook: secret encrypt failed for {}", url);
+            spdlog::error("WebhookStore::create_webhook: secret encrypt failed for {}", url_scheme_host(url));
             return std::unexpected(WebhookWriteError::db_error);
         }
         encrypted = std::move(*enc);
@@ -386,7 +386,7 @@ WebhookStore::create_webhook(const std::string& url, const std::string& event_ty
         "RETURNING id",
         params);
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
-        spdlog::error("WebhookStore::create_webhook: insert failed for {}: {}", url,
+        spdlog::error("WebhookStore::create_webhook: insert failed for {}: {}", url_scheme_host(url),
                       PQerrorMessage(lease.get()));
         return std::unexpected(WebhookWriteError::db_error);
     }
@@ -644,11 +644,11 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
             status_code = result->status;
         } else {
             error = "connection_failed";
-            spdlog::warn("WebhookStore: delivery to {} failed: connection error", wh.url);
+            spdlog::warn("WebhookStore: delivery to {} failed: connection error", url_scheme_host(wh.url));
         }
     } catch (const std::exception& ex) {
         error = ex.what();
-        spdlog::warn("WebhookStore: delivery to {} failed: {}", wh.url, error);
+        spdlog::warn("WebhookStore: delivery to {} failed: {}", url_scheme_host(wh.url), error);
     }
     // `signature` is a hex digest, not secret material — nothing left to
     // wipe here. The SecureBuffer itself was already destroyed (and wiped)

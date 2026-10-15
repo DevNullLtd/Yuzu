@@ -42,6 +42,7 @@ TEST_CASE("url policy: scheme+host drops userinfo path query and fragment", "[in
     CHECK(url_scheme_host("http://u:p@host.example:8443/x?y=1#z") == "http://host.example:8443");
     CHECK(url_scheme_host("https://host.example") == "https://host.example");
     CHECK(url_scheme_host("host.example/path").empty());
+    CHECK(url_scheme_host("host.example/p?r=http://x").empty()); // "://" inside a query
 }
 
 TEST_CASE("url audit detail: scheme+host and a fingerprint, never the path or query",
@@ -59,6 +60,12 @@ TEST_CASE("url audit detail: scheme+host and a fingerprint, never the path or qu
     // fingerprint alone.
     CHECK(url_audit_detail(std::string("https://h.example/\r\nforged=1")).starts_with("url_fp="));
     CHECK(url_audit_detail("no-scheme/path").starts_with("url_fp="));
+    // A later "://" in the path or query is not a scheme: nothing before it is echoed.
+    const auto fake = url_audit_detail("hooks.example/services/T/B/SECRET?r=http://x");
+    CHECK(fake.starts_with("url_fp="));
+    CHECK(fake.find("SECRET") == std::string::npos);
+    // An oversized authority (the audit-first row precedes validation) is not echoed.
+    CHECK(url_audit_detail("https://" + std::string(400, 'a')).starts_with("url_fp="));
 }
 
 TEST_CASE("url delivery parts: the authority ends at '/', '?' or '#'",

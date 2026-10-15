@@ -5417,7 +5417,8 @@ store accepts `http://` for development convenience — same posture as Offload 
 `webhook.created` analytics event and the audit rows carry the scheme and host (plus, in the audit rows, a
 short `url_fp` fingerprint) only: a destination URL is a bearer secret and its path and query are never
 recorded. A URL with a query but no path (`https://hooks.example?token=x`) is delivered to the host with
-the query intact. The same hooks are managed from **Settings > Integrations**, which calls this route.
+the query intact. Destinations are not yet restricted by address (loopback, link-local and private
+ranges are accepted); an opt-in guard is tracked in #4816. The same hooks are managed from **Settings > Integrations**, which calls this route.
 
 **Errors.** `400` for an empty/missing `url`, invalid JSON, a URL that isn't `http://`/`https://`,
 or a URL with embedded credentials or control bytes.

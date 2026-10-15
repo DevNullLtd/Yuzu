@@ -16,6 +16,7 @@
 #include <openssl/sha.h>
 
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -33,15 +34,33 @@ namespace yuzu::server {
 }
 
 namespace detail {
-/// Authority component of `url` (between "://" and the first '/', '?' or '#').
-/// Empty when there is no "://".
+/// Where the authority of `after_scheme` (the text after "://") ends: the first '/', '?' or '#',
+/// or npos. The one definition validation (`url_authority`) and delivery
+/// (`url_delivery_parts`) share.
+[[nodiscard]] inline std::size_t authority_end(std::string_view after_scheme) noexcept {
+    return after_scheme.find_first_of("/?#");
+}
+
+/// Authority component of `url` (between "://" and `authority_end`). Empty when there is no
+/// "://".
 [[nodiscard]] inline std::string_view url_authority(std::string_view url) noexcept {
     const auto scheme_end = url.find("://");
     if (scheme_end == std::string_view::npos)
         return {};
     auto rest = url.substr(scheme_end + 3);
-    const auto end = rest.find_first_of("/?#");
+    const auto end = authority_end(rest);
     return end == std::string_view::npos ? rest : rest.substr(0, end);
+}
+
+/// A URI scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). Anything else before "://" is part
+/// of a path or query, not a scheme.
+[[nodiscard]] inline bool is_url_scheme(std::string_view s) noexcept {
+    if (s.empty() || !std::isalpha(static_cast<unsigned char>(s.front())))
+        return false;
+    for (char c : s)
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '+' && c != '-' && c != '.')
+            return false;
+    return true;
 }
 } // namespace detail
 
@@ -51,11 +70,11 @@ namespace detail {
 }
 
 /// `scheme://host[:port]` with any userinfo, path, query and fragment removed.
-/// Returns an empty string when `url` has no "://" (never echo an unparseable
-/// value).
+/// Returns an empty string when `url` does not start with `<scheme>://` (never echo an
+/// unparseable value, and never mistake a later "://" in a path or query for the scheme).
 [[nodiscard]] inline std::string url_scheme_host(std::string_view url) {
     const auto scheme_end = url.find("://");
-    if (scheme_end == std::string_view::npos)
+    if (scheme_end == std::string_view::npos || !detail::is_url_scheme(url.substr(0, scheme_end)))
         return {};
     auto authority = detail::url_authority(url);
     if (const auto at = authority.rfind('@'); at != std::string_view::npos)
@@ -83,7 +102,7 @@ struct UrlDeliveryParts {
     } else if (url.starts_with("http://")) {
         url.remove_prefix(7);
     }
-    const auto end = url.find_first_of("/?#");
+    const auto end = detail::authority_end(url);
     out.host_port = std::string(url.substr(0, end));
     if (end == std::string_view::npos)
         return out;
@@ -97,7 +116,7 @@ struct UrlDeliveryParts {
 
 /// First 12 lowercase hex characters (48 bits) of SHA-256 over the whole URL:
 /// enough to tell whether two audit rows, or a row and a candidate URL, name the
-/// same destination, too little to recover the secret. 
+/// same destination, too little to recover the secret.
 [[nodiscard]] inline std::string url_fingerprint(std::string_view url) {
     std::array<unsigned char, SHA256_DIGEST_LENGTH> md{};
     SHA256(reinterpret_cast<const unsigned char*>(url.data()), url.size(), md.data());
@@ -117,8 +136,9 @@ struct UrlDeliveryParts {
 [[nodiscard]] inline std::string url_audit_detail(std::string_view url) {
     std::string out;
     // A value with control bytes (not yet validated on the audit-first path) is never echoed.
+    // Bounded: this can run on an unvalidated value (the audit-first row precedes validation).
     if (const auto host = url_has_control_bytes(url) ? std::string{} : url_scheme_host(url);
-        !host.empty())
+        !host.empty() && host.size() <= 300)
         out = "url=" + host + " ";
     out += "url_fp=" + url_fingerprint(url);
     return out;

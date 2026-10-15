@@ -257,6 +257,7 @@ struct McpHarness {
     yuzu::server::test::TestRouteSink sink; // last: handlers capture `this`
 
     McpHarness() {
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
         auto auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "admin";
@@ -346,6 +347,23 @@ TEST_CASE("mcp POST: when the attempted row cannot be written nothing changes (m
     REQUIRE(h.attempts.size() == 1);
     CHECK(h.attempts[0].result == "attempted");
     CHECK(h.audits.empty());
+}
+
+TEST_CASE("mcp POST: a header-less cookie write is refused 403 and changes nothing",
+          "[integrations][mcp][settings][routes][security]") {
+    McpHarness h;
+    h.cfg.mcp_disable = false;
+    h.cfg.mcp_read_only = true;
+    h.sink.default_headers = {{"Host", "yuzu.test"}}; // no Origin, no Referer
+
+    auto res = h.post("enabled=false&read_only=false");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK_FALSE(h.cfg.mcp_disable);
+    CHECK(h.cfg.mcp_read_only);
+    CHECK(h.attempts.empty());
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "csrf.denied");
 }
 
 TEST_CASE("mcp POST: a cross-site Origin is refused 403 and changes nothing",

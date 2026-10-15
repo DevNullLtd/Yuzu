@@ -6299,12 +6299,27 @@ void SettingsRoutes::register_routes(
     // `read_only`, each `true` or `false` (integrations_render.cpp). The earlier first-match
     // read treated an absent field as false, so a partial body switched MCP off or flipped
     // Read-only to Full access. Nothing changes on a refused body.
-    sink.Post("/api/settings/mcp", [this, origin_safe](const httplib::Request& req,
-                                                       httplib::Response& res) {
+    sink.Post("/api/settings/mcp", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        if (!origin_safe(req, res, "/api/settings/mcp"))
+        // Same-site gate for a cookie-authorised write: unlike origin_safe above, a header-less
+        // cookie request is refused (browsers always send an Origin on a write); token callers
+        // are exempt.
+        const auto session = auth_fn_(req, res);
+        if (!session)
             return;
+        if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
+                                        req.get_header_value("Origin"),
+                                        req.get_header_value("Referer"),
+                                        cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
+                                             : std::span<const std::string>{})) {
+            audit_fn_(req, "csrf.denied", "denied", "Endpoint", "/api/settings/mcp",
+                      "cross-site or header-less browser write refused");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "cross-site request refused"),
+                            "application/json");
+            return;
+        }
         const auto form = integrations::parse_mcp_form(req.body);
         if (!form) {
             res.status = 400;

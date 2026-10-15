@@ -765,7 +765,7 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
     // it in /deliveries.
     if (!tgt.url.starts_with("http://") && !tgt.url.starts_with("https://")) {
         record_delivery(tgt.id, event_type, event_count, payload_body, 0, "invalid_scheme");
-        spdlog::warn("OffloadTargetStore: refused dispatch with non-http(s) URL: {}", tgt.url);
+        spdlog::warn("OffloadTargetStore: refused dispatch with non-http(s) URL: {}", url_scheme_host(tgt.url));
         if (metrics_)
             metrics_->counter("yuzu_server_offload_delivery_failed_total").increment();
         return;
@@ -874,11 +874,11 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             status_code = result->status;
         } else {
             error = "connection_failed";
-            spdlog::warn("OffloadTargetStore: delivery to {} failed: connection error", tgt.url);
+            spdlog::warn("OffloadTargetStore: delivery to {} failed: connection error", url_scheme_host(tgt.url));
         }
     } catch (const std::exception& ex) {
         error = ex.what();
-        spdlog::warn("OffloadTargetStore: delivery to {} failed: {}", tgt.url, error);
+        spdlog::warn("OffloadTargetStore: delivery to {} failed: {}", url_scheme_host(tgt.url), error);
     }
 
     if (metrics_) {
