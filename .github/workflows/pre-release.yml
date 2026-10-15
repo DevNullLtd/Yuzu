@@ -989,6 +989,8 @@ jobs:
               [ -e "$d" ] || continue
               sudo chown root:wheel "$d"; sudo chmod go-w "$d"
             done
+          else
+            echo "::notice::the hosted image's /usr/local chain is already trusted; the refusal path was not exercised"
           fi
           echo "Installing: ${PKGS[0]}"
           sudo installer -pkg "${PKGS[0]}" -target / -verboseR

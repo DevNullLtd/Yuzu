@@ -16,13 +16,16 @@ This applies to every macOS `.pkg`, including the release package.
   changed, and says which one applies:
   - `/usr/local`, `/usr/local/lib` or `/usr/local/lib/yuzu`, or `/usr/local/bin`
     for the loose-binary package, is not root-owned or is group- or
-    world-writable. That is typical of Intel Macs where Homebrew was installed
-    into `/usr/local`.
-  - An agent binary, rollback file or plugin in those directories is a symlink,
-    or another account could have written it. The installer lists each entry.
-  - `/Library/Application Support/Yuzu` is not owned by root or `_yuzu`, or is
-    group- or world-writable.
-  - A new plugin has the same name as a third-party plugin.
+    world-writable. That is typical of Macs whose Homebrew lives in
+    `/usr/local`: Intel Macs, and Apple silicon Macs running an Intel or
+    migrated Homebrew.
+  - An agent binary, rollback file or plugin (at any depth) in those directories
+    is a symlink, or another account could have written it. The installer lists
+    each entry.
+  - `/Library/Application Support/Yuzu` or `/Library/Logs/Yuzu` is not owned by
+    root or `_yuzu`, or is group- or world-writable.
+  - A new plugin has the same name as one no Yuzu package installed, or as a
+    Yuzu plugin whose bytes were changed after installation.
   - The existing service requires signed plugins (`--plugin-require-signature`)
     and the package contains an unsigned plugin. Every release `.pkg` does.
 - A first install of the stock package is **installed but not started**,
@@ -34,13 +37,19 @@ This applies to every macOS `.pkg`, including the release package.
   environment variable and the standard proxy variables. Previously an upgrade
   replaced `/Library/LaunchDaemons/com.yuzu.agent.plist`, losing anything added
   to it. Any other environment variable is dropped and named in
-  `/var/log/install.log`.
+  `/var/log/install.log`. If the existing definition cannot be parsed, the
+  package default is installed with a warning, and earlier settings must be
+  re-applied.
+- An unrecognized development app under the data directory is moved to
+  `/var/db/yuzu-agent/quarantine/` and reported; it no longer blocks the install
+  or `uninstall.sh`.
 
 **What to check.**
 
 - If a refusal names a `/usr/local` directory, make it root-owned and remove
   the group and world write bits. Then inspect the files it lists: changing
-  the directory's mode does not change who wrote what is already in it.
+  the directory's mode does not change who wrote what is already in it. Do not
+  `chown -R` them: that makes another account's files look root-installed.
 - If the data directory is refused, never delete it: it holds the agent's
   identity and enrolment. Run `chmod go-w` on it, or restore its owner.
 - For signed-plugin enforcement, remove `--plugin-require-signature` before

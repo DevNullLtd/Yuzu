@@ -10,26 +10,34 @@ bash deploy/packaging/macos/build-pkg.sh --bin-dir build-macos --version <versio
 ```
 
 Both lanes run root code from below `/usr/local`, a tree the package shares
-with other tools and never re-owns: plugins and the plist-merge helper from
-`/usr/local/lib/yuzu`, and in the loose lane the daemon itself from
-`/usr/local/bin`. Installation therefore requires each existing directory of
-`/usr/local`, `/usr/local/lib` and `/usr/local/lib/yuzu` (plus `/usr/local/bin`
-for the loose lane) to be root-owned and not group- or world-writable; otherwise
-it stops before the running agent is touched. Hosts this can stop:
+with other tools and never re-owns: plugins from `/usr/local/lib/yuzu`, and in
+the loose lane the daemon itself from `/usr/local/bin`. Installation therefore
+requires each existing directory of `/usr/local`, `/usr/local/lib` and
+`/usr/local/lib/yuzu` (plus `/usr/local/bin` for the loose lane) to be
+root-owned and not group- or world-writable. These checks run in `preinstall`,
+before Installer writes or removes anything, so a refusal leaves the existing
+installation exactly as it was. Hosts this can stop:
 
-- Intel Macs where Homebrew was installed into `/usr/local`; its installer gives
-  the admin user ownership of `/usr/local/bin` and `/usr/local/lib`. Apple
-  silicon Homebrew lives in `/opt/homebrew` and is not affected.
+- Macs whose Homebrew lives in `/usr/local`: its installer gives the admin user
+  ownership of `/usr/local/bin` and `/usr/local/lib`. That is the default on
+  Intel Macs, and also on Apple silicon Macs that run an Intel (Rosetta)
+  Homebrew or were migrated from an Intel Mac. A native Apple silicon Homebrew
+  lives in `/opt/homebrew` and is not affected.
 - Hosts where an MDM or provisioning script loosened `/usr/local` modes.
 
 Making the directories root-owned does not undo what another account already
 wrote into them. The installer also refuses when any `yuzu-agent*`,
-`libyuzu_agent_core*` or `.yuzu-update-verified` entry in `/usr/local/bin`, or
-any entry in `/usr/local/lib/yuzu/plugins`, is a symlink, is not root-owned, or
-is group- or world-writable, and it lists each one. Inspect them, remove
-anything you did not install as root, then retry. Package promotion removes the
-updater's `yuzu-agent.old` rollback file and its marker, because they belong to
-the code being replaced.
+`libyuzu_agent_core*`, `.yuzu-*` or `.libyuzu_agent_core*` entry in
+`/usr/local/bin`, or anything at any depth below `/usr/local/lib/yuzu/plugins`
+(the agent loads plugins recursively), is a symlink, is not root-owned, or is
+group- or world-writable. It lists each one, even when it also refused a
+directory. Inspect them, remove anything you did not install as root, then
+retry. Do not `chown -R` these paths: that makes another account's files look
+root-installed. Package promotion removes the updater's `yuzu-agent.old`
+rollback file and its marker, because they belong to the code being replaced.
+In the loose lane, the delivered binary and core library are promoted only if
+their SHA-256 matches what the package recorded. The plist-merge helper runs
+from the package's own Scripts directory, never from `/usr/local`.
 
 The opt-in development lane stages a signed, immutable `YuzuAgent.app` and keeps
 plugins external at `/usr/local/lib/yuzu/plugins`:
@@ -86,12 +94,15 @@ must be owned by root or by the `_yuzu` service account that
 world-writable; otherwise installation stops before anything is staged, and the
 directory is left exactly as it was. It holds the agent's identity and
 enrolment, so never delete it to get past this check; remove the write bit or
-restore its owner instead. Logs, configuration, and trust anchors also remain
-outside the sealed app, with existing configuration and certificate-directory
+restore its owner instead. `/Library/Logs/Yuzu` follows the same rule, since the
+same script gives it to `_yuzu`. Configuration, certificate and plugin
+directories must be root-owned and not group- or world-writable. Logs,
+configuration, and trust anchors remain outside the sealed app, with existing
 ownership and modes preserved.
 When upgrading an earlier development build that placed `YuzuAgent.app` below
-the data directory, the installer snapshots that package-owned child for
-recovery and removes it only after the new daemon is healthy; it never changes
+the data directory, the installer leaves that child in place until the new
+daemon is in place, then moves it into the recovery snapshot and deletes or
+quarantines it there; it never changes
 the containing data directory's ownership, mode, or unrelated contents. A
 legacy child is removed only if its exact application identifier, team,
 developer-signing authority, embedded-profile SHA-256, and strict code-signature
@@ -105,7 +116,7 @@ narrowly limited to the original profile hash, expected Yuzu team, signed
 application identifier, and signer; a renewed or otherwise different profile is
 intentionally quarantined.
 
-These values are pinned in `preinstall`, `postinstall`, and `uninstall.sh` as
+These values are pinned in `postinstall` and `uninstall.sh` as
 `LEGACY_TEAM_ID`, `LEGACY_APP_ID`, `LEGACY_SIGNING_AUTHORITY`, and
 `LEGACY_PROFILE_SHA256`, and identify one developer's pre-package development
 build only. They grant nothing to any other signer: retirement requires all of
@@ -119,7 +130,11 @@ the transaction, the sealed bundle arrives as a private archive of `Contents`;
 postinstall extracts it only inside the trusted incoming root, rejects symlinks,
 strictly verifies the reconstructed app, and merges the existing service
 settings into the new definition, all before anything active is stopped. A
-failure there leaves the running agent untouched.
+failure there leaves the running agent untouched. When upgrading a package from
+before this installer, which wrote straight to the live paths, Installer may
+remove files the old package's receipt listed before `postinstall` runs. A
+refusal at that point puts back every live file missing since the snapshot, and
+never overwrites one.
 
 Whether the new agent is started depends on what it replaces:
 
@@ -134,7 +149,13 @@ Whether the new agent is started depends on what it replaces:
   no rollback, since nothing running was replaced.
 - **Nothing configured** (a first install of the stock package). It is installed
   but not started, because the agent refuses to run without a trust anchor. The
-  Installer output says how to configure and start it.
+  Installer output says how to configure and start it. The definition is in
+  `/Library/LaunchDaemons`, so after a reboot launchd starts it and it exits
+  and retries every 10 seconds until configured, as earlier packages did.
+  Disable the service if it should stay off until then.
+
+"Running" means the same process for two seconds, so an agent that launchd
+keeps restarting does not count, and its upgrade is not health-gated.
 
 Recovery restarts a restored agent only if it was running when the snapshot was
 taken. A restored definition that recovery does not start (because the agent
@@ -236,7 +257,8 @@ promotion, before taking a new snapshot. A recovery pointer that is unusable
 (dangling after an interrupted cleanup, empty after a torn write, or a symlink)
 is reported and dropped, and a phase that cannot be read is treated as an
 interrupted promotion, so no recovery state can block later installs. Installs
-and `uninstall.sh` take one lock (`/var/db/.yuzu-agent-transition.lock`), so an
+and `uninstall.sh` take one lock (`/var/db/.yuzu-agent-transition.lock`, readable
+only by root, so no other account can hold it), so an
 uninstall waits for an install in progress rather than racing it.
 
 Older loose packages did not ship `package-files.list`. Their first upgrade
@@ -281,8 +303,10 @@ the next package run repairs or discards whatever it finds there.
 
 ## Deploying with MDM
 
-The package needs no interaction. To have the agent start on its first install,
-make its configuration available before the package runs:
+The package needs no interaction. The target needs the directory state described
+above: a root-owned, non-writable `/usr/local` chain, and data and log
+directories owned by root or `_yuzu`. To have the agent start on its first
+install, make its configuration available before the package runs:
 
 1. Deploy the server's CA certificate, for example
    `/etc/yuzu-agent/certs/server-ca.pem` (root-owned, mode 644).

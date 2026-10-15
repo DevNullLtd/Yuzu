@@ -65,8 +65,9 @@ CLT SDK is sufficient for CI parity: the ES SDK (`usr/lib/libEndpointSecurity.tb
 (it is not an `.framework` bundle, and "needs full Xcode" is a myth — see
 `docs/darwin-compat.md`'s EndpointSecurity row), and the build probe finds it
 on either SDK, so the real ES client compiles with CLT alone. The `com.apple.developer.endpoint-security.client`
-entitlement + root + a signed/notarized binary are the actual on-device
-gates for the real ES path, not the SDK choice.
+entitlement (granted to a signed app bundle through its provisioning
+profile), root, and Full Disk Access are the actual on-device gates for the
+real ES path, not the SDK choice. Notarization is not one of them.
 
 ### 2. Shared build substrate
 
