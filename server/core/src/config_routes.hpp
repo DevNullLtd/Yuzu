@@ -27,21 +27,18 @@
 ///   GET /api/config             (perm_fn Infrastructure:Read)
 ///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN
 ///                                 auth_fn for the audit-attributed
-///                                 username — order preserved verbatim:
-///                                 body parsing and integer-key validation
-///                                 both happen BETWEEN the two gates, exactly
-///                                 as in the original inline code)
+///                                 username and the same-site check, THEN
+///                                 body parsing and integer-key validation)
 ///
-/// AUDIT ASYMMETRY (preserved verbatim, not introduced by this move): GET is
-/// a pure read, never audited. PUT audits ONLY a successful write
-/// (`config.update`, `success`) — every rejection (missing/invalid body,
-/// non-numeric integer-key value, store-level validation failure) is NOT
-/// audited; only a genuine store-level DB/crypto error (503) and success are
-/// distinguished at the response-shape level, and only success reaches
-/// `deps.audit_fn`. A secret key's audited `detail` never carries the raw
-/// value — `RuntimeConfigStore::redacted_placeholder()` substitutes for it —
-/// this is the fix for the twice-leaked-secret history the route's own body
-/// comment documents; not a defect this move introduces or repairs further.
+/// AUDIT (ADR-0033 section 9, no audit row, no mutation): GET is a pure read, never audited. PUT
+/// is audit-first. After the gates and body/integer validation (rejections there are not
+/// audited) it writes a `config.update` row with result `attempted` and an empty detail; if that
+/// row cannot be stored the call is a 503 with `Sec-Audit-Failed` and nothing is stored or
+/// applied. A `success` row (or `failure` when the store refuses) follows; a lost outcome row
+/// leaves the change applied and sets `Sec-Audit-Failed`. A cookie session without a same-site
+/// Origin/Referer is refused 403 and audited `csrf.denied` before the body is read (token
+/// callers are exempt). A secret key's audited `detail` never carries the raw value --
+/// `RuntimeConfigStore::redacted_placeholder()` substitutes for it.
 ///
 /// This route IS now TestRouteSink-registered (`test_config_routes.cpp`) —
 /// the original inline code's comment noting the opposite ("this route is

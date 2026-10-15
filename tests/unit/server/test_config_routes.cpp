@@ -72,11 +72,16 @@ struct MockHarness {
 
     bool auth_allow{true};
     std::string auth_username{"alice"};
+    /// Token callers are exempt from the same-site gate, so the existing cases keep working;
+    /// the cross-site cases set a cookie source ("local") explicitly.
+    std::string auth_source{"api_token"};
 
     bool perm_allow{true};
     std::vector<std::pair<std::string, std::string>> perm_calls;
 
     bool audit_succeeds{true};
+    /// 0-based index of the one audit call that fails (-1: none); independent of audit_succeeds.
+    int audit_fails_at{-1};
     std::vector<AuditRow> audits;
 
     yuzu::server::test::TestRouteSink sink;
@@ -96,6 +101,7 @@ struct MockHarness {
             }
             auth::Session s;
             s.username = auth_username;
+            s.auth_source = auth_source;
             return s;
         };
         deps.perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -112,8 +118,9 @@ struct MockHarness {
         deps.audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& r, const std::string& tt,
                                const std::string& ti, const std::string& d) -> bool {
+            const int idx = static_cast<int>(audits.size());
             audits.push_back({a, r, tt, ti, d});
-            return audit_succeeds;
+            return audit_succeeds && idx != audit_fails_at;
         };
         config::register_config_routes(sink, deps);
     }
@@ -303,12 +310,16 @@ TEST_CASE("config_routes: PUT an integer key round-trips into cfg AND the store,
     CHECK(b["applied"] == true);
     CHECK(h.cfg.response_retention_days == 120); // in-memory cfg_ applied
 
-    REQUIRE(h.audits.size() == 1);
+    // Audit-first: an `attempted` row before the change, the outcome row after.
+    REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "config.update");
-    CHECK(h.audits[0].result == "success");
-    CHECK(h.audits[0].target_type == "RuntimeConfig");
-    CHECK(h.audits[0].target_id == "response_retention_days");
-    CHECK(h.audits[0].detail == "value=120");
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[0].detail.empty());
+    CHECK(h.audits[1].action == "config.update");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_type == "RuntimeConfig");
+    CHECK(h.audits[1].target_id == "response_retention_days");
+    CHECK(h.audits[1].detail == "value=120");
 
     // The read-back half: GET must reflect the write via the store, not just
     // the in-memory cfg_ side effect checked above.
@@ -320,8 +331,30 @@ TEST_CASE("config_routes: PUT an integer key round-trips into cfg AND the store,
     CHECK(get_b["overrides"]["response_retention_days"]["value"] == "120");
 }
 
-TEST_CASE("config_routes: PUT surfaces a dropped audit row as Sec-Audit-Failed and keeps the "
-          "applied change",
+TEST_CASE("config_routes: PUT refuses the change when the attempted audit row cannot be "
+          "written (no audit row, no mutation)",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    const int before = h.cfg.response_retention_days;
+
+    h.audit_fails_at = 0; // the attempted row
+    auto res = h.sink.Put("/api/config/response_retention_days", R"({"value":"121"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.cfg.response_retention_days == before); // live config untouched
+    CHECK(h.audits.size() == 1);                    // no outcome row for a change never made
+
+    auto get_res = h.sink.Get("/api/config");
+    REQUIRE(get_res);
+    CHECK_FALSE(body(get_res->body)["overrides"].contains("response_retention_days")); // store untouched
+}
+
+TEST_CASE("config_routes: PUT flags a lost outcome row with Sec-Audit-Failed and keeps the change",
           "[pg][server][routes][config_routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
     PgWired w{db.dsn()};
@@ -334,13 +367,92 @@ TEST_CASE("config_routes: PUT surfaces a dropped audit row as Sec-Audit-Failed a
     CHECK(ok->status == 200);
     CHECK_FALSE(ok->has_header("Sec-Audit-Failed"));
 
-    h.audit_succeeds = false;
+    h.audits.clear();
+    h.audit_fails_at = 1; // the outcome row
     auto res = h.sink.Put("/api/config/response_retention_days", R"({"value":"121"})");
     REQUIRE(res);
-    CHECK(res->status == 200); // applied, not rolled back
+    CHECK(res->status == 200); // the attempted row exists; the change is applied, not rolled back
     CHECK(body(res->body)["applied"] == true);
     CHECK(h.cfg.response_retention_days == 121);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("config_routes: PUT a rejected value leaves an attempted and a failure row",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    auto res = h.sink.Put("/api/config/log_level", R"({"value":"loud"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].result == "failure");
+}
+
+TEST_CASE("config_routes: PUT heartbeat_timeout enforces the 30 second floor at the boundary",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    const auto before = h.cfg.session_timeout.count();
+
+    for (const char* v : {"0", "1", "29"}) {
+        INFO(v);
+        auto res = h.sink.Put("/api/config/heartbeat_timeout",
+                              std::string(R"({"value":")") + v + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.cfg.session_timeout.count() == before);
+    }
+    auto ok = h.sink.Put("/api/config/heartbeat_timeout", R"({"value":"30"})");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.cfg.session_timeout.count() == 30);
+}
+
+TEST_CASE("config_routes: PUT from a cookie session needs a same-site Origin or Referer",
+          "[pg][server][routes][config_routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.auth_source = "local"; // a cookie session
+    h.wire();
+    const std::string path = "/api/config/response_retention_days";
+    const std::string put_body = R"({"value":"120"})";
+    const int before = h.cfg.response_retention_days;
+
+    auto foreign = h.sink.dispatch("PUT", path, put_body, "application/json",
+                                   {{"Host", "yuzu.example"}, {"Origin", "https://evil.example"}});
+    REQUIRE(foreign);
+    CHECK(foreign->status == 403);
+    CHECK(h.cfg.response_retention_days == before);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "csrf.denied");
+
+    auto headerless = h.sink.dispatch("PUT", path, put_body, "application/json",
+                                      {{"Host", "yuzu.example"}});
+    REQUIRE(headerless);
+    CHECK(headerless->status == 403);
+    CHECK(h.cfg.response_retention_days == before);
+
+    auto same = h.sink.dispatch("PUT", path, put_body, "application/json",
+                                {{"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}});
+    REQUIRE(same);
+    CHECK(same->status == 200);
+    CHECK(h.cfg.response_retention_days == 120);
+
+    // A token caller is not riding a cookie: no Origin needed.
+    h.auth_source = "api_token";
+    auto token = h.sink.dispatch("PUT", path, R"({"value":"121"})", "application/json", {});
+    REQUIRE(token);
+    CHECK(token->status == 200);
 }
 
 TEST_CASE("config_routes: PUT a non-numeric value for an integer key is a 400, cfg untouched, "
@@ -441,9 +553,10 @@ TEST_CASE("config_routes: PUT a secret key never leaks the raw value into the au
     CHECK_FALSE(b.contains("value")); // secret key: no value echoed back
     CHECK(b["applied"] == true);
 
-    REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].detail.find("super-secret-value") == std::string::npos);
-    CHECK(h.audits[0].detail == "value=" + std::string(RuntimeConfigStore::redacted_placeholder()));
+    REQUIRE(h.audits.size() == 2); // attempted (no value at all), then the redacted outcome
+    for (const auto& a : h.audits)
+        CHECK(a.detail.find("super-secret-value") == std::string::npos);
+    CHECK(h.audits[1].detail == "value=" + std::string(RuntimeConfigStore::redacted_placeholder()));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
