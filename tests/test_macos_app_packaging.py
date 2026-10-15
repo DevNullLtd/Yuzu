@@ -594,12 +594,14 @@ class PackagingStructureTests(unittest.TestCase):
                        "acl_grants_write", "code_directory_chain_trusted", "require_started", "stop_service",
                        "restart_restored_service", "recover_interrupted_promotion", "copy_back",
                        "restore_missing_live_files", "require_trusted_restore_targets", "code_directory_trusted",
-                       "root_file_trusted"),
+                       "root_file_trusted", "operational_tree_trusted", "operational_directory_trusted",
+                       "reject_untrusted_operational_entries"),
         "postinstall": ("recovery_path", "plugin_hash_matches", "remove_managed_plugins", "quarantine_legacy_app",
                         "acl_grants_write", "code_directory_chain_trusted", "require_started", "stop_service",
                         "restart_restored_service", "finish_recovery", "restore_previous",
                         "require_trusted_restore_targets", "code_directory_trusted", "root_file_trusted",
-                        "carries_acl"),
+                        "carries_acl", "operational_tree_trusted", "operational_directory_trusted",
+                        "reject_untrusted_operational_entries"),
     }
 
     def _installer_harness(self, root: Path, script: str, names: tuple[str, ...], body: str, *,
@@ -2624,6 +2626,139 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                     self.assertIn("did not stop within 30 seconds; nothing was removed", result.stderr)
                     self.assertEqual(self._launchctl_log(root).count("print system/com.yuzu.agent"), 62)
 
+    # ── PR #4482 review, second round (FortitudeEtc 2026-10-15): what is inside ──
+    # The root daemon opens agent.db, its stores and its log by name and follows
+    # symlinks, so a root-owned directory is not enough: every entry in the data
+    # and log directories must be root's own plain file or directory.
+    FIND_AS_ROOT = ('find() { local a=() prev="" x; for x in "$@"; do '
+                    '[[ "$prev" == -user && "$x" == 0 ]] && x="$(id -u)"; a+=("$x"); prev="$x"; done; '
+                    'command find "${a[@]}"; }\n')
+
+    @posix_shell
+    def test_operational_entries_must_be_root_owned_plain_files(self) -> None:
+        cases = ["clean", "symlink", "group-writable file", "fifo", "hard link", "another account",
+                 "legacy app contents skipped", "legacy app is a symlink", "symlink in the log directory"]
+        if sys.platform == "darwin":
+            cases.append("write ACL")
+        for script in ("preinstall", "postinstall"):
+            for case in cases:
+                with self.subTest(script=script, case=case), \
+                        tempfile.TemporaryDirectory(prefix="yuzu_test_operational_entries_") as temporary:
+                    root = Path(temporary)
+                    data, logs = root / "data", root / "logs"
+                    for directory in (data, logs, data / "state"):
+                        directory.mkdir(parents=True)
+                        directory.chmod(0o755)
+                    for path in (data / "agent.db", data / "state/kv_store.db", logs / "yuzu-agent.log"):
+                        path.write_text("root's own")
+                        path.chmod(0o644)
+                    expected = None
+                    stubs = self.FIND_AS_ROOT
+                    if case == "symlink":
+                        (data / "agent.db").unlink()
+                        (data / "agent.db").symlink_to(root / "elsewhere")
+                        expected = data / "agent.db"
+                    elif case == "group-writable file":
+                        (data / "state/kv_store.db").chmod(0o664)
+                        expected = data / "state/kv_store.db"
+                    elif case == "fifo":
+                        os.mkfifo(data / "command_dedup.db")
+                        expected = data / "command_dedup.db"
+                    elif case == "hard link":
+                        os.link(data / "agent.db", root / "outside")
+                        expected = data / "agent.db"
+                    elif case == "another account":
+                        # Real ownership: a non-root test user owns every fixture file;
+                        # a root test run (a container) gives this one to nobody.
+                        stubs = ""
+                        if os.geteuid() == 0:
+                            os.chown(data / "agent.db", 65534, 65534)
+                        expected = data / "agent.db"
+                    elif case == "legacy app contents skipped":
+                        (data / "YuzuAgent.app/Contents").mkdir(parents=True)
+                        (data / "YuzuAgent.app/Contents/link").symlink_to(root / "elsewhere")
+                    elif case == "legacy app is a symlink":
+                        (data / "YuzuAgent.app").symlink_to(root, target_is_directory=True)
+                        expected = data / "YuzuAgent.app"
+                    elif case == "symlink in the log directory":
+                        (logs / "yuzu-agent.log").unlink()
+                        (logs / "yuzu-agent.log").symlink_to(root / "elsewhere")
+                        expected = logs / "yuzu-agent.log"
+                    elif case == "write ACL":
+                        subprocess.run(["/bin/chmod", "+a", "everyone allow write", str(data / "agent.db")], check=True)
+                        expected = data / "agent.db"
+                    try:
+                        result = self._installer_harness(
+                            root, script, ("acl_grants_write", "reject_untrusted_operational_entries"),
+                            "reject_untrusted_operational_entries\necho ACCEPTED\n", stubs=stubs)
+                    finally:
+                        if case == "write ACL":
+                            subprocess.run(["/bin/chmod", "-N", str(data / "agent.db")], check=True)
+                    self.assertEqual("ACCEPTED" in result.stdout, expected is None, result.stderr)
+                    if expected is not None:
+                        self.assertNotEqual(result.returncode, 0)
+                        listed = [line.strip() for line in result.stderr.splitlines() if line.startswith("         /")]
+                        self.assertTrue(any(line.startswith(str(expected)) for line in listed), result.stderr)
+                        self.assertIn("Never chown -R", result.stderr)
+                    # Nothing is changed or removed.
+                    self.assertTrue((logs).is_dir())
+                    self.assertTrue((data / "agent.db").exists() or (data / "agent.db").is_symlink())
+
+    @posix_shell
+    def test_operational_entries_are_checked_before_anything_changes(self) -> None:
+        pre = (BUILD_PKG.parent / "preinstall").read_text()
+        check = pre.index("\nreject_untrusted_operational_entries || exit 1\n")
+        self.assertLess(pre.index("\nrequire_trusted_log_directory || exit 1\n"), check)
+        self.assertLess(check, pre.index('secure_payload_parent "$APP_ROOT" 755'))
+        self.assertLess(check, pre.index('RECOVERY="$(mktemp -d'))
+        post = (BUILD_PKG.parent / "postinstall").read_text()
+        check = post.index("\nreject_untrusted_operational_entries || exit 1\n")
+        self.assertLess(post.index("\nensure_data_directory || exit 1\n"), check)
+        self.assertLess(check, post.index("PROMOTION_ARMED=1\n"))
+
+    @posix_shell
+    def test_recovery_does_not_start_the_agent_over_an_untrusted_data_tree(self) -> None:
+        # Recovery runs before an install's own data and log checks, so it applies
+        # them itself before starting root code; it still restores and completes.
+        for script in ("preinstall", "postinstall"):
+            for case in ("trusted", "planted symlink", "data directory owned by another account"):
+                with self.subTest(script=script, case=case), \
+                        tempfile.TemporaryDirectory(prefix="yuzu_test_recover_data_tree_") as temporary:
+                    root = Path(temporary)
+                    recovery = self._recovery_layout(root)
+                    (root / "launchctl.state").write_text(RUNNING)
+                    owners = {}
+                    if case == "planted symlink":
+                        (root / "data/agent.db").symlink_to(root / "elsewhere")
+                    elif case == "data directory owned by another account":
+                        owners[root / "data"] = 299
+                    result = self._restore(root, script, recovery, owners=owners, stubs=self.FIND_AS_ROOT)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("RESTORED", result.stdout)
+                    started = "bootstrap system" in self._launchctl_log(root)
+                    self.assertEqual(started, case == "trusted", result.stderr)
+                    self.assertEqual((root / "LaunchDaemons/com.yuzu.agent.plist").read_text(), "previous definition")
+                    if case != "trusted":
+                        self.assertIn("data or log directory, or something in it", result.stderr)
+
+    @macos_userland
+    def test_restart_refuses_a_definition_or_executable_with_a_write_acl(self) -> None:
+        # The ACL half of root_file_trusted (second review round: no test failed
+        # when it was deleted).
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_root_file_acl_") as temporary:
+                target = Path(temporary) / "file"
+                target.write_text("x")
+                target.chmod(0o644)
+                body = f'if root_file_trusted "{target}"; then echo TRUSTED; else echo REFUSED; fi\n'
+                names = ("acl_grants_write", "root_file_trusted")
+                self.assertIn("TRUSTED", self._installer_harness(Path(temporary), script, names, body).stdout)
+                subprocess.run(["/bin/chmod", "+a", "everyone allow write", str(target)], check=True)
+                try:
+                    self.assertIn("REFUSED", self._installer_harness(Path(temporary), script, names, body).stdout)
+                finally:
+                    subprocess.run(["/bin/chmod", "-N", str(target)], check=True)
+
     # ── Governance G8-S7: an access-control list is a write grant mode bits miss ─
     @macos_userland
     def test_acl_write_grants_are_refused_and_stripped(self) -> None:
@@ -3375,7 +3510,11 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                             self.assertEqual((logs / "yuzu-agent.log").read_text(), "history")
                         if not accepted:
                             self.assertIn("existing log directory must be root-owned", result.stderr)
-                            self.assertIn("sudo chown -hR root:wheel", result.stderr)
+                            # The directory itself only: a recursive chown would make a
+                            # planted entry look root-owned (second review round).
+                            self.assertIn("sudo chown root:wheel", result.stderr)
+                            self.assertIn("Never chown -R", result.stderr)
+                            self.assertNotIn("chown -hR", result.stderr)
                     finally:
                         if acl:
                             subprocess.run(["/bin/chmod", "-N", str(logs)], check=True)

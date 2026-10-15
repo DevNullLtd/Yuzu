@@ -24,11 +24,14 @@ This applies to every macOS `.pkg`, including the release package.
     an access control list. The installer lists each entry.
   - `/etc/yuzu-agent` or `/etc/yuzu-agent/certs` is not root-owned, or is group-
     or world-writable.
-  - `/Library/Application Support/Yuzu` or `/Library/Logs/Yuzu` is not
-    root-owned, is group- or world-writable, or has an access control list that
-    lets another account write to it. The agent runs as root and writes there.
-    A Mac where `scripts/install-agent-user.sh` gave them to `_yuzu` needs them
-    returned to root first; the refusal prints the commands.
+  - `/Library/Application Support/Yuzu` or `/Library/Logs/Yuzu`, or anything
+    in them, is not root-owned, is group- or world-writable, or has an access
+    control list that lets another account write to it; or an entry in them is
+    a symlink, a special file or a hard-linked file. The agent runs as root and
+    opens files there by name. A Mac where `scripts/install-agent-user.sh` gave
+    them to `_yuzu` needs them returned to root first. The refusal lists each
+    entry; inspect and fix them one at a time, and never `chown -R`, which would
+    make a planted symlink look root-owned (see the packaging README).
   - `/var/db/yuzu-agent`, or a recovery snapshot in it, has an access control
     list. The installer never sets one, so it refuses rather than remove it.
   - A new plugin has the same name as one no Yuzu package installed, or as a

@@ -187,13 +187,58 @@ refuse_operational_directory() {
     local path="$1" what="$2"
     echo "ERROR: the existing $what directory must be root-owned, not group/world writable and without an ACL that lets another account write: $path" >&2
     echo "       (owner uid $(stat -f '%u' "$path"), mode $(stat -f '%Lp' "$path")). The agent runs as root and writes there." >&2
-    echo "       Do not delete it: the data directory holds the agent's identity and enrolment. To fix it, run:" >&2
-    echo "         sudo chown -hR root:wheel \"$path\" && sudo chmod -R go-w \"$path\" && sudo chmod -RN \"$path\"" >&2
-    echo "       then install again. The active service was left unchanged." >&2
+    echo "       Do not delete it: the data directory holds the agent's identity and enrolment. Fix the directory itself:" >&2
+    echo "         sudo chown root:wheel \"$path\" && sudo chmod go-w \"$path\" && sudo chmod -N \"$path\"" >&2
+    echo "       and install again; the installer then lists anything inside it to inspect. Never chown -R:" >&2
+    echo "       that makes an entry another account planted look root-owned. The active service was left unchanged." >&2
 }
 
 require_trusted_data_directory() {
     operational_directory_trusted "$DATA_DIR" || { refuse_operational_directory "$DATA_DIR" data; return 1; }
+}
+
+# The directories alone are not enough: the root daemon opens agent.db, its
+# other stores and its log by name inside them, following symlinks. A symlink,
+# an entry another account owns or can write (mode bits or an ACL), a special
+# file or a hard-linked file could redirect a root write or feed root another
+# account's bytes, and a recursive chown would only make it look root-owned
+# (PR #4482 review, FortitudeEtc 2026-10-15, second round). The legacy
+# development app below the data root is quarantined, never run, by the
+# installer itself, so it is skipped. Lists every offending entry; returns 1 if
+# there is any, or if a directory cannot be inspected.
+reject_untrusted_operational_entries() {
+    local path entry found bad=""
+    for path in "$DATA_DIR" "$LOG_DIR"; do
+        [[ -d "$path" && ! -L "$path" ]] || continue
+        found="$(find "$path" -mindepth 1 \( -path "$LEGACY_APP" -type d -prune \) -o \
+            \( -type l -o ! -user 0 -o -perm -0020 -o -perm -0002 -o \( ! -type f ! -type d \) -o \
+               \( -type f -links +1 \) \) -print)" || {
+            echo "ERROR: cannot inspect $path" >&2; return 1; }
+        [[ -z "$found" ]] || bad="$bad$found"$'\n'
+        # find has no ACL test: check every entry.
+        while IFS= read -r -d '' entry; do
+            ! acl_grants_write "$entry" || bad="$bad$entry (access control list grants write)"$'\n'
+        done < <(find "$path" -mindepth 1 \( -path "$LEGACY_APP" -type d -prune \) -o -print0)
+    done
+    [[ -z "$bad" ]] && return 0
+    echo "ERROR: the agent runs as root and opens files in its data and log directories by name, and these" >&2
+    echo "       entries could have been planted or changed by another account:" >&2
+    printf '%s' "$bad" | while IFS= read -r entry; do echo "         $entry" >&2; done
+    echo "       Remove any symlink, special file or hard link. For a regular file or directory you have" >&2
+    echo "       inspected and trust, run: sudo chown root:wheel <path> && sudo chmod go-w <path> && sudo chmod -N <path>" >&2
+    echo "       Never chown -R: that makes a planted entry look root-owned. Then retry." >&2
+    return 1
+}
+
+# Recovery's start gate: both directories absent, or trusted, and everything in
+# them too. Returns 1 instead of exiting.
+operational_tree_trusted() {
+    local path
+    for path in "$DATA_DIR" "$LOG_DIR"; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        [[ -d "$path" && ! -L "$path" ]] && operational_directory_trusted "$path" || return 1
+    done
+    reject_untrusted_operational_entries
 }
 
 ensure_data_directory() {
@@ -682,6 +727,12 @@ restart_restored_service() {
         echo "WARNING: restored the previous agent but did not start it: its code directories or files are not root-owned and protected from other accounts" >&2
         return 0
     fi
+    # The data and log checks run after recovery in an install, so recovery runs
+    # them itself before starting root code over them (FortitudeEtc 2026-10-15).
+    if ! operational_tree_trusted; then
+        echo "WARNING: restored the previous agent but did not start it: its data or log directory, or something in it, is not root-owned and protected from other accounts" >&2
+        return 0
+    fi
     # Read first, then match: a failed read must never look like "not the
     # legacy program".
     program_args="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST")" || {
@@ -841,6 +892,7 @@ require_trusted_directory "$APP_ROOT"
 require_trusted_directory "$YUZU_LIB"
 ensure_data_directory || exit 1
 require_trusted_log_directory || exit 1
+reject_untrusted_operational_entries || exit 1
 # Preserve existing operational contents and modes only when their directory is
 # safe for a root daemon.  Fresh installs create the documented external paths.
 preserve_or_create_directory "$CONFIG_DIR" 755

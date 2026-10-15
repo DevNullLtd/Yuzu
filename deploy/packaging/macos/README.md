@@ -93,25 +93,37 @@ The bundle LaunchDaemon runs as root, retains external plugins, and always passe
 `--no-auto-update`. The sealed app is in the package-owned, root-owned
 `/Library/Application Support/YuzuAgent/YuzuAgent.app`; data stays in
 `/Library/Application Support/Yuzu` and is never ownership-reset or removed by
-this lane. The daemon runs as root and opens its databases and log by path, so
-anyone who can create entries in these directories could redirect a root write
-with a symlink. An existing data directory must therefore be root-owned, not
-group- or world-writable, and without an access control list that lets another
-account write to it. Otherwise installation stops before anything is staged,
-and the directory is left exactly as it was. `/Library/Logs/Yuzu` follows the
-same rule. This includes the `_yuzu` account that
-`scripts/install-agent-user.sh` creates for the unprivileged development run:
-that script gives it both directories, so a Mac it has run on needs them
-returned to root before the package will install. The refusal prints the fix:
+this lane. The daemon runs as root and opens its databases and log by name,
+following symlinks, so anyone who could create or change entries in these
+directories could redirect a root write. An existing data directory must
+therefore be root-owned, not group- or world-writable, and without an access
+control list that lets another account write to it. Everything inside it must
+be a regular file or directory owned by root, not group- or world-writable,
+without such an ACL, and not hard-linked. A symlink, a FIFO or another special
+file is refused. Otherwise installation stops before anything is staged, lists
+each offending entry, and leaves the directory exactly as it was.
+`/Library/Logs/Yuzu` follows the same rules. The legacy development app below
+the data directory is the one exception: the installer quarantines it itself
+and never runs it.
+
+This includes the `_yuzu` account that `scripts/install-agent-user.sh` creates
+for the unprivileged development run. That script gives `_yuzu` both
+directories and their contents, so a Mac it has run on needs them returned to
+root before the package will install. Fix the directory itself first:
 
 ```sh
-sudo chown -hR root:wheel "/Library/Application Support/Yuzu"
-sudo chmod -R go-w "/Library/Application Support/Yuzu"
-sudo chmod -RN "/Library/Application Support/Yuzu"
+sudo chown root:wheel "/Library/Application Support/Yuzu"
+sudo chmod go-w "/Library/Application Support/Yuzu"
+sudo chmod -N "/Library/Application Support/Yuzu"
 ```
 
-and the same for `/Library/Logs/Yuzu`. The data directory holds the agent's
-identity and enrolment, so never delete it to get past this check.
+Then install again: the installer lists every entry inside that still needs
+attention. Remove any symlink, special file or hard link. Re-own a regular file
+or directory only after inspecting it, one path at a time. Never use
+`chown -R`, `chown -hR` or `chmod -R`: a symlink planted while `_yuzu` owned
+the directory would become root-owned and pass the check, and the daemon would
+follow it. Do the same for `/Library/Logs/Yuzu`. The data directory holds the
+agent's identity and enrolment, so never delete it to get past this check.
 Configuration, certificate and plugin
 directories must be root-owned and not group- or world-writable; these are all
 checked in `preinstall`, before the payload. Logs,
@@ -183,7 +195,8 @@ Recovery restarts a restored agent only if it was running when the snapshot was
 taken. A restored definition that recovery does not start (because the agent
 was not running before, its code directory is untrusted, it cannot be read, it
 points into the data directory, it does not run the package's own
-`yuzu-agent`, or it or that executable could be changed by another account)
+`yuzu-agent`, it or that executable could be changed by another account, or
+the data or log directory or something in it fails the checks above)
 is still in `/Library/LaunchDaemons`, so
 launchd starts it at the next boot, exactly as before the install. Disable it
 (`launchctl disable system/com.yuzu.agent`) if it must stay stopped. A restored agent that does not stay running is reported, and recovery

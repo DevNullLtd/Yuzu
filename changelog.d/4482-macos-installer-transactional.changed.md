@@ -6,7 +6,7 @@
     - a `/usr/local` directory the agent runs from is not root-owned, or is group- or world-writable (common on Intel Macs with Homebrew);
     - agent code or plugins there could have been written by another account (mode bits or an access control list);
     - `/etc/yuzu-agent` or its `certs` directory is not root-owned or is group- or world-writable;
-    - the data or log directory is not root-owned, is group- or world-writable, or has an access control list that lets another account write to it (a `_yuzu`-owned directory left by `scripts/install-agent-user.sh` must be returned to root);
+    - the data or log directory, or anything in it, is not root-owned, is group- or world-writable, or has an access control list that lets another account write to it, or an entry in it is a symlink, special file or hard link (a `_yuzu`-owned tree left by `scripts/install-agent-user.sh` must be returned to root entry by entry, never with `chown -R`);
     - the recovery state in `/var/db/yuzu-agent` has an access control list;
     - a retained signed-plugin requirement meets an unsigned package.
   - `uninstall.sh` stops the agent first. If it is still running after 30 seconds, the uninstall fails and removes nothing.
