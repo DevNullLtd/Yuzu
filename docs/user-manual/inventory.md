@@ -628,11 +628,10 @@ place, **Hardware** and **Software**, each its own page:
       **Whole fleet** (`403`) unless that set is unfiltered; with a global grant neither
       changes the outcome today, and both stay in place as defence in depth for when the
       gate becomes scope-aware.
-    - **Which devices.** A run reaches agents attached to **this server process** only. A
-      device with no live session on this server is skipped and counted as not connected to
-      this server (`skipped_offline`): that is a disconnected device, and it is also a device
-      attached to another server of an active-active deployment, which this route cannot tell
-      apart from a disconnected one and does not contact. Agents older than 0.13.1 are skipped
+    - **Which devices.** A run reaches agents attached to **this server process** only.
+      `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability).
+      Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded, devices attached to other servers are not listed either.
+      `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents older than 0.13.1 are skipped
       and counted separately (`skipped_version`). One request reaches at most 500 devices (`413` above that, counted after the skips:
       narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
       up to 256 bytes.

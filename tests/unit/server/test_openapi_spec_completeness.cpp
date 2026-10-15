@@ -379,8 +379,12 @@ TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out reques
     const std::string accepted = op["responses"]["202"].value("description", "");
     for (const char* field : {"requested", "agents_reached", "skipped_offline", "skipped_version", "command_id"})
         CHECK(accepted.find(field) != std::string::npos);
-    // skipped_offline is defined as "no session on this server process", not "disconnected".
-    CHECK(accepted.find("no live session on this server process") != std::string::npos);
+    // skipped_offline is defined as "not reached by this server process", not "disconnected", and
+    // the counts are said not to be a census of the fleet (in the 202 text and the description).
+    CHECK(accepted.find("this server process did not reach") != std::string::npos);
+    CHECK(accepted.find("not the fleet") != std::string::npos);
+    CHECK(description.find("not a census of the fleet") != std::string::npos);
+    CHECK(description.find("the send was refused by the live stream") != std::string::npos);
     // The 429 leg names its Retry-After and the 413 leg its cap.
     CHECK(op["responses"]["429"].value("description", "").find("Retry-After") != std::string::npos);
     CHECK(op["responses"]["413"].value("description", "").find("500") != std::string::npos);

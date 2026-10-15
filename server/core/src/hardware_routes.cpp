@@ -548,8 +548,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // gate: with a global grant neither changes the outcome today, and they are wired for when the
     // gate becomes scope-aware.
     // REACH: this server process only. Sessions and sends are per process, so an agent attached to
-    // another replica has no session here, is counted in skipped_offline with the disconnected ones
-    // (this route cannot tell them apart) and is not sent to.
+    // another replica has no session here and is not sent to. skipped_offline = candidates this
+    // process did not reach that are not too old: no live session here (disconnected, or attached
+    // to another server) or a send the live stream refused. A group or a named device lists its
+    // disconnected members too; __all__ and a scope expression list only this process's sessions
+    // plus the shared presence record, so a device offline everywhere is never counted. The counts
+    // describe what THIS server could reach, not the fleet.
     // Audit BEFORE dispatch, fail closed. 202 means REQUESTED: `agents_reached` is sessions that
     // accepted the frame, not devices that have synced.
     static_assert(software_sync::kMaxIdLen == auth::kMaxAgentIdLength);

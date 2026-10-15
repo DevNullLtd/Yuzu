@@ -328,14 +328,22 @@ struct Candidate {
     std::string id;
     /// nullopt == no live session on THIS server process. That is all this route can know: a
     /// device attached to another replica of an active-active deployment looks the same as a
-    /// disconnected one, and is counted with it.
+    /// disconnected one, and is counted with it (see `Counts::skipped_offline`).
     std::optional<std::string> version;
 };
 
 struct Counts {
     std::size_t requested{0};
     std::size_t reached{0};
-    /// No live session on THIS server process (disconnected, or attached to another replica).
+    /// Candidates this server process did not reach and that are not too old: no live session
+    /// here (a disconnected device, or one attached to another server) OR a send the live stream
+    /// refused (`finalize` adds those, e.g. a gateway-attached agent whose gateway lacks the
+    /// dispatch capability). Which devices are candidates depends on the arm: a group or a named
+    /// device lists its disconnected members too, but `__all__` and a scope expression list only
+    /// this server's own sessions plus the shared presence record, so a device offline everywhere
+    /// is never enumerated or counted, and a degraded presence read also hides devices attached to
+    /// other servers. So `requested` and `skipped_offline` describe what THIS server could reach;
+    /// they are not a census of the fleet.
     std::size_t skipped_offline{0};
     std::size_t skipped_version{0};
 };
@@ -367,7 +375,7 @@ template <class SupportsFn>
 }
 
 /// Counts after dispatch: `reached` is what the registry accepted; a target that was live
-/// at partition time but refused the send is reported with the offline ones.
+/// at partition time but whose send the live stream refused is added to `skipped_offline`.
 [[nodiscard]] inline Counts finalize(Counts planned, std::size_t sent) {
     if (sent > planned.reached)
         sent = planned.reached; // a dispatcher cannot have reached more than it was given
