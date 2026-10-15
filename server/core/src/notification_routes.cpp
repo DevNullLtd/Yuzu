@@ -64,14 +64,11 @@ template <class Mutate>
 void audited_mutation(const NotificationRoutes::AuditFn& audit_fn, const char* verb,
                       const httplib::Request& req, httplib::Response& res, Mutate&& mutate) {
     // The route regex admits any digit string. One that does not fit an int64 names no
-    // notification: nothing to change, so nothing to audit-first. The refusal still leaves an
-    // outcome row, as an unknown id does (digits only, capped).
+    // notification: nothing to change, so nothing to audit-first.
     std::int64_t numeric = 0;
     try {
         numeric = std::stoll(req.matches[1].str());
     } catch (...) {
-        note_audit(audit_fn, req, verb, "failure", "notification",
-                   req.matches[1].str().substr(0, 32), "id_not_representable");
         res.status = 404;
         res.set_content(detail::a4_error(res, "notification not found"), "application/json");
         return;

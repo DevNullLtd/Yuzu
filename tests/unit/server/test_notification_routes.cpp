@@ -675,12 +675,4 @@ TEST_CASE("POST /api/notifications/:id: an id that overflows int64 is a 404 not 
     const auto all = w.store.list_all(/*limit=*/10, /*offset=*/0);
     REQUIRE(all.size() == 1);
     CHECK_FALSE(all[0].dismissed);
-    // Each refusal left one failure row and no `attempted` row (nothing to gate).
-    std::size_t refused = 0;
-    for (const auto& a : h.audit_calls) {
-        CHECK(a.result == "failure");
-        CHECK(a.detail == "id_not_representable");
-        ++refused;
-    }
-    CHECK(refused == 2);
 }
