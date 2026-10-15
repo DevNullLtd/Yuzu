@@ -130,10 +130,10 @@ the wrap happens INSIDE the formatter:
     it gets flagged and a reviewer has to consciously verify the line shape
     rather than inherit a blanket pass.
 
-SECOND, SEPARATE CHECK (#5513): claimed agent ids in four named files outside the
+SECOND, SEPARATE CHECK (#5513): claimed agent ids in five named files outside the
 Guardian/Spark basename family -- server/core/src/agent_service_impl.cpp,
-gateway_service_impl.cpp, custom_properties_store.cpp and custom_properties_routes.cpp
-(AGENT_ID_FILES). It flags a spdlog:: argument that is a request-derived agent id
+gateway_service_impl.cpp, agent_registry.cpp, custom_properties_store.cpp and
+custom_properties_routes.cpp (AGENT_ID_FILES). It flags a spdlog:: argument that is a request-derived agent id
 (`info.agent_id()`, `request->agent_id()`, `req->agent_id()`, a local alias bound from
 one of those in the same function, or the bare `agent_id` in the custom-properties
 files) and is not wholly a log_id_token / log_key_token / audit_token /
@@ -141,10 +141,18 @@ onbehalf::sanitize_for_log call or the local `safe_agent_id`. It is LEXICAL: it 
 argument text, not data flow, so an id reaching the log through a variable it cannot
 trace to a request accessor, or a new spelling, is not seen. The exact scope and limits
 are in the block comment above find_agent_id_violations_in_text(). FILE_BASENAME_RE and
-the pattern check above are unchanged and do not apply to these four files.
+the pattern check above are unchanged and do not apply to these five files.
+In agent_registry.cpp only the claimed ids from `info.agent_id()` (and the local
+`safe_agent_id` built from it) are in scope; the many other spdlog calls in that file print
+ids taken from the session table and are deliberately not matched.
+A fourth, narrower rule (REGISTRY_FREE_TEXT_FILES, agent_registry.cpp only) requires an
+spdlog:: argument that is an agent-supplied hostname (`info.hostname()` or a local alias bound
+from it) or the `.error()` of a `revoke_by_device(` result (a store error string that can quote
+the device id) to be wholly one wrap call.
 A third, narrower rule (PQ_ERROR_FILES) requires every spdlog:: argument that contains a
-PQerrorMessage( call in custom_properties_store.cpp to be wrapped (libpq error text can quote
-the claimed agent id).
+PQerrorMessage( or PQresultErrorMessage( call in custom_properties_store.cpp to be wrapped
+(libpq error text can quote the claimed agent id). It matches the call name only: a value
+copied into a local first is not seen.
 
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml,
 same precedent shape as test_no_connless_pq_escape.py and
@@ -823,9 +831,14 @@ def find_violations_in_text(text: str) -> list[tuple[int, str, list[str]]]:
 # declaration or init of that name must have a right-hand side that is wholly one
 # `log_id_token(...)` call, and a file that logs `safe_agent_id` without defining it
 # is flagged, so neither weakening nor deleting the definition can pass.
+# agent_registry.cpp is scanned by this check too, but only claimed ids from
+# `info.agent_id()` and `safe_agent_id` are in scope there; its other spdlog calls print
+# ids from the session table, which look like bare names with no accessor alias and are
+# deliberately not matched. Hostnames and the revoke error text in that file are covered
+# by the separate free-text rule (REGISTRY_FREE_TEXT_FILES) below.
 # Not covered, by design: a bare id that reaches the log through a variable the
 # check cannot trace to a request accessor (for example an id read back from a
-# session table), a hostname or other claimed field, and any new spelling nobody
+# session table), any other claimed field, and any new spelling nobody
 # has added here. An accessor passed as a sub-expression of a larger call (for
 # example `fmt::format("{}", request->agent_id())`) IS flagged, conservatively,
 # unless the whole argument is a wrap call. Known lexical limits: alias forms such
@@ -839,6 +852,9 @@ AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
     # path -> bare names that are ALWAYS a request-derived agent id in that file
     "server/core/src/agent_service_impl.cpp": (),
     "server/core/src/gateway_service_impl.cpp": (),
+    # Only claimed ids from `info.agent_id()` / `safe_agent_id` are matched; the file's other
+    # spdlog calls print ids from the session table, which the check cannot trace and ignores.
+    "server/core/src/agent_registry.cpp": (),
     "server/core/src/custom_properties_store.cpp": ("agent_id",),
     "server/core/src/custom_properties_routes.cpp": ("agent_id",),
 }
@@ -946,6 +962,8 @@ def find_agent_id_violations_in_text(
 PQ_ERROR_FILES: tuple[str, ...] = ("server/core/src/custom_properties_store.cpp",)
 
 
+# Name-only: the rule matches the call NAME inside the argument text. A value copied into a
+# local first (`const char* e = PQerrorMessage(c); spdlog::warn("{}", e)`) is not caught.
 def find_pq_error_violations_in_text(text: str) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
     for pos, stmt in find_spdlog_statements_with_pos(text):
@@ -953,7 +971,54 @@ def find_pq_error_violations_in_text(text: str) -> list[tuple[int, str]]:
         if parsed is None:
             continue
         for arg in split_top_level_args(parsed[1]):
-            if "PQerrorMessage(" in arg and not argument_is_wrapped(arg):
+            if (
+                "PQerrorMessage(" in arg or "PQresultErrorMessage(" in arg
+            ) and not argument_is_wrapped(arg):
+                out.append((text.count("\n", 0, pos) + 1, stmt))
+                break
+    return out
+
+
+# Fourth, narrower rule: agent-supplied free text and store error text in the register path.
+# In agent_registry.cpp an spdlog argument that is
+#   - `info.hostname()` (any receiver) or a local alias bound from such an accessor earlier in
+#     the SAME function (`const auto& host = info.hostname();`), or
+#   - `X.error()` where `X` is a local bound earlier in the same function from a
+#     `revoke_by_device(` call (a store error string that can quote the claimed device id)
+# must be wholly one wrap call (log_key_token / log_id_token / audit_token). Lexical, like the
+# checks above: a hostname reaching the log through a variable it cannot trace to the accessor,
+# another store call's error, and `session->hostname` (a member, not an accessor call) are not
+# seen. The function boundary is the last `\n}` before the call, as for the agent-id check.
+REGISTRY_FREE_TEXT_FILES: tuple[str, ...] = ("server/core/src/agent_registry.cpp",)
+
+_RAW_HOSTNAME_ACCESSOR_RE = re.compile(
+    r"\b\w+(?:\.|->)hostname\(\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
+)
+_HOSTNAME_ALIAS_DECL_RE = re.compile(
+    r"\b(?:const\s+)?(?:auto|std::string)\s*&?\s*(\w+)\s*=\s*\w+(?:\.|->)hostname\(\)\s*;"
+)
+_REVOKE_RESULT_DECL_RE = re.compile(
+    r"\b(?:const\s+)?auto\s*&?\s*(\w+)\s*=\s*[\w.>:-]*revoke_by_device\s*\("
+)
+
+
+def find_registry_free_text_violations_in_text(text: str) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for pos, stmt in find_spdlog_statements_with_pos(text):
+        parsed = parse_call(stmt)
+        if parsed is None:
+            continue
+        fn_start = text.rfind("\n}", 0, pos)
+        scope = text[fn_start + 1 if fn_start != -1 else 0 : pos]
+        host_names = {m.group(1) for m in _HOSTNAME_ALIAS_DECL_RE.finditer(scope)}
+        revoke_names = {m.group(1) for m in _REVOKE_RESULT_DECL_RE.finditer(scope)}
+        for arg in split_top_level_args(parsed[1]):
+            raw = (
+                _RAW_HOSTNAME_ACCESSOR_RE.search(arg) is not None
+                or any(re.search(r"(?<![\w.>:])" + re.escape(n) + r"\b(?!\s*\()", arg) for n in host_names)
+                or any(re.search(r"(?<![\w.>:])" + re.escape(n) + r"\.error\(\)", arg) for n in revoke_names)
+            )
+            if raw and not argument_is_wrapped(arg):
                 out.append((text.count("\n", 0, pos) + 1, stmt))
                 break
     return out
@@ -1286,6 +1351,46 @@ def _selfcheck() -> None:
     )
     if find_pq_error_violations_in_text(pq_must_not):
         raise SystemExit(f"selfcheck: unexpected PQerrorMessage violation: {pq_must_not!r}")
+    pq_res_must_match = 'spdlog::warn("query failed: {}", PQresultErrorMessage(res.get()));'
+    if not find_pq_error_violations_in_text(pq_res_must_match):
+        raise SystemExit(f"selfcheck: expected a PQresultErrorMessage violation: {pq_res_must_match!r}")
+    pq_res_must_not = (
+        'spdlog::warn("query failed: {}", ::yuzu::log_key_token(PQresultErrorMessage(res.get())));'
+    )
+    if find_pq_error_violations_in_text(pq_res_must_not):
+        raise SystemExit(f"selfcheck: unexpected PQresultErrorMessage violation: {pq_res_must_not!r}")
+
+    # 10. The register-path free-text rule (find_registry_free_text_violations_in_text).
+    free_must_match = [
+        'spdlog::info("Agent registered: hostname=\'{}\'", info.hostname());',
+        'spdlog::info("Agent registered: hostname=\'{}\'", req->hostname());',
+        "void F() {\n  const auto& host = info.hostname();\n"
+        '  spdlog::info("registered \'{}\'", host);\n}\n',
+        "void F() {\n  auto revoked = store->revoke_by_device(info.agent_id());\n"
+        '  spdlog::error("revoke failed for \'{}\': {}", safe_agent_id, revoked.error());\n}\n',
+        "void F() {\n  auto revoked = store->revoke_by_device(info.agent_id());\n"
+        '  spdlog::error("revoke failed: {}", "x" + revoked.error());\n}\n',
+    ]
+    for src in free_must_match:
+        if not find_registry_free_text_violations_in_text(src):
+            raise SystemExit(f"selfcheck: expected a register-path free-text violation: {src!r}")
+    free_must_not = [
+        'spdlog::info("Agent registered: hostname=\'{}\'", ::yuzu::log_key_token(info.hostname()));',
+        'spdlog::info("host empty? {}", info.hostname().empty());',
+        "void F() {\n  const auto& host = info.hostname();\n"
+        '  spdlog::info("registered \'{}\'", ::yuzu::log_key_token(host));\n}\n',
+        "void F() {\n  auto revoked = store->revoke_by_device(info.agent_id());\n"
+        '  spdlog::error("revoke failed for \'{}\': {}", safe_agent_id,'
+        " ::yuzu::log_key_token(revoked.error()));\n}\n",
+        # An alias bound in an EARLIER function must not leak into the next one, and an
+        # unrelated result's error() is not this rule's business.
+        "void F() {\n  auto revoked = store->revoke_by_device(a);\n}\n"
+        'void G() {\n  auto revoked = other();\n  spdlog::error("x {}", revoked.error());\n}\n',
+        'spdlog::info("tags {}", session->hostname);',
+    ]
+    for src in free_must_not:
+        if find_registry_free_text_violations_in_text(src):
+            raise SystemExit(f"selfcheck: unexpected register-path free-text violation: {src!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -1337,6 +1442,15 @@ def main() -> int:
         for line_no, stmt in find_pq_error_violations_in_text(text):
             snippet = " ".join(stmt.split())[:160]
             agent_hits.append(f"{rel}:{line_no}: {snippet}")
+    for rel in REGISTRY_FREE_TEXT_FILES:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            agent_hits.append(f"{rel}: file listed in REGISTRY_FREE_TEXT_FILES does not exist")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for line_no, stmt in find_registry_free_text_violations_in_text(text):
+            snippet = " ".join(stmt.split())[:160]
+            agent_hits.append(f"{rel}:{line_no}: {snippet}")
     rc = 0
     if hits:
         print(
@@ -1348,8 +1462,8 @@ def main() -> int:
         rc = 1
     if agent_hits:
         print(
-            "FAIL: spdlog:: call prints a request-derived agent id or raw libpq error text "
-            "unwrapped (#5513 CWE-117 log-injection tripwire). Wrap with ::yuzu::log_id_token(...) "
+            "FAIL: spdlog:: call prints a request-derived agent id, agent-supplied hostname or raw "
+            "store/libpq error text unwrapped (#5513 CWE-117 log-injection tripwire). Wrap with ::yuzu::log_id_token(...) "
             "/ ::yuzu::log_key_token(...) "
             "(common/include/yuzu/log_token.hpp):"
         )

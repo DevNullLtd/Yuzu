@@ -59,9 +59,12 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     session->os = info.platform().os();
     session->arch = info.platform().arch();
     session->agent_version = info.agent_version();
-    // Every log line in this function prints the agent-supplied id and free text neutralised,
-    // never raw (CWE-117); the gateway path reaches here without the direct path's enrollment
-    // checks.
+    // Every spdlog call in THIS function prints the claimed id (via safe_agent_id) and any
+    // agent-supplied free text (tag key, hostname) or store error text neutralised (CWE-117);
+    // the gateway path reaches here without the direct path's enrollment checks. The removal,
+    // rollback and sweep lines further down print ids read back from the session table: both
+    // callers bound them in length and refused an embedded NUL before this call, but those
+    // lines do not neutralise newline, space or '='.
     const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
     // Ingest filter (#3295): validated and non-service, mirroring TagStore's
     // own sync_agent_tags gate (tag_store.cpp) so a service claim or an
@@ -147,7 +150,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (!revoked) {
             spdlog::error("AgentRegistry::register_agent: device token revoke-by-device failed "
                           "for '{}', refusing registration: {}",
-                          safe_agent_id, revoked.error());
+                          safe_agent_id, ::yuzu::log_key_token(revoked.error()));
             metrics_
                 .counter("yuzu_agents_registration_refused_total",
                          {{"reason", "device_token_revoke_failed"}})
