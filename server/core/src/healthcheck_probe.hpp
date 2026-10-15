@@ -19,7 +19,8 @@ namespace yuzu::server::healthcheck {
 /// The configure half of the TLS probe, exposed so a test can inspect the
 /// client's trust store after a connect. Loads the anchor via
 /// set_ca_cert_path only (never the system store); verification on, hostname
-/// check off, redirects not followed.
+/// check off, redirects not followed. Returns nullptr when the target has no
+/// trust anchor: an empty CA path would make httplib fall back to the OS store.
 [[nodiscard]] std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& target);
 #endif
 

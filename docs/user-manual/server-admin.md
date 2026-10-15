@@ -5426,7 +5426,7 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 
 ### Probing a TLS-enabled server
 
-The shipped images contain no `curl` (the chiselled image ships a static busybox with `wget`, see `deploy/docker/Dockerfile.server.chisel`), and before this change the HTTP port answered every request with a redirect when HTTPS was on. Two mechanisms now let an orchestrator probe such a server.
+The shipped images contain no `curl` (the chiselled image ships a static busybox with `wget`, see `deploy/docker/Dockerfile.server.chisel`), and on images 0.14.1 and older the HTTP port answers every request with a redirect when HTTPS is on. Two mechanisms let an orchestrator probe such a server.
 
 **1. The HTTP port answers the four probes directly.** With HTTPS on, the redirect listener (`--web-port`, `8080` by default) serves `/livez`, `/readyz`, `/health` and `/api/health` without redirecting. The rules:
 

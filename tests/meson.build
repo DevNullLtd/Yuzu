@@ -3526,11 +3526,13 @@ endif
 # #5906: `yuzu-server --healthcheck` CLI contract against the real binary (no listener, no
 # Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
 # runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# gate labelled 'server' fails that check on the Windows legs.
 if _bash_test.found() and meson.can_run_host_binaries() and build_server
-  test('--healthcheck CLI contract (#5906)',
+  test('healthcheck CLI contract (#5906)',
     _bash_test,
     args: [files('shell/test_healthcheck_cli.sh'), meson.project_build_root()],
-    suite: 'server',
+    suite: ['server', 'docs'],
     timeout: 60,
     depends: [yuzu_server_exe],
   )

@@ -9,6 +9,10 @@ namespace yuzu::server::healthcheck {
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) {
+    // An empty CA path makes httplib's load_certs() fall through to the OS trust store
+    // (httplib.h:15538-15541), the fallback this probe must never take: refuse instead.
+    if (t.trust_anchor.empty())
+        return nullptr;
     auto c = std::make_unique<httplib::SSLClient>(t.host, t.port);
     // The anchor goes in via the CA-file setter, NOT the store-injection one: with
     // no CA file path set, httplib 0.37.1 load_certs() (httplib.h:15529-15549)
@@ -43,9 +47,11 @@ HealthcheckOutcome probe_once(const HealthcheckTarget& t, int max_total_ms) {
     // oidc_provider.cpp).
     std::unique_ptr<httplib::ClientImpl> client;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    if (t.tls)
+    if (t.tls) {
         client = make_tls_client(t);
-    else
+        if (!client)
+            return HealthcheckOutcome{.status = 0, .error = "no trust anchor"};
+    } else
 #endif
     {
         client = std::make_unique<httplib::ClientImpl>(t.host, t.port);

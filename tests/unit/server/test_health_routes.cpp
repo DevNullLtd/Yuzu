@@ -1,9 +1,9 @@
 /// @file test_health_routes.cpp
 /// HTTP-level coverage for the 6-route Health/Infra cluster (#2542 PR-10) —
-/// driven in-process through TestRouteSink (no httplib acceptor, #438) except
-/// the one [live] case at the end, which binds a real loopback listener to
-/// cover install_plaintext_redirect_pre_routing, mirroring
-/// test_result_set_routes.cpp's / test_page_routes.cpp's Harness shape. None of
+/// driven in-process through TestRouteSink (no httplib acceptor, #438),
+/// mirroring test_result_set_routes.cpp's / test_page_routes.cpp's Harness
+/// shape — except the one [live] case at the end, which binds a real loopback
+/// listener to cover install_plaintext_redirect_pre_routing. None of
 /// these 6 routes touches Postgres directly through this harness (every store
 /// pointer defaults to null and the handlers'
 /// `store && store->is_open()` idiom degrades to "not open" — a REAL
@@ -109,7 +109,7 @@ struct Harness {
     // four probes on `plain_sink`; `plain_override` points at some other sink (the
     // real-listener case); `main_serving` is read live by the 503 gate.
     bool plain_wired{false};
-    bool main_serving{true};
+    std::atomic<bool> main_serving{true}; // read by an httplib worker in the [live] case
     HttpRouteSink* plain_override{nullptr};
 
     // Both sinks LAST (sink-last rule): their handlers capture `deps`.
@@ -186,7 +186,7 @@ struct Harness {
         deps.nvd_db = nvd_db;
         deps.plaintext_probe_sink =
             plain_override ? plain_override : (plain_wired ? &plain_sink : nullptr);
-        deps.main_listener_serving_fn = [this] { return main_serving; };
+        deps.main_listener_serving_fn = [this] { return main_serving.load(); };
         // Every other store pointer stays null — see file header comment.
         health::register_health_routes(sink, deps);
     }
@@ -659,7 +659,8 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // The probe routes must be handed the plaintext sink and the 503 gate.
     expect(".plaintext_probe_sink = redirect_sink_.get()", 1,
            "register_health_routes receives the redirect listener's sink");
-    expect(".main_listener_serving_fn", 1, "the plaintext probes are gated on the HTTPS listener");
+    expect(".main_listener_serving_fn = [this] { return web_server_ && web_server_->is_running(); }",
+           1, "the plaintext probes are gated on the HTTPS listener actually running");
     // One closed probe set shared by the main pre-routing chokepoint.
     expect("health::is_probe_path(req.path)", 1,
            "main pre-routing exempts probes through the one shared predicate");

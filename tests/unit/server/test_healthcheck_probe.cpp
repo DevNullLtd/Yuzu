@@ -7,6 +7,10 @@
 ///     refuses, that it cannot hang, and that it never follows a redirect.
 ///     Compiled out under TSan (#438: httplib's acceptor crashes it with no
 ///     report), and the TLS ones additionally require OpenSSL support.
+/// The [live] layer lives in the unit suite because it needs only loopback
+/// sockets and temp PEMs (no process spawn, no Postgres), every bound it checks
+/// is an upper bound (the deadline cases assert < 2 s, never a lower bound), and
+/// the integration surface has no TLS client harness.
 
 #include "healthcheck_probe.hpp"
 #include "healthcheck_rules.hpp"
@@ -157,6 +161,23 @@ TEST_CASE("healthcheck: the diagnostic is one line, names target and anchor, nev
     CHECK(healthcheck_diagnostic(tp, {0, "Connection"}).find("trust anchor: none") !=
           std::string::npos);
 }
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+TEST_CASE("healthcheck: a TLS target with no trust anchor is refused, never probed against the "
+          "system store",
+          "[server][healthcheck]") {
+    // An empty CA path would make httplib's load_certs() fall back to the OS trust store.
+    HealthcheckTarget t;
+    t.tls = true;
+    t.host = "127.0.0.1";
+    t.port = 1; // never dialled: the factory refuses before a socket exists
+    t.path = "/readyz";
+    CHECK(make_tls_client(t) == nullptr);
+    const auto out = probe_once(t);
+    CHECK(out.status == 0);
+    CHECK(out.error.find("no trust anchor") != std::string::npos);
+}
+#endif
 
 // ── [live] loopback cases ───────────────────────────────────────────────────
 

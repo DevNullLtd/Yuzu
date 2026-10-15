@@ -10,7 +10,12 @@
 #      probe that ran AFTER server init would die on the missing DSN or write a config file.
 #   B  TLS branch: the same through the TLS path; the line names https:// and default-ca.pem.
 #   C  option checks: a bad --healthcheck-path value, and --healthcheck-path alone, are refused.
-#   D  YUZU_HEALTHCHECK=1 in the environment never turns the server into a probe.
+#   D  YUZU_HEALTHCHECK=1 in the environment never turns the server into a probe: it does
+#      not satisfy --healthcheck-path's dependency on --healthcheck (a wired envname would),
+#      and --version, which CLI11 handles before any environment option, still wins.
+#   E  environment-only target: the probe reads the server's own listener variables.
+#   F  an existing, invalid --config file is neither read nor touched, and changes nothing
+#      about the diagnostic.
 #
 # Run:  bash tests/shell/test_healthcheck_cli.sh <BUILDDIR>
 set -euo pipefail
@@ -83,11 +88,41 @@ run c2 --healthcheck-path /livez
 check "C --healthcheck-path alone is refused" \
   "$([ "$(rc c2)" != 0 ] && grep -Eq -e '--healthcheck-path.*--healthcheck([^-]|$)' "$CAP/c2.err"; echo $?)"
 
-# D: the environment variable is not an option.
+# D: the environment variable is not an option. --healthcheck-path alone (target pinned to a
+# closed port so a wired envname could only probe, never reach a real server) must still be
+# refused: --version alone cannot show that, CLI11 handles it before any environment option.
 export YUZU_HEALTHCHECK=1
+run d1 --healthcheck-path /livez --no-https --web-address 127.0.0.1 --web-port "$PORT"
 run d --version
 unset YUZU_HEALTHCHECK
+check "D --healthcheck-path alone is still refused" \
+  "$([ "$(rc d1)" != 0 ] && grep -Eq -e '--healthcheck-path.*--healthcheck([^-]|$)' "$CAP/d1.err"; echo $?)"
+check "D no probe ran" "$(! grep -q 'healthcheck:' "$CAP/d1.out" "$CAP/d1.err"; echo $?)"
 check "D --version still prints the version" "$([ "$(rc d)" = 0 ] && [ -s "$CAP/d.out" ]; echo $?)"
-check "D no probe ran" "$(! grep -q 'healthcheck:' "$CAP/d.out" "$CAP/d.err"; echo $?)"
+check "D --version ran no probe" "$(! grep -q 'healthcheck:' "$CAP/d.out" "$CAP/d.err"; echo $?)"
+
+# E: the target comes from the server's own environment variables when no flag names it.
+export YUZU_NO_HTTPS=1 YUZU_WEB_ADDRESS=127.0.0.1 YUZU_WEB_PORT="$PORT"
+run e "${STATE[@]}" --healthcheck
+unset YUZU_NO_HTTPS YUZU_WEB_ADDRESS YUZU_WEB_PORT
+line="$(head -n1 "$CAP/e.err")"
+check "E rc is 1" "$([ "$(rc e)" = 1 ]; echo $?)"
+check "E line names the environment target" \
+  "$(case "$line" in "healthcheck: GET http://127.0.0.1:$PORT/readyz -> "*) true;; *) false;; esac; echo $?)"
+check "E line ends with the anchor note" \
+  "$(case "$line" in *"(trust anchor: none)") true;; *) false;; esac; echo $?)"
+
+# F: an invalid config file sits outside $WORK (which A/B check for stray writes). A probe that
+# loaded it would log to stdout (Unsupported version) and, on first-run setup, rewrite it.
+BADCFG="$CAP/invalid-yuzu-server.cfg"
+printf '# Version: 99\n\377\376garbage\n' >"$BADCFG"
+cp "$BADCFG" "$CAP/invalid-yuzu-server.orig"
+run f --config "$(winpath "$BADCFG")" --data-dir "$(winpath "$WORK/data")" \
+  --healthcheck --no-https --web-address 127.0.0.1 --web-port "$PORT"
+check "F rc is 1" "$([ "$(rc f)" = 1 ]; echo $?)"
+check "F stdout is empty" "$([ ! -s "$CAP/f.out" ]; echo $?)"
+check "F diagnostic is identical to A's" "$(cmp -s "$CAP/f.err" "$CAP/a.err"; echo $?)"
+check "F config file is byte-identical" "$(cmp -s "$BADCFG" "$CAP/invalid-yuzu-server.orig"; echo $?)"
+check "F wrote no files" "$([ -z "$(find "$WORK" -type f)" ]; echo $?)"
 
 exit "$fail"

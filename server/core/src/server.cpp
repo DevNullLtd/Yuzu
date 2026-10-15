@@ -14746,7 +14746,9 @@ private:
             // monitoring integrations behind a NAT or sharing a source-IP
             // bucket with authed REST traffic cannot 429-starve the health
             // probe. The endpoints themselves are strictly read-only and
-            // documented as unauthenticated. This IS the probes' only gate:
+            // documented as unauthenticated. This is the probes' only gate
+            // on the HTTPS listener (the plaintext redirect listener admits
+            // no body at all: is_plaintext_probe_request, health_routes.hpp):
             // the cap check runs here, unconditionally, before the
             // Unhandled return, precisely because everything past this
             // point (on-behalf-of, rate limiting) is skipped for these four
