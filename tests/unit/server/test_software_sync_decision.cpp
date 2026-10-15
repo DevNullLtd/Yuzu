@@ -484,3 +484,104 @@ TEST_CASE("sync resolve: no target, or an unwired store read, is Aborted - never
     CHECK(ss::resolve_targets({DispatchArm::Ids, "h"}, authz::VisibleSet{}, unwired).status ==
           ss::Resolved::Status::Ok);
 }
+
+// ── fan-out: one command id, honest counts ────────────────────────────────────────
+
+namespace {
+
+// Records every step so a test can prove the order, the single id and who was attempted.
+struct FanOutProbe {
+    int minted = 0;
+    int prepared = 0;
+    std::string prepared_with;
+    Ids attempted;
+    std::vector<std::string> frames; // the command each send saw
+    std::function<bool(const std::string&)> accept = [](const std::string&) { return true; };
+    bool classifiable = true;
+
+    ss::DispatchResult run(const Ids& ids) {
+        return ss::fan_out(
+            ids,
+            [&] {
+                ++minted;
+                return std::string("cmd-") + std::to_string(minted);
+            },
+            [&](const std::string& command_id) -> std::optional<std::string> {
+                ++prepared;
+                prepared_with = command_id;
+                if (!classifiable)
+                    return std::nullopt;
+                return "frame:" + command_id;
+            },
+            [&](const std::string& id, const std::string& frame) {
+                attempted.push_back(id);
+                frames.push_back(frame);
+                return accept(id);
+            });
+    }
+};
+
+} // namespace
+
+TEST_CASE("sync fan_out: ONE command id is minted, prepared once and shared by every send",
+          "[server][software_sync]") {
+    FanOutProbe p;
+    const auto r = p.run({"a", "b", "c"});
+    CHECK(p.minted == 1);
+    CHECK(p.prepared == 1);
+    CHECK(p.prepared_with == "cmd-1");
+    CHECK(r.command_id == "cmd-1");
+    CHECK(r.sent == 3);
+    CHECK(p.attempted == Ids{"a", "b", "c"}); // input order
+    CHECK(p.frames == std::vector<std::string>(3, "frame:cmd-1")); // the same command each time
+}
+
+TEST_CASE("sync fan_out: sent counts accepted frames only and a refusal does not stop the loop",
+          "[server][software_sync]") {
+    FanOutProbe p;
+    p.accept = [](const std::string& id) { return id != "b" && id != "d"; };
+    const auto r = p.run({"a", "b", "c", "d", "e"});
+    CHECK(r.sent == 3);
+    CHECK(p.attempted == Ids{"a", "b", "c", "d", "e"}); // every id was tried
+    CHECK(r.command_id == "cmd-1");                     // the id was used even though some were refused
+
+    FanOutProbe none;
+    none.accept = [](const std::string&) { return false; };
+    const auto nothing = none.run({"a", "b"});
+    CHECK(nothing.sent == 0);
+    CHECK(nothing.command_id == "cmd-1");
+    CHECK(none.attempted.size() == 2);
+}
+
+TEST_CASE("sync fan_out: an empty id list sends nothing and mints no id", "[server][software_sync]") {
+    FanOutProbe p;
+    const auto r = p.run({});
+    CHECK(r.sent == 0);
+    CHECK(r.command_id.empty());
+    CHECK(p.minted == 0);
+    CHECK(p.prepared == 0);
+    CHECK(p.attempted.empty());
+}
+
+TEST_CASE("sync fan_out: a command that cannot be built sends nothing and reports no id",
+          "[server][software_sync]") {
+    FanOutProbe p;
+    p.classifiable = false;
+    const auto r = p.run({"a", "b"});
+    CHECK(p.prepared == 1);
+    CHECK(r.sent == 0);
+    CHECK(r.command_id.empty()); // the per-device route relies on an empty id here
+    CHECK(p.attempted.empty());
+}
+
+TEST_CASE("sync fan_out: a single id behaves as the per-device push", "[server][software_sync]") {
+    FanOutProbe p;
+    const auto r = p.run({"only"});
+    CHECK(r.sent == 1);
+    CHECK(r.command_id == "cmd-1");
+    FanOutProbe q;
+    q.accept = [](const std::string&) { return false; };
+    const auto refused = q.run({"only"});
+    CHECK(refused.sent == 0);
+    CHECK(refused.command_id == "cmd-1"); // route maps sent==0 to "not reachable"
+}

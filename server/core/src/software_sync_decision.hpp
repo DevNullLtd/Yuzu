@@ -272,6 +272,33 @@ struct Expansion {
     return out;
 }
 
+// ── fan-out ───────────────────────────────────────────────────────────────────────
+
+/// Send one prepared command to each id under ONE command id. The three steps are injected so
+/// the sequencing is testable without a registry:
+///   `mint_id()`          -> the command id (called once, and only when there is something to send);
+///   `prepare(command_id)`-> the command, or an empty/false result when it cannot be built
+///                           (an `optional` or `expected`; nothing is sent and no id is reported);
+///   `send_one(id, cmd)`  -> true when the registry accepted the frame for that id.
+/// `sent` counts accepted frames only; a refused send does not stop the loop. An empty id list
+/// sends nothing and mints no id. The caller flushes the gateway once if `sent > 0`.
+template <class MintId, class Prepare, class SendOne>
+[[nodiscard]] DispatchResult fan_out(const std::vector<std::string>& ids, MintId&& mint_id,
+                                     Prepare&& prepare, SendOne&& send_one) {
+    DispatchResult out;
+    if (ids.empty())
+        return out;
+    const std::string command_id = mint_id();
+    auto cmd = prepare(command_id);
+    if (!cmd)
+        return out;
+    out.command_id = command_id;
+    for (const auto& id : ids)
+        if (send_one(id, *cmd))
+            ++out.sent;
+    return out;
+}
+
 // ── partition ─────────────────────────────────────────────────────────────────────
 
 struct Candidate {

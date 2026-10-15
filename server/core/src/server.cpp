@@ -12381,22 +12381,24 @@ private:
     /// nothing and returns the empty result (no command id).
     [[nodiscard]] yuzu::server::software_sync::DispatchResult
     push_sync_now(const std::vector<std::string>& ids, const std::string& source) {
-        const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
-        yuzu::server::software_sync::DispatchResult out;
-        const auto command_id = "__sync__-now-" + std::to_string(now_s) + "-" +
-                                auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
-        auto classified =
-            build_classified_command(yuzu::server::DispatchCaller{.system = true}, "__sync__", "now",
-                                     command_id, /*parameters=*/{{"source", source}});
-        if (!classified)
-            return out;
-        out.command_id = command_id;
-        for (const auto& id : ids)
-            if (send_system_reserved(id, *classified,
-                                     yuzu::server::SystemReservedPush::inventory_sync_now))
-                ++out.sent;
+        auto out = yuzu::server::software_sync::fan_out(
+            ids,
+            [] {
+                const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                return "__sync__-now-" + std::to_string(now_s) + "-" +
+                       auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+            },
+            [&](const std::string& command_id) {
+                return build_classified_command(yuzu::server::DispatchCaller{.system = true},
+                                                "__sync__", "now", command_id,
+                                                /*parameters=*/{{"source", source}});
+            },
+            [&](const std::string& id, const detail::ClassifiedCommand& cmd) {
+                return send_system_reserved(id, cmd,
+                                            yuzu::server::SystemReservedPush::inventory_sync_now);
+            });
         if (out.sent > 0)
             forward_gateway_pending(); // gateway agents are only QUEUED
         return out;
