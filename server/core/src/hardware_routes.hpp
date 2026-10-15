@@ -272,7 +272,9 @@ public:
     /// registry refused (no live session / stream write failed).
     using SyncDispatchFn = std::function<HwSyncDispatchResult(const std::string& agent_id,
                                                               const std::string& source)>;
-    /// The live session's self-reported agent_version; nullopt == no live session.
+    /// The live session's self-reported agent_version; nullopt == no session on THIS server
+    /// process (sessions are per process, so a device attached to another replica reads the same
+    /// as a disconnected one).
     using AgentVersionFn = std::function<std::optional<std::string>(const std::string& agent_id)>;
     /// One plugin's pre-serialised plugin-docs manifest JSON (`plugin_docs_manifest`),
     /// nullopt when no manifest documents that plugin.
@@ -334,7 +336,9 @@ public:
         /// set is unfiltered; `sync_dispatch_many_fn` sends `__sync__.now` to each id.
         /// `sync_caller_unfiltered_fn` lets a confined caller's `__all__` be refused before it
         /// takes the single in-flight slot or reads the fleet.
-        /// Any of the four empty == the route answers 503 (fail closed, nothing sent).
+        /// Any of the six (`sync_perm_fn`, `auth_fn`, the three `sync_*_fn` closures above,
+        /// `agent_version_fn`) empty == the route answers an AUDITED 500 (result=failure, nothing
+        /// sent): a missing derivation is a misconfiguration, not an outage.
         /// `sync_now_fn` is optional (empty == system clock).
         SyncPermFn sync_perm_fn;
         SyncResolveFn sync_resolve_fn;
