@@ -258,6 +258,13 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # the two Estate changes net 0 on their own (+1 NVD status card exception, -1 discovery row
 # twinned), so the count after this merge is the value the checker reports, set from its output.
 #
+# Audit filter parity: get.api-audit flips "planned:#2146" -> "twinned" (GET /api/v1/audit +
+# MCP query_audit_log, now at filter/paging parity), the checker reports 208 - 1 = 207 on the merged tree
+# (dev's 208 above, less this flip).
+#
+# Merged onto the Estate changes: the count is the value the checker reports on the merged
+# tree, set from its output.
+#
 # Access Users page (#5880): re-surfaces the untwinned Settings users list as two read-only
 # fragments, GET /fragments/access/users/list (planned:#2146) and .../detail (composed-of the
 # list), +2. A GET /api/v1/users twin is not built here; the Settings rows and these two
@@ -269,14 +276,14 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # self-only GET /api/v1/tokens (an administrator on a cookie session sees every owner). The two
 # principal fragments share GET /api/v1/engine-principals' EnginePrincipal:Read gate but add the
 # page's roles/credentials composition and an audit-gated revocation detail, so they are not
-# ledgered as twins here. Merged with the 208 above, the two Access pages make 213 (208 + 2 + 3),
+# ledgered as twins here. Merged with the 207 above, the two Access pages make 212 (207 + 2 + 3),
 # the value the checker reports on the merged tree, not hand-picked. The ADR-1005 exception
 # recorded for the four Dashboard fragments does not cover these rows; whether to extend it is
 # the owner's decision on #5880.
 #
 # Access pages merged onto the Estate changes: the count is the value the checker reports on the
 # merged tree, set from its output.
-BASELINE_UNTWINNED = 213
+BASELINE_UNTWINNED = 212
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

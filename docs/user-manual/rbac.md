@@ -287,8 +287,8 @@ Recommended order for a fresh install:
 
 ## The authorization topology floor (#2376)
 
-Ten reads are treated as **authorization topology** rather than ordinary
-operational data. Wherever the legacy RBAC-off fallback is the branch in
+Eleven reads are treated as **authorization topology or audit evidence**
+rather than ordinary operational data. Wherever the legacy RBAC-off fallback is the branch in
 effect, they require the `admin` session role — the generic “any Read is
 allowed” rule does not reach them. (With RBAC **enabled** they are ordinary
 permission checks, so a seeded `Reviewer` holding `AccessReview:Read` is
@@ -306,14 +306,18 @@ admitted; the floor never overrides a live RBAC grant.)
 | `ServerConfig:Read` (#4028) | Server runtime-configuration read-twins — `GET /api/v1/settings/server-config`, `/settings/gateway`, `/settings/mcp` and `/settings/data-retention` |
 | `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
 | `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2) |
+| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
-that includes these ten. On a default install (RBAC ships disabled) that
+that includes these eleven. On a default install (RBAC ships disabled) that
 handed a plain `user` session read access to the authorization topology
 itself: who holds what role, and the complete access-review grant
 population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
-access. The floor closes that gap by denying these ten reads to a
+access — and, until #5771, the full audit trail (who did what, to which
+target, with what outcome, plus the free-text detail and, on the legacy
+`GET /api/audit` route, each actor's role and source IP). The floor closes
+that gap by denying these eleven reads to a
 non-admin whenever the legacy fallback is the branch in effect — never by
 changing behavior under a live RBAC grant.
 
@@ -324,7 +328,7 @@ particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
 + `AccessReview:Attest`) continues to reach the access-review export exactly
 as before — the floor never overrides that grant.
 
-**If you are relying on a non-admin reaching one of these ten reads on an
+**If you are relying on a non-admin reaching one of these eleven reads on an
 RBAC-disabled install,** that access is now denied. The supported remedy is
 to enable RBAC and grant the appropriate role rather than to expect a
 non-admin session to reach authorization topology while RBAC is off:
@@ -347,6 +351,11 @@ non-admin session to reach authorization topology while RBAC is off:
   (the authority ceiling); use an Administrator-minted non-service token.
 - For the OIDC SSO config status read: enable RBAC and grant
   `OidcConfig:Read` — `Administrator`-only for the same reason.
+- For the audit trail (#5771): enable RBAC and assign a role that holds
+  `AuditLog:Read` — the built-in `Operator`, `PlatformEngineer`,
+  `ITServiceOwner` and `Viewer` roles already hold it, or grant it to a
+  custom role. The `Reviewer` role does not hold it. Under RBAC, `AuditLog:Read`
+  is not confined to a management group: a holder reads every row.
 
 The floor is deliberately **not configurable** — there is no setting that
 widens it back open. It is keyed on `(securable, operation)`, not on route
@@ -475,7 +484,7 @@ Seven roles are created automatically and cannot be deleted:
 | `UserManagement` | User accounts and role assignments |
 | `Security` | Security settings (TLS, enrollment, quarantine, CA and KEK reads, and privilege-posture reads such as the local_security_policy `sudoers` content) |
 | `ApiToken` | API token lifecycle |
-| `AuditLog` | Audit event records |
+| `AuditLog` | Audit event records. `AuditLog:Read` is in the topology floor (#5771): admin-only while RBAC is off. |
 | `Policy` | Guaranteed State policy fragments and composed policies |
 | `DeviceToken` | Agent device-token issuance and revocation |
 | `SoftwareDeployment` | Software deployment campaigns |

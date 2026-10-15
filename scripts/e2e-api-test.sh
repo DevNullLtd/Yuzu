@@ -343,6 +343,8 @@ if [[ "$SKIP_AUTH" == "false" ]]; then
     http_get "$SERVER_URL/api/v1/me"
     assert_eq "GET /api/v1/me with cookie returns 200" "200" "$HTTP_STATUS"
     assert_contains "GET /api/v1/me contains 'admin'" "admin" "$HTTP_BODY"
+    assert_contains "GET /api/v1/me reports effective_role" "effective_role" "$HTTP_BODY"
+    assert_contains "GET /api/v1/me reports can_access_settings" "can_access_settings" "$HTTP_BODY"
 
     # POST /logout
     http_post "$SERVER_URL/logout" "" "application/json"
@@ -488,6 +490,10 @@ log "═════════════════════════
 # GET /api/v1/rbac/roles -> 200
 http_get "$SERVER_URL/api/v1/rbac/roles"
 assert_eq "GET /api/v1/rbac/roles returns 200" "200" "$HTTP_STATUS"
+
+# GET /api/v1/rbac/roles/{unknown}/permissions -> 404 (not an empty 200)
+http_get "$SERVER_URL/api/v1/rbac/roles/NoSuchRoleE2E/permissions"
+assert_eq "GET /api/v1/rbac/roles/{unknown}/permissions returns 404" "404" "$HTTP_STATUS"
 
 # POST /api/v1/rbac/check -> 200
 http_post "$SERVER_URL/api/v1/rbac/check" \

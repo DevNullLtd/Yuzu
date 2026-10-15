@@ -299,7 +299,8 @@ An empty `violations` array is the positive evidence, not the absence of a
 check. If the RBAC reference data needed to compute the wildcard bound can't
 be resolved, the route returns `503` ("cannot verify") rather than a false
 `ok:true` — treat that response as "run again," never as "clean." This
-auditor is gated on `AuditLog:Read`, not `Security`, deliberately: a
+auditor is gated on `AuditLog:Read`, not `Security`, deliberately (with RBAC
+enabled; admin-only while RBAC is off, #5771): a
 read-only auditor role can run it without holding engine-principal write
 access.
 
