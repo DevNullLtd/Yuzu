@@ -224,6 +224,12 @@ inline std::vector<std::string> pam_logical_lines(std::string_view text) {
 
 /// Skips comments, blanks and `@include`. A line that is not `type control module`
 /// is dropped (PAM itself would reject it) -- pam.d holds no other policy.
+///
+/// Normalised the way Linux-PAM reads a line, so a configured module is never missed: the
+/// type is matched case-insensitively (`AUTH`, `Auth`) and reported lower-case, and a module
+/// given with a directory path (`/usr/lib64/security/pam_faillock.so`) is reported by its file
+/// name only; the directory is not kept. The module's own name stays case-sensitive (it is a
+/// file name).
 inline std::vector<PamLine> parse_pam_lines(std::string_view text) {
     std::vector<PamLine> out;
     for (const auto& line : pam_logical_lines(text)) {
@@ -240,6 +246,9 @@ inline std::vector<PamLine> parse_pam_lines(std::string_view text) {
         auto t = word();
         if (!t.empty() && t.front() == '-') t.remove_prefix(1);
         p.type = std::string{t};
+        std::transform(p.type.begin(), p.type.end(), p.type.begin(), [](unsigned char c) {
+            return static_cast<char>(c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c);
+        });
         s = trim_ws(s);
         if (!s.empty() && s.front() == '[') {
             const auto close = s.find(']');
@@ -249,7 +258,10 @@ inline std::vector<PamLine> parse_pam_lines(std::string_view text) {
         } else {
             p.control = std::string{word()};
         }
-        p.module = std::string{word()};
+        auto mod = word();
+        if (const auto slash = mod.rfind('/'); slash != std::string_view::npos)
+            mod.remove_prefix(slash + 1);
+        p.module = std::string{mod};
         p.args = std::string{trim_ws(s)};
         if (p.type.empty() || p.control.empty() || p.module.empty()) continue;
         out.push_back(std::move(p));
@@ -892,6 +904,10 @@ inline constexpr int kReadSymlink = -4;
 /// check (sudo allows a group-writable file owned by the sudoers group), and the same direction:
 /// content sudo would refuse is never reported as policy.
 inline constexpr int kReadInsecure = -5;
+/// open() returned ENOENT or ENOTDIR, but the path itself is a symlink: its target is missing or
+/// unreachable (an authselect link mid-apply, a removed target, a target path through a regular file). That is not "this file is not here" -- a link was put there
+/// on purpose -- so it is a failed read, never the silent absent a missing alternative gets.
+inline constexpr int kReadDanglingSymlink = -6;
 
 /// The owner a sudoers source must have in production: root. Named so the default cannot drift
 /// (the reader takes the owner as a parameter only so tests can run as any user).
@@ -923,6 +939,7 @@ inline ReadOutcome classify_read_errno(int err) {
     case kReadEmbeddedNul: return {ReadClass::Failed, "embedded_nul"};
     case kReadSymlink: return {ReadClass::Failed, "symlink_refused"};
     case kReadInsecure: return {ReadClass::Failed, "insecure_owner_or_mode"};
+    case kReadDanglingSymlink: return {ReadClass::Failed, "dangling_symlink"};
     default: return {ReadClass::Failed, "errno_" + std::to_string(err)};
     }
 }
@@ -1026,6 +1043,11 @@ namespace detail {
 
 struct Tally {
     std::size_t readable = 0, denied = 0, failed = 0;
+    /// Rows that carry a setting (a key, a pam.<type>.<module> line) as opposed to a
+    /// `source_state` row; counted when produced, so a row the row cap later drops still counts.
+    std::size_t key_rows = 0;
+    /// Every path read SUCCESSFULLY, in read order (the `source` of `lockout_keys|not_found`).
+    std::vector<std::string> read_paths;
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> rows;
     bool capped = false;
@@ -1099,21 +1121,27 @@ std::optional<std::string> read_source(const FileReader& rd, Tally& t, const std
     auto r = checked_read(rd, path);
     if (r.err == 0) {
         ++t.readable;
+        t.read_paths.push_back(path);
         return std::move(r.data);
     }
     state_row(t.state_of(classify_read_errno(r.err), path));
     return std::nullopt;
 }
 
+/// `counts_as_key` false: the rows are still reported, but they are not evidence of a lockout
+/// setting (the login.defs login-prompt/faillog keys), so they do not stop `not_found`.
 inline void kv_source(const FileReader& rd, Tally& t, std::string_view action, const std::string& path,
-                      std::string_view seps, std::span<const std::string_view> allow) {
+                      std::string_view seps, std::span<const std::string_view> allow,
+                      bool counts_as_key = true) {
     auto text = read_source(rd, t, path, [&](const auto& st) {
         t.row(format_kv_row(action, "source_state", kv_state_text(st), path));
     });
     if (!text) return;
     for (const auto& [k, v] : parse_kv_lines(*text, seps))
-        if (allow.empty() || std::find(allow.begin(), allow.end(), k) != allow.end())
+        if (allow.empty() || std::find(allow.begin(), allow.end(), k) != allow.end()) {
+            if (counts_as_key) ++t.key_rows;
             t.row(format_kv_row(action, k, v, path));
+        }
 }
 
 /// `files` are distro ALTERNATIVES (Debian common-*, RHEL system-auth/password-auth), so one
@@ -1130,11 +1158,14 @@ inline void pam_sources(const FileReader& rd, Tally& t, std::string_view action,
         if (r.err == 0) {
             ++exist;
             ++t.readable;
+            t.read_paths.push_back(path);
             for (const auto& p : parse_pam_lines(r.data))
                 if (std::find(types.begin(), types.end(), p.type) != types.end() &&
-                    std::find(modules.begin(), modules.end(), p.module) != modules.end())
+                    std::find(modules.begin(), modules.end(), p.module) != modules.end()) {
+                    ++t.key_rows;
                     t.row(format_kv_row(action, "pam." + p.type + "." + p.module,
                                         p.control + (p.args.empty() ? "" : " " + p.args), path));
+                }
             continue;
         }
         const auto st = t.state_of(classify_read_errno(r.err), path);
@@ -1198,12 +1229,32 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
         break;
     }
     case LocalPolicyAction::Lockout: {
-        detail::kv_source(rd, t, prefix, "/etc/login.defs", " \t", kLoginDefsLockoutKeys);
+        // LOGIN_RETRIES, LOGIN_TIMEOUT, FAILLOG_ENAB and FAIL_DELAY are login(1) prompt and faillog
+        // settings, not account-lockout counters: reported, but not evidence that lockout is set.
+        detail::kv_source(rd, t, prefix, "/etc/login.defs", " \t", kLoginDefsLockoutKeys, false);
         detail::kv_source(rd, t, prefix, "/etc/security/faillock.conf", " \t=", {});
         constexpr std::string_view files[] = {"common-auth", "common-account", "system-auth",
                                               "password-auth"};
         constexpr std::string_view types[] = {"auth", "account"};
         detail::pam_sources(rd, t, prefix, files, types, kPamLockoutModules);
+        // The DEFAULT "no lockout key found" answer (#5620): at least one source was read and
+        // NO key row (a faillock.conf key, a pam.<type>.<module> line) was produced; the login.defs rows
+        // are reported but do not count (login-prompt and faillog settings, not lockout).
+        // An absent or unreadable sibling keeps its own `source_state` row and does not suppress
+        // this one -- a host with no faillock.conf and no PAM lockout line gets BOTH facts. Any
+        // key row at all (say faillock.conf absent but system-auth configures pam_faillock) means
+        // there is no "not found" to say. When a sibling was UNREADABLE (failed, not absent) the
+        // row is still written, naming only the files actually read; the CONSTRAINED status and
+        // that sibling's `unreadable` row carry the caveat. Zero readable sources: no row.
+        // `source` lists exactly the files read, in read order, so it never claims a file that was
+        // absent or refused. The wording is about what was READ: faillock.conf drop-ins, PAM
+        // include/substack targets, PAM services other than the four named files, IdM/SSSD and
+        // fail2ban are not read, so it is never "no lockout enforced".
+        if (t.key_rows == 0 && t.readable > 0) {
+            std::string joined;
+            for (const auto& f : t.read_paths) joined += (joined.empty() ? "" : ",") + f;
+            t.row(format_kv_row(prefix, "lockout_keys", "not_found", joined));
+        }
         break;
     }
     case LocalPolicyAction::Audit: {

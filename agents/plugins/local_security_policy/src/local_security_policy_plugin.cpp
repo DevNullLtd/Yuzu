@@ -69,7 +69,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "/etc/login.defs + /etc/security/faillock.conf + /etc/pam.d/{common-auth,common-account,"
          "system-auth,password-auth} (bounded file reads)",
          "reports configuration, not live lockout counters; faillock.conf drop-ins and PAM "
-         "include/substack targets are not read"
+         "include/substack targets are not read; `lockout_keys|not_found` (read at least one "
+         "source, found no key) must not be read as 'no lockout enforced' -- sshd and other PAM "
+         "services, IdM/SSSD and fail2ban are not read"
          "; in a container (deploy/docker/Dockerfile.agent) these are the image's files, not "
          "the host's"},
         /* .macos_leg   = */
