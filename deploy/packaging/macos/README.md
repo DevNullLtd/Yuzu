@@ -76,12 +76,23 @@ recovery and removes it only after the new daemon is healthy; it never changes
 the containing data directory's ownership, mode, or unrelated contents. A
 legacy child is removed only if its exact application identifier, team,
 developer-signing authority, embedded-profile SHA-256, and strict code-signature
-verification all match the development bundle. Any other legacy child is retained
-under the root-owned recovery directory for operator inspection, and the service
-is deliberately left stopped rather than bootstrapping code from the mutable data
-directory. This migration is narrowly limited to the original profile hash,
-expected Yuzu team, signed application identifier, and signer; a renewed or
-otherwise different profile is intentionally retained.
+verification all match the development bundle. Any other legacy child is never
+run, restored, or deleted: it is moved to a root-only quarantine,
+`/var/db/yuzu-agent/quarantine/legacy-YuzuAgent.*/`, outside both the data
+directory and the recovery state, and reported. An install whose new daemon is
+already healthy is kept; recovery never starts a service whose program lives in
+the data directory, and it never blocks a later install. This migration is
+narrowly limited to the original profile hash, expected Yuzu team, signed
+application identifier, and signer; a renewed or otherwise different profile is
+intentionally quarantined.
+
+These values are pinned in `preinstall`, `postinstall`, and `uninstall.sh` as
+`LEGACY_TEAM_ID`, `LEGACY_APP_ID`, `LEGACY_SIGNING_AUTHORITY`, and
+`LEGACY_PROFILE_SHA256`, and identify one developer's pre-package development
+build only. They grant nothing to any other signer: retirement requires all of
+them to match. Remove the legacy migration (and these pins) once no managed Mac
+still has a `YuzuAgent.app` under the data directory; never extend them to a new
+identity.
 Package transitions preserve them and retain package-owned code/configuration for
 recovery. The package first writes its code and LaunchDaemon plist to package-owned
 incoming paths. To prevent Installer from relocating an upgradeable `.app` before
