@@ -18548,6 +18548,113 @@ private:
                                          return std::nullopt;
                                      return quarantine_store_->list_quarantined_in(ids, limit);
                                  },
+                             // POST /api/v1/hardware/sync (Software "Sync now" for a scope).
+                             // Type-level Execution:Execute; the targets are then resolved
+                             // against the caller's OWN Execution:Execute visible set.
+                             .sync_perm_fn = perm_fn,
+                             .sync_resolve_fn =
+                                 [this](const auth::Session& sess,
+                                        const software_sync::Selector& sel) -> software_sync::Resolved {
+                                     software_sync::Resolved out; // status defaults to Aborted
+                                     const auto visible = derive_exec_visible(sess);
+                                     out.caller_unfiltered = !visible.has_value();
+                                     std::vector<std::string> ids;
+                                     switch (sel.arm) {
+                                     case DispatchArm::Ids:
+                                         ids.push_back(sel.expr);
+                                         break;
+                                     case DispatchArm::Broadcast:
+                                         ids = registry_.all_ids();
+                                         break;
+                                     case DispatchArm::Group: {
+                                         // A missing or degraded group store is "could not
+                                         // resolve", never an empty group.
+                                         const auto members =
+                                             mgmt_group_store_
+                                                 ? mgmt_group_store_->get_members_checked(sel.expr.substr(6))
+                                                 : std::nullopt;
+                                         if (!members) {
+                                             out.detail = "db_degraded";
+                                             return out;
+                                         }
+                                         for (const auto& m : *members)
+                                             ids.push_back(m.agent_id);
+                                         break;
+                                     }
+                                     case DispatchArm::Scope: {
+                                         // The same ladder a real dispatch uses (alias -> owner
+                                         // check -> parse -> registry evaluation, fail closed).
+                                         const std::string role = auth::role_to_string(sess.role);
+                                         const std::string ref_id =
+                                             "__sync__-scope-" + auth::AuthManager::bytes_to_hex(
+                                                                     auth::AuthManager::random_bytes(8));
+                                         yuzu::server::ScopeLadderAudit audit;
+                                         audit.resolution_failed = [&](const std::string& ref) {
+                                             audit_scope_resolution_failed(sess.username, role, ref_id, ref);
+                                         };
+                                         audit.evaluation_aborted = [&](const std::string& reason) {
+                                             audit_scope_evaluation_aborted(sess.username, role, ref_id,
+                                                                            reason);
+                                         };
+                                         auto ladder = yuzu::server::resolve_scope_targets(
+                                             sel.expr, sess.username, result_set_store_.get(),
+                                             [&](const yuzu::scope::Expression& parsed) {
+                                                 return registry_.evaluate_scope(
+                                                     parsed, tag_store_.get(),
+                                                     custom_properties_store_.get(),
+                                                     result_set_store_.get(), sess.username);
+                                             },
+                                             audit);
+                                         if (ladder.parse_error) {
+                                             out.status = software_sync::Resolved::Status::InvalidScope;
+                                             out.detail = *ladder.parse_error;
+                                             return out;
+                                         }
+                                         if (!ladder.matched) {
+                                             out.detail = ladder.abort_reason
+                                                              ? to_string(*ladder.abort_reason)
+                                                              : "unknown";
+                                             return out;
+                                         }
+                                         ids = std::move(*ladder.matched);
+                                         break;
+                                     }
+                                     case DispatchArm::None:
+                                         return out;
+                                     }
+                                     out.ids = yuzu::server::authz::filter_to_scope(ids, visible);
+                                     out.status = software_sync::Resolved::Status::Ok;
+                                     return out;
+                                 },
+                             // One system-reserved push per target under ONE command id and ONE
+                             // gateway flush (the TAR fleet_snapshot shape) - the agent ignores
+                             // stagger for `__sync__.now`, so the herd is bounded by the route's
+                             // 500-target cap, not here.
+                             .sync_dispatch_many_fn =
+                                 [this](const std::vector<std::string>& ids, const std::string& source)
+                                     -> software_sync::DispatchResult {
+                                     const auto now_s =
+                                         std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count();
+                                     software_sync::DispatchResult out;
+                                     out.command_id =
+                                         "__sync__-fleet-" + std::to_string(now_s) + "-" +
+                                         auth::AuthManager::bytes_to_hex(
+                                             auth::AuthManager::random_bytes(8));
+                                     auto classified = build_classified_command(
+                                         yuzu::server::DispatchCaller{.system = true}, "__sync__",
+                                         "now", out.command_id, /*parameters=*/{{"source", source}});
+                                     if (!classified)
+                                         return out;
+                                     for (const auto& id : ids)
+                                         if (send_system_reserved(
+                                                 id, *classified,
+                                                 yuzu::server::SystemReservedPush::inventory_sync_now))
+                                             ++out.sent;
+                                     forward_gateway_pending(); // gateway agents are only QUEUED
+                                     return out;
+                                 },
                          });
 
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs

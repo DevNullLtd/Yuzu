@@ -481,9 +481,13 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // /api/v1/hardware — the Hardware CI list/record/sync REST v1 twin
     // (hardware_routes.cpp). ANY method: GET /api/v1/hardware and
     // GET /api/v1/hardware/{id} are bodyless list/record reads; only
-    // POST /api/v1/hardware/{id}/sync carries a body, and it is a single
-    // JSON object with one short "source" token (one of 5 fixed literals,
-    // e.g. "installed_software") — a few dozen bytes at most. 4 KiB leaves
+    // POST /api/v1/hardware/{id}/sync and the fleet fan-out POST
+    // /api/v1/hardware/sync carry a body. The first is a single JSON object
+    // with one short "source" token (one of 5 fixed literals, e.g.
+    // "installed_software") — a few dozen bytes at most; the second adds a
+    // "scope" token or a "scope_expression" (the route refuses one over
+    // 1024 characters, so 4 KiB is ample and no separate entry is needed —
+    // it inherits this one by segment-boundary prefix). 4 KiB leaves
     // generous headroom over that real shape while keeping this three orders
     // of magnitude under the 4 MiB catch-all (governance Gate 2: this route
     // had no reviewed entry, per the routed-concern row's requirement that

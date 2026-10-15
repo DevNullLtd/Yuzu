@@ -533,6 +533,155 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(out.dump(), "application/json");
     });
 
+    // -- REST v1: POST /api/v1/hardware/sync — "Sync now" for a scope (the Software page) --
+    // One click, many devices. `scope` is __all__ / group:<id> / an agent id; `scope_expression`
+    // is a scope DSL expression (software_sync_decision.hpp owns the request grammar and every
+    // bound below). Gate = Execution:Execute; the targets are the caller's OWN Execution:Execute
+    // visible set (a hidden device is dropped, never reported), and only a caller whose set is
+    // unfiltered may name the whole fleet. Audit BEFORE dispatch, fail closed. 202 means
+    // REQUESTED — `reached` is sessions that accepted the frame, not devices that have synced.
+    static_assert(software_sync::kMaxIdLen == auth::kMaxAgentIdLength);
+    sink.Post("/api/v1/hardware/sync", [this](const httplib::Request& req, httplib::Response& res) {
+        namespace ss = software_sync;
+        constexpr const char* kAction = "inventory.sync.request";
+        detail::ensure_correlation_id(res);
+        if (!deps_.sync_perm_fn || !deps_.auth_fn || !deps_.sync_resolve_fn ||
+            !deps_.sync_dispatch_many_fn || !deps_.agent_version_fn) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "sync-on-demand is unavailable on this server",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+        if (!deps_.sync_perm_fn(req, res, "Execution", "Execute")) return;
+        const auto session = deps_.auth_fn(req, res);
+        if (!session) return;
+
+        const auto parsed = ss::parse_request(nlohmann::json::parse(req.body, nullptr, false));
+        if (!parsed) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "denied", "Scope", "",
+                                            "bad request: " + ss::audit_token(parsed.error()));
+            res.status = 400;
+            res.set_content(detail::a4_error(res, parsed.error()), "application/json");
+            return;
+        }
+        const ss::Selector& sel = parsed->sel;
+        const char* const target_type = sel.arm == DispatchArm::Ids ? "Agent" : "Scope";
+        const std::string target_id = ss::target_label(sel);
+        const auto refuse = [&](int status, const std::string& message, const std::string& why,
+                                const detail::A4ErrorOpts& opts = {}) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "denied", target_type,
+                                            target_id, why + " scope=" + ss::audit_token(sel.expr));
+            res.status = status;
+            res.set_content(detail::a4_error(res, message, opts), "application/json");
+        };
+
+        // One multi-device run at a time, and one per operator per minute. The flag is held to
+        // the end of the handler, so the cooldown check below and the stamp after dispatch
+        // cannot interleave with another run.
+        struct RunGuard {
+            std::atomic<bool>* flag{nullptr};
+            ~RunGuard() {
+                if (flag) flag->store(false);
+            }
+        } run_guard;
+        const bool guarded = ss::needs_run_guard(sel.arm);
+        if (guarded) {
+            bool idle = false;
+            if (!sync_run_active_.compare_exchange_strong(idle, true)) {
+                refuse(409, "another sync run is already in progress; try again in a moment",
+                       "run_in_flight", {.retry_after_ms = 5000});
+                return;
+            }
+            run_guard.flag = &sync_run_active_;
+            std::int64_t wait = 0;
+            {
+                std::lock_guard<std::mutex> lk(sync_run_mu_);
+                wait = ss::cooldown_remaining(ss::last_run_of(sync_last_run_, session->username),
+                                              now_secs());
+            }
+            if (wait > 0) {
+                res.set_header("Retry-After", std::to_string(wait));
+                refuse(429, "a sync run was requested a moment ago; wait " + std::to_string(wait) + "s",
+                       "rate_limited cooldown=" + std::to_string(wait) + "s",
+                       {.retry_after_ms = wait * 1000});
+                return;
+            }
+        }
+
+        const auto resolved = deps_.sync_resolve_fn(*session, sel);
+        if (resolved.status == ss::Resolved::Status::InvalidScope) {
+            refuse(400, "invalid scope: " + resolved.detail, "invalid_scope");
+            return;
+        }
+        if (resolved.status != ss::Resolved::Status::Ok) {
+            // A degraded store or a failed owner check: never "no matches". Nothing was sent.
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "failure", target_type,
+                                            target_id,
+                                            "scope_unresolved reason=" + ss::audit_token(resolved.detail));
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "the scope could not be evaluated; no device was contacted",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+
+        // ponytail: one registry session lookup per candidate, so O(fleet) for __all__ before
+        // the 500 cap applies; ADR-3007's paced run replaces both when the fleet outgrows it.
+        std::vector<ss::Candidate> candidates;
+        candidates.reserve(resolved.ids.size());
+        for (const auto& id : resolved.ids)
+            candidates.push_back({id, deps_.agent_version_fn(id)});
+        const auto plan = ss::partition(
+            candidates, [](std::string_view v) { return agent_supports_sync_now(v); });
+
+        switch (ss::decide(sel.arm, resolved.caller_unfiltered, plan.counts)) {
+        case ss::Verdict::FleetWideRequired:
+            refuse(403, "syncing the whole fleet needs a fleet-wide Execution:Execute grant",
+                   "fleet_wide_required");
+            return;
+        case ss::Verdict::TooMany:
+            refuse(413,
+                   "this would reach " + std::to_string(plan.counts.reached) + " devices; the limit is " +
+                       std::to_string(ss::kMaxTargets) + " per request — narrow the scope",
+                   "over_cap reached=" + std::to_string(plan.counts.reached) +
+                       " cap=" + std::to_string(ss::kMaxTargets));
+            return;
+        case ss::Verdict::Proceed: break;
+        }
+
+        // Audit BEFORE dispatch and fail closed — same contract as the per-device route.
+        if (!detail::emit_behavioral_audit(deps_.audit_fn, req, res, kAction, ss::audit_result(plan.counts),
+                                           target_type, target_id, ss::audit_detail(*parsed, plan.counts))) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+
+        ss::DispatchResult sent;
+        if (!plan.targets.empty())
+            sent = deps_.sync_dispatch_many_fn(plan.targets, parsed->source);
+        if (!plan.targets.empty() && sent.sent == 0) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "no selected device is reachable right now",
+                                             {.retry_after_ms = 30000}),
+                            "application/json");
+            return;
+        }
+        if (guarded && sent.sent > 0) {
+            std::lock_guard<std::mutex> lk(sync_run_mu_);
+            ss::stamp(sync_last_run_, session->username, now_secs());
+        }
+        nlohmann::json out = {
+            {"data", ss::summary_json(ss::finalize(plan.counts, sent.sent), sent.command_id, now_secs())},
+            {"meta", {{"api_version", "v1"}}},
+        };
+        res.status = 202;
+        res.set_content(out.dump(), "application/json");
+    });
+
     // -- REST v1: GET /api/v1/hardware --
     sink.Get("/api/v1/hardware", [this](const httplib::Request& req, httplib::Response& res) {
         detail::ensure_correlation_id(res);

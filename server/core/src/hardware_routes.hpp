@@ -27,8 +27,12 @@
 #include "hardware_list_model.hpp"
 #include "inventory_routes.hpp"      // InventoryDeviceRow / InventoryDevicesResult reuse
 #include "quarantine_visible.hpp"    // QuarantineListFn (list pill)
+#include "software_sync_decision.hpp" // software_sync::{Selector, Resolved, DispatchResult}
 
+#include <atomic>
+#include <cstdint>
 #include <expected>
+#include <mutex>
 #include <unordered_map>
 
 #include <httplib.h>
@@ -275,6 +279,19 @@ public:
     /// `device_routes.cpp`'s list already follows.
     using DexScoreFn = std::function<int(const std::string& agent_id)>;
 
+    /// Type-level (not per-device) permission gate: same contract as `ScopedPermFn` minus
+    /// the agent id — false means the response is already written.
+    using SyncPermFn = std::function<bool(const httplib::Request&, httplib::Response&,
+                                          const std::string& securable_type,
+                                          const std::string& operation)>;
+    /// Selector -> caller-visible target ids (+ whether the caller is unfiltered).
+    using SyncResolveFn = std::function<software_sync::Resolved(const auth::Session&,
+                                                                const software_sync::Selector&)>;
+    /// Send `__sync__.now {source}` to every id as one system-reserved push (one command id,
+    /// one gateway flush); `sent` counts the sessions that accepted the frame.
+    using SyncDispatchManyFn = std::function<software_sync::DispatchResult(
+        const std::vector<std::string>& ids, const std::string& source)>;
+
     struct Deps {
         AuthFn auth_fn;
         ScopedPermFn scoped_perm_fn;
@@ -295,6 +312,15 @@ public:
         /// The authoritative active-quarantine read, for the list's Quarantined pill. Empty
         /// = no pill and no banner (the panel and lens have their own routes).
         QuarantineListFn quarantine_list_fn;
+        /// POST /api/v1/hardware/sync — the Software page's fleet/group/scope "Sync now".
+        /// `sync_perm_fn` is the type-level Execution:Execute gate (it writes the 401/403).
+        /// `sync_resolve_fn` turns a selector into the caller's visible target ids (already
+        /// intersected with their Execution:Execute visible set) and reports whether that
+        /// set is unfiltered; `sync_dispatch_many_fn` sends `__sync__.now` to each id.
+        /// Any of the three empty == the route answers 503 (fail closed, nothing sent).
+        SyncPermFn sync_perm_fn;
+        SyncResolveFn sync_resolve_fn;
+        SyncDispatchManyFn sync_dispatch_many_fn;
     };
 
     void register_routes(httplib::Server& svr, Deps deps);
@@ -307,6 +333,12 @@ private:
                                     const HardwareCiDetail& detail) const;
 
     Deps deps_;
+
+    // POST /api/v1/hardware/sync run state. `sync_run_mu_` guards the per-operator cooldown
+    // stamps; `sync_run_active_` is the single in-flight multi-device run.
+    std::mutex sync_run_mu_;
+    std::unordered_map<std::string, std::int64_t> sync_last_run_;
+    std::atomic<bool> sync_run_active_{false};
 };
 
 } // namespace yuzu::server
