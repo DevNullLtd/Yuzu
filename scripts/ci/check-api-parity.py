@@ -265,6 +265,10 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # offload-target and directory sync fragments are `twinned` to existing v1 routes and MCP tools and add nothing.
 # Merged with the dev changes above (208, including the Estate read twins) the two webhook rows
 # bring the count to 210 (208 + 2), the value the checker reports on the merged tree.
+# OWNER DECISION PENDING: this raise is NOT covered by the ADR-1005 exception recorded for the
+# four Dashboard fragments of PR #5859. The twins that would remove it (and the legacy-route
+# writes the page drives) are tracked in #5885; until the owner extends the exception or the twins
+# land, the +2 stands as a flagged, reviewed raise.
 BASELINE_UNTWINNED = 210
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
