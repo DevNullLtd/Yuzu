@@ -79,6 +79,7 @@
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
 #include "deployment_store.hpp"
+#include "developer_routes.hpp" // System > Developer and API page + fragments (read-only)
 #include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovered_devices_reader.hpp" // make_discovered_devices_reader (core wiring)
 #include "discovery_store.hpp"
@@ -155,6 +156,9 @@
 #include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
+#include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
+#include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
+#include "access_tokens_render.hpp"
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
@@ -167,6 +171,7 @@
 #include "tag_routes.hpp" // #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
 #include "data_inventory_routes.hpp" // #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
 #include "config_routes.hpp" // #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
+#include "settings_general_routes.hpp" // System "General and appearance" page + two UI fragments
 #include "diagnostics_routes.hpp" // #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
 #include "legacy_events_routes.hpp" // #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
 #include "instruction_fragment_routes.hpp" // #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
@@ -2349,7 +2354,7 @@ public:
         // sets a cohort export tag key in Settings → DEX alerts; absent otherwise).
         metrics_.describe("yuzu_fleet_perf_cohort_cpu_pct",
                           "Per-cohort device CPU utilization % (avg/p50/p90/max by {stat}; "
-                          "cohorts of the configured export tag key, >=10 reporting devices)",
+                          "cohorts of the configured export tag key, >=1 reporting device)",
                           "gauge");
         metrics_.describe("yuzu_fleet_perf_cohort_commit_pct",
                           "Per-cohort memory commit-charge % (avg/p50/p90/max by {stat})",
@@ -3836,7 +3841,9 @@ public:
         metrics_.describe("yuzu_server_guardian_read_degrade_total",
                           "Guardian rules/status/DEX reads that returned degraded (could not "
                           "read) rather than a genuine result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(store_not_open/pool_acquire_timeout/query_error, plus "
+                          "concurrency_budget for a guardian_state read refused over its "
+                          "in-flight budget) and source "
                           "(guardian_state = DEX/observation reads, fail-soft, empty result "
                           "served; guardian_rules = authoritative rule/status reads, fail-hard, "
                           "push/reconcile aborts rather than fans out empty). A sampled warn "
@@ -3846,6 +3853,9 @@ public:
             for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
                 metrics_.counter("yuzu_server_guardian_read_degrade_total",
                                  {{"reason", reason}, {"source", source}});
+        // The Apps stability read's in-flight budget refusal (guardian_state only).
+        metrics_.counter("yuzu_server_guardian_read_degrade_total",
+                         {{"reason", "concurrency_budget"}, {"source", "guardian_state"}});
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
                           "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) - the "
@@ -13956,7 +13966,17 @@ private:
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
                 try {
-                    cfg_.session_timeout = std::chrono::seconds(std::stoi(e.value));
+                    // A value stored before the 30 s floor existed would make every directly
+                    // connected agent flap; raise it to the floor and say how to clear it.
+                    const int stored = std::stoi(e.value);
+                    const int applied = clamp_heartbeat_timeout(stored);
+                    if (applied != stored)
+                        spdlog::warn("Stored heartbeat_timeout {} is below the {} second minimum; "
+                                     "using {} seconds. PUT /api/config/heartbeat_timeout with a "
+                                     "value of {} or more to replace the stored one.",
+                                     stored, kMinHeartbeatTimeoutSeconds, applied,
+                                     kMinHeartbeatTimeoutSeconds);
+                    cfg_.session_timeout = std::chrono::seconds(applied);
                 } catch (...) {}
             } else if (e.key == "response_retention_days") {
                 try {
@@ -15426,6 +15446,97 @@ private:
                              .store = custom_properties_store_.get(),
                          });
 
+        // Access pages (Phase 2 UI): the read-only /access/users page, its two fragments and
+        // the page's static glue. Placed after audit_fn (which it binds for the Access PRs
+        // that follow). The read goes through AuthDB::list_users() (a std::expected: a store
+        // fault reaches the page as "could not be read", never as an empty list); the
+        // in-memory AuthManager::list_users() fallback is deliberately not used.
+        yuzu::server::access::register_access_routes(
+            inline_sink,
+            yuzu::server::access::Deps{
+                .auth_fn = auth_fn,
+                .admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
+                    return auth_routes_->probe_admin(req, res);
+                },
+                .perm_fn = perm_fn,
+                .audit_fn = audit_fn,
+                .list_users_fn =
+                    [this]() -> std::expected<std::vector<auth::UserEntry>, std::string> {
+                    if (!auth_db_)
+                        return std::unexpected(std::string("auth store not configured"));
+                    auto r = auth_db_->list_users();
+                    if (!r)
+                        return std::unexpected("AuthDB::list_users failed (error " +
+                                               std::to_string(static_cast<int>(r.error())) + ")");
+                    return std::move(*r);
+                },
+            });
+
+        // Tokens and principals page (Phase 2 UI), read-only half: /access/tokens, its three
+        // fragments and the page's static glue. Every read is a checked store read (a store
+        // fault reaches the page as "could not be read", never as an empty list). Stores are
+        // dereferenced inside the closures so a store that is absent (SQLite-only install)
+        // is a read failure, not a crash.
+        yuzu::server::access_tokens::register_access_tokens_routes(
+            inline_sink,
+            yuzu::server::access_tokens::Deps{
+                .auth_fn = auth_fn,
+                // Quiet probes (no denial row for a cookie session): the panels auto-load.
+                .perm_fn = draw_perm_fn,
+                .audit_fn = audit_fn,
+                .rbac_enforced_fn = [this]() { return rbac_enforcement_in_effect(rbac_store_.get()); },
+                .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
+                .list_tokens_fn = [this](const std::string& filter)
+                    -> std::expected<std::vector<ApiToken>, std::string> {
+                    if (!api_token_store_ || !api_token_store_->is_open())
+                        return std::unexpected(std::string("api token store not open"));
+                    return api_token_store_->list_tokens(filter);
+                },
+                .list_principals_fn = [this]()
+                    -> std::expected<std::vector<EnginePrincipalRow>, std::string> {
+                    if (!engine_principal_store_ || !engine_principal_store_->is_open())
+                        return std::unexpected(std::string("engine principal store not open"));
+                    return engine_principal_store_->list_all_checked(true);
+                },
+                .all_roles_fn = [this]() -> std::expected<std::vector<PrincipalRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_all_principal_roles_checked();
+                },
+                .get_principal_fn = [this](const std::string& id)
+                    -> std::expected<std::optional<EnginePrincipalRow>, std::string> {
+                    if (!engine_principal_store_ || !engine_principal_store_->is_open())
+                        return std::unexpected(std::string("engine principal store not open"));
+                    return engine_principal_store_->get(id);
+                },
+                .active_credentials_fn = [this](const std::string& id)
+                    -> std::expected<std::vector<ApiToken>, std::string> {
+                    if (!api_token_store_ || !api_token_store_->is_open())
+                        return std::unexpected(std::string("api token store not open"));
+                    return api_token_store_->list_active_for_principal_checked(id);
+                },
+                .principal_roles_fn = [this](const std::string& id)
+                    -> std::expected<std::vector<PrincipalRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->get_principal_roles_checked("engine", id);
+                },
+                .revoke_detail_fn = [this](const std::string& id)
+                    -> std::expected<yuzu::server::access_tokens::RevokeDetail, std::string> {
+                    if (!audit_store_)
+                        return std::unexpected(std::string("audit store not configured"));
+                    AuditQuery q;
+                    q.target_type = "EnginePrincipal";
+                    q.target_id = id;
+                    q.action = "engine_principal.revoke";
+                    q.limit = yuzu::server::access_tokens::kRevokeHistoryQueryLimit;  // newest first
+                    auto events = audit_store_->query(q);
+                    if (!events)
+                        return std::unexpected(std::string("audit store did not answer"));
+                    return yuzu::server::access_tokens::revoke_detail_from(std::move(*events));
+                },
+            });
+
         // Hardware record, "Tags and properties" lens: the read-only HTML twin of the
         // custom-properties routes above. Probes run against a throwaway Response so a
         // denied probe never writes the gate's 403 to the real one (htmx would drop it).
@@ -15788,6 +15899,58 @@ private:
                              .runtime_config_store = runtime_config_store_.get(),
                          });
 
+        // System "General and appearance" page and its two UI-only fragments
+        // (settings_general_routes.*). All three are admin-gated (`require_admin`, the same
+        // gate `/settings` uses); the runtime form writes through the PUT above and nothing
+        // here adds a REST route or an MCP tool. The analytics store is held weakly and
+        // locked per call, like every other consumer of it (it is reset on shutdown).
+        yuzu::server::settings_general::register_settings_general_routes(
+            inline_sink,
+            yuzu::server::settings_general::Deps{
+                .admin_fn =
+                    [this](const httplib::Request& req, httplib::Response& res) {
+                        return require_admin(req, res);
+                    },
+                .runtime_fn =
+                    [this]() {
+                        yuzu::server::settings_general::RuntimeView v;
+                        v.heartbeat_seconds =
+                            static_cast<std::int64_t>(cfg_.session_timeout.count());
+                        const auto level =
+                            spdlog::level::to_string_view(spdlog::default_logger()->level());
+                        v.log_level.assign(level.data(), level.size());
+                        v.store_available =
+                            runtime_config_store_ && runtime_config_store_->is_open();
+                        return v;
+                    },
+                .events_fn =
+                    [this, weak_store = std::weak_ptr<AnalyticsEventStore>(analytics_store_)]() {
+                        yuzu::server::settings_general::EventsView v;
+                        v.collection_enabled = cfg_.analytics_enabled;
+                        v.sink_configured =
+                            !cfg_.clickhouse_url.empty() || !cfg_.analytics_jsonl_path.empty();
+                        if (auto store = weak_store.lock()) {
+                            v.store_present = true;
+                            v.store_open = store->is_open();
+                            v.emitted_by_this_server = store->total_emitted();
+                            if (v.store_open) {
+                                v.pending = store->pending_count();
+                                if (auto events = store->query_recent(
+                                        yuzu::server::settings_general::kRecentEventsLimit)) {
+                                    std::vector<yuzu::server::settings_general::EventRow> rows;
+                                    rows.reserve(events->size());
+                                    for (const auto& e : *events)
+                                        rows.push_back({e.event_type, e.source,
+                                                        severity_to_string(e.severity),
+                                                        e.event_time});
+                                    v.recent = std::move(rows);
+                                }
+                            }
+                        }
+                        return v;
+                    },
+            });
+
         // #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API.
         // `forward_legacy_command_fn` wraps the ServerImpl-private
         // `forward_legacy_command` member — see diagnostics_routes.hpp's
@@ -16055,6 +16218,19 @@ private:
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).
         settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
+        // System > Data and retention: report the windows the three stores really
+        // enforce (each copied its window at construction and never re-reads cfg_).
+        // A store that is absent or failed to open enforces nothing: report unknown.
+        settings_routes_->set_retention_enforced_fn([this]() {
+            yuzu::server::settings_model::RetentionEnforced e;
+            if (response_store_ && response_store_->is_open())
+                e.response_retention_days = response_store_->retention_days();
+            if (audit_store_ && audit_store_->is_open())
+                e.audit_retention_days = audit_store_->retention_days();
+            if (guaranteed_state_store_ && guaranteed_state_store_->is_open())
+                e.guardian_event_retention_days = guaranteed_state_store_->retention_days();
+            return e;
+        });
 
         // #2542 PR-12: the legacy GET /events SSE stream, extracted onto
         // the HttpRouteSink seam (legacy_events_routes.cpp) — see that
@@ -19920,6 +20096,29 @@ private:
         discover_routes_ = std::make_unique<DiscoverRoutes>();
         discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
                                           instruction_store_.get(), &registry_);
+
+        // System > Developer and API (read-only): page + five fragments over the
+        // shared discovery builders above. The page and every fragment are admin-only like
+        // /settings; a fragment then also takes its twin's own Infrastructure:Read gate.
+        {
+            HttplibRouteSink developer_sink{*web_server_};
+            yuzu::server::developer::register_developer_routes(
+                developer_sink,
+                yuzu::server::developer::Deps{
+                    .admin_fn =
+                        [this](const httplib::Request& req, httplib::Response& res) {
+                            return require_admin(req, res);
+                        },
+                    .perm_fn = perm_fn,
+                    .probe_fn =
+                        [this](const httplib::Request& req, const std::string& type,
+                               const std::string& op) {
+                            return auth_routes_->has_permission(req, type, op);
+                        },
+                    .rbac_store = rbac_store_.get(),
+                    .registry = &registry_,
+                });
+        }
 
         // DEX app-perf-over-time read providers (slice 2). `dex_perf_api`
         // (built once ABOVE, before the DexRoutes registration) is the ONE

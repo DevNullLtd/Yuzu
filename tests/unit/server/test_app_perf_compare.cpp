@@ -173,8 +173,9 @@ TEST_CASE("compare: nearest-rank percentiles + median delta over the paired set"
     CHECK(c.pairs.back().agent_id == "m0");
 }
 
-TEST_CASE("compare: small_cohort flags sub-floor sets but never suppresses", "[verify][compare]") {
-    SECTION("paired below kDexCohortFloor → small_cohort, stats still present") {
+TEST_CASE("compare: small_cohort follows the one-device floor and never suppresses",
+          "[verify][compare]") {
+    SECTION("three paired machines: not small at the one-device floor, stats present") {
         std::vector<AppPerfCohortRow> rows;
         for (int i = 0; i < 3; ++i) {
             const std::string a = "m" + std::to_string(i);
@@ -184,7 +185,7 @@ TEST_CASE("compare: small_cohort flags sub-floor sets but never suppresses", "[v
         auto c = compare(reduce_version_window(rows, "A", 7), reduce_version_window(rows, "B", 7),
                          "A", "B", 7);
         CHECK(c.paired == 3);
-        CHECK(c.small_cohort);
+        CHECK_FALSE(c.small_cohort); // 3 >= kDexCohortFloor (1); was true at the old floor of 10
         CHECK_FALSE(c.insufficient);
         CHECK(c.cpu_after_mean == Approx(4.0)); // NOT suppressed — canaries are small
     }

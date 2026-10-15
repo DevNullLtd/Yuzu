@@ -30,6 +30,16 @@ constexpr NavItem kSoftwareSub[] = {
 constexpr NavItem kFleetSub[] = {
     {.key = "network", .label = "Network", .href = "/network"},
 };
+// System pages under Settings, in the design's artboard order. ORDER CONTRACT: the full
+// sequence is General, Security, Integrations, PKI, Plugins, Data, Licence, Developer
+// (test_nav_shells pins it as a sub-sequence). Own entries only, and only for pages that
+// exist: each System page adds its line here, at its artboard position, when it lands. The
+// parent keeps `/settings` (the monolith), so no child repeats the parent's href.
+constexpr NavItem kSettingsSub[] = {
+    {.key = "settings-general", .label = "General", .href = "/settings/general"},
+    {.key = "settings-data", .label = "Data and retention", .href = "/settings/data"},
+    {.key = "settings-developer", .label = "Developer and API", .href = "/settings/developer"},
+};
 
 constexpr NavItem kOperate[] = {
     {.key = "dashboard", .label = "Dashboard", .href = "/", .icon = "M4 17l6-6-6-6 M12 19h8"},
@@ -76,11 +86,22 @@ constexpr NavItem kEstate[] = {
              "18",
      .children = kFleetSub},
 };
+constexpr NavItem kAccess[] = {
+    {.key = "users",
+     .label = "Users",
+     .href = "/access/users",
+     .icon = "M12 12a4 4 0 100-8 4 4 0 000 8z M4 21c0-4 3.6-7 8-7s8 3 8 7"},
+    {.key = "tokens",
+     .label = "Tokens and principals",
+     .href = "/access/tokens",
+     .icon = "M15 9a4 4 0 10-7 2.6L3 17v4h4v-2h2v-2h2l2.4-2.4A4 4 0 0015 9z"},
+};
 constexpr NavItem kSystem[] = {
     {.key = "settings",
      .label = "Settings",
      .href = "/settings",
      .icon = "M4 6h10 M18 6h2 M4 12h4 M12 12h8 M4 18h12 M14 4v4 M10 10v4 M16 16v4",
+     .children = kSettingsSub,
      .admin_only = true},
 };
 
@@ -88,6 +109,7 @@ constexpr NavGroup kGroups[] = {
     {"Operate", kOperate},
     {"Posture", kPosture},
     {"Estate", kEstate},
+    {"Access", kAccess},
     {"System", kSystem},
 };
 

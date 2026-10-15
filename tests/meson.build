@@ -1397,6 +1397,16 @@ if build_server
       'unit/server/test_page_routes.cpp',
       'unit/server/test_dialog_module.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
+      'unit/server/test_developer_render.cpp', # System > Developer and API: pure renderers
+      'unit/server/test_developer_routes.cpp', # System > Developer and API: page + fragment gates
+      'unit/server/test_access_render.cpp', # Access pages (Phase 2): Users list + Account panel renderers
+      'unit/server/test_access_routes.cpp', # Access pages: /access/users + fragments + static glue (gate order, degraded states)
+      'unit/server/test_access_js.cpp', # Access pages: string pins on the template and yuzu-access.js
+      'unit/server/test_access_golden.cpp', # Access pages: four rendered-fragment goldens
+      'unit/server/test_access_tokens_render.cpp', # Tokens and principals page: pure renderers
+      'unit/server/test_access_tokens_routes.cpp', # Tokens and principals page: routes, gates, audit, degraded states
+      'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
+      'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
@@ -1567,6 +1577,7 @@ if build_server
       '../agents/plugins/tar/src/tar_schema_registry.cpp',
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_dex_app_perf_failures.cpp', # pure per-version crash/hang join + shared versions[] serializer - no store, no PG
+      'unit/server/test_dex_apps_stability.cpp', # pure application/version stability assembly + shared apps JSON serializer - no store, no PG
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_dex_app_perf_version_table.cpp', # per-version crash/hang table renderer + fragment route over the FnDexPerfApi double - no store, no PG
@@ -1705,6 +1716,7 @@ if build_server
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
       'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 21 panels + static h1 on the /settings page
+      'unit/server/test_settings_general.cpp',      # System General page: runtime/events renderers, routes, page pins
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
@@ -3445,6 +3457,17 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   _python3_test,
   args: [files('test_agent_ota_wiring_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# Access Users page: pins the production wiring in server.cpp (the real require_admin gate and the
+# AuthDB::list_users() account source), which every route test stubs. Source-text only, so Python.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# no-build gate labelled 'server' fails that check on the Windows legs.
+test('access users production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_wiring_lexical.py')],
+  suite: 'docs',
   timeout: 30,
 )
 

@@ -141,6 +141,16 @@ ignoring it.
 store is degraded (previously an empty `200`) and `404` for an unknown role
 (previously `200 {"data":[]}`).
 
+## Behaviour change: `PUT /api/config/{key}` is audit-first, refuses cross-site cookie writes and floors `heartbeat_timeout` at 30 seconds
+
+**What changed.**
+
+- A call to `PUT /api/config/{key}` now writes a `config.update` audit row with result `attempted` before it changes anything, then a `success` or `failure` row. Each accepted call leaves two rows where it left one. If the `attempted` row cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and nothing is changed, so a runtime setting (including the log level) cannot be changed during an audit-store outage.
+- A call authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise it answers `403 cross-site request refused` and is audited as `csrf.denied`. API, MCP and engine token callers are not affected.
+- `heartbeat_timeout` below 30 seconds is refused with `400`. A value below 30 that an earlier build stored is raised to 30 when the server starts (a WARN line names it); `GET /api/config` keeps listing the stored override until you `PUT` a value of 30 or more.
+
+**What to check.** A script that signs in with a cookie and calls this route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. A SIEM or alert rule that counts one `config.update` row per change now sees two; match on `result=success`. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin` or the General page's Save is refused. A stored value below 30 cannot be cleared by saving 30 on the General page, because that page already shows 30 as the current value: save another value first, or `PUT` it with a token. The Developer page's fragments are now administrators only (a non-admin holding `Infrastructure:Read` gets `403` from them), and the permission grid no longer writes a denial row on each load. Whatever you set, keep `heartbeat_timeout` well above the heartbeat interval your agents run with: 30 leaves no margin for a late heartbeat.
+
 ## Behaviour change: sign-in moves to the landing page, `/login` redirects
 
 **What changed.** `/home` is now the sign-in page (and the landing page for a signed-in user). A page requested
@@ -985,6 +995,16 @@ No config or data migration is required.
 - **`/viz/fleet` and MCP `get_fleet_topology`** now also show a departed device, flagged stale, for 7 days, so `yuzu_viz_offline_hosts_total` rises after the upgrade.
 - **Retention.** A row is deleted 37 days after its device was last seen (the 30-day roster window plus a 7-day margin). Each replica runs the prune hourly and deletes at most 12,000 rows per hour. The first pass runs about a minute after the server starts. On the first start after the upgrade it only records its clock anchor, so deletions begin with the next hourly pass; on every later start it already deletes; a large backlog inherited from an older release drains at that rate (100,000 rows in about 8 hours).
 - **Decommission erases the row.** `DELETE /api/v1/sle/agents/{id}` deletes the device's `endpoint_state` row (#5682), so a decommissioned device leaves `/hardware`. A still-enrolled agent that heartbeats again re-creates it, so stop the agent first. A device that is never decommissioned ages out under the 37-day rule.
+
+## Behaviour change: the DEX cohort floor is one device, and the Apps list fails closed
+
+**Not a Breaking lead:** no flag or route is removed and no response field is renamed. Three operator-visible behaviours change.
+
+- **The cohort floor is 1 (was 10).** A point, cohort or per-version figure with a single contributing device now publishes that device's exact CPU and memory aggregate on the un-audited DEX reads, including a cohort keyed by a per-device tag value (an asset tag, serial number or owner). No `agent_id` is emitted and the permission is unchanged (`GuaranteedState:Read`); the audited per-device drill is unchanged. The `floor` field those responses echo now reads 1.
+- **The Prometheus cohort export carries one-device cohorts.** With `dex_cohort_export_key` set, a one-device cohort exports as `yuzu_fleet_perf_cohort_*{cohort=<tag value>}` on `/metrics`, governed by `/metrics` authentication (loopback is always unauthenticated; remote scrapes need any authenticated session, with no `GuaranteedState:Read` check, unless `--metrics-no-auth` is set) rather than `GuaranteedState:Read`. Choose keys whose values do not name a device or person. `yuzu_fleet_perf_cohort_clipped` can now rise on high-cardinality keys.
+- **The Apps list answers `503` on a degraded read.** `GET /api/v1/dex/apps` answers `503` with `retry_after_ms: 2000`, and MCP `list_dex_apps` a retryable error, where they previously returned an empty list. Treat `503` as retry; it also answers `503` at once when four Apps reads are already running on that server (keep to four parallel calls and honour `retry_after_ms`; each refusal is counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`, which trips the warning alert `YuzuGuardianReadDegraded` if it persists). The rows gain `distinct_devices_online` (an integer, `null` when no fleet source is wired); the share, rate and score are over the Windows devices online now, and the score is withheld as `offline_affected` while any affected device is offline (expect that on most multi-device applications of a fleet with laptops; use the share and rate until an offline-aware score is decided, #5894). The list is now Windows-scoped and keeps the 100 applications affecting the most devices (`apps_total` and `apps_truncated` report the cut); the Apps tab is unchanged.
+
+No config or data migration is required.
 
 ## Behaviour change: a failed device-roster read is reported instead of shown as an empty fleet (#5531)
 

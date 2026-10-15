@@ -154,7 +154,7 @@ TEST_CASE("DexPerfApi apps() parity + null-store degrade", "[pg][dex_perf_api]")
     CHECK_FALSE(degraded->apps(t).has_value());
 }
 
-TEST_CASE("DexPerfApi app_fleet_trend() parity + floor suppression + null-store degrade",
+TEST_CASE("DexPerfApi app_fleet_trend() parity + one-device floor + null-store degrade",
          "[pg][dex_perf_api]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -166,7 +166,8 @@ TEST_CASE("DexPerfApi app_fleet_trend() parity + floor suppression + null-store 
     REQUIRE(b2.is_open());
 
     const std::int64_t day = today_utc() - 86400;
-    // 2 devices — below kDexCohortFloor (10), so the seam's floor must suppress.
+    // 2 devices — at or above kDexCohortFloor (1), so the seam publishes the point
+    // (it was suppressed at the old floor of 10).
     seed_b1(b1, "agent-1", "chrome.exe", "124.0.0.0", day, 5.0, 100000000);
     seed_b1(b1, "agent-2", "chrome.exe", "124.0.0.0", day, 7.0, 120000000);
     REQUIRE(rollup.roll_day(day));
@@ -183,10 +184,11 @@ TEST_CASE("DexPerfApi app_fleet_trend() parity + floor suppression + null-store 
     CHECK((*seam)[0].version == direct[0].version);
     CHECK((*seam)[0].device_count == direct[0].device_count);
     CHECK((*seam)[0].suppressed == direct[0].suppressed);
-    // Below-floor: BOTH the direct transform and the seam must suppress —
-    // proves the seam did not skip the floor gate.
-    CHECK((*seam)[0].suppressed);
+    // One-device floor: BOTH the direct transform and the seam publish the
+    // two-device point with its exact mean ((5.0 + 7.0) / 2).
+    CHECK_FALSE((*seam)[0].suppressed);
     CHECK((*seam)[0].device_count == 2);
+    CHECK((*seam)[0].cpu_mean == 6.0);
 
     auto degraded = make_local_dex_perf_api({}, nullptr, nullptr, nullptr, nullptr, nullptr);
     CHECK_FALSE(degraded->app_fleet_trend("chrome.exe", "124.0.0.0").has_value());
@@ -372,13 +374,13 @@ TEST_CASE("DexPerfApi group_trend()/tag_trend() REAL member resolution + kDexCoh
     auto api = make_local_dex_perf_api({}, nullptr, &b1, &reader, &mgmt, &tags);
     const std::int64_t day = today_utc() - 86400;
 
-    SECTION("group_trend: sub-floor member count suppresses (count only, metrics withheld)") {
+    SECTION("group_trend: a three-member group is published at the one-device floor") {
         ManagementGroup g;
-        g.name = "SubFloorGroup";
+        g.name = "SmallGroup";
         g.membership_type = "static";
         auto group_id = mgmt.create_group(g);
         REQUIRE(group_id.has_value());
-        // 3 members — below kDexCohortFloor (10).
+        // 3 members — above kDexCohortFloor (1); suppressed at the old floor of 10.
         for (const char* a : {"gsub-1", "gsub-2", "gsub-3"}) {
             REQUIRE(mgmt.add_member(*group_id, a).has_value());
             seed_b1(b1, a, "chrome.exe", "124.0.0.0", day, 5.0, 100000000);
@@ -387,19 +389,17 @@ TEST_CASE("DexPerfApi group_trend()/tag_trend() REAL member resolution + kDexCoh
         REQUIRE(trend.has_value());
         REQUIRE(!trend->empty());
         CHECK((*trend)[0].device_count == 3);
-        CHECK((*trend)[0].suppressed);
-        // Suppressed clears the exact mean — the real single-device value
-        // (5.0%) must never reach a caller for a sub-floor named group.
-        CHECK((*trend)[0].cpu_mean == 0.0);
+        CHECK_FALSE((*trend)[0].suppressed);
+        CHECK((*trend)[0].cpu_mean == 5.0); // the exact mean is published
     }
 
-    SECTION("group_trend: at-floor member count passes (real metrics visible)") {
+    SECTION("group_trend: a ten-member group publishes real metrics") {
         ManagementGroup g;
         g.name = "AtFloorGroup";
         g.membership_type = "static";
         auto group_id = mgmt.create_group(g);
         REQUIRE(group_id.has_value());
-        // 10 members == kDexCohortFloor: passes, not suppressed.
+        // 10 members, well above the one-device floor: published, not suppressed.
         for (int i = 0; i < 10; ++i) {
             const std::string a = "gfloor-" + std::to_string(i);
             REQUIRE(mgmt.add_member(*group_id, a).has_value());
@@ -413,7 +413,7 @@ TEST_CASE("DexPerfApi group_trend()/tag_trend() REAL member resolution + kDexCoh
         CHECK((*trend)[0].cpu_mean > 0.0); // real mean survives once at floor
     }
 
-    SECTION("tag_trend: sub-floor tagged cohort suppresses (count only, metrics withheld)") {
+    SECTION("tag_trend: a two-device tagged cohort is published at the one-device floor") {
         for (const char* a : {"tsub-1", "tsub-2"}) {
             REQUIRE(tags.set_tag(a, "model", "Latitude5420").has_value());
             seed_b1(b1, a, "chrome.exe", "124.0.0.0", day, 6.0, 100000000);
@@ -422,8 +422,8 @@ TEST_CASE("DexPerfApi group_trend()/tag_trend() REAL member resolution + kDexCoh
         REQUIRE(trend.has_value());
         REQUIRE(!trend->empty());
         CHECK((*trend)[0].device_count == 2);
-        CHECK((*trend)[0].suppressed);
-        CHECK((*trend)[0].cpu_mean == 0.0);
+        CHECK_FALSE((*trend)[0].suppressed);
+        CHECK((*trend)[0].cpu_mean == 6.0);
     }
 
     SECTION("tag_trend: at-floor tagged cohort passes (real metrics visible)") {
@@ -787,8 +787,9 @@ TEST_CASE("DexPerfApi app_fleet_report() joins crashes and hangs and exposure pe
     const std::int64_t today = today_utc();
     seed_two_version_fixture(b1, gss, today);
     const std::int64_t day = today - 86400;
-    // A third version on only 3 devices: its performance point is suppressed and its
-    // figures are published all the same (the join carries no device floor).
+    // A third version on only 3 devices: its performance point is published (the
+    // cohort floor is one device; it was suppressed at the old 10) and its figures
+    // are published all the same (the join carries no device floor).
     for (int i = 1; i <= 3; ++i)
         seed_b1(b1, aid(i), "chrome.exe", "126.0.0.0", day, 2.0, 80000000);
     // A crash stamped in the future on an exposed 125 device must not enter any figure.
@@ -811,7 +812,7 @@ TEST_CASE("DexPerfApi app_fleet_report() joins crashes and hangs and exposure pe
     // 126: 3 exposure devices; its one crash (a01) is published with its exposed
     // figure and rate, and the ratio against 125 stands, at any device count.
     const auto& v126 = rep->versions[0];
-    CHECK(v126.perf.suppressed);
+    CHECK_FALSE(v126.perf.suppressed); // 3 >= kDexCohortFloor (1)
     CHECK(v126.perf.device_count == 3);
     CHECK(v126.exposure_devices == 3);
     CHECK(v126.affected_devices == 1);

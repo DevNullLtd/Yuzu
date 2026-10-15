@@ -3696,7 +3696,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`, `failure`, `partial`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404), `owns_active_engine_principal` (409), `last_administrator_blocked` (409, nothing revoked: the early form). The LATE form is `result=partial` (credentials were revoked and the account stays active), detail `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary. `failure` detail `store_failure ...` (503), or `identity_link_resolution_failed` / `api_token_store_unavailable`; `partial` detail `account_deactivated session_wipe_failed=true ...` (503) or the revoke summary with `api_tokens_db_error=true` (500). |
 | `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`; the principal is the caller on every row, including those written after its own session was revoked. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service sessions_revoked=<N> provisional_mfa_cleared=<true\|false>`, written in the same transaction as the change (no separate `session.revoke_all` row). Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `wrong_current`, `account_locked`, `sso_only_local_disabled`, `verify_transient`, `not_found`, `conflict`, `store_unavailable`, `audit_unavailable`. A malformed body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. Never carries the password or its length. |
 | `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`, principal = the caller. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user> sessions_revoked=<N> provisional_mfa_cleared=<true\|false>` (no separate `session.revoke_all` row), plus — only when a lockout existed — an `auth.lockout.cleared` row (`result=ok`, `detail=password_reset`), both in the same transaction as the reset. Denied/error detail tokens: `token_session`, `csrf`, `durable_admin_required`, `admin_gate_unavailable`, `self_target`, `break_glass_target`, `not_found`, `not_local`, `store_unavailable`, `audit_unavailable`. A malformed username or body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. |
-| `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
+| `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. **Exception:** an interactive cookie session (local, OIDC or SAML) refused on an auto-loading dashboard panel fragment (the Access Users panels) writes no row; token and engine callers always do. |
 | `auth.lockout.applied` | Account locked after `--auth-lockout-threshold` consecutive failed local-password logins (SOC 2 CC6.3). Emitted **once** at the threshold crossing — not once per blocked attempt (those are tracked only by `yuzu_auth_lockout_blocked_total` to avoid audit flooding). `result=ok` (the lock was applied; the warning severity is carried by the metric + analytics event, not the audit result), `target_type=User`, `detail=threshold=<N> window_secs=<S>`. |
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, `reset_on_successful_login` when the user's next successful login clears a non-zero counter, `reset_on_password_change` when `POST /api/v1/users/me/password` verifies the current password, or `password_reset` when `POST /api/v1/users/{name}/password` clears an existing lockout (written in the same transaction as the reset; never written when there was nothing to clear). |
 | `execution.detail.fetch` | `GET /api/v1/executions/{id}` (REST v1 single-execution lookup). `result=denied` only (#1634) on the BARE route (no `include`) — emitted on the 404 branch, execution genuinely nonexistent OR out of the caller's management-group scope, non-distinguishing detail text; there is no `result=success` row on the bare route's 200 path. **As of #4030, this no longer holds for the whole URL pattern:** `?include=agents` on this same route, and the sibling `GET /api/v1/executions/{id}/responses`, both DO write `result=success` rows under this identical verb name on their 200 path (see `docs/user-manual/audit-log.md`'s `execution.detail.fetch` row for the full, current three-way split). |
@@ -4753,15 +4753,21 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 **Permission:** `Infrastructure:Write`
 
+**Audit:** audit-first (ADR-0033 section 9, no audit row, no mutation). An `attempted` `config.update` row is written before anything changes; if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and the key is neither stored nor applied. A `success` row follows a change, or a `failure` row a store refusal. If only that outcome row is lost the change stays applied and the `200` carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)). Each accepted call therefore leaves two rows.
+
+**Dangling `attempted` row.** An `attempted` `config.update` row with no `success` or `failure` row after it means the outcome is unknown (the server stopped between the two, or the outcome row was lost); read `GET /api/config` to see what is in force. A `failure` row for a database error records `store error; outcome unknown`, because the write may have committed before the acknowledgement was lost.
+
+**Cross-site writes.** A session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API, MCP and engine token callers are exempt.
+
 **Allowed keys** (the full set; source of truth is `kAllowedKeys` in
 `server/core/src/runtime_config_store.cpp`):
 
 | Key | Type | Takes effect | Description |
 |---|---|---|---|
-| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline |
-| `response_retention_days` | integer | **stored only, applied at next restart** | Days to retain command response data |
-| `audit_retention_days` | integer | **stored only, applied at next restart** | Days to retain audit log entries |
-| `guardian_event_retention_days` | integer | **stored only, applied at next restart** | Days to retain guaranteed-state events |
+| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline. Minimum 30 (the default agent heartbeat interval); a lower value is refused `400`. 30 is a floor, not a recommendation: keep it well above the agents' own `--heartbeat`. A value stored below 30 before the floor existed is raised to 30 at server start (logged), while `GET /api/config` keeps listing the stored override until you replace it |
+| `response_retention_days` | integer | **stored only, not enforced - see note** | Days to retain command response data |
+| `audit_retention_days` | integer | **stored only, not enforced - see note** | Days to retain audit log entries |
+| `guardian_event_retention_days` | integer | **stored only, not enforced - see note** | Days to retain guaranteed-state events |
 | `log_level` | string | immediately | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
 | `auto_approve_enabled` | boolean | **never - see note** | Accepted and stored, but no consumer reads it back |
 | `plugin_signing_required` | boolean | **records intent only - see note** | Server-side record of the Settings "Require signed plugins" toggle |
@@ -4785,12 +4791,14 @@ most keys:
 - **immediately** - only two keys. `heartbeat_timeout` is assigned into the live server config and
   re-read on every stale-session sweep; `log_level` is applied by `RuntimeConfigStore::set()` itself
   via `spdlog::set_level`.
-- **stored only, applied at next restart** - `response_retention_days`, `audit_retention_days`,
+- **stored only, not enforced** - `response_retention_days`, `audit_retention_days`,
   `guardian_event_retention_days`. The handler updates the in-memory config, so `GET /api/config`
-  and the Settings page immediately report the NEW value - but each store captured its retention
-  window when it was constructed and exposes no setter, so the store still enforcing retention keeps
-  the old value until the server restarts. **The API reports the stored value, not the value being
-  enforced.** Restart after changing a retention window.
+  reports the NEW value - but each store copied its retention window when it was constructed and
+  exposes no setter, so the stores keep enforcing the window they were built with. **The API
+  reports the stored value, not the value being enforced.** `GET /api/v1/settings/data-retention`
+  and the Data and retention page show the enforced value under `enforced`. To change a window, set
+  `--response-retention-days`, `--audit-retention-days`, `--guardian-event-retention-days` (or the
+  matching `YUZU_*` environment variable) and restart. No route removes a stored override.
 - **records intent only** - `plugin_signing_required` is read in exactly two places, both of which
   render the Settings status badge. **No server or agent code consumes it to require signatures**,
   and it is not carried in any proto field, so it never reaches an agent. Agent-side enforcement is
@@ -4860,7 +4868,7 @@ another OIDC field, restart first so the process is not holding the old value.
 > **Two different error sources, two different shapes.** The shared authorization gate in front of
 > this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
 > authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
-> gated route. The bodies **the handler itself** emits do not — `/api/config` is a legacy
+> gated route. Most bodies **the handler itself** emits do not (the two A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
 > non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
@@ -4870,7 +4878,10 @@ another OIDC field, restart first so the process is not holding the old value.
 > earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
 > deliberate distinction, and has been unified). Note `503` is emitted by **both** sources, so status
 > alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
-> it, on every status.
+> it, on every status. Two refusals added with the audit-first and same-site gates use the A4 envelope
+> (`correlation_id` present): `403` `cross-site request refused` and `503` `audit log unavailable; the
+> change was not made` (`retry_after_ms: 5000`, a `remediation` hint, header `Sec-Audit-Failed: true`). An unknown key is a
+> bare `400` and writes no audit row.
 
 **Error (503) - runtime config store unavailable.** A genuine DB/crypto write failure, distinguished
 from caller-input validation at the seam so it never returns a `400`-shaped body instead:
@@ -4897,6 +4908,11 @@ from caller-input validation at the seam so it never returns a `400`-shaped body
 A value of `0` for `heartbeat_timeout`, `response_retention_days` or `audit_retention_days` passes
 the route's `>= 0` pre-check and is then rejected by the store's own `> 0` check, so it returns the
 **bare** shape with a different message: `{ "error": "value must be a positive integer" }`.
+A `heartbeat_timeout` of `1` to `29` is refused the same way with
+`{ "error": "heartbeat_timeout must be at least 30 seconds (the default agent heartbeat interval)" }`:
+a window shorter than the agent heartbeat interval would mark every directly connected agent offline
+between two heartbeats. The floor equals the default heartbeat interval and leaves no margin for a
+late heartbeat, so choose a value well above the interval your agents run with.
 
 **Error (400) - the redaction placeholder submitted as a secret.** `GET /api/config` omits a
 secret's value and the startup log prints `<redacted>` in its place. Any value **containing** that
@@ -4911,7 +4927,7 @@ client secret contains `<redacted>`, rotate it at the IdP to a value that does n
 { "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
 ```
 
-**Audit:** a successful write emits `config.update` / `RuntimeConfig` with `target_id` = the key.
+**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error).
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
@@ -5061,6 +5077,13 @@ Erlang gateway upstream status: enabled state, listen address, gateway mode, liv
 Core server configuration: gRPC/web addresses and ports, session timeout, max agents, rate limits,
 OTA/gRPC tuning knobs. Nothing secret.
 
+`session_timeout_seconds` is the **agent heartbeat timeout**: the number of seconds without a
+heartbeat after which this server drops a directly connected agent. It is not the dashboard sign-in
+expiry. The sign-in limits are `session_inactivity_seconds` (the `--session-inactivity-secs` idle
+timeout; `0` means off) and `session_absolute_lifetime_seconds` (the fixed sign-in lifetime, 8 hours).
+The heartbeat timeout can be changed at runtime with `PUT /api/config/heartbeat_timeout`; the two
+sign-in limits cannot.
+
 **Permission:** `ServerConfig:Read`. **Audit:** none.
 
 ```json
@@ -5070,7 +5093,9 @@ OTA/gRPC tuning knobs. Nothing secret.
     "management_grpc_address": "0.0.0.0:50052",
     "web_address": "127.0.0.1",
     "web_port": 8080,
-    "session_timeout_seconds": 3600,
+    "session_timeout_seconds": 90,
+    "session_inactivity_seconds": 0,
+    "session_absolute_lifetime_seconds": 28800,
     "max_agents": 10000,
     "auth_config_path": "/etc/yuzu/yuzu-server.cfg",
     "rate_limit_per_ip": 100,
@@ -5107,14 +5132,29 @@ REST-only — see the #520 note above.
 
 #### `GET /api/v1/settings/data-retention`
 
-Response/audit data retention windows, in days.
+Response, audit and Guardian-event data retention windows, in days.
 
-**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (two
+**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (a few
 integers).
+
+The top-level fields are the configured/stored values. `enforced` holds the window each store is
+actually applying, in days (`0` or less means rows never expire); a value is `null` when the store
+is absent or not open, which is "unknown", not zero. The two differ after a runtime
+`PUT /api/config/<key>`, which is stored but not applied (see
+[When a change takes effect](#when-a-change-takes-effect)).
 
 ```json
 {
-  "data": { "response_retention_days": 90, "audit_retention_days": 365 },
+  "data": {
+    "response_retention_days": 90,
+    "audit_retention_days": 365,
+    "guardian_event_retention_days": 30,
+    "enforced": {
+      "response_retention_days": 90,
+      "audit_retention_days": 365,
+      "guardian_event_retention_days": 30
+    }
+  },
   "meta": { "api_version": "v1" }
 }
 ```
@@ -6762,6 +6802,17 @@ One plugin's manifest, narrower than the whole-catalog route above (#4108) — t
 Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as the catalog route.
 
 ---
+
+#### Developer and API page
+
+Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a read-only front for the discovery routes above. It adds no REST route and no MCP tool: its four panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row for a dashboard session (a token caller keeps its denial row).
+
+- **API:** the OpenAPI document link and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes.
+- **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown.
+- **Permissions:** each `Securable:Operation` pair with the roles that allow it. The role grid needs `UserManagement:Read`, as on `/discover/permissions`; without it the page says so instead of listing nothing.
+- **Plugins:** the build-embedded manifests with per-OS support. The list of plugins connected devices currently report is a separate, on-request list: no connected device is not the same as no plugins.
+
+The load generator and process data fetch controls are not part of this page.
 
 ### Inventory
 
@@ -9127,7 +9178,7 @@ Fleet-relative performance percentiles per **cohort** — the distinct values of
 
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `key` — the cohort tag key (`[A-Za-z0-9_.:-]{1,64}`, default `model`).
-- **Response:** `{key, floor, cohorts[], available_keys[]}`. Each cohort row is `{cohort, devices, suppressed}` plus, when not suppressed, per-metric stats as in `/perf/fleet`. Cohorts under `floor` (10) reporting devices carry `suppressed: true` with their population and **no stats**; devices without the key form the explicit `cohort: ""` (untagged) residual. `available_keys` lists the fleet's tag keys for picker UIs. `400` on an invalid key. Not audited.
+- **Response:** `{key, floor, cohorts[], available_keys[]}`. Each cohort row is `{cohort, devices, suppressed}` plus, when not suppressed, per-metric stats as in `/perf/fleet`. Cohorts under `floor` (1 reporting device, so only an empty cohort) carry `suppressed: true` with their population and **no stats**. A cohort keyed by a per-device tag value with one device is that device's exact figures. Devices without the key form the explicit `cohort: ""` (untagged) residual. `available_keys` lists the fleet's tag keys for picker UIs. `400` on an invalid key. Not audited.
 
 #### `GET /api/v1/dex/perf/cohort-diff`
 
@@ -9135,7 +9186,7 @@ The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, o
 
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `key` — the cohort tag key (`[A-Za-z0-9_.:-]{1,64}`, default `model`); `a`, `b` — the two cohort values to compare (**both required**; an empty value is the untagged residual).
-- **Response:** `{key, floor, found_a, found_b, a, b, delta_pct}`. `found_a`/`found_b` are `false` when a cohort has no reporting devices (its side is `null`). `a`/`b` are cohort rows `{cohort, devices, suppressed}` plus per-metric stats when not suppressed. `delta_pct` is `{cpu_pct, commit_pct, disk_lat_ms}` where each is A's p50 relative to B's p50 (B the baseline; positive = A higher), or `null` unless **both** cohorts expose that metric (neither suppressed below the 10-device floor). `400` on an invalid key or missing `a`/`b`. Not audited.
+- **Response:** `{key, floor, found_a, found_b, a, b, delta_pct}`. `found_a`/`found_b` are `false` when a cohort has no reporting devices (its side is `null`). `a`/`b` are cohort rows `{cohort, devices, suppressed}` plus per-metric stats when not suppressed. `delta_pct` is `{cpu_pct, commit_pct, disk_lat_ms}` where each is A's p50 relative to B's p50 (B the baseline; positive = A higher), or `null` unless **both** cohorts expose that metric (neither suppressed below the one-device floor, i.e. neither empty). A cohort keyed by a per-device tag value with one device is that device's exact figures. `400` on an invalid key or missing `a`/`b`. Not audited.
 
 #### `GET /api/v1/dex/perf/devices`
 
@@ -9150,7 +9201,7 @@ The one device list behind every Performance drill: worst devices by a metric (d
 
 Per-application CPU / working-set **by version, over the retained window**, across the fleet or one management group — reading the retained Postgres aggregate (B1 per-device daily / B2 fleet rollup), not the live federated device drill. Per-app sampling is opt-in (`procperf_enabled`, off by default); a device contributes only after its first completed UTC midnight. The aggregate surfaces gate `GuaranteedState:Read` and are **not** audited (cohort posture); the per-device drill is behavioural PII and is audited fail-closed (see below). The same shared transform backs these endpoints, the `get_dex_app_perf` / `get_dex_group_app_perf` MCP tools, and the dashboard so the numbers cannot disagree.
 
-> **Percentile + suppression semantics (all three trend endpoints).** Each `points[]` entry's `cpu_p50`/`cpu_p95`/`ws_p50`/`ws_p95` is either `null` (absent — empty population, **not** zero) or `{value, lower_bound}`. `lower_bound: true` means the percentile fell in the open top histogram bucket, so `value` is a **floor** — render it as "≥ value", never an exact quantile. `hist_stale: true` means the row was stamped under a superseded histogram scheme, so percentiles are withheld (the exact mean/max still stand). **Cohort floor:** any `(version, day)` point covering fewer than **10** devices (`kDexCohortFloor`) is suppressed — its stats are withheld and only `device_count` is honest (a sub-floor aggregate would single out an individual). This applies to **both** the fleet and the group endpoints.
+> **Percentile + suppression semantics (all three trend endpoints).** Each `points[]` entry's `cpu_p50`/`cpu_p95`/`ws_p50`/`ws_p95` is either `null` (absent — empty population, **not** zero) or `{value, lower_bound}`. `lower_bound: true` means the percentile fell in the open top histogram bucket, so `value` is a **floor** — render it as "≥ value", never an exact quantile. `hist_stale: true` means the row was stamped under a superseded histogram scheme, so percentiles are withheld (the exact mean/max still stand). **Cohort floor:** `kDexCohortFloor` is **one** device (maintainer ruling, 2026-10-14; previously 10): a `(version, day)` point is published with its stats whenever at least one device contributed, so only a point no device contributed to is suppressed (stats withheld, `device_count` only). A single-device point is therefore published — as a fleet-wide aggregate by application and version with no `agent_id`, behind `GuaranteedState:Read`; the per-device drill remains the audited path. This applies to **both** the fleet and the group endpoints.
 
 #### `GET /api/v1/dex/perf/apps`
 
@@ -9165,8 +9216,8 @@ The fleet trend for one application — one point per `(version, UTC day)` over 
 
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `app` — **required**, ≤ 512 bytes, no control characters (a `400` otherwise; a NUL would truncate the bound query). `version` — optional; omitted = every version interleaved, each point tagged with its canonicalized `version`; same length/charset rule.
-- **Response:** `{app, version, points[], versions[], versions_truncated, failure_window_days, exposure_basis, stat_failures}`. Each point: `{version, day, device_count, suppressed}` plus the full stat fields (`cpu_mean, cpu_max, cpu_p50, cpu_p95, ws_mean, ws_max, ws_p50, ws_p95, hist_stale`) **only when `suppressed` is false** — a sub-floor `(version, day)` point (fewer than 10 devices) carries `device_count` only, the same suppression the group endpoint applies (see the percentile/suppression note above). `400` on a missing/invalid `app` or `version`; `503` (with `retry_after_ms: 2000`) when either the performance read or the crash-and-hang read degrades. Not audited.
-- **Per-version crash and hang join (additive):** the response also carries `versions[]`, `versions_truncated`, `failure_window_days`, `exposure_basis` and `stat_failures`; `app`, `version` and `points[]` are unchanged. `versions[]` has one row per version, newest canonical (four-part, numeric) version first, at most **20** rows (`versions_truncated: true` when older versions were dropped; the unknown-version `""` bucket sorts last). The cap keeps the 20 highest version strings the agents reported, so a device reporting implausible versions can push real ones out of the default list (`versions_truncated: true`); `?version=` reaches any of them. The list is derived from the same row-capped read as `points[]`, which returns at most 100,000 `(version, day)` rows ordered by version string and then day: an application with more retained rows than that (about 556 versions over the 180-day window) has its later-sorting version strings cut off before the numeric newest-20 selection runs, so a numerically newest version can be absent while `versions_truncated` reports only the 20-row cap. It names only versions with retained performance rows, so **the absence of a row is not the absence of failures**. Each row carries `version`, `latest_day` and `day_count` (days the version appears in the window), `device_count` and `suppressed` (the latest day's device count and its sub-floor flag, as on a point), `affected_devices`, `crashes` and `hangs`, the exposure fields below, `previous_version` and `failure_rate_ratio`. Failures are joined to a row on the exact canonical version and subject the agent reported: a row with `affected_devices > 0` and `exposure_devices: null` is failures recorded under a version that has no samples, and a zero rate covers only failures recorded under exactly that version (a packaged app whose crash events carry no version lands in the `""` bucket). **This join carries no device floor** (maintainer ruling, 2026-10-14): every figure below is published at any device count, 1 device included. It is a fleet-wide aggregate by application and version only, with no `agent_id` or device identifier, behind `GuaranteedState:Read`; the per-`(version, day)` point floor on `points[]` is unchanged:
+- **Response:** `{app, version, points[], versions[], versions_truncated, failure_window_days, exposure_basis, stat_failures}`. Each point: `{version, day, device_count, suppressed}` plus the full stat fields (`cpu_mean, cpu_max, cpu_p50, cpu_p95, ws_mean, ws_max, ws_p50, ws_p95, hist_stale`) **only when `suppressed` is false** — a sub-floor `(version, day)` point (the floor is one device, so a point no device contributed to) carries `device_count` only, the same suppression the group endpoint applies (see the percentile/suppression note above). `400` on a missing/invalid `app` or `version`; `503` (with `retry_after_ms: 2000`) when either the performance read or the crash-and-hang read degrades. Not audited.
+- **Per-version crash and hang join (additive):** the response also carries `versions[]`, `versions_truncated`, `failure_window_days`, `exposure_basis` and `stat_failures`; `app`, `version` and `points[]` are unchanged. `versions[]` has one row per version, newest canonical (four-part, numeric) version first, at most **20** rows (`versions_truncated: true` when older versions were dropped; the unknown-version `""` bucket sorts last). The cap keeps the 20 highest version strings the agents reported, so a device reporting implausible versions can push real ones out of the default list (`versions_truncated: true`); `?version=` reaches any of them. The list is derived from the same row-capped read as `points[]`, which returns at most 100,000 `(version, day)` rows ordered by version string and then day: an application with more retained rows than that (about 556 versions over the 180-day window) has its later-sorting version strings cut off before the numeric newest-20 selection runs, so a numerically newest version can be absent while `versions_truncated` reports only the 20-row cap. It names only versions with retained performance rows, so **the absence of a row is not the absence of failures**. Each row carries `version`, `latest_day` and `day_count` (days the version appears in the window), `device_count` and `suppressed` (the latest day's device count and its sub-floor flag, as on a point), `affected_devices`, `crashes` and `hangs`, the exposure fields below, `previous_version` and `failure_rate_ratio`. Failures are joined to a row on the exact canonical version and subject the agent reported: a row with `affected_devices > 0` and `exposure_devices: null` is failures recorded under a version that has no samples, and a zero rate covers only failures recorded under exactly that version (a packaged app whose crash events carry no version lands in the `""` bucket). **No device floor applies to this join** (maintainer ruling, 2026-10-14; the cohort floor is one device, see the note above): every figure below is published at any device count, 1 device included. It is a fleet-wide aggregate by application and version only, with no `agent_id` or device identifier, behind `GuaranteedState:Read`:
   - **Breadth** — `affected_devices` is the number of fleet-wide devices that reported a crash or hang for the version in the window, and `crashes` and `hangs` are the fleet-wide event counts; all three are always present (a type with no events is `0`). Breadth counts every reporting device, sampled or not.
   - **Exposure** — `exposure_devices` is the number of devices with retained resource-significant samples for that exact image and version in the window. It is a selected subset (the daily top-N consumers), **not a census**, hence `exposure_basis: "resource_significant"`. `null` means unknown (no sample rows), never zero. When it is known, `exposed_crashes` and `exposed_hangs` count the crash and hang events on **exposed devices only** (each `null` only when exposure is unknown), and, when it is positive, `failure_rate` is `{estimate, lower, upper, reliable}` — those exposed events per exposed device over the window, with an exact (Garwood) 95 percent interval, at full double precision (it is up to the view to scale to per 1,000). A zero `exposure_devices` gives a `null` rate (never a divide by zero, never a healthy zero). The rate is per exposed device over the window, **not per day of use**: a version with fewer days in the window (`day_count`, `latest_day`) has had less time to fail, so read the rate beside `day_count`: it counts days in the 180-day trend window, so only a value below `failure_window_days` + 1 means shorter in-window tenure. `reliable` is `false` below 20 events, an evidence-quality marker and not a floor: print the interval beside it.
   - `previous_version` is the next-older known version in the list (`null` for the oldest known version in the list (see `versions_truncated`) and for `""`). `failure_rate_ratio` is `{estimate, lower, upper, unbounded, reliable}` — this version's rate over the previous version's, with an exact conditional (Clopper-Pearson) 95 percent interval — present only when **both** versions have a known, positive exposure; `null` otherwise, and `null` when neither version saw an exposed event. When the previous version saw no exposed events, `estimate` and `upper` are `null` with `unbounded: true` (a finite `lower` still holds). A request for one exact `version` yields a one-row `versions[]` with no previous version.
@@ -9189,7 +9240,7 @@ The same trend shape, aggregated **on-the-fly over one management group's member
 
 - **Permission:** `GuaranteedState:Read`. Gated on the **global** permission (like the cohort surface), not the per-device scope gate: the global check excludes management-group-scoped-only principals, so only a fleet-wide-Read caller — who can already compute every fleet/cohort aggregate — reaches it. No cross-operator exposure **on that axis**. A service-scoped API token is a DIFFERENT axis, though: `ITServiceOwner` holds a global `GuaranteedState:Read` grant regardless of scope, so the global-permission reasoning above does not confine it — it could otherwise supply any `group_id`, including one outside its own service. Found by this branch's own governance review (PR #3156), while re-verifying the external review's separate findings on this same file; a service-scoped token is now denied outright (`403`).
 - **Query parameters:** `group_id` — **required**, ≤ 512 bytes, no control characters. `app` — **required**, same rule. `version` — optional, same rule.
-- **Response:** `{group_id, app, version, floor, points[]}` where `floor` is the suppression threshold (10). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An empty/unknown group returns `200` with `points: []` (not a `503`). `400` on a missing/invalid parameter; `503` on store degrade.
+- **Response:** `{group_id, app, version, floor, points[]}` where `floor` is the suppression threshold (1: only an empty point is suppressed). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An empty/unknown group returns `200` with `points: []` (not a `503`). `400` on a missing/invalid parameter; `503` on store degrade.
 - **Audit:** `dex.perf.group.view` (`denied` only — an ordinary successful read is not audited, matching this route's existing aggregate/cohort posture).
 
 #### `GET /api/v1/dex/perf/tag`
@@ -9198,7 +9249,7 @@ The same trend shape as `/dex/perf/group` above, aggregated **on-the-fly over th
 
 - **Permission:** `GuaranteedState:Read`. Same global-permission gate and the same DIFFERENT-axis service-scoped-token caveat as `/dex/perf/group` — see that section. A service-scoped API token is denied outright (`403`).
 - **Query parameters:** `key` — optional tag key, default `"model"`; must match `^[A-Za-z0-9_.:-]{1,64}$` (`400` otherwise). `value` — **required**, ≤ 512 bytes, no control characters (an omitted or empty `value` is `400` — there is no "every value" wildcard). `app` — **required**, same rule. `version` — optional, same rule.
-- **Response:** `{key, value, app, version, floor, points[]}` where `floor` is the suppression threshold (10). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An unknown tag value returns `200` with `points: []` (not a `503`) — indistinguishable from a genuinely empty cohort. `400` on a missing/invalid parameter; `503` on store degrade.
+- **Response:** `{key, value, app, version, floor, points[]}` where `floor` is the suppression threshold (1: only an empty point is suppressed). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An unknown tag value returns `200` with `points: []` (not a `503`) — indistinguishable from a genuinely empty cohort. `400` on a missing/invalid parameter; `503` on store degrade.
 - **Audit:** `dex.perf.tag.view` (`denied` only — an ordinary successful read is not audited, matching `/dex/perf/group`'s posture).
 
 #### `GET /api/v1/dex/perf/compare`
@@ -9207,7 +9258,7 @@ The **`/auto` VERIFY** before/after comparison: did upgrading `app` from `baseli
 
 - **Permission:** `GuaranteedState:Read`, gated on the **global** permission (same posture as `/dex/perf/group`, including the same DIFFERENT-axis caveat for service-scoped tokens — see that section). A service-scoped API token is denied outright (`403`); found by this branch's own governance review (PR #3156), while re-verifying the external review's separate findings on this same file. The near-individual nature of this endpoint (real canaries are often 2-3 devices) makes the gap especially severe for it.
 - **Query parameters:** `group` — **required**, ≤ 512 bytes, no control characters; the management group whose members are the cohort. `app`, `baseline`, `candidate` — **required**, same validation; `baseline` and `candidate` must differ (`400` if equal after canonicalization). `window` — optional integer days, default `7`, clamped `1`–`31`.
-- **Response (`200`):** `{app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, truncated, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{…}, distribution{up, flat, down}}`. `truncated:true` means the cohort exceeded the 100,000-row read cap — the counts are **incomplete and may mis-pair** machines (a device that ran both versions can be mis-reported as one-version-only); treat the result as unreliable and narrow the group or shorten the window. A zero-sample machine (one that measured nothing in-window) is excluded from pairing rather than counted as a 0%-CPU pair. `cohort_size` = group members; `paired` = ran both (the comparison population); `baseline_only`/`candidate_only` = excluded (one version only); `no_data` = `cohort_size − paired − baseline_only − candidate_only`. `small_cohort:true` = `paired` non-zero but below the 10-device floor — **not** suppressed (canaries are deliberately small; the surface marks it *indicative*). `insufficient:true` = `paired == 0` (no machine ran both — the `cpu`/`ws`/`distribution` values are zero and should not be displayed). `cpu.*` are percent (float); `ws.*` are bytes (int64); `delta_median` is the median per-machine delta (positive = candidate heavier). `distribution.{up,flat,down}` count machines whose per-machine CPU delta exceeded / stayed within / fell below ±0.3 pp.
+- **Response (`200`):** `{app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, truncated, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{…}, distribution{up, flat, down}}`. `truncated:true` means the cohort exceeded the 100,000-row read cap — the counts are **incomplete and may mis-pair** machines (a device that ran both versions can be mis-reported as one-version-only); treat the result as unreliable and narrow the group or shorten the window. A zero-sample machine (one that measured nothing in-window) is excluded from pairing rather than counted as a 0%-CPU pair. `cohort_size` = group members; `paired` = ran both (the comparison population); `baseline_only`/`candidate_only` = excluded (one version only); `no_data` = `cohort_size − paired − baseline_only − candidate_only`. `small_cohort:true` = `paired` non-zero but below the cohort floor — **not** suppressed (canaries are deliberately small); with the floor at one device the field stays on the wire but is always `false`. `insufficient:true` = `paired == 0` (no machine ran both — the `cpu`/`ws`/`distribution` values are zero and should not be displayed). `cpu.*` are percent (float); `ws.*` are bytes (int64); `delta_median` is the median per-machine delta (positive = candidate heavier). `distribution.{up,flat,down}` count machines whose per-machine CPU delta exceeded / stayed within / fell below ±0.3 pp.
 - **No per-machine identity in the response** — the aggregate carries no `agent_id`. The per-machine pairs are a **dashboard-only** drill (`/fragments/auto/verify/drill`, audited `dex.app_perf.compare.drill`); there is **no REST or MCP per-machine surface** in this slice (a REST audited-fail-closed per-machine drill is a deferred follow-up).
 - **Error paths:** `400` on a missing/invalid required parameter or `baseline == candidate`; `403` if a service-scoped API token calls this route; `503` on store degrade or startup warmup (the A4 body's `retry_after_ms` carries the suggested delay).
 - **Headers:** `X-Correlation-Id` on every response path; `Sec-Audit-Failed: true` when the audit row could not persist (the read still proceeds — operational set-and-proceed).
@@ -9265,11 +9316,14 @@ App blast-radius drill — crash/hang summary, faulting modules, exception codes
 
 #### `GET /api/v1/dex/apps`
 
-App-centric stability list — every application with a crash/hang signal in the window, ranked by activity. The machine-readable equivalent of the `/dex` **Apps** tab.
+App-centric stability list — every application with a Windows crash/hang signal in the window (the 100 affecting the most devices; see `apps_total` and `apps_truncated`), per application and per version. The **Apps** tab, the Overview top apps and `GET /api/v1/dex/app` stay all-platform until the tab is rewired, so the same application can show different counts on the two surfaces.
 
 - **Permission:** `GuaranteedState:Read`.
 - **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
-- **Response:** `data` object `{window, apps[]}` — `apps[]` each `{subject, crashes, hangs, distinct_devices, last_seen}`. No per-agent identity (a distinct-device **count** per app, never an `agent_id`) — not audited.
+- **Response:** `data` object `{window, population, population_basis, apps_total, apps_truncated, apps[]}`. `apps[]` holds the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order, not database collation); `apps_total` counts every application with a Windows crash or hang signal in the window and `apps_truncated` is `true` when the cut dropped any. Each `{subject, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (up to 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when that cut dropped any. A full response is about 1.2 MB at 100 applications with 20 versions each; MCP clients should request it only when the per-version rows are needed. `crashes`, `hangs` and `distinct_devices` are window-wide. `share_affected`, `rate_per_1000` and `score` are over one population, the Windows devices online now: `distinct_devices_online` is how many of the affected devices are online now (`null` when no fleet source is wired, because membership is then unknown), `share_affected` is that count over the population (95 percent Wilson interval), `rate_per_1000` is those devices' events per 1,000 online devices (exact interval), and the score's inputs are the same online devices' figures. A device that crashed and then went offline is therefore in the counts and in `distinct_devices`, not in the share or rate, and the **score is withheld as `offline_affected`** when it would otherwise be published and `distinct_devices` exceeds `distinct_devices_online`, because a score built from the online devices alone would read healthy for an application that takes its devices offline. Read `distinct_devices_online` against `distinct_devices` before trusting a low share: figures over "online now" vary with the time of day (laptops overnight, weekends) for the same window. Expect this often: on a fleet with laptops or off-hours devices most applications with several affected devices will show a withheld score at any given moment, so use the share and rate, read against `distinct_devices_online` / `distinct_devices`, until an offline-aware score is decided (#5894). The online devices' events are not published separately; the rate is derived from them. `share_affected` carries `reliable: false` under 20 online affected devices and `rate_per_1000` under 20 online events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
+- **Population and scope:** counts are Windows-scoped and `population` is the number of Windows devices online now (`population_basis: "windows_online"`; `null` = no fleet source wired (unknown); `0` = no Windows device online now). With an unknown or zero population there is no share and no rate, and the score is withheld as `no_population`. The share is a proportion over that one population: its numerator is drawn from the same online devices the population counts, so the affected set can never exceed it. No device floor applies: figures are published at any device count.
+- **Failure:** a failed store read, an invalid score policy or a read over its concurrency budget returns `503` with `retry_after_ms: 2000`, never an empty list. The read holds a database connection for several seconds on a large window, so at most four run at once per server; a fifth answers `503` immediately (counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`) and the caller retries.
+- No per-agent identity (a distinct-device **count** per app, never an `agent_id`) — not audited.
 
 #### `GET /api/v1/dex/catalogue`
 
@@ -9771,6 +9825,47 @@ curl -X DELETE https://yuzu-server:8080/api/settings/users/admin \
 The following endpoints are under `/api/` (without the `v1` prefix). They predate the versioned API and remain available for backward compatibility. These endpoints return JSON but do not use the standard v1 envelope.
 
 ---
+
+### Access — Users
+
+These endpoints back the read-only **Access → Users** page (`/access/users`). They return HTMX fragments, not the JSON envelope, and require an admin session. Neither one changes anything, and neither writes a success audit row. A refused browser session writes no denial row either (the panels load automatically); a refused API or MCP token is audited by the admin gate (`auth.admin_required`).
+
+**`GET /fragments/access/users/list`**
+
+Render the Users panel: one row per active account (name, source, account role).
+
+- **Permission:** Admin only
+- **Response (200):** HTML fragment. At most 500 rows are drawn; a banner states the true count when more exist. When the account store does not answer, the fragment is a red "could not be read" box with a Retry button and **no table**, still with status 200 (htmx discards 4xx/5xx bodies). It is never an empty table.
+- **Response (401):** The admin gate passed but the session could not be re-resolved.
+- **Response (403):** Not an administrator. The panel shows a "not available to your account" note.
+- **Response (500):** The resolved session has an empty username. The page refuses rather than render rows with no "Current user" marker.
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/users/detail?username=<name>`**
+
+Render the Account panel for one active account.
+
+- **Query:** `username` — URL-encoded (an SSO principal such as `oidc:https://idp/x#sub` must encode `#` as `%23`). Empty or absent returns the "select a user" placeholder.
+- **Permission, statuses, headers:** as for the list. An unknown name is a 200 "No such user" panel, distinct from the red unreadable-store box.
+
+### Access — Tokens and principals
+
+These endpoints back the read-only **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything. The 200 fragments send `Cache-Control: no-store, private`; the 403 and 500 responses send `no-store`.
+
+**`GET /fragments/access/tokens/list`** (`?state=active|all`)
+
+- **Permission:** `ApiToken:Read`. An administrator on a browser session sees every owner's tokens; every other caller, including an administrator's API, MCP or service-scoped token, sees only their own, as `GET /api/v1/tokens` does.
+- **Response (200):** HTML fragment, capped at 500 rows with a banner. A token store that does not answer is a red "could not be read" box (still 200), never an empty table.
+- **Response (401 / 403):** not signed in / lacks `ApiToken:Read` (the panel shows "not available to your account"). A refused browser session writes no audit row; a refused token does.
+- **Response (500):** the resolved session has no username.
+
+**`GET /fragments/access/principals/list`** and **`GET /fragments/access/principals/detail?id=engine:<slug>`**
+
+- **Permission:** `EnginePrincipal:Read`, the same permission as `GET /api/v1/engine-principals` and `/{id}` (administrators only while RBAC is disabled). The page refuses engine credentials and MCP-tier tokens whatever they hold: `403` with the A4 envelope message `this credential cannot access this endpoint`, audited as `engine_principal.list` / `engine_principal.get` with `result=denied` and `detail=engine_session_denied` or `mcp_session_denied`.
+- **Response (401 / 403):** not signed in / lacks `EnginePrincipal:Read` (the panel shows "not available to your account"; the permission gate's own denial, not the credential message above, which applies to a caller that holds the permission). A refused browser session writes no audit row.
+- **Response (200):** HTML fragment. The list carries `data-check="1"` only when the caller also holds `AuditLog:Read` (the page script then runs the no-administrator check). A malformed `id` is the "select a principal" placeholder with no store read; an unknown id is a 200 "not found" panel.
+- **Revocation detail:** for a revoked principal the free-text detail of the `engine_principal.revoke` audit event is shown only to callers who hold `AuditLog:Read`; others see it marked withheld (also when the grant could not be confirmed). The newest 200 events are read; when more exist the panel says so.
+- **Audit:** success writes `engine_principal.list` or `engine_principal.get`, plus `engine_principal.role.listed` when the roles were read. A refused browser session writes no row; a refused token or engine caller does.
 
 ### Commands
 
@@ -10639,6 +10734,12 @@ A `from_result_set:<id-or-alias>` reference in the expression is resolved agains
 #### `POST /api/export/json-to-csv`
 
 Convert a JSON result set to CSV format for download.
+
+**Permission:** `Response:Read`. **Body:** a JSON array of objects, up to 100 MiB (the pre-auth body cap, [`json_to_csv_export`](#pre-auth-request-body-caps-2407)). The header row is the first object's keys.
+
+**Cells.** A string cell and every header have a leading `=`, `+`, `-`, `@`, tab or carriage return neutralised with a leading `'` (CWE-1236), then RFC 4180 quoting. A missing or `null` cell is empty. Any other non-string cell (number, boolean, nested value) is written as its JSON text with RFC 4180 quoting only, so `-5` stays `-5` and a nested object keeps its commas inside one cell; those values cannot spell a formula.
+
+**Errors.** `400` `request body nests too deeply` when the raw text nests more than 32 levels (checked before parsing); `400` `invalid JSON array` when the body is not an array, is empty (`[]`), or its first element is not a non-empty object (the first object's keys are the columns; later non-objects are skipped and keys absent from the first object are dropped); `403` without `Response:Read`. The reply is `text/csv` with `Content-Disposition: attachment; filename="export.csv"`.
 
 ---
 
@@ -11542,13 +11643,13 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `list_dex_perf_apps` | Applications with retained fleet app-perf data (the picker) |
 | `get_dex_app_perf` | Fleet trend for one application, by version, over time |
 | `list_dex_app_perf_devices` | The version-row "which devices" drill — the MCP twin of `GET /api/v1/dex/perf/app/devices`. Required `app` AND `version` (version is present-required, unlike `get_dex_app_perf`'s "omit = all versions"; pass `""` for the unknown-version bucket). Unlike its aggregate siblings in this table, each row names an `agent_id`, so it gates on `require_fleet_read` (ADR-0017) instead of a bare permission check, confining a management-group/service-scoped caller to their visible devices with the filter pushed into the store query. Emits the dedicated `dex.app_perf.devices.view` audit verb (set-and-proceed, `audit_persisted:false` on a dropped row) plus the generic `mcp.list_dex_app_perf_devices` call audit. `truncated:true` means only the highest-CPU devices are returned. |
-| `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices). A service-scoped API token is denied outright (`kPermissionDenied`) — found by this branch's own governance review (PR #3156); the same DIFFERENT-axis gap as its REST twin `GET /api/v1/dex/perf/group`. This tool's own interim deny call was retired as provably dead code (guardian-confinement-2298 PR 3 "the flip", #3290 Phase 2 bucket 1a): the shared `perm_fn` (`AuthRoutes::require_permission`) already denies any service-scoped token outright for `(GuaranteedState, Read)` before this tool-specific branch is reached, since the service-scope global-safe allow-list is seeded empty. That denial is audited under the generic `auth.permission_required` verb, not `dex.perf.group.view` (REST's twin route denies BEFORE `perm_fn` via its own `deny_fleet_wide_service_scoped` call, so REST's deny IS recorded under `dex.perf.group.view`). |
-| `get_dex_tag_app_perf` | The device-model tag-value cohort twin of `get_dex_group_app_perf` — the MCP twin of `GET /api/v1/dex/perf/tag`. Required `value` and `app`; optional `key` (default `"model"`, pattern `^[A-Za-z0-9_.:-]{1,64}$`) and `version`. An absent `key` defaults; a PRESENT `key` (including `""`) is validated like REST's `has_param`, so `key=""` `400`s identically on both transports rather than MCP silently substituting the default. Same sub-floor suppression, same service-scoped denial (`kPermissionDenied`) and the same retired-interim-deny-call / generic-`auth.permission_required`-verb posture as `get_dex_group_app_perf` above — not `dex.perf.tag.view` (REST's twin denies before `perm_fn` and IS recorded under that dedicated verb). |
+| `get_dex_group_app_perf` | One management group's app trend (the cohort floor is one device, so only an empty point is suppressed). A service-scoped API token is denied outright (`kPermissionDenied`) — found by this branch's own governance review (PR #3156); the same DIFFERENT-axis gap as its REST twin `GET /api/v1/dex/perf/group`. This tool's own interim deny call was retired as provably dead code (guardian-confinement-2298 PR 3 "the flip", #3290 Phase 2 bucket 1a): the shared `perm_fn` (`AuthRoutes::require_permission`) already denies any service-scoped token outright for `(GuaranteedState, Read)` before this tool-specific branch is reached, since the service-scope global-safe allow-list is seeded empty. That denial is audited under the generic `auth.permission_required` verb, not `dex.perf.group.view` (REST's twin route denies BEFORE `perm_fn` via its own `deny_fleet_wide_service_scoped` call, so REST's deny IS recorded under `dex.perf.group.view`). |
+| `get_dex_tag_app_perf` | The device-model tag-value cohort twin of `get_dex_group_app_perf` — the MCP twin of `GET /api/v1/dex/perf/tag`. Required `value` and `app`; optional `key` (default `"model"`, pattern `^[A-Za-z0-9_.:-]{1,64}$`) and `version`. An absent `key` defaults; a PRESENT `key` (including `""`) is validated like REST's `has_param`, so `key=""` `400`s identically on both transports rather than MCP silently substituting the default. Same one-device floor, same service-scoped denial (`kPermissionDenied`) and the same retired-interim-deny-call / generic-`auth.permission_required`-verb posture as `get_dex_group_app_perf` above — not `dex.perf.tag.view` (REST's twin denies before `perm_fn` and IS recorded under that dedicated verb). |
 | `compare_app_perf_versions` | Cohort-paired before/after comparison (the `/auto` VERIFY stage). Parameters `group`, `app`, `baseline`, `candidate` (all required) + `window` (integer days, default 7). Returns the same identity-free aggregate shape as `GET /api/v1/dex/perf/compare`. A successful call is **recorded under the generic `mcp.compare_app_perf_versions` tool-call audit** (not the REST `dex.app_perf.compare` verb) — but a service-scoped API token is denied outright (`kPermissionDenied`, found by this branch's own governance review, PR #3156) and that denial IS recorded under `dex.app_perf.compare`, matching its REST twin's deny-path verb rather than the generic one. |
 | `get_dex_device_score` (#4035) | Per-device DEX read model — the MCP twin of `GET /api/v1/dex/devices/{id}`. Score (-1 = no store configured) + this device's own signal summary. Ancestor-aware SCOPED `GuaranteedState:Read` gate (like `query_software_licenses`); every call emits `dex.device.view` (set-and-proceed, `audit_persisted:false` on a dropped row — MCP has no `Sec-Audit-Failed` header, unlike the REST twin's fail-closed 503). **#4855:** a DEGRADED signal-summary read (store closed / pool-acquire timeout / query error) returns a retryable `kInternalError` (`retry_after_ms`) instead of a result — never conflate this with the `-1` "no store" case above; the `dex.device.view` behavioral-PII audit row still records `success` (the access happened), while the separate `mcp.get_dex_device_score` tool-invocation audit flips to `failure`. |
 | `get_dex_device_app_perf` (#4035) | Per-device retained daily app-perf series — the MCP twin of `GET /api/v1/dex/devices/{id}/app-perf` (closes the gap this section previously documented as "no MCP twin"). Optional `app` narrows to one app. Same SCOPED gate + `dex.device.app_perf.view` audit posture as `get_dex_device_score`. |
 | `get_dex_app` (#4035) | App blast-radius drill — the MCP twin of `GET /api/v1/dex/app`. Required `name`, optional `window`. `devices[]` is a fleet-wide aggregate with no per-caller confinement (WS-A4 PR-1 Gate 7 fix round — an earlier per-caller resolver was retired; see the REST twin's own doc for why). `deny_fleet_wide_service_scoped` (the service-scoped-token axis) + fail-closed `try_persist_audit` under `dex.app.view` (`audit_persisted:false` on a dropped row), matching the REST twin's posture even though the dashboard fragment only audits the denial. |
-| `list_dex_apps` (#4035) | App-centric stability list — the MCP twin of `GET /api/v1/dex/apps`. No per-agent identity — not audited. |
+| `list_dex_apps` (#4035) | App-centric stability list — the MCP twin of `GET /api/v1/dex/apps`: per-version rows, Windows-scoped counts, `apps_total`/`apps_truncated` and `versions_truncated`, share/rate/score over the Windows devices online now (`distinct_devices_online` is the share's numerator), the score withheld as `offline_affected` while any affected device is offline, and a retryable error on a degraded read or one over the four-at-once read budget. No per-agent identity; no domain audit verb (the generic tool-call row is still written). |
 | `get_dex_catalogue` (ADR-0031 WS-A4 PR-1) | Signal catalogue family cards (Catalogue View 1) — the MCP twin of `GET /api/v1/dex/catalogue`. Optional `os`/`window`. No per-agent identity — not audited on success. A degraded fleet signal-summary read returns a retryable `kInternalError` (never a fabricated healthy, zero-event catalogue — WS-A4 PR-1 fix round, mirrors `get_dex_device_score`'s own #4855 degrade posture). |
 | `get_dex_catalogue_group` (#4035) | Signal-family drill (Catalogue View 2) — the MCP twin of `GET /api/v1/dex/catalogue/group`. Required `name`, optional `os`/`window`. An unknown family name returns `kInvalidParams`. `benign` (true for the one family whose window activity is routine reports, not incidents). Not audited (no per-agent identity). |
 | `get_dex_device_history` (#4035) | Per-device raw signal history — the MCP twin of `GET /api/v1/dex/devices/{id}/history`; the distinct signal-**history** capability from `get_dex_device_score` above (same device, different data). Ancestor-aware SCOPED gate, same shape as `get_dex_device_score`. Emits `dex.device.view` — the SAME verb `get_dex_device_score` uses (both the fragment and this pair deliberately reuse one verb across the two distinct per-device capabilities). |

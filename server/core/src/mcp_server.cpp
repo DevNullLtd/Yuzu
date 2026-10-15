@@ -1608,13 +1608,29 @@ static const ToolDef kTools[] = {
      R"j("audit_persisted":{"type":"boolean"}},"required":["process_name","window","crashes","hangs","signals","distinct_devices","first_seen","last_seen","modules","exceptions","devices"]})j"},
 
     {"list_dex_apps",
-     "App-centric stability list: every application with a crash/hang signal in the window, "
-     "ranked by activity. No per-agent identity (a distinct-device COUNT per app, never an "
-     "agent_id) — not audited. Mirrors GET /api/v1/dex/apps. Requires GuaranteedState:Read.",
+     "Application and per-version stability list: every application with a Windows crash/hang "
+     "signal in the window - the 100 applications affecting the most Windows devices (then "
+     "crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then "
+     "name in byte order); apps_total counts every application with a Windows crash or hang signal in the "
+     "window and apps_truncated flags the cut; up to 20 versions each, versions_truncated flags "
+     "that cut. Each row carries crashes, hangs and devices affected over the window "
+     "(distinct_devices), then the figures over one population, the Windows devices online now: "
+     "distinct_devices_online (those of the affected devices that are online now; null when no fleet source is wired), the share of "
+     "that population affected (95 percent Wilson interval), the online devices' events per "
+     "1,000 online devices (exact interval) and the stability score with its decomposition, so a "
+     "device that crashed and went offline is in the counts but not in the share, and the score is "
+     "withheld as offline_affected while any affected device is offline. "
+     "Counts are Windows-scoped (the Apps tab, the Overview top apps and get_dex_app still count "
+     "every platform) and the population is Windows devices online now (population: null = no "
+     "fleet source wired, 0 = no Windows device online now; population_basis). No device floor is applied. No per-agent identity (a distinct-device "
+     "COUNT, never an agent_id) - not audited. A degraded read is an error, never an empty list. "
+     "Mirrors GET /api/v1/dex/apps. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
-     R"j({"type":"object","properties":{"window":{"type":"string"},)j"
-     R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["subject","crashes","hangs","distinct_devices","last_seen"]}}},)j"
-     R"j("required":["window","apps"]})j"},
+     R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
+     R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},)j"
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
+     R"j("required":["window","apps","population","population_basis","apps_total","apps_truncated"]})j"},
 
     {"get_dex_catalogue",
      "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
@@ -1852,9 +1868,9 @@ static const ToolDef kTools[] = {
      "failure_rate_ratio against previous_version (the next older returned version; null "
      "for the oldest known version and for the unknown version; exact conditional "
      "interval; upper is null with unbounded=true when the previous version saw no "
-     "exposed events). This join carries no device floor (maintainer ruling): every "
-     "figure is published at any device count, and the per-(version, day) point floor "
-     "on points[] is unchanged. exposure_basis "
+     "exposed events). No device floor applies to this join or to points[] (floor of "
+     "one device): every figure is published at any device count. "
+     "exposure_basis "
      "resource_significant: exposure is the daily top-N consumers, not a census. "
      "stat_failures counts statistics that returned nothing on valid input (expected 0). "
      "Mirrors GET /api/v1/dex/perf/app. Requires GuaranteedState:Read.",
@@ -1920,10 +1936,10 @@ static const ToolDef kTools[] = {
      "trend aggregated over a single group's members (computed on-the-fly from the "
      "per-device B1 store). One point per (version, UTC day) with exact group mean+max "
      "+ bucket-resolution p50/p95 (same histogram scheme as the fleet trend). Because "
-     "a group is a set of specific devices, any point covering fewer than the floor "
-     "(10) devices is returned suppressed=true with device_count only "
-     "(means/percentiles withheld — a small named-group aggregate is de-facto "
-     "individual behaviour). Aggregate (no agent_id) — not audited. Mirrors GET "
+     "a group is a set of specific devices, the same floor as the fleet trend applies "
+     "(one device): only a point no device contributed to is returned suppressed=true "
+     "with device_count only (means/percentiles withheld). Aggregate (no agent_id) — "
+     "not audited. Mirrors GET "
      "/api/v1/dex/perf/group. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","maxLength":512,"description":"Management group id"},)j"
@@ -1949,9 +1965,9 @@ static const ToolDef kTools[] = {
      "value (default key 'model'), computed on-the-fly from the per-device B1 store — "
      "the SAME composition as get_dex_group_app_perf, just resolving membership via a "
      "device tag instead of a management group. Because a named tag-value cohort is a "
-     "set of specific devices exactly like a management group, the SAME floor (10) "
-     "suppression applies: a sub-floor point carries suppressed=true with device_count "
-     "only. Discover valid values for a key via GET /api/v1/dex/perf/cohorts?key=<key> "
+     "set of specific devices exactly like a management group, the SAME floor (one "
+     "device) applies: a point no device contributed to carries suppressed=true with "
+     "device_count only. Discover valid values for a key via GET /api/v1/dex/perf/cohorts?key=<key> "
      "(its cohorts[].cohort field lists them) — this tool answers the trend for ONE "
      "already-known value, it does not enumerate them. Aggregate (no agent_id) — not "
      "audited. Mirrors GET /api/v1/dex/perf/tag. Requires GuaranteedState:Read.",
@@ -2011,9 +2027,9 @@ static const ToolDef kTools[] = {
      "candidate_only); members with no data are no_data. EVIDENTIAL ONLY: returns "
      "the measured shift (cpu/ws before/after means, median per-machine delta, p95 "
      "across machines) + the up/flat/down split — NO verdict, NO threshold. You "
-     "judge from the evidence. NO floor (canaries are 2-3 devices): a sub-floor "
-     "paired set carries small_cohort=true (read as indicative), never suppression; "
-     "insufficient=true => no machine ran both. No per-machine row (that PII is the "
+     "judge from the evidence. NO floor (canaries are 2-3 devices): nothing is "
+     "suppressed; small_cohort stays on the wire and is false (the cohort floor is one "
+     "device); insufficient=true => no machine ran both. No per-machine row (that PII is the "
      "audited dashboard drill). The read is audited (dex.app_perf.compare, "
      "operational). Mirrors GET /api/v1/dex/perf/compare. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
@@ -15926,6 +15942,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto model = dex_api_->apps(window);
+                // A failed read or an invalid score policy is an error, never
+                // an empty or perfect list (matches the REST 503).
+                if (model.degraded) {
+                    mcp_audit("failure", "DEX store read degraded");
+                    res.set_content(
+                        a4_error(kInternalError, "DEX store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(dex_apps_json(model), kObjectOutputSchema)),
@@ -17047,7 +17073,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── /auto VERIFY before/after (parity with GET /api/v1/dex/perf/compare) ──
             // Cohort-PAIRED comparison: the per-machine before→after delta aggregated
             // over a group, EVIDENTIAL only (no verdict). NO floor (canaries are 2-3
-            // devices; a sub-floor paired set carries small_cohort=true). The aggregate
+            // devices; small_cohort stays on the wire, false at a one-device floor). The aggregate
             // carries no per-machine row (that PII is the audited dashboard drill); the
             // tool call itself is the access record (generic mcp.<tool> audit — the
             // works-council accountability that replaces the floor's suppression).
