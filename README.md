@@ -202,6 +202,10 @@ The stack publishes ports 8443 (dashboard and REST API), 8080 (redirects to HTTP
 - CMake (required by Meson's cmake dependency method)
 - C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set
+- Optional, for the Erlang gateway: Erlang/OTP 28.4 or any later 28.x, plus
+  rebar3. `meson setup` finds it (kerl, asdf, mise, Homebrew `erlang@28`,
+  distro packages, the Windows installer) and skips the gateway with a warning
+  if none matches; see [`docs/erlang-gateway-build.md`](docs/erlang-gateway-build.md).
 - Python 3 with **PyYAML** (`pip install pyyaml`, or `pacman -S python-yaml`
   on MSYS2). Required at `meson setup` for the build-time
   `InstructionDefinition` content embed; meson configure fails fast

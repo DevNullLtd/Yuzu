@@ -380,8 +380,9 @@ jobs:
             --x-manifest-root="$GITHUB_WORKSPACE"
 
       # Install Erlang/OTP + rebar3 for the gateway custom_target. The
-      # meson `gateway` custom_target fires when `find_program('rebar3')`
-      # succeeds at configure time; on the self-hosted Linux runner
+      # meson `gateway` custom_target is scheduled when rebar3 is found AND
+      # configure resolves an Erlang/OTP 28.4 or later 28.x (else it is
+      # skipped with a WARNING); on the self-hosted Linux runner
       # rebar3 sits at /home/github-runner/.local/bin/rebar3 so the
       # custom_target IS scheduled, and the Build step then dies with
       # `/usr/bin/env: 'escript': No such file or directory` if Erlang
@@ -399,8 +400,8 @@ jobs:
       # +`$GITHUB_PATH` plumbing (PR #923) which could not find Erlang
       # at all when the runner lacked a kerl/asdf/brew install — the
       # 2026-05-10 and 2026-05-17 scheduled runs both failed on this
-      # branch. Linux only — Windows uses build_gateway.py's C:\Erlang
-      # junction lookup.
+      # branch. Linux only — on Windows configure resolves the OTP under
+      # C:\Program Files (C:\Erlang is never searched).
       - name: Install Erlang/OTP and rebar3 (linux)
         if: matrix.os == 'linux'
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
