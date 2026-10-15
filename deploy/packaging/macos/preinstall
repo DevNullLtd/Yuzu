@@ -160,6 +160,23 @@ adopt_receipted_plugins() {
 # it is moved to a root-only quarantine OUTSIDE the data root and the recovery
 # snapshot, and reported. Keeping it inside the recovery snapshot (as before)
 # blocked every later recovery and install permanently (PR #4482 review).
+# The loose lane runs the root daemon from /usr/local/bin. Unlike the package's
+# own directories it is shared with other tools (Homebrew on Intel Macs, MDM
+# scripts) and must never be chmod/chown-ed by this package, so it is checked,
+# not repaired: /usr/local and /usr/local/bin must be real, root-owned and not
+# group/world writable, or a non-root user could swap the executable that
+# launchd then runs as root (PR #4482 review). Returns 1 instead of exiting so
+# recovery can decide what to do.
+loose_code_directory_trusted() {
+    local path owner mode
+    for path in /usr/local /usr/local/bin; do
+        [[ -d "$path" && ! -L "$path" ]] || return 1
+        owner="$(stat -f '%u' "$path")"
+        mode="$(stat -f '%Lp' "$path")"
+        [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || return 1
+    done
+}
+
 quarantine_legacy_app() {
     local source="$1" quarantine destination
     [[ -e "$source" || -L "$source" ]] || return 0
@@ -228,6 +245,10 @@ recover_interrupted_promotion() {
     [[ ! -d "$recovery/yuzu/plugins" ]] || mkdir -p "$YUZU_LIB/plugins"
     [[ ! -d "$recovery/yuzu/plugins" ]] || ditto "$recovery/yuzu/plugins" "$YUZU_LIB/plugins"
     quarantine_legacy_app "$recovery/legacy-retired.app"
+    if [[ -e "$recovery/loose/yuzu-agent" ]] && ! loose_code_directory_trusted; then
+        echo "WARNING: restored the previous loose-lane agent but did not start it: /usr/local or /usr/local/bin is not root-owned and non-writable" >&2
+        return 0
+    fi
     if [[ -e "$PLIST" ]]; then
         if /usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST" 2>/dev/null | \
            grep -Fq -- "$LEGACY_APP/Contents/MacOS/yuzu-agent"; then

@@ -9,6 +9,13 @@ The default package remains the loose-binary lane:
 bash deploy/packaging/macos/build-pkg.sh --bin-dir build-macos --version <version> --output dist
 ```
 
+The loose lane runs the root LaunchDaemon from `/usr/local/bin`, a directory
+the package shares with other tools and never re-owns. Installation therefore
+requires `/usr/local` and `/usr/local/bin` to be root-owned and not group- or
+world-writable (some Intel-Mac Homebrew setups loosen them); otherwise it stops
+before the running agent is touched. The signed app lane does not use
+`/usr/local/bin`.
+
 The opt-in development lane stages a signed, immutable `YuzuAgent.app` and keeps
 plugins external at `/usr/local/lib/yuzu/plugins`:
 

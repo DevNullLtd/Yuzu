@@ -414,6 +414,75 @@ MODE_FILE="{root}/lib/package-mode"; recovery="{root}/state/install-recovery.TES
             log = root / "launchctl.log"
             self.assertNotIn("bootstrap", log.read_text() if log.exists() else "")
 
+    # ── PR #4482 review (Doomgoose blocker 3): the loose lane's code directory.
+    def _loose_dir_harness(self, root: Path, body: str, owners: dict[str, str], script: str = "postinstall",
+                           names: tuple[str, ...] = ("loose_code_directory_trusted",)) -> subprocess.CompletedProcess:
+        source = (BUILD_PKG.parent / script).read_text()
+        program = "\n".join(self._script_function(source, name) for name in names)
+        local, local_bin = root / "ul", root / "ul/bin"
+        program = (program.replace("for path in /usr/local /usr/local/bin", f'for path in "{local}" "{local_bin}"')
+                   .replace("/usr/local/bin", str(local_bin)).replace("/usr/local/lib", str(root / "ul/lib"))
+                   .replace("/usr/libexec/PlistBuddy", "plist_buddy"))
+        cases = " ".join(f'"{path}") echo {uid} ;;' for path, uid in owners.items())
+        stubs = f"""set -eu
+stat() {{ if [[ "$2" == "%u" ]]; then case "$3" in {cases} *) echo 0 ;; esac; else command stat "$@"; fi; }}
+launchctl() {{ echo "$*" >> "{root}/launchctl.log"; }}
+require_started() {{ :; }}
+plist_buddy() {{ echo {local_bin}/yuzu-agent; }}
+ditto() {{ if [[ -d "$1" ]]; then mkdir -p "$2"; cp -R "$1/." "$2/"; else cp "$1" "$2"; fi; }}
+STATE_DIR="{root}/state"; LEGACY_APP="{root}/data/YuzuAgent.app"; YUZU_LIB="{root}/ul/lib/yuzu"; APP_ROOT="{root}/app"
+PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuzu/plugins"
+"""
+        return subprocess.run([PKG_SHELL, "-c", stubs + program + "\n" + body], text=True, capture_output=True)
+
+    def test_loose_code_directory_must_be_root_owned_and_not_writable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_loose_dir_") as temporary:
+            root = Path(temporary)
+            local, local_bin = root / "ul", root / "ul/bin"
+            local_bin.mkdir(parents=True)
+            def trusted(owners: dict[str, str] | None = None) -> bool:
+                result = self._loose_dir_harness(root, "loose_code_directory_trusted && echo TRUSTED", owners or {})
+                return "TRUSTED" in result.stdout
+            local.chmod(0o755); local_bin.chmod(0o755)
+            self.assertTrue(trusted())
+            local_bin.chmod(0o775)                            # Intel-Homebrew-style group-writable bin
+            self.assertFalse(trusted())
+            local_bin.chmod(0o755); local.chmod(0o777)        # writable parent: bin itself can be renamed
+            self.assertFalse(trusted())
+            local.chmod(0o755)
+            self.assertFalse(trusted({str(local_bin): "501"}))  # user-owned bin
+            local_bin.rmdir(); (root / "elsewhere").mkdir(); local_bin.symlink_to(root / "elsewhere")
+            self.assertFalse(trusted())
+
+    def test_loose_promotion_is_refused_before_the_active_service_is_touched(self) -> None:
+        postinstall = (BUILD_PKG.parent / "postinstall").read_text()
+        check = postinstall.index('if [[ "$MODE" == "loose" ]] && ! loose_code_directory_trusted; then')
+        self.assertLess(postinstall.index("loose_code_directory_trusted() {"), check)
+        self.assertLess(check, postinstall.index("require_stopped\nremove_managed_plugins"))
+        self.assertLess(check, postinstall.index("printf 'promoting\\n'"))
+
+    def test_recovery_does_not_start_a_loose_agent_from_an_untrusted_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_loose_recover_") as temporary:
+            root = Path(temporary)
+            recovery = root / "state/install-recovery.TEST"
+            for folder in ("loose", "LaunchDaemons"):
+                (recovery / folder).mkdir(parents=True)
+            (recovery / "loose/yuzu-agent").write_text("previous loose agent")
+            (recovery / "LaunchDaemons/com.yuzu.agent.plist").write_text("previous")
+            for folder in ("ul/bin", "ul/lib/yuzu/plugins", "LaunchDaemons", "app", "data"):
+                (root / folder).mkdir(parents=True, exist_ok=True)
+            (root / "ul").chmod(0o755); (root / "ul/bin").chmod(0o775)
+            result = self._loose_dir_harness(
+                root, f'recover_interrupted_promotion "{recovery}" && echo RECOVERED', {}, script="preinstall",
+                names=("loose_code_directory_trusted", "quarantine_legacy_app", "remove_managed_plugins",
+                       "recover_interrupted_promotion"))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("RECOVERED", result.stdout)
+            self.assertIn("did not start it", result.stderr)
+            self.assertEqual((root / "ul/bin/yuzu-agent").read_text(), "previous loose agent")
+            log = root / "launchctl.log"
+            self.assertNotIn("bootstrap", log.read_text() if log.exists() else "")
+
     @unittest.skipUnless(sys.platform == "darwin", "native macOS archive/plist integration")
     def test_two_stage_final_output_cms_policy_is_verified_before_publication(self) -> None:
         # Orchestration fixture, not a cryptographic claim: the verifier double
