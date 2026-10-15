@@ -43,6 +43,8 @@ using yuzu::server::ContainmentGate;
 using yuzu::server::dispatch_confined_arms;
 using yuzu::server::DispatchArm;
 using yuzu::server::DispatchResolvers;
+using yuzu::server::dispatch_system_reserved_ids;
+using yuzu::server::SystemReservedPush;
 using yuzu::server::resolve_and_dispatch_confined;
 using yuzu::server::resolve_scope_targets;
 using yuzu::server::ScopeAbortReason;    // #4981 PR-1
@@ -165,6 +167,62 @@ TEST_CASE("Ids arm: a present-EMPTY visible set reaches NOBODY (fail-closed)",
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
     CHECK_FALSE(sink.unfiltered_broadcast_used);
+}
+
+// ------------------------------------------- system-reserved Ids fan-out ---
+// `dispatch_system_reserved_ids` is the send path of REST POST /api/v1/hardware/sync and the
+// MCP twin sync_hardware_software: the reach decision is the seam's, not the caller's resolver.
+
+TEST_CASE("system-reserved ids: unfiltered authority sends to exactly the named ids",
+          "[server][dispatch][scope][security][sync_fanout]") {
+    RecordingSink sink;
+    std::vector<std::string> sent_to;
+    const auto r = dispatch_system_reserved_ids(
+        SystemReservedPush::inventory_sync_now, kThree, unfiltered(), [&](const std::string& id) {
+            sent_to.push_back(id);
+            return true;
+        });
+    CHECK(r.sent == 3);
+    CHECK(sent_to == kThree);
+    CHECK_FALSE(sink.unfiltered_broadcast_used);
+}
+
+TEST_CASE("system-reserved ids: a device outside the caller's visible set is never sent to",
+          "[server][dispatch][scope][security][sync_fanout]") {
+    std::vector<std::string> sent_to;
+    const auto r = dispatch_system_reserved_ids(
+        SystemReservedPush::inventory_sync_now, kThree, only({"dev-B"}), [&](const std::string& id) {
+            sent_to.push_back(id);
+            return true;
+        });
+    CHECK(r.sent == 1);
+    CHECK(sent_to == std::vector<std::string>{"dev-B"});
+}
+
+TEST_CASE("system-reserved ids: a present-EMPTY visible set reaches NOBODY",
+          "[server][dispatch][scope][security][sync_fanout]") {
+    int calls = 0;
+    const auto r = dispatch_system_reserved_ids(SystemReservedPush::inventory_sync_now, kThree,
+                                                deny_all(), [&](const std::string&) {
+                                                    ++calls;
+                                                    return true;
+                                                });
+    CHECK(r.sent == 0);
+    CHECK(calls == 0);
+}
+
+TEST_CASE("system-reserved ids: the control-plane exemption still reaches a quarantined device",
+          "[server][dispatch][scope][security][sync_fanout]") {
+    // A contained device keeps answering the read-only sync: no containment gate applies here.
+    std::vector<std::string> sent_to;
+    const auto r = dispatch_system_reserved_ids(
+        SystemReservedPush::inventory_sync_now, {"dev-Q"}, unfiltered(), [&](const std::string& id) {
+            sent_to.push_back(id);
+            return true;
+        });
+    CHECK(r.sent == 1);
+    CHECK(r.denied_quarantined_count == 0);
+    CHECK(sent_to == std::vector<std::string>{"dev-Q"});
 }
 
 // -------------------------------------------------------------- Group arm ---

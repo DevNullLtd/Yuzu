@@ -449,12 +449,13 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 ///   - `inventory_sync_now` asks an agent to re-run its daily-sync source(s)
 ///     and report (`__sync__.now`, ADR-0016 update). Read-only, no execution;
 ///     operator-REQUESTED but system-DISPATCHED, so it rides this door. Not
-///     quarantine-gated, same as tar_fleet_snapshot. Two operator routes use it:
+///     quarantine-gated, same as tar_fleet_snapshot. Three operator surfaces use it:
 ///     `POST /api/v1/hardware/{id}/sync` reaches ONE agent (gated on
-///     Execution:Execute for that device), and `POST /api/v1/hardware/sync` reaches
-///     up to 500 on this server process under ONE command id (gated by the type-level
-///     Execution:Execute check, the caller's visible-set intersection, the 500-target
-///     cap, a per-operator cooldown and a single in-flight run).
+///     Execution:Execute for that device), and `POST /api/v1/hardware/sync` plus the MCP tool
+///     `sync_hardware_software` reach up to 500 on this server process under ONE command id
+///     (gated by the type-level Execution:Execute check, a per-operator cooldown and a single
+///     in-flight run, with WHO IS REACHED decided here by `dispatch_system_reserved_ids`, the
+///     caller's visible-set intersection taken at send time, and the 500-target cap).
 ///   - `guardian_push_rules` delivers Guardian baseline rules the agent may
 ///     ENFORCE, and is therefore the one exempt channel that mutates the
 ///     endpoint. It is NOT arbitrary command execution: the assertion
@@ -861,6 +862,35 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
         break;
     }
     return result;
+}
+
+
+/// The system-reserved FAN-OUT arm: send one already-built system-reserved command to an explicit
+/// id list. Who is reached is decided HERE like every other operator dispatch surface: the id
+/// list is intersected with the caller's `exec_visible` set at send time (`nullopt`/present-empty
+/// semantics as in `dispatch_confined_arms`), so a hidden device is never sent to whatever the
+/// caller's own resolver returned. The containment gate is the one bypass the closed
+/// `SystemReservedPush` enumeration documents; `plugin_missing` and `os_kill_switched` stay empty
+/// because a system-reserved command is not a plugin an agent advertises (the registry still
+/// enforces the per-OS kill switch at send time).
+///
+/// `send_to` is the push's own door (`ServerImpl::send_system_reserved`); `forward_gateway_pending`
+/// stays with the caller. Only an `Ids` arm exists: a system-reserved fan-out never names `__all__`
+/// to this function (the caller expands the selector first and bounds the count).
+[[nodiscard]] inline ArmDispatchResult
+dispatch_system_reserved_ids(SystemReservedPush /*push: the closed set this bypass is for*/,
+                             const std::vector<std::string>& ids, const authz::VisibleSet& exec_visible,
+                             std::function<bool(const std::string&)> send_to) {
+    ConfinedDispatchSink sink;
+    sink.send_to = std::move(send_to);
+    sink.send_to_all_unfiltered = [] { return 0; }; // never used: only the Ids arm runs
+    sink.known_agent_ids = [] { return std::vector<std::string>{}; };
+    // presence_widens / prepare_route_fallback left unset: the per-id path always runs.
+    ConfinedDispatchTargets targets;
+    targets.agent_ids = &ids;
+    return dispatch_confined_arms(DispatchArm::Ids, targets, exec_visible,
+                                  /*broadcast_on_none=*/false, ContainmentGate::exempt_control_plugin(),
+                                  sink);
 }
 
 } // namespace yuzu::server

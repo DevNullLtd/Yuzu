@@ -252,6 +252,20 @@ std::size_t find_live_call(const std::string& src, const std::string& call) {
 }
 } // namespace
 
+TEST_CASE("mcp route registration: wiring -- server.cpp wires the software sync runner before "
+          "register_routes",
+          "[server][routes][mcp]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const auto reg = find_live_call(src, "mcp_server_->register_routes(");
+    const auto run =
+        find_live_call(src, "mcp_server_->set_software_sync_runner(software_sync_runner())");
+    REQUIRE(reg != std::string::npos);
+    REQUIRE(run != std::string::npos);
+    CHECK(run < reg);
+}
+
 TEST_CASE("mcp route registration: wiring -- server.cpp wires the deployment store and "
           "the discovery reader before register_routes",
           "[server][routes][mcp]") {

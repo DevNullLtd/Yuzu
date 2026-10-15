@@ -262,7 +262,7 @@ surface, not the **token-themed** product. Use it on the Cedar & Vale deck
 (`deploy/docker/cedar-vale/app/`) and future marketing pages. **Never on product UI** —
 `server/core/src/*_ui.cpp`, `server/core/static/*`, including in-product fleet viz (`viz_*_ui.cpp`,
 `yuzu-viz*.js` — product despite the name). Product UI stays HTMX-first, server-rendered,
-token-themed (colours come from the `--mds-*` tokens in `yuzu.css`, never hard-coded per page).
+token-themed (colours come from the `--mds-*` tokens in `yuzu.css`, never hard-coded per page). The former dark-theme-only rule was retired by owner ruling on 2026-10-15 (six schemes: three dark, three light).
 
 **No htmx `hx-on`.** Dashboard CSP is `script-src 'self' 'unsafe-inline'` (no `unsafe-eval`); htmx
 compiles `hx-on:*` with `new Function()`, which CSP **blocks at runtime — the handler silently does

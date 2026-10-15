@@ -28,7 +28,9 @@
 #include "hardware_list_model.hpp"
 #include "inventory_routes.hpp"      // InventoryDeviceRow / InventoryDevicesResult reuse
 #include "quarantine_visible.hpp"    // QuarantineListFn (list pill)
+#include "audited_write.hpp"         // WriteGate (same-site gate for the sync POSTs)
 #include "software_sync_decision.hpp" // software_sync::{Selector, Resolved, DispatchResult}
+#include "software_sync_runner.hpp"   // software_sync::Runner (the shared fleet-run sequence)
 
 #include <atomic>
 #include <cstdint>
@@ -296,8 +298,8 @@ public:
                                                                 const software_sync::Selector&)>;
     /// Send `__sync__.now {source: installed_software}` to every id as one system-reserved
     /// push (one command id, one gateway flush); `sent` counts the sessions that accepted it.
-    using SyncDispatchManyFn =
-        std::function<software_sync::DispatchResult(const std::vector<std::string>& ids)>;
+    using SyncDispatchManyFn = std::function<software_sync::DispatchResult(
+        const auth::Session&, const std::vector<std::string>& ids)>;
     /// Does the caller hold an UNFILTERED Execution:Execute (so may name the whole fleet)? Cheap
     /// by contract: no fleet read. The route asks it before taking the run guard.
     using SyncUnfilteredFn = std::function<bool(const auth::Session&)>;
@@ -345,6 +347,14 @@ public:
         SyncDispatchManyFn sync_dispatch_many_fn;
         SyncUnfilteredFn sync_caller_unfiltered_fn;
         SyncNowFn sync_now_fn;
+        /// The fleet run, shared with the MCP tool `sync_hardware_software` so the per-operator
+        /// cooldown and the single in-flight slot bind BOTH surfaces. Production wires one
+        /// instance into both; unset (a test), the route builds a private one from the
+        /// `sync_*_fn` closures above.
+        std::shared_ptr<software_sync::Runner> sync_runner;
+        /// Same-site gate for the cookie-authorised sync POSTs (both the fleet and the
+        /// per-device route). Unwired fails closed: a header-less request is refused.
+        WriteGate write_gate;
     };
 
     void register_routes(httplib::Server& svr, Deps deps);
@@ -358,12 +368,9 @@ private:
 
     Deps deps_;
 
-    // POST /api/v1/hardware/sync run state. `sync_run_mu_` guards the per-operator cooldown
-    // stamps; `sync_run_active_` is the single in-flight multi-device run. Both are per server
-    // PROCESS, not cluster-wide (each active-active replica has its own).
-    std::mutex sync_run_mu_;
-    std::unordered_map<std::string, std::int64_t> sync_last_run_;
-    std::atomic<bool> sync_run_active_{false};
+    /// The fleet-run sequence and its per-process cooldown / in-flight state (built from the
+    /// `sync_*_fn` closures when `Deps::sync_runner` is unset).
+    std::shared_ptr<software_sync::Runner> sync_runner_;
 };
 
 } // namespace yuzu::server

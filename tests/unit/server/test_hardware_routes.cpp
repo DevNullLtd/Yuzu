@@ -242,6 +242,9 @@ struct HwHarness {
         };
         deps.sync_dispatch_fn = unwire_sync_dispatch ? HardwareRoutes::SyncDispatchFn{} : sync_fn;
         deps.agent_version_fn = unwire_agent_version_fn ? HardwareRoutes::AgentVersionFn{} : version_fn;
+        // A browser sends these on every same-origin write; the per-device sync POST refuses a
+        // cookie-session write without them.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
         routes.register_routes(sink, deps);
     }
 };

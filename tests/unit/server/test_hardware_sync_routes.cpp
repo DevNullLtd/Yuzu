@@ -45,6 +45,7 @@ struct SyncHarness {
 
     bool allow_execute = true;
     std::string username = "alice";
+    std::string auth_source;       // "api_token" etc.: what the same-site gate sees
     bool audit_should_fail = false;
     std::int64_t clock = 1'700'000'000; // the route's injected "now" (seconds)
 
@@ -131,7 +132,7 @@ struct SyncHarness {
                 return precheck_override.value_or(resolved.caller_unfiltered);
             };
         if (w.dispatch)
-            deps.sync_dispatch_many_fn = [this](const std::vector<std::string>& ids) {
+            deps.sync_dispatch_many_fn = [this](const auth::Session&, const std::vector<std::string>& ids) {
                 ++dispatch_calls;
                 events.push_back("dispatch");
                 dispatched.insert(dispatched.end(), ids.begin(), ids.end());
@@ -139,6 +140,14 @@ struct SyncHarness {
                     during_dispatch();
                 return ss::DispatchResult{accept.value_or(ids.size()), "__sync__-fleet-test"};
             };
+        deps.write_gate.resolve_session = [this](const httplib::Request&) {
+            auth::Session s;
+            s.username = username;
+            s.auth_source = auth_source;
+            return std::optional<auth::Session>(s);
+        };
+        // A browser sends these on every same-origin write; the same-site tests override them.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
         routes.register_routes(sink, deps);
     }
 
@@ -427,9 +436,57 @@ TEST_CASE("sync route: a scope that could not be evaluated is 503; never 'no mat
     CHECK(contains(h.audit_details.back(), "owner_check_failed"));
 }
 
+// ── same-site write gate ──────────────────────────────────────────────────────────
+
+TEST_CASE("sync route: a cross-site, foreign-origin or header-less cookie write is 403 and sends nothing",
+          "[hardware][sync_fanout][route][security]") {
+    const std::vector<std::unordered_map<std::string, std::string>> bad = {
+        {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}}, // foreign Origin
+        {{"Host", "yuzu.test"}, {"Referer", "https://evil.example/x"}}, // foreign Referer
+        {{"Host", "yuzu.test"}},                                       // neither header
+    };
+    for (const auto& headers : bad) {
+        SyncHarness h;
+        h.live(3);
+        h.sink.default_headers = headers;
+        auto res = h.post(R"({"scope":"__all__"})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.resolve_calls == 0);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.audited("requested") == false);
+        REQUIRE_FALSE(h.audit_rows.empty());
+        CHECK(h.audit_rows.back().starts_with("csrf.denied|denied|"));
+    }
+}
+
+TEST_CASE("sync route: the same-site gate runs after the permission gate and exempts token callers",
+          "[hardware][sync_fanout][route][security]") {
+    {
+        // An unauthorised cross-site caller keeps the plain 403 and leaves no csrf row.
+        SyncHarness h;
+        h.allow_execute = false;
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+        auto res = h.post(R"({"scope":"__all__"})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.audit_rows.empty());
+    }
+    for (const char* source : {"api_token", "mcp_token"}) {
+        SyncHarness h;
+        h.live(2);
+        h.auth_source = source;
+        h.sink.default_headers = {{"Host", "yuzu.test"}}; // automation sends no Origin
+        auto res = h.post(R"({"scope":"__all__"})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(h.dispatch_calls == 1);
+    }
+}
+
 // ── bounds ────────────────────────────────────────────────────────────────────────
 
-TEST_CASE("sync route: 501 reachable devices is 413 with the count; 500 is allowed",
+TEST_CASE("sync route: 501 reachable devices is 413; 500 is allowed",
           "[hardware][sync_fanout][route][security]") {
     {
         SyncHarness h;
@@ -437,7 +494,7 @@ TEST_CASE("sync route: 501 reachable devices is 413 with the count; 500 is allow
         auto res = h.post(R"({"scope":"__all__"})");
         REQUIRE(res);
         CHECK(res->status == 413);
-        CHECK(contains(res->body, "501"));
+        // The partition stops at the first target past the cap, so the exact total is not known.
         CHECK(contains(res->body, "500"));
         CHECK(h.dispatch_calls == 0);
         CHECK(h.audited("denied"));

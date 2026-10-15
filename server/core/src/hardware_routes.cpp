@@ -186,6 +186,20 @@ void HardwareRoutes::register_routes(httplib::Server& svr, Deps deps) {
 void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     deps_ = std::move(deps);
 
+    // The fleet run: shared with the MCP twin when the server wires one; otherwise (a test) a
+    // private instance over this route's own closures.
+    sync_runner_ = deps_.sync_runner;
+    if (!sync_runner_ && deps_.sync_resolve_fn && deps_.sync_dispatch_many_fn &&
+        deps_.sync_caller_unfiltered_fn && deps_.agent_version_fn) {
+        software_sync::Env env;
+        env.resolve = deps_.sync_resolve_fn;
+        env.dispatch = deps_.sync_dispatch_many_fn;
+        env.caller_unfiltered = deps_.sync_caller_unfiltered_fn;
+        env.agent_version = deps_.agent_version_fn;
+        env.now = deps_.sync_now_fn;
+        sync_runner_ = std::make_shared<software_sync::Runner>(std::move(env));
+    }
+
     // -- Page shells (auth-only chrome; fragments carry the real gates) --
     sink.Get("/hardware", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = deps_.auth_fn(req, res);
@@ -426,6 +440,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) return;
+        if (deps_.write_gate.refuse_cross_site(deps_.audit_fn, req, res, "hardware.sync")) return;
 
         std::string source = "all";
         if (!req.body.empty()) {
@@ -543,10 +558,15 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // bound below).
     // GATE: the type-level Execution:Execute check (sync_perm_fn = require_permission), which reads
     // GLOBAL grants only, so an operator whose Execute is limited to management groups gets 403
-    // for every scope kind. The visible-set intersection (a hidden device is dropped, never
-    // reported) and the fleet-wide refusal for a filtered caller are DEFENCE IN DEPTH behind that
-    // gate: with a global grant neither changes the outcome today, and they are wired for when the
-    // gate becomes scope-aware.
+    // for every scope kind; then the same-site write gate (a cookie-session write must name this
+    // site; token callers are exempt). WHO IS REACHED is decided by `dispatch_confined_arms`
+    // (the system-reserved fan-out arm): the id list is intersected with the caller's own
+    // Execution:Execute visible set at SEND time, so a hidden device is never sent to. The
+    // resolver's narrowing (software_sync::resolve_targets) and the fleet-wide refusal for a
+    // filtered caller keep the counts, the 413 cap and the audit row from describing devices the
+    // caller may not see; with a global grant none of them changes the outcome today.
+    // The sequence (cooldown, in-flight lease, partition + cap, audit, dispatch, stamp) is
+    // software_sync::Runner, shared with the MCP tool sync_hardware_software.
     // REACH: this server process only. Sessions and sends are per process, so an agent attached to
     // another replica has no session here and is not sent to. skipped_offline = candidates this
     // process did not reach that are not too old: no live session here (disconnected, or attached
@@ -561,10 +581,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         namespace ss = software_sync;
         constexpr const char* kAction = "inventory.sync.request";
         detail::ensure_correlation_id(res);
-        const auto now = [this] { return deps_.sync_now_fn ? deps_.sync_now_fn() : now_secs(); };
-        if (!deps_.sync_perm_fn || !deps_.auth_fn || !deps_.sync_resolve_fn ||
-            !deps_.sync_dispatch_many_fn || !deps_.sync_caller_unfiltered_fn ||
-            !deps_.agent_version_fn) {
+        if (!deps_.sync_perm_fn || !deps_.auth_fn || !sync_runner_) {
             // The derivation of "which devices may this caller sync" is this route's only
             // per-device authorization, so a missing dependency is a server misconfiguration
             // (500), not a transient outage, and it is audited. Nothing here may use the
@@ -579,6 +596,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!deps_.sync_perm_fn(req, res, "Execution", "Execute")) return;
         const auto session = deps_.auth_fn(req, res);
         if (!session) return;
+        // After the permission gate (an unauthorised caller keeps its 403) and before anything
+        // is parsed, resolved, slotted, audited or sent.
+        if (deps_.write_gate.refuse_cross_site(deps_.audit_fn, req, res, "hardware.sync")) return;
 
         const auto parsed = ss::parse_request(nlohmann::json::parse(req.body, nullptr, false));
         if (!parsed) {
@@ -588,157 +608,35 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(detail::a4_error(res, parsed.error()), "application/json");
             return;
         }
-        const ss::Selector& sel = *parsed;
-        const char* const target_type = sel.arm == DispatchArm::Ids ? "Agent" : "Scope";
-        const std::string target_id = ss::target_label(sel);
-        const auto refuse = [&](int status, const std::string& message, const std::string& why,
-                                const detail::A4ErrorOpts& opts = {}) {
-            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "denied", target_type,
-                                            target_id, why + " scope=" + ss::audit_token(sel.expr));
-            res.status = status;
-            res.set_content(detail::a4_error(res, message, opts), "application/json");
+
+        // The audit sink for this request: refusals are best-effort rows, the pre-dispatch row
+        // is fail closed (`emit_behavioral_audit` also marks the response Sec-Audit-Failed).
+        ss::Audit audit;
+        audit.note = [&](std::string_view result, std::string_view type, const std::string& id,
+                         const std::string& detail_text) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, std::string(result),
+                                            std::string(type), id, detail_text);
         };
-        const auto refuse_fleet_wide = [&] {
-            refuse(403, "syncing the whole fleet needs a fleet-wide Execution:Execute grant",
-                   "fleet_wide_required");
+        audit.persist = [&](std::string_view result, std::string_view type, const std::string& id,
+                            const std::string& detail_text) {
+            return detail::emit_behavioral_audit(deps_.audit_fn, req, res, kAction, std::string(result),
+                                                 std::string(type), id, detail_text);
         };
-
-        // A confined caller naming the whole fleet is refused HERE: before it can take the
-        // in-flight slot below and before the resolver reads the fleet. ss::decide applies the
-        // same rule again to the resolver's own answer (defence in depth).
-        if (sel.arm == DispatchArm::Broadcast &&
-            ss::fleet_wide_denied(sel.arm, deps_.sync_caller_unfiltered_fn(*session))) {
-            refuse_fleet_wide();
+        const auto out = sync_runner_->run(*session, *parsed, audit);
+        if (out.status != ss::Status::Accepted) {
+            if (out.status == ss::Status::Cooldown)
+                res.set_header("Retry-After", std::to_string(out.retry_after_secs));
+            res.status = out.http;
+            if (out.retry_after_ms >= 0)
+                res.set_content(detail::a4_error(res, out.message, {.retry_after_ms = out.retry_after_ms}),
+                                "application/json");
+            else
+                res.set_content(detail::a4_error(res, out.message), "application/json");
             return;
         }
-
-        // Ordering: preflight 403 -> cooldown 429 -> slot 409 -> resolve -> decide -> audit ->
-        // dispatch. One multi-device run at a time and one per operator per minute, both per
-        // server process. The cooldown is read BEFORE the slot so a 429 never occupies it, and
-        // the slot is held to the end of the handler, so the stamp after dispatch cannot
-        // interleave with another run. Note the dispatch loop is sequential: a connected agent
-        // that has stopped reading holds the slot (a concurrent run gets 409) until it reads or
-        // disconnects; no clear time is promised.
-        struct RunGuard {
-            RunGuard() = default;
-            RunGuard(const RunGuard&) = delete; // a copy would release the slot twice
-            RunGuard& operator=(const RunGuard&) = delete;
-            std::atomic<bool>* flag{nullptr};
-            void release() {
-                if (flag) flag->store(false);
-                flag = nullptr;
-            }
-            ~RunGuard() { release(); }
-        } run_guard;
-        static_assert(!std::is_copy_constructible_v<RunGuard> && !std::is_move_constructible_v<RunGuard> &&
-                          !std::is_copy_assignable_v<RunGuard> && !std::is_move_assignable_v<RunGuard>,
-                      "a copied, moved or assigned guard would release the slot twice");
-        const bool guarded = ss::needs_run_guard(sel.arm);
-        const auto cooldown_wait = [&] {
-            std::optional<std::int64_t> last;
-            {
-                std::lock_guard<std::mutex> lk(sync_run_mu_);
-                last = ss::last_run_of(sync_last_run_, session->username);
-            }
-            return ss::cooldown_remaining(last, now()); // the clock is read outside the lock
-        };
-        const auto refuse_cooldown = [&](std::int64_t wait) {
-            res.set_header("Retry-After", std::to_string(wait));
-            refuse(429, "a sync run was requested a moment ago; wait " + std::to_string(wait) + "s",
-                   "rate_limited cooldown=" + std::to_string(wait) + "s", {.retry_after_ms = wait * 1000});
-        };
-        if (guarded) {
-            if (const auto wait = cooldown_wait(); wait > 0) {
-                refuse_cooldown(wait);
-                return;
-            }
-            bool idle = false;
-            if (!sync_run_active_.compare_exchange_strong(idle, true)) {
-                refuse(409, "another sync run is already in progress; try again in a moment",
-                       "run_in_flight", {.retry_after_ms = 5000});
-                return;
-            }
-            run_guard.flag = &sync_run_active_;
-            // This operator's previous run may have stamped between the check above and taking
-            // the slot. Release the slot before the refusal's audit write.
-            if (const auto wait = cooldown_wait(); wait > 0) {
-                run_guard.release();
-                refuse_cooldown(wait);
-                return;
-            }
-        }
-
-        const auto resolved = deps_.sync_resolve_fn(*session, sel);
-        if (resolved.status == ss::Resolved::Status::InvalidScope) {
-            refuse(400, "invalid scope: " + resolved.detail, "invalid_scope");
-            return;
-        }
-        if (resolved.status != ss::Resolved::Status::Ok) {
-            // A degraded store or a failed owner check: never "no matches". Nothing was sent.
-            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "failure", target_type,
-                                            target_id,
-                                            "scope_unresolved reason=" + ss::audit_token(resolved.detail));
-            res.status = 503;
-            res.set_content(detail::a4_error(res, "the scope could not be evaluated; no device was contacted",
-                                             {.retry_after_ms = 5000}),
-                            "application/json");
-            return;
-        }
-
-        // ponytail: one registry session lookup per candidate, so O(fleet) for __all__ before
-        // the 500 cap applies; ADR-3007's paced run replaces both when the fleet outgrows it.
-        std::vector<ss::Candidate> candidates;
-        candidates.reserve(resolved.ids.size());
-        for (const auto& id : resolved.ids)
-            candidates.push_back({id, deps_.agent_version_fn(id)}); // a session on THIS process, or nullopt
-        const auto plan = ss::partition(
-            candidates, [](std::string_view v) { return agent_supports_sync_now(v); });
-
-        switch (ss::decide(sel.arm, resolved.caller_unfiltered, plan.counts)) {
-        case ss::Verdict::FleetWideRequired:
-            refuse_fleet_wide();
-            return;
-        case ss::Verdict::TooMany:
-            refuse(413,
-                   "this would reach " + std::to_string(plan.counts.reached) + " devices; the limit is " +
-                       std::to_string(ss::kMaxTargets) + " per request — narrow the scope",
-                   "over_cap reached=" + std::to_string(plan.counts.reached) +
-                       " cap=" + std::to_string(ss::kMaxTargets));
-            return;
-        case ss::Verdict::Proceed: break;
-        }
-
-        // Audit BEFORE dispatch and fail closed — same contract as the per-device route.
-        if (!detail::emit_behavioral_audit(deps_.audit_fn, req, res, kAction, ss::audit_result(plan.counts),
-                                           target_type, target_id, ss::audit_detail(sel, plan.counts))) {
-            res.status = 503;
-            res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
-                                             {.retry_after_ms = 5000}),
-                            "application/json");
-            return;
-        }
-
-        ss::DispatchResult sent;
-        if (!plan.targets.empty())
-            sent = deps_.sync_dispatch_many_fn(plan.targets);
-        if (!plan.targets.empty() && sent.sent == 0) {
-            res.status = 503;
-            res.set_content(detail::a4_error(res, "no selected device is reachable right now",
-                                             {.retry_after_ms = 30000}),
-                            "application/json");
-            return;
-        }
-        if (guarded && sent.sent > 0) {
-            const auto stamp_at = now(); // the clock is read outside the lock
-            std::lock_guard<std::mutex> lk(sync_run_mu_);
-            ss::stamp(sync_last_run_, session->username, stamp_at);
-        }
-        nlohmann::json out = {
-            {"data", ss::summary_json(ss::finalize(plan.counts, sent.sent), sent.command_id, now())},
-            {"meta", {{"api_version", "v1"}}},
-        };
+        nlohmann::json body = {{"data", out.summary}, {"meta", {{"api_version", "v1"}}}};
         res.status = 202;
-        res.set_content(out.dump(), "application/json");
+        res.set_content(body.dump(), "application/json");
     });
 
     // -- REST v1: GET /api/v1/hardware --
