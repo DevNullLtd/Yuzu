@@ -32,6 +32,7 @@ using yuzu::server::test::MockIdp;
 namespace {
 
 constexpr const char* kRefused = "address not permitted";
+constexpr const char* kCleartextPublic = "plain http is not permitted to a public address";
 
 /// Gives names an answer for the life of the guard, then restores the OS resolver.
 struct ResolverGuard {
@@ -210,6 +211,88 @@ TEST_CASE("OIDC egress: a name is resolved, every answer classified, and the con
         REQUIRE_FALSE(doc.has_value());
         CHECK(doc.error().find("did not resolve") != std::string::npos);
         CHECK(idp.discovery_calls.load() == 0);
+    }
+}
+
+TEST_CASE("OIDC egress: plain http to a public address is refused, whatever the operator switch",
+          "[oidc][oidc_egress][security]") {
+    // No case connects to a public address: every refusal happens before a socket exists, and the
+    // https side of the rule is pinned as a pure decision in test_oidc_egress_policy.cpp.
+    MockIdp idp;
+    const std::string issuer = "http://idp.test:" + std::to_string(idp.port);
+    idp.with([&](MockIdp& m) { m.discovery_issuer = issuer; });
+
+    SECTION("a name that resolves to a public address is refused with the switch on and off") {
+        ResolverGuard resolver(
+            [](const std::string&) -> std::vector<std::string> { return {"93.184.216.34"}; });
+        for (const bool allow : {false, true}) {
+            CAPTURE(allow);
+            yuzu::test::LogCapture cap(spdlog::level::warn);
+            auto doc = OidcProvider::fetch_discovery_document(issuer, false, allow, 2000);
+            cap.stop();
+            REQUIRE_FALSE(doc.has_value());
+            CHECK(doc.error().find(kCleartextPublic) != std::string::npos);
+            CHECK(doc.error().find(kRefused) == std::string::npos);
+            CHECK(doc.error().find("93.184.216.34") == std::string::npos);
+            CHECK(cap.text().find("plain http") != std::string::npos);
+            CHECK(cap.text().find("93.184.216.34") == std::string::npos);
+            auto body = OidcProvider::http_get_bounded(issuer + "/jwks", false, allow, 2000);
+            REQUIRE_FALSE(body.has_value());
+            CHECK(body.error().find(kCleartextPublic) != std::string::npos);
+        }
+        CHECK(idp.discovery_calls.load() == 0);
+        CHECK(idp.jwks_calls.load() == 0);
+    }
+    SECTION("a public address in a mixed plain-http answer is skipped, not connected to") {
+        ResolverGuard resolver([](const std::string&) -> std::vector<std::string> {
+            return {"93.184.216.34", "127.0.0.1"};
+        });
+        auto doc = OidcProvider::fetch_discovery_document(issuer, false, true, 2000);
+        REQUIRE(doc.has_value()); // only the loopback answer was pinned, and the mock saw it
+        CHECK(idp.discovery_calls.load() == 1);
+    }
+    SECTION("a private address over plain http still needs the switch, and works with it") {
+        ResolverGuard resolver(
+            [](const std::string&) -> std::vector<std::string> { return {"127.0.0.1"}; });
+        auto refused = OidcProvider::fetch_discovery_document(issuer, false, false, 2000);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find(kRefused) != std::string::npos);
+        CHECK(refused.error().find(kCleartextPublic) == std::string::npos);
+        CHECK(OidcProvider::fetch_discovery_document(issuer, false, true, 2000).has_value());
+    }
+    SECTION("an IP literal is refused the same way, with the switch on and off") {
+        for (const char* url : {"http://8.8.8.8", "http://8.8.8.8:8080/realms/x",
+                                "http://[2606:4700:4700::1111]", "http://[::ffff:808:808]"}) {
+            CAPTURE(url);
+            for (const bool allow : {false, true}) {
+                CAPTURE(allow);
+                auto doc = OidcProvider::fetch_discovery_document(url, false, allow, 1000);
+                REQUIRE_FALSE(doc.has_value());
+                CHECK(doc.error().find(kCleartextPublic) != std::string::npos);
+                auto body =
+                    OidcProvider::http_get_bounded(std::string(url) + "/jwks", false, allow, 1000);
+                REQUIRE_FALSE(body.has_value());
+                CHECK(body.error().find(kCleartextPublic) != std::string::npos);
+            }
+        }
+    }
+    SECTION("the token POST to a plain-http public endpoint is refused, the secret never sent") {
+        idp.with([](MockIdp& m) {
+            m.discovery_body = R"({"issuer":")" + m.base() + R"(","authorization_endpoint":")" +
+                               m.base() +
+                               R"(/authorize","token_endpoint":"http://8.8.8.8/token",)" +
+                               R"("jwks_uri":")" + m.base() + R"(/jwks"})";
+        });
+        const auto cfg = provider_cfg(idp.base(), true);
+        OidcProvider provider(cfg);
+        const auto flow = provider.start_auth_flow();
+        REQUIRE_FALSE(idp.follow_authorize(flow.url).empty());
+        auto r = provider.handle_callback("the-code",
+                                          yuzu::server::test::url_query_param(flow.url, "state"),
+                                          flow.binding_secret);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find(kCleartextPublic) != std::string::npos);
+        CHECK(idp.token_calls.load() == 0);
     }
 }
 

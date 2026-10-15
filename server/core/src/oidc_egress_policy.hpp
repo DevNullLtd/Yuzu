@@ -20,6 +20,20 @@
 // An IPv6 address that embeds an IPv4 address (IPv4-mapped ::ffff:0:0/96, NAT64 64:ff9b::/96, 6to4
 // 2002::/16) is classified by the embedded IPv4 address, so `::ffff:169.254.169.254` is
 // link-local, not "public IPv6". A public embedded address stays public.
+//
+// Third rule, on the TRANSPORT rather than the address: plain http (`cleartext`) to a PUBLIC
+// address is refused outright, with no switch. That is the realistic internet man-in-the-middle
+// case (anyone on the path forges the discovery document, the JWKS or the token response); https
+// to a public address is unchanged. Plain http to a loopback/private/carrier-grade-NAT/unique-local
+// address stays governed by `--oidc-allow-private-networks` alone, and stays exposed to anyone on
+// that network path.
+//
+// KNOWN LIMIT: the classification is of the address AS THE SERVER SEES IT. Besides the well-known
+// NAT64 prefix and 6to4 above, it cannot know an operator's network-specific NAT64 prefix
+// (RFC 6052 section 2.2), a proxy, a VPN or any other translator in the path, so an address in
+// 2000::/3 that such a translator maps to a private IPv4 destination classifies as Public. Plain
+// http to it is refused by the cleartext rule; https to it is limited to a blind TCP connect,
+// because TLS verification still uses the host name.
 
 #include <array>
 #include <cstddef>
@@ -289,6 +303,15 @@ constexpr Verdict decision(AddressClass c, bool allow_private) {
         return Verdict::Refuse;
     }
     return Verdict::Refuse; // an out-of-range value fails closed
+}
+
+/// As above for a request over `cleartext` (plain http) or not: a PUBLIC address is never allowed
+/// over plain http, whatever the operator's switch; every other class decides as the two-argument
+/// form does.
+constexpr Verdict decision(AddressClass c, bool allow_private, bool cleartext) {
+    if (cleartext && c == AddressClass::Public)
+        return Verdict::Refuse;
+    return decision(c, allow_private);
 }
 
 /// A fixed label for logs (never the address itself).

@@ -173,6 +173,10 @@ public:
     /// "request failed: " + this on the GET paths, "token endpoint request failed: " + this on the
     /// token POST). Never carries the resolved address.
     static constexpr const char* kEgressRefused = "address not permitted by the OIDC egress policy";
+    /// The fixed reason (same prefixes as `kEgressRefused`) for plain http to a PUBLIC address,
+    /// which is refused whatever `--oidc-allow-private-networks` says. Names no address.
+    static constexpr const char* kEgressCleartextPublicRefused =
+        "plain http is not permitted to a public address";
 
     /// The bounds on every IdP GET (discovery, JWKS, Test Connection), pinned by name in
     /// tests/unit/server/test_oidc_provider.cpp so a silent edit fails a test: the
@@ -335,8 +339,11 @@ public:
     /// (cloud metadata included), unspecified, multicast and reserved addresses are always
     /// refused; loopback, RFC 1918, carrier-grade NAT and unique-local ones are refused unless
     /// `allow_private_networks` (the operator's `--oidc-allow-private-networks`). A refusal is the
-    /// fixed `kEgressRefused` text and names no address. Name resolution is inside the total
-    /// bound. Only the first permitted address is tried (no fallback to the others).
+    /// fixed `kEgressRefused` text and names no address. Plain http (an `http://` URL) to a PUBLIC
+    /// address is refused outright, with the distinct fixed `kEgressCleartextPublicRefused` text,
+    /// whatever `allow_private_networks` says; plain http to a loopback/private address still
+    /// needs that flag. Name resolution is inside the total bound. Up to four permitted addresses
+    /// are tried in order while the connect fails (any other outcome is final).
     [[nodiscard]] static std::expected<std::string, std::string>
     http_get_bounded(const std::string& url, bool skip_tls_verify, bool allow_private_networks,
                      int timeout_ms = kHttpOperationTimeoutMs);

@@ -585,6 +585,14 @@ OidcProvider::validate_claims(const IdTokenClaims& claims,
     return {};
 }
 
+// ── IdP response size cap ────────────────────────────────────────────────────
+
+namespace {
+// The most bytes read from any IdP response: a discovery document, a JWKS (GET) and a token
+// endpoint reply (POST on every platform) are a few KiB. The one definition for all of them.
+constexpr std::size_t kHttpMaxBody = 256 * 1024;
+} // namespace
+
 // ── WinHTTP helper (Windows only) ────────────────────────────────────────────
 
 #ifdef _WIN32
@@ -671,6 +679,15 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
             DWORD bytes_read = 0;
             WinHttpReadData(request, buf.data(), bytes_available, &bytes_read);
             response.append(buf.data(), bytes_read);
+            // Same cap as the POSIX client: an oversize reply is a failure (empty), not a
+            // reason to keep growing.
+            if (response.size() > kHttpMaxBody) {
+                spdlog::error("WinHTTP: response exceeds {} bytes, aborting", kHttpMaxBody);
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                return {};
+            }
         }
     } while (bytes_available > 0);
 
@@ -750,6 +767,7 @@ struct HttpUrl {
     std::string origin;
     std::string host; // the authority's host, brackets stripped (what httplib connects to)
     std::string path;
+    bool cleartext{}; // plain http (the egress policy refuses it to a public address)
 };
 
 // Splits "http(s)://authority[/path][?query][#fragment]" at the FIRST of '/', '?' or '#' after
@@ -773,6 +791,7 @@ std::optional<HttpUrl> split_http_url(const std::string& url) {
         return std::nullopt;
     HttpUrl out;
     out.origin = std::string(scheme) + std::string(authority);
+    out.cleartext = scheme == "http://";
     // authority_well_formed vouched for the shape: "[hex:colons]" or "host" before an optional
     // ":port". This is the same host httplib::Client's constructor extracts from the origin.
     out.host = std::string(authority.starts_with('[') ? authority.substr(1, authority.find(']') - 1)
@@ -819,8 +838,9 @@ std::string_view truncate_utf8(std::string_view s, std::size_t max) {
 
 // ── Egress policy (oidc_egress_policy.hpp) ───────────────────────────────────
 
-// The fixed reasons a vetted target is not connected to. Neither names a resolved address.
+// The fixed reasons a vetted target is not connected to. None names a resolved address.
 constexpr const char* kEgressRefusedReason = OidcProvider::kEgressRefused;
+constexpr const char* kEgressCleartextPublicReason = OidcProvider::kEgressCleartextPublicRefused;
 constexpr const char* kEgressUnresolvedReason = "the host name did not resolve";
 
 // Decides where ONE fetch may connect, BEFORE any socket exists. A host that is an IP literal is
@@ -963,9 +983,16 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 #endif
 
 std::expected<std::vector<std::string>, const char*>
-vet_egress_target(const std::string& host, bool allow_private, int dns_timeout_ms) {
+vet_egress_target(const std::string& host, bool allow_private, bool cleartext, int dns_timeout_ms) {
     namespace egress = ::yuzu::server::oidc::egress;
     const auto refuse = [&](egress::AddressClass cls) -> std::unexpected<const char*> {
+        // Plain http to a public address is refused whatever the switch says (a distinct reason).
+        if (cleartext && cls == egress::AddressClass::Public) {
+            spdlog::warn("OIDC egress: refused host '{}': plain http to a {} address (never "
+                         "allowed; use an https URL)",
+                         ::yuzu::log_key_token(host), egress::class_name(cls));
+            return std::unexpected(kEgressCleartextPublicReason);
+        }
         spdlog::warn("OIDC egress: refused host '{}': {} address{}", ::yuzu::log_key_token(host),
                      egress::class_name(cls),
                      egress::decision(cls, true) == egress::Verdict::Allow
@@ -975,7 +1002,7 @@ vet_egress_target(const std::string& host, bool allow_private, int dns_timeout_m
     };
 
     if (const auto literal = egress::classify_literal(host)) {
-        if (egress::decision(*literal, allow_private) != egress::Verdict::Allow)
+        if (egress::decision(*literal, allow_private, cleartext) != egress::Verdict::Allow)
             return refuse(*literal);
         return std::vector<std::string>{};
     }
@@ -983,7 +1010,7 @@ vet_egress_target(const std::string& host, bool allow_private, int dns_timeout_m
     std::vector<std::string> pins;
     std::optional<egress::AddressClass> first_refused;
     const auto consider = [&](egress::AddressClass cls, const char* text) {
-        if (egress::decision(cls, allow_private) == egress::Verdict::Allow) {
+        if (egress::decision(cls, allow_private, cleartext) == egress::Verdict::Allow) {
             if (pins.size() < kMaxPinnedAddresses &&
                 std::find(pins.begin(), pins.end(), text) == pins.end())
                 pins.emplace_back(text);
@@ -1074,7 +1101,7 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     if (!egress_target)
         return std::unexpected("invalid token endpoint URL");
     if (const auto vet = vet_egress_target(egress_target->host, config_.allow_private_networks,
-                                           kHttpOperationTimeoutMs);
+                                           egress_target->cleartext, kHttpOperationTimeoutMs);
         !vet) {
         spdlog::error("OIDC token exchange: request refused: {}", vet.error());
         return std::unexpected(std::string("token endpoint request failed: ") + vet.error());
@@ -1103,7 +1130,8 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
         // function the GETs use); nothing is sent to an address the policy refuses. A failed
         // CONNECT moves on to the next permitted address (no request was sent, so a retry is
         // safe); any other outcome is final.
-        const auto pins = vet_egress_target(target->host, config_.allow_private_networks, 10000);
+        const auto pins = vet_egress_target(target->host, config_.allow_private_networks,
+                                            target->cleartext, 10000);
         if (!pins) {
             spdlog::error("OIDC token exchange: request refused: {}", pins.error());
             return std::unexpected(std::string("token endpoint request failed: ") + pins.error());
@@ -1119,6 +1147,7 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
             client->set_connection_timeout(10);
             client->set_read_timeout(15);
             client->set_write_timeout(15);
+            client->set_payload_max_length(kHttpMaxBody);
             client->enable_server_certificate_verification(!config_.skip_tls_verify);
             httplib::Headers headers;
             if (!auth_header.empty())
@@ -1272,16 +1301,43 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
             return std::unexpected("JWKS response missing 'keys' array");
 
         std::vector<CachedJwk> keys;
+        // IdP-controlled JSON: one malformed key (not an object, or a `use`/`kid`/`alg` that is
+        // not a string, or key material of the wrong type) is skipped and its siblings are kept;
+        // only a structural error in the document fails the whole parse (the catch below).
+        std::size_t index = 0;
         for (const auto& key : j["keys"]) {
-            auto use = key.value("use", "sig");
+            const std::size_t at = index++;
+            const auto string_member = [&key](const char* name, const char* fallback,
+                                              std::string& out) {
+                const auto it = key.find(name);
+                if (it == key.end()) {
+                    out = fallback;
+                    return true;
+                }
+                if (!it->is_string())
+                    return false;
+                out = it->get<std::string>();
+                return true;
+            };
+            std::string use;
+            CachedJwk cached;
+            if (!key.is_object() || !string_member("use", "sig", use) ||
+                !string_member("kid", "", cached.kid) ||
+                !string_member("alg", "RS256", cached.alg)) {
+                spdlog::warn("OidcProvider: skipping JWK #{}: not an object or a use/kid/alg "
+                             "member that is not a string",
+                             at);
+                continue;
+            }
             if (use != "sig")
                 continue;
 
-            CachedJwk cached;
-            cached.kid = key.value("kid", "");
-            cached.alg = key.value("alg", "RS256");
-
-            cached.pkey = jwk_to_pkey(key);
+            try {
+                cached.pkey = jwk_to_pkey(key);
+            } catch (const std::exception&) { // kty/n/e of the wrong type
+                spdlog::warn("OidcProvider: skipping JWK #{}: key material of the wrong type", at);
+                continue;
+            }
             if (!cached.pkey) {
                 spdlog::warn("OidcProvider: failed to parse JWK kid={}",
                              ::yuzu::log_key_token(cached.kid));
@@ -1524,8 +1580,6 @@ void OidcProvider::set_jwks_key_age_for_test(std::chrono::seconds age) {
 // ── Discovery (#5692) ────────────────────────────────────────────────────────
 
 namespace {
-
-constexpr std::size_t kHttpMaxBody = 256 * 1024; // a discovery document or JWKS is a few KiB
 
 // The scheme prefix of an http(s) issuer ("" when it is neither); case-sensitive on purpose.
 std::string_view issuer_scheme(std::string_view issuer) {
@@ -1889,7 +1943,8 @@ std::expected<std::string, std::string> OidcProvider::http_get_bounded(const std
         // Egress policy: resolve and classify the target BEFORE any socket exists, then pin the
         // connect to a vetted address (see vet_egress_target). Name resolution is part of the
         // total bound below.
-        const auto pins = vet_egress_target(target->host, allow_private_networks, timeout_ms);
+        const auto pins =
+            vet_egress_target(target->host, allow_private_networks, target->cleartext, timeout_ms);
         if (!pins)
             return std::unexpected(std::string("request failed: ") + pins.error());
 
@@ -2164,8 +2219,9 @@ OidcProvider::OidcProvider(OidcConfig config) : config_(std::move(config)) {
             literal != egress::AddressClass::Loopback)
             spdlog::warn("OIDC issuer {} uses http:// on a non-loopback host: the signing keys "
                          "(the trust root for every ID token) and the client secret travel "
-                         "unencrypted and anyone on the path can forge a sign-in; use an https "
-                         "issuer outside a lab",
+                         "unencrypted and anyone on the path can forge a sign-in (plain http to a "
+                         "PUBLIC address is refused outright; a private address needs "
+                         "--oidc-allow-private-networks); use an https issuer outside a lab",
                          ::yuzu::log_key_token(config_.issuer));
     }
 }

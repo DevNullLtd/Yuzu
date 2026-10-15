@@ -210,6 +210,49 @@ TEST_CASE("OIDC egress: the two-tier decision", "[oidc][oidc_egress]") {
     CHECK(decision(bogus, true) == Verdict::Refuse);
 }
 
+TEST_CASE("OIDC egress: plain http to a public address is never allowed", "[oidc][oidc_egress]") {
+    const AddressClass all[] = {
+        AddressClass::Public,          AddressClass::Loopback,    AddressClass::Private,
+        AddressClass::CarrierGradeNat, AddressClass::UniqueLocal, AddressClass::OtherNonGlobal,
+        AddressClass::Unspecified,     AddressClass::LinkLocal,   AddressClass::CloudMetadata,
+        AddressClass::Multicast,       AddressClass::Reserved};
+    for (const auto c : all) {
+        CAPTURE(class_name(c));
+        for (const bool allow_private : {false, true}) {
+            CAPTURE(allow_private);
+            // https (not cleartext) decides exactly as the two-argument form does.
+            CHECK(decision(c, allow_private, false) == decision(c, allow_private));
+            if (c == AddressClass::Public) {
+                // The one class the cleartext rule changes: refused, with the switch on or off.
+                CHECK(decision(c, allow_private, true) == Verdict::Refuse);
+            } else {
+                // Every other class is governed by the switch alone, cleartext or not.
+                CHECK(decision(c, allow_private, true) == decision(c, allow_private));
+            }
+        }
+    }
+    // Plain http to a loopback/private address is still allowed with the switch on.
+    CHECK(decision(AddressClass::Loopback, true, true) == Verdict::Allow);
+    CHECK(decision(AddressClass::Private, true, true) == Verdict::Allow);
+    // An out-of-range value fails closed.
+    CHECK(decision(static_cast<AddressClass>(200), true, true) == Verdict::Refuse);
+}
+
+TEST_CASE("OIDC egress: a network-specific NAT64 prefix is the documented classification limit",
+          "[oidc][oidc_egress]") {
+    // The policy classifies the address as the server sees it. It decodes IPv4-mapped, the
+    // well-known NAT64 prefix 64:ff9b::/96 and 6to4, but cannot know an operator's
+    // network-specific NAT64 prefix (RFC 6052 section 2.2): an address in 2000::/3 whose last 32
+    // bits spell 169.254.169.254 under such a prefix classifies as Public. This pins that
+    // boundary so a change to it is deliberate and the documented residual stays true.
+    CHECK(classify_text("2001:4860:4860::a9fe:a9fe") == AddressClass::Public);
+    CHECK(classify_text("2606:4700:4700::a9fe:a9fe") == AddressClass::Public);
+    // The same embedded address under the well-known prefix IS decoded.
+    CHECK(classify_text("64:ff9b::a9fe:a9fe") == AddressClass::LinkLocal);
+    // Plain http to such an address is refused by the cleartext rule.
+    CHECK(decision(classify_text("2001:4860:4860::a9fe:a9fe"), true, true) == Verdict::Refuse);
+}
+
 TEST_CASE("OIDC egress: the literal parser is strict and leaves odd spellings to the resolver",
           "[oidc][oidc_egress]") {
     // Not canonical literals: classify_literal says nullopt, so the caller resolves them and

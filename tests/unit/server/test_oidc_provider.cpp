@@ -1397,6 +1397,37 @@ TEST_CASE("OIDC discovery: all three endpoints come from the document and a full
     CHECK(idp.jwks_calls.load() == 1);
 }
 
+TEST_CASE("OIDC token exchange: the token response is capped at 256 KiB",
+          "[oidc][oidc_discovery][security]") {
+    // The cap is the one used for discovery and JWKS (kHttpMaxBody in oidc_provider.cpp): a token
+    // endpoint that keeps sending must not grow server memory. The padded member rides beside a
+    // valid id_token, so only the size decides the outcome.
+    const auto login = [](std::size_t pad) {
+        MockIdp idp;
+        idp.with([&](MockIdp& m) { m.token_body_pad = pad; });
+        const auto cfg = discovery_cfg(idp);
+        OidcProvider provider(cfg);
+        const auto flow = provider.start_auth_flow();
+        REQUIRE_FALSE(idp.follow_authorize(flow.url).empty());
+        auto claims = provider.handle_callback(
+            "the-code", yuzu::server::test::url_query_param(flow.url, "state"),
+            flow.binding_secret);
+        CHECK(idp.token_calls.load() == 1);
+        return claims;
+    };
+
+    SECTION("a 100 KiB response is accepted (boundary control)") {
+        const auto claims = login(100 * 1024);
+        REQUIRE(claims.has_value());
+        CHECK(claims->sub == "alice-sub");
+    }
+    SECTION("a 300 KiB response fails with the fixed token-endpoint error") {
+        const auto claims = login(300 * 1024);
+        REQUIRE_FALSE(claims.has_value());
+        CHECK(claims.error().starts_with("token endpoint request failed"));
+    }
+}
+
 TEST_CASE("OIDC discovery: an explicitly configured field is authoritative and is never discovered",
           "[oidc][oidc_discovery]") {
     MockIdp idp;
@@ -3653,6 +3684,77 @@ TEST_CASE("OIDC JWKS: a document with no usable keys does not displace the cache
     REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-2")).has_value());
 }
 
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+// ── One malformed key does not discard its siblings (#5692 C7) ───────────────
+
+TEST_CASE("OIDC JWKS: a key with a member of the wrong type is skipped, its siblings are kept",
+          "[oidc][oidc_discovery][security]") {
+    // jwks_json() is one well-formed RSA key under `kid`; splice the malformed keys before it.
+    const auto with_bad = [](const std::string& bad_keys) {
+        auto good = nlohmann::json::parse(yuzu::server::test::jwks_json("good-kid"));
+        auto doc = nlohmann::json::parse(R"({"keys":[)" + bad_keys + "]}");
+        for (auto& k : good["keys"])
+            doc["keys"].push_back(k);
+        return doc.dump();
+    };
+    const char* bad[] = {
+        R"({"kty":"RSA","kid":null,"n":"AQAB","e":"AQAB"})",
+        R"({"kty":"RSA","kid":5,"n":"AQAB","e":"AQAB"})",
+        R"({"kty":"RSA","use":5,"kid":"x","n":"AQAB","e":"AQAB"})",
+        R"({"kty":"RSA","use":"sig","alg":[],"kid":"x","n":"AQAB","e":"AQAB"})",
+        R"({"kty":"RSA","kid":"x","n":5,"e":"AQAB"})",
+        R"({"kty":5})",
+        R"(5)",
+        R"("a string")",
+        R"(null)",
+        R"([])",
+    };
+    for (const char* b : bad) {
+        CAPTURE(b);
+        const auto keys = OidcProvider::parse_jwks(with_bad(b));
+        REQUIRE(keys.has_value());
+        REQUIRE(keys->size() == 1);
+        CHECK((*keys)[0].kid == "good-kid");
+        CHECK((*keys)[0].pkey != nullptr);
+    }
+    // Every key malformed: the document parses, with nothing usable (the pre-existing behavior;
+    // fetch_jwks then refuses to replace a cached set with it).
+    const auto none =
+        OidcProvider::parse_jwks(R"({"keys":[{"kty":"RSA","kid":null,"n":"AQAB","e":"AQAB"},5]})");
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+    // A structural error still fails the whole document.
+    CHECK_FALSE(OidcProvider::parse_jwks(R"({"keys":5})").has_value());
+}
+
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
+TEST_CASE("OIDC JWKS: a served set with one malformed key still verifies tokens under the good key",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    idp.with([](MockIdp& m) {
+        auto doc = nlohmann::json::parse(yuzu::server::test::jwks_json("mock-kid-1"));
+        doc["keys"].insert(
+            doc["keys"].begin(),
+            nlohmann::json::parse(R"({"kty":"RSA","kid":null,"n":"AQAB","e":"AQAB"})"));
+        m.jwks_body = doc.dump();
+    });
+    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    CHECK(idp.jwks_calls.load() == 1);
+}
+
+TEST_CASE("OIDC JWKS: a served set whose every key is malformed keeps the no-usable-keys behavior",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    idp.with([](MockIdp& m) { m.jwks_body = R"({"keys":[{"kty":"RSA","kid":null},5]})"; });
+    const auto r = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(idp.jwks_calls.load() >= 1);
+}
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
 
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN

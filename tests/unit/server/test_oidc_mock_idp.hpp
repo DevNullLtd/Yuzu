@@ -87,6 +87,9 @@ struct MockIdp {
     // Non-empty `token_body` = POST /token answers it verbatim, with `token_status`.
     std::string token_body;
     int token_status{200};
+    // > 0 = the normal POST /token answer carries an extra `"pad":"xxx..."` member of this many
+    // bytes (a token response of a chosen size; the id_token itself stays valid).
+    std::size_t token_body_pad{0};
     // Non-empty = the discovery document advertises `base() + token_endpoint_advert` as its
     // token_endpoint (default "/token"): "/token?p=b2c_1_signin" is a query-bearing endpoint,
     // "?x=1" an EMPTY path with a query. `last_token_target` (under mu) is the request target
@@ -214,7 +217,13 @@ struct MockIdp {
                     tok = rs256_sign(token_kid, id_token_payload(c, last_nonce, "alice-sub"));
                 }
             }
-            res.set_content(R"({"id_token":")" + tok + R"(","token_type":"Bearer"})",
+            std::string pad;
+            {
+                std::lock_guard lk(mu);
+                if (token_body_pad > 0)
+                    pad = R"(,"pad":")" + std::string(token_body_pad, 'x') + '"';
+            }
+            res.set_content(R"({"id_token":")" + tok + R"(","token_type":"Bearer")" + pad + "}",
                             "application/json");
         };
         svr.Post("/token", token_handler);
