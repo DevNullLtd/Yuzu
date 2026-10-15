@@ -4469,6 +4469,26 @@ void SettingsRoutes::register_routes(
     sink.Post("/api/settings/oidc", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        // admin_fn_ admits a JIT-elevated session, but the sign-in provider (issuer, client,
+        // admin group) decides who becomes a STANDING administrator at the next SSO login, so
+        // an elevated session must not change it. Same own-role rule as the role-change route.
+        const auto caller = auth_fn_(req, res);
+        if (!caller) {
+            res.status = 401;
+            return;
+        }
+        if (caller->role != auth::Role::admin) {
+            audit_fn_(req, "oidc.configure", "denied", "OidcConfig", "",
+                      "elevated_session_oidc_change_blocked");
+            res.status = 403;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Changing sign-in provider settings needs your own administrator role, not an elevation","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Changing sign-in provider settings needs your "
+                                                  "own administrator role, not a temporary "
+                                                  "elevation"),
+                            "application/json");
+            return;
+        }
 
         auto issuer = extract_form_value(req.body, "issuer");
         auto client_id = extract_form_value(req.body, "client_id");
@@ -5185,6 +5205,24 @@ void SettingsRoutes::register_routes(
         auto session = auth_fn_(req, res);
         if (!session) {
             res.status = 401;
+            return;
+        }
+        // admin_fn_ admits a JIT-elevated session (effective_role). An elevation is temporary
+        // authority, and an account role is a STANDING grant: letting an elevated `user`
+        // change an account's role would turn the elevation into a durable administrator that
+        // outlives the window (the same principle as rbac_admin_predicate.hpp, decision 1).
+        // Require the session's own role (`session->role`, not `effective_role`): a local
+        // account's role, or the IdP-mapped role of an SSO session. Sessions are wiped on a
+        // role change, which bounds how stale that cached role can be.
+        if (session->role != auth::Role::admin) {
+            audit_fn_(req, "user.role_change", "denied", "User", req.matches[1].str(),
+                      "elevated_session_role_change_blocked");
+            res.status = 403;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Changing an account role needs your own administrator role, not an elevation","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Changing an account role needs your own "
+                                                  "administrator role, not a temporary elevation"),
+                            "application/json");
             return;
         }
         // PR2 — MFA step-up gate. Role changes promote/demote a
