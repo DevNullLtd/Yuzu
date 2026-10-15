@@ -12,6 +12,7 @@
 #include <shared_mutex>
 #include <string_view>
 
+#include "admin_gate.hpp"
 #include "authz_topology_floor.hpp"
 #include "body_cap_policy.hpp" // resolve_body_cap — path_class label for the service-scope deny metric (#2298 PR 3)
 #include "default_certs.hpp" // detect_hostname — the server name on the landing page's slim bar
@@ -620,12 +621,15 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
     if (!session)
         return false;
 
-    // Service-scoped tokens are limited to ITServiceOwner permissions for one named
-    // service; they must never reach admin routes regardless of the creator's role.
-    // MCP tokens are for fleet management (queries, instruction execution) and must
-    // not be used to administer the server itself (settings, users, TLS, OIDC).
-    // See docs/mcp-server.md and docs/auth-architecture.md (#520).
-    if (!session->token_scope_service.empty()) {
+    // The decision lives in authz::admin_gate_verdict (admin_gate.hpp) so the
+    // /settings gate and /api/me's can_access_settings share one copy. Service-
+    // scoped and MCP tokens never reach admin routes whatever their creator's
+    // role (docs/mcp-server.md, docs/auth-architecture.md #520); otherwise the
+    // EFFECTIVE role counts, so an active JIT elevation is admin for its window.
+    switch (authz::admin_gate_verdict(*session)) {
+    case authz::AdminGate::Admit:
+        return true;
+    case authz::AdminGate::ServiceScoped:
         audit_log(req, "auth.admin_required", "denied", "", "",
                   "service-scoped token blocked from admin route");
         res.status = 403;
@@ -636,32 +640,22 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
             detail::a4_denial(res, 403, "service-scoped tokens cannot perform admin operations"),
             "application/json");
         return false;
-    }
-    if (!session->mcp_tier.empty()) {
+    case authz::AdminGate::McpTier:
         audit_log(req, "auth.admin_required", "denied", "", "",
                   "MCP token blocked from admin route");
         res.status = 403;
         res.set_content(detail::a4_denial(res, 403, "MCP tokens cannot perform admin operations"),
                         "application/json");
         return false;
+    case authz::AdminGate::NotAdmin:
+        break;
     }
-
-    // effective_role(), not the raw role, so an active JIT admin elevation
-    // (POST /api/v1/elevate) is treated as admin for its window and auto-reverts.
-    // Only interactive cookie sessions can be elevated — the MCP/service-token
-    // guards above already rejected those credentials, and elevate_session never
-    // runs for them.
-    if (auth::effective_role(*session) != auth::Role::admin) {
-        // SOC 2 CC7.2: every privileged-endpoint denial must surface in
-        // the audit chain, not just the request log. Emitting here closes
-        // the gap for every caller in one place rather than threading an
-        // audit_fn through dozens of route registrations (governance PR4).
-        audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
-        res.status = 403;
-        res.set_content(detail::a4_denial(res, 403, "admin role required"), "application/json");
-        return false;
-    }
-    return true;
+    // SOC 2 CC7.2: every privileged-endpoint denial must surface in the audit
+    // chain, not just the request log (governance PR4).
+    audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
+    res.status = 403;
+    res.set_content(detail::a4_denial(res, 403, "admin role required"), "application/json");
+    return false;
 }
 
 bool AuthRoutes::service_scope_admits(std::string_view securable_type,

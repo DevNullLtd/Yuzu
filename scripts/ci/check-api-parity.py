@@ -257,7 +257,14 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # Landing on dev's 208 (device containment, hardware properties and the Home/Dashboard rows, above),
 # the two Estate changes net 0 on their own (+1 NVD status card exception, -1 discovery row
 # twinned), so the count after this merge is the value the checker reports, set from its output.
-BASELINE_UNTWINNED = 208
+#
+# Audit filter parity: get.api-audit flips "planned:#2146" -> "twinned" (GET /api/v1/audit +
+# MCP query_audit_log, now at filter/paging parity), the checker reports 208 - 1 = 207 on the merged tree
+# (dev's 208 above, less this flip).
+#
+# Merged onto the Estate changes: the count is the value the checker reports on the merged
+# tree, set from its output.
+BASELINE_UNTWINNED = 207
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
