@@ -6,9 +6,12 @@
 // long raw string literal away from server.cpp's brace matching.
 
 #include "app_shell.hpp"
+#include "operate_extras_ui.hpp"
 #include "result_sets_ui.hpp"
 #include "web_utils.hpp"
 
+#include <cstdio>
+#include <ctime>
 #include <string>
 
 namespace yuzu::server {
@@ -44,31 +47,79 @@ std::string status_badge(ResultSetStatus s) {
 
 } // namespace
 
+namespace {
+
+// "2026-10-14 05:12 UTC" -- fixed-width, locale-free, and the same on every host.
+std::string utc_stamp(int64_t epoch) {
+    if (epoch <= 0)
+        return "-";
+    const std::time_t t = static_cast<std::time_t>(epoch);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M UTC", &tm);
+    return buf;
+}
+
+const char* source_label(const std::string& kind) {
+    if (kind == source_kind::kTarQuery)
+        return "TAR query";
+    if (kind == source_kind::kInstructionResult)
+        return "Instruction result";
+    if (kind == source_kind::kManualCurate)
+        return "Imported ids";
+    if (kind == "inventory_query")
+        return "Inventory query";
+    return "Other";
+}
+
+bool reeval_supported(const std::string& kind) {
+    return kind == source_kind::kTarQuery || kind == source_kind::kInstructionResult;
+}
+
+} // namespace
+
 std::string render_result_sets_sidebar(const std::vector<ResultSet>& sets,
-                                       const std::string& selected_id) {
+                                       const std::string& selected_id, const SidebarNotes& notes) {
+    if (notes.degraded) {
+        return R"(<div class="rs-empty" data-degraded="1">Result set store unavailable. )"
+               R"(This is not an empty list.</div>)";
+    }
     if (sets.empty()) {
         return R"(<div class="rs-empty">No result sets yet. Create one from a query,
                   or import device IDs above.</div>)";
     }
-    std::string h;
+    std::string h =
+        "<table class=\"rs-table\"><thead><tr><th>Result set</th><th>Source</th>"
+        "<th>Devices</th><th>Status</th><th>Captured</th><th>Expires</th></tr></thead><tbody>";
     for (const auto& r : sets) {
         const bool active = r.id == selected_id;
-        h += "<div class=\"rs-item";
+        h += "<tr class=\"rs-item";
         if (active)
             h += " active";
         h += "\" hx-get=\"/fragments/result-sets/" + html_escape(r.id) +
              "/detail\" hx-target=\"#rs-detail\" hx-swap=\"innerHTML\">";
-        h += "<div class=\"rs-item-top\">";
+        h += "<td class=\"rs-name\">";
         if (r.pinned)
-            h += "<span class=\"rs-pin\" title=\"pinned\">★</span>";
-        h += "<span class=\"rs-name\">" + html_escape(label_for(r)) + "</span>";
-        h += "</div>";
-        h += "<div class=\"rs-item-meta\">";
-        h += "<span>" + std::to_string(r.device_count) + " device" +
-             (r.device_count == 1 ? "" : "s") + "</span>";
-        h += status_badge(r.status);
-        h += "</div>";
-        h += "</div>";
+            h += "<span class=\"rs-pin\" title=\"pinned\">★</span> ";
+        h += html_escape(label_for(r)) + "</td>";
+        h += std::string("<td>") + source_label(r.source_kind) + "</td>";
+        h += "<td>" + std::to_string(r.device_count) + " device" +
+             (r.device_count == 1 ? "" : "s") + "</td>";
+        const auto badge = status_badge(r.status);
+        h += "<td>" + (badge.empty() ? std::string("Ready") : badge) + "</td>";
+        h += "<td>" + utc_stamp(r.created_at) + "</td>";
+        h += "<td>" + (r.pinned ? std::string("Pinned") : utc_stamp(r.ttl_at)) + "</td>";
+        h += "</tr>";
+    }
+    h += "</tbody></table>";
+    if (notes.truncated) {
+        h += "<div class=\"rs-foot\" data-truncated=\"1\">Showing the " +
+             std::to_string(notes.limit) + " most recent.</div>";
     }
     return h;
 }
@@ -79,8 +130,16 @@ std::string render_result_set_detail_empty() {
               </div>)";
 }
 
-std::string render_result_set_detail(const ResultSet& rs, const std::vector<LineageNode>& chain) {
+std::string render_result_set_detail(const ResultSet& rs, const std::vector<LineageNode>& chain,
+                                     const DetailOptions& opts) {
     std::string h;
+    const std::string base = "/fragments/result-sets/" + html_escape(rs.id);
+    // A pending set refreshes itself every 5 s until it materialises (no page-wide poll).
+    if (rs.status == ResultSetStatus::Pending) {
+        h += "<div class=\"rs-poll\" data-pending=\"1\" hx-get=\"" + base +
+             "/detail\" hx-trigger=\"every 5s\" hx-target=\"#rs-detail\" hx-swap=\"innerHTML\">"
+             "Waiting for responses&hellip;</div>";
+    }
     h += "<div class=\"rs-detail-head\">";
     h += "<h2>" + html_escape(label_for(rs)) + "</h2>";
     if (rs.pinned)
@@ -107,11 +166,21 @@ std::string render_result_set_detail(const ResultSet& rs, const std::vector<Line
     h += "<div class=\"rs-stats\">";
     h += "<div><span class=\"rs-stat-k\">Devices</span><span class=\"rs-stat-v\">" +
          std::to_string(rs.device_count) + "</span></div>";
-    h += "<div><span class=\"rs-stat-k\">Source</span><span class=\"rs-stat-v\">" +
-         html_escape(rs.source_kind) + "</span></div>";
+    h += std::string("<div><span class=\"rs-stat-k\">Source</span><span class=\"rs-stat-v\">") +
+         source_label(rs.source_kind) + "</span></div>";
+    h += "<div><span class=\"rs-stat-k\">Captured</span><span class=\"rs-stat-v\">" +
+         utc_stamp(rs.created_at) + "</span></div>";
+    h += "<div><span class=\"rs-stat-k\">Expires</span><span class=\"rs-stat-v\">" +
+         (rs.pinned ? std::string("Pinned") : utc_stamp(rs.ttl_at)) + "</span></div>";
     h += "<div><span class=\"rs-stat-k\">Owner</span><span class=\"rs-stat-v\">" +
          html_escape(rs.owner_principal) + "</span></div>";
     h += "</div>";
+    if (rs.status == ResultSetStatus::Failed) {
+        h += "<div class=\"rs-note\" data-failed=\"1\">Failed to materialize.";
+        if (!rs.source_execution_id.empty())
+            h += " Execution <code>" + html_escape(rs.source_execution_id) + "</code>.";
+        h += "</div>";
+    }
 
     // Copyable scope token — the whole point: drop this into any scope box.
     const std::string token = "from_result_set:" + rs.id;
@@ -119,14 +188,14 @@ std::string render_result_set_detail(const ResultSet& rs, const std::vector<Line
     h += "<label class=\"rs-token-label\">Scope token</label>";
     h += "<div class=\"rs-token\"><code id=\"rs-token-text\">" + html_escape(token) +
          "</code>";
-    h += "<button class=\"rs-copy\" type=\"button\" "
-         "onclick=\"navigator.clipboard.writeText('" +
-         html_escape(token) + "');this.textContent='Copied';\">Copy</button>";
+    // A delegated listener in yuzu-operate-extras.js reads data-ox-copy (no inline handler:
+    // the page CSP forbids it).
+    h += "<button class=\"rs-copy\" type=\"button\" data-ox-copy=\"" + html_escape(token) +
+         "\">Copy</button>";
     h += "</div></div>";
 
     // Actions.
     h += "<div class=\"rs-actions\">";
-    const std::string base = "/fragments/result-sets/" + html_escape(rs.id);
     if (rs.pinned) {
         h += "<button class=\"rs-btn\" hx-post=\"" + base +
              "/unpin\" hx-target=\"#rs-detail\" hx-swap=\"innerHTML\">Unpin</button>";
@@ -136,9 +205,20 @@ std::string render_result_set_detail(const ResultSet& rs, const std::vector<Line
     }
     h += "<button class=\"rs-btn rs-btn-danger\" hx-post=\"" + base +
          "/delete\" hx-target=\"#rs-detail\" hx-swap=\"innerHTML\" "
-         "hx-confirm=\"Delete this result set? Pinned sets must be unpinned first.\">"
-         "Delete</button>";
+         "hx-confirm=\"Delete result set " + html_escape(label_for(rs)) +
+         "? Pinned sets must be unpinned first.\">Delete</button>";
+    if (opts.reeval_allowed && reeval_supported(rs.source_kind) &&
+        rs.status != ResultSetStatus::Pending) {
+        h += "<button class=\"rs-btn\" type=\"button\" data-ox-reeval=\"" + html_escape(rs.id) +
+             "\" data-ox-name=\"" + html_escape(label_for(rs)) + "\">Re-evaluate</button>";
+    }
     h += "</div>";
+    if (rs.pinned)
+        h += "<div class=\"rs-foot\">Pinned sets must be unpinned before they can be deleted.</div>";
+    // Members load on demand: ids only (process and signer are not stored).
+    h += "<div class=\"rs-members-wrap\"><button class=\"rs-btn\" type=\"button\" hx-get=\"" +
+         base + "/members\" hx-target=\"#rs-members-body\" hx-swap=\"innerHTML\">"
+         "Show devices</button><div id=\"rs-members-body\"></div></div>";
     return h;
 }
 
@@ -155,13 +235,13 @@ const char* const kResultSetsPageTemplate = R"HTM(<!DOCTYPE html>
     button, input, textarea { font: inherit; color: inherit; }
     code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
     :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-    .rs-content { padding: 22px 28px 36px; min-height: calc(100vh - var(--shell-top-h, 72px)); }
+    .rs-content { padding: 22px 28px 36px; min-height: calc(100vh - var(--shell-top-h)); }
     .rs-content h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em;
                      line-height: 1.2; color: var(--ink); }
     .rs-subtitle { color: var(--mut); margin: 4px 0 22px 0; max-width: 70ch; }
     .rs-subtitle code { color: var(--ink2); }
     .rs-layout { display: flex; flex-wrap: wrap; gap: 22px; align-items: flex-start; }
-    .rs-rail { flex: 1 1 320px; max-width: 360px; min-width: 0; }
+    .rs-rail { flex: 1 1 420px; max-width: 720px; min-width: 0; }
     .rs-main { flex: 999 1 560px; min-width: 0; }
     .rs-panel { background: var(--surface); border: 1px solid var(--line);
                 border-radius: var(--rad-panel); min-width: 0; }
@@ -235,10 +315,35 @@ const char* const kResultSetsPageTemplate = R"HTM(<!DOCTYPE html>
       transition: background .12s, border-color .12s;
     }
     .rs-create button:hover { background: var(--primary-h); border-color: var(--primary-h); }
+    .rs-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .rs-table th { text-align: left; font-weight: 500; color: var(--mut); padding: 8px 12px;
+                   border-bottom: 1px solid var(--line); white-space: nowrap; }
+    .rs-table td { padding: 8px 12px; border-bottom: 1px solid var(--line); color: var(--ink2);
+                   white-space: nowrap; }
+    .rs-table td.rs-name { white-space: normal; overflow-wrap: anywhere; color: var(--ink);
+                           font-weight: 600; }
+    .rs-table tr.rs-item { cursor: pointer; }
+    .rs-foot { padding: 10px 16px; font-size: 12.5px; color: var(--mut); }
+    .rs-note { margin: 0 0 12px; padding: 8px 10px; border: 1px solid var(--line2);
+               border-radius: var(--rad-ctl); background: var(--surface2); color: var(--ink2);
+               font-size: 13px; }
+    .rs-poll { margin-bottom: 12px; font-size: 13px; color: var(--mut); }
+    .rs-members { margin: 12px 0 0; padding: 0; list-style: none; display: grid; gap: 2px;
+                  max-height: 320px; overflow: auto; }
+    .rs-members-wrap { margin-top: 16px; }
+    .rs-tools { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px;
+                border-bottom: 1px solid var(--line); }
+    .rs-tools .rs-btn { height: 28px; font-size: 13px; padding: 0 10px; }
+    #ox-rs-out { padding: 0 16px; }
+    #ox-rs-out:not(:empty) { padding-top: 12px; }
     @media (max-width: 900px) { .rs-content { padding: 16px; } .rs-rail { max-width: none; } }
   </style>
+  <style>
+)HTM" YUZU_OX_CSS R"HTM(  </style>
+  <script src="/static/yuzu-dialog.js" defer></script>
+  <script src="/static/yuzu-operate-extras.js" defer></script>
 </head>
-<body>
+<body data-page="result-sets">
 
   <!--yuzu:shell--><!--/yuzu:shell-->
 
@@ -255,14 +360,19 @@ const char* const kResultSetsPageTemplate = R"HTM(<!DOCTYPE html>
       <div class="rs-rail">
         <div class="rs-panel">
           <div class="rs-panel-header">Your result sets</div>
-          <form class="rs-create"
+          <form class="rs-create" id="rs-create-form"
                 hx-post="/fragments/result-sets/create"
-                hx-target="#rs-sidebar" hx-swap="innerHTML"
-                hx-on::after-request="if(event.detail.successful) this.reset()">
+                hx-target="#rs-sidebar" hx-swap="innerHTML">
             <input type="text" name="name" placeholder="Name (optional)" maxlength="128">
             <textarea name="device_ids" placeholder="Device IDs, one per line (CSV import)"></textarea>
             <button type="submit">Create result set</button>
           </form>
+          <div class="rs-tools">
+            <button type="button" class="rs-btn" id="ox-rs-instr">From instruction</button>
+            <button type="button" class="rs-btn" id="ox-rs-inv">From inventory</button>
+            <button type="button" class="rs-btn" id="ox-rs-tar">From TAR query</button>
+          </div>
+          <div id="ox-rs-out" aria-live="polite"></div>
           <div id="rs-sidebar"
                hx-get="/fragments/result-sets/sidebar"
                hx-trigger="load, every 15s, resultSetsChanged from:body"
@@ -285,6 +395,19 @@ const char* const kResultSetsPageTemplate = R"HTM(<!DOCTYPE html>
       </div>
     </div>
   </div>
+
+  <script>
+    /* Clear the create form once its request succeeds, so a second Send does
+       not repeat the same name and device list. A delegated body listener,
+       not an inline handler attribute: htmx compiles those with
+       new Function(), which this page's CSP (no 'unsafe-eval') blocks at
+       runtime. The sidebar's own poll fires htmx:afterRequest too, so the
+       listener keys on the form's id. */
+    document.body.addEventListener('htmx:afterRequest', function(e) {
+      var el = e.detail && e.detail.elt;
+      if (el && el.id === 'rs-create-form' && e.detail.successful) el.reset();
+    });
+  </script>
 
 </body></html>
 )HTM";

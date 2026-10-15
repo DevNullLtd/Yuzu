@@ -882,7 +882,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.3 Granular RBAC :white_check_mark: `T2`
 
-`RBACStore` (777 LOC): principals, custom roles, 10 securable types (Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response), 5 operations (Read, Write, Execute, Delete, Approve). Deny-override, system roles, group-based assignments. Global enable/disable toggle.
+`RBACStore` (777 LOC): principals, custom roles, 10 securable types (Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response), 5 operations (Read, Write, Execute, Delete, Approve). Deny-override, system roles, group-based assignments. Global enable/disable toggle. The dashboard's **Access → Users** page (`/access/users`) lists the server's accounts read-only; account and RBAC changes stay in Settings and the RBAC API.
 
 ### 18.4 Management-Group-Scoped Roles :white_check_mark: `T2`
 
@@ -1000,7 +1000,7 @@ The `command_id → execution_id` map + `ExecutionEventBus` SSE stream unifying 
 
 ### 21.3 System Notifications :white_check_mark: `T2`
 
-`NotificationStore` (migrated to PostgreSQL; verified 2026-09-07 via `pg::PgPool` constructor in `notification_store.cpp`, previous row text stale-claimed SQLite). Create notifications with level (info/warn/error/success), title, and message. List unread/all, mark as read, dismiss (soft-delete), count unread. Server generates notifications for system events (agent registration, policy violations, deployment completions). REST API and dashboard bell icon integration.
+`NotificationStore` (migrated to PostgreSQL; verified 2026-09-07 via `pg::PgPool` constructor in `notification_store.cpp`, previous row text stale-claimed SQLite). Create notifications with level (info/warn/error/success), title, and message. List unread/all, mark as read, dismiss (soft-delete), count unread. The server writes a notification from five producer sites covering four events: first agent enrolment, a failed command (on both the Subscribe and gateway paths), a fleet incident (blast radius) and a DEX alert. Policy violations and deployment completions produce none. The dashboard header bell lists the unread feed and offers Mark read and Dismiss over the three dashboard JSON routes in `rest-api.md` ("Notifications feed"); there is no REST v1 or MCP twin yet.
 
 ### 21.4 Event Subscriptions (Webhook / Email) :white_check_mark: `T3`
 
@@ -1383,15 +1383,15 @@ Server-side N-distinct-device incident detector (`server/core/src/dex_blast_radi
 
 ### 32.5 Upgrade Evidence — Cohort-Paired Before/After Comparison :white_check_mark: `T2` *(verified 2026-09-07)*
 
-`/auto` Verify (§36.3): pure compare engine (`server/core/src/app_perf_compare.{hpp,cpp}`), cohort reader (`app_perf_cohort_reader.hpp`, `app_perf_group_reader.{hpp,cpp}`), REST `/dex/perf/compare` surface confirmed present. Evidential — no verdict/threshold, per `verify_routes.cpp` (§36.3). Deliberately **no floor suppression here**, unlike the fleet/group reads in §32.6: `kDexCohortFloor` only sets the honest `small_cohort` flag (`app_perf_compare.cpp:190`; "NOT suppressed" per `app_perf_compare.hpp:34`), and the audited `dex.app_perf.compare` read replaces suppression (audit verb documented in `docs/user-manual/rest-api.md`; `verify_routes.cpp:132`).
+`/auto` Verify (§36.3): pure compare engine (`server/core/src/app_perf_compare.{hpp,cpp}`), cohort reader (`app_perf_cohort_reader.hpp`, `app_perf_group_reader.{hpp,cpp}`), REST `/dex/perf/compare` surface confirmed present. Evidential — no verdict/threshold, per `verify_routes.cpp` (§36.3). Deliberately **no floor suppression here**: `kDexCohortFloor` only sets the `small_cohort` flag (`app_perf_compare.cpp:190`; "NOT suppressed" per `app_perf_compare.hpp:34`), which stays on the wire but is never true now that the floor is one device (maintainer ruling 2026-10-14), and the audited `dex.app_perf.compare` read is the control (audit verb documented in `docs/user-manual/rest-api.md`; `verify_routes.cpp:132`).
 
 ### 32.6 Behavioral-PII Privacy Engineering :white_check_mark: `T2` *(verified 2026-09-07)*
 
-Cohort-floor suppression on fleet/group app-perf reads (no singling-out below the floor) and audit-on-open per-device lenses (§21.6). *(Referenced from `docs/yuzu-guardian-design-v1.1.md` §24 invariants cited in `CLAUDE.md`; not independently re-derived this session.)*
+Cohort-floor suppression on fleet/group app-perf reads (the floor is one device since the maintainer ruling of 2026-10-14: a single-device point is published as a fleet-wide aggregate by application and version with no `agent_id`; only an empty point is suppressed) and audit-on-open per-device lenses (§21.6). *(Referenced from `docs/yuzu-guardian-design-v1.1.md` §24 invariants cited in `CLAUDE.md`; not independently re-derived this session.)*
 
-### 32.7 Experience Scoring and Sentiment :x: `T3` *(verified 2026-09-07)*
+### 32.7 Experience Scoring and Sentiment :large_orange_diamond: `T3` *(verified 2026-10-14)*
 
-Not implemented — deliberately. Composite 0-100 experience scores (with sentiment surveys as an input) are a DEX-market pattern; Yuzu currently positions evidence-not-scores. Would additionally require the §14.4 survey primitive as an input (now shipped, but no scoring/sentiment engine consumes it).
+Partly implemented — deliberately narrow. A transparent, decomposed secondary composite (0-100 stability score with its named deductions) is published beside the measured rates and intervals on `GET /api/v1/dex/apps` / `list_dex_apps`; nothing in the product acts on it. Opaque composite experience scores and sentiment scoring (which would additionally need the §14.4 survey primitive as an input) remain out.
 
 ---
 

@@ -1,10 +1,12 @@
 #include "instruction_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "instruction_extras_render.hpp"
 #include "instruction_store.hpp"
 #include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "instruction_yaml.hpp"
 #include "json_extract.hpp"
+#include "rest_a4_envelope_http.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp"
 
@@ -12,6 +14,9 @@
 #include <spdlog/spdlog.h>
 
 #include <cctype>
+#include <charconv>
+#include <cstdint>
+#include <optional>
 #include <string>
 
 // Editor fragment HTML templates — defined in instruction_ui.cpp (a
@@ -22,6 +27,27 @@ extern const char* const kInstructionEditorHtml;
 extern const char* const kInstructionEditorDeniedHtml;
 
 namespace yuzu::server::instruction {
+
+namespace {
+/// Cookie-authorised writes need a same-site Origin/Referer (token callers are exempt); see
+/// `browser_write_is_cross_site`. Runs AFTER the permission gate so an unauthenticated or
+/// unauthorised caller still gets the 401/403 it always did. Refusals are audited.
+bool refuse_cross_site_write(const Deps& deps, const httplib::Request& req, httplib::Response& res) {
+    std::string source;
+    if (deps.resolve_session_fn)
+        if (auto sess = deps.resolve_session_fn(req))
+            source = sess->auth_source;
+    if (!browser_write_is_cross_site(source, req.get_header_value("Host"),
+                                     req.get_header_value("Origin"),
+                                     req.get_header_value("Referer"), deps.csrf_trusted_origins))
+        return false;
+    (void)deps.audit_fn(req, "csrf.denied", "denied", "Endpoint", "instruction",
+                        "cross-site or header-less browser write refused");
+    res.status = 403;
+    res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+    return true;
+}
+} // namespace
 
 void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     // -- Instruction Definitions API --------------------------------------
@@ -92,6 +118,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/instructions
     sink.Post("/api/instructions", [deps](const httplib::Request& req, httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionDefinition", "Write"))
+            return;
+        if (refuse_cross_site_write(deps, req, res))
             return;
         if (!deps.store) {
             res.status = 503;
@@ -252,6 +280,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                                      httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionDefinition", "Write"))
             return;
+        if (refuse_cross_site_write(deps, req, res))
+            return;
         if (!deps.store) {
             res.status = 503;
             res.set_content(
@@ -325,7 +355,9 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             // between the load and this write, and would re-run the write-time schema check
             // on a legacy row.
             def.parameter_schema.clear();
-            auto result = deps.store->update_definition(def);
+            // Optimistic concurrency: only apply if the row is still the one loaded above, so
+            // a concurrent edit is a 409 rather than silently overwritten by this stale copy.
+            auto result = deps.store->update_definition(def, def.updated_at);
             if (!result) {
                 // ADR-0058: a genuine DB/lease failure 503s; "not_found: " -> 404 (mirrors
                 // the DELETE route immediately below); everything else is a 400 validation
@@ -349,10 +381,13 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                              "InstructionDefinition", id, "not_found");
                 if ((db_error || not_found) && !audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
-                res.status = db_error ? 503 : (not_found ? 404 : 400);
+                const bool conflict = !db_error && is_conflict_error(result.error());
+                res.status = db_error ? 503 : (not_found ? 404 : (conflict ? 409 : 400));
                 res.set_content(nlohmann::json({{"error", db_error
                                                                ? "instruction store unavailable"
-                                                               : result.error()}})
+                                                               : (conflict
+                                                                      ? std::string(strip_conflict_prefix(result.error()))
+                                                                      : result.error())}})
                                     .dump(),
                                 "application/json");
                 return;
@@ -374,6 +409,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     sink.Delete(R"(/api/instructions/([^/]+))", [deps](const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionDefinition", "Delete"))
+            return;
+        if (refuse_cross_site_write(deps, req, res))
             return;
         if (!deps.store) {
             res.status = 503;
@@ -452,6 +489,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     sink.Post("/api/instructions/import", [deps](const httplib::Request& req,
                                                  httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionDefinition", "Write"))
+            return;
+        if (refuse_cross_site_write(deps, req, res))
             return;
         if (!deps.store) {
             res.status = 503;
@@ -583,6 +622,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                               httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionSet", "Write"))
             return;
+        if (refuse_cross_site_write(deps, req, res))
+            return;
         if (!deps.store) {
             res.status = 503;
             res.set_content(
@@ -596,35 +637,50 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         InstructionSet s;
         s.name = name;
         s.description = desc;
+        // Every outcome is audited (#3598 / REVIEW amendment 6). The ATTEMPT row is written
+        // BEFORE the mutation and the write is refused (503, Sec-Audit-Failed) when it cannot
+        // be stored (ADR-0033 section 9: no audit row -> no mutation); the outcome row after
+        // it records what the store did. A failed outcome-row write still surfaces as
+        // Sec-Audit-Failed.
+        auto audit = [&](const char* outcome, const std::string& id, const std::string& detail) {
+            if (!deps.audit_fn(req, "instruction_set.create", outcome, "InstructionSet", id,
+                               detail))
+                res.set_header("Sec-Audit-Failed", "true");
+        };
+        if (!deps.audit_fn(req, "instruction_set.create", "attempted", "InstructionSet", "",
+                           audit_token(name))) {
+            res.set_header("Sec-Audit-Failed", "true");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "the audit record could not be persisted, so "
+                                                  "the set was NOT created; retry once the audit "
+                                                  "store recovers"),
+                            "application/json");
+            return;
+        }
         auto result = deps.store->create_set(s);
         if (!result) {
             // ADR-0058: a genuine DB/lease failure 503s, never falls through to
             // the conflict/validation split below.
-            // Not audited: this route has no audit logging at all (success or failure),
-            // pre-existing and unrelated to this migration — tracked separately, not
-            // asymmetrically half-fixed here (#3598).
             bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
             if (db_error) {
+                audit("error", "", "db_error");
                 res.status = 503;
                 res.set_content(
                     R"({"error":"instruction store unavailable"})",
                     "application/json");
                 return;
             }
-            // Gate 4 Finding A / Gate 6 enterprise-readiness: this route was the one
-            // sibling of instruction.create/update/delete that never added the
-            // is_conflict_error branch store_errors.hpp's kConflictPrefix comment says
-            // every duplicate-class error site must handle — a duplicate id fell
-            // through to plain 400 with the raw unstripped "conflict:" prefix in the
-            // body. Matches instruction.create's pattern (this route still has no audit
-            // logging at all, pre-existing gap, not fixed here).
+            // Gate 4 Finding A / Gate 6: the duplicate-id class must strip the
+            // internal conflict prefix and answer 409, as instruction.create does.
             bool is_conflict = is_conflict_error(result.error());
+            audit("denied", "", is_conflict ? "conflict" : "invalid");
             res.status = is_conflict ? 409 : 400;
             auto body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
                                         : result.error();
             res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
             return;
         }
+        audit("success", *result, audit_token(name));
         res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
     });
 
@@ -632,6 +688,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     sink.Delete(R"(/api/instruction-sets/([^/]+))", [deps](const httplib::Request& req,
                                                             httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionSet", "Delete"))
+            return;
+        if (refuse_cross_site_write(deps, req, res))
             return;
         if (!deps.store) {
             res.status = 503;
@@ -642,19 +700,27 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
-        // ADR-0058: delete_set now returns std::expected<void, std::string> — a
+        auto audit = [&](const char* outcome, const std::string& detail) {
+            if (!deps.audit_fn(req, "instruction_set.delete", outcome, "InstructionSet", id,
+                               detail))
+                res.set_header("Sec-Audit-Failed", "true");
+        };
+        // ATTEMPT row first, fail closed (see create): the id is known before the call.
+        if (!deps.audit_fn(req, "instruction_set.delete", "attempted", "InstructionSet", id, "")) {
+            res.set_header("Sec-Audit-Failed", "true");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "the audit record could not be persisted, so "
+                                                  "the set was NOT deleted; retry once the audit "
+                                                  "store recovers"),
+                            "application/json");
+            return;
+        }
+        // ADR-0058: delete_set returns std::expected<void, std::string> - a
         // genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
         // ProductPackStore::uninstall's identical REST contract change).
         auto del_result = deps.store->delete_set(id);
-        // R2 / gov Gate 4 consistency-auditor finding: these 404/503 denial branches are
-        // new in this migration (pre-migration delete_set was an undifferentiated
-        // 200 {"deleted": bool} with no distinguishable denial to audit) — unlike
-        // create_set (still undifferentiated 400/503 today, tracked separately, #3598),
-        // these are new-in-this-diff and must not ship unaudited from birth.
         if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
-            if (!deps.audit_fn(req, "instruction_set.delete", "error", "InstructionSet", id,
-                               "db_error"))
-                res.set_header("Sec-Audit-Failed", "true");
+            audit("error", "db_error");
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
@@ -662,15 +728,14 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (!del_result) {
-            if (!deps.audit_fn(req, "instruction_set.delete", "denied", "InstructionSet", id,
-                               "not_found"))
-                res.set_header("Sec-Audit-Failed", "true");
+            audit("denied", "not_found");
             res.status = 404;
             res.set_content(
                 R"({"error":{"code":404,"message":"instruction set not found"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
+        audit("success", "");
         res.set_content(nlohmann::json({{"deleted", true}}).dump(), "application/json");
     });
 
@@ -706,6 +771,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 };
                 replace("{{TITLE}}", "Edit Definition");
                 replace("{{DEF_ID}}", def.id);
+                replace("{{DEF_UPDATED_AT}}", std::to_string(def.updated_at));
                 replace("{{DEF_NAME}}", def.name);
                 replace("{{DEF_VERSION}}", def.version);
                 replace("{{DEF_PLUGIN}}", def.plugin);
@@ -770,6 +836,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             };
             replace("{{TITLE}}", "New Definition");
             clear("{{DEF_ID}}");
+            clear("{{DEF_UPDATED_AT}}");
             clear("{{DEF_NAME}}");
             clear("{{DEF_VERSION}}");
             clear("{{DEF_PLUGIN}}");
@@ -803,6 +870,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     sink.Post("/api/instructions/yaml", [deps](const httplib::Request& req,
                                                httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionDefinition", "Write"))
+            return;
+        if (refuse_cross_site_write(deps, req, res))
             return;
         auto session = deps.auth_fn(req, res);
         if (!session)
@@ -842,6 +911,9 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         // bundled importer applies (embed_content.py::def_envelope).
         auto fields = instruction_yaml::parse_definition_yaml(yaml_source);
 
+        // Create path: a fresh definition from the YAML's own fields plus the
+        // create defaults. The update path below replaces this with
+        // merge_yaml_into_stored so nothing the YAML cannot express is reset.
         InstructionDefinition def;
         def.name = fields.name;
         def.version = fields.version.empty() ? "1.0.0" : fields.version;
@@ -884,11 +956,58 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                         false);
                 return;
             }
+            // Load the stored row and carry forward every column the YAML does
+            // not express (set, enabled, TTLs, schemas, templates, platforms,
+            // ...) and the four scalars it may omit (type, version,
+            // concurrency, approval). A degraded read refuses the save: writing
+            // a fresh definition over an unread row is exactly the data loss
+            // this merge exists to prevent.
+            std::string approval_detail;
+            // The editor sends the updated_at it LOADED; a save is applied only if the row is
+            // still at that version (409 otherwise), so two operators cannot silently overwrite
+            // each other's approval/enabled/set changes. A caller that sends none (API use) is
+            // checked against the version read here, which narrows the race to this handler.
+            std::optional<std::int64_t> expected_updated_at;
+            if (const auto sent = req.get_param_value("updated_at"); !sent.empty()) {
+                std::int64_t v = 0;
+                const auto [ptr, ec] = std::from_chars(sent.data(), sent.data() + sent.size(), v);
+                if (ec != std::errc{} || ptr != sent.data() + sent.size()) {
+                    res.status = 400;
+                    respond("Update failed: updated_at must be an integer", false);
+                    return;
+                }
+                expected_updated_at = v;
+            }
+            auto stored_result = deps.store->get_definition(def_id);
+            if (!stored_result) {
+                spdlog::warn("instruction yaml update: stored read failed: id={} error={}",
+                             log_safe(def_id), stored_result.error());
+                res.status = 503;
+                respond("Update failed: instruction store unavailable", false);
+                return;
+            }
+            if (*stored_result) {
+                const auto& stored = **stored_result;
+                if (!expected_updated_at)
+                    expected_updated_at = stored.updated_at;
+                def = instruction_extras::merge_yaml_into_stored(stored, fields, yaml_source,
+                                                                 session->username);
+                if (def.approval_mode != stored.approval_mode)
+                    approval_detail = "approval_mode: " + stored.approval_mode + " -> " +
+                                      def.approval_mode;
+            }
             def.id = def_id;
-            auto result = deps.store->update_definition(def);
+            auto result = deps.store->update_definition(def, expected_updated_at);
             if (!result) {
                 spdlog::warn("instruction yaml update failed: id={} error={}",
                              log_safe(def_id), result.error());
+                if (is_conflict_error(result.error())) {
+                    res.status = 409;
+                    respond("Update failed: this definition was changed by someone else since you "
+                            "opened it - reload the editor and re-apply your change",
+                            false);
+                    return;
+                }
                 // A db_error-prefixed message can carry libpq internals (PQerrorMessage
                 // fragments) — generic-ize it before it reaches the operator, matching
                 // workflow_routes.cpp's product_pack_client_message convention (gov Gate 4
@@ -900,7 +1019,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             (void)deps.audit_fn(req, "instruction.update", "success", "InstructionDefinition",
-                                def_id, "");
+                                def_id, approval_detail);
             deps.emit_event_fn("instruction.updated", req, {}, {{"instruction_id", def_id}});
             respond("Definition updated", true);
         } else {

@@ -37,6 +37,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <regex>
 #include <string>
 #include <string_view>
 
@@ -357,6 +358,40 @@ TEST_CASE("static_js_bundle: kYuzuVizJs declares per-OS palette for linux/darwin
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows:"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickOsColor"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("linux:   '#2dd4bf'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:  '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("macos:   '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows: '#4c9aff'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("default: '#9aa2ae'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs pins the listener coral, talking-socket blue and local edge",
+          "[static-js][viz]") {
+    // Reverting the listener sphere to yellow (or the :port label away from the coral chart
+    // token) must fail loud: the invariants doc and the legend both name these colours.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xff6b7a"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("ctx.fillStyle = '#ff6b7a'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("TALKING_SOCKET_COLOR = 0x7ab6ff"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xe9ecf0"));
+}
+
+TEST_CASE("static_js_bundle: the Fleet page keeps its error banner and the Host page its Refresh button",
+          "[static-js][viz][page]") {
+    REQUIRE(kVizFleetPageHtml != nullptr);
+    REQUIRE(kVizHostPageHtml != nullptr);
+    const std::string fleet(kVizFleetPageHtml);
+    CHECK_THAT(fleet, ContainsSubstring("id=\"viz-error\" role=\"alert\""));
+    CHECK_THAT(fleet, ContainsSubstring("#viz-error.shown { display: flex; }"));
+    CHECK_THAT(std::string(kVizHostPageHtml), ContainsSubstring("id=\"refresh-btn\""));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs leaves the stage backdrop to the page CSS",
+          "[static-js][viz]") {
+    // The page's .viz-stage rule paints the backdrop so it follows the
+    // theme. That only shows through a transparent renderer, so alpha: true
+    // is load-bearing and the scene must not set an opaque background.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("alpha: true"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, !ContainsSubstring("scene.background ="));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs uses FNV-1a 32-bit hash for stable layout",
@@ -668,19 +703,19 @@ TEST_CASE("static_js_bundle: kYuzuVizJs guards camera position against NaN/Infin
 TEST_CASE("static_js_bundle: kYuzuVizJs declares CATEGORY_PALETTE for the six categories",
           "[static-js][viz][pr7]") {
     // PR 7 category palette. Each colour is a UX contract — it carries
-    // semantic meaning to the operator (browser=blue, db=amber, web=green
+    // semantic meaning to the operator (browser=blue, db=yellow, web=teal
     // etc.) so a stealth refactor that swaps a hex code is a deliberate
     // UX decision worth surfacing in PR review. Pin both the palette
     // constant name and every category=hex pair so a refactor that drops
     // or recolours a category fails this test loud.
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("CATEGORY_PALETTE"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickCategoryColor"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   '#6e7681'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  '#58a6ff'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#d29922'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#56d364'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#bc8cff'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#8b949e'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   '#9aa2ae'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  '#4c9aff'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#2dd4bf'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#a78bfa'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#9199a6'"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs lays processes out on hash(pid|ppid)-mod-bucket grid",
@@ -1128,6 +1163,19 @@ TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and 
     CHECK_THAT(armed, ContainsSubstring("filter: none"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuCss has no unscoped .scope rule", "[static-js][yuzu-css]") {
+    // The DEX trends OS cards (dex_routes.cpp) carry a bare `.scope` element and
+    // style it themselves (`.gp-oscard .scope`, guardian_page_ui.cpp). A bare
+    // `.scope` selector in the shared sheet reaches that element on every page
+    // that loads it: the old `@media (max-width: 1440px) { .scope { width: 220px
+    // !important } }` pinned the card line to 220 px below 1440 px. The dashboard
+    // panel is `.scope-panel`; `.scope-*` classes are different tokens and stay.
+    // A selector starts after the sheet start, `{`, `}`, `,` or a comment end; `.scope` followed
+    // by `-` or a word character is another class and does not match.
+    const std::regex bare_scope(R"((^|[{},/])\s*\.scope(?![-\w]))");
+    CHECK_FALSE(std::regex_search(yuzu::server::kYuzuCss, bare_scope));
+}
+
 TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs", "[static-js][yuzu-css]") {
     CHECK(yuzu::server::kYuzuCss.find('\0') == std::string::npos);
     // (See kEChartsJs counterpart — stray-delimiter check is tautological
@@ -1248,6 +1296,9 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml renders IPC graph mount point", "[
 TEST_CASE("static_js_bundle: kVizHostPageHtml renders TAR tree mount point", "[viz-host][page]") {
     std::string html(kVizHostPageHtml);
     CHECK_THAT(html, ContainsSubstring("id=\"tar-tree\""));
+    // The pane fills itself over htmx on load; losing either attribute leaves it empty.
+    CHECK_THAT(html, ContainsSubstring("hx-get=\"/fragments/tar/process-tree?device={{AGENT_ID}}\""));
+    CHECK_THAT(html, ContainsSubstring("hx-trigger=\"load\""));
 }
 
 TEST_CASE("static_js_bundle: kVizHostPageHtml binds via data-agent-id attribute",
@@ -1440,6 +1491,21 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml has a resizable splitter persisted
     CHECK_THAT(html, ContainsSubstring("splitter"));
 }
 
+TEST_CASE("static_js_bundle: kVizHostPageHtml clamps the splitter to the fixed chrome",
+          "[viz-host][page][splitter]") {
+    // The splitter, the "Process tree" header and the tree's own padding
+    // cannot shrink, so a bare 0.1-0.9 clamp overflows .vh-main (39 px at
+    // 1440x900 for a stored 0.9). The max ratio is measured from the root,
+    // applied on load (apply), on drag, and on resize; the old literal
+    // upper bound must not return as the only gate.
+    std::string html(kVizHostPageHtml);
+    CHECK_THAT(html, ContainsSubstring("function maxRatio()"));
+    CHECK_THAT(html, ContainsSubstring("r = Math.min(r, maxRatio());"));
+    CHECK_THAT(html, ContainsSubstring("r < maxRatio()"));
+    CHECK_THAT(html, ContainsSubstring("new ResizeObserver(() => apply(ratio)).observe(root);"));
+    CHECK_THAT(html, !ContainsSubstring("r < 0.9"));
+}
+
 TEST_CASE("static_js_bundle: kVizHostPageHtml does not reference any CDN",
           "[viz-host][page][security]") {
     // Sec invariant: no off-box dependency loading. cytoscape must be
@@ -1448,4 +1514,25 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml does not reference any CDN",
     CHECK(html.find("cdn.") == std::string::npos);
     CHECK(html.find("unpkg.") == std::string::npos);
     CHECK(html.find("jsdelivr.") == std::string::npos);
+}
+
+// ── Shared dialog module (yuzu-dialog.js) ───────────────────────────────────
+
+namespace yuzu::server {
+extern const std::string kYuzuDialogJs;
+} // namespace yuzu::server
+
+TEST_CASE("static_js_bundle: kYuzuDialogJs exposes YuzuDialog and carries no markup sink",
+          "[static-js][dialog][security]") {
+    const std::string& js = yuzu::server::kYuzuDialogJs;
+    CHECK(js.size() >= 4000);
+    CHECK(js.find('\0') == std::string::npos);
+    CHECK_THAT(js, ContainsSubstring("window.YuzuDialog"));
+    CHECK_THAT(js, ContainsSubstring("showModal"));
+    CHECK_THAT(js, ContainsSubstring("AbortSignal.timeout(15000)"));
+    CHECK(js.find("innerHTML") == std::string::npos);
+    CHECK(js.find("insertAdjacentHTML") == std::string::npos);
+    CHECK(js.find("eval(") == std::string::npos);
+    CHECK(js.find("new Function") == std::string::npos);
+    CHECK(js.find("document.write") == std::string::npos);
 }

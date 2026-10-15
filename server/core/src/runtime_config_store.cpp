@@ -548,6 +548,10 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
             int val = std::stoi(value);
             if (val <= 0)
                 return std::unexpected("value must be a positive integer");
+            if (key == "heartbeat_timeout" && val < kMinHeartbeatTimeoutSeconds)
+                return std::unexpected("heartbeat_timeout must be at least " +
+                                       std::to_string(kMinHeartbeatTimeoutSeconds) +
+                                       " seconds (the default agent heartbeat interval)");
         } catch (...) {
             return std::unexpected("value must be a valid integer");
         }

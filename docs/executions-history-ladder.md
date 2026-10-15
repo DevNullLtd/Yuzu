@@ -330,6 +330,12 @@ client SSE listener's binding contract. Renaming any of them is a silent
 regression: the listener falls back to no-op and the drawer freezes
 mid-execution with no error.
 
+The Executions page (`/executions`, `yuzu-operate.js`) is a second client of the same
+stamps. `GET /fragments/executions/{id}/detail?view=page` returns `<div data-slot="selected">`
+followed by `<div data-slot="devices">` (the Device results panel, rendered by
+`render_exec_devices`), keeps every stamp above, and caps the per-device table at 500 rows
+and the collapsed responses list at 50; the drawer's default view is unchanged and uncapped.
+
 ### Audit policy
 
 `execution.live_subscribe` audits on first connect per session-per-execution

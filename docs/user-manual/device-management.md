@@ -146,7 +146,9 @@ Administrators can configure rules that automatically approve agents matching sp
 
 **Add an auto-approval rule:**
 
-The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments.
+The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments. The four writes below are dashboard writes: a request whose `Origin` (or `Referer`) names a different site is refused with `403`; a request with neither header (curl, automation) is accepted, as for the other Settings writes.
+
+Every write is recorded before it is applied: an `attempt` audit row is written first and, if it cannot be stored, the write is refused with `503` (`Sec-Audit-Failed: true`) and nothing changes. A rule that cannot be saved to disk is refused with `500` and nothing changes. Error responses are the standard JSON error body; the dashboard shows a toast.
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve \
@@ -156,7 +158,11 @@ curl -s -X POST http://localhost:8080/api/settings/auto-approve \
 
 This rule automatically approves any agent whose hostname matches the glob pattern `web-*.example.com`.
 
-Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. An `ip_subnet` value must be an IPv4 address or `a.b.c.d/N` with `N` a whole number from 0 to 32 written in digits only (no sign, so `/-0` is refused; IPv6 is not supported); anything else is `400` and the rule is not stored. A malformed rule that is already in the rule file never matches, so it never approves an agent.
+Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. A value is at most 253 characters and a label at most 128. A rule that would match every machine (a hostname glob of only `*`, or an `ip_subnet` of `/0`) is refused.
+
+**These rules are not a strong admission control.** `hostname_glob` and `cloud_provider` match strings the registering agent states about itself (its hostname and attestation provider); any client that can reach the Register endpoint can claim a matching value, which makes such a rule no stronger than `*`. `ip_subnet` matches the connection's peer address. `trusted_ca` can never match today because Register does not yet populate the CA fingerprint. Verified proof for the first two is reserved for a later tier. Treat `any`-mode `hostname_glob`/`cloud_provider` rules as a convenience for a trusted network, not as a security boundary.
+
+If the saved policy file (`auto-approve.cfg`) is damaged (a line with an unknown type, a short line, or a `mode:` other than exactly `any` or `all`), the server activates no auto-approve rules at start (every agent waits for manual approval), logs an error, and keeps the original as `auto-approve.cfg.rejected`; re-create the rules in Settings.
 
 **Set the auto-approve match mode:**
 
@@ -173,7 +179,6 @@ Supported modes:
 | `any` | First matching enabled rule auto-approves the agent (default) |
 | `all` | All enabled rules must match for auto-approval |
 
-Every rule change (add, mode change, toggle, delete) writes an audit row, `settings.auto_approve.*`, naming what changed: the rule type and value, the rule index, or the new match mode (see [Audit Log](audit-log.md)); a rejected subnet, a value or label containing `:` or a control character (the rules file is `:`-delimited, one rule per line, so such text would reload as a different rule), and an index that matches no rule are audited as `denied`.
 
 Note: Auto-approval only applies when rules exist and are enabled. When no rules are configured, all agents enter the pending queue regardless of mode. To disable auto-approval entirely, remove or disable all rules.
 
@@ -528,8 +533,8 @@ Unless noted, these endpoints accept form-encoded parameters and return HTML fra
 | `POST` | `/api/settings/enrollment-tokens` | Generate an enrollment token (form-encoded) | HTMX |
 | `POST` | `/api/settings/enrollment-tokens/batch` | Generate tokens in batch (JSON in, JSON out) | JSON |
 | `DELETE` | `/api/settings/enrollment-tokens/{token_id}` | Revoke a token | HTMX |
-| `POST` | `/api/settings/auto-approve` | Add a rule (form: `type`, `value`, `label`) | HTMX |
-| `POST` | `/api/settings/auto-approve/mode` | Set match mode (form: `mode=any\|all`) | HTMX |
+| `POST` | `/api/settings/auto-approve` | Add a rule (form: `type`, `value`, `label`); `400` and nothing saved for an unknown type, empty value, `:` or control character in value or label, malformed `ip_subnet` (IPv4 with optional `/0-32`) or `trusted_ca` that is not 64 hex characters | HTMX |
+| `POST` | `/api/settings/auto-approve/mode` | Set match mode (form: `mode=any\|all`); other values return `400` | HTMX |
 | `POST` | `/api/settings/auto-approve/{index}/toggle` | Enable/disable a rule | HTMX |
 | `DELETE` | `/api/settings/auto-approve/{index}` | Delete a rule | HTMX |
 | `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart) | HTMX |

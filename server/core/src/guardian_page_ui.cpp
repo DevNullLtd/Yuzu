@@ -27,6 +27,7 @@ const char* const kGuardianDetailPageTemplate =
   <link rel="stylesheet" href="/static/yuzu.css">
   <meta name="htmx-config" content='{"allowEval":false}'>
   <script src="/static/htmx.js"></script>
+  <script src="/static/yuzu-dialog.js"></script>
   <style>
     .gp-wrap { padding: 22px 28px 36px; }
     :where(.gp-wrap) a { color: var(--primary); }  /* bare links; any class rule wins (zero specificity) */
@@ -47,6 +48,7 @@ const char* const kGuardianDetailPageTemplate =
     .gp-actions { display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
 
     .gp-sech { font-size: 14px; font-weight: 600; color: var(--ink); margin: 22px 0 8px; }
+    .gp-sech .gp-reg { font-weight: 400; }
     .gp-note { font-size: 12.5px; color: var(--mut); margin-top: 8px; }
     .gp-note b { color: var(--ink); font-weight: 600; }
 
@@ -76,6 +78,7 @@ const char* const kGuardianDetailPageTemplate =
     /* compliance hero */
     .gp-hero { display: flex; gap: 24px; align-items: center; flex-wrap: wrap; padding: 16px 18px;
                background: var(--surface); border: 1px solid var(--line); border-radius: var(--rad-panel); }
+    .gp-hero-bar { flex: 1; min-width: 320px; }
     .gp-pct { font-size: 26px; font-weight: 500; letter-spacing: -.02em; line-height: 1.15; color: var(--ink); }
     .gp-pct small { display: block; font-size: 13px; color: var(--mut); font-weight: 400; letter-spacing: 0; }
     .gp-bar { display: flex; gap: 2px; height: 18px; border-radius: 3px; overflow: hidden; background: var(--bg); }
@@ -86,7 +89,7 @@ const char* const kGuardianDetailPageTemplate =
                    margin-right: 6px; vertical-align: middle; }
     .gp-legend b { color: var(--ink); font-weight: 600; margin-left: 4px; }
 
-    /* readout row (was a strip of stat tiles): one bordered region, 1px rules between figures */
+    /* readout row: one bordered region, 1px rules between figures */
     .gp-tiles { display: flex; flex-wrap: wrap; gap: 1px; margin-top: 16px; overflow: hidden;
                 background: var(--line); border: 1px solid var(--line); border-radius: var(--rad-panel); }
     .gp-tile { flex: 1 1 170px; min-width: 0; padding: 14px 18px; background: var(--surface); }
@@ -430,8 +433,9 @@ const char* const kGuardianDetailPageTemplate =
   </script>
 )HTM"
     // Chunk 3: the Hardware CI record's generic action runner. Split into its own
-    // literal because chunk 2 above sits at ~14.5 KiB and MSVC caps a single
-    // string literal at 16 KiB (C2026) -- see the sibling warning in
+    // literal because chunk 2 above sits at ~14 KB (measure with a full-range
+    // rawcheck: tools/rawcheck.py scans only uncommitted diffs) and MSVC caps a
+    // single string literal at 16,380 bytes (C2026) -- see the sibling warning in
     // instruction_ui.cpp. Keep prose OUT of this literal; explain here instead.
     //
     // hwRunAction(btn): reads the enclosing <form>'s data-plugin/data-action/
@@ -526,8 +530,7 @@ const char* const kGuardianDetailPageTemplate =
     //
     // hwSyncNow(btn, source): POST /api/v1/hardware/{id}/sync, then swap the
     // lens body for the 2s poll fragment (await_since = the SERVER's requested_at).
-    // hwTagSet / hwTagDelete: JSON to the EXISTING /api/tags/set and
-    // /api/tags/delete, then reload the whole CI record (header chips + lens).
+    // Tag add / remove on the record are static/yuzu-device-data.js controls.
     // hwFilterResult(el): free-text or regex filter over a result's table rows
     // / pre lines, with a hit counter; an invalid regex marks the box red and
     // filters nothing. hwExportCsv(btn): RFC 4180 CSV of the VISIBLE rows
@@ -535,10 +538,6 @@ const char* const kGuardianDetailPageTemplate =
     // hwCopyResult(btn): visible text to the clipboard.
     R"HTM(
   <script>
-    function hwReloadCi(agent, lens) {
-      var mount = document.getElementById('guardian-detail'); if (!mount || !window.htmx) return;
-      window.htmx.ajax('GET', '/fragments/hardware/ci?id=' + encodeURIComponent(agent) + '&lens=' + encodeURIComponent(lens || 'overview'), { target: '#guardian-detail', swap: 'innerHTML' });
-    }
     function hwSyncNow(btn, source) {
       var agent = btn.getAttribute('data-agent'), lens = btn.getAttribute('data-lens') || 'overview';
       btn.disabled = true;
@@ -565,37 +564,6 @@ const char* const kGuardianDetailPageTemplate =
           '" hx-trigger="load delay:1s" hx-swap="outerHTML"><span class="gp-mute">Sync requested \u2014 waiting for the device to report\u2026 usually a couple of seconds on Linux/Windows, up to ~15s on macOS the first time.</span></div>';
         if (window.htmx) window.htmx.process(lensDiv);
       }).catch(function () { btn.disabled = false; showToast('Sync request failed', 'error'); });
-    }
-    function hwPostJson(url, body, ok) {
-      return fetch(url, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-        .then(function (r) { return r.text().then(function (t) { return { status: r.status, text: t }; }); })
-        .then(function (resp) {
-          if (resp.status >= 400) {
-            var msg = 'Request failed (' + resp.status + ')';
-            try { var j = JSON.parse(resp.text); msg = (j.error && j.error.message) || j.error || msg; } catch (e) { if (resp.text && resp.text.length < 200) msg = resp.text; }
-            showToast(msg, 'error'); return;
-          }
-          ok();
-        }).catch(function () { showToast('Network error', 'error'); });
-    }
-    function hwTagSet(btn) {
-      var form = btn.closest('form'); if (!form) return;
-      var agent = form.getAttribute('data-agent');
-      var key = (form.querySelector('input[name="key"]').value || '').trim();
-      var value = (form.querySelector('input[name="value"]').value || '').trim();
-      if (!key) { showToast('Tag key is required', 'error'); return; }
-      if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) { showToast('Tag key: letters, digits, _ . : - (max 64)', 'error'); return; }
-      btn.disabled = true;
-      hwPostJson('/api/tags/set', { agent_id: agent, key: key, value: value }, function () {
-        showToast('Tag ' + key + ' set', 'success'); hwReloadCi(agent, 'tags');
-      }).then(function () { btn.disabled = false; });
-    }
-    function hwTagDelete(a) {
-      var agent = a.getAttribute('data-agent'), key = a.getAttribute('data-key');
-      if (!window.confirm('Remove tag ' + key + '?')) return;
-      hwPostJson('/api/tags/delete', { agent_id: agent, key: key }, function () {
-        showToast('Tag ' + key + ' removed', 'success'); hwReloadCi(agent, 'tags');
-      });
     }
     function hwFilterResult(el) {
       var tool = el.closest('.hw-rtool'); if (!tool) return;
@@ -667,7 +635,7 @@ const char* const kGuardianDetailPageTemplate =
     // re-render so a selection made on page 1 is still reflected if the operator
     // re-sorts without clearing it.
     //
-    // hwBulkTag(btn, mode): validates the key with the SAME regex hwTagSet uses,
+    // hwBulkTag(btn, mode): validates the key with the SAME regex the Add tag dialog uses,
     // then fans the selection out over the EXISTING single-agent /api/tags/set or
     // /api/tags/delete (never a new bulk route — each call still runs its own
     // per-target scoped Tag:Write gate + tag.set/.delete audit row, so a bulk
@@ -761,24 +729,99 @@ const char* const kGuardianDetailPageTemplate =
       }
       if (!key) { showToast('Tag key is required', 'error'); return; }
       if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) { showToast('Tag key: letters, digits, _ . : - (max 64)', 'error'); return; }
-      btn.disabled = true;
-      var url = mode === 'set' ? '/api/tags/set' : '/api/tags/delete';
-      hwBulkRun(ids, function (id) {
-        var body = mode === 'set' ? { agent_id: id, key: key, value: value } : { agent_id: id, key: key };
-        return hwBulkFetchTag(url, body);
-      }, function (ok, denied, failed) {
-        btn.disabled = false;
-        var verb = mode === 'set' ? 'Tagged' : 'Untagged';
-        if (!failed.length) {
-          showToast(verb + ' ' + ok + '/' + ids.length, 'success');
-        } else {
-          var shown = failed.slice(0, 3).join(', ') + (failed.length > 3 ? ', …' : '');
-          var reason = denied ? (denied + ' denied') : (failed.length + ' failed');
-          showToast(verb + ' ' + ok + '/' + ids.length + ' — ' + reason + ': ' + shown, 'error');
-        }
-        hwBulkRefresh();
-      });
+      var apply = function () {
+        btn.disabled = true;
+        var url = mode === 'set' ? '/api/tags/set' : '/api/tags/delete';
+        hwBulkRun(ids, function (id) {
+          var body = mode === 'set' ? { agent_id: id, key: key, value: value } : { agent_id: id, key: key };
+          return hwBulkFetchTag(url, body);
+        }, function (ok, denied, failed) {
+          btn.disabled = false;
+          var verb = mode === 'set' ? 'Tagged' : 'Untagged';
+          if (!failed.length) {
+            showToast(verb + ' ' + ok + '/' + ids.length, 'success');
+          } else {
+            var shown = failed.slice(0, 3).join(', ') + (failed.length > 3 ? ', …' : '');
+            var reason = denied ? (denied + ' denied') : (failed.length + ' failed');
+            showToast(verb + ' ' + ok + '/' + ids.length + ' — ' + reason + ': ' + shown, 'error');
+          }
+          hwBulkRefresh();
+        });
+      };
+      // Confirm through the shared dialog when this page loaded it; the Guardian and
+      // DEX pages that share this script block do not, and keep the direct apply.
+      if (!window.YuzuDialog) { apply(); return; }
+      var body = [(mode === 'set' ? 'Set ' : 'Remove ') + 'tag ' + key + (mode === 'set' ? '=' + value : '') +
+        ' on ' + ids.length + ' selected device' + (ids.length === 1 ? '' : 's') + '?'];
+      if (key === 'service') body.push(btn.getAttribute('data-service-note') || '');
+      window.YuzuDialog.confirm({ title: mode === 'set' ? 'Set tag on devices' : 'Remove tag from devices',
+        body: body, confirmLabel: mode === 'set' ? 'Set tag' : 'Remove tag', danger: mode !== 'set' })
+        .then(function (ok) { if (ok) apply(); });
     }
+  </script>
+)HTM"
+    // Guard edit / delete controller. Own literal (MSVC 16 KiB cap); no inline
+    // handlers: one delegated listener on the buttons the guard fragment draws
+    // (data-gp-act). Without window.YuzuDialog the buttons are hidden, not dead.
+    R"HTM(
+  <script>
+    (function () {
+      'use strict';
+      var D = window.YuzuDialog;
+      if (!D) {
+        var st = document.createElement('style');
+        st.textContent = '[data-gp-act]{display:none}';
+        document.head.appendChild(st);
+        return;
+      }
+      function base(b) { return '/fragments/guardian/guard/' + encodeURIComponent(b.getAttribute('data-gp-id')); }
+      function edit(b) {
+        var mode = b.getAttribute('data-gp-mode') || '';
+        D.form({
+          title: 'Edit Guard',
+          body: ['Mode: ' + mode + ' (read-only). A Guard’s mode is fixed at creation; '
+                 + 'create a new Guard for a different posture.'],
+          note: 'Saving bumps the version. Last write wins: there is no check for a concurrent edit.',
+          fields: [
+            { name: 'name', label: 'Name', type: 'text', required: true, maxlength: 128,
+              value: b.getAttribute('data-gp-name') },
+            { name: 'severity', label: 'Severity', type: 'select',
+              value: b.getAttribute('data-gp-severity') || 'medium',
+              options: ['critical', 'high', 'medium', 'low'].map(function (s) { return { value: s, label: s }; }) },
+            { name: 'enabled', label: 'State', type: 'select', value: b.getAttribute('data-gp-enabled'),
+              options: [{ value: '1', label: 'Enabled' }, { value: '0', label: 'Disabled' }] }
+          ],
+          submitLabel: 'Save',
+          submit: function (v) {
+            return D.request('POST', base(b) + '/update',
+                             { form: { name: v.name.trim(), severity: v.severity, enabled: v.enabled } })
+              .then(function (r) { return r.ok ? null : (r.message || ('Save failed (' + r.status + ')')); });
+          }
+        }).then(function (v) { if (v) location.reload(); });
+      }
+      function del(b) {
+        var name = b.getAttribute('data-gp-name');
+        D.form({
+          title: 'Delete Guard',
+          danger: true,
+          body: ['Deletes the Guard and its live compliance state; agents already enforcing it keep enforcing until the next push (#4304).',
+                 'Type the Guard name to confirm: ' + name],
+          fields: [{ name: 'confirm', label: 'Guard name', type: 'text', required: true, maxlength: 128 }],
+          submitLabel: 'Delete Guard',
+          validate: function (v) { return v.confirm === name ? null : 'The name does not match.'; },
+          submit: function (v) {
+            return D.request('POST', base(b) + '/delete', { form: { confirm_name: v.confirm } })
+              .then(function (r) { return r.ok ? null : (r.message || ('Delete failed (' + r.status + ')')); });
+          }
+        }).then(function (v) { if (v) window.location = '/guardian'; });
+      }
+      document.addEventListener('click', function (e) {
+        var b = e.target && e.target.closest ? e.target.closest('[data-gp-act]') : null;
+        if (!b) return;
+        e.preventDefault();
+        if (b.getAttribute('data-gp-act') === 'edit') edit(b); else del(b);
+      });
+    })();
   </script>
 )HTM"
     R"HTM(

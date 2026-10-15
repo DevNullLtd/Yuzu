@@ -360,7 +360,16 @@ public:
     [[nodiscard]] bool rbac_enabled_view_degraded() const;
 
     // ── Roles CRUD ───────────────────────────────────────────────────────
+    /// LEGACY fail-soft: `list_roles_checked().value_or({})`. A degrade reads as
+    /// an empty vector, indistinguishable from "no roles". Prefer the checked read.
     std::vector<RbacRole> list_roles() const;
+
+    /// Authoritative variant: `unexpected(msg)` = closed store, pool-acquire
+    /// timeout or query error (the last two bump
+    /// `yuzu_server_rbac_read_degrade_total{reason}`); a value, possibly empty,
+    /// is a fully-read result.
+    std::expected<std::vector<RbacRole>, std::string> list_roles_checked() const;
+
     std::optional<RbacRole> get_role(const std::string& name) const;
     std::expected<void, std::string> create_role(const RbacRole& role);
     std::expected<void, std::string> update_role(const std::string& name,

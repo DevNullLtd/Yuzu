@@ -36,6 +36,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <format>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -4221,6 +4222,107 @@ TEST_CASE("GET /api/v1/result-sets/{id}/members: a degraded members-table read r
 
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
+}
+
+TEST_CASE("GET /api/v1/result-sets/{id}/members: the caller's CURRENT fleet-read scope reaches "
+          "the SQL before LIMIT, so hidden ids neither appear nor take page slots, at 1/9/10/11 "
+          "visible members and limit=10 (mutation: drop gate.scope and hidden ids lead page 1)",
+          "[pg][result_set][security][members]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    for (const int visible_n : {1, 9, 10, 11}) {
+        INFO("visible members: " << visible_n);
+        // 15 hidden ids sort before every visible one and one hidden id follows each visible
+        // one, so a post-filter would return a page of only hidden ids and an interleaved one
+        // would short every page.
+        std::vector<std::string> all;
+        std::unordered_set<std::string> visible;
+        std::vector<std::string> expected;
+        for (int i = 0; i < 15; ++i)
+            all.push_back(std::format("aaa-{:02d}", i));
+        for (int i = 0; i < visible_n; ++i) {
+            const auto v = std::format("dev-{:02d}", i);
+            all.push_back(v);
+            all.push_back(v + "-h");
+            visible.insert(v);
+            expected.push_back(v);
+        }
+        const auto id = h.seed_materialized(std::format("scoped-{}", visible_n), all);
+        h.fleet_read_scope_override = visible;
+
+        std::vector<std::string> seen;
+        std::vector<std::size_t> page_sizes;
+        std::string cursor;
+        for (int guard = 0; guard < 10; ++guard) {
+            std::string path = "/api/v1/result-sets/" + id + "/members?limit=10";
+            if (!cursor.empty())
+                path += "&cursor=" + cursor;
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            auto j = nlohmann::json::parse(res->body);
+            const auto& ids = j["data"]["device_ids"];
+            page_sizes.push_back(ids.size());
+            for (const auto& d : ids)
+                seen.push_back(d.get<std::string>());
+            cursor = j["data"]["next_cursor"].get<std::string>();
+            if (cursor.empty())
+                break;
+        }
+        CHECK(seen == expected);
+        CHECK(page_sizes.front() == static_cast<std::size_t>(std::min(visible_n, 10)));
+        CHECK(page_sizes.size() == (visible_n > 10 ? 2u : 1u));
+    }
+
+    CHECK(h.fleet_read_fn_reached);
+    SECTION("a caller who now sees none of them gets an empty page, not the set") {
+        const auto id = h.seed_materialized("all-hidden", {"d1", "d2"});
+        h.fleet_read_scope_override = yuzu::server::authz::deny_all();
+        auto res = h.sink.Get("/api/v1/result-sets/" + id + "/members");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["data"]["device_ids"].empty());
+        CHECK(j["data"]["next_cursor"].get<std::string>().empty());
+    }
+}
+
+TEST_CASE("GET /api/v1/result-sets/{id}/members: a refused fleet-read gate and an unwired one "
+          "disclose no member id",
+          "[pg][result_set][security][members]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    SECTION("the gate refuses (403)") {
+        AsyncHarness h(pool);
+        const auto id = h.seed_materialized("gated", {"dev-1", "dev-2"});
+        AsyncHarness::permit_exec = false;
+        auto res = h.sink.Get("/api/v1/result-sets/" + id + "/members");
+        AsyncHarness::permit_exec = true;
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("dev-1") == std::string::npos);
+        CHECK(h.fleet_read_fn_reached);
+    }
+    SECTION("the gate is unwired: 503 and an audit row, never the unrestricted read") {
+        AsyncHarness h(pool, /*with_dispatch=*/true, /*inv=*/nullptr, /*with_exec_visible=*/true,
+                       /*with_fleet_read_fn=*/false);
+        const auto id = h.seed_materialized("unwired", {"dev-1", "dev-2"});
+        auto res = h.sink.Get("/api/v1/result-sets/" + id + "/members");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("dev-1") == std::string::npos);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_STORE_UNAVAILABLE") !=
+              std::string::npos);
+        REQUIRE_FALSE(h.audits.empty());
+        CHECK(h.audits.back().action == "result_set.members");
+        CHECK(h.audits.back().detail == "reason=fleet_read_fn_unwired");
+    }
 }
 
 TEST_CASE("GET /api/v1/result-sets/{id}/lineage: a degraded result_sets read refuses (503) "

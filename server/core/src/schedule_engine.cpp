@@ -326,13 +326,15 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
     // separate raw in-memory value to redact FROM: the persisted blob IS
     // what gets redispatched. Redacting it here would silently break
     // re-dispatch instead of merely protecting a history row, so a
-    // grant_secret-bearing schedule is refused outright — a single-
-    // redemption, ~15-minute-TTL credential cannot survive as a repeatable
-    // schedule regardless of this leak. See sensitive_instruction_params.hpp.
+    // schedule carrying a classified secret is refused outright — a single-
+    // redemption, ~15-minute-TTL grant cannot survive as a repeatable
+    // schedule, and a long-lived credential (client_secret) must not sit in
+    // the schedules table in the clear. See sensitive_instruction_params.hpp.
     if (schedule_params_contain_sensitive_key(*canon_params))
         return std::unexpected(
-            "parameters contain a one-time credential (grant_secret/grant_id) that cannot be "
-            "scheduled — mint a fresh grant and dispatch it directly instead");
+            "parameters contain a secret value (a grant secret or id, or a client secret) that "
+            "cannot be stored in a schedule — dispatch the instruction directly with a fresh "
+            "value instead");
 
     auto id = sched.id.empty() ? generate_id() : sched.id;
     auto now = now_epoch();

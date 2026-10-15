@@ -89,9 +89,9 @@
     "method": "GET",
     "path": "/api/audit",
     "capability_id": "get.api-audit",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {"method": "GET", "path": "/api/v1/audit"},
+    "mcp_twin": "query_audit_log",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -300,7 +300,7 @@
     "method": "GET",
     "path": "/api/me",
     "capability_id": "get.api-me",
-    "rest_v1_twin": null,
+    "rest_v1_twin": {"method": "GET", "path": "/api/v1/me"},
     "mcp_twin": null,
     "status": "planned:#2146"
   },
@@ -542,6 +542,22 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/dashboard/activity",
+    "capability_id": "get.fragments-dashboard-activity",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-audit"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dashboard/health",
+    "capability_id": "get.fragments-dashboard-health",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-health"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/instructions",
     "capability_id": "get.fragments-instructions",
     "rest_v1_twin": null,
@@ -555,6 +571,17 @@
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/instructions/templates",
+    "capability_id": "get.fragments-instructions-templates",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/definitions/{param}/response-templates"
+    },
+    "mcp_twin": "get_definition",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -573,6 +600,17 @@
       "path": "/api/v1/result-sets"
     },
     "mcp_twin": "create_result_set",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/result-sets/producers",
+    "capability_id": "get.fragments-result-sets-producers",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/instructions"
+    },
+    "mcp_twin": "list_definitions",
     "status": "twinned"
   },
   {
@@ -606,6 +644,17 @@
       "path": "/api/v1/result-sets/{param}"
     },
     "mcp_twin": "get_result_set",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/result-sets/{param}/members",
+    "capability_id": "get.fragments-result-sets-param-members",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/result-sets/{param}/members"
+    },
+    "mcp_twin": "get_result_set_members",
     "status": "twinned"
   },
   {

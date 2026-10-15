@@ -32,13 +32,9 @@ bool dex_window_is_valid(const std::string& window) {
     return window == "24h" || window == "7d" || window == "30d" || window == "all";
 }
 
-// ISO-8601 UTC cutoff for "N days ago"; "" for days<=0 (the "all" window, where a
-// per-device-days rate is ill-defined). Mirrors guardian_ingest's ts_to_iso8601.
-std::string dex_iso_since(int days) {
-    if (days <= 0)
-        return {};
-    const auto t = std::chrono::system_clock::now() - std::chrono::hours(24 * days);
-    std::time_t tt = std::chrono::system_clock::to_time_t(t);
+// ISO-8601 UTC text of an absolute instant. Mirrors guardian_ingest's ts_to_iso8601.
+std::string dex_iso_at(std::int64_t epoch_seconds) {
+    std::time_t tt = static_cast<std::time_t>(epoch_seconds);
     std::tm tm{};
 #if defined(_WIN32)
     gmtime_s(&tm, &tt);
@@ -48,6 +44,23 @@ std::string dex_iso_since(int days) {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return buf;
+}
+
+DexDayWindow dex_day_window(std::int64_t now_epoch, int days) {
+    DexDayWindow w;
+    w.end_day = (now_epoch / 86400) * 86400;
+    w.since_day = w.end_day - static_cast<std::int64_t>(days) * 86400;
+    w.since_iso = dex_iso_at(w.since_day);
+    return w;
+}
+
+// ISO-8601 UTC cutoff for "N days ago"; "" for days<=0 (the "all" window, where a
+// per-device-days rate is ill-defined). Mirrors guardian_ingest's ts_to_iso8601.
+std::string dex_iso_since(int days) {
+    if (days <= 0)
+        return {};
+    const auto t = std::chrono::system_clock::now() - std::chrono::hours(24 * days);
+    return dex_iso_at(static_cast<std::int64_t>(std::chrono::system_clock::to_time_t(t)));
 }
 
 std::string dex_normalize_os_filter(const std::string& os) {

@@ -516,6 +516,13 @@ public:
     std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
     std::vector<DefinitionExecutionStats> get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
     FleetExecutionSummary get_fleet_summary(std::optional<int64_t> since = std::nullopt) const;
+    /// Same figures with the store-failure / genuinely-zero distinction: unexpected when the
+    /// store is closed, the lease fails or any statement fails (an empty table is a successful
+    /// read of zeros). `include_active_agents = false` skips the DISTINCT agent scan. `since` is
+    /// presence-tracked like `ExecutionStatsQuery`: unset = no bound, a literal 0 is a bound.
+    [[nodiscard]] std::expected<FleetExecutionSummary, std::string>
+    get_fleet_summary_checked(std::optional<int64_t> since = std::nullopt,
+                              bool include_active_agents = true) const;
 
     // ── Command <-> execution correlation (HA WS-1(1b), ADR-2002 section 5) ──
     //

@@ -134,7 +134,7 @@ TEST_CASE("policy: the default validates and reproduces the stability score bit-
         mk(1000, 300, 300, 0, Rr{2.0, 5.0}),
         mk(1000, 300, 300, 0, Rr{3.0, 9.0}),
         mk(1000, 300, 300, 0, Rr{2.0, kInf}),
-        mk(5, 1, 1),  // below the floor
+        mk(5, 1, 1),  // a five-device population (scored: the floor is one device)
         mk(10, 11, 0) // inconsistent
     };
     // Values, not only plumbing: the stability score's known answers.

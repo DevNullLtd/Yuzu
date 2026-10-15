@@ -8,6 +8,7 @@
 
 #include "compliance_routes.hpp"
 
+#include "compliance_fragments.hpp" // pure HTML renderers for the fragments below
 #include "compliance_model.hpp"      // shared REST/MCP/fragment builders (#4034, recipe Rule 1)
 #include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial/a4_error/ensure_correlation_id — mints/
@@ -20,7 +21,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Compliance page HTML (defined in compliance_ui.cpp).
@@ -54,298 +58,216 @@ std::string list_json(nlohmann::json data, int64_t total, int64_t start = 0,
 
 } // namespace
 
-// ── Static helpers ──────────────────────────────────────────────────────────
-
-const char* ComplianceRoutes::compliance_level(int pct) {
-    if (pct >= 90) return "good";
-    if (pct >= 70) return "warn";
-    return "bad";
-}
-
 // ── Fragment renderers ──────────────────────────────────────────────────────
+//
+// Markup lives in compliance_fragments.hpp (pure, fixture-testable); this file
+// owns the store reads, confinement and the degrade decisions.
 
-std::string ComplianceRoutes::render_compliance_summary_fragment() {
-    // Real policy data via the ComplianceApi seam (ADR-0031 WS-A4).
-    struct PolicyRow {
-        std::string id;
-        std::string name;
-        std::string scope;
-        int pct;
-        int compliant;
-        int total;
-        bool enabled;
-    };
+std::string ComplianceRoutes::render_compliance_summary_fragment(bool can_write, bool can_execute,
+                                                                 bool can_delete) {
+    namespace ch = compliance_html;
+    // No store seam is a wiring fault, not "no policies": rendering the empty
+    // state would read as a healthy fleet with nothing defined. Same degrade
+    // as the fragments list.
+    if (!api_) {
+        return ch::render_unavailable(
+            "Policy data temporarily unavailable (store not available) — try again shortly.");
+    }
 
-    std::vector<PolicyRow> policies;
+    ch::SummaryView view;
+    view.can_write = can_write;
+    view.can_execute = can_execute;
+    view.can_delete = can_delete;
+    PolicyQuery query;
+    view.policy_limit = static_cast<std::size_t>(query.limit);
+
     // ADR-0056: a degraded read must render distinctly from "genuinely no
     // policies" — collapsing them would show a false "0 policies, nothing to
     // see" state when the real answer is "could not ask the store".
     bool degraded = false;
-
-    if (api_) {
-        auto all_policies = api_->list_policies(PolicyQuery{});
-        if (!all_policies) {
-            degraded = true;
-        } else {
-            for (const auto& p : *all_policies) {
-                auto cs = api_->compliance_summary(p.id);
-                if (!cs) {
-                    degraded = true;
-                    continue;
-                }
-                // #4034 Rule 1: identity/scope/enabled and compliant/total come
-                // from the SAME builders GET /api/v1/policies and
-                // GET /api/v1/compliance/{id} call — this fragment cannot drift
-                // from the REST/MCP field selection (docs/api-twin-recipe.md §1).
-                nlohmann::json row_j = policy_list_row_json(p);
-                nlohmann::json cs_j = compliance_summary_json(*cs);
-                PolicyRow row;
-                row.id = row_j.at("id").get<std::string>();
-                row.name = row_j.at("name").get<std::string>();
-                row.scope = row_j.at("scope_expression").get<std::string>();
-                row.enabled = row_j.at("enabled").get<bool>();
-                row.compliant = static_cast<int>(cs_j.at("compliant").get<int64_t>());
-                row.total = static_cast<int>(cs_j.at("total").get<int64_t>());
-                row.pct = (row.total > 0) ? (row.compliant * 100 / row.total) : 0;
-                policies.push_back(std::move(row));
+    auto all_policies = api_->list_policies(query);
+    if (!all_policies) {
+        degraded = true;
+    } else {
+        for (const auto& p : *all_policies) {
+            auto cs = api_->compliance_summary(p.id);
+            if (!cs) {
+                degraded = true;
+                continue;
             }
+            // #4034 Rule 1: identity/scope/enabled and the status tally come
+            // from the SAME builders GET /api/v1/policies and
+            // GET /api/v1/compliance/{id} call — this fragment cannot drift
+            // from the REST/MCP field selection (docs/api-twin-recipe.md §1).
+            nlohmann::json row_j = policy_list_row_json(p);
+            nlohmann::json cs_j = compliance_summary_json(*cs);
+            ch::PolicyRow row;
+            row.id = row_j.at("id").get<std::string>();
+            row.name = row_j.at("name").get<std::string>();
+            row.scope = row_j.at("scope_expression").get<std::string>();
+            row.enabled = row_j.at("enabled").get<bool>();
+            row.compliant = cs_j.at("compliant").get<int64_t>();
+            row.non_compliant = cs_j.at("non_compliant").get<int64_t>();
+            row.unknown = cs_j.at("unknown").get<int64_t>();
+            row.fixing = cs_j.at("fixing").get<int64_t>();
+            row.error = cs_j.at("error").get<int64_t>();
+            row.total = cs_j.at("total").get<int64_t>();
+            view.policies.push_back(std::move(row));
         }
     }
 
     if (degraded) {
-        return "<div class=\"cmp-panel\"><div class=\"empty-state\">"
-               "Policy data temporarily unavailable (store degraded) — try again shortly."
-               "</div></div>";
+        return ch::render_unavailable(
+            "Policy data temporarily unavailable (store degraded) — try again shortly.");
     }
 
-    // Fleet-level compliance via the seam
-    FleetCompliance fc;
-    if (api_) {
-        auto fc_res = api_->fleet_compliance();
-        if (!fc_res) {
-            return "<div class=\"cmp-panel\"><div class=\"empty-state\">"
-                   "Fleet compliance temporarily unavailable (store degraded) — try again "
-                   "shortly.</div></div>";
-        }
-        fc = *fc_res;
+    auto fc_res = api_->fleet_compliance();
+    if (!fc_res) {
+        return ch::render_unavailable("Fleet compliance temporarily unavailable (store "
+                                      "degraded) — try again shortly.");
     }
-    int fleet_pct = static_cast<int>(fc.compliance_pct);
-
-    std::string html;
-
-    // Readout row: fleet compliance (with its level bar), policy and device-check counts
-    html += "<div class=\"compliance-hero\">"
-            "<div class=\"hero-cell\">"
-            "<div class=\"hero-v\">" + std::to_string(fleet_pct) + "%</div>"
-            "<div class=\"hero-l\">Fleet compliance</div>"
-            "<div class=\"compliance-bar\"><div class=\"compliance-fill ";
-    html += compliance_level(fleet_pct);
-    html += "\" style=\"width:" + std::to_string(fleet_pct) + "%\"></div></div>"
-            "</div>"
-            "<div class=\"hero-cell\"><div class=\"hero-v\">" +
-            std::to_string(static_cast<int>(policies.size())) +
-            "</div><div class=\"hero-l\">Policies active</div></div>"
-            "<div class=\"hero-cell\"><div class=\"hero-v\">" +
-            std::to_string(static_cast<int>(fc.total_checks)) +
-            "</div><div class=\"hero-l\">Device checks</div></div>"
-            "</div>";
-
-    // Policy table
-    html += "<div class=\"cmp-panel\"><div class=\"tw\"><table class=\"policy-table\">"
-            "<thead><tr>"
-            "<th>#</th><th>Policy</th><th>Scope</th>"
-            "<th>Compliance</th><th></th><th></th>"
-            "</tr></thead><tbody>";
-
-    if (policies.empty()) {
-        html += "<tr><td colspan=\"6\" class=\"empty-state\">"
-                "No policies defined. Create policies in the Policy Engine to track compliance."
-                "</td></tr>";
-    } else {
-        int row = 0;
-        for (const auto& p : policies) {
-            ++row;
-            html += "<tr>"
-                    "<td class=\"policy-idx\">" + std::to_string(row) + "</td>"
-                    "<td class=\"policy-name\">" + html_escape(p.name) + "</td>"
-                    "<td class=\"policy-scope\">" + html_escape(p.scope) + "</td>"
-                    "<td>"
-                    "<span class=\"policy-pct " + std::string(compliance_level(p.pct)) + "\">"
-                    + std::to_string(p.pct) + "%</span>"
-                    "<div class=\"mini-bar\"><div class=\"mini-fill " + std::string(compliance_level(p.pct)) +
-                    "\" style=\"width:" + std::to_string(p.pct) + "%\"></div></div>"
-                    "</td>"
-                    "<td class=\"policy-count\">"
-                    + std::to_string(p.compliant) + "/" + std::to_string(p.total) +
-                    "</td>"
-                    "<td>"
-                    "<button class=\"btn btn-secondary btn-sm\" "
-                    "hx-get=\"/fragments/compliance/" + html_escape(p.id) + "\" "
-                    "hx-target=\"#compliance-detail\" "
-                    "hx-swap=\"innerHTML\">"
-                    "View</button>"
-                    "</td></tr>";
-        }
-    }
-
-    html += "</tbody></table></div></div>";
-    return html;
+    view.fleet = *fc_res;
+    return ch::render_summary(view);
 }
 
-std::string ComplianceRoutes::render_compliance_detail_fragment(const std::string& policy_id) {
-    // Look up the policy via the seam. Low-stakes (page-title fallback
-    // only) — a degraded read or not-found just keeps the id as the
-    // displayed name; not worth a distinct error state here.
-    std::string policy_name = policy_id;
-    if (api_) {
-        auto policy = api_->get_policy(policy_id);
-        if (policy && *policy)
-            policy_name = (*policy)->policy.name;
+std::string ComplianceRoutes::render_compliance_detail_fragment(
+    const std::string& policy_id, const authz::VisibleSet& scope,
+    std::optional<std::size_t>& rows_read) {
+    namespace ch = compliance_html;
+    rows_read.reset();
+
+    ch::DetailView view;
+    view.policy_id = policy_id;
+    view.policy_name = policy_id;
+    view.confined = scope.has_value();
+
+    if (!api_) {
+        // No store seam is a wiring fault, not a policy with no data yet: render
+        // the degraded note a failed read gets, never "No compliance data yet".
+        // rows_read stays unset, so no audit row is written for a view that
+        // read nothing.
+        view.degraded = true;
+        return ch::render_detail(view);
     }
 
-    // Get real compliance statuses via the seam.
-    struct AgentRow {
-        std::string agent_id;
-        std::string hostname;
-        std::string os;
-        std::string status;
-        std::string last_check;
-        std::string detail;
-    };
-
-    std::vector<AgentRow> agents;
-    bool degraded = false;
-    // #4034 Rule 1: same confined_policy_compliance tally REST's
-    // GET /api/v1/compliance/{id} and MCP's get_policy_agent_statuses use to
-    // count agents by status (scope=nullopt/TOP — this fragment has no
-    // confinement gate of its own to derive a narrower scope from; the
-    // fragment's separate lack-of-RBAC-gate gap is #4042's job, not this
-    // one's). Default-constructed (all-zero) until the block below runs, so
-    // it stays valid across the degraded/empty early-returns further down.
-    ConfinedPolicyCompliance confined;
-    confined.summary.policy_id = policy_id;
-    if (api_) {
-        auto statuses = api_->policy_agent_statuses(policy_id);
-        if (!statuses) {
-            degraded = true;
-            statuses = std::vector<PolicyAgentStatus>{};
-        }
-        confined = confined_policy_compliance(*statuses, /*scope=*/std::nullopt, policy_id);
-        for (const auto& s : confined.visible) {
-            nlohmann::json row_j = policy_agent_status_json(s);
-            AgentRow row;
-            row.agent_id = row_j.at("agent_id").get<std::string>();
-            row.status = row_j.at("status").get<std::string>();
-            row.detail = row_j.at("check_result").get<std::string>();
-
-            // Look up hostname/os from agent registry
-            row.hostname = row.agent_id;
-            row.os = "";
-            try {
-                auto agents_json_str = agents_json_fn_();
-                auto arr = nlohmann::json::parse(agents_json_str);
-                for (const auto& a : arr) {
-                    if (a.value("agent_id", std::string{}) == row.agent_id) {
-                        row.hostname = a.value("hostname", row.agent_id);
-                        row.os = a.value("os", std::string{});
+    // The header is best-effort: a degraded read or a not-found keeps the
+    // id as the displayed name and omits the kv panel. Definition reads
+    // (name, scope expression, bound fragment) are a GLOBAL Policy:Read on
+    // the REST twins (perm_fn_); this route's fleet-read gate also admits
+    // a holder whose grant arrives only through a management group, so a
+    // confined caller gets the per-device rows and nothing else, exactly
+    // what GET /api/v1/compliance/{id} returns.
+    if (!view.confined) {
+        auto policy = api_->get_policy(policy_id);
+        if (policy && *policy) {
+            const auto& d = **policy;
+            view.have_policy = true;
+            view.policy_name = d.policy.name;
+            view.applies_to = d.policy.scope_expression;
+            view.remediation_available = d.remediation_available;
+            auto frags = api_->list_fragments(FragmentQuery{});
+            if (frags) {
+                for (const auto& f : *frags) {
+                    if (f.id == d.policy.fragment_id) {
+                        view.check = f.check_compliance;
                         break;
                     }
                 }
-            } catch (...) {}
-
-            // Format last_check as relative time
-            const int64_t last_check_at = row_j.at("last_check_at").get<int64_t>();
-            if (last_check_at > 0) {
-                auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
-                auto delta = now - last_check_at;
-                if (delta < 60) row.last_check = std::to_string(delta) + "s ago";
-                else if (delta < 3600) row.last_check = std::to_string(delta / 60) + " min ago";
-                else row.last_check = std::to_string(delta / 3600) + "h ago";
-            } else {
-                row.last_check = "never";
             }
-
-            agents.push_back(std::move(row));
         }
     }
 
-    if (degraded) {
-        // ADR-0056: must not read the same as "no compliance data yet" —
-        // that phrasing tells an operator to wait, when the real answer is
-        // "the store could not be asked".
-        return "<div class=\"detail-panel\">"
-               "<h3>" + html_escape(policy_name) +
-               " <span class=\"detail-id\">"
-               "(" + html_escape(policy_id) + ")</span></h3>"
-               "<div class=\"empty-state\">Compliance data temporarily unavailable (store "
-               "degraded) — try again shortly.</div></div>";
+    auto statuses = api_->policy_agent_statuses(policy_id);
+    if (!statuses) {
+        view.degraded = true;
+    } else {
+        // #4034 Rule 1 + ADR-0017: the SAME confined tally REST's
+        // GET /api/v1/compliance/{id} and MCP's get_policy_agent_statuses
+        // use, narrowed to the caller's own scope.
+        auto confined = confined_policy_compliance(*statuses, scope, policy_id);
+        view.summary = confined.summary;
+        rows_read = confined.visible.size();
+
+        // One registry read per render, not one per row.
+        std::unordered_map<std::string, std::pair<std::string, std::string>> by_agent;
+        try {
+            auto arr = nlohmann::json::parse(agents_json_fn_());
+            for (const auto& a : arr) {
+                by_agent[a.value("agent_id", std::string{})] = {
+                    a.value("hostname", std::string{}), a.value("os", std::string{})};
+            }
+        } catch (...) {
+            // Hostname/OS are display-only; fall back to the agent id.
+        }
+
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+        for (const auto& s : confined.visible) {
+            nlohmann::json row_j = policy_agent_status_json(s);
+            ch::DetailAgent row;
+            row.agent_id = row_j.at("agent_id").get<std::string>();
+            row.status = row_j.at("status").get<std::string>();
+            row.detail = row_j.at("check_result").get<std::string>();
+            row.hostname = row.agent_id;
+            auto it = by_agent.find(row.agent_id);
+            if (it != by_agent.end()) {
+                if (!it->second.first.empty())
+                    row.hostname = it->second.first;
+                row.os = it->second.second;
+            }
+            row.last_check = ch::format_age(now, row_j.at("last_check_at").get<int64_t>());
+            view.agents.push_back(std::move(row));
+        }
     }
-    if (agents.empty()) {
-        return "<div class=\"detail-panel\">"
-               "<h3>" + html_escape(policy_name) +
-               " <span class=\"detail-id\">"
-               "(" + html_escape(policy_id) + ")</span></h3>"
-               "<div class=\"empty-state\">No compliance data yet. "
-               "Agents will report status once the policy triggers fire.</div></div>";
+    return ch::render_detail(view);
+}
+
+std::string ComplianceRoutes::render_policy_fragments_fragment() {
+    namespace ch = compliance_html;
+    if (!api_) {
+        return ch::render_unavailable("Fragments temporarily unavailable");
     }
-
-    // Status counts come from the SAME confined_policy_compliance tally the
-    // agent-row loop above populated `confined.summary` with (#4034 Rule 1) —
-    // no second hand-rolled status if/else chain.
-    const int compliant = static_cast<int>(confined.summary.compliant);
-    const int non_compliant = static_cast<int>(confined.summary.non_compliant);
-    const int unknown = static_cast<int>(confined.summary.unknown);
-    const int fixing = static_cast<int>(confined.summary.fixing);
-
-    std::string html;
-    html += "<div class=\"detail-panel\">"
-            "<h3>" + html_escape(policy_name) +
-            " <span class=\"detail-id\">"
-            "(" + html_escape(policy_id) + ")</span></h3>";
-
-    // Status summary badges
-    html += "<div class=\"detail-badges\">"
-            "<span class=\"status-compliant\">" + std::to_string(compliant) + " compliant</span>"
-            "<span class=\"status-non-compliant\">" + std::to_string(non_compliant) + " non-compliant</span>"
-            "<span class=\"status-pending-eval\">" + std::to_string(unknown) + " unknown</span>"
-            "<span class=\"status-remediated\">" + std::to_string(fixing) + " fixing</span>"
-            "</div>";
-
-    // Per-agent table
-    html += "<div class=\"tw\"><table class=\"detail-table\">"
-            "<thead><tr>"
-            "<th>Agent</th><th>Hostname</th><th>OS</th>"
-            "<th>Status</th><th>Last Check</th><th>Detail</th>"
-            "</tr></thead><tbody>";
-
-    for (const auto& a : agents) {
-        std::string status_class = "status-compliant";
-        if (a.status == "non_compliant") status_class = "status-non-compliant";
-        else if (a.status == "unknown") status_class = "status-pending-eval";
-        else if (a.status == "fixing") status_class = "status-remediated";
-        else if (a.status == "error") status_class = "status-non-compliant";
-
-        std::string status_label = a.status;
-        if (status_label == "non_compliant") status_label = "Non-Compliant";
-        else if (status_label == "compliant") status_label = "Compliant";
-        else if (status_label == "unknown") status_label = "Unknown";
-        else if (status_label == "fixing") status_label = "Fixing";
-        else if (status_label == "error") status_label = "Error";
-
-        html += "<tr>"
-                "<td class=\"mono-id\">" + html_escape(a.agent_id) + "</td>"
-                "<td>" + html_escape(a.hostname) + "</td>"
-                "<td class=\"cell-mut\">" + html_escape(a.os) + "</td>"
-                "<td><span class=\"" + status_class + "\">" + status_label + "</span></td>"
-                "<td class=\"cell-mut\">" + html_escape(a.last_check) + "</td>"
-                "<td class=\"cell-wrap\">" + html_escape(a.detail) + "</td>"
-                "</tr>";
+    FragmentQuery fq;
+    PolicyQuery pq;
+    auto frags = api_->list_fragments(fq);
+    auto policies = api_->list_policies(pq);
+    if (!frags || !policies) {
+        return ch::render_unavailable("Fragments temporarily unavailable");
     }
 
-    html += "</tbody></table></div></div>";
-    return html;
+    ch::FragmentsView view;
+    view.fragment_limit = static_cast<std::size_t>(fq.limit);
+    // One policy read covers every fragment unless the policy list itself was
+    // cut by its cap, in which case a count taken from it would undercount
+    // (and make Delete look safe): fall back to one filtered read per
+    // fragment, bounded by the fragment cap.
+    const bool policies_capped = policies->size() >= static_cast<std::size_t>(pq.limit);
+    std::unordered_map<std::string, int64_t> used_by;
+    if (!policies_capped) {
+        for (const auto& p : *policies)
+            ++used_by[p.fragment_id];
+    }
+    for (const auto& f : *frags) {
+        ch::FragmentRow row;
+        row.id = f.id;
+        row.name = f.name;
+        row.check_instruction = f.check_instruction;
+        if (!policies_capped) {
+            auto it = used_by.find(f.id);
+            row.used_by = it == used_by.end() ? 0 : it->second;
+        } else {
+            PolicyQuery per;
+            per.fragment_filter = f.id;
+            auto n = api_->list_policies(per);
+            if (!n)
+                return ch::render_unavailable("Fragments temporarily unavailable");
+            row.used_by = static_cast<int64_t>(n->size());
+            row.used_by_capped = n->size() >= static_cast<std::size_t>(per.limit);
+        }
+        view.fragments.push_back(std::move(row));
+    }
+    return ch::render_fragments(view);
 }
 
 // guardian-confinement-2298 PR3 §3e — see the declaration comment in
@@ -435,24 +357,70 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                      });
 
     // -- Compliance HTMX fragment: fleet summary --------------------------
+    // #4042: service-scoped deny first (blanket), then the same Policy:Read
+    // grant GET /api/v1/compliance asks for. perm_fn_ is a GLOBAL grant
+    // check, so a holder whose Policy:Read comes only through a management
+    // group is refused here (403) and never reaches the confined detail.
     sink.Get("/fragments/compliance/summary",
                      [this](const httplib::Request& req, httplib::Response& res) {
                          if (deny_service_scoped_(req, res)) return;
-                         auto session = auth_fn_(req, res);
-                         if (!session) return;
-                         res.set_content(render_compliance_summary_fragment(),
+                         if (!perm_fn_(req, res, "Policy", "Read")) return;
+                         // Probe once per summary render, into a throwaway
+                         // response (perm_fn_ writes a 403 into what it is
+                         // handed and audits each denial). The detail and
+                         // fragment panels reuse these flags client-side.
+                         httplib::Response probe;
+                         const bool can_write = perm_fn_(req, probe, "Policy", "Write");
+                         const bool can_execute = perm_fn_(req, probe, "Policy", "Execute");
+                         const bool can_delete = perm_fn_(req, probe, "Policy", "Delete");
+                         res.set_content(render_compliance_summary_fragment(can_write, can_execute,
+                                                                           can_delete),
+                                         "text/html; charset=utf-8");
+                     });
+
+    // -- Policy fragments list (the HTML twin of GET /api/policy-fragments) --
+    // Deliberately OUTSIDE /fragments/compliance/(\w[\w\-]*): that regex is
+    // the per-policy id namespace and would swallow a sibling literal.
+    sink.Get("/fragments/policy-fragments",
+                     [this](const httplib::Request& req, httplib::Response& res) {
+                         if (deny_service_scoped_(req, res)) return;
+                         if (!perm_fn_(req, res, "Policy", "Read")) return;
+                         res.set_content(render_policy_fragments_fragment(),
                                          "text/html; charset=utf-8");
                      });
 
     // -- Compliance HTMX fragment: per-policy agent detail ----------------
+    // #4042: the REST v1 twin's contract. fleet_read_fn_ is the SOLE gate
+    // (never stacked with perm_fn_), rows are confined to the caller's
+    // scope, and the per-agent read writes compliance.agent_statuses.view.
+    // Audit posture follows the dashboard convention (set-and-proceed, flag
+    // via Sec-Audit-Failed); the REST twin fails closed instead.
     sink.Get(R"(/fragments/compliance/(\w[\w\-]*))",
                      [this](const httplib::Request& req, httplib::Response& res) {
                          if (deny_service_scoped_(req, res)) return;
-                         auto session = auth_fn_(req, res);
-                         if (!session) return;
+                         if (!fleet_read_fn_) {
+                             // Unwired is misconfiguration: 503, never a
+                             // fall-through to an ungated render.
+                             spdlog::error("GET /fragments/compliance/{{id}}: fleet_read_fn_ "
+                                           "unwired — misconfigured call site; failing closed");
+                             res.status = 503;
+                             res.set_content(detail::a4_error(res, "service unavailable"),
+                                             "application/json");
+                             return;
+                         }
+                         auto gate = fleet_read_fn_(req, res, "Policy", "Read");
+                         if (!gate.admitted) return;
                          auto policy_id = req.matches[1].str();
-                         res.set_content(render_compliance_detail_fragment(policy_id),
-                                         "text/html; charset=utf-8");
+                         std::optional<std::size_t> rows_read;
+                         auto html =
+                             render_compliance_detail_fragment(policy_id, gate.scope, rows_read);
+                         if (rows_read) {
+                             (void)detail::emit_behavioral_audit(
+                                 audit_fn_, req, res, "compliance.agent_statuses.view", "success",
+                                 "Policy", policy_id,
+                                 "agents=" + std::to_string(*rows_read) + " surface=dashboard");
+                         }
+                         res.set_content(html, "text/html; charset=utf-8");
                      });
 
     // -- Policy Engine API (Phase 5, READ side) -------------------------------

@@ -104,6 +104,8 @@
 //     once the execution reaches a terminal state.
 // ─────────────────────────────────────────────────────────────────────────────
 
+#include "authz_model.hpp" // authz::VisibleSet: the members read's visibility scope
+
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -131,6 +133,21 @@ inline constexpr std::string_view kTarQuery = "tar_query";
 inline constexpr std::string_view kInstructionResult = "instruction_result";
 inline constexpr std::string_view kManualCurate = "manual_curate";
 } // namespace source_kind
+
+/// The statement and positional parameters for one `members_checked` page. A pure function (no
+/// database) so the text, the parameter order and the position of the visibility clause relative
+/// to `ORDER BY`/`LIMIT` can be unit-pinned. `$n` placeholders only; no caller value is spliced.
+/// `limit` is the page size: the statement selects `limit + 1` rows and the store trims the extra
+/// one, which is its "more exist" signal. `visible` engaged adds `device_id = ANY(...)` (engaged
+/// but empty adds `1=0`, never an unfiltered read) BEFORE the keyset predicate and the ORDER
+/// BY/LIMIT: ADR-0017 INV-3, so a device the caller can no longer see never takes a page slot.
+struct MembersPageSql {
+    std::string sql;
+    std::vector<std::string> params;
+};
+[[nodiscard]] MembersPageSql build_members_page_sql(const std::string& id,
+                                                    const std::string& cursor, int limit,
+                                                    const authz::VisibleSet& visible);
 
 /// Row metadata for a result set (members live in a separate table).
 struct ResultSet {
@@ -256,9 +273,19 @@ public:
         std::vector<std::string> device_ids;
         std::string next_cursor; // empty once the last page is reached
     };
-    std::expected<MembersPage, ResultSetError> members_checked(const std::string& id,
-                                                                const std::string& cursor,
-                                                                int limit);
+    ///
+    /// `visible` is the caller's CURRENT list-read scope (the `fleet_read_fn` gate's `scope`,
+    /// `Infrastructure:Read`): nullopt = unrestricted, engaged = only those device ids, engaged
+    /// but empty = none (an empty page without a round trip). It is applied in the SQL before
+    /// `ORDER BY`/`LIMIT` (ADR-0017 INV-3), so ids the caller can no longer see neither appear
+    /// nor use up page slots, and the cursor walks only visible ids. EVERY read that DISPLAYS
+    /// membership to a person must pass the caller's scope. The default (unrestricted) is for
+    /// the two producer routes that materialise a parent set's members as the input of a
+    /// separately scoped query: narrowing the parent there would silently shrink a set that
+    /// targets the fleet (the #4306 target-erasure shape).
+    std::expected<MembersPage, ResultSetError>
+    members_checked(const std::string& id, const std::string& cursor, int limit,
+                    const authz::VisibleSet& visible = std::nullopt);
     /// Deny-or-benign plain wrapper over `members_checked` — see the
     /// file-header posture note. `out_next_cursor` is cleared on a `DbError`
     /// (same shape as a genuine last page), matching this method's pre-#4306

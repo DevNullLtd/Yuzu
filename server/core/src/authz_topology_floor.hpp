@@ -51,6 +51,17 @@
 /// posture across the RBAC-off toggle, not only to protect the RBAC graph
 /// itself.
 ///
+/// #5771 added a third inclusion class: EVIDENCE-GRADE data. `AuditLog:Read`
+/// is the SOC 2 CC6.1/CC7.2 evidence store — who did what, to which target,
+/// with what outcome, plus free-text detail (and, on the legacy dashboard
+/// route, the actor's role and source IP). It is neither authorization
+/// topology nor an `admin_fn_` -> `perm_fn_` migration, but on the RBAC-off
+/// default it was the one evidence store left readable by ANY signed-in
+/// session, which defeats the control it evidences. The inclusion test is
+/// therefore: the read discloses authorization topology, OR it preserves an
+/// existing admin-only posture across a gate migration, OR it returns the
+/// audit evidence itself. A new entry must fit one of the three.
+///
 /// EXTEND this set, never fork it — a second copy of a floor set is exactly
 /// the kind of drift the repo's other chokepoints (`dispatch_confined_arms.hpp`,
 /// `principal_quota_gate.hpp`) exist to prevent.
@@ -112,6 +123,15 @@ inline constexpr TopologyFloorEntry kTopologyFloor[] = {
     // unaffected (it authorizes via has_permission + the AdminOrApproval
     // switch in agent_registry.hpp:243-285, not this branch).
     {"Forensics", "Read"},
+    // #5771 — the audit trail (evidence-grade data; see the file-header note
+    // above). Every surface that gates on this pair — GET /api/audit,
+    // GET /api/v1/audit, GET /api/v1/audit/auth-sample,
+    // GET /api/v1/engine-principals/audit/no-admin, the MCP query_audit_log /
+    // audit_engine_no_admin tools and the yuzu://audit/recent resource — is
+    // admin-only while RBAC is off. A live grant (seeded Administrator,
+    // PlatformEngineer, Operator, ITServiceOwner, Viewer, or a custom role)
+    // still admits: the floor never runs ahead of the RBAC-on branch.
+    {"AuditLog", "Read"},
 };
 
 /// True when `(securable, operation)` is in the topology floor, i.e. the

@@ -312,6 +312,30 @@ TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave
     CHECK(description.find("all-time") == std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the retry semantics",
+          "[openapi][rbac]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& paths = spec["paths"];
+
+    auto response_keys = [](const json& op) {
+        std::set<std::string> keys;
+        for (auto it = op["responses"].begin(); it != op["responses"].end(); ++it)
+            keys.insert(it.key());
+        return keys;
+    };
+
+    REQUIRE(paths.contains("/rbac/roles"));
+    const auto& roles = paths["/rbac/roles"]["get"];
+    CHECK(response_keys(roles) == std::set<std::string>{"200", "403", "503"});
+    CHECK(roles.value("description", "").find("retry_after_ms") != std::string::npos);
+
+    REQUIRE(paths.contains("/rbac/roles/{role}/permissions"));
+    const auto& perms = paths["/rbac/roles/{role}/permissions"]["get"];
+    CHECK(response_keys(perms) == std::set<std::string>{"200", "403", "404", "503"});
+    CHECK(perms.value("description", "").find("retry_after_ms") != std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query parameter and "
           "response shape (#5294)",
           "[openapi][plugin_config][5294]") {

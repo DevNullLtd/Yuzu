@@ -41,41 +41,133 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
 <body>
   <!--yuzu:shell--><!--/yuzu:shell-->
 
-  <!-- Mount root carries agent_id via data-attribute so the renderer can
-       read it deterministically without parsing window.location. The
-       {{AGENT_ID}} placeholder is replaced by the server-side route
-       handler. -->
   <style>
-    /* Slice 4 splitter — draggable horizontal divider between the IPC
-       graph (top) and TAR tree (bottom). Ratio persists in localStorage
-       under yuzuVizHostSplitRatio so an operator's chosen layout sticks
-       across page reloads. */
-    #viz-host-root { display: flex; flex-direction: column; height: calc(100vh - var(--shell-top-h)); }
-    #ipc-graph { flex: 0 0 60%; width: 100%; }
-    #tar-tree { flex: 1 1 40%; overflow: auto; }
-    #splitter {
-      flex: 0 0 6px;
-      background: var(--border, #30363d);
-      cursor: row-resize;
+    body { display: flex; flex-direction: column; height: 100vh; margin: 0; }
+    /* Page body: title block (.page-header from yuzu.css), toolbar, then the
+       graph and TAR panes. The long sentence needs more than the 70ch default. */
+    .vh-body {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+      padding: 22px 28px 28px;
     }
-    #splitter:hover { background: var(--accent, #58a6ff); }
+    .vh-body .subtitle { max-width: 100ch; }
+    .vh-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    /* Each pane is a bordered panel: a header row (.vh-hd) over a body
+       (#ipc-graph / #tar-tree) that carries the side and bottom borders.
+       The headers sit beside the panes, never inside them, because
+       Cytoscape owns #ipc-graph's children and htmx swaps #tar-tree's. */
+    .vh-hd {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 14px;
+      padding: 12px 16px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--rad-panel) var(--rad-panel) 0 0;
+    }
+    .vh-hd h2 { font-size: 14px; font-weight: 600; }
+    .vh-sub { color: var(--mut); font-size: 13px; }
+    /* A very long agent id must wrap, not scroll the page sideways. */
+    .page-header .subtitle, .vh-sub { overflow-wrap: anywhere; }
+    .vh-legend {
+      margin-left: auto;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      font-size: 13px;
+      color: var(--mut);
+    }
+    .vh-legend i { display: inline-block; vertical-align: -1px; margin-right: 6px; }
+    /* Swatches carry meaning by colour: keep them in forced-colors / High Contrast. */
+    .vh-sw { width: 10px; height: 10px; forced-color-adjust: none; }
+    .vh-sw.proc { background: var(--c1); border-radius: 50%; }
+    .vh-sw.sock { background: var(--c3); border-radius: 2px; }
+    .vh-sw.owns { width: 14px; height: 0; border-top: 1px dashed var(--faint); }
+    .vh-sw.conn { width: 14px; height: 0; border-top: 2px solid var(--c2); }
+    .vh-main { flex: 1; display: flex; flex-direction: column; min-height: 520px; }
+    #viz-host-root { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+    #ipc-graph, #tar-tree {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-top: 0;
+      border-radius: 0 0 var(--rad-panel) var(--rad-panel);
+    }
+    #ipc-graph { flex: 0 0 60%; }
+    #tar-tree { flex: 1 1 40%; overflow: auto; padding: 16px; }
+    .vh-error { padding: 16px; color: var(--ink2); }
+    .vh-stale {
+      padding: 8px 16px;
+      font-size: 13px;
+      color: var(--warn);
+      background: color-mix(in srgb, var(--warn) 12%, var(--surface));
+      border: 1px solid var(--line);
+      border-width: 0 1px 1px;
+    }
+    /* Splitter — draggable horizontal divider between the IPC graph (top)
+       and TAR tree (bottom). Ratio persists in localStorage under
+       yuzuVizHostSplitRatio so an operator's chosen layout sticks across
+       page reloads. */
+    #splitter { flex: 0 0 22px; position: relative; cursor: row-resize; }
+    #splitter::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 36px;
+      height: 3px;
+      margin: -1px 0 0 -18px;
+      border-radius: 2px;
+      background: var(--line2);
+      transition: background 0.12s;
+    }
+    #splitter:hover::after { background: var(--primary); }
     .yuzu-tar-highlight {
-      background: rgba(255, 242, 204, 0.3);
-      transition: background 0.5s ease-out;
+      background: color-mix(in srgb, var(--hl) 14%, transparent);
+      transition: background 0.12s;
     }
   </style>
-  <div id="viz-host-root" data-agent-id="{{AGENT_ID}}">
-    <div class="toolbar" style="padding:6px 12px; display:flex; gap:8px; align-items:center;">
-      <strong>Host detail</strong>
-      <span style="opacity:0.7; font-size:12px;">{{AGENT_ID}}</span>
-      <span style="flex:1"></span>
-      <button id="refresh-btn">Refresh</button>
+  <div class="vh-body">
+    <header class="page-header">
+      <div>
+        <h1>Host map</h1>
+        <div class="subtitle">{{AGENT_ID}}: processes, their sockets, and what connects to what.</div>
+      </div>
+    </header>
+    <div class="vh-toolbar">
+      <button id="refresh-btn" class="btn btn-secondary">Refresh</button>
     </div>
-    <div id="ipc-graph"></div>
-    <div id="splitter"></div>
-    <div id="tar-tree"
-         hx-get="/fragments/tar/process-tree?device={{AGENT_ID}}"
-         hx-trigger="load"></div>
+    <div class="vh-main">
+      <div class="vh-hd">
+        <h2>Process connections</h2>
+        <span class="vh-sub">{{AGENT_ID}}, force-directed layout</span>
+        <div class="vh-legend">
+          <span><i class="vh-sw proc"></i>Process</span>
+          <span><i class="vh-sw sock"></i>Socket</span>
+          <span><i class="vh-sw owns"></i>Owns</span>
+          <span><i class="vh-sw conn"></i>Connection</span>
+        </div>
+      </div>
+      <!-- Mount root carries agent_id via data-attribute so the renderer can
+           read it deterministically without parsing window.location. The
+           {{AGENT_ID}} placeholder is replaced by the server-side route
+           handler. -->
+      <div id="viz-host-root" data-agent-id="{{AGENT_ID}}">
+        <div id="ipc-graph"></div>
+        <div id="splitter"></div>
+        <div class="vh-hd">
+          <h2>Process tree</h2>
+          <span class="vh-sub">From TAR, for this host</span>
+        </div>
+        <div id="tar-tree"
+             hx-get="/fragments/tar/process-tree?device={{AGENT_ID}}"
+             hx-trigger="load"></div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -108,11 +200,30 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
       const KEY = "yuzuVizHostSplitRatio";
       let ratio = parseFloat(localStorage.getItem(KEY));
       if (!Number.isFinite(ratio) || ratio < 0.1 || ratio > 0.9) ratio = 0.6;
+      // The panes split by percentage, but everything else in the root (the
+      // splitter, the "Process tree" header, a stale banner) and the tree's
+      // own padding and border cannot shrink. The top pane may take at most
+      // what is left, or the root overflows .vh-main. Measured on every
+      // apply, not hard-coded: the header height follows the font.
+      function maxRatio() {
+        const cs = getComputedStyle(bottom);
+        let fixed = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom) +
+                    parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth);
+        for (const el of root.children) {
+          if (el !== top && el !== bottom) fixed += el.offsetHeight;
+        }
+        const h = root.clientHeight;
+        return h > 0 ? Math.min(0.9, 1 - fixed / h) : 0.9;
+      }
+      // A stored ratio is clamped here, so it is safe on load and after a
+      // resize; `ratio` keeps the stored value so a larger window gets it back.
       function apply(r) {
+        r = Math.min(r, maxRatio());
         top.style.flex = "0 0 " + (r * 100) + "%";
         bottom.style.flex = "1 1 " + ((1 - r) * 100) + "%";
       }
       apply(ratio);
+      new ResizeObserver(() => apply(ratio)).observe(root);
       let dragging = false;
       splitter.addEventListener("mousedown", () => { dragging = true; });
       window.addEventListener("mouseup", () => {
@@ -123,7 +234,7 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
         if (!dragging) return;
         const rect = root.getBoundingClientRect();
         const r = (e.clientY - rect.top) / rect.height;
-        if (r > 0.1 && r < 0.9) { ratio = r; apply(r); }
+        if (r > 0.1 && r < maxRatio()) { ratio = r; apply(r); }
       });
     })();
   </script>

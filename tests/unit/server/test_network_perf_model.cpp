@@ -85,6 +85,16 @@ std::string render_devices(const NetPerfSnapshot& snap, NetPerfMetric metric, bo
                                            not_reporting, cooc, cohort_filter, limit);
 }
 
+// Exactly one <style> block, and it carries the DEX sheet (a known .dx- rule).
+bool one_dx_style(const std::string& h) {
+    const auto open = h.find("<style>");
+    if (open == std::string::npos || h.find("<style>", open + 1) != std::string::npos)
+        return false;
+    const auto close = h.find("</style>", open);
+    const auto rule = h.find(".dx-ctl{", open);
+    return close != std::string::npos && rule != std::string::npos && rule < close;
+}
+
 } // namespace
 
 // ── network_perf_rules ───────────────────────────────────────────────────────
@@ -268,6 +278,15 @@ TEST_CASE("overview render: cards, co-occurrence, honesty", "[network][ui]") {
     CHECK(html.find("Measurement-first") != std::string::npos);
     CHECK(html.find("baseline") != std::string::npos);                // threshold needs a real-fleet baseline
     CHECK(html.find("not a verdict") != std::string::npos);           // honest evidence, never a verdict
+}
+
+TEST_CASE("network fragments: overview and devices each carry exactly one DEX style block",
+          "[network][ui]") {
+    NetPerfSnapshot snap;
+    snap.devices.push_back(dev("lnx-1", 40.0, 0.4, 3.0e6));
+    CHECK(one_dx_style(render_network_overview_fragment(net_perf_fleet_now(snap))));
+    CHECK(one_dx_style(
+        render_devices(snap, NetPerfMetric::kRtt, false, NetCoocFilter::kNone, std::nullopt, 50)));
 }
 
 TEST_CASE("overview render: empty population is honest", "[network][ui]") {

@@ -127,10 +127,19 @@ public:
                 httplib::detail::parse_query_text(query_text, req.params);
             if (!content_type.empty())
                 req.set_header("Content-Type", content_type);
+            // Headers every request from this sink carries (e.g. a browser's same-site
+            // Origin); per-call extra_headers below still win.
+            for (const auto& [name, value] : default_headers) {
+                req.set_header(name, value);
+            }
             // Inject test-supplied headers. Done AFTER Content-Type so a
             // test that explicitly overrides Content-Type via the map
             // wins (rare, but a valid scenario).
+            // httplib keeps header duplicates (an unordered_multimap) and a read returns
+            // the first one, whose order differs between standard libraries: erase the
+            // existing value so the per-call header wins everywhere.
             for (const auto& [name, value] : extra_headers) {
+                req.headers.erase(name);
                 req.set_header(name, value);
             }
 
@@ -169,6 +178,9 @@ public:
         }
         return nullptr;
     }
+
+    /// Sent with every dispatch before per-call headers (which override by name).
+    std::unordered_map<std::string, std::string> default_headers;
 
     /// Convenience wrappers for common verbs.
     auto Get(const std::string& path) { return dispatch("GET", path); }

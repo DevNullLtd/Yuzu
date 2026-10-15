@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <limits>
 #include <unordered_set>
@@ -286,9 +287,66 @@ bool hw_row_matches(const InventoryDeviceRow& row, const std::vector<std::string
     return true;
 }
 
+std::optional<double> median_ram_gb(const std::vector<InventoryDeviceRow>& rows,
+                                    std::size_t* count) {
+    std::vector<double> gb;
+    for (const auto& r : rows) {
+        const std::string& s = r.ci_ram_bytes;
+        if (is_blank_sentinel(s) || s.size() > 18 ||
+            !std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+            continue;
+        const double bytes = std::stod(s);
+        if (bytes > 0)
+            gb.push_back(bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+    if (count)
+        *count = gb.size();
+    if (gb.empty())
+        return std::nullopt;
+    std::sort(gb.begin(), gb.end());
+    const std::size_t mid = gb.size() / 2;
+    return gb.size() % 2 ? gb[mid] : (gb[mid - 1] + gb[mid]) / 2.0;
+}
+
+std::vector<std::pair<std::string, std::size_t>>
+count_by_manufacturer(const std::vector<InventoryDeviceRow>& rows, std::size_t top_n) {
+    std::vector<std::pair<std::string, std::size_t>> counts; // folded key -> count; first spelling kept
+    std::vector<std::string> keys;
+    for (const auto& r : rows) {
+        std::string m = r.ci_manufacturer;
+        const auto b = m.find_first_not_of(" \t");
+        if (b == std::string::npos)
+            continue;
+        m = m.substr(b, m.find_last_not_of(" \t") - b + 1);
+        if (is_blank_sentinel(m))
+            continue;
+        const std::string key = to_lower_ascii(m);
+        const auto it = std::find(keys.begin(), keys.end(), key);
+        if (it == keys.end()) {
+            keys.push_back(key);
+            counts.emplace_back(m, 1);
+        } else {
+            ++counts[static_cast<std::size_t>(it - keys.begin())].second;
+        }
+    }
+    std::stable_sort(counts.begin(), counts.end(), [](const auto& a, const auto& b) {
+        return a.second != b.second ? a.second > b.second : a.first < b.first;
+    });
+    if (counts.size() > top_n) {
+        std::size_t other = 0;
+        for (std::size_t i = top_n; i < counts.size(); ++i)
+            other += counts[i].second;
+        counts.resize(top_n);
+        counts.emplace_back("Other", other);
+    }
+    return counts;
+}
+
 HardwareKpis hardware_kpis(const std::vector<InventoryDeviceRow>& roster) {
     HardwareKpis k;
     k.total = roster.size();
+    k.median_ram_gb = median_ram_gb(roster, &k.ram_devices);
+    k.by_manufacturer = count_by_manufacturer(roster);
     for (const auto& row : roster) {
         if (row.online)
             ++k.online;

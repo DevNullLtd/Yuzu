@@ -33,6 +33,7 @@ struct DefinitionFields {
     std::string plugin;
     std::string action;
     std::string description;
+    bool has_description{false}; ///< the key is present as a scalar, even an empty one
     std::string concurrency;
     std::string approval;
     bool has_api_version{false};

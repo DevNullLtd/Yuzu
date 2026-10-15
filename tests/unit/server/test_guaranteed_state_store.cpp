@@ -193,6 +193,14 @@ TEST_CASE("GuaranteedStateStore: opens in-memory and runs migrations",
     CHECK(store.event_count() == 0);
 }
 
+TEST_CASE("GuaranteedStateStore: retention_days() reports the constructor-time window",
+          "[pg][guaranteed_state_store][db][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, 31);
+    REQUIRE(store.is_open());
+    CHECK(store.retention_days() == 31);
+}
 // ── M6 / #1209: monotonic policy generation ─────────────────────────────────
 
 TEST_CASE("GuaranteedStateStore: policy_generation bumps monotonically on mutations",

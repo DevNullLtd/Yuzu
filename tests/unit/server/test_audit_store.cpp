@@ -293,6 +293,14 @@ TEST_CASE("AuditStore: open against a fresh template clone", "[pg][audit_store][
     CHECK(store.last_pass_unixtime() == 0);
 }
 
+TEST_CASE("AuditStore: retention_days() reports the constructor-time window",
+          "[pg][audit_store][db][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool, 366);
+    REQUIRE(store.is_open());
+    CHECK(store.retention_days() == 366);
+}
 TEST_CASE("AuditStore: bad-path constructor (unroutable DSN) is closed and fails hard/degrades",
           "[audit_store]") {
     PgPool bad{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};

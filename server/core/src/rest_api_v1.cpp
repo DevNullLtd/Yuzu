@@ -50,6 +50,7 @@
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
+#include "quarantine_visible.hpp" // quarantine_visible_records: shared admit-then-filter read (REST GET + dashboard fragments)
 #include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
 #include "result_set_matcher.hpp" // validate_matcher: admission check of a caller matcher (#4644)
 #include "result_set_model.hpp" // #2146 Batch B2: shared REST v1 + MCP result-set JSON builder
@@ -63,6 +64,7 @@
 #include "password_policy.hpp"       // #5342 — check_password_policy for the password routes
 #include "credential_change_owner.hpp" // #5342 — CredentialChangeRequest/Outcome (the one-transaction write)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
+#include "admin_gate.hpp"
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_catalogue_model.hpp" // shared REST+MCP software catalogue model
@@ -907,14 +909,18 @@ const std::string& openapi_spec() {
   "security": [{"bearerAuth": [], "apiKeyHeader": [], "cookieAuth": []}],
   "paths": {
     "/me": {
-      "get": {"summary": "Get current user info", "tags": ["Authentication"], "responses": {"200": {"description": "Current user details"}}}
+      "get": {"summary": "Get current user info (adds effective_role, elevated, elevated_until, can_access_settings)", "tags": ["Authentication"], "responses": {"200": {"description": "Current user details"}}}
     },
     "/devices": {
       "get": {"summary": "Fleet device list (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint — SOLE gate, never stacked with a bare permission check). Row shape matches the pre-existing MCP list_agents tool exactly: agent_id/hostname/os/arch/agent_version, 5 fields, sourced from the live AgentRegistry. devices_omitted counts agents dropped by the caller's management-group/service-scope confinement (0 = unfiltered or nothing dropped). Not audited on success (device identity is machine metadata, not behavioural PII) — require_fleet_read itself audits every denial path internally.", "responses": {"200": {"description": "{data: {devices[], count, devices_omitted}, pagination, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "503": {"description": "Route misconfigured (fleet_read_fn/device registry unwired) or authorization store unavailable"}}}
     },
     "/devices/{id}": {
       "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Always includes a tags array (key/value/source), empty when the device has no tags (a null/unwired TagStore degrades to an empty array, never an omitted key). Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags[]}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
-    },
+    },)json"
+        // Split before /hardware: the /me summary growth (#5779) took the first
+        // segment past 15,000 bytes. Adjacent literals concatenate at compile
+        // time, so the emitted OpenAPI JSON is byte-identical.
+        R"json(
     "/hardware": {
       "get": {"summary": "Hardware CI list (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint). Query params q/os/status/sort/dir/tag/offset/limit — an unrecognised sort/os/status token or an invalid tag key is a 400, and any dir other than desc sorts ascending. Rows carry the same identity fields as /devices plus CI blob fields (manufacturer/model/serial/cpu/ram/os_version), a per-page DEX score, agent_version/arch, claimed IPs, and tags. `dex_score` is `null` both when the device has no DEX data and when the per-device DEX read degraded (#4855) — this list/badge view does not distinguish the two (tracked at #4909); see `GET /api/v1/dex/devices/{id}` for a degrade-distinguishing per-device read. Audited as inventory.devices (result=failure when the roster read failed); a persist failure on the success audit fails the request closed (503).", "responses": {"200": {"description": "{data: {devices[], kpis, query}, pagination, meta}"}, "400": {"description": "Unrecognised sort, os, or status token, or an invalid tag key"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "503": {"description": "Route misconfigured (roster unwired), the device roster could not be read (retry_after_ms set), the authorization store unavailable (retry_after_ms 5000), or audit subsystem degraded"}}}
     },
@@ -1047,10 +1053,10 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/rbac/roles": {
-      "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "responses": {"200": {"description": "List of roles"}}}
+      "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "description": "Requires UserManagement:Read. A degraded RBAC store is a retryable 503 (retry_after_ms 5000), never an empty 200 list.", "responses": {"200": {"description": "List of roles"}, "403": {"description": "Requires UserManagement:Read"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
     },
     "/rbac/roles/{role}/permissions": {
-      "get": {"summary": "Get permissions for a role", "tags": ["RBAC"], "parameters": [{"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of permissions"}}}
+      "get": {"summary": "Get permissions for a role", "tags": ["RBAC"], "parameters": [{"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "description": "Requires UserManagement:Read. A role the roles table does not hold is 404 (not an empty 200); a degraded RBAC store is a retryable 503 (retry_after_ms 5000).", "responses": {"200": {"description": "List of permissions"}, "403": {"description": "Requires UserManagement:Read"}, "404": {"description": "No such role"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
     },
     "/rbac/check": {
       "post": {"summary": "Check if current user has a permission", "tags": ["RBAC"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"securable_type": {"type": "string"}, "operation": {"type": "string"}}}}}}, "responses": {"200": {"description": "Permission check result"}}}
@@ -1067,7 +1073,11 @@ const std::string& openapi_spec() {
     "/rbac/enforcement": {
       "put": {"summary": "Enable or disable RBAC enforcement fleet-wide (A1)", "tags": ["RBAC"], "description": "Gated on the SAME durable is_rbac_administrator check as the role-assignment routes above, not an ordinary permission check, plus MFA step-up. On a real transition, refused (403) unless the caller ALSO holds authority under the regime that is durably true right now (an authenticatable fleet-wide Administrator grant while currently on, local admin role while currently off), and refused (409) unless the caller would remain a durable administrator under the destination regime: enabling requires the caller's own fleet-wide Administrator grant, disabling requires the caller's own local account to hold the admin role. Idempotent: requesting the current state returns changed=false without evaluating either check. No GET twin — read the current state via GET /api/v1/me (rbac_enabled) or this route's own response.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}}}}, "responses": {"200": {"description": "Enforcement state applied (or already matched — changed=false)"}, "400": {"description": "Invalid JSON, or enabled missing/not a JSON boolean (strict — no string/number coercion)"}, "401": {"description": "Not authenticated, or MFA step-up required or failed (stale/absent proof; api_token/mcp_token bearer sessions are exempt) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the set_rbac_enforcement tool instead, which requires the supervised tier plus an approval ticket), or (on a real transition) does not hold authority under the regime that is durably true right now"}, "409": {"description": "Refused: the caller would not remain a durable administrator after the switch"}, "503": {"description": "RBAC/AuthDB store unavailable (including when the admin gate itself cannot confirm authority — now audited too), or the audit write for this mutation failed (fail-closed)"}}}
     },
-    "/tag-categories": {
+)json"
+        // Split again (MSVC C2026 16,380-byte cap): the merged /rbac/roles (role-read
+        // 404/503 docs) and /audit (filter parity) entries pushed this segment past the
+        // 15,000-byte working ceiling; concatenated at compile time, byte-identical JSON.
+        R"json(    "/tag-categories": {
       "get": {"summary": "List tag categories and allowed values", "tags": ["Tags"], "responses": {"200": {"description": "List of tag categories"}}}
     },
     "/tag-compliance": {
@@ -1084,7 +1094,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "List instruction definitions", "tags": ["Instructions"], "responses": {"200": {"description": "List of instruction definitions"}}}
     },
     "/audit": {
-      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1 (a client error, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
+      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}, {"name": "target_type", "in": "query", "schema": {"type": "string"}}, {"name": "target_id", "in": "query", "description": "Requires target_type", "schema": {"type": "string"}}, {"name": "since", "in": "query", "description": "Inclusive epoch seconds; 0 = unbounded", "schema": {"type": "integer", "minimum": 0}}, {"name": "until", "in": "query", "description": "Inclusive epoch seconds; 0 = unbounded", "schema": {"type": "integer", "minimum": 0}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 10000}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1, malformed since/until/offset, since > until, or target_id without target_type (client errors, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
     },
     "/audit/auth-sample": {
       "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Window start, epoch seconds (optional, digits only). Omit for no lower bound; 0 is accepted and matches the same rows as omitting it."}, {"name": "to", "in": "query", "schema": {"type": "integer", "minimum": 1}, "description": "Window end, epoch seconds (optional, digits only). Omit for no upper bound; 0 is rejected with 400 (0 is not a way to say unbounded)."}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, to=0, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
@@ -1302,6 +1312,12 @@ const std::string& openapi_spec() {
     },
     "/workflows/{id}": {
       "get": {"summary": "Fetch one workflow (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflows/{id} and MCP get_workflow (new). Requires Workflow:Read. Full step list plus yaml_source. Shared builder workflow_detail_json.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Workflow detail"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "404": {"description": "Workflow not found"}, "503": {"description": "Workflow engine not available"}}}
+    },)json"
+        // The workflow-execution LIST. Own segment (MSVC C2026 16,380-byte cap): joined to the
+        // previous literal (about 13 KB) it would exceed the limit.
+        R"json(
+    "/workflow-executions": {
+      "get": {"summary": "List workflow executions", "tags": ["Workflows"], "description": "REST v1 / MCP list_workflow_executions twin pair, new (no legacy route listed runs). WorkflowEngine's own multi-step runs, a DIFFERENT data model from GET /executions (single-instruction fan-out Executions). Requires Workflow:Read through the fleet-read gate (admit-then-filter, ADR-0017): a confined caller (management-group or service-scoped) sees only runs with at least one agent in its scope, and that scope is applied in the store BEFORE ordering and the page limit, so an invisible run never consumes a page slot and next_cursor and page length depend only on runs the caller may see; a forged cursor reveals nothing. Rows are metadata only (id, workflow_id, workflow_name, workflow_deleted, status, current_step, started_at, completed_at): never agent ids, step results or a fleet-size count. Newest first by (started_at, id) with keyset paging: pass next_cursor back as cursor (null when no more rows exist); a cursor is a position only and does not bind the other filters. latest_per_workflow=true returns at most one run per workflow, the newest among the runs that pass the other filters AND the caller's visibility, ordered by workflow_id, with no cursor (combining the two is a 400) and result_truncated_by_cap true when more workflows matched than limit. pagination.total is the number of rows in this page, never a fleet-wide count. Input is strict: an unknown or repeated parameter, an out-of-vocabulary status, a malformed workflow_id/since/until/cursor, since after until, or limit below 1 is a 400; limit above 500 is clamped to 500. No audit row is written for a successful list (run metadata); a denial is audited by the gate as auth.fleet_read_required. A store failure or statement timeout is a 503 with retry_after_ms, never an empty 200. Service-scoped tokens are admitted only through the fleet-read gate's ITServiceOwner ceiling and tag scope (the service-scope allow-list is unchanged).", "parameters": [{"name": "workflow_id", "in": "query", "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$", "maxLength": 128}, "description": "Exact workflow filter"}, {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["pending", "running", "completed", "failed", "cancelled"]}, "description": "Exact status filter"}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 9007199254740992}, "description": "Runs started at or after this epoch second"}, {"name": "until", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 9007199254740992}, "description": "Runs started strictly before this epoch second; must not be before since"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50}, "description": "Page size; above 500 is clamped"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "next_cursor from the previous page; not combinable with latest_per_workflow"}, {"name": "latest_per_workflow", "in": "query", "schema": {"type": "boolean", "default": false}, "description": "At most one (the newest visible) run per workflow, ordered by workflow_id"}], "responses": {"200": {"description": "{data:[{id,workflow_id,workflow_name,workflow_deleted,status,current_step,started_at,completed_at}],pagination:{total,start,page_size,next_cursor,result_truncated_by_cap?}}"}, "400": {"description": "Unknown or repeated parameter, or a malformed or out-of-range value (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Insufficient permission (Workflow:Read) or a service-scoped token the gate refuses (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Workflow engine unavailable or the read degraded (store failure, statement timeout): retry_after_ms 5000; an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/workflow-executions/{id}": {
       "get": {"summary": "Fetch one workflow execution (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflow-executions/{id} and MCP get_workflow_execution (new) — WorkflowEngine's own per-step execution record, a DIFFERENT data model from ExecutionTracker's fan-out Execution (GET /executions/{id}). Both this route and the legacy twin gate on fleet_read_fn (Workflow:Read) with record-level confinement (#4030 Gate 8 fix): a caller with no agent visible in agent_ids_json 404s identically to a nonexistent execution, never a narrower-but-present record; an admitted confined caller's agent_ids is narrowed to their visible agents and each step's result.agents_reached is stripped. Audited as workflow_execution.detail.fetch (set-and-proceed) on both the success path and the confinement-denied path — a genuinely nonexistent id writes no audit row (the denied row alone therefore distinguishes 'exists, out of scope' from 'never existed' for a caller who also holds AuditLog:Read; tracked open). Shared builder workflow_execution_detail_json.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Workflow execution detail"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "404": {"description": "Execution not found"}, "503": {"description": "Workflow engine not available"}}}
@@ -1351,13 +1367,13 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and perf_capable_online carry the honest OS-aware denominator (online devices whose OS has a perf collector: Windows + Linux today); windows_online is kept unchanged for compatibility. linux_online/macos_online are the same online-count per OS, and reporting_windows/reporting_linux/reporting_macos split the reporting population by OS — macos_online is real (agents connect) but reporting_macos is always 0 today (no macOS perf collector yet). Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online, linux_online, macos_online, reporting_windows, reporting_linux, reporting_macos, perf_capable_online)"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/perf/cohorts": {
-      "get": {"summary": "Fleet-relative performance percentiles per cohort", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cohorts are the distinct values of an operator-chosen tag key (default model). Cohorts under the 10-device statistical floor return suppressed=true with their population and no stats; devices without the key form the explicit cohort=\"\" (untagged) residual, never a silent omission. available_keys lists the fleet's tag keys for picker UIs. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}], "responses": {"200": {"description": "Cohort table (key, floor, cohorts[].{cohort, devices, suppressed, cpu_pct?, commit_pct?, disk_lat_ms?}, available_keys[])"}, "400": {"description": "Invalid tag key"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Fleet-relative performance percentiles per cohort", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cohorts are the distinct values of an operator-chosen tag key (default model). Cohorts under the statistical floor (one device, so only an empty cohort) return suppressed=true with their population and no stats. A cohort keyed by a per-device tag value with one device is that device's exact figures. Devices without the key form the explicit cohort=\"\" (untagged) residual, never a silent omission. available_keys lists the fleet's tag keys for picker UIs. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}], "responses": {"200": {"description": "Cohort table (key, floor, cohorts[].{cohort, devices, suppressed, cpu_pct?, commit_pct?, disk_lat_ms?}, available_keys[])"}, "400": {"description": "Invalid tag key"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/perf/cohort-diff": {
-      "get": {"summary": "Direct cohort-vs-cohort performance comparison", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. F2c (BRD 99/103): diffs two cohorts (values of the chosen tag key, default model) head-to-head — e.g. image_type vanilla vs layered — where /dex/perf/cohorts benchmarks each cohort against the fleet. Both cohort values a and b are required (an empty value is the untagged residual). delta_pct.<metric> is A's p50 relative to B's p50 (B the baseline), null unless BOTH cohorts expose the metric (neither suppressed below the 10-device floor). found_a/found_b are false when a cohort has no reporting devices. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "a", "in": "query", "required": true, "schema": {"type": "string"}, "description": "First cohort value (empty string = untagged residual)."}, {"name": "b", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Second cohort value (the baseline)."}], "responses": {"200": {"description": "Diff object (key, floor, found_a, found_b, a|null, b|null, delta_pct{cpu_pct|null, commit_pct|null, disk_lat_ms|null})"}, "400": {"description": "Invalid tag key, or missing cohort params"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Direct cohort-vs-cohort performance comparison", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. F2c (BRD 99/103): diffs two cohorts (values of the chosen tag key, default model) head-to-head — e.g. image_type vanilla vs layered — where /dex/perf/cohorts benchmarks each cohort against the fleet. Both cohort values a and b are required (an empty value is the untagged residual). delta_pct.<metric> is A's p50 relative to B's p50 (B the baseline), null unless BOTH cohorts expose the metric (neither suppressed below the one-device floor, i.e. neither empty). found_a/found_b are false when a cohort has no reporting devices. A cohort keyed by a per-device tag value with one device is that device's exact figures. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "a", "in": "query", "required": true, "schema": {"type": "string"}, "description": "First cohort value (empty string = untagged residual)."}, {"name": "b", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Second cohort value (the baseline)."}], "responses": {"200": {"description": "Diff object (key, floor, found_a, found_b, a|null, b|null, delta_pct{cpu_pct|null, commit_pct|null, disk_lat_ms|null})"}, "400": {"description": "Invalid tag key, or missing cohort params"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/perf/devices": {
-      "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Each row names an agent_id fleet-wide, so every call emits a dex.perf.device.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.perf.device.view audit row cannot persist, so the device list is never served without durable evidence. (The three aggregate DEX-perf endpoints — fleet, cohorts, cohort-diff — stay unaudited: no agent_id, no per-device data.)", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?, os)"}, "400": {"description": "Invalid cohort_key or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.perf.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural data was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Each row names an agent_id fleet-wide, so every call emits a dex.perf.device.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.perf.device.view audit row cannot persist, so the device list is never served without durable evidence. (The three aggregate DEX-perf endpoints — fleet, cohorts, cohort-diff — stay unaudited: no agent_id; a cohort of one device carries that device's figures.)", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?, os)"}, "400": {"description": "Invalid cohort_key or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.perf.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural data was withheld because the access-audit row failed to persist."}}}}}
     },
     )json"
         // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at compile.
@@ -1366,19 +1382,21 @@ const std::string& openapi_spec() {
       "get": {"summary": "Apps with retained fleet app-perf data (picker)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Lists the distinct apps that currently have retained fleet performance-over-time data in the Postgres B2 store, so a worker discovers which app= values GET /dex/perf/app can answer (agentic-first A2 discovery). Each entry carries the count of distinct retained versions and the most recent UTC-midnight epoch day seen. truncated=true means the distinct-app list was clipped at the server cap (5000). Fleet metadata — NOT audited.", "responses": {"200": {"description": "Picker object (apps[].{app_name, versions, last_day}, truncated)"}, "503": {"description": "service unavailable, or the app-perf store read degraded (retry)"}}}
     },
     "/dex/perf/app": {
-      "get": {"summary": "Fleet performance-over-time trend for one app", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The 'over time' companion to /dex/perf/fleet: reads the retained Postgres B1/B2 substrate (NOT live heartbeat) to answer 'did this app regress across the fleet'. Returns one point per (version, UTC day) over the B2 retention (up to 180 days). version omitted = every version interleaved, each point tagged with its canonicalized version; a supplied version is canonicalized to match the stored key. Each point carries the EXACT fleet mean and max (cpu_mean share-of-capacity %, ws_mean working-set bytes) plus bucket-resolution p50/p95 read from the fixed histogram. A percentile is {value, lower_bound}: lower_bound=true means it falls in the open top bucket and value is a FLOOR (render '>= value'), and a percentile is null when the population is empty or the row predates the current histogram scheme. hist_stale=true flags a point whose stored histogram scheme differs from the running one — its means/maxima still stand, its percentiles are withheld. Fleet aggregate (no agent_id) — NOT audited; the per-device drill lives on the audited /dex/devices/{id} family.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover valid names via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized and matched exactly; omit for all versions."}], "responses": {"200": {"description": "Trend object (app, version, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale}). A sub-floor (<10 devices) point carries suppressed=true with device_count only."}, "400": {"description": "missing app, or app/version invalid (too long or control characters)"}, "503": {"description": "service unavailable, or the app-perf store read degraded (retry)"}}}
+      "get": {"summary": "Fleet performance-over-time trend for one app", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The 'over time' companion to /dex/perf/fleet: reads the retained Postgres B1/B2 substrate (NOT live heartbeat) to answer 'did this app regress across the fleet'. Returns one point per (version, UTC day) over the B2 retention (up to 180 days). version omitted = every version interleaved, each point tagged with its canonicalized version; a supplied version is canonicalized to match the stored key. Each point carries the EXACT fleet mean and max (cpu_mean share-of-capacity %, ws_mean working-set bytes) plus bucket-resolution p50/p95 read from the fixed histogram. A percentile is {value, lower_bound}: lower_bound=true means it falls in the open top bucket and value is a FLOOR (render '>= value'), and a percentile is null when the population is empty or the row predates the current histogram scheme. hist_stale=true flags a point whose stored histogram scheme differs from the running one — its means/maxima still stand, its percentiles are withheld. )json"
+        R"json(Also carries versions[], one row per version (the 20 highest canonical versions the agents reported, newest first; versions_truncated=true when older versions were dropped; a version with no retained performance rows is not listed, so no row is not no failures) joining the last failure_window_days of crash and hang observations (30, clamped to one day less than the observation retention when that is 1 to 30 days; whole UTC days plus the current day so far; an observation stamped after the end of the current UTC day is excluded), matched on the exact canonical version and subject the agent reported: affected_devices (fleet-wide devices that reported a crash or hang) with crashes and hangs, always present as fleet-wide event counts; exposure_devices (devices with retained resource-significant samples, a selected subset and not a census, null when unknown, so affected_devices > 0 with null exposure is failures recorded under a version with no samples), and when exposure_devices is known: exposed_crashes and exposed_hangs and, when it is positive, failure_rate (exposed events per exposed device over the window, not per day of use: read it beside day_count and latest_day, a version with fewer than failure_window_days + 1 days has had less time to fail; exact 95 percent interval; a zero exposure gives a null rate), and, when both versions have a known positive exposure_devices, failure_rate_ratio against previous_version (the next older returned version; null for the oldest known version and for the unknown version; exact conditional interval; upper null with unbounded=true when the previous version saw no exposed events). No device floor applies to this join or to points[] (floor of one device): every figure is published at any device count. exposure_basis resource_significant: exposure is the daily top-N consumers, not a census. stat_failures counts statistics that returned nothing on valid input (expected 0). )json"
+        R"json(Fleet aggregate (no agent_id) — NOT audited; the per-device drill lives on the audited /dex/devices/{id} family.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover valid names via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized and matched exactly; omit for all versions."}], "responses": {"200": {"description": "Trend object (app, version, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale}). The floor is one device, so only a point no device contributed to carries suppressed=true with device_count only. Also versions[], versions_truncated, failure_window_days, exposure_basis (resource_significant) and stat_failures."}, "400": {"description": "missing app, or app/version invalid (too long or control characters)"}, "503": {"description": "service unavailable, or the app-perf or crash-and-hang read degraded (retry)"}}}
     },
     "/dex/perf/app/devices": {
       "get": {"summary": "Which devices reported one app version (version-row drill)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read via AuthRoutes::require_fleet_read (ADR-0017 admit-then-filter — the SOLE gate on this route, never stacked with a bare permission check). Unlike GET /dex/perf/app above, each row here names an agent_id — a fleet-wide fan-out of identified per-device data — so the caller's management-group/service-scope confinement is pushed into the underlying SQL query itself (never a post-fetch filter): a confined caller sees exactly their visible devices, never an unfiltered page. version is REQUIRED and matched EXACTLY (omit-means-'all-versions' does NOT apply here, unlike /dex/perf/app — pass an empty string for the unknown-version bucket; Linux procperf reports every app under this empty bucket today). Each row is that device's MOST RECENT reported day for this exact (app, version) among its retained daily top-N resource-significant app-versions — NOT a census of every device with this app-version installed (see /api/v1/inventory/software for the census). Rows are ordered by descending cpu_avg and capped; truncated=true means only the highest-CPU devices are shown. Per-device (B1) data retains only 31 days, shorter than this trend's 180-day (B2) retention, so a version last seen >31 days ago legitimately returns zero devices even though GET /dex/perf/app still shows aggregate history for it. Individual-identifying, so every call emits a dex.app_perf.devices.view audit event and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that row cannot persist.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Exact version, canonicalized and matched exactly; empty string = the unknown-version bucket, NOT 'all versions'."}], "responses": {"200": {"description": "Devices-drill object (app, version, truncated, devices[].{agent_id, last_day, samples, cpu_avg, ws_avg_bytes})"}, "400": {"description": "missing/invalid app or version (version must be present, even if empty)"}, "403": {"description": "caller lacks GuaranteedState:Read"}, "503": {"description": "Service unavailable, the app-perf store read degraded, OR the dex.app_perf.devices.view audit row could not persist (carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/perf/group": {
-      "get": {"summary": "Management-group app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The fleet-trend shape (GET /dex/perf/app) aggregated over ONE management group's members, computed on-the-fly from the per-device B1 store (NOT the fleet B2). One point per (version, UTC day): exact group mean/max + bucket-resolution p50/p95, same histogram scheme as the fleet trend. Because a management group is a set of SPECIFIC devices, any (version, day) point covering fewer than the statistical floor (10) of devices is returned with suppressed=true and device_count only — its means/percentiles are withheld (a small named-group aggregate is de-facto individual behaviour). Aggregate (no agent_id). Gated on GLOBAL GuaranteedState:Read (like the cohort surface): a management-group-scoped RBAC principal does not pass the global check and cannot use this endpoint — no cross-operator exposure on THAT axis. A service-scoped API token is a separate axis, though: it holds a global GuaranteedState:Read grant via ITServiceOwner regardless of scope, so it could otherwise supply any group_id, including one outside its own service — denied outright (403), and the deny is audited (dex.perf.group.view) though an ordinary successful read is not.", "parameters": [{"name": "group_id", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}}, {"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized + matched exactly; omit for all versions."}], "responses": {"200": {"description": "Group trend (group_id, app, version, floor, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing group_id/app, or a param too long"}, "403": {"description": "Service-scoped API token — this management-group read cannot be confined to the token's service (a management-group-scoped RBAC grant is a different axis and is excluded by the global permission gate; a service-scoped token holds a global grant regardless)."}, "503": {"description": "service unavailable, or the app-perf group read degraded (retry)"}}}
+      "get": {"summary": "Management-group app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The fleet-trend shape (GET /dex/perf/app) aggregated over ONE management group's members, computed on-the-fly from the per-device B1 store (NOT the fleet B2). One point per (version, UTC day): exact group mean/max + bucket-resolution p50/p95, same histogram scheme as the fleet trend. Because a management group is a set of SPECIFIC devices, any (version, day) point covering fewer than the statistical floor (one device, so only an empty point) is returned with suppressed=true and device_count only — its means/percentiles are withheld. Aggregate (no agent_id). Gated on GLOBAL GuaranteedState:Read (like the cohort surface): a management-group-scoped RBAC principal does not pass the global check and cannot use this endpoint — no cross-operator exposure on THAT axis. A service-scoped API token is a separate axis, though: it holds a global GuaranteedState:Read grant via ITServiceOwner regardless of scope, so it could otherwise supply any group_id, including one outside its own service — denied outright (403), and the deny is audited (dex.perf.group.view) though an ordinary successful read is not.", "parameters": [{"name": "group_id", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}}, {"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized + matched exactly; omit for all versions."}], "responses": {"200": {"description": "Group trend (group_id, app, version, floor, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing group_id/app, or a param too long"}, "403": {"description": "Service-scoped API token — this management-group read cannot be confined to the token's service (a management-group-scoped RBAC grant is a different axis and is excluded by the global permission gate; a service-scoped token holds a global grant regardless)."}, "503": {"description": "service unavailable, or the app-perf group read degraded (retry)"}}}
     },
     "/dex/perf/tag": {
-      "get": {"summary": "Device-tag-cohort app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The SAME on-the-fly B1 aggregate as GET /dex/perf/group, but membership resolves via a device tag value (default key 'model', the asset-tagging recipe's conventional key) instead of a management group id — e.g. 'which Latitude 5420 devices regressed on this app'. Because a named tag-value cohort is a set of SPECIFIC devices exactly like a management group, the SAME statistical floor (10) applies: a sub-floor (version, day) point is suppressed=true with device_count only. Discover valid values for a key via GET /dex/perf/cohorts?key=<key> (its cohorts[].cohort field lists them) — this endpoint answers the trend for ONE already-known value; it does not enumerate them. Aggregate (no agent_id). Gated on GLOBAL GuaranteedState:Read and denied to a service-scoped API token exactly like GET /dex/perf/group (a service-scoped token holds a global GuaranteedState:Read grant via ITServiceOwner regardless of scope, so unguarded it could supply any tag value fleet-wide, including one outside its own service) — denied outright (403), and the deny is audited (dex.perf.tag.view) though an ordinary successful read is not.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "value", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Tag value naming the cohort; discover via GET /dex/perf/cohorts?key=<key>."}, {"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized + matched exactly; omit for all versions."}], "responses": {"200": {"description": "Tag-cohort trend (key, value, app, version, floor, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing value/app, invalid tag key, or a param too long"}, "403": {"description": "Service-scoped API token — this tag-cohort read cannot be confined to the token's service."}, "503": {"description": "service unavailable, or the app-perf tag cohort read degraded (retry)"}}}
+      "get": {"summary": "Device-tag-cohort app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The SAME on-the-fly B1 aggregate as GET /dex/perf/group, but membership resolves via a device tag value (default key 'model', the asset-tagging recipe's conventional key) instead of a management group id — e.g. 'which Latitude 5420 devices regressed on this app'. Because a named tag-value cohort is a set of SPECIFIC devices exactly like a management group, the SAME statistical floor (one device) applies: only a (version, day) point no device contributed to is suppressed=true with device_count only. Discover valid values for a key via GET /dex/perf/cohorts?key=<key> (its cohorts[].cohort field lists them) — this endpoint answers the trend for ONE already-known value; it does not enumerate them. Aggregate (no agent_id). Gated on GLOBAL GuaranteedState:Read and denied to a service-scoped API token exactly like GET /dex/perf/group (a service-scoped token holds a global GuaranteedState:Read grant via ITServiceOwner regardless of scope, so unguarded it could supply any tag value fleet-wide, including one outside its own service) — denied outright (403), and the deny is audited (dex.perf.tag.view) though an ordinary successful read is not.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "value", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Tag value naming the cohort; discover via GET /dex/perf/cohorts?key=<key>."}, {"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized + matched exactly; omit for all versions."}], "responses": {"200": {"description": "Tag-cohort trend (key, value, app, version, floor, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing value/app, invalid tag key, or a param too long"}, "403": {"description": "Service-scoped API token — this tag-cohort read cannot be confined to the token's service."}, "503": {"description": "service unavailable, or the app-perf tag cohort read degraded (retry)"}}}
     },
     "/dex/perf/compare": {
-      "get": {"summary": "Before/after app performance (cohort-paired, /auto VERIFY)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The UAT non-functional evidence: did upgrading 'app' from 'baseline' to 'candidate' change how the SAME machines in 'group' perform? The shift is computed PER MACHINE (each device's own baseline-version window vs its own candidate-version window, both from the per-device B1 store, the window anchored to that machine's version transition not to today), then the per-machine deltas are aggregated — so the population is held fixed (a fleet baseline-vs-candidate diff would be confounded by different populations). A machine that ran only one of the two versions in-window is EXCLUDED and counted (baseline_only/candidate_only); cohort members with no app-perf data at all are no_data. EVIDENTIAL ONLY: the response is the measured shift (cpu/ws before/after means, median per-machine delta, p95 across machines) plus the up/flat/down per-machine split — there is NO verdict, NO threshold, NO pass/fail. NO cohort floor (real canaries are 2-3 devices): a sub-floor paired set carries small_cohort=true (render 'indicative'), never suppression; insufficient=true means no machine ran both versions. The aggregate carries NO per-machine row (that PII is the audited dashboard drill). Because an unfloored small-cohort aggregate is near-individual, the read IS audited (dex.app_perf.compare, operational set-and-proceed). Gated on GLOBAL GuaranteedState:Read like /dex/perf/group, including the same service-scoped-token caveat: a token holds a global grant via ITServiceOwner regardless of scope, so it could otherwise supply any group, including one outside its own service — denied outright (403), audited under this same dex.app_perf.compare verb.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "group", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Management-group id whose members are the cohort."}, {"name": "baseline", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The before version (canonicalized + matched exactly)."}, {"name": "candidate", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The after version; must differ from baseline."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "integer", "default": 7, "minimum": 1, "maximum": 31}, "description": "Days of each version per machine to reduce."}], "responses": {"200": {"description": "Comparison object (app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{...}, distribution{up, flat, down})"}, "400": {"description": "missing/invalid param, or baseline == candidate"}, "403": {"description": "Service-scoped API token — this near-individual before/after comparison cannot be confined to the token's service."}, "503": {"description": "service unavailable, or the app-perf cohort read degraded (retry)"}}}
+      "get": {"summary": "Before/after app performance (cohort-paired, /auto VERIFY)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The UAT non-functional evidence: did upgrading 'app' from 'baseline' to 'candidate' change how the SAME machines in 'group' perform? The shift is computed PER MACHINE (each device's own baseline-version window vs its own candidate-version window, both from the per-device B1 store, the window anchored to that machine's version transition not to today), then the per-machine deltas are aggregated — so the population is held fixed (a fleet baseline-vs-candidate diff would be confounded by different populations). A machine that ran only one of the two versions in-window is EXCLUDED and counted (baseline_only/candidate_only); cohort members with no app-perf data at all are no_data. EVIDENTIAL ONLY: the response is the measured shift (cpu/ws before/after means, median per-machine delta, p95 across machines) plus the up/flat/down per-machine split — there is NO verdict, NO threshold, NO pass/fail. NO cohort floor (real canaries are 2-3 devices): nothing is suppressed; small_cohort stays on the wire and is false (the cohort floor is one device); insufficient=true means no machine ran both versions. The aggregate carries NO per-machine row (that PII is the audited dashboard drill). Because an unfloored small-cohort aggregate is near-individual, the read IS audited (dex.app_perf.compare, operational set-and-proceed). Gated on GLOBAL GuaranteedState:Read like /dex/perf/group, including the same service-scoped-token caveat: a token holds a global grant via ITServiceOwner regardless of scope, so it could otherwise supply any group, including one outside its own service — denied outright (403), audited under this same dex.app_perf.compare verb.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "group", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Management-group id whose members are the cohort."}, {"name": "baseline", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The before version (canonicalized + matched exactly)."}, {"name": "candidate", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The after version; must differ from baseline."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "integer", "default": 7, "minimum": 1, "maximum": 31}, "description": "Days of each version per machine to reduce."}], "responses": {"200": {"description": "Comparison object (app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{...}, distribution{up, flat, down})"}, "400": {"description": "missing/invalid param, or baseline == candidate"}, "403": {"description": "Service-scoped API token — this near-individual before/after comparison cannot be confined to the token's service."}, "503": {"description": "service unavailable, or the app-perf cohort read degraded (retry)"}}}
     })json"
         // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at
         // compile time. #4035's 8 new DEX twins start a fresh literal segment.
@@ -1387,7 +1405,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "App blast-radius drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Crash/hang summary, faulting modules, exception codes, and the affected-device list for one application (process image name) — the REST twin of the /fragments/dex/app dashboard drill. ALL of it, including the devices array of affected agent_ids, is a fleet-wide aggregate with no per-caller confinement (WS-A4 PR-1 Gate 7 fix round: the earlier per-caller `visible` filter was retired — it was dormant for a management-group-confined caller, who is denied outright below, and wrongly narrowed a JIT-elevated administrator instead of giving them the unfiltered view elevation earns). Every call emits a dex.app.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Process image name, e.g. notepad.exe."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "App drill object (process_name, window, crashes, hangs, signals, distinct_devices, first_seen, last_seen, modules[], exceptions[], devices[])"}, "400": {"description": "missing name, or invalid window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.app.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/apps": {
-      "get": {"summary": "App-centric stability list", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every application with a crash/hang signal in the window, ranked by activity — the REST twin of the /fragments/dex/apps dashboard tab. No per-agent identity (a distinct-device COUNT per app, never an agent_id) — fleet aggregate, NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Apps list (data.window, data.apps[].{subject, crashes, hangs, distinct_devices, last_seen})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "App-centric stability list", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every application with a Windows crash/hang signal in the window: the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order); apps_total counts every application with a Windows crash or hang signal in the window and apps_truncated flags the cut; up to 20 versions each (devices affected descending, then version), versions_truncated flags that cut. Each row carries crashes, hangs and distinct_devices (window-wide), then the figures over one population, the Windows devices online now: distinct_devices_online (the affected devices that are online now; null when no fleet source is wired), share_affected (95 percent Wilson interval of those over the population), rate_per_1000 (their events per 1,000 online devices, exact interval) and the stability score with its decomposition, so a device that crashed and went offline is in the counts but not in the share, and the score is withheld as offline_affected while any affected device is offline. Counts are Windows-scoped (the Apps tab, the Overview top apps and GET /dex/app still count every platform) and the population is Windows devices online now (population: null = no fleet source wired, 0 = no Windows device online now; population_basis names it). No device floor is applied. The version-regression term is not assessed here. No per-agent identity (a distinct-device COUNT per app, never an agent_id) — fleet aggregate, NOT audited. A failed read, an invalid score policy or a read over its concurrency budget (4 at once) returns 503, never an empty list.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Apps list (data.window, data.population, data.population_basis, data.apps_total, data.apps_truncated, data.apps[].{subject, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable, or the application-stability read degraded or over its concurrency budget (retry_after_ms 2000)"}}}
     },
     "/dex/catalogue": {
       "get": {"summary": "Signal catalogue family cards (Catalogue View 1)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every catalogued signal family's card: how many of its member types a connected, in-scope platform monitors, the family's own health-score slice, its window event count, its busiest member type, plus an 'Other (uncatalogued)' list of obs_types seen on the wire but not yet in a curated family — the REST twin of the /fragments/dex/catalogue dashboard grid (ADR-0031 WS-A4 PR-1; see docs/dex-signal-catalog.md for the family names). No per-agent identity — fleet aggregate, NOT audited. A degraded fleet signal-summary read (store closed / pool-acquire timeout / query error) 503s (retry_after_ms 2000) rather than rendering a fabricated healthy, zero-event catalogue (WS-A4 PR-1 fix round, closes sec-5).", "parameters": [{"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Catalogue object (os, window, monitored_types, total_types, families[].{name, monitored, total, health_score|null, events, top_obs_type|null}, uncatalogued[].{obs_type, count, distinct_devices, last_seen})"}, "400": {"description": "invalid os or window"}, "503": {"description": "service unavailable, or the fleet signal-summary read degraded (retry_after_ms 2000)"}}}
@@ -1417,6 +1435,13 @@ const std::string& openapi_spec() {
         // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at
         // compile time. This segment grew past the cap after the origin/dev
         // merge combined both branches' additions into the prior chunk.
+        // Estate E-2: a fresh literal for the discovered-devices twin (MSVC
+        // C2026 ~16 KB per-literal cap) so the neighbouring chunks keep their
+        // headroom.
+        R"json(,
+    "/network/discovered-devices": {
+      "get": {"summary": "Hosts found by network discovery scans", "tags": ["Network"], "description": "Requires Infrastructure:Read. REST/MCP twin (list_discovered_devices) of the /fragments/network/discovered dashboard fragment; all three call the same builder. Newest last-seen first, at most 500 rows: summary.total and summary.subnets count every row matching the optional subnet filter, and truncated is true when more rows matched than were returned. Hostnames and MAC addresses are agent-reported free text. No managed flag is returned: discovery does not yet match hosts to enrolled agents. The gate is the flat Infrastructure:Read, so, when RBAC is enforced, an operator confined to a management group is refused (403) rather than shown a narrowed list (#5855, revisit by 2026-11-14). Each row names a host fleet-wide, so every call emits a network.discovered.view audit event and a service-scoped API token is denied outright (403). FAILS CLOSED (503 + Sec-Audit-Failed: true) when that audit row cannot persist. A store fault is a 503, never an empty list.", "parameters": [{"name": "subnet", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 64}, "description": "Only hosts found on exactly this subnet string."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 500}}], "responses": {"200": {"description": "{data: [{id, ip_address, mac_address, hostname, subnet, discovered_by, discovered_at, last_seen}], summary: {total, subnets}, truncated}"}, "400": {"description": "Invalid limit or subnet"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service. Also returned to an operator confined to a management group when RBAC is enforced (#5855)."}, "503": {"description": "Discovery store unavailable or degraded, OR the network.discovered.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when host data was withheld because the access-audit row failed to persist."}}}}}
+    })json"
         R"json(,
     "/network/devices": {
       "get": {"summary": "Device list behind every network-quality drill", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default rtt), devices NOT reporting network this cycle (filter=not_reporting), a co-occurrence band (cooc=device|app|network_only|degraded), or one cohort's members. Cohort handling mirrors the /network dashboard fragment: the optional key selects a tag dimension and cohort_value (empty string = the untagged residual) filters to it. Rows carry the co-occurring facts (under_pressure, app_unstable) and fleet_pctile (nearest-rank position for the sort metric) — evidence for correlation, never a verdict. Each row names an agent_id fleet-wide, so every call emits a network.device.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the network.device.view audit row cannot persist, so the device list is never served without durable evidence. (GET /network/fleet stays unaudited: an aggregate, no agent_id.)", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["rtt", "retrans", "throughput"], "default": "rtt"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cooc", "in": "query", "required": false, "schema": {"type": "string", "enum": ["device", "app", "network_only", "degraded"]}}, {"name": "key", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Cohort tag key to resolve per-device cohort values; empty = no cohort dimension. NOTE: the network surface uses 'key' (with a length guard, empty allowed) where /dex/perf uses 'cohort_key' (validated, default 'model') — the difference mirrors each surface's cohort-resolution model."}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?)"}, "400": {"description": "Invalid limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the network.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural data was withheld because the access-audit row failed to persist."}}}}}
@@ -1578,13 +1603,13 @@ const std::string& openapi_spec() {
       "get": {"summary": "Erlang gateway upstream status", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/gateway, sharing its builder (settings_model::build_gateway_settings). Requires ServerConfig:Read (dedicated securable grouping the operational/infra Settings sub-areas, Administrator-only, floored in authz_topology_floor.hpp). NOT audited — operational status, nothing secret. MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {enabled, listen_address, gateway_mode, active_sessions}, meta}. listen_address/gateway_mode/active_sessions are defaulted (empty/false/0) when enabled=false."}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
     },
     "/settings/server-config": {
-      "get": {"summary": "Core server configuration (addresses, timeouts, OTA/gRPC tuning)", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/server-config, sharing its builder (settings_model::build_server_config_settings). Requires ServerConfig:Read. NOT audited — nothing secret. MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {agent_grpc_address, management_grpc_address, web_address, web_port, session_timeout_seconds, max_agents, auth_config_path, rate_limit_per_ip, login_rate_limit_per_ip, ota_max_concurrent_per_peer, ota_rate_refill_per_min, ota_rate_capacity, ota_max_concurrent_total, ota_max_peers_tracked, ota_transfer_deadline_secs, ota_chunk_write_deadline_secs, grpc_max_concurrent_streams, grpc_max_resource_memory_mb}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
+      "get": {"summary": "Core server configuration (addresses, timeouts, OTA/gRPC tuning)", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/server-config, sharing its builder (settings_model::build_server_config_settings). Requires ServerConfig:Read. NOT audited — nothing secret. session_timeout_seconds is the AGENT heartbeat timeout, not the dashboard sign-in expiry (see session_inactivity_seconds and session_absolute_lifetime_seconds). MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {agent_grpc_address, management_grpc_address, web_address, web_port, session_timeout_seconds, session_inactivity_seconds (0 = idle timeout off), session_absolute_lifetime_seconds, max_agents, auth_config_path, rate_limit_per_ip, login_rate_limit_per_ip, ota_max_concurrent_per_peer, ota_rate_refill_per_min, ota_rate_capacity, ota_max_concurrent_total, ota_max_peers_tracked, ota_transfer_deadline_secs, ota_chunk_write_deadline_secs, grpc_max_concurrent_streams, grpc_max_resource_memory_mb}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
     },
     "/settings/mcp": {
       "get": {"summary": "MCP server status and client-connection info", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/mcp, sharing its builder (settings_model::build_mcp_settings). Requires ServerConfig:Read. NOT audited — low sensitivity (an MCP client with a valid token already knows this endpoint exists). This route describes the MCP surface but is itself REST-only, deliberately (#520, see /settings/tls) — it is not, and does not become, an MCP tool.", "responses": {"200": {"description": "{data: {enabled, read_only, endpoint_url}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
     },
     "/settings/data-retention": {
-      "get": {"summary": "Response/audit data retention windows", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/data-retention, sharing its builder (settings_model::build_data_retention_settings). Requires ServerConfig:Read. NOT audited — lowest sensitivity of the 8 Settings read-twins (two integers). MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {response_retention_days, audit_retention_days}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
+      "get": {"summary": "Response/audit/Guardian data retention windows", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/data-retention, sharing its builder (settings_model::build_data_retention_settings). Requires ServerConfig:Read. NOT audited — lowest sensitivity of the 8 Settings read-twins (a few integers). The top-level days are the stored/configured values; enforced.* is what the stores apply (null when unknown). MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {response_retention_days, audit_retention_days, guardian_event_retention_days, enforced: {...}}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
     },
     "/settings/analytics": {
       "get": {"summary": "Analytics drain + ClickHouse integration settings", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/analytics, sharing its builder (settings_model::build_analytics_settings). Requires AnalyticsConfig:Read (dedicated securable). Audited fail-closed (settings.analytics.read) — mixed, leans high (embedded-credential risk). SECURITY FIX bundled with this twin: clickhouse_url is sanitized of embedded userinfo credentials (settings_model::sanitize_url_userinfo) before being returned — previously the sibling HTML fragment rendered it verbatim, masking only the separate clickhouse_password field. The raw password itself is never returned, only clickhouse_password_set. MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {enabled, drain_interval_seconds, batch_size, clickhouse_configured, clickhouse_url (userinfo-sanitized), clickhouse_database, clickhouse_table, clickhouse_username, clickhouse_password_set, jsonl_export_path}, meta}"}, "403": {"description": "Permission denied (AnalyticsConfig:Read)"}, "503": {"description": "Audit subsystem unavailable — refuses to serve without durable evidence"}}}
@@ -1690,6 +1715,12 @@ const std::string& openapi_spec() {
     },
     "/deployments/preview": {
       "get": {"summary": "Deploy-config go/warn preview for one pre-flight run", "tags": ["Pre-flight"], "description": "Requires SoftwareDeployment:Read. Owner-scoped (the run's created_by must match the caller — a not-yours run reads as 404, closing the existence oracle). REST/MCP twin (get_deployment_preview) of GET /fragments/auto/deploy — confirmed inert, reads only the pre-flight run store, never creates or advances a deployment. Own audit verb deployment.config.view (distinct from deployment.create), unaudited on success; a service-scoped API token is denied outright (403) for the same owner-scope-confinement reason as GET /preflight/runs.", "parameters": [{"name": "run", "in": "query", "required": true, "schema": {"type": "string"}, "description": "The source pre-flight run id"}], "responses": {"200": {"description": "{data: {run_id, name, go, warn}}"}, "400": {"description": "Missing run parameter"}, "403": {"description": "Service-scoped API token — this owner-scoped read cannot be confined to the token's service."}, "404": {"description": "No such run, or it belongs to another operator"}, "503": {"description": "Pre-flight run store unavailable"}}}
+    },
+    "/deployments": {
+      "get": {"summary": "List the caller's own software deployments", "tags": ["Pre-flight"], "description": "Requires SoftwareDeployment:Read. Owner-scoped (created_by = the caller), newest first. REST/MCP twin (list_deployments) of GET /fragments/auto/deployments, over the live /auto engine (not the dormant /software-deployments store). Read-only: never advances or dispatches. State is running or complete; failed and skipped counts are carried in state.label. artifact_url and exec_args are never returned (has_args only). pagination.truncated is true when more deployments exist than limit returned; there is no total and no paging cursor, so raise limit (max 100). Unaudited on success; a service-scoped API token is denied (403).", "parameters": [{"name": "limit", "in": "query", "required": false, "description": "Whole integer; values outside 1..100 are clamped. Anything else, including a number followed by other characters, is 400.", "schema": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100}}], "responses": {"200": {"description": "{data: [{deployment_id, source_run_id, name, artifact_filename, artifact_sha256, has_args, status, state: {code, label, tone}, created_at_ms, completed_at_ms, total, succeeded, failed, skipped, active}], pagination: {start, page_size, truncated}}"}, "400": {"description": "Invalid limit"}, "403": {"description": "Service-scoped API token"}, "503": {"description": "Deployment run store unavailable (a store fault is never an empty list)"}}}
+    },
+    "/deployments/{id}": {
+      "get": {"summary": "One of the caller's deployments with its device grid", "tags": ["Pre-flight"], "description": "Requires SoftwareDeployment:Read. Owner-scoped: a deployment that is not the caller's reads as 404 (no existence oracle). REST/MCP twin (get_deployment) of GET /fragments/auto/deployments/detail. Read-only: unlike GET /fragments/auto/deploy/result it never advances the engine and writes no per-poll audit row. Counts are exact from the run row; devices are ordered by hostname then agent id, capped by limit, with truncated set when more exist.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "description": "Whole integer; values outside 1..5000 are clamped. Anything else, including a number followed by other characters, is 400.", "schema": {"type": "integer", "default": 500, "minimum": 1, "maximum": 5000}}], "responses": {"200": {"description": "{data: {deployment row fields, devices: [{agent_id, hostname, os, step, exit_code, error, updated_at_ms}], device_limit, truncated}}"}, "400": {"description": "Invalid limit"}, "403": {"description": "Service-scoped API token"}, "404": {"description": "No such deployment, or it belongs to another operator"}, "503": {"description": "Deployment run store unavailable"}}}
     },
     "/license": {
       "get": {"summary": "Get the active license", "tags": ["License Management"], "description": "Only available when LicenseStore is wired — the server does not construct it today (licensing deliberately shelved, ADR-0048); documented for when a future change re-wires it. Requires License:Read.", "responses": {"200": {"description": "Active license: {id, organization, seat_count, seats_used, issued_at, expires_at, edition, status, days_remaining}. No active license: {status: \"none\"}."}, "503": {"description": "A genuine database read failure"}}},
@@ -2849,6 +2880,19 @@ void RestApiV1::register_routes(
             data.add("rbac_enabled", false);
             data.add("rbac_role", session->role == auth::Role::admin ? "Administrator" : "Viewer");
         }
+        // Same session self-description as legacy GET /api/me (#5779, #4208).
+        const bool elevated = auth::is_elevated(*session);
+        data.add("effective_role", auth::role_to_string(auth::effective_role(*session)))
+            .add("elevated", elevated);
+        if (elevated) {
+            data.add("elevated_until",
+                     format_iso_utc(std::chrono::duration_cast<std::chrono::seconds>(
+                                        session->elevated_until.time_since_epoch())
+                                        .count()));
+        }
+        data.add("can_access_settings",
+                 authz::admin_gate_verdict(*session) == authz::AdminGate::Admit);
+        res.set_header("Cache-Control", "no-store, private");
         res.set_content(ok_json(data.str()), "application/json");
     });
 
@@ -5989,14 +6033,15 @@ void RestApiV1::register_routes(
 
     sink.Get(
         "/api/v1/quarantine",
-        [auth_fn, scoped_perm_fn, quarantine_store](const httplib::Request& req,
-                                                     httplib::Response& res) {
-            // gov-fix(consistency-auditor): admit-then-filter, matching POST/DELETE
-            // (CDX-P1-02) rather than the flat global gate this route shipped with —
-            // a management-group-confined operator who can act on a device via
-            // POST/DELETE must also be able to SEE it here, and must not see
-            // quarantine records for devices outside their scope. Fail CLOSED (500)
-            // if scoped_perm_fn is unwired, never fall back to an unfiltered list.
+        [auth_fn, fleet_read_fn, quarantine_store](const httplib::Request& req,
+                                                    httplib::Response& res) {
+            // ADR-0017 (World A): a list of per-agent data goes through the admit-then-filter
+            // list chokepoint (`fleet_read_fn` = `require_fleet_read`) — ONE Security:Read
+            // decision per request, its scope pushed into the store query, so a management-
+            // group-confined operator sees only their own records and an out-of-scope record
+            // costs neither a probe nor an audit row. Fail CLOSED (500) if the gate is
+            // unwired, never fall back to an unfiltered list. POST/DELETE keep the per-
+            // device `scoped_perm_fn` (one device, one decision).
             if (!auth_fn(req, res))
                 return;
             if (!quarantine_store || !quarantine_store->is_open()) {
@@ -6004,18 +6049,26 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
-            if (!scoped_perm_fn) {
+            if (!fleet_read_fn) {
                 res.status = 500;
                 res.set_content(detail::a4_error(res, "scope gate not configured"),
                                 "application/json");
                 return;
             }
+            const authz::FleetReadGate gate = fleet_read_fn(req, res, "Security", "Read");
+            if (!gate.admitted)
+                return; // response already written by fleet_read_fn
 
-            // AUTHORITATIVE read (ADR-0047): nullopt is a degraded read, NEVER
-            // rendered as an empty quarantine list — a device could still be
-            // actively contained while the caller sees "nothing quarantined".
-            auto records = quarantine_store->list_quarantined();
-            if (!records) {
+            // AUTHORITATIVE scoped read, shared with the dashboard fragments
+            // (quarantine_visible.hpp — one copy of the rules): a nullopt store read is a
+            // degraded read, NEVER an empty list (a degraded read must not render as
+            // "not quarantined").
+            const auto visible_set = quarantine_visible_records(
+                gate.scope,
+                [quarantine_store](const std::vector<std::string>* ids, std::size_t limit) {
+                    return quarantine_store->list_quarantined_in(ids, limit);
+                });
+            if (visible_set.status == QuarantineReadStatus::StoreDegraded) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "quarantine list unavailable — try again"),
                                 "application/json");
@@ -6023,39 +6076,7 @@ void RestApiV1::register_routes(
             }
             JArr arr;
             int64_t visible = 0;
-            for (const auto& r : *records) {
-                httplib::Response probe; // throwaway: per-record admit probe, never sent
-                if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id)) {
-                    // gov-fix(security-guardian, widened by unhappy-path Gate 4):
-                    // a per-record degrade is NOT a denial and must not be
-                    // silently filtered out — that would render a degraded
-                    // authz check as "not quarantined", the exact fail-open
-                    // the store-layer nullopt check above exists to close,
-                    // just one layer up. The auth caller has ALREADY been
-                    // authenticated once by auth_fn above, using the SAME
-                    // req — every per-record call re-derives authorization
-                    // from scratch (require_scoped_permission calls
-                    // require_auth internally on every invocation), so any
-                    // outcome OTHER than an explicit 403 (a genuine scope
-                    // denial) is anomalous mid-request and must fail the
-                    // WHOLE list closed, not just the RBAC/tag-store-degrade
-                    // 503 case: a transient engine-principal store outage
-                    // landing between auth_fn's initial check and a later
-                    // per-record probe surfaces as a bare 401 (require_auth
-                    // does not distinguish "no session" from "could not
-                    // determine" for that principal class — see
-                    // EngineLookupStatus::StoreUnreachable's own comment,
-                    // auth_routes.cpp), which the original 503-only check
-                    // would have silently treated as a denial.
-                    if (probe.status != 403) {
-                        res.status = 503;
-                        res.set_content(
-                            detail::a4_error(res, "authorization check unavailable — try again"),
-                            "application/json");
-                        return;
-                    }
-                    continue;
-                }
+            for (const auto& r : visible_set.records) {
                 arr.add(JObj()
                             .add("agent_id", r.agent_id)
                             .add("status", r.status)
@@ -6157,6 +6178,22 @@ void RestApiV1::register_routes(
         auto session = auth_fn(req, res);
         std::string by = session ? session->username : "system";
 
+        // ADR-0033 §9: a mutating capability fails closed on audit failure (no audit row,
+        // no mutation). The attempt row is written AFTER authorisation and validation and
+        // BEFORE the store write, so containment is never changed without a record; the
+        // outcome row below says whether it applied (`success` keeps meaning "applied").
+        if (!detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "attempt",
+                                           "Security", agent_id, reason)) {
+            res.status = 503;
+            res.set_content(
+                detail::a4_error(res,
+                                 "audit subsystem unavailable; refusing to change containment "
+                                 "without durable evidence",
+                                 {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                "application/json");
+            return;
+        }
+
         auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
         if (!result) {
             const bool db_error = is_quarantine_db_error(result.error());
@@ -6174,10 +6211,14 @@ void RestApiV1::register_routes(
             // already audits this branch (mcp_audit("failure", ...)) — REST
             // was silently skipping it, the only quarantine failure path with
             // no audit row.
-            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id, result.error());
+            (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "failure",
+                                                "Security", agent_id, result.error());
             return;
         }
-        audit_fn(req, "quarantine.enable", "success", "Security", agent_id, reason);
+        // The change is made; a lost outcome row is signalled by Sec-Audit-Failed, and the
+        // attempt row already records who asked.
+        (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "success",
+                                            "Security", agent_id, reason);
         res.status = 201;
         res.set_content(ok_json(JObj().add("quarantined", true).str()), "application/json");
     });
@@ -6220,6 +6261,19 @@ void RestApiV1::register_routes(
             if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
                 return;
 
+            // ADR-0033 §9: attempt row before the store write, fail closed (see POST above).
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable", "attempt",
+                                               "Security", agent_id, "")) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "audit subsystem unavailable; refusing to change containment "
+                                     "without durable evidence",
+                                     {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                    "application/json");
+                return;
+            }
+
             auto result = quarantine_store->release_device(agent_id);
             if (!result) {
                 const bool db_error = is_quarantine_db_error(result.error());
@@ -6230,18 +6284,37 @@ void RestApiV1::register_routes(
                                                  db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
                                                            : detail::A4ErrorOpts{}),
                                 "application/json");
-                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
-                         result.error());
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable",
+                                                    "failure", "Security", agent_id, result.error());
                 return;
             }
-            audit_fn(req, "quarantine.disable", "success", "Security", agent_id, "");
+            (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable", "success",
+                                                "Security", agent_id, "");
             res.set_content(ok_json(JObj().add("released", true).str()), "application/json");
         });
 
     // ── RBAC (/api/v1/rbac) ──────────────────────────────────────────────
 
+    // Both role reads below are on the CHECKED store reads: a closed store, a
+    // pool-acquire timeout or a query error is a retryable 503, never the empty
+    // `200 {"data":[]}` the fail-soft `list_roles()` / `get_role_permissions()`
+    // returned — an empty role list or permission set reads as "nobody has any
+    // access". The message is fixed on purpose: the store's libpq text is never
+    // echoed (#5063 family), the 503 and its correlation_id are the signal.
+    // No audit: neither read captures `audit_fn`, and no audit verb exists for
+    // either (same as the /rbac/roles/assignments genuine-failure path).
+    const auto rbac_read_degraded = [](httplib::Response& res) {
+        res.status = 503;
+        res.set_content(
+            detail::a4_error(res, "rbac store read degraded",
+                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                 .remediation = "retry shortly"}),
+            "application/json");
+    };
+
     sink.Get("/api/v1/rbac/roles",
-             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+             [perm_fn, rbac_store, rbac_read_degraded](const httplib::Request& req,
+                                                       httplib::Response& res) {
                  if (!perm_fn(req, res, "UserManagement", "Read"))
                      return;
                  if (!rbac_store) {
@@ -6250,21 +6323,26 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 auto roles = rbac_store->list_roles();
+                 auto roles = rbac_store->list_roles_checked();
+                 if (!roles) {
+                     rbac_read_degraded(res);
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& r : roles) {
+                 for (const auto& r : *roles) {
                      arr.add(JObj()
                                  .add("name", r.name)
                                  .add("description", r.description)
                                  .add("is_system", r.is_system)
                                  .add("created_at", r.created_at));
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(roles.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(roles->size())),
                                  "application/json");
              });
 
     sink.Get(R"(/api/v1/rbac/roles/(.+)/permissions)",
-             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+             [perm_fn, rbac_store, rbac_read_degraded](const httplib::Request& req,
+                                                       httplib::Response& res) {
                  if (!perm_fn(req, res, "UserManagement", "Read"))
                      return;
                  if (!rbac_store) {
@@ -6273,10 +6351,33 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 auto role_name = req.matches[1].str();
-                 auto perms = rbac_store->get_role_permissions(role_name);
+                 const auto role_name = req.matches[1].str();
+                 // Existence on a CHECKED read, then the permissions on another: a degrade
+                 // at either step is a 503 and can never surface as a 404, and a name the
+                 // roles table does not hold is a 404, not `200 {"data":[]}`. get_role()
+                 // is not usable here — it reads a degrade as "no such role". The scan is
+                 // over a handful of rows and compares the name exactly (no libpq text
+                 // parameter, so an embedded NUL cannot truncate into a real role).
+                 auto roles = rbac_store->list_roles_checked();
+                 if (!roles) {
+                     rbac_read_degraded(res);
+                     return;
+                 }
+                 const bool known = std::any_of(roles->begin(), roles->end(),
+                                                [&](const RbacRole& r) { return r.name == role_name; });
+                 if (!known) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "role not found"), "application/json");
+                     return;
+                 }
+
+                 auto perms = rbac_store->get_role_permissions_checked(role_name);
+                 if (!perms) {
+                     rbac_read_degraded(res);
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& p : perms) {
+                 for (const auto& p : *perms) {
                      arr.add(JObj()
                                  .add("securable_type", p.securable_type)
                                  .add("operation", p.operation)
@@ -7727,7 +7828,8 @@ void RestApiV1::register_routes(
         // Only the templates change: blank the schema so update_definition keeps the stored
         // column (an empty parameter_schema means "keep") instead of writing the loaded copy back.
         def.parameter_schema.clear();
-        auto upd = instruction_store->update_definition(def);
+        // Only apply if the row is still the one read above (a concurrent edit is a 409).
+        auto upd = instruction_store->update_definition(def, def.updated_at);
         if (!upd)
             return upd.error();
         return std::nullopt;
@@ -7740,6 +7842,8 @@ void RestApiV1::register_routes(
             return 503;
         if (err.rfind("not_found:", 0) == 0)
             return 404;
+        if (is_conflict_error(err))
+            return 409;
         return 500;
     };
 
@@ -7859,11 +7963,32 @@ void RestApiV1::register_routes(
                  res.set_content(detail::a4_error(res, "template not found"), "application/json");
              });
 
+    // Same-site gate for the cookie-authorised template mutations the Instructions page calls
+    // (token callers are exempt). Runs after the permission gate; auth_fn writes its own 401.
+    auto rt_refuse_cross_site = [auth_fn, audit_fn, trusted = csrf_trusted_origins_](
+                                    const httplib::Request& req, httplib::Response& res) -> bool {
+        auto sess = auth_fn(req, res);
+        if (!sess)
+            return true;
+        if (!browser_write_is_cross_site(sess->auth_source, req.get_header_value("Host"),
+                                         req.get_header_value("Origin"),
+                                         req.get_header_value("Referer"), trusted))
+            return false;
+        audit_fn(req, "csrf.denied", "denied", "Endpoint", "response_template",
+                 "cross-site or header-less browser write refused");
+        res.status = 403;
+        res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+        return true;
+    };
+
     // POST /api/v1/definitions/{id}/response-templates ─ create
     sink.Post(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates)",
-              [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
+              [perm_fn, audit_fn, instruction_store, persist_templates, persist_status,
+                  rt_refuse_cross_site](const httplib::Request& req,
                                                                         httplib::Response& res) {
                   if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                      return;
+                  if (rt_refuse_cross_site(req, res))
                       return;
                   if (!instruction_store || !instruction_store->is_open()) {
                       res.status = 503;
@@ -7935,8 +8060,9 @@ void RestApiV1::register_routes(
                       spdlog::error("response_template.create persist failed: def={} err={}",
                                     def_id, *err);
                       res.status = persist_status(*err);
-                      res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
-                                                                              : "persist failure"),
+                      res.set_content(detail::a4_error(res, res.status == 404   ? "definition not found"
+                                                : res.status == 409 ? "definition was modified concurrently; reload and retry"
+                                                                    : "persist failure"),
                                       "application/json");
                       audit_fn(req, "response_template.create", "failure", "InstructionDefinition",
                                def_id, "reason=persist_failure");
@@ -7950,9 +8076,12 @@ void RestApiV1::register_routes(
 
     // PUT /api/v1/definitions/{id}/response-templates/{tid} ─ replace
     sink.Put(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-             [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
+             [perm_fn, audit_fn, instruction_store, persist_templates, persist_status,
+                  rt_refuse_cross_site](const httplib::Request& req,
                                                                        httplib::Response& res) {
                  if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                     return;
+                 if (rt_refuse_cross_site(req, res))
                      return;
                  if (!instruction_store || !instruction_store->is_open()) {
                      res.status = 503;
@@ -8051,8 +8180,9 @@ void RestApiV1::register_routes(
                      spdlog::error("response_template.update persist failed: def={} tid={} err={}",
                                    def_id, tid, *err);
                      res.status = persist_status(*err);
-                     res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
-                                                                             : "persist failure"),
+                     res.set_content(detail::a4_error(res, res.status == 404   ? "definition not found"
+                                                : res.status == 409 ? "definition was modified concurrently; reload and retry"
+                                                                    : "persist failure"),
                                      "application/json");
                      audit_fn(req, "response_template.update", "failure", "InstructionDefinition",
                               def_id, "reason=persist_failure");
@@ -8066,9 +8196,12 @@ void RestApiV1::register_routes(
     // DELETE /api/v1/definitions/{id}/response-templates/{tid}
     sink.Delete(
         R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-        [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
+        [perm_fn, audit_fn, instruction_store, persist_templates, persist_status,
+                  rt_refuse_cross_site](const httplib::Request& req,
                                                                   httplib::Response& res) {
             if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                return;
+            if (rt_refuse_cross_site(req, res))
                 return;
             if (!instruction_store || !instruction_store->is_open()) {
                 res.status = 503;
@@ -8133,8 +8266,9 @@ void RestApiV1::register_routes(
                 spdlog::error("response_template.delete persist failed: def={} tid={} err={}",
                               def_id, tid, *err);
                 res.status = persist_status(*err);
-                res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
-                                                                        : "persist failure"),
+                res.set_content(detail::a4_error(res, res.status == 404   ? "definition not found"
+                                                : res.status == 409 ? "definition was modified concurrently; reload and retry"
+                                                                    : "persist failure"),
                                 "application/json");
                 audit_fn(req, "response_template.delete", "failure", "InstructionDefinition",
                          def_id, "reason=persist_failure");
@@ -8186,6 +8320,53 @@ void RestApiV1::register_routes(
                  }
                  q.principal = req.get_param_value("principal");
                  q.action = req.get_param_value("action");
+                 q.target_type = req.get_param_value("target_type");
+                 q.target_id = req.get_param_value("target_id");
+                 auto bad_request = [&res](const char* msg) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, msg), "application/json");
+                 };
+                 // A NUL (%00) or invalid UTF-8 breaks the bind: truncation silently widens
+                 // the filter, a bad byte surfaces as a false 503 and read-degrade count.
+                 if (!audit_string_filters_wellformed(q)) {
+                     bad_request("string filters must be valid UTF-8 without NUL");
+                     return;
+                 }
+                 // since/until: epoch seconds, the whole value ONE base-10 integer; both bounds
+                 // inclusive and PRESENCE-tracked (#4644): omitted = that side unbounded. A
+                 // present-but-empty value is malformed. `since=0` is a harmless literal bound
+                 // (every stored timestamp is positive); `until` of 0 or below is refused, since
+                 // it would bound the read at the epoch and match nothing.
+                 for (const auto& [name, dst] :
+                      {std::pair<const char*, std::optional<int64_t>*>{"since", &q.since},
+                       std::pair<const char*, std::optional<int64_t>*>{"until", &q.until}}) {
+                     if (!req.has_param(name))
+                         continue;
+                     const auto v = parse_query_int<int64_t>(req.get_param_value(name));
+                     if (!v || *v < 0 || (std::string_view(name) == "until" && *v == 0)) {
+                         bad_request("since must be a non-negative epoch second and until a "
+                                     "positive one (omit a bound to leave it open)");
+                         return;
+                     }
+                     *dst = *v;
+                 }
+                 if (q.since && q.until && *q.since > *q.until) {
+                     bad_request("since must be <= until");
+                     return;
+                 }
+                 if (const auto off = req.get_param_value("offset"); !off.empty()) {
+                     const auto v = parse_query_int<int>(off);
+                     if (!v || *v < 0 || *v > kAuditMaxOffset) {
+                         bad_request("offset must be 0..10000");
+                         return;
+                     }
+                     q.offset = *v;
+                 }
+                 // The index leads with target_type, so a bare target_id is a scan.
+                 if (!q.target_id.empty() && q.target_type.empty()) {
+                     bad_request("target_id requires target_type");
+                     return;
+                 }
 
                  // ADR-0040: degrade-distinguishable read — nullopt on a
                  // store/pool failure. Surface 503, never a false-empty 200 (an
@@ -8193,14 +8374,18 @@ void RestApiV1::register_routes(
                  auto events = audit_store->query(q);
                  if (!events) {
                      res.status = 503;
-                     res.set_content(detail::a4_error(res, "audit store degraded"),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res, "audit store degraded",
+                                          detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                              .remediation = "retry shortly"}),
+                         "application/json");
                      return;
                  }
                  JArr arr;
                  for (size_t i = 0; i < events->size(); ++i) {
                      const auto& e = (*events)[i];
                      arr.add(JObj()
+                                 .add("id", e.id)
                                  .add("timestamp", e.timestamp)
                                  .add("principal", e.principal)
                                  .add("action", e.action)
@@ -8209,7 +8394,9 @@ void RestApiV1::register_routes(
                                  .add("target_id", e.target_id)
                                  .add("detail", e.detail));
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events->size())),
+                 // total = rows on this page; a page shorter than `limit` is the last.
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events->size()),
+                                           q.offset, q.limit),
                                  "application/json");
              });
 
@@ -13598,7 +13785,7 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}/members
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/members)",
-                 [auth_fn, audit_fn, result_set_store, rs_err, load_owned,
+                 [auth_fn, audit_fn, result_set_store, rs_err, load_owned, fleet_read_fn,
                   deny_fleet_wide_service_scoped](const httplib::Request& req,
                                                   httplib::Response& res) {
                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
@@ -13616,6 +13803,27 @@ void RestApiV1::register_routes(
                      auto row = load_owned(req, id, session->username, res);
                      if (!row)
                          return;
+                     // Ownership says whose set it is, not which devices the owner may
+                     // still see (their management-group authority can narrow after the
+                     // set was made). Resolve the CURRENT list-read scope through the
+                     // Infrastructure:Read admit-then-filter gate, the one the create
+                     // route applies to device_ids, and push it into the SQL before
+                     // LIMIT (ADR-0017 INV-3). Same gate on the dashboard fragment and
+                     // the MCP twin.
+                     if (!fleet_read_fn) {
+                         spdlog::error("result_set.members: fleet_read_fn unwired — "
+                                       "misconfigured call site; failing closed");
+                         if (audit_fn)
+                             (void)audit_fn(req, "result_set.members", "failure", "ResultSet",
+                                            id, "reason=fleet_read_fn_unwired");
+                         rs_err(res, 503,
+                                "RESULT_SET_STORE_UNAVAILABLE: device visibility check "
+                                "unavailable");
+                         return;
+                     }
+                     auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
+                     if (!gate.admitted)
+                         return; // gate already wrote 401/403/503
                      std::string cursor =
                          req.has_param("cursor") ? req.get_param_value("cursor") : "";
                      int limit = 1000;
@@ -13633,7 +13841,7 @@ void RestApiV1::register_routes(
                      // #4306 finding 3 / #4307 finding 2: never a 200 with an
                      // empty array on a degraded read — indistinguishable
                      // from a genuine last/empty page.
-                     auto page = result_set_store->members_checked(id, cursor, limit);
+                     auto page = result_set_store->members_checked(id, cursor, limit, gate.scope);
                      if (!page) {
                          // #4306 gov-4306-S8: audit parity with MCP's equivalent
                          // degraded-read branch, scoped to this branch only.
@@ -16782,18 +16990,18 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 auto trend = dex_perf_api->app_fleet_trend(app, version);
-                 if (!trend) { // AUTHORITATIVE read degrade
+                 auto report = dex_perf_api->app_fleet_report(app, version);
+                 if (!report) { // AUTHORITATIVE read degrade
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "app-perf store read degraded", cid,
                                                /*retry_after_ms=*/2000,
-                                               "the app-perf store could not be read; retry shortly"),
+                                               "the app-perf or crash-and-hang store could not be read; retry shortly"),
                          "application/json");
                      return;
                  }
                  JArr points;
-                 for (const auto& pt : *trend) {
+                 for (const auto& pt : report->points) {
                      // The fleet path floors too now, so a sub-floor point carries
                      // suppressed=true with device_count only — same shape as the
                      // group endpoint; without the flag a suppressed point would read
@@ -16819,6 +17027,13 @@ void RestApiV1::register_routes(
                                              .add("app", app)
                                              .add("version", version)
                                              .raw("points", points.str())
+                                             .raw("versions", dex_app_perf_versions_json(*report))
+                                             .add("versions_truncated", report->versions_truncated)
+                                             .add("failure_window_days",
+                                                  std::int64_t{report->failure_window_days})
+                                             .add("exposure_basis", "resource_significant")
+                                             .add("stat_failures",
+                                                  std::int64_t{report->stat_failures})
                                              .str()),
                                  "application/json");
              });
@@ -17239,8 +17454,8 @@ void RestApiV1::register_routes(
     // only: measured shift + the up/flat/down split, NO verdict, NO threshold.
     //
     // NO cohort floor: real canaries are 2-3 devices, so a floor would gut the
-    // feature; a sub-kDexCohortFloor paired set carries small_cohort=true so the
-    // caller marks it "indicative". The aggregate carries NO per-machine row (that
+    // feature; small_cohort (paired below kDexCohortFloor) stays on the wire but is
+    // never true with the floor at one device. The aggregate carries NO per-machine row (that
     // PII is the audited dashboard drill only) — but an unfloored small-cohort
     // aggregate is near-individual, so the read IS audited: dex.app_perf.compare,
     // OPERATIONAL set-and-proceed (records who compared whose canary — the
@@ -17512,6 +17727,17 @@ void RestApiV1::register_routes(
             return;
         }
         const auto model = dex_api->apps(window);
+        // A failed read or an invalid score policy must never render as an
+        // empty or perfect list.
+        if (model.degraded) {
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "DEX store read degraded", cid,
+                                                  /*retry_after_ms=*/2000,
+                                                  "the DEX application-stability read could not be "
+                                                  "completed; retry shortly"),
+                            "application/json");
+            return;
+        }
         res.set_content(ok_json(dex_apps_json(model)), "application/json");
     });
 

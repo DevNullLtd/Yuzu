@@ -26,6 +26,7 @@
 // fully defined, so no separate include is needed for that.
 #include "file_retrieval_routes.hpp"
 #include "dex_perf_model.hpp"
+#include "discovered_devices_model.hpp" // list_discovered_devices read seam (DiscoveredDevicesReadFn)
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
@@ -114,6 +115,10 @@ class PluginConfigStore;
 // handler, which is the same shape). Forward-declared (pointer-only in the
 // setter below); the .cpp includes preflight_run_store.hpp for the definition.
 class PreflightRunStore;
+// Read-only deployment list/detail (list_deployments / get_deployment). Forward-declared
+// (pointer-only in the setter below); the .cpp includes deployment_routes.hpp, which pulls in
+// the store definition and the shared JSON builders.
+class DeploymentRunStore;
 // #2146 Batch B1 — backs get_guardian_device_compliance (the SAME BaselineStore
 // GET /guaranteed-state/device-compliance already reads). Forward-declared
 // (pointer-only in the setter below); the .cpp includes baseline_store.hpp for
@@ -520,6 +525,19 @@ public:
     /// both tools answer "unavailable" rather than crashing.
     void set_preflight_run_store(PreflightRunStore* store) { preflight_run_store_ = store; }
 
+    /// The deployment run store, backing `list_deployments` and `get_deployment`
+    /// (mirror GET /api/v1/deployments[/{id}], owner-scoped, read-only). Unset
+    /// (`nullptr`, the default) => both tools answer "unavailable". This is the live
+    /// `/auto` engine's store, NOT the dormant `SoftwareDeploymentStore`.
+    void set_deployment_run_store(DeploymentRunStore* store) { deployment_run_store_ = store; }
+    /// Network discovery read seam, backing `list_discovered_devices` (mirrors
+    /// GET /api/v1/network/discovered-devices; same shared builders). A
+    /// function rather than a store so tests inject fixtures. Unset (empty,
+    /// the default) => the tool answers "unavailable" rather than crashing.
+    void set_discovered_devices_reader(DiscoveredDevicesReadFn reader) {
+        discovered_devices_reader_ = std::move(reader);
+    }
+
     /// #2146 Batch B2 — the scope-walking result-set store, backing the 12
     /// result-set MCP tools (`list_result_sets` through `delete_result_set`).
     /// Same setter idiom as `set_preflight_run_store` above. Unset
@@ -739,12 +757,13 @@ public:
 
     /// ADR-0031 WS-A4 (eighth family): the SAME in-process workflow-read API
     /// seam the REST `GET /api/v1/workflows[/{id}]` and
-    /// `GET /api/v1/workflow-executions/{id}` handlers use — server.cpp
+    /// `GET /api/v1/workflow-executions[/{id}]` handlers use — server.cpp
     /// wires the IDENTICAL instance so `list_workflows`/`get_workflow`/
-    /// `get_workflow_execution` can never disagree with REST v1.
+    /// `get_workflow_execution`/`list_workflow_executions` can never
+    /// disagree with REST v1.
     /// A SETTER, not a `build_handler` parameter — mirrors `set_schedule_api`
     /// above: `build_handler`'s own `WorkflowEngine* workflow_engine`
-    /// parameter is now unused inside these three tool bodies (superseded by
+    /// parameter is now unused inside these tool bodies (superseded by
     /// this seam) but is kept, unremoved, for constructor-signature
     /// stability — a bounded, disclosed, deferred follow-up, not an
     /// oversight (matrix doc, `workflow` family row). Unset (default-
@@ -1202,6 +1221,8 @@ private:
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
     PreflightRunStore* preflight_run_store_{nullptr};
+    DeploymentRunStore* deployment_run_store_{nullptr};
+    DiscoveredDevicesReadFn discovered_devices_reader_;
     // #2146 Batch B2 — see set_result_set_store above.
     ResultSetStore* result_set_store_{nullptr};
     // #4981 PR-2 — see set_scope_evaluate_fn above.

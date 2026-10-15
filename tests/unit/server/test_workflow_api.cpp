@@ -2,9 +2,9 @@
  * test_workflow_api.cpp — the EIGHTH per-family in-process API seam for the
  * presentation/core/engine split (ADR-0031, WS-A4). `LocalWorkflowApi`
  * (workflow_api.cpp) is a thin wrap of `WorkflowEngine::list_workflows`/
- * `get_workflow`/`get_execution` — each method's own behaviour is already
- * covered by `test_workflow_engine.cpp`, so this file proves only the
- * WIRING: that the seam forwards each call unmodified and returns the
+ * `get_workflow`/`get_execution`/`query_executions_page` — each method's own
+ * behaviour is already covered by `test_workflow_engine.cpp`, so this file
+ * proves only the WIRING: that the seam forwards each call unmodified and returns the
  * engine's result unmodified, through the public `WorkflowApi` interface —
  * the class itself (`LocalWorkflowApi`) is deliberately private to
  * workflow_api.cpp, so this file uses only `make_local_workflow_api`,
@@ -22,9 +22,14 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <set>
+#include <string>
+#include <unordered_set>
+
 using yuzu::server::make_local_workflow_api;
 using yuzu::server::Workflow;
 using yuzu::server::WorkflowEngine;
+using yuzu::server::WorkflowExecutionListQuery;
 using yuzu::server::WorkflowQuery;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgResult;
@@ -103,9 +108,68 @@ TEST_CASE("WorkflowApi::get_workflow_execution: forwards get_execution unmodifie
     CHECK_FALSE(missing->has_value());
 }
 
+namespace {
+std::set<std::string> run_ids(const yuzu::server::WorkflowExecutionPage& page) {
+    std::set<std::string> ids;
+    for (const auto& r : page.rows)
+        ids.insert(r.id);
+    return ids;
+}
+} // namespace
+
+TEST_CASE("WorkflowApi::list_workflow_executions: the query and the scope reach the store "
+          "unmodified",
+          "[pg][workflow_api]") {
+    WorkflowEnginePg fx;
+    auto api = make_local_workflow_api(*fx.get());
+
+    auto wf = fx->create_workflow("kind: Workflow\n"
+                                  "metadata:\n"
+                                  "  displayName: list-seam\n"
+                                  "spec:\n"
+                                  "  steps:\n"
+                                  "    - instruction: inst-1\n");
+    REQUIRE(wf.has_value());
+    const yuzu::server::StepDispatchFn dispatch =
+        [](const std::string&, const std::string&,
+           const std::string&) -> std::expected<std::string, std::string> {
+        return std::string(R"({"status":"ok"})");
+    };
+    auto run_a = fx->execute(*wf, {"agent-1"}, dispatch);
+    auto run_b = fx->execute(*wf, {"agent-2"}, dispatch);
+    REQUIRE(run_a.has_value());
+    REQUIRE(run_b.has_value());
+
+    // nullopt scope: unfiltered, both runs.
+    auto all = api->list_workflow_executions(WorkflowExecutionListQuery{}, std::nullopt);
+    REQUIRE(all.has_value());
+    CHECK(run_ids(*all) == std::set<std::string>{*run_a, *run_b});
+
+    // An engaged scope is flattened for the store and confines the page.
+    auto mine = api->list_workflow_executions(
+        WorkflowExecutionListQuery{},
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-1"}});
+    REQUIRE(mine.has_value());
+    CHECK(run_ids(*mine) == std::set<std::string>{*run_a});
+
+    // Engaged-empty is deny-all: never widened to unfiltered.
+    auto none = api->list_workflow_executions(WorkflowExecutionListQuery{},
+                                              yuzu::server::authz::deny_all());
+    REQUIRE(none.has_value());
+    CHECK(none->rows.empty());
+
+    // The query is forwarded unmodified: a page size of one leaves a cursor behind it.
+    WorkflowExecutionListQuery one;
+    one.limit = 1;
+    auto first = api->list_workflow_executions(one, std::nullopt);
+    REQUIRE(first.has_value());
+    CHECK(first->rows.size() == 1);
+    CHECK(first->next.has_value());
+}
+
 // Mirrors test_workflow_engine.cpp's degrade case: a reachable database whose
 // schema migration FAILS leaves the engine `!is_open()`. `LocalWorkflowApi`'s
-// three methods are thin wraps of the checked engine calls — this proves the
+// four methods are thin wraps of the checked engine calls — this proves the
 // seam forwards that AUTHORITATIVE degrade unmodified (not swallowed into a
 // false empty/not-found result), which is what the REST v1/MCP degraded-path
 // tests all depend on.
@@ -139,4 +203,8 @@ TEST_CASE("WorkflowApi: an unopened engine answers the AUTHORITATIVE degrade on 
     auto exec_result = api->get_workflow_execution("any-id");
     REQUIRE_FALSE(exec_result.has_value());
     CHECK(exec_result.error().find("workflow engine not available") != std::string::npos);
+
+    auto page_result = api->list_workflow_executions(WorkflowExecutionListQuery{}, std::nullopt);
+    REQUIRE_FALSE(page_result.has_value());
+    CHECK(page_result.error().find("workflow engine not available") != std::string::npos);
 }

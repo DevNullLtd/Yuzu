@@ -603,7 +603,7 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
     // `q.offset > 0`, so a negative offset is already inert at this seam.
     const int64_t fetch_limit = q.random_sample ? static_cast<int64_t>(kAuditSampleScanCap)
                                                 : static_cast<int64_t>(std::max(q.limit, 0));
-    sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::bigint";
+    sql += " ORDER BY timestamp DESC, id DESC LIMIT $" + std::to_string(idx++) + "::bigint";
     binds.push_back(std::to_string(fetch_limit));
     if (q.offset > 0 && !q.random_sample) {
         sql += " OFFSET $" + std::to_string(idx++) + "::bigint";

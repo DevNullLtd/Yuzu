@@ -313,6 +313,12 @@ enum class ConsumeFailure {
     return "unknown";
 }
 
+/// Longest reviewer comment `approve`/`reject` accept, in bytes. The guard lives in
+/// set_review_status, where REST and MCP meet. The dialogs cap input at 1000 UTF-16
+/// units, at most 4000 UTF-8 bytes, so the two limits never disagree.
+inline constexpr std::size_t kMaxReviewCommentBytes = 4000;
+inline constexpr const char* kReviewCommentTooLong = "comment too long (max 4000 bytes)";
+
 inline constexpr const char* kNotConsumableMessage =
     "approval not consumable (already used, not approved, or absent)";
 

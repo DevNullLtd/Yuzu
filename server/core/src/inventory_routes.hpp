@@ -122,8 +122,9 @@ struct InventoryDevicesResult {
 };
 
 // ── PURE renderers (implemented in inventory_ui.cpp) ─────────────────────────────
-// Each returns a self-contained fragment: the inventory sub-nav + the active tab's
-// content. A `std::nullopt` data argument is a STORE DEGRADE → an honest
+// Each returns an HTML fragment: the whole Software page (component CSS, title block and
+// content) or the part an htmx request swaps into it (results, rows, an expansion). A
+// `std::nullopt` data argument is a STORE DEGRADE → an honest
 // "data unavailable" banner, NEVER an empty table (authoritative reads, ADR-0016 §7:
 // an empty table reads as "installed nowhere" — the fail-open the store forbids).
 

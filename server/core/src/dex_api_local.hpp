@@ -42,15 +42,20 @@ using FleetFn = std::function<DexFleet()>;
 ///
 /// `fleet_fn` may be empty — the impl then uses `DexFleet{}` (the honest
 /// "no data" denominator), exactly as the handlers' `fleet_fn_ ? fleet_fn_()
-/// : DexFleet{}` guard does today.
+/// : DexFleet{}` guard does today; `apps()` treats an empty `fleet_fn` as an
+/// unknown population (nullopt).
 ///
 /// LIFETIME CONTRACT (load-bearing, mirrors verify_api_local.hpp): `store` is
 /// borrowed, NOT owned — it MUST outlive every call to the returned API.
 /// `ServerImpl` guarantees this by joining the web thread (`web_server_->
 /// stop()`) before destroying `guaranteed_state_store_`, so no handler can
-/// reach the API after it dies. `fleet_fn`'s captures are subject to the same
-/// ordering.
+/// reach the API after it dies. `fleet_fn`'s and `policy_fn`'s captures are
+/// subject to the same ordering.
+///
+/// `policy_fn` may be empty - the impl then scores under
+/// `dex_default_score_policy()`; see `DexScorePolicyFn` for the contract.
 [[nodiscard]] std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store,
-                                                         FleetFn fleet_fn);
+                                                         FleetFn fleet_fn,
+                                                         DexScorePolicyFn policy_fn = {});
 
 } // namespace yuzu::server

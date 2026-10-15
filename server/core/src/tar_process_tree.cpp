@@ -1332,7 +1332,7 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     h += "</tbody></table>";
     if (rendered == 0)
         return "<div class=\"devnet-empty\">No capture sources reported by this device.</div>";
-    h += "<div class=\"apply-bar\" id=\"capApplyBar\" hidden><span class=\"apply-icon\">&#9888;</span>"
+    h += "<div class=\"apply-bar note warn\" id=\"capApplyBar\" hidden><span class=\"apply-icon\">&#9888;</span>"
          "<span id=\"capApplyMsg\">0 pending changes</span><span class=\"apply-spacer\"></span>"
          "<button class=\"btn-secondary\" onclick=\"discardCapChanges()\">Discard</button>"
          "<button class=\"apply-push\" onclick=\"pushCapChanges()\">Push changes &#8594;</button></div>";

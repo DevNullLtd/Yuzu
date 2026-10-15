@@ -86,7 +86,7 @@ TEST_CASE("ScheduleEngine: create with bad frequency_type fails", "[schedule_eng
 // occurrence — redacting a persisted grant_secret would silently break that
 // re-dispatch rather than merely protecting a history row, so creation is
 // refused outright instead. See sensitive_instruction_params.hpp.
-TEST_CASE("ScheduleEngine: create is refused when parameters carry a one-time credential",
+TEST_CASE("ScheduleEngine: create is refused when parameters carry a classified secret",
          "[schedule_engine][pg]") {
     ScheduleEnginePg fx;
 
@@ -95,7 +95,15 @@ TEST_CASE("ScheduleEngine: create is refused when parameters carry a one-time cr
     sched.parameter_values = R"({"grant_secret":"deadbeef","path":"/tmp/x"})";
     auto result = fx->create_schedule(sched);
     REQUIRE_FALSE(result.has_value());
-    CHECK(result.error().find("one-time credential") != std::string::npos);
+    CHECK(result.error().find("secret value") != std::string::npos);
+
+    // client_secret is the shipped Entra directory-sync definition's long-lived credential.
+    auto entra = make_schedule("def-001", "interval", "Entra Sync Schedule");
+    entra.interval_minutes = 60;
+    entra.parameter_values = R"({"tenant_id":"t","client_id":"c","client_secret":"s3cret"})";
+    auto refused = fx->create_schedule(entra);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("secret value") != std::string::npos);
 }
 
 TEST_CASE("ScheduleEngine: create is refused when parameters carry a bare grant_id",

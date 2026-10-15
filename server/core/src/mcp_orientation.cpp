@@ -97,7 +97,8 @@ constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_c
                                          "get_dex_group_app_perf",   "get_dex_tag_app_perf",
                                          "compare_app_perf_versions",
                                          "get_dex_device_app_perf"};
-constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices"};
+constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices",
+                                        "list_discovered_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
                                            "get_bundle_result"};
 constexpr std::string_view kRemediation[] = {"quarantine_device"};
@@ -177,14 +178,15 @@ constexpr std::string_view kGuardian[] = {
 // stages' read twins. Own family, distinct from Fleet & agents / Live
 // execution: these are owner-scoped readiness/preview reads over the
 // operator's OWN saved runs, not fleet-wide agent data or dispatch.
-constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_deployment_preview"};
+constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_deployment_preview",
+                                                 "list_deployments", "get_deployment"};
 // #4030: WorkflowEngine's multi-step orchestration — its own family, distinct
 // from both "Instructions & schedules" (single InstructionDefinitions) and
 // "Executions & audit" (ExecutionTracker's single-instruction fan-out): a
 // Workflow composes multiple steps, and its execution record is a different
 // data model from an Execution (see get_workflow_execution's tool doc).
 constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
-                                           "get_workflow_execution"};
+                                           "list_workflow_executions", "get_workflow_execution"};
 // #4027 — TAR (Timeline / Activity Recorder) had zero MCP presence before this
 // read-twin batch; its own family rather than folding into an unrelated one.
 constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
@@ -308,7 +310,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"DEX signals", "digital-employee-experience reliability signals and their scope/detail",
      kDexSignals},
     {"DEX performance", "fleet, cohort, device, and per-app performance over time", kDexPerf},
-    {"Network quality", "fleet and per-device network-quality posture", kNetwork},
+    {"Network quality", "fleet and per-device network-quality posture, and hosts found by "
+                      "discovery scans",
+     kNetwork},
     {"Live execution", "dispatch plugin actions or bundles to endpoints and collect results",
      kExecution},
     {"Device remediation", "quarantine a device (destructive, approval-gated)", kRemediation},
@@ -340,8 +344,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Guardian", "live Guardian rule/event state and per-device guard status (not the schema "
                 "catalog -- see Policy & compliance for that)",
      kGuardian},
-    {"Pre-flight & deploy", "owner-scoped saved pre-flight runs and the deploy-config go/warn "
-                            "preview for one of them",
+    {"Pre-flight & deploy", "owner-scoped saved pre-flight runs, the deploy-config go/warn "
+                            "preview for one of them, and the caller's deployments and their "
+                            "device grids",
      kPreflightDeploy},
     {"Workflows", "multi-step workflow definitions and their per-step execution records",
      kWorkflows},

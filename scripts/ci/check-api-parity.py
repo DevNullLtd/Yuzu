@@ -198,7 +198,109 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get_software_versions (both already "twinned", count unchanged). The raw route's
 # format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
 # same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
-BASELINE_UNTWINNED = 199
+# DEX Alerts tab (posture PR-E): GET /fragments/dex/alerts is "composed-of" the legacy
+# settings fragment (+1, 199 -> 200); the fragment's three POSTs stay planned:#2146.
+#
+# System "General and appearance" page: two UI-only fragments, GET
+# /fragments/settings/general-runtime (composed-of:get.api-config) and GET
+# /fragments/settings/analytics-events (composed-of:get.api-analytics-recent). Each composes an
+# existing JSON route that is itself `planned:#2146` with no REST v1 or MCP twin (the legacy
+# runtime-config and analytics routes), so there is no twin to point at and each counts as
+# untwinned. Reviewed: a fragment is UI, not a machine surface (ADR-1005 Decision 4), and the
+# routes they compose are the ledgered gap.
+#
+# Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
+# is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
+# which counts as untwinned by design, so the count rises 199 -> 200.
+#
+# Device containment fragments (es-1): get.fragments-hardware-quarantine is "twinned" to GET
+# /api/v1/quarantine (no MCP list tool exists; the gap is recorded on the row), and
+# get.fragments-hardware-ci-containment is "composed-of:get.fragments-hardware-quarantine"
+# (a single-device read of the same active-record set; REST has no per-device GET). One
+# composed-of row, so 200 -> 201, measured by the checker, not hand-picked.
+#
+# Stored data panel (es-1): get.fragments-hardware-ci-stored-data is an "exception:" row (the
+# erase it fronts is DELETE /api/v1/sle/agents/{id}, which has no ledger row to compose), so
+# 201 -> 202, measured by the checker, not hand-picked.
+#
+# The DEX Alerts and policy-fragments changes above landed on 199 and merged together to 201
+# (199 + 1 + 1). The two containment rows above landed on that, so merged with them the count
+# is 203 (201 + 1 composed-of + 1 exception), the value the checker reports on the merged tree.
+#
+# Hardware record properties panel (device data, merged from dev): GET /fragments/hardware/ci/properties
+# is "planned:#2146" (its data routes, /api/agents/{id}/properties*, are dashboard-only with no REST v1
+# or MCP twin), so it deepens an untwinned surface by one row. Merged with the containment rows above
+# the count is 204 (203 + 1), the value the checker reports on the merged tree.
+#
+# Home page (HM-1, measured on its own base at 200 = 199 + 1): +1 `composed-of:` row,
+# GET /fragments/home/summary (readout, needs attention) over the existing hardware roster,
+# approvals count, executions and fleet-compliance reads; a UI fragment. NOT a rule that such a
+# fragment owes no twin: ADR-1005 Decision 4 says a dashboard fragment is not an API twin. The
+# four Dashboard rows below are an owner-accepted TEMPORARY exception (review of PR #5859,
+# 2026-10-15), so the baseline stays raised until the estate partition, activity and health
+# reads have REST v1 and MCP twins; the next reader should not take it as precedent.
+# Home panels (HM-2, measured on its own base at 204 = 201 + 3): +3. The three Home fragments
+# (/fragments/home/policies, /fragments/home/activity, /fragments/home/health) are UI-only
+# compositions over existing twinned or planned reads, so each is a composed-of row that
+# counts untwinned.
+# Both Home changes landed on 201 on their own base. Merged with the dev changes above (204) the
+# four Home/Dashboard rows bring the count to 208 (204 + 4), the value the checker reports on the
+# merged tree.
+# Design delta 2026-10-14: the four rows above moved with their panels to the Dashboard and
+# are now /fragments/dashboard/{summary,policies,activity,health} (same composed-of status,
+# same count; a rename, not a new surface), so the count stays 208.
+#
+# Estate deployment read twins: GET /fragments/auto/deployments and .../detail are new routes
+# ledgered "twinned" (GET /api/v1/deployments[/{id}] + MCP list_deployments / get_deployment,
+# count unchanged). The new GET /fragments/auto/nvd status card is ledgered "exception"
+# (grandfathered NVD surface, no get_nvd_status MCP): +1. Merged on top of the 201 above, the
+# checker reported 202 on the merged tree.
+#
+# Network discovery read twin (Estate E-2): the unbounded legacy GET /api/discovery/results
+# row flips "planned:#2146" -> "twinned" (GET /api/v1/network/discovered-devices + MCP
+# list_discovered_devices); the new GET /fragments/network/discovered row is born "twinned"
+# (count unchanged): -1 on its own. Combined with the +1 above the checker reported 201 on the
+# merged tree, not a hand-added delta.
+#
+# Landing on dev's 208 (device containment, hardware properties and the Home/Dashboard rows, above),
+# the two Estate changes net 0 on their own (+1 NVD status card exception, -1 discovery row
+# twinned), so the count after this merge is the value the checker reports, set from its output.
+#
+# The System General page (this branch) adds the two composed-of fragments described above
+# (general-runtime, analytics-events): +2. Landing on dev's 207 (after the audit filter parity
+# flip below), the count is 209, the value the checker reports on the merged tree.
+#
+# Audit filter parity: get.api-audit flips "planned:#2146" -> "twinned" (GET /api/v1/audit +
+# MCP query_audit_log, now at filter/paging parity), the checker reports 208 - 1 = 207 on the merged tree
+# (dev's 208 above, less this flip).
+#
+# Merged onto the Estate changes: the count is the value the checker reports on the merged
+# tree, set from its output.
+#
+# Access Users page (#5880): re-surfaces the untwinned Settings users list as two read-only
+# fragments, GET /fragments/access/users/list (planned:#2146) and .../detail (composed-of the
+# list), +2. A GET /api/v1/users twin is not built here; the Settings rows and these two
+# are retired together when that twin lands.
+#
+# Tokens and principals page (#5880): re-surfaces the untwinned Settings token and principal
+# lists as three read-only fragments, GET /fragments/access/tokens/list, .../principals/list
+# and .../principals/detail (each planned:#2146), +3. The token list is not a twin of the
+# self-only GET /api/v1/tokens (an administrator on a cookie session sees every owner). The two
+# principal fragments share GET /api/v1/engine-principals' EnginePrincipal:Read gate but add the
+# page's roles/credentials composition and an audit-gated revocation detail, so they are not
+# ledgered as twins here. Merged with the 207 above, the two Access pages make 212 (207 + 2 + 3),
+# the value the checker reports on the merged tree, not hand-picked. The ADR-1005 exception
+# recorded for the four Dashboard fragments does not cover these rows; whether to extend it is
+# the owner's decision on #5880.
+#
+# Access pages merged onto the Estate changes: the count is the value the checker reports on the
+# merged tree, set from its output.
+#
+# System General and Data pages (#5873): re-surfaces the untwinned General runtime and analytics
+# events settings as GET /fragments/settings/general-runtime and /fragments/settings/analytics-events,
+# +2. Merged with the Access pages (212 above), the count is 214, the value the checker reports on the
+# merged tree, not hand-picked. Whether the ADR-1005 exception extends to these rows is the owner's decision on #5873.
+BASELINE_UNTWINNED = 214
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

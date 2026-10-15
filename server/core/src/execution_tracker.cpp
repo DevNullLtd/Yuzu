@@ -2217,20 +2217,28 @@ ExecutionTracker::try_get_definition_statistics(const ExecutionStatsQuery& q) co
 }
 
 FleetExecutionSummary ExecutionTracker::get_fleet_summary(std::optional<int64_t> since) const {
-    return try_get_fleet_summary(since).value_or(FleetExecutionSummary{});
+    return get_fleet_summary_checked(since).value_or(FleetExecutionSummary{});
 }
 
-std::optional<FleetExecutionSummary> ExecutionTracker::try_get_fleet_summary(std::optional<int64_t> since) const {
+std::optional<FleetExecutionSummary>
+ExecutionTracker::try_get_fleet_summary(std::optional<int64_t> since) const {
+    auto r = get_fleet_summary_checked(since);
+    if (!r) {
+        spdlog::warn("ExecutionTracker::try_get_fleet_summary degraded: {}", r.error());
+        return std::nullopt;
+    }
+    return std::move(*r);
+}
+
+std::expected<FleetExecutionSummary, std::string>
+ExecutionTracker::get_fleet_summary_checked(std::optional<int64_t> since,
+                                            bool include_active_agents) const {
     FleetExecutionSummary s;
-    if (!open_) {
-        spdlog::warn("ExecutionTracker::try_get_fleet_summary degraded: tracker not open");
-        return std::nullopt;
-    }
+    if (!open_)
+        return std::unexpected("execution store not open");
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease) {
-        spdlog::warn("ExecutionTracker::try_get_fleet_summary degraded: pool exhausted");
-        return std::nullopt;
-    }
+    if (!lease)
+        return std::unexpected("pool exhausted");
 
     // Total executions and success rate
     {
@@ -2250,10 +2258,8 @@ std::optional<FleetExecutionSummary> ExecutionTracker::try_get_fleet_summary(std
         pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
         // Any failed sub-query is a degraded read: a half-populated summary would present
         // zeros for the failed parts as if they were measurements.
-        if (res.status() != PGRES_TUPLES_OK) {
-            spdlog::warn("ExecutionTracker::try_get_fleet_summary degraded: query failed");
-            return std::nullopt;
-        }
+        if (res.status() != PGRES_TUPLES_OK)
+            return std::unexpected("totals query failed");
         if (PQntuples(res.get()) > 0) {
             s.total_executions = to_i64(col(res.get(), 0, 0));
             s.overall_success_rate = to_d(col(res.get(), 0, 1));
@@ -2268,16 +2274,14 @@ std::optional<FleetExecutionSummary> ExecutionTracker::try_get_fleet_summary(std
         pg::PgResult res = pg::exec_params(
             lease.get(), "SELECT COUNT(*) FROM execution_tracker.executions WHERE dispatched_at >= $1",
             std::vector<std::string>{std::to_string(today_start)});
-        if (res.status() != PGRES_TUPLES_OK) {
-            spdlog::warn("ExecutionTracker::try_get_fleet_summary degraded: query failed");
-            return std::nullopt;
-        }
+        if (res.status() != PGRES_TUPLES_OK)
+            return std::unexpected("today query failed");
         if (PQntuples(res.get()) > 0)
             s.executions_today = to_i64(col(res.get(), 0, 0));
     }
 
-    // Active agents
-    {
+    // Active agents (the Operate stats strip does not show it and skips the scan)
+    if (include_active_agents) {
         std::string sql = "SELECT COUNT(DISTINCT agent_id) FROM execution_tracker.agent_exec_status";
         std::vector<std::string> params;
         if (since) {
@@ -2285,10 +2289,8 @@ std::optional<FleetExecutionSummary> ExecutionTracker::try_get_fleet_summary(std
             params.push_back(std::to_string(*since));
         }
         pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-        if (res.status() != PGRES_TUPLES_OK) {
-            spdlog::warn("ExecutionTracker::try_get_fleet_summary degraded: query failed");
-            return std::nullopt;
-        }
+        if (res.status() != PGRES_TUPLES_OK)
+            return std::unexpected("active agents query failed");
         if (PQntuples(res.get()) > 0)
             s.active_agents = to_i64(col(res.get(), 0, 0));
     }

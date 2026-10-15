@@ -683,16 +683,26 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // governance PR review (2026-08-31): mark_cancelled now reports
-        // whether the update actually happened — do not tell the
-        // operator "cancelled" (HTTP 200 + a "success" audit row) when
-        // it didn't.
-        if (!deps.execution_tracker->mark_cancelled(id, user)) {
+        // mark_cancelled_checked keeps "nothing to cancel" (already terminal, or the row
+        // vanished between the read above and the guarded UPDATE) apart from a store failure:
+        // the first is a state-guard refusal (409, audited `denied`), only the second is a 503.
+        using Outcome = ExecutionTracker::MarkCancelledOutcome;
+        switch (deps.execution_tracker->mark_cancelled_checked(id, user)) {
+        case Outcome::kFailed:
             (void)deps.audit_fn(req, "execution.cancel", "failure", "execution", id, "");
             res.status = 503;
             res.set_content(detail::a4_error(res, "cancel failed - execution store degraded"),
                             "application/json");
             return;
+        case Outcome::kNoOp:
+            (void)deps.audit_fn(req, "execution.cancel", "denied", "execution", id,
+                                "already finished (no state change)");
+            res.status = 409;
+            res.set_content(detail::a4_error(res, "execution already finished"),
+                            "application/json");
+            return;
+        case Outcome::kCancelled:
+            break;
         }
         (void)deps.audit_fn(req, "execution.cancel", "success", "execution", id, "");
         deps.emit_event_fn("execution.completed", req, {{"status", "cancelled"}},
