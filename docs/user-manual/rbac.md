@@ -287,8 +287,8 @@ Recommended order for a fresh install:
 
 ## The authorization topology floor (#2376)
 
-Ten reads are treated as **authorization topology** rather than ordinary
-operational data. Wherever the legacy RBAC-off fallback is the branch in
+Eleven reads are treated as **authorization topology or audit evidence**
+rather than ordinary operational data. Wherever the legacy RBAC-off fallback is the branch in
 effect, they require the `admin` session role — the generic “any Read is
 allowed” rule does not reach them. (With RBAC **enabled** they are ordinary
 permission checks, so a seeded `Reviewer` holding `AccessReview:Read` is
@@ -306,14 +306,18 @@ admitted; the floor never overrides a live RBAC grant.)
 | `ServerConfig:Read` (#4028) | Server runtime-configuration read-twins — `GET /api/v1/settings/server-config`, `/settings/gateway`, `/settings/mcp` and `/settings/data-retention` |
 | `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
 | `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2) |
+| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
-that includes these ten. On a default install (RBAC ships disabled) that
+that includes these eleven. On a default install (RBAC ships disabled) that
 handed a plain `user` session read access to the authorization topology
 itself: who holds what role, and the complete access-review grant
 population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
-access. The floor closes that gap by denying these ten reads to a
+access — and, until #5771, the full audit trail (who did what, to which
+target, with what outcome, plus the free-text detail and, on the legacy
+`GET /api/audit` route, each actor's role and source IP). The floor closes
+that gap by denying these eleven reads to a
 non-admin whenever the legacy fallback is the branch in effect — never by
 changing behavior under a live RBAC grant.
 
@@ -324,7 +328,7 @@ particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
 + `AccessReview:Attest`) continues to reach the access-review export exactly
 as before — the floor never overrides that grant.
 
-**If you are relying on a non-admin reaching one of these ten reads on an
+**If you are relying on a non-admin reaching one of these eleven reads on an
 RBAC-disabled install,** that access is now denied. The supported remedy is
 to enable RBAC and grant the appropriate role rather than to expect a
 non-admin session to reach authorization topology while RBAC is off:
@@ -347,6 +351,11 @@ non-admin session to reach authorization topology while RBAC is off:
   (the authority ceiling); use an Administrator-minted non-service token.
 - For the OIDC SSO config status read: enable RBAC and grant
   `OidcConfig:Read` — `Administrator`-only for the same reason.
+- For the audit trail (#5771): enable RBAC and assign a role that holds
+  `AuditLog:Read` — the built-in `Operator`, `PlatformEngineer`,
+  `ITServiceOwner` and `Viewer` roles already hold it, or grant it to a
+  custom role. The `Reviewer` role does not hold it. Under RBAC, `AuditLog:Read`
+  is not confined to a management group: a holder reads every row.
 
 The floor is deliberately **not configurable** — there is no setting that
 widens it back open. It is keyed on `(securable, operation)`, not on route
@@ -364,7 +373,10 @@ counted in `yuzu_auth_topology_floor_denied_total{permission}`, separate
 > auditing permission gate. An ordinary non-admin call therefore increments this counter and writes
 > an `auth.permission_required` `denied` row for a permission the caller never asked for. Until
 > #2829 lands, do **not** alert on this counter alone as evidence of someone probing the
-> authorization topology — correlate with the route in the audit row first.
+> authorization topology — correlate with the route in the audit row first. The Access
+> principals fragments (`/fragments/access/principals/*`) are a further source: they probe
+> `EnginePrincipal:Read` on every page view, a floored refusal moves this counter, and for a
+> browser session no audit row accompanies the increment.
 from an ordinary legacy-fallback denial, so a spike in floored denials is
 visible without grepping audit-log text.
 
@@ -411,6 +423,26 @@ purely that an auditor reading the export or a closed campaign draws the
 wrong conclusion about what state RBAC was in — not that access control
 itself misbehaves.
 
+## Viewing accounts from the dashboard
+
+The **Users** page (`/access/users`, in the **Access** section of the sidebar) lists the
+accounts that can sign in to this server and shows one account's details beside the list.
+It is read-only: it shows each account's name, where it comes from (local, OIDC, SAML, AD or
+SCIM) and its account role. Adding, removing and changing accounts is done in **Settings**.
+
+- **Who can see it.** Any signed-in user can open the page. The two panels need the
+  Administrator account role; for anyone else each panel says it is not available to their
+  account. A refused browser session writes no audit row (the panels load automatically, so
+  a row per page view would fill the log with denials); a refused API or MCP token that
+  reaches the panel URL is recorded as an administrator-required denial.
+- **Account role versus RBAC role.** The account role (`admin` or `user`) is the legacy role:
+  it decides who can open Settings and what applies while RBAC enforcement is off. RBAC roles
+  apply once enforcement is on, and are managed through the RBAC API.
+- **Unreadable store.** If the account store does not answer, the Users panel shows a red
+  message with a Retry button. It never shows an empty list in that case, so a degraded store
+  cannot be mistaken for "nobody is here".
+- **Your own account.** Your row is marked "Current user" and has no Manage link.
+
 ## Concepts
 
 | Concept | Description |
@@ -452,7 +484,7 @@ Seven roles are created automatically and cannot be deleted:
 | `UserManagement` | User accounts and role assignments |
 | `Security` | Security settings (TLS, enrollment, quarantine, CA and KEK reads, and privilege-posture reads such as the local_security_policy `sudoers` content) |
 | `ApiToken` | API token lifecycle |
-| `AuditLog` | Audit event records |
+| `AuditLog` | Audit event records. `AuditLog:Read` is in the topology floor (#5771): admin-only while RBAC is off. |
 | `Policy` | Guaranteed State policy fragments and composed policies |
 | `DeviceToken` | Agent device-token issuance and revocation |
 | `SoftwareDeployment` | Software deployment campaigns |
@@ -490,7 +522,7 @@ The 8 routes/tools in this family authorize purely on `owner_principal == sessio
 | `GET /api/v1/result-sets` | `list_result_sets` | `GET /fragments/result-sets/sidebar` |
 | `POST /api/v1/result-sets` | `create_result_set` | `POST /fragments/result-sets/create` |
 | `GET /api/v1/result-sets/{id}` | `get_result_set` | `GET /fragments/result-sets/{id}/detail` |
-| `GET /api/v1/result-sets/{id}/members` | `get_result_set_members` | *(no fragment equivalent — the detail fragment shows only a device COUNT, not the member list)* |
+| `GET /api/v1/result-sets/{id}/members` | `get_result_set_members` | `GET /fragments/result-sets/{id}/members` (same `Infrastructure:Read` scope, applied before the page limit) |
 | `GET /api/v1/result-sets/{id}/lineage` | `get_result_set_lineage` | *(shown as the breadcrumb on the detail fragment)* |
 | `POST /api/v1/result-sets/{id}/pin` | `pin_result_set` | `POST /fragments/result-sets/{id}/pin` |
 | `POST /api/v1/result-sets/{id}/unpin` | `unpin_result_set` | `POST /fragments/result-sets/{id}/unpin` |
@@ -819,6 +851,10 @@ curl -s -b cookies.txt -X POST \
     "role_name": "Operator"
   }'
 ```
+
+## Tokens and principals page
+
+The read-only `/access/tokens` page shows API tokens and engine principals. Its token list uses `ApiToken:Read` and is scoped to the caller's own tokens unless the caller is an administrator on a cookie session; an administrator's API, MCP or service-scoped token gets its own tokens only. The principal list and detail use `EnginePrincipal:Read`, the same permission as `GET /api/v1/engine-principals` (administrators only while RBAC is disabled; an ordinary grant once it is enabled): with RBAC on, an account administrator without that grant is refused and a non-administrator who holds it is admitted. Engine and MCP-tier credentials are refused whatever they hold. A refused browser session writes no audit row, because the panels load automatically. A revoked principal's free-text revocation detail comes from the audit trail and is shown only to callers who also hold `AuditLog:Read`; others see it marked withheld. The no-administrator check above the list also needs `AuditLog:Read` and is skipped, with a note, without it. Role assignment for engine principals is shown here; assigning is not.
 
 ## Examples
 

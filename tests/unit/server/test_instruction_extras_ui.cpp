@@ -121,8 +121,17 @@ TEST_CASE("instruction extras ui: the controller is CSP-clean and gates every wr
                              "setInterval(\""})
         CHECK_FALSE(has(js, sink));
     // Every mutating call goes through the shared request helper (bounded, step-up aware),
-    // never a bare fetch.
-    CHECK_FALSE(has(js, "fetch("));
+    // never a bare fetch. The one exception in the file is the Result sets controller's read of
+    // the producers fragment (HTML, which the JSON helper cannot carry); it is allowed by its
+    // exact text only, and no other fetch call may exist.
+    {
+        std::string without_producers_read = js;
+        const std::string producers_read = "window.fetch('/fragments/result-sets/producers', init)";
+        const auto at = without_producers_read.find(producers_read);
+        REQUIRE(at != std::string::npos);
+        without_producers_read.erase(at, producers_read.size());
+        CHECK_FALSE(has(without_producers_read, "fetch("));
+    }
     // Destructive actions confirm first.
     CHECK(has(js, "title: 'Delete instruction set'"));
     CHECK(has(js, "title: 'Delete response template'"));

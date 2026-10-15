@@ -171,7 +171,7 @@ cmd_fleet_snapshot() {
   info "Dispatching crossplatform.tar.fleet_snapshot..."
   local resp
   resp=$(curl -fsS -b "$VIZ_UAT_DIR/cookies.txt" \
-      -H "Content-Type: application/json" \
+      -H "Content-Type: application/json" -H "Origin: http://localhost:8080" \
       -X POST "http://localhost:8080/api/instructions/crossplatform.tar.fleet_snapshot/execute" \
       -d "{\"agent_ids\":$agent_ids_json}" || true)
   local cmd_id

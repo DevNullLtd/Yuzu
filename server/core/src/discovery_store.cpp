@@ -11,6 +11,7 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -252,6 +253,76 @@ DiscoveryStore::list_devices(const std::string& subnet_filter) {
     for (int i = 0; i < rows; ++i)
         out.push_back(read_device(res.get(), i));
     return out;
+}
+
+std::expected<std::vector<DiscoveredDevice>, std::string>
+DiscoveryStore::list_devices_checked(const std::string& subnet_filter, int limit) {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("DiscoveryStore: list_devices_checked degraded — store not open");
+        return std::unexpected("database not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("DiscoveryStore: list_devices_checked degraded — pool acquire timed out "
+                         "({})",
+                         pool_.last_error());
+        return std::unexpected("database unavailable — try again");
+    }
+    // The filter is bound as a parameter either way ('' matches every subnet
+    // through the OR); `last_seen` ties break on `id` so paging is stable.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        (std::string("SELECT ") + kDeviceCols +
+         " FROM discovery_store.discovered_devices WHERE ($1::text = '' OR subnet = $1::text) "
+         "ORDER BY last_seen DESC, id DESC LIMIT $2::bigint")
+            .c_str(),
+        std::vector<std::string>{sanitize_pg_text(subnet_filter),
+                                 std::to_string(std::max(limit, 1))});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("DiscoveryStore: list_devices_checked degraded — query failed: {}",
+                         PQerrorMessage(lease.get()));
+        return std::unexpected("discovery read degraded");
+    }
+    std::vector<DiscoveredDevice> out;
+    const int rows = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.push_back(read_device(res.get(), i));
+    return out;
+}
+
+std::expected<DiscoverySummary, std::string>
+DiscoveryStore::summarize(const std::string& subnet_filter) {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("DiscoveryStore: summarize degraded — store not open");
+        return std::unexpected("database not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("DiscoveryStore: summarize degraded — pool acquire timed out ({})",
+                         pool_.last_error());
+        return std::unexpected("database unavailable — try again");
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT COUNT(*), COUNT(DISTINCT NULLIF(subnet, '')) "
+        "FROM discovery_store.discovered_devices WHERE ($1::text = '' OR subnet = $1::text)",
+        std::vector<std::string>{sanitize_pg_text(subnet_filter)});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("DiscoveryStore: summarize degraded — query failed: {}",
+                         PQerrorMessage(lease.get()));
+        return std::unexpected("discovery read degraded");
+    }
+    return DiscoverySummary{to_i64(PQgetvalue(res.get(), 0, 0)),
+                            to_i64(PQgetvalue(res.get(), 0, 1))};
 }
 
 std::expected<std::optional<DiscoveredDevice>, std::string>

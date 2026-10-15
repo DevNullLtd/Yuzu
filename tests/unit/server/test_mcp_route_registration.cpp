@@ -232,3 +232,40 @@ TEST_CASE("mcp route registration: wiring -- server.cpp still calls "
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("mcp_server_->register_routes(") != std::string::npos);
 }
+
+// The handler tests in test_mcp_server.cpp call these two setters themselves, so
+// deleting either production line would leave every one of them green while the real
+// server answers "unavailable" for list_deployments / get_deployment (deployment run
+// store) or list_discovered_devices (discovery reader). Same source-text tripwire as
+// above; both setters must also precede register_routes, which freezes the handlers.
+// A call that has been commented out must not count, so only a call that begins its
+// line (leading whitespace only) is a live one.
+namespace {
+std::size_t find_live_call(const std::string& src, const std::string& call) {
+    for (auto at = src.find(call); at != std::string::npos; at = src.find(call, at + 1)) {
+        const auto bol = src.rfind('\n', at);
+        const auto from = bol == std::string::npos ? 0 : bol + 1;
+        if (src.find_first_not_of(" \t", from) == at)
+            return at;
+    }
+    return std::string::npos;
+}
+} // namespace
+
+TEST_CASE("mcp route registration: wiring -- server.cpp wires the deployment store and "
+          "the discovery reader before register_routes",
+          "[server][routes][mcp]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const auto reg = find_live_call(src, "mcp_server_->register_routes(");
+    const auto dep =
+        find_live_call(src, "mcp_server_->set_deployment_run_store(deployment_run_store_.get())");
+    const auto disc =
+        find_live_call(src, "mcp_server_->set_discovered_devices_reader(discovered_reader)");
+    REQUIRE(reg != std::string::npos);
+    REQUIRE(dep != std::string::npos);
+    REQUIRE(disc != std::string::npos);
+    CHECK(dep < reg);
+    CHECK(disc < reg);
+}

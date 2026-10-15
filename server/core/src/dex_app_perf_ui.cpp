@@ -593,9 +593,10 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                         "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>");
         }
         if (v.suppressed) {
-            // Sub-floor named-group slice → count only (works-council floor).
+            // Sub-floor slice → count only (the one floor constant; one device
+            // since the 2026-10-14 ruling, so this is an empty latest day).
             h += "<tr><td>" + ver + tag +
-                 "</td><td colspan=\"4\" class=\"gp-mute\">&mdash; n too small (fewer than " +
+                 "</td><td colspan=\"4\" class=\"gp-mute\">&mdash; n too small (below the floor of " +
                  std::to_string(group_floor) + " devices on its latest day &mdash; stats "
                  "withheld)</td><td>" + std::to_string(v.device_count) + "</td></tr>";
             continue;
@@ -645,9 +646,9 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
     if (is_group || is_model)
         foot += " This is a <b>named cohort of specific devices</b>" +
                 std::string(is_model ? " (device model)" : " (management group)") +
-                ", so any version whose latest day covers fewer than " +
+                ", so any version whose latest day falls below the floor of " +
                 std::to_string(group_floor) +
-                " devices shows its count only (works-council co-determination). Cohort scope reads "
+                " devices shows its count only. Cohort scope reads "
                 "the per-device store (up to <b>31 days</b>); the whole-fleet view covers the full "
                 "<b>180-day</b> aggregate, so a cohort series is shorter for the same app. Per-version "
                 "crash and hang figures are recorded fleet-wide, so they are shown for the whole "
@@ -682,7 +683,7 @@ std::string render_dex_app_perf_version_devices(const std::vector<AppPerfVersion
                     "<thead><tr><th>Device</th><th>Last seen</th><th>CPU</th>"
                     "<th>Working set</th></tr></thead><tbody>";
     for (const auto& d : devices) {
-        h += "<tr><td class=\"dx-mono\">" + esc(d.agent_id) +
+        h += "<tr><td class=\"mono\">" + esc(d.agent_id) +
              "</td><td>" + ymd(d.last_day) + "</td><td>" + fmt_pct(d.cpu_avg) + "</td><td>" +
              fmt_bytes(static_cast<double>(d.ws_avg_bytes)) + "</td></tr>";
     }

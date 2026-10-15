@@ -3163,6 +3163,11 @@ TEST_CASE("RbacStore: every checked read on a store that is not open reports the
     const auto r8 = acc.role_effects_for("Infrastructure", "Read");
     REQUIRE_FALSE(r8.has_value());
     CHECK(std::string_view{r8.error()} == kRbacErrStoreNotOpen);
+    const auto r9 = broken.list_roles_checked();
+    REQUIRE_FALSE(r9.has_value());
+    CHECK(std::string_view{r9.error()} == kRbacErrStoreNotOpen);
+    // list_roles() is this read with the error collapsed: a closed store is an empty vector.
+    CHECK(broken.list_roles().empty());
 }
 
 TEST_CASE("RbacStore: the checked reads without a breaker report the shared "
@@ -3197,6 +3202,9 @@ TEST_CASE("RbacStore: the checked reads without a breaker report the shared "
     const auto r5 = replica_b.list_groups_checked();
     REQUIRE_FALSE(r5.has_value());
     CHECK(std::string_view{r5.error()} == kRbacErrPoolAcquireTimeout);
+    const auto r6 = replica_b.list_roles_checked();
+    REQUIRE_FALSE(r6.has_value());
+    CHECK(std::string_view{r6.error()} == kRbacErrPoolAcquireTimeout);
 }
 
 namespace {
@@ -3356,6 +3364,70 @@ TEST_CASE("RbacStore: the single-row role permission read agrees with the whole-
         // is what authz::ceiling_degrade_reason sees.
         CHECK(got.error().starts_with("query failed: "));
         CHECK(want.error().starts_with("query failed: "));
+    }
+}
+
+// list_roles_checked is the authoritative read behind GET /api/v1/rbac/roles and the existence
+// check of GET /api/v1/rbac/roles/{role}/permissions: a failed read must be an error, never an
+// empty list, and must land on yuzu_server_rbac_read_degrade_total under the right reason. The
+// not-open and starved-pool error texts are pinned in the two cases above; this case adds the
+// query-error branch (a dropped table) and the counter at both failing branches. list_roles() is
+// the same read with the error collapsed, so each failure is asserted through both.
+TEST_CASE("RbacStore: list_roles_checked reports a failed read as an error and records "
+          "read-degrade, list_roles collapses it to empty",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    SECTION("a genuine read lists the seeded roles, in the same order from both accessors") {
+        const auto checked = store.list_roles_checked();
+        REQUIRE(checked.has_value());
+        const auto plain = store.list_roles();
+        REQUIRE(plain.size() == checked->size());
+        CHECK(checked->size() >= 7);
+        for (std::size_t i = 0; i < plain.size(); ++i)
+            CHECK(plain[i].name == (*checked)[i].name);
+        CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+                  .value() == 0.0);
+    }
+
+    SECTION("a failed query is an error carrying the query-failed prefix, and is counted") {
+        exec_on_test_db(rbac_db_fx_.dsn(), "DROP TABLE rbac_store.roles CASCADE");
+        const auto checked = store.list_roles_checked();
+        REQUIRE_FALSE(checked.has_value());
+        CHECK(checked.error().starts_with("query failed: "));
+        CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+                  .value() == 1.0);
+        CHECK(store.list_roles().empty());
+        CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+                  .value() == 2.0);
+    }
+
+    SECTION("a starved pool is an error carrying the shared timeout text, and is counted") {
+        PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(),
+                       .size = 1,
+                       .saturated_fast_fail = std::chrono::milliseconds{50}}};
+        REQUIRE(pool_b.valid());
+        RbacStore replica_b{pool_b};
+        REQUIRE(replica_b.is_open());
+        yuzu::MetricsRegistry metrics_b;
+        replica_b.set_metrics(&metrics_b);
+        auto held = pool_b.acquire();
+        REQUIRE(held);
+
+        const auto checked = replica_b.list_roles_checked();
+        REQUIRE_FALSE(checked.has_value());
+        CHECK(std::string_view{checked.error()} == kRbacErrPoolAcquireTimeout);
+        CHECK(metrics_b
+                  .counter("yuzu_server_rbac_read_degrade_total",
+                           {{"reason", "pool_acquire_timeout"}})
+                  .value() == 1.0);
+        CHECK(replica_b.list_roles().empty());
+        CHECK(metrics_b
+                  .counter("yuzu_server_rbac_read_degrade_total",
+                           {{"reason", "pool_acquire_timeout"}})
+                  .value() == 2.0);
     }
 }
 

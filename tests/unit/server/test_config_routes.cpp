@@ -41,10 +41,13 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <optional>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -77,11 +80,16 @@ struct MockHarness {
     auth::Role session_role{auth::Role::admin};
     bool session_elevated{false};  // a real, active JIT elevation on the session
     std::string session_mcp_tier;  // non-empty models an MCP-tier bearer token
+    /// Token callers are exempt from the same-site gate, so the existing cases keep working;
+    /// the cross-site cases set a cookie source ("local") explicitly.
+    std::string auth_source{"api_token"};
 
     bool perm_allow{true};
     std::vector<std::pair<std::string, std::string>> perm_calls;
 
     bool audit_succeeds{true};
+    /// 0-based index of the one audit call that fails (-1: none); independent of audit_succeeds.
+    int audit_fails_at{-1};
     std::vector<AuditRow> audits;
 
     yuzu::server::test::TestRouteSink sink;
@@ -105,6 +113,7 @@ struct MockHarness {
             s.mcp_tier = session_mcp_tier;
             if (session_elevated)
                 s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
+            s.auth_source = auth_source;
             return s;
         };
         deps.perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -121,8 +130,9 @@ struct MockHarness {
         deps.audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& r, const std::string& tt,
                                const std::string& ti, const std::string& d) -> bool {
+            const int idx = static_cast<int>(audits.size());
             audits.push_back({a, r, tt, ti, d});
-            return audit_succeeds;
+            return audit_succeeds && idx != audit_fails_at;
         };
         config::register_config_routes(sink, deps);
     }
@@ -312,12 +322,16 @@ TEST_CASE("config_routes: PUT an integer key round-trips into cfg AND the store,
     CHECK(b["applied"] == true);
     CHECK(h.cfg.response_retention_days == 120); // in-memory cfg_ applied
 
-    REQUIRE(h.audits.size() == 1);
+    // Audit-first: an `attempted` row before the change, the outcome row after.
+    REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "config.update");
-    CHECK(h.audits[0].result == "success");
-    CHECK(h.audits[0].target_type == "RuntimeConfig");
-    CHECK(h.audits[0].target_id == "response_retention_days");
-    CHECK(h.audits[0].detail == "value=120");
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[0].detail.empty());
+    CHECK(h.audits[1].action == "config.update");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_type == "RuntimeConfig");
+    CHECK(h.audits[1].target_id == "response_retention_days");
+    CHECK(h.audits[1].detail == "value=120");
 
     // The read-back half: GET must reflect the write via the store, not just
     // the in-memory cfg_ side effect checked above.
@@ -327,6 +341,239 @@ TEST_CASE("config_routes: PUT an integer key round-trips into cfg AND the store,
     auto get_b = body(get_res->body);
     REQUIRE(get_b["overrides"].contains("response_retention_days"));
     CHECK(get_b["overrides"]["response_retention_days"]["value"] == "120");
+}
+
+TEST_CASE("config_routes: PUT refuses the change when the attempted audit row cannot be "
+          "written - no audit row, no mutation",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    const int before = h.cfg.response_retention_days;
+
+    h.audit_fails_at = 0; // the attempted row
+    auto res = h.sink.Put("/api/config/response_retention_days", R"({"value":"121"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    const auto refused = body(res->body);
+    CHECK(refused["error"]["message"] == "audit log unavailable; the change was not made");
+    CHECK(refused["error"]["retry_after_ms"] == 5000);
+    CHECK(refused["error"].contains("correlation_id"));
+    CHECK(h.cfg.response_retention_days == before); // live config untouched
+    CHECK(h.audits.size() == 1);                    // no outcome row for a change never made
+
+    auto get_res = h.sink.Get("/api/config");
+    REQUIRE(get_res);
+    CHECK_FALSE(body(get_res->body)["overrides"].contains("response_retention_days")); // store untouched
+}
+
+TEST_CASE("config_routes: PUT flags a lost outcome row with Sec-Audit-Failed and keeps the change",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    auto ok = h.sink.Put("/api/config/response_retention_days", R"({"value":"120"})");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK_FALSE(ok->has_header("Sec-Audit-Failed"));
+
+    h.audits.clear();
+    h.audit_fails_at = 1; // the outcome row
+    auto res = h.sink.Put("/api/config/response_retention_days", R"({"value":"121"})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // the attempted row exists; the change is applied, not rolled back
+    CHECK(body(res->body)["applied"] == true);
+    CHECK(h.cfg.response_retention_days == 121);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    REQUIRE(h.audits.size() == 2); // the lost row is the outcome row, not the attempted one
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].result == "success");
+}
+
+TEST_CASE("config_routes: PUT a rejected value leaves an attempted and a failure row",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    auto res = h.sink.Put("/api/config/log_level", R"({"value":"loud"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].result == "failure");
+    // The failure row carries the operator-written refusal, never the submitted value.
+    CHECK(h.audits[1].detail.find("one of") != std::string::npos);
+    CHECK(h.audits[1].detail.find("loud") == std::string::npos);
+
+    // A key that names no setting is refused before any audit row.
+    h.audits.clear();
+    auto unknown = h.sink.Put("/api/config/not_a_setting", R"({"value":"1"})");
+    REQUIRE(unknown);
+    CHECK(unknown->status == 400);
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("config_routes: PUT heartbeat_timeout enforces the 30 second floor at the boundary",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    const auto before = h.cfg.session_timeout.count();
+
+    for (const char* v : {"0", "1", "29"}) {
+        INFO(v);
+        auto res = h.sink.Put("/api/config/heartbeat_timeout",
+                              std::string(R"({"value":")") + v + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.cfg.session_timeout.count() == before);
+    }
+    auto ok = h.sink.Put("/api/config/heartbeat_timeout", R"({"value":"30"})");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.cfg.session_timeout.count() == 30);
+}
+
+TEST_CASE("config_routes: PUT from a cookie session needs a same-site Origin or Referer",
+          "[pg][server][routes][config_routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.auth_source = "local"; // a cookie session
+    h.wire();
+    const std::string path = "/api/config/response_retention_days";
+    const std::string put_body = R"({"value":"120"})";
+    const int before = h.cfg.response_retention_days;
+
+    auto foreign = h.sink.dispatch("PUT", path, put_body, "application/json",
+                                   {{"Host", "yuzu.example"}, {"Origin", "https://evil.example"}});
+    REQUIRE(foreign);
+    CHECK(foreign->status == 403);
+    CHECK(body(foreign->body)["error"]["message"] == "cross-site request refused");
+    CHECK(body(foreign->body)["error"].contains("correlation_id"));
+    CHECK(h.cfg.response_retention_days == before);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "csrf.denied");
+
+    auto headerless = h.sink.dispatch("PUT", path, put_body, "application/json",
+                                      {{"Host", "yuzu.example"}});
+    REQUIRE(headerless);
+    CHECK(headerless->status == 403);
+    CHECK(h.cfg.response_retention_days == before);
+
+    auto same = h.sink.dispatch("PUT", path, put_body, "application/json",
+                                {{"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}});
+    REQUIRE(same);
+    CHECK(same->status == 200);
+    CHECK(h.cfg.response_retention_days == 120);
+
+    // A token caller is not riding a cookie: no Origin needed.
+    h.auth_source = "api_token";
+    auto token = h.sink.dispatch("PUT", path, R"({"value":"121"})", "application/json", {});
+    REQUIRE(token);
+    CHECK(token->status == 200);
+}
+
+TEST_CASE("config_routes: PUT same-site gate sits after the permission gate and before the body",
+          "[pg][server][routes][config_routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.auth_source = "local";
+    h.cfg.csrf_trusted_origins = {"https://proxy.example"};
+    h.wire();
+    const std::string path = "/api/config/response_retention_days";
+    const std::unordered_map<std::string, std::string> foreign{{"Host", "yuzu.example"},
+                                                               {"Origin", "https://evil.example"}};
+
+    // An unauthorised caller gets the permission 403, not the cross-site refusal or a row.
+    h.perm_allow = false;
+    auto unauth = h.sink.dispatch("PUT", path, "not json", "application/json", foreign);
+    REQUIRE(unauth);
+    CHECK(unauth->status == 403);
+    CHECK(unauth->body.find("denied") != std::string::npos);
+    CHECK(h.audits.empty());
+    h.perm_allow = true;
+
+    // A foreign browser write is refused before its (malformed) body is looked at.
+    auto cross = h.sink.dispatch("PUT", path, "not json", "application/json", foreign);
+    REQUIRE(cross);
+    CHECK(cross->status == 403);
+    CHECK(cross->body.find("cross-site") != std::string::npos);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "csrf.denied");
+
+    // A same-site Referer with no Origin is admitted; so is a configured trusted origin.
+    auto referer = h.sink.dispatch("PUT", path, R"({"value":"120"})", "application/json",
+                                   {{"Host", "yuzu.example"},
+                                    {"Referer", "https://yuzu.example/settings/general"}});
+    REQUIRE(referer);
+    CHECK(referer->status == 200);
+    auto trusted = h.sink.dispatch("PUT", path, R"({"value":"121"})", "application/json",
+                                   {{"Host", "internal:8080"}, {"Origin", "https://proxy.example"}});
+    REQUIRE(trusted);
+    CHECK(trusted->status == 200);
+    CHECK(h.cfg.response_retention_days == 121);
+}
+
+TEST_CASE("config: LiveSeconds copies and assigns by value and is safe across threads",
+          "[server][config_routes][concurrency]") {
+    yuzu::server::Config a;
+    CHECK(a.session_timeout.count() == 90);
+    a.session_timeout = std::chrono::seconds(45);
+    yuzu::server::Config b = a; // Config is passed and copied by value
+    CHECK(b.session_timeout.count() == 45);
+    b.session_timeout = std::chrono::seconds(60);
+    a = b;
+    CHECK(static_cast<std::chrono::seconds>(a.session_timeout) == std::chrono::seconds(60));
+
+    // One writer and several readers/copiers on fixed iteration counts (no sleeps): every value
+    // seen is one that was written. Under the CI sanitizer leg a plain seconds member races here.
+    yuzu::server::Config shared;
+    shared.session_timeout = std::chrono::seconds(30);
+    std::atomic<bool> bad{false};
+    std::thread writer([&] {
+        for (int i = 0; i < 20000; ++i)
+            shared.session_timeout = std::chrono::seconds(i % 2 ? 30 : 90);
+    });
+    std::vector<std::thread> readers;
+    readers.reserve(3); // no throw between the writer starting and the joins
+    for (int t = 0; t < 3; ++t)
+        readers.emplace_back([&] {
+            for (int i = 0; i < 20000; ++i) {
+                const auto v = shared.session_timeout.count();
+                const yuzu::server::Config copy = shared;
+                const auto c = copy.session_timeout.count();
+                if ((v != 30 && v != 90) || (c != 30 && c != 90))
+                    bad = true;
+            }
+        });
+    writer.join();
+    for (auto& r : readers)
+        r.join();
+    CHECK_FALSE(bad.load());
+}
+
+TEST_CASE("config: clamp_heartbeat_timeout raises a sub-floor stored value to the floor",
+          "[server][config_routes]") {
+    // A heartbeat stored before the floor existed is raised to it, never dropped or lowered.
+    CHECK(clamp_heartbeat_timeout(1) == kMinHeartbeatTimeoutSeconds);
+    CHECK(clamp_heartbeat_timeout(29) == kMinHeartbeatTimeoutSeconds);
+    CHECK(clamp_heartbeat_timeout(30) == 30);
+    CHECK(clamp_heartbeat_timeout(120) == 120);
 }
 
 TEST_CASE("config_routes: PUT a non-numeric value for an integer key is a 400, cfg untouched, "
@@ -410,6 +657,24 @@ TEST_CASE("config_routes: PUT a value nested past the depth limit is a 400 with 
     CHECK_FALSE(get_b["overrides"].contains("oidc_issuer"));
 }
 
+TEST_CASE("config_routes: PUT the redaction placeholder for a secret key is refused without echoing it",
+          "[pg][server][routes][config_routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    const std::string placeholder(RuntimeConfigStore::redacted_placeholder());
+    auto res = h.sink.Put("/api/config/oidc_client_secret", R"({"value":")" + placeholder + R"("})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].detail.find("placeholder") != std::string::npos); // the refusal text
+    CHECK(h.audits[1].detail.find(placeholder) == std::string::npos);   // never the submitted value
+}
+
 TEST_CASE("config_routes: PUT a secret key never leaks the raw value into the audit detail "
           "or the response body",
           "[pg][server][routes][config_routes]") {
@@ -427,9 +692,10 @@ TEST_CASE("config_routes: PUT a secret key never leaks the raw value into the au
     CHECK_FALSE(b.contains("value")); // secret key: no value echoed back
     CHECK(b["applied"] == true);
 
-    REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].detail.find("super-secret-value") == std::string::npos);
-    CHECK(h.audits[0].detail == "value=" + std::string(RuntimeConfigStore::redacted_placeholder()));
+    REQUIRE(h.audits.size() == 2); // attempted (no value at all), then the redacted outcome
+    for (const auto& a : h.audits)
+        CHECK(a.detail.find("super-secret-value") == std::string::npos);
+    CHECK(h.audits[1].detail == "value=" + std::string(RuntimeConfigStore::redacted_placeholder()));
 }
 
 // ── An elevated-only session cannot write the sign-in provider keys ──────────
@@ -559,4 +825,13 @@ TEST_CASE("config_routes: wiring -- server.cpp still calls register_config_route
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_config_routes(") != std::string::npos);
+    // The boot loader raises a sub-floor stored heartbeat_timeout through the shared helper.
+    CHECK(src.find("clamp_heartbeat_timeout(stored)") != std::string::npos);
+    CHECK(src.find("cfg_.session_timeout = std::chrono::seconds(applied);") != std::string::npos);
+    // The Developer role-grid probe is the non-auditing has_permission, not the auditing gate.
+    const auto dev = src.find("yuzu::server::developer::Deps{");
+    REQUIRE(dev != std::string::npos);
+    const auto block = src.substr(dev, 900);
+    CHECK(block.find(".probe_fn =") != std::string::npos);
+    CHECK(block.find("auth_routes_->has_permission(") != std::string::npos);
 }
