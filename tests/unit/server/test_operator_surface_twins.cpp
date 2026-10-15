@@ -459,6 +459,11 @@ constexpr TwinRow kExpectedTwins[] = {
     // REST twin gates on).
     {"list_preflight_runs", "Infrastructure", "Read", true},
     {"get_deployment_preview", "SoftwareDeployment", "Read", true},
+    {"list_deployments", "SoftwareDeployment", "Read", true},
+    {"get_deployment", "SoftwareDeployment", "Read", true},
+    // Estate E-2: the discovered-devices read twin, pinned against the REST
+    // GET /api/v1/network/discovered-devices gate in network_routes.cpp.
+    {"list_discovered_devices", "Infrastructure", "Read", true},
     // #4030: executions/workflows/schedules read-twin programme.
     {"list_workflows", "Workflow", "Read", true},
     {"get_workflow", "Workflow", "Read", true},

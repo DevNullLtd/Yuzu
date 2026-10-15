@@ -1359,6 +1359,7 @@ if build_server
       'unit/server/test_deployment_run_store.cpp',
       'unit/server/test_deployment_engine.cpp',
       'unit/server/test_deployment_routes.cpp',
+      'unit/server/test_deployments_render.cpp',
       'unit/server/test_bundle_service.cpp',
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
@@ -1765,6 +1766,7 @@ if build_server
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
       'unit/server/test_discovery_store.cpp',
+      'unit/server/test_discovered_devices.cpp', # Estate E-2: discovered-devices read twin (pure)
       'unit/server/test_discovery_scan_route.cpp',
     ),
     include_directories: [
