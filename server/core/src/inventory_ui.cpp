@@ -962,7 +962,9 @@ function swSync() {
   D.form({
     title: 'Sync now',
     body: 'Ask devices to re-send their installed-software inventory now instead of waiting for the daily sync. ' +
-          'Only connected devices on agent 0.13.1 or later respond, and one request reaches at most 500 devices.',
+          'This server asks the devices connected to it. Devices not connected to this server (including one ' +
+          'attached to another server) and agents older than 0.13.1 are skipped, and one request reaches at ' +
+          'most 500 devices.',
     fields: [
       { name: 'kind', label: 'Which devices', type: 'select', options: opts },
       { name: 'expr', label: 'Scope expression or group', type: 'text', maxlength: 1024,
@@ -991,14 +993,14 @@ function swSync() {
     if (!v) return null;
     var e = v.expr.trim(), body = { source: 'installed_software' }, what;
     if (v.kind === 'device') { body.scope = id; what = '1 device (' + host + ') will be asked to re-send its software inventory.'; }
-    else if (v.kind === 'fleet') { body.scope = '__all__'; what = 'Every connected device you can reach will be asked to re-send its software inventory.'; }
-    else if (e.indexOf('group:') === 0) { body.scope = e; what = 'Every connected device in ' + e + ' will be asked to re-send its software inventory.'; }
+    else if (v.kind === 'fleet') { body.scope = '__all__'; what = 'Every device connected to this server that you can reach will be asked to re-send its software inventory.'; }
+    else if (e.indexOf('group:') === 0) { body.scope = e; what = 'Every device in ' + e + ' that is connected to this server will be asked to re-send its software inventory.'; }
     else {
       body.scope_expression = e;
       what = (count === null ? 'The devices matching this scope' : count + ' device' + (count === 1 ? ' matches' : 's match') + ' this scope and') +
              ' will be asked to re-send their software inventory.';
     }
-    return D.confirm({ title: 'Sync now?', body: [what, 'Offline devices and agents older than 0.13.1 are skipped.'], confirmLabel: 'Sync now' })
+    return D.confirm({ title: 'Sync now?', body: [what, 'Devices not connected to this server (including one attached to another server) and agents older than 0.13.1 are skipped.'], confirmLabel: 'Sync now' })
       .then(function (ok) { return ok ? D.request('POST', '/api/v1/hardware/sync', { json: body }) : null; });
   }).then(function (r) { if (r) swSyncDone(r); }, function () { /* dialog busy or closed */ });
 }

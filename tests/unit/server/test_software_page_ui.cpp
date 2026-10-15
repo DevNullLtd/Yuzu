@@ -787,6 +787,14 @@ TEST_CASE("software page: Sync now button and dialog script drive the fan-out ro
         REQUIRE(has(s, need));
     // The 202 count is agents_reached (as on /api/command and the per-device route).
     REQUIRE_FALSE(has(s, "d.reached"));
+    // One definition of "skipped" in the dialog and its confirm step: not connected to THIS server
+    // (a device attached to another server included) or an agent older than 0.13.1.
+    REQUIRE(has(s, "Devices not connected to this server (including one attached to another server) and "
+                   "agents older than 0.13.1 are skipped."));
+    REQUIRE(has(s, "This server asks the devices connected to it."));
+    REQUIRE_FALSE(has(s, "Only connected devices"));
+    REQUIRE_FALSE(has(s, "Offline devices and agents"));
+    REQUIRE_FALSE(has(s, "Every connected device"));
     // The scope preview needs Infrastructure:Read, so a PERMISSION refusal (403, or 401) means "no
     // count" and the dialog goes on to the confirm step; any other failure (400 invalid expression,
     // 404, 503) is still returned to the dialog so it is caught before the operator confirms.
