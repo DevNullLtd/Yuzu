@@ -34,7 +34,7 @@ supersession rows appended to `governance.d/macos-foundation-20260917.cdfcd1.jso
 | # | Decision |
 |---|---|
 | D1 | An unconfigured first install is installed but **not started**, and is never rolled back for not running. |
-| D2 | The data directory (and, by the same rule, the log directory) may be owned by **root or the `_yuzu` service account**, and must never be group- or world-writable. Otherwise the install refuses; it never adopts or re-owns the directory. |
+| D2 | The data directory (and, by the same rule, the log directory) may be owned by **root or the `_yuzu` service account**, and must never be group- or world-writable. Otherwise the install refuses; it never adopts or re-owns the directory. **Withdrawn the same day** after the external review below: root only. |
 | D3 | The recovery state-machine rework lands **in this PR**, not in a follow-up. |
 | D4 | Chaos scenarios that need a real install run in a **disposable tart VM** ("Use tart"). |
 
@@ -61,6 +61,22 @@ findings were edge cases of transient `pkgutil` failures and one lane switch. Th
 (`8691d6bf6`) were covered by behavioural tests, each mutation-checked, but **no further review
 round re-read them**. The maintainer's standing guidance is to stop a governance loop once it no
 longer moves the release. A later change to these scripts reopens Gate 8 for its own diff.
+
+**External review after the record (FortitudeEtc, 2026-10-15, [review 5533419011](https://github.com/DevNullLtd/Yuzu/pull/4482#pullrequestreview-5533419011)).**
+It confirmed the earlier blockers fixed and raised one new blocker and three should-fix items, all
+fixed in `32acd46f2` and recorded in the ledger as `fr-1`..`fr-4` (pass 6):
+
+| Id | Finding | Fix |
+|---|---|---|
+| fr-1 | The root daemon trusted `_yuzu`-owned data and log directories (D2), so that account could redirect a root write with a symlink. | D2 withdrawn by the owner: both directories must be root-owned, not group/world writable and free of write-granting ACLs. |
+| fr-2 | `uninstall.sh` removed everything after a 30 s stop timeout. | It stops the agent first and refuses, with everything in place, if it does not stop. |
+| fr-3 | Recovery state had no ACL check (`chmod 700` leaves ACLs). | The state root and every snapshot are refused on any ACL entry, checked and never stripped; a recovery restart also requires the package's own executable with a root-only definition and executable. |
+| fr-4 | A loose package could build without `libyuzu_agent_core.dylib`. | The build fails, and postinstall requires the core's recorded hash. |
+
+These fixes were tested (three new behavioural tests, 18 mutations killed) but not run through a
+governance gate or the VM. The review's minor items (promoted-plist hardening, the bare `delete`
+ACL right, the updater's lstat-then-rename, stale macOS rows in `docs/agent-privilege-model.md`)
+are not addressed here.
 
 ## Evidence at the final head (`8691d6bf6`)
 
