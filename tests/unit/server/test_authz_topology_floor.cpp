@@ -1011,6 +1011,9 @@ TEST_CASE("AuditLog:Read floor: a non-admin is refused 403 on filtered and malfo
         {"/api/audit?action=a%00b", 400},
         {"/api/audit?target_type=a%00b", 400},
         {"/api/audit?target_id=a%00b", 400},
+        // Invalid UTF-8 would fail the Postgres bind: a false 503 and a false degrade count.
+        {"/api/audit?principal=%C3%28", 400},
+        {"/api/audit?target_id=%FF", 400},
         {"/api/audit?since=-1", 400},
         {"/api/audit?until=-5", 400},
         {"/api/audit?since=9&until=3", 400},

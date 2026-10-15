@@ -75,6 +75,7 @@ Callers that paged deeper or asked for more than 1000 rows should narrow the
 window with `since`/`until`. MCP `query_audit_log` now rejects a wrong-typed or
 negative filter with an invalid-params error (`-32602`) instead of silently
 ignoring it.
+`query_audit_log` string filters are now limited to 256 characters (`target_id` 512) and a longer value is `-32602`. `GET /api/audit` and `GET /api/v1/audit` return `400` for a NUL or invalid UTF-8 in a string filter (a NUL used to truncate the filter and widen the read), and `GET /api/audit` also returns `400` for a negative `since`/`until` or an inverted window. `query_audit_log` now returns `has_more` beside `entries` in its structured result; the text channel is unchanged. Clients that sent such filters should shorten or drop them.
 
 **Role reads fail closed.** `GET /api/v1/rbac/roles` and
 `GET /api/v1/rbac/roles/{role}/permissions` now answer `503` when the permission

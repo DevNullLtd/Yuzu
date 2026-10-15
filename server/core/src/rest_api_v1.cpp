@@ -8229,13 +8229,10 @@ void RestApiV1::register_routes(
                      res.status = 400;
                      res.set_content(detail::a4_error(res, msg), "application/json");
                  };
-                 // A NUL (%00) would truncate the bound value at the C-string boundary and
-                 // silently widen the filter.
-                 if (q.principal.find('\0') != std::string::npos ||
-                     q.action.find('\0') != std::string::npos ||
-                     q.target_type.find('\0') != std::string::npos ||
-                     q.target_id.find('\0') != std::string::npos) {
-                     bad_request("string filters must not contain NUL");
+                 // A NUL (%00) or invalid UTF-8 breaks the bind: truncation silently widens
+                 // the filter, a bad byte surfaces as a false 503 and read-degrade count.
+                 if (!audit_string_filters_wellformed(q)) {
+                     bad_request("string filters must be valid UTF-8 without NUL");
                      return;
                  }
                  // since/until: epoch seconds, whole value one non-negative integer;

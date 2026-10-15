@@ -1,5 +1,7 @@
 #pragma once
 
+#include "utf8_sanitize.hpp"
+
 /// @file audit_store.hpp
 /// SOC 2 evidence chain — operator actions, agent enrolment, fleet-topology
 /// events, background schedule execution, and every behavioural-PII access.
@@ -138,6 +140,18 @@ inline constexpr std::size_t kAuditSampleScanCap = 10000;
 /// An offset above it is a 400, never a silent clamp: a client must not receive a
 /// different page than it asked for. Auditors narrow with `since`/`until`.
 inline constexpr int kAuditMaxOffset = 10000;
+
+/// True when every string filter of `q` is safe to bind: no NUL (it would truncate the bound
+/// value at the C-string boundary and widen the filter) and valid UTF-8 (Postgres rejects the
+/// bind, which would surface as a false 503 plus a false read-degrade count). One copy for the
+/// legacy and v1 REST routes; MCP gets valid UTF-8 from its JSON parser.
+inline bool audit_string_filters_wellformed(const AuditQuery& q) {
+    for (const std::string* v : {&q.principal, &q.action, &q.target_type, &q.target_id}) {
+        if (v->find('\0') != std::string::npos || sanitize_utf8_strict(*v) != *v)
+            return false;
+    }
+    return true;
+}
 
 // ── Retention clock guard (#2360) ──────────────────────────────────────────
 //

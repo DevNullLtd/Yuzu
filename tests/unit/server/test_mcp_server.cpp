@@ -17577,7 +17577,9 @@ TEST_CASE("MCP query_audit_log: the published schema carries its bounds and desc
         if (t["name"] == "query_audit_log")
             tool = t;
     REQUIRE_FALSE(tool.is_null());
-    const auto& props = tool["inputSchema"]["properties"];
+    // Non-const copies: a reverted fix then fails one CHECK instead of aborting the shard on a
+    // missing key (const operator[] asserts).
+    nlohmann::json props = tool["inputSchema"]["properties"];
     for (const char* f : {"principal", "action", "target_type"}) {
         INFO(f);
         CHECK(props[f]["maxLength"] == 256);
@@ -17594,10 +17596,10 @@ TEST_CASE("MCP query_audit_log: the published schema carries its bounds and desc
     CHECK(desc.find("live") != std::string::npos);
     CHECK(desc.find("retry_after_ms") != std::string::npos);
     // The output schema declares and requires has_more next to entries.
-    const auto& out = tool["outputSchema"];
+    nlohmann::json out = tool["outputSchema"];
     CHECK(out["properties"].contains("has_more"));
     CHECK(out["properties"]["has_more"]["type"] == "boolean");
-    const auto req = out["required"];
+    nlohmann::json req = out["required"];
     CHECK(std::find(req.begin(), req.end(), "has_more") != req.end());
     CHECK(std::find(req.begin(), req.end(), "entries") != req.end());
 }
@@ -17656,6 +17658,8 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
         const std::vector<std::string> bads = {
             R"({"offset":-1})", R"({"principal":42})", R"({"target_id":"x"})" /* no target_type */,
             R"({"principal":")" + std::string(257, 'p') + R"("})",
+            R"({"action":")" + std::string(257, 'a') + R"("})",
+            R"({"target_type":")" + std::string(257, 't') + R"("})",
             R"({"target_type":"t","target_id":")" + std::string(513, 'i') + R"("})",
             R"({"since":9,"until":3})", R"({"principal":"a\u0000b"})", R"({"target_id":7})",
             R"({"target_type":"T","target_id":"a\u0000b"})"};
@@ -17664,7 +17668,7 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
             auto body = call(bad);
             REQUIRE(body.contains("error"));
             CHECK(body["error"]["code"] == -32602);
-            const auto& data = body["error"]["data"];
+            auto& data = body["error"]["data"];
             CHECK_FALSE(data["correlation_id"].get<std::string>().empty());
             CHECK(data["retry_after_ms"].is_null());
             CHECK_FALSE(data["remediation"].is_null());
@@ -17678,7 +17682,8 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
         auto ok = call(R"({"principal":")" + wide + R"("})");
         CHECK(ok.contains("result"));
         auto over = call(R"({"principal":")" + wide + "\xC3\xA9" + R"("})");
-        CHECK(over.contains("error"));
+        REQUIRE(over.contains("error"));
+        CHECK(over["error"]["code"] == -32602);
     }
 
     SECTION("the filter limits are inclusive: 256 and 512 characters are accepted") {
@@ -17688,12 +17693,31 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
         CHECK(ok2.contains("result"));
     }
 
+    SECTION("the page cap: 501 matching rows give a 500-row page with has_more, then the tail") {
+        for (int i = 0; i < 498; ++i) { // 3 rows exist already
+            AuditEvent evt;
+            evt.principal = "a5-probe";
+            evt.action = "a5.probe";
+            evt.target_type = "a5_t";
+            evt.target_id = "bulk-" + std::to_string(i);
+            evt.result = "success";
+            evt.timestamp = 1000;
+            REQUIRE(store.log(evt));
+        }
+        auto capped = page(R"(,"limit":500)");
+        CHECK(capped["entries"].size() == 500);
+        CHECK(capped["has_more"] == true);
+        auto tail = page(R"(,"limit":500,"offset":500)");
+        CHECK(tail["entries"].size() == 1);
+        CHECK(tail["has_more"] == false);
+    }
+
     SECTION("a store fault is a retryable A4 error, never an empty page") {
-        auto held = pool.acquire(); // the only connection: the store's 2 s bounded wait expires
+        auto held = pool.acquire(); // the only connection: the store's bounded acquire fast-fails
         REQUIRE(held);
         auto body = call("{" + base + "}");
         REQUIRE(body.contains("error"));
-        const auto& data = body["error"]["data"];
+        auto& data = body["error"]["data"];
         CHECK(data["retry_after_ms"].is_number());
         CHECK(data["retry_after_ms"].get<int>() > 0);
         CHECK_FALSE(data["remediation"].is_null());
@@ -17701,7 +17725,7 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
     }
 }
 
-TEST_CASE("MCP query_audit_log: an unconfigured audit store is an A4 error, not a bare one",
+TEST_CASE("MCP query_audit_log: an unconfigured audit store is an A4 error rather than a bare one",
           "[mcp][audit][a5]") {
     McpTestServer ts; // no audit_store_for_test
     ts.start("readonly");
@@ -17710,7 +17734,7 @@ TEST_CASE("MCP query_audit_log: an unconfigured audit store is an A4 error, not 
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
-    const auto& data = body["error"]["data"];
+    auto& data = body["error"]["data"];
     CHECK_FALSE(data["correlation_id"].get<std::string>().empty());
     CHECK(data["retry_after_ms"].is_null());
     CHECK_FALSE(data["remediation"].is_null());

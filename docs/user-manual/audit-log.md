@@ -478,9 +478,10 @@ curl -s -b cookies.txt \
 ### GET /api/audit (legacy)
 
 The legacy endpoint caps `limit` at 1000 and rejects `offset` above 10000, the
-same ceilings as `/api/v1/audit`. New integrations should prefer
-`/api/v1/audit`, which now accepts the same filters and validates them
-strictly.
+same ceilings as `/api/v1/audit`. It answers `400` for a negative `since`/`until`, an
+inverted window, and a string filter holding a NUL or invalid UTF-8 (the v1 route does the
+same for the string filters). New integrations should prefer `/api/v1/audit`, which also
+rejects a `target_id` given without `target_type`.
 
 **Query parameters:**
 

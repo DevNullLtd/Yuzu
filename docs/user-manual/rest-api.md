@@ -10486,7 +10486,7 @@ Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a lo
 Query audit events. Legacy route — **not** merely `GET /api/v1/audit` without
 the v1 envelope; the response shape and accepted parameters both genuinely
 differ. Accepts `principal`, `action`, `target_type`, `target_id`, `since`,
-`until`, `limit`, and `offset` (the same filter names as the v1 route; the legacy route's validation is looser: it does not reject a NUL in a string filter, a negative or inverted `since`/`until` window, or a `target_id` given without `target_type`). Response is `{"events": [...], "count": N, "total": <number-or-
+`until`, `limit`, and `offset` (the same filter names as the v1 route; the legacy route's validation is looser in one respect only: it does not reject a `target_id` given without `target_type`). Response is `{"events": [...], "count": N, "total": <number-or-
 null>}` (field names `events`/`count`/`total`, not v1's `data`/`pagination`/
 `meta`), and each event row additionally carries `principal_role` and
 `source_ip`, which v1's row shape omits. `total` is a best-effort second read
@@ -10500,8 +10500,9 @@ at 10000.
 **Permission:** `AuditLog:Read` (admin-only while RBAC is disabled, #5771).
 
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — a `since`/`until`/
-`limit`/`offset` query parameter is not a valid integer, `limit < 1`, or
-`offset` outside `0..10000`; `503` — the audit store is closed, or the page-rows query
+`limit`/`offset` query parameter is not a valid integer, `limit < 1`,
+`offset` outside `0..10000`, `since`/`until` is negative or `since` is after `until`, or a string filter
+contains a NUL or invalid UTF-8; `503` — the audit store is closed, or the page-rows query
 degraded (ADR-0040 deny-on-degrade; never a false-empty `200`).
 
 ---
