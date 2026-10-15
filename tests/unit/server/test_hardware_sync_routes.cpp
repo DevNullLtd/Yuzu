@@ -69,6 +69,8 @@ struct SyncHarness {
     std::string last_username;
     // Runs inside the dispatch call, to re-enter the route while a run is in flight.
     std::function<void()> during_dispatch;
+    // Runs inside every audit write, to prove what the route holds while it writes.
+    std::function<void()> on_audit;
 
     explicit SyncHarness(SyncWiring w = {}) {
         resolved.status = ss::Resolved::Status::Ok;
@@ -87,6 +89,8 @@ struct SyncHarness {
                 events.push_back("audit:" + r);
                 audit_rows.push_back(a + "|" + r + "|" + tt + "|" + tid);
                 audit_details.push_back(d);
+                if (on_audit)
+                    on_audit();
                 return !audit_should_fail;
             };
         if (w.perm)
@@ -516,6 +520,46 @@ TEST_CASE("sync route: a run already in flight makes a second one 409 and sends 
     h.during_dispatch = nullptr;
     h.username = "bob";
     CHECK(h.post(R"({"scope":"__all__"})")->status == 202);
+}
+
+TEST_CASE("sync route: the same operator overlapping a run gets 409 from the slot, not a second run",
+          "[hardware][sync_fanout][route]") {
+    SyncHarness h;
+    h.live(2);
+    int inner_status = 0;
+    h.during_dispatch = [&] {
+        auto r = h.post(R"({"scope":"group:g"})"); // alice again, her first run not yet stamped
+        inner_status = r ? r->status : -1;
+    };
+    REQUIRE(h.post(R"({"scope":"__all__"})")->status == 202);
+    CHECK(inner_status == 409);
+    CHECK(h.dispatch_calls == 1);
+    // Once the first run has stamped, the cooldown (not the slot) is what refuses her.
+    h.during_dispatch = nullptr;
+    CHECK(h.post(R"({"scope":"group:g"})")->status == 429);
+}
+
+TEST_CASE("sync route: a refused cooldown never holds the slot while the audit row is written",
+          "[hardware][sync_fanout][route]") {
+    SyncHarness h;
+    h.live(2);
+    REQUIRE(h.post(R"({"scope":"__all__"})")->status == 202); // alice stamps
+    // From inside alice's refused attempt's audit write, another operator asks for a run. The
+    // slot is free (a 429 never took it), so bob is not answered 409.
+    int inner_status = 0;
+    bool fired = false;
+    h.on_audit = [&] {
+        if (fired)
+            return;
+        fired = true;
+        h.username = "bob";
+        auto r = h.post(R"({"scope":"group:g"})");
+        inner_status = r ? r->status : -1;
+        h.username = "alice";
+    };
+    CHECK(h.post(R"({"scope":"group:g"})")->status == 429);
+    CHECK(fired);
+    CHECK(inner_status == 202);
 }
 
 TEST_CASE("sync route: a single-device sync is not held by a multi-device run in flight",

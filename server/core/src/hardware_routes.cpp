@@ -599,20 +599,38 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // One multi-device run at a time, and one per operator per minute. The flag is held to
-        // the end of the handler, so the cooldown check below and the stamp after dispatch
-        // cannot interleave with another run.
+        // Ordering: preflight 403 -> cooldown 429 -> slot 409 -> resolve -> decide -> audit ->
+        // dispatch. One multi-device run at a time and one per operator per minute, both per
+        // server process. The cooldown is read BEFORE the slot so a 429 never occupies it, and
+        // the slot is held to the end of the handler, so the stamp after dispatch cannot
+        // interleave with another run. Note the dispatch loop is sequential: a stalled agent
+        // stream holds the slot (a concurrent run gets 409) until its write fails.
         struct RunGuard {
             RunGuard() = default;
             RunGuard(const RunGuard&) = delete; // a copy would release the slot twice
             RunGuard& operator=(const RunGuard&) = delete;
             std::atomic<bool>* flag{nullptr};
-            ~RunGuard() {
+            void release() {
                 if (flag) flag->store(false);
+                flag = nullptr;
             }
+            ~RunGuard() { release(); }
         } run_guard;
         const bool guarded = ss::needs_run_guard(sel.arm);
+        const auto cooldown_wait = [&] {
+            std::lock_guard<std::mutex> lk(sync_run_mu_);
+            return ss::cooldown_remaining(ss::last_run_of(sync_last_run_, session->username), now());
+        };
+        const auto refuse_cooldown = [&](std::int64_t wait) {
+            res.set_header("Retry-After", std::to_string(wait));
+            refuse(429, "a sync run was requested a moment ago; wait " + std::to_string(wait) + "s",
+                   "rate_limited cooldown=" + std::to_string(wait) + "s", {.retry_after_ms = wait * 1000});
+        };
         if (guarded) {
+            if (const auto wait = cooldown_wait(); wait > 0) {
+                refuse_cooldown(wait);
+                return;
+            }
             bool idle = false;
             if (!sync_run_active_.compare_exchange_strong(idle, true)) {
                 refuse(409, "another sync run is already in progress; try again in a moment",
@@ -620,16 +638,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             run_guard.flag = &sync_run_active_;
-            std::int64_t wait = 0;
-            {
-                std::lock_guard<std::mutex> lk(sync_run_mu_);
-                wait = ss::cooldown_remaining(ss::last_run_of(sync_last_run_, session->username), now());
-            }
-            if (wait > 0) {
-                res.set_header("Retry-After", std::to_string(wait));
-                refuse(429, "a sync run was requested a moment ago; wait " + std::to_string(wait) + "s",
-                       "rate_limited cooldown=" + std::to_string(wait) + "s",
-                       {.retry_after_ms = wait * 1000});
+            // This operator's previous run may have stamped between the check above and taking
+            // the slot. Release the slot before the refusal's audit write.
+            if (const auto wait = cooldown_wait(); wait > 0) {
+                run_guard.release();
+                refuse_cooldown(wait);
                 return;
             }
         }
