@@ -478,8 +478,9 @@ TEST_CASE("update package rows encode each path part, and offer no action for an
     CHECK(yuzu::test::has_url(urls, b));
     for (const auto& u : urls) {
         CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
-        if (u.rfind("/api/settings/updates/", 0) == 0) {
-            // exactly /api/settings/updates/<p>/<a>/<v>[/rollout]
+        if (u.rfind("/api/settings/updates/", 0) == 0 && u != "/api/settings/updates/upload") {
+            // exactly /api/settings/updates/<p>/<a>/<v>[/rollout]; the upload form
+            // posts to the fixed /api/settings/updates/upload and is not a package row
             const auto n = yuzu::test::path_slashes(u);
             CHECK((n == 6 || n == 7));
         }
