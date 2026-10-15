@@ -626,8 +626,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             ~RunGuard() { release(); }
         } run_guard;
-        static_assert(!std::is_copy_constructible_v<RunGuard> && !std::is_move_constructible_v<RunGuard>,
-                      "a copied or moved guard would release the slot twice");
+        static_assert(!std::is_copy_constructible_v<RunGuard> && !std::is_move_constructible_v<RunGuard> &&
+                          !std::is_copy_assignable_v<RunGuard> && !std::is_move_assignable_v<RunGuard>,
+                      "a copied, moved or assigned guard would release the slot twice");
         const bool guarded = ss::needs_run_guard(sel.arm);
         const auto cooldown_wait = [&] {
             std::optional<std::int64_t> last;
@@ -724,8 +725,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (guarded && sent.sent > 0) {
+            const auto stamp_at = now(); // the clock is read outside the lock
             std::lock_guard<std::mutex> lk(sync_run_mu_);
-            ss::stamp(sync_last_run_, session->username, now());
+            ss::stamp(sync_last_run_, session->username, stamp_at);
         }
         nlohmann::json out = {
             {"data", ss::summary_json(ss::finalize(plan.counts, sent.sent), sent.command_id, now())},
