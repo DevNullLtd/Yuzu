@@ -518,6 +518,24 @@ TEST_CASE("The analytics HTML fragment sanitizes the ClickHouse URL identically 
     CHECK(res->body.find("host:9000/yuzu") != std::string::npos);
 }
 
+TEST_CASE("The NVD settings fragment never re-shows proxy credentials",
+          "[settings][security]") {
+    SettingsReadTwinsHarness h;
+    h.cfg.nvd_proxy = "http://svc-account:hunter2@proxy.lan:3128";
+
+    auto res = h.sink.Get("/fragments/settings/nvd");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("hunter2") == std::string::npos);
+    CHECK(res->body.find("svc-account") == std::string::npos);
+    CHECK(res->body.find("proxy.lan:3128") != std::string::npos);
+
+    h.cfg.nvd_proxy = "http://proxy.lan:3128"; // a credential-free proxy is shown as-is
+    auto plain = h.sink.Get("/fragments/settings/nvd");
+    REQUIRE(plain);
+    CHECK(plain->body.find("http://proxy.lan:3128") != std::string::npos);
+}
+
 // ── Degraded runtime_config_store (UP-3/CH-2 fix, Gate 8 coverage gap) ────
 //
 // A `PgPool` built on an invalid conninfo fails PgPool's own parse step and

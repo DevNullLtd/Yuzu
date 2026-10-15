@@ -249,9 +249,29 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # Design delta 2026-10-14: the four rows above moved with their panels to the Dashboard and
 # are now /fragments/dashboard/{summary,policies,activity,health} (same composed-of status,
 # same count; a rename, not a new surface), so the count stays 208.
+#
+# Estate deployment read twins: GET /fragments/auto/deployments and .../detail are new routes
+# ledgered "twinned" (GET /api/v1/deployments[/{id}] + MCP list_deployments / get_deployment,
+# count unchanged). The new GET /fragments/auto/nvd status card is ledgered "exception"
+# (grandfathered NVD surface, no get_nvd_status MCP): +1. Merged on top of the 201 above, the
+# checker reported 202 on the merged tree.
+#
+# Network discovery read twin (Estate E-2): the unbounded legacy GET /api/discovery/results
+# row flips "planned:#2146" -> "twinned" (GET /api/v1/network/discovered-devices + MCP
+# list_discovered_devices); the new GET /fragments/network/discovered row is born "twinned"
+# (count unchanged): -1 on its own. Combined with the +1 above the checker reported 201 on the
+# merged tree, not a hand-added delta.
+#
+# Landing on dev's 208 (device containment, hardware properties and the Home/Dashboard rows, above),
+# the two Estate changes net 0 on their own (+1 NVD status card exception, -1 discovery row
+# twinned), so the count after this merge is the value the checker reports, set from its output.
+#
 # The System General page (merged from this branch) adds the two composed-of fragments
 # described above (general-runtime, analytics-events): 208 + 2 = 210, the value the checker
 # reports on the merged tree.
+#
+# Merged onto the Estate changes: the count is the value the checker reports on the merged
+# tree, set from its output.
 BASELINE_UNTWINNED = 210
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
