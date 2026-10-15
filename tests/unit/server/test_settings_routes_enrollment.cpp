@@ -156,7 +156,7 @@ struct EnrollRoutesHarness {
 
 /// The 64-hex raw token shown in the dashboard's one-time reveal block.
 std::string raw_token_in(const std::string& html) {
-    const std::string marker = "<code>";
+    const std::string marker = "<code class=\"mono\">";
     for (std::size_t pos = html.find(marker); pos != std::string::npos;
          pos = html.find(marker, pos + 1)) {
         const auto start = pos + marker.size();
@@ -912,7 +912,7 @@ TEST_CASE("settings auto-approve: match-everything rules and oversized text are 
 
 // A lapsed token cannot be minted without waiting out a TTL, so the store row's expiry is
 // pushed into the past the way test_auth.cpp does for the consume path. It must list Expired
-// (neutral pill), not Active; an exhausted-and-lapsed token keeps Exhausted, and a token that
+// (warn pill), not Active; an exhausted-and-lapsed token keeps Exhausted, and a token that
 // never expires stays Active.
 TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as Active",
           "[pg][settings_routes][enrollment]") {
@@ -938,13 +938,13 @@ TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as
     const auto pill_of = [&](const std::string& id) {
         const auto row = res->body.find("<code>" + id + "</code>");
         REQUIRE(row != std::string::npos);
-        const auto pill = res->body.find("role-badge ", row);
+        const auto pill = res->body.find("pill ", row);
         REQUIRE(pill != std::string::npos);
         return res->body.substr(pill, res->body.find("</span>", pill) - pill);
     };
-    CHECK(pill_of(lapsed->token_id) == "role-badge role-user\">Expired");
-    CHECK(pill_of(never->token_id) == "role-badge role-admin\">Active");
-    CHECK(res->body.find("role-ok") == std::string::npos);
+    CHECK(pill_of(lapsed->token_id) == "pill warn\">Expired");
+    CHECK(pill_of(never->token_id) == "pill info\">Active");
+    CHECK(res->body.find("pill ok") == std::string::npos);
 }
 
 // The pure decision behind that pill, with the clock injected: no Postgres, no TTL wait.

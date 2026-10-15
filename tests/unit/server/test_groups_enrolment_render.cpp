@@ -7,10 +7,12 @@
  * What these pin: the three states stay distinct (populated / empty / store did not answer),
  * every agent- or operator-supplied string is escaped, the bulk actions are off whenever the
  * list is not whole, the rule copy is honest about what is matched, and the confirm text
- * follows the match mode (in "all" mode enabling narrows and removing widens).
+ * follows the match mode (in "all" mode enabling narrows and removing widens), and an
+ * agent- or store-supplied id reaches a URL path only as ONE percent-encoded segment.
  */
 
 #include "enrolment_render.hpp"
+#include "url_attr_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -247,6 +249,79 @@ TEST_CASE("enrolment pending: row actions use the existing routes; Forget only o
     CHECK_THAT(html.substr(a, html.find("</button>", a) - a), !ContainsSubstring("hx-confirm"));
     // No inline handler; the bulk bar is hx-post, not onclick.
     CHECK_THAT(html, !ContainsSubstring("onclick"));
+}
+
+TEST_CASE("enrolment pending: a hostile agent id reaches every row URL as one encoded segment",
+          "[groups][enrolment][render][url_path_segment]") {
+    for (const char* id : {"./bulk-approve?", "../auto-approve/mode?", "../enrollment-tokens?",
+                           "a/b", "a#b", "a?b", "%252e", "caf\xC3\xA9", "a b&c", "x\"y"}) {
+        INFO("id=" << id);
+        const std::vector<auth::PendingAgent> v = {agent(id, "h"), agent("other", "h2")};
+        const auto html = render_pending(&v);
+        const auto urls = yuzu::test::url_attr_values(html);
+        const std::string base = "/api/settings/pending-agents/" + url_path_segment(id);
+        REQUIRE(yuzu::test::has_url(urls, base + "/approve"));
+        REQUIRE(yuzu::test::has_url(urls, base + "/deny"));
+        REQUIRE(yuzu::test::has_url(urls, base)); // Forget
+        for (const auto& u : urls) {
+            CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+            if (u.rfind("/api/settings/pending-agents/", 0) == 0 &&
+                u.find("bulk-") == std::string::npos) {
+                // <prefix>/<one segment>[/<verb>]: the id contributes no slash, '?' or '#'.
+                CHECK(yuzu::test::path_slashes(u) <= 5);
+                CHECK(u.find('?') == std::string::npos);
+                CHECK(u.find('#') == std::string::npos);
+            }
+        }
+    }
+}
+
+TEST_CASE("enrolment pending: empty and dot-only ids get no row action, only the note",
+          "[groups][enrolment][render][url_path_segment]") {
+    for (const char* id : {"", ".", "..", "%2e%2e", "%2E", ".%2e"}) {
+        INFO("id=" << id);
+        const std::vector<auth::PendingAgent> v = {agent(id, "h"), agent("normal", "h2")};
+        const auto html = render_pending(&v);
+        const auto urls = yuzu::test::url_attr_values(html);
+        for (const auto& u : urls) {
+            CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+            CHECK(u.find("pending-agents//") == std::string::npos);
+            CHECK(u.find("pending-agents/./") == std::string::npos);
+            CHECK(u.find("pending-agents/../") == std::string::npos);
+        }
+        CHECK(yuzu::test::has_url(urls, "/api/settings/pending-agents/normal/approve"));
+        // Exactly one row (the unaddressable one) lacks actions; it says why.
+        CHECK(count_of(html, "identifier not supported for row actions") == 1);
+        CHECK(count_of(html, ">Approve</button>") == 1);
+        CHECK(count_of(html, ">Forget</button>") == 1);
+    }
+}
+
+TEST_CASE("enrolment pending: a lone unaddressable waiting agent still has the bulk actions",
+          "[groups][enrolment][render][url_path_segment]") {
+    const std::vector<auth::PendingAgent> lone = {agent("..", "h")};
+    const auto html = render_pending(&lone);
+    CHECK_THAT(html, ContainsSubstring("identifier not supported for row actions"));
+    CHECK_THAT(html, !ContainsSubstring(">Approve</button>"));
+    CHECK_THAT(html, ContainsSubstring("hx-post=\"/api/settings/pending-agents/bulk-approve\""));
+    CHECK_THAT(html, ContainsSubstring("Approve all (1)"));
+    // A lone ordinary agent keeps the old shape: row actions, no bulk bar.
+    const std::vector<auth::PendingAgent> ok = {agent("fine", "h")};
+    CHECK_THAT(render_pending(&ok), !ContainsSubstring("bulk-approve"));
+}
+
+TEST_CASE("enrolment tokens: the token id in a Revoke URL is one encoded segment",
+          "[groups][enrolment][render][url_path_segment]") {
+    const std::vector<auth::EnrollmentToken> v = {token("../x?y/z")};
+    const auto html = render_tokens(&v, "", kNow);
+    const auto urls = yuzu::test::url_attr_values(html);
+    CHECK(yuzu::test::has_url(urls, "/api/settings/enrollment-tokens/" +
+                                        url_path_segment("../x?y/z")));
+    for (const auto& u : urls) {
+        CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+        if (u.rfind("/api/settings/enrollment-tokens/", 0) == 0)
+            CHECK(yuzu::test::path_slashes(u) == 4);
+    }
 }
 
 TEST_CASE("enrolment pending: bulk actions name the total and up to ten hostnames",
