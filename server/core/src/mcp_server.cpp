@@ -1589,21 +1589,27 @@ static const ToolDef kTools[] = {
      R"j("audit_persisted":{"type":"boolean"}},"required":["process_name","window","crashes","hangs","signals","distinct_devices","first_seen","last_seen","modules","exceptions","devices"]})j"},
 
     {"list_dex_apps",
-     "Application and per-version stability list: every application with a crash/hang signal in "
-     "the window, ranked by activity (crashes plus hangs, then name); up to 100 applications and "
-     "20 versions each, flagged when capped. Each row carries crashes, hangs, devices affected, "
+     "Application and per-version stability list: every application with a Windows crash/hang "
+     "signal in the window - the 100 applications affecting the most Windows devices (then "
+     "crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then "
+     "name); apps_total counts every application with a Windows crash or hang signal in the "
+     "window and apps_truncated flags the cut; up to 20 versions each, versions_truncated flags "
+     "that cut. Each row carries crashes, hangs, devices affected, "
      "the share of the reporting population affected (95 percent Wilson interval), events per "
      "1,000 reporting devices (exact interval) and the stability score with its decomposition. "
-     "Counts are Windows-scoped and the population is Windows devices online now "
-     "(population_basis); no device floor is applied. No per-agent identity (a distinct-device "
+     "Counts are Windows-scoped (the Apps tab, the Overview top apps and get_dex_app still count "
+     "every platform) and the population is Windows devices online now (population: null = no "
+     "fleet source wired, 0 = no Windows device online now; population_basis); when more devices "
+     "were affected than are online now, share_affected and rate_per_1000 are null and the score "
+     "is withheld as inconsistent. No device floor is applied. No per-agent identity (a distinct-device "
      "COUNT, never an agent_id) - not audited. A degraded read is an error, never an empty list. "
      "Mirrors GET /api/v1/dex/apps. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
-     R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},)j"
+     R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
      R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},)j"
      R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"]},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
      R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"]},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","crashes","hangs","distinct_devices","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
-     R"j("required":["window","apps","population","population_basis"]})j"},
+     R"j("required":["window","apps","population","population_basis","apps_total","apps_truncated"]})j"},
 
     {"get_dex_catalogue",
      "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
@@ -1841,8 +1847,8 @@ static const ToolDef kTools[] = {
      "failure_rate_ratio against previous_version (the next older returned version; null "
      "for the oldest known version and for the unknown version; exact conditional "
      "interval; upper is null with unbounded=true when the previous version saw no "
-     "exposed events). No device floor applies to this join or to points[] (maintainer "
-     "ruling, floor of one device): every figure is published at any device count. "
+     "exposed events). No device floor applies to this join or to points[] (floor of "
+     "one device): every figure is published at any device count. "
      "exposure_basis "
      "resource_significant: exposure is the daily top-N consumers, not a census. "
      "stat_failures counts statistics that returned nothing on valid input (expected 0). "

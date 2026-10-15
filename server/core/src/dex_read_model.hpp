@@ -148,13 +148,16 @@ inline constexpr const char* kDexAppsPopulationBasis = "windows_online";
 /// policy): never render it as an empty or perfect list.
 struct DexAppsModel {
     std::string window;
-    std::optional<int64_t> population; ///< Windows devices online now; nullopt = unknown (never 0)
+    std::optional<int64_t> population; ///< Windows devices online now; nullopt = no fleet source wired (unknown), 0 = no Windows device online
     std::vector<DexAppStability> apps;
+    int64_t apps_total{0};       ///< every application with a Windows crash/hang signal in the window
+    bool apps_truncated{false};  ///< apps_total > apps.size(): the top-N cut dropped some
     bool degraded{false};
 };
 
 /// PURE assembly of the Apps model from grouped store rows. OWNS the published
-/// order: applications by crashes+hangs DESC then subject ASC; each
+/// order: applications by crashes+hangs DESC then subject ASC (membership at the
+/// top-N cut is the store's: most devices affected first); each
 /// application's versions by devices affected DESC then version ASC. Scores use
 /// kDexCohortFloor (one device, maintainer ruling 2026-10-14): every figure is
 /// published at any device count; an unknown or zero population withholds

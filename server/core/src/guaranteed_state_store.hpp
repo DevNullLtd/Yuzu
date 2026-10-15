@@ -278,9 +278,11 @@ public:
                                       const std::string& platform = "") const;
     std::vector<DexAppCrashCount> dex_top_apps(const std::string& since = "", int limit = 20) const;
     /// Windows-scoped (`platform`) application AND per-version stability rows in
-    /// ONE statement (one snapshot): for the top `app_limit` applications by
-    /// crashes+hangs (the `dex_top_apps` ranking decides MEMBERSHIP), one total
-    /// row (`version` nullopt, plus `version_count`) and up to `version_limit`
+    /// ONE statement (one snapshot): for the `app_limit` applications affecting
+    /// the most devices (then events, then name; Windows rows only) -- the
+    /// published activity order is the assembler's -- one total row (`version`
+    /// nullopt, plus `version_count` and `apps_total`, the count of every
+    /// qualifying application before the cut) and up to `version_limit`
     /// version rows (most devices affected first). `per_device_cap` caps each
     /// device's events in the `capped_*` sums (the stability score's caller
     /// duty). `std::nullopt` on a degraded read (store-not-open / pool-timeout /

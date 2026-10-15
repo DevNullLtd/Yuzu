@@ -2617,6 +2617,8 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
     // Additive per-application and per-version figures.
     CHECK(j["data"]["population"].is_number_integer());
     CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(j["data"]["apps_total"] == 2);
+    CHECK(j["data"]["apps_truncated"] == false);
     CHECK_FALSE(j["data"].contains("stat_failures"));
     const auto& first = j["data"]["apps"][0];
     for (const char* k : {"share_affected", "rate_per_1000", "score", "version_count", "versions_truncated"})
@@ -2653,8 +2655,17 @@ TEST_CASE("REST dex/apps: a degraded store read -> 503 with retry_after_ms, neve
     REQUIRE(res);
     CHECK(res->status == 503);
     auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"] == 503);
     CHECK(j["error"]["retry_after_ms"] == 2000);
     CHECK(res->body.find("\"apps\"") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps: an off-enum window is a 400, never a silent default",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/apps?window=bogus");
+    REQUIRE(res);
+    CHECK(res->status == 400);
 }
 
 TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no audit",
@@ -3641,7 +3652,7 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         REQUIRE(res);
         CHECK(res->status == 200);
         auto j = nlohmann::json::parse(res->body);
-        CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+        CHECK(j["data"]["floor"].get<int64_t>() == 1); // the one-device floor, as a literal
         CHECK(j["data"]["key"].get<std::string>() == "model");
         CHECK(j["data"]["value"].get<std::string>() == "Latitude 5420");
     }
@@ -3729,7 +3740,7 @@ TEST_CASE("REST dex/perf/group: missing params → 400; provider absent → 503;
         REQUIRE(res);
         CHECK(res->status == 200);
         auto j = nlohmann::json::parse(res->body);
-        CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+        CHECK(j["data"]["floor"].get<int64_t>() == 1); // the one-device floor, as a literal
     }
 }
 

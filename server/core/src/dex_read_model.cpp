@@ -187,12 +187,12 @@ DexStabilityFigures apps_figures(const DexAppStabilityRow& r, std::optional<int6
     f.hangs = hangs;
     f.distinct_devices = affected;
     f.last_seen = r.last_seen;
-    // An unknown or zero population nulls both share and rate; affected >
-    // population nulls the share only (the rate stays published). A refusal,
-    // not a failure.
-    if (population && *population > 0) {
-        if (affected >= 0 && affected <= *population)
-            f.share_affected = dex_proportion(affected, *population);
+    // An unknown or zero population nulls both share and rate; so does
+    // affected > population (the window outlives the devices online, the same
+    // denominator mismatch that withholds the score as inconsistent). A
+    // refusal, not a failure.
+    if (population && *population > 0 && affected >= 0 && affected <= *population) {
+        f.share_affected = dex_proportion(affected, *population);
         if (crashes + hangs >= 0)
             f.rate_per_1000 = dex_rate(crashes + hangs, static_cast<double>(*population) / 1000.0);
     }
@@ -250,6 +250,7 @@ DexAppsModel dex_apps_model_from_rows(const std::string& window,
         a.subject = r.subject;
         a.figures = apps_figures(r, population, eff);
         a.version_count = r.version_count;
+        m.apps_total = std::max(m.apps_total, r.apps_total);
         a.versions_truncated = r.version_count > kDexAppsVersionCap;
         index[a.subject] = m.apps.size();
         m.apps.push_back(std::move(a));
@@ -266,6 +267,7 @@ DexAppsModel dex_apps_model_from_rows(const std::string& window,
         v.figures = apps_figures(r, population, eff);
         m.apps[it->second].versions.push_back(std::move(v));
     }
+    m.apps_truncated = m.apps_total > static_cast<int64_t>(m.apps.size());
     std::stable_sort(m.apps.begin(), m.apps.end(), [](const DexAppStability& x, const DexAppStability& y) {
         const int64_t ax = x.figures.crashes + x.figures.hangs;
         const int64_t ay = y.figures.crashes + y.figures.hangs;
@@ -328,6 +330,8 @@ std::string dex_apps_json(const DexAppsModel& model) {
     }
     json out{{"window", model.window}};
     out["apps"] = std::move(arr);
+    out["apps_total"] = model.apps_total;
+    out["apps_truncated"] = model.apps_truncated;
     out["population"] = model.population ? json(*model.population) : json(nullptr);
     out["population_basis"] = kDexAppsPopulationBasis;
     return out.dump();

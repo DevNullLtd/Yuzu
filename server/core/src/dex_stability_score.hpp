@@ -98,7 +98,7 @@
  *   deductions are present together exactly when `withheld` is empty. No
  *   withheld result carries N, A or any count, whatever the reason. A page
  *   that shows a count from its own input may show N, and only N, for
- *   below_floor (a count under the floor identifies nobody); never A, crash or
+ *   below_floor; never A, crash or
  *   hang counts, which are the individual behaviour the floor withholds, and
  *   never any count for no_population, inconsistent, invalid_weights or
  *   invalid_edges.

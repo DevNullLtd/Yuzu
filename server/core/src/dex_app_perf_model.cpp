@@ -487,11 +487,9 @@ AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> 
         if (!cur.exposure_devices || !prev.exposure_devices || *cur.exposure_devices <= 0 ||
             *prev.exposure_devices <= 0)
             continue;
-        // The exposure is a device count: the minimum exposure is stated as 1
-        // explicitly (equal to the derived default since the 2026-10-14 ruling).
         cur.failure_rate_ratio =
             dex_rate_ratio(exposed_events[i], static_cast<double>(*cur.exposure_devices),
-                           exposed_events[i + 1], static_cast<double>(*prev.exposure_devices), 1.0);
+                           exposed_events[i + 1], static_cast<double>(*prev.exposure_devices));
         // Both arms zero-event, or an arm past the ratio's accuracy limit, are
         // documented refusals; any other missing ratio is a computation failure.
         const bool refusal = (exposed_events[i] == 0 && exposed_events[i + 1] == 0) ||

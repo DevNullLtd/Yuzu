@@ -2844,8 +2844,9 @@ groups:
             yuzu_server_guardian_read_degrade_total{reason="{{ $labels.reason }}",
             source="{{ $labels.source }}"} is non-zero. source="guardian_state"
             means a DEX/observation read (crash summary, top apps, device
-            score inputs, ...) is degrading and fails SOFT - callers keep
-            serving an empty/partial result, so this counter and the sampled
+            score inputs, ...) is degrading and fails SOFT (except the
+            per-device score, catalogue and Apps list reads, which fail closed)
+            - callers keep serving an empty/partial result, so this counter and the sampled
             warn log are the only external tell; do not read a "healthy"
             device compliance score as authoritative while this fires (#4855).
             source="guardian_rules" means an AUTHORITATIVE rule/status read

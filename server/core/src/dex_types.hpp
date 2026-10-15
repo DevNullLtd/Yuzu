@@ -78,7 +78,9 @@ struct DexAppCrashCount {          // top unreliable apps + blast radius
 /// (`version` == nullopt) or one of its versions (`version` == "" is the
 /// unknown-version bucket, the same convention as AppPerfVersionFailureRow).
 /// `capped_*` are sums over devices of min(events_d, per-device cap), the
-/// stability score's caller duty. `version_count` is set on total rows only.
+/// stability score's caller duty. `version_count` and `apps_total` (every
+/// application with a signal in the window, before the top-N cut) are set on
+/// total rows only.
 struct DexAppStabilityRow {
     std::string subject;
     std::optional<std::string> version;
@@ -88,6 +90,7 @@ struct DexAppStabilityRow {
     int64_t capped_crashes{0};
     int64_t capped_hangs{0};
     int64_t version_count{0};
+    int64_t apps_total{0};
     std::string last_seen;
 };
 struct DexModuleCrashCount {       // top faulting modules (crash-scoped)

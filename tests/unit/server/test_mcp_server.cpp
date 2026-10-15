@@ -8227,6 +8227,7 @@ TEST_CASE("MCP DEX: list_dex_apps reports a degraded read as an error, never an 
     CHECK(res->body.find("\"result\"") == std::string::npos);
     CHECK(res->body.find("DEX store read degraded") != std::string::npos);
     auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == kInternalError);
     CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|failure");
     for (const auto& a : ts.audit_log)
@@ -8365,8 +8366,11 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         REQUIRE(t.contains("outputSchema"));
         const auto& out = t["outputSchema"];
         CHECK(out["required"] ==
-              nlohmann::json::array({"window", "apps", "population", "population_basis"}));
+              nlohmann::json::array({"window", "apps", "population", "population_basis", "apps_total",
+                                     "apps_truncated"}));
         CHECK(out["properties"]["population"]["type"] == nlohmann::json::array({"integer", "null"}));
+        CHECK(out["properties"]["apps_total"]["type"] == "integer");
+        CHECK(out["properties"]["apps_truncated"]["type"] == "boolean");
         const auto& row = out["properties"]["apps"]["items"]["properties"];
         for (const char* k : {"share_affected", "rate_per_1000", "score", "versions", "version_count",
                               "versions_truncated"})
@@ -8379,6 +8383,11 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
               nlohmann::json::array({"version", "crashes", "hangs", "distinct_devices", "last_seen",
                                      "share_affected", "rate_per_1000", "score"}));
         for (const auto* node : {&row, &row["versions"]["items"]["properties"]}) {
+            const auto obj_null = nlohmann::json::array({"object", "null"});
+            CHECK((*node)["share_affected"]["type"] == obj_null);
+            CHECK((*node)["rate_per_1000"]["type"] == obj_null);
+            CHECK((*node)["score"]["properties"]["withheld"]["type"] ==
+                  nlohmann::json::array({"string", "null"}));
             CHECK((*node)["share_affected"]["required"] == interval_req);
             CHECK((*node)["rate_per_1000"]["required"] == interval_req);
             CHECK((*node)["score"]["properties"]["deductions"]["items"]["required"] == deduction_req);

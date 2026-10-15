@@ -31,7 +31,8 @@ using namespace yuzu::server;
 namespace {
 
 DexAppStabilityRow total_row(const std::string& subject, int64_t crashes, int64_t hangs, int64_t affected,
-                             int64_t cc, int64_t ch, int64_t version_count = 1) {
+                             int64_t cc, int64_t ch, int64_t version_count = 1,
+                             int64_t apps_total = 0) {
     DexAppStabilityRow r;
     r.subject = subject;
     r.crashes = crashes;
@@ -40,6 +41,7 @@ DexAppStabilityRow total_row(const std::string& subject, int64_t crashes, int64_
     r.capped_crashes = cc;
     r.capped_hangs = ch;
     r.version_count = version_count;
+    r.apps_total = apps_total;
     r.last_seen = "2026-10-14T00:00:00Z";
     return r;
 }
@@ -138,7 +140,46 @@ TEST_CASE("apps model: more devices affected than online is a refusal, not a cla
     const auto m = dex_apps_model_from_rows("30d", {total_row("a.exe", 9, 0, 9, 9, 0)}, 5, def());
     const auto& f = m.apps[0].figures;
     CHECK_FALSE(f.share_affected);
+    CHECK_FALSE(f.rate_per_1000); // same denominator mismatch: no rate on a basis the row calls inconsistent
     CHECK(std::string(f.score.withheld) == "inconsistent");
+    // Exactly the population affected is consistent: share and rate are published.
+    const auto eq = dex_apps_model_from_rows("30d", {total_row("a.exe", 9, 0, 5, 9, 0)}, 5, def());
+    CHECK(eq.apps[0].figures.share_affected);
+    CHECK(eq.apps[0].figures.rate_per_1000);
+    CHECK(eq.apps[0].figures.score.score);
+}
+
+TEST_CASE("apps model: apps_total and apps_truncated name the top-N cut", "[dex][apps_model]") {
+    const auto cut = dex_apps_model_from_rows(
+        "7d", {total_row("a.exe", 1, 0, 1, 1, 0, 1, 5), total_row("b.exe", 1, 0, 1, 1, 0, 1, 5),
+               total_row("c.exe", 1, 0, 1, 1, 0, 1, 5)},
+        10, def());
+    CHECK(cut.apps_total == 5);
+    CHECK(cut.apps_truncated);
+    const auto whole = dex_apps_model_from_rows("7d", {total_row("a.exe", 1, 0, 1, 1, 0, 1, 1)}, 10, def());
+    CHECK(whole.apps_total == 1);
+    CHECK_FALSE(whole.apps_truncated);
+}
+
+TEST_CASE("apps model: order and assembly corners", "[dex][apps_model]") {
+    // A version row fed before its total still attaches; the activity key
+    // counts hangs; a version with fewer devices but more events sorts after
+    // one with more devices.
+    const auto m = dex_apps_model_from_rows(
+        "7d",
+        {version_row("a.exe", "1.0", 9, 0, 1), version_row("a.exe", "2.0", 1, 0, 2),
+         total_row("a.exe", 10, 0, 2, 10, 0), total_row("b.exe", 4, 7, 1, 4, 5)},
+        20, def());
+    REQUIRE(m.apps.size() == 2);
+    CHECK(m.apps[0].subject == "b.exe"); // 4 + 7 hangs beats 10 crashes
+    REQUIRE(m.apps[1].versions.size() == 2);
+    CHECK(m.apps[1].versions[0].version == "2.0");
+    CHECK(m.apps[1].versions[1].version == "1.0");
+    // The floor is one device: a population of 1 or 2 still scores.
+    for (const int64_t pop : {1, 2}) {
+        const auto s2 = dex_apps_model_from_rows("7d", {total_row("a.exe", 1, 0, 1, 1, 0)}, pop, def());
+        CHECK(s2.apps[0].figures.score.score);
+    }
 }
 
 TEST_CASE("apps model: a one-device application is published with no floor", "[dex][apps_model]") {
@@ -191,7 +232,7 @@ TEST_CASE("apps json: exact golden for the unknown-population model", "[dex][app
         R"("share_affected":null)";
     const std::string expect =
         R"({"apps":[{)" + fig + R"(,"subject":"a.exe","version_count":1,"versions":[{)" + fig +
-        R"(,"version":"1.0"}],"versions_truncated":false}],"population":null,)"
+        R"(,"version":"1.0"}],"versions_truncated":false}],"apps_total":0,"apps_truncated":false,"population":null,)"
         R"("population_basis":"windows_online","window":"7d"})";
     CHECK(dex_apps_json(m) == expect);
 }
@@ -203,6 +244,8 @@ TEST_CASE("apps json: pre-existing keys survive and the key set is the documente
     CHECK(j["window"] == "7d");
     CHECK(j["population"] == 50);
     CHECK(j["population_basis"] == "windows_online");
+    CHECK(j["apps_total"] == 0);
+    CHECK(j["apps_truncated"] == false);
     const auto& a = j["apps"][0];
     CHECK(a["subject"] == "a.exe");
     CHECK(a["crashes"] == 12);
@@ -231,5 +274,22 @@ TEST_CASE("apps json: an empty model", "[dex][apps_model]") {
     DexAppsModel m;
     m.window = "7d";
     CHECK(dex_apps_json(m) ==
-          R"({"apps":[],"population":null,"population_basis":"windows_online","window":"7d"})");
+          R"({"apps":[],"apps_total":0,"apps_truncated":false,"population":null,)"
+          R"("population_basis":"windows_online","window":"7d"})");
+}
+
+TEST_CASE("apps json: a populated row carries the score object, rate and both cap flags",
+          "[dex][apps_model]") {
+    const auto m = dex_apps_model_from_rows(
+        "7d", {total_row("a.exe", 12, 3, 7, 10, 3, 21, 100), version_row("a.exe", "1.0", 12, 3, 7)}, 50, def());
+    const auto j = nlohmann::json::parse(dex_apps_json(m));
+    CHECK(j["apps_total"] == 100);
+    CHECK(j["apps_truncated"] == true);
+    const auto& a = j["apps"][0];
+    CHECK(a["version_count"] == 21);
+    CHECK(a["versions_truncated"] == true);
+    CHECK(a["score"]["withheld"].is_null());
+    CHECK(a["rate_per_1000"]["estimate"].get<double>() == Approx(300.0));
+    CHECK(a["score"]["deductions"][0]["name"].is_string());
+    CHECK(a["versions"][0]["version"] == "1.0");
 }

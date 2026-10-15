@@ -431,13 +431,18 @@ TEST_CASE("DexApi: apps caps versions at 20 and flags it", "[pg][dex][apps_model
         seed_obs_v(store, "v" + std::to_string(i), "d" + std::to_string(i), "many.exe",
                    "process.crashed", v, kTs);
     }
+    // The lexically last version ("1.0.0.9") is the most affected: it must be
+    // kept and listed first, so the cut ranks by devices, not by name.
+    seed_obs_v(store, "v-extra", "d-extra", "many.exe", "process.crashed", "1.0.0.9", kTs);
     const auto m = make_local_dex_api(&store, {})->apps("7d");
     REQUIRE(m.apps.size() == 1);
     CHECK(m.apps[0].version_count == 21);
     CHECK(m.apps[0].versions_truncated);
-    // Equal devices everywhere: the kept 20 are the lexically smallest, in order.
+    // Then equal devices: the kept 19 are the lexically smallest, in order.
     std::sort(versions.begin(), versions.end());
-    versions.resize(20);
+    versions.pop_back(); // "1.0.0.9", listed first
+    versions.resize(19);
+    versions.insert(versions.begin(), "1.0.0.9");
     REQUIRE(m.apps[0].versions.size() == 20);
     for (std::size_t i = 0; i < 20; ++i)
         CHECK(m.apps[0].versions[i].version == versions[i]);
@@ -527,8 +532,8 @@ TEST_CASE("DexApi: apps counts Windows rows only", "[pg][dex][apps_model]") {
     CHECK(m.apps[0].version_count == 2);
 }
 
-// 102 subjects: the top 100 by activity are kept, ties fall to subject order, and
-// the cut is made on activity rank, not on name.
+// 102 subjects: the top 100 by devices affected then activity are kept, ties fall
+// to subject order, and the cut is made on that rank, not on name.
 TEST_CASE("DexApi: apps keeps the top 100 applications by activity", "[pg][dex][apps_model]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -567,4 +572,81 @@ TEST_CASE("DexApi: apps on an intact empty store is a healthy empty list", "[pg]
     const auto m = make_local_dex_api(&store, {})->apps("7d");
     CHECK_FALSE(m.degraded);
     CHECK(m.apps.empty());
+}
+
+// One sick device crash-looping three applications must not displace an
+// application on eight devices from the top-N cut: membership is the most
+// devices affected, and apps_total/apps_truncated name the cut.
+TEST_CASE("DexApi: apps top-N membership is devices affected, not raw events",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int n = 0;
+    for (const char* app : {"sick-a.exe", "sick-b.exe", "sick-c.exe"})
+        for (int i = 0; i < 9; ++i)
+            seed_obs_v(store, "sk" + std::to_string(++n), "sick", app, "process.crashed", "1.0", kTs);
+    for (int i = 0; i < 8; ++i)
+        seed_obs_v(store, "wd" + std::to_string(++n), "w" + std::to_string(i), "widespread.exe",
+                   "process.crashed", "1.0", kTs);
+    const auto rows = store.dex_app_stability_checked(yuzu::server::dex_iso_since(7), "windows",
+                                                      /*app_limit=*/2, 20, 5);
+    REQUIRE(rows);
+    int totals = 0;
+    bool widespread = false;
+    for (const auto& r : *rows) {
+        if (r.version)
+            continue;
+        ++totals;
+        CHECK(r.apps_total == 4);
+        widespread = widespread || r.subject == "widespread.exe";
+    }
+    CHECK(totals == 2);
+    CHECK(widespread);
+    const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20,
+                                                          yuzu::server::dex_default_score_policy());
+    CHECK(m.apps_total == 4);
+    CHECK(m.apps_truncated);
+}
+
+// Store-level pins for the window, the per-device cap and last_seen.
+TEST_CASE("DexApi: apps store read honours the window, the per-device cap and last_seen",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    const std::string later = yuzu::server::dex_iso_since(1).substr(0, 10) + "T12:00:00Z";
+    const std::string old_ts = yuzu::server::dex_iso_since(40).substr(0, 10) + "T12:00:00Z";
+    int n = 0;
+    auto id = [&] { return "q" + std::to_string(++n); };
+    // One device, 4 crashes in each of two versions: capped at 5 per device, 4 per version.
+    for (int i = 0; i < 4; ++i) {
+        seed_obs_v(store, id(), "c1", "cap.exe", "process.crashed", "1.0", kTs);
+        seed_obs_v(store, id(), "c1", "cap.exe", "process.crashed", "2.0", i == 0 ? later : kTs);
+    }
+    for (int i = 0; i < 7; ++i)
+        seed_obs_v(store, id(), "c2", "cap.exe", "process.hung", "1.0", kTs);
+    seed_obs_v(store, id(), "c3", "cap.exe", "process.crashed", "1.0", old_ts); // outside 7d
+    auto total_of = [](const std::vector<yuzu::server::DexAppStabilityRow>& rows) {
+        for (const auto& r : rows)
+            if (!r.version)
+                return r;
+        FAIL("no total row");
+        return yuzu::server::DexAppStabilityRow{};
+    };
+    const auto week = store.dex_app_stability_checked(yuzu::server::dex_iso_since(7), "windows", 10, 20, 5);
+    REQUIRE(week);
+    const auto t = total_of(*week);
+    CHECK(t.crashes == 8);
+    CHECK(t.capped_crashes == 5);
+    CHECK(t.hangs == 7);
+    CHECK(t.capped_hangs == 5);
+    CHECK(t.affected_devices == 2);
+    CHECK(t.last_seen == later);
+    const auto all = store.dex_app_stability_checked("", "windows", 10, 20, 5);
+    REQUIRE(all);
+    CHECK(total_of(*all).affected_devices == 3);
+    CHECK(total_of(*all).crashes == 9);
 }
