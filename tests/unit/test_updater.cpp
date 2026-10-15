@@ -192,6 +192,39 @@ TEST_CASE("rollback_if_needed returns true when .old exists but NO verified mark
     REQUIRE_FALSE(fs::exists(old_path));
 }
 
+#ifndef _WIN32
+// PR #4482 governance ch-4: a .old another account could have written is never
+// promoted to the executable, whether group/world-writable or a symlink.
+TEST_CASE("rollback_if_needed refuses a writable or symlinked .old",
+          "[updater][rollback]") {
+    TempUpdaterDir tmp("rollback_untrusted");
+    const auto& dir = tmp.guard.path;
+    auto exe_path = dir / "yuzu-agent";
+    auto old_path = dir / "yuzu-agent.old";
+    write_fake_binary(exe_path);
+
+    UpdateConfig config;
+    Updater updater(config, "test-agent", "0.1.0", "darwin", "arm64", exe_path);
+
+    SECTION("group- or world-writable") {
+        write_fake_binary(old_path);
+        fs::permissions(old_path, fs::perms::group_write | fs::perms::others_write,
+                        fs::perm_options::add);
+        REQUIRE_FALSE(updater.rollback_if_needed());
+    }
+    SECTION("a symlink") {
+        auto target = dir / "planted";
+        write_fake_binary(target);
+        fs::create_symlink(target, old_path);
+        REQUIRE_FALSE(updater.rollback_if_needed());
+    }
+    // The executable was not replaced.
+    REQUIRE_FALSE(fs::is_symlink(exe_path));
+    std::ifstream in(exe_path, std::ios::binary);
+    REQUIRE(std::string(std::istreambuf_iterator<char>(in), {}) == "fake-binary-content");
+}
+#endif
+
 TEST_CASE("disabled startup maintenance leaves executable-adjacent rollback files untouched",
           "[updater][maintenance][no-auto-update]") {
     TempUpdaterDir tmp("disabled_maintenance");

@@ -1052,6 +1052,21 @@ bool Updater::rollback_if_needed() {
     // register or crashed on startup). Roll back to the previous binary.
     spdlog::warn("Update verification marker not found — rolling back to previous binary");
 
+#ifndef _WIN32
+    // The rename below makes .old the executable the service manager runs next.
+    // Only this process's own account may have written it: a planted file left
+    // in a once-writable directory would otherwise be promoted to the daemon
+    // (PR #4482 governance ch-4). lstat, so a symlink is refused, not followed.
+    struct stat old_st {};
+    if (::lstat(old_path.c_str(), &old_st) != 0 || !S_ISREG(old_st.st_mode) ||
+        old_st.st_uid != ::geteuid() || (old_st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        spdlog::error("Refusing rollback: '{}' is not a regular file owned by this account "
+                      "and writable only by it",
+                      old_path.string());
+        return false;
+    }
+#endif
+
     fs::rename(old_path, exe_path_, ec);
     if (ec) {
         spdlog::error("CRITICAL: Rollback failed: '{}' -> '{}': {}", old_path.string(),
