@@ -24,7 +24,7 @@
 ///     the request ever reaches the handlers this file registers. That
 ///     exemption is load-bearing infrastructure (a monitoring probe or an
 ///     orchestrator health check must work with no credentials) and stays
-///     in server.cpp untouched — grep `is_probe_path` there.
+///     in server.cpp, which now calls this header's `is_probe_path` for the probe set.
 ///   - `/health`/`/api/health`'s shared `health_handler` ADDITIONALLY does
 ///     its own optional, non-blocking session resolve
 ///     (`deps.resolve_session_fn`, never writes to `res` on failure) to
@@ -101,7 +101,8 @@
 /// The corresponding `ServerImpl::nvd_metrics_scrape_mu_` member declaration
 /// is deleted from server.cpp by this extraction (dead after the move).
 ///
-/// Routes (6), plus the first four again on `deps.plaintext_probe_sink` when set:
+/// Routes (6), plus /livez, /readyz, /health and /api/health again on
+/// `deps.plaintext_probe_sink` when set:
 ///   GET /metrics                    (unauthenticated from 127.0.0.1/::1 always;
 ///                                     remote depends on cfg_.metrics_require_auth
 ///                                     — that branch lives in server.cpp's

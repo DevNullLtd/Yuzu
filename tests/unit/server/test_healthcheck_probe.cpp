@@ -28,8 +28,14 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
+
+#ifndef _WIN32
+#include <csignal>
+#include <signal.h>
+#endif
 
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
@@ -181,6 +187,66 @@ TEST_CASE("healthcheck: control bytes in the target never split the diagnostic l
     CHECK(line.find("(trust anchor: /certs/an_chor_.pem)") != std::string::npos);
 }
 
+TEST_CASE("healthcheck: each diagnostic field is capped on its own, never the whole line",
+          "[server][healthcheck]") {
+    // healthcheck_diagnostic wraps log_key_token around the URL, the reason and the anchor
+    // SEPARATELY: each over-long field keeps a 231-byte head, '~' and a 24-byte tail (256 bytes),
+    // and the literal scaffolding between them survives. A single wrap around the whole line
+    // would yield one 256-byte line and fail every check below.
+    HealthcheckTarget t;
+    t.tls = true;
+    t.host = std::string(300, 'a');
+    t.port = 8443;
+    t.path = "/readyz";
+    t.trust_anchor = fs::path{"/" + std::string(300, 'c') + ".pem"};
+    const std::string reason(300, 'b');
+
+    const auto url = healthcheck_url(t);
+    const auto anchor = t.trust_anchor.string();
+    const auto line = healthcheck_diagnostic(t, {0, reason});
+
+    CHECK(line == "healthcheck: GET " + yuzu::log_key_token(url) + " -> " +
+                      yuzu::log_key_token(reason) + " (trust anchor: " +
+                      yuzu::log_key_token(anchor) + ")");
+
+    // Independently of the helper: 17 + 4 + 16 + 1 bytes of scaffolding around three 256-byte
+    // tokens.
+    constexpr std::size_t kScaffolding = 17 + 4 + 16 + 1;
+    constexpr std::size_t kToken = 256;
+    constexpr std::size_t kMarker = 231; // head bytes before the '~'
+    REQUIRE(line.size() == 3 * kToken + kScaffolding);
+
+    const std::string url_token = line.substr(17, kToken);
+    const std::string reason_token = line.substr(17 + kToken + 4, kToken);
+    const std::string anchor_token = line.substr(17 + kToken + 4 + kToken + 16, kToken);
+    CHECK(line.substr(17 + kToken, 4) == " -> ");
+    CHECK(line.substr(17 + kToken + 4 + kToken, 16) == " (trust anchor: ");
+    CHECK(line.back() == ')');
+
+    for (const auto* tok : {&url_token, &reason_token, &anchor_token}) {
+        CHECK((*tok)[kMarker] == '~');
+        CHECK(tok->find('~') == kMarker);
+    }
+    CHECK(url_token.starts_with("https://aaaa"));
+    CHECK(url_token.substr(kMarker + 1) == url.substr(url.size() - 24));
+    CHECK(reason_token.substr(kMarker + 1) == std::string(24, 'b'));
+    CHECK(anchor_token.substr(kMarker + 1) == std::string(20, 'c') + ".pem");
+}
+
+TEST_CASE("healthcheck: the diagnostic keeps spaces and backslashes in a Windows anchor path",
+          "[server][healthcheck]") {
+    HealthcheckTarget t;
+    t.tls = true;
+    t.host = "127.0.0.1";
+    t.port = 8443;
+    t.path = "/readyz";
+    // On POSIX fs::path keeps the backslashes verbatim in .string().
+    t.trust_anchor = fs::path{R"(C:\Program Files\Yuzu\certs\default-ca.pem)"};
+    CHECK(healthcheck_diagnostic(t, {503, {}}) ==
+          "healthcheck: GET https://127.0.0.1:8443/readyz -> 503 (trust anchor: "
+          "C:\\Program Files\\Yuzu\\certs\\default-ca.pem)");
+}
+
 TEST_CASE("healthcheck: probe_bounded abandons a probe that outlives the deadline",
           "[server][healthcheck]") {
     // The probe captures a shared_future copy, so the abandoned worker owns what it waits on.
@@ -209,6 +275,96 @@ TEST_CASE("healthcheck: probe_bounded returns the outcome of a probe that finish
     REQUIRE(out.has_value());
     CHECK(out->status == 200);
 }
+
+namespace {
+
+// File-static so a plain function pointer (run_healthcheck's hard_exit hook, shaped like
+// std::_Exit) can record into it.
+std::atomic<int> g_recorded_exit{-1};
+void record_exit(int code) {
+    g_recorded_exit = code;
+}
+
+} // namespace
+
+TEST_CASE("healthcheck: run_healthcheck cuts a hanging probe at the deadline, prints the timeout "
+          "line and exits 1",
+          "[server][healthcheck]") {
+    g_recorded_exit = -1;
+    Config cfg{};
+    cfg.https_enabled = false; // plain target: no anchor, and nothing is dialled (probe injected)
+    // The hanging probe ends by itself after 2 s. With the probe_bounded wrapper removed,
+    // run_healthcheck would get that 200 back (code 0, no line, no exit) and FAIL the checks
+    // below instead of hanging the suite.
+    std::promise<void> release;
+    auto hanging = [released = release.get_future().share()](const HealthcheckTarget&) {
+        released.wait_for(std::chrono::seconds(2));
+        return HealthcheckOutcome{.status = 200, .error = {}};
+    };
+    std::ostringstream diag;
+
+    const int code = run_healthcheck(cfg, "/readyz", diag, hanging, std::chrono::milliseconds(50),
+                                     &record_exit);
+    release.set_value(); // let the abandoned worker finish
+
+    CHECK(code == 1);
+    CHECK(g_recorded_exit.load() == 1);
+    CHECK(diag.str() == "healthcheck: GET http://127.0.0.1:" + std::to_string(cfg.web_port) +
+                            "/readyz -> timed out after 50 ms (trust anchor: none)\n");
+    // Pinned in the header too: published in the server-admin Time row; compose's timeout is 5 s.
+    CHECK(kProbeDeadline == std::chrono::milliseconds(4000));
+}
+
+TEST_CASE("healthcheck: run_healthcheck with a probe that answers in time prints nothing and does "
+          "not hard-exit",
+          "[server][healthcheck]") {
+    g_recorded_exit = -1;
+    Config cfg{};
+    cfg.https_enabled = false;
+    std::ostringstream diag;
+
+    const int code = run_healthcheck(
+        cfg, "/readyz", diag,
+        [](const HealthcheckTarget&) { return HealthcheckOutcome{.status = 200, .error = {}}; },
+        std::chrono::seconds(2), &record_exit);
+
+    CHECK(code == 0);
+    CHECK(diag.str().empty());
+    CHECK(g_recorded_exit.load() == -1);
+}
+
+#ifndef _WIN32
+TEST_CASE("healthcheck: run_healthcheck ignores SIGPIPE before the probe runs",
+          "[server][healthcheck]") {
+    // httplib ignores SIGPIPE only inside Server::Server(), which the --healthcheck process never
+    // constructs; a reset peer would otherwise kill it with 141 and no diagnostic.
+    struct sigaction prev{};
+    REQUIRE(sigaction(SIGPIPE, nullptr, &prev) == 0);
+    yuzu::test::ScopeExit restore{[&] { sigaction(SIGPIPE, &prev, nullptr); }};
+    // The live cases' httplib Server constructors have already flipped SIGPIPE to SIG_IGN
+    // process-wide: start from the default so run_healthcheck is the only thing that can ignore it.
+    std::signal(SIGPIPE, SIG_DFL);
+
+    g_recorded_exit = -1;
+    Config cfg{};
+    cfg.https_enabled = false;
+    bool seen_ignored = false;
+    std::ostringstream diag;
+    // Captured inside the probe, so this also proves the ordering: before the first socket I/O.
+    const int code = run_healthcheck(
+        cfg, "/readyz", diag,
+        [&seen_ignored](const HealthcheckTarget&) {
+            struct sigaction sa{};
+            sigaction(SIGPIPE, nullptr, &sa);
+            seen_ignored = (sa.sa_handler == SIG_IGN);
+            return HealthcheckOutcome{.status = 200, .error = {}};
+        },
+        kProbeDeadline, &record_exit);
+
+    CHECK(code == 0);
+    CHECK(seen_ignored);
+}
+#endif
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 TEST_CASE("healthcheck: a TLS target with no trust anchor is refused, never probed against the "

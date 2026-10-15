@@ -2,6 +2,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include <csignal>
 #include <cstdlib>
 #include <future>
 #include <ostream>
@@ -24,11 +25,11 @@ std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) 
     // install CA, or the operator's --https-cert). The [live] containment test
     // counts the store after a connect.
     c->set_ca_cert_path(t.trust_anchor.string());
+    auto* ctx = static_cast<SSL_CTX*>(c->tls_context());
     if (t.partial_chain) {
         // Operator mode: the anchor is the (possibly non-self-signed) server
         // certificate itself, so its issuer is absent from the store.
-        X509_STORE_set_flags(SSL_CTX_get_cert_store(static_cast<SSL_CTX*>(c->tls_context())),
-                             X509_V_FLAG_PARTIAL_CHAIN);
+        X509_STORE_set_flags(SSL_CTX_get_cert_store(ctx), X509_V_FLAG_PARTIAL_CHAIN);
     }
     c->enable_server_certificate_verification(true);
     c->enable_server_hostname_verification(false);
@@ -39,7 +40,7 @@ std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) 
     // read timeout. A peer that stalls (never answers, so never reads ours) would cost
     // one more read timeout on top of the request deadline (measured +2.0 s). The probe
     // reads one status line and exits, so there is nothing a clean close would protect.
-    SSL_CTX_set_quiet_shutdown(static_cast<SSL_CTX*>(c->tls_context()), 1);
+    SSL_CTX_set_quiet_shutdown(ctx, 1);
     return c;
 }
 #endif
@@ -104,7 +105,15 @@ std::optional<HealthcheckOutcome> probe_bounded(std::chrono::milliseconds deadli
     return done.get();
 }
 
-int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag) {
+int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag,
+                    std::function<HealthcheckOutcome(const HealthcheckTarget&)> probe,
+                    std::chrono::milliseconds deadline, void (*hard_exit)(int)) {
+#ifndef _WIN32
+    // httplib ignores SIGPIPE only inside Server::Server() (httplib.h:10404-10406), which this
+    // one-shot mode never constructs, and sends with flags 0: a client writing into a reset peer
+    // would otherwise die with 141 and no diagnostic. Set before the first socket write.
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
     constexpr bool kTlsSupported = true;
 #else
@@ -112,22 +121,22 @@ int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag
 #endif
     const auto target =
         resolve_healthcheck_target(cfg, path, auth::default_cert_dir(), kTlsSupported);
-    // Absolute cap over the whole probe, name resolution and handshake included; 1 s of
-    // headroom under compose's 5 s covers exec, CLI parse, the diagnostic write and exit.
-    constexpr std::chrono::milliseconds kProbeDeadline{4000};
-    const auto outcome = probe_bounded(kProbeDeadline, [target] { return probe_once(target); });
-    if (!outcome) {
-        const HealthcheckOutcome timed_out{
-            .status = 0,
-            .error = "timed out after " + std::to_string(kProbeDeadline.count()) + " ms"};
-        diag << healthcheck_diagnostic(target, timed_out) << '\n';
-        diag.flush();
-        // The abandoned worker is blocked in httplib/OpenSSL: skip static destructors.
-        std::_Exit(healthcheck_exit_code(timed_out));
+    // The worker owns its copy of `probe` and `target`, so abandoning it (deadline first) is safe.
+    const auto outcome =
+        probe_bounded(deadline, [probe = std::move(probe), target] { return probe(target); });
+    const HealthcheckOutcome timed_out{
+        .status = 0, .error = "timed out after " + std::to_string(deadline.count()) + " ms"};
+    const HealthcheckOutcome& result = outcome ? *outcome : timed_out;
+    const int code = healthcheck_exit_code(result);
+    if (code != 0) {
+        diag << healthcheck_diagnostic(target, result) << '\n';
+        diag.flush(); // required before hard_exit: _Exit runs no stream destructors
     }
-    const int code = healthcheck_exit_code(*outcome);
-    if (code != 0)
-        diag << healthcheck_diagnostic(target, *outcome) << '\n';
+    // The abandoned worker is blocked in httplib/OpenSSL, so production skips static destructors
+    // (std::_Exit). A test hook that returns falls through to `return code`, which never
+    // dereferences *outcome on this branch.
+    if (!outcome)
+        hard_exit(code);
     return code;
 }
 

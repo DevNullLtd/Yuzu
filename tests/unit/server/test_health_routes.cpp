@@ -659,7 +659,8 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // The probe routes must be handed the plaintext sink and the 503 gate.
     expect(".plaintext_probe_sink = redirect_sink_.get()", 1,
            "register_health_routes receives the redirect listener's sink");
-    expect(".main_listener_serving_fn = [this] { return web_server_ && web_server_->is_running(); }",
+    expect(".main_listener_serving_fn = [this] { return web_server_ && "
+           "web_server_->is_running(); }",
            1, "the plaintext probes are gated on the HTTPS listener actually running");
     // One closed probe set shared by the main pre-routing chokepoint.
     expect("health::is_probe_path(req.path)", 1,
