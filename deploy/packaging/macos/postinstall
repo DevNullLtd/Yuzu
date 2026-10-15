@@ -580,6 +580,31 @@ verify_incoming_loose_code() {
     done
 }
 
+# Recovery writes only into real directories: a symlinked package directory is
+# refused by name, never written through (governance S8-1). The installer
+# never creates one, so a link here was placed by someone.
+require_real_restore_targets() {
+    local path
+    for path in "$LOOSE_BIN" /usr/local/lib "$YUZU_LIB" "$PLUGIN_DIR" "$APP_ROOT" /Library/LaunchDaemons; do
+        [[ ! -L "$path" ]] || {
+            echo "ERROR: refusing to restore into symlinked $path; remove the link and retry" >&2
+            return 1; }
+    done
+}
+
+# A directory a restored agent may run code from: absent, or real, root-owned,
+# not group/world writable and with no write-granting ACL. Returns 1 instead of
+# exiting, for recovery's start decision.
+code_directory_trusted() {
+    local path="$1" owner mode
+    [[ -e "$path" || -L "$path" ]] || return 0
+    [[ -d "$path" && ! -L "$path" ]] || return 1
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || return 1
+    ! acl_grants_write "$path"
+}
+
 # Recovery restarts only a service that was running when the snapshot was
 # taken. A restored service that will not stay up is reported, never retried
 # forever: the pending install is the remedy (PR #4482 governance sec-1).
@@ -590,8 +615,11 @@ restart_restored_service() {
         echo "WARNING: restored the previous service definition; it was not running before, so it was not started" >&2
         return 0; }
     [[ ! -e "$recovery/loose/yuzu-agent" ]] || lane=loose
-    if ! code_directory_chain_trusted "$lane"; then
-        echo "WARNING: restored the previous agent but did not start it: a directory below /usr/local is not root-owned, or is group- or world-writable" >&2
+    # The same bar as an install (S8-1): the chain, every code entry and plugin,
+    # and the bundle lane's code root.
+    if ! code_directory_chain_trusted "$lane" || ! code_directory_trusted "$APP_ROOT" || \
+       ! reject_untrusted_code_entries; then
+        echo "WARNING: restored the previous agent but did not start it: its code directories or files are not root-owned and protected from other accounts" >&2
         return 0
     fi
     # Read first, then match: a failed read must never look like "not the
@@ -631,6 +659,7 @@ restore_previous() {
     phase="$(cat "$recovery/phase" 2>/dev/null || true)"
     # Before promotion nothing active has changed: there is nothing to restore.
     [[ "$phase" == promoting ]] || return 0
+    require_real_restore_targets || return 1
     stop_service || echo "WARNING: Yuzu Agent is still unloading; restoring anyway" >&2
     # Clear both lanes and the generated plist first: recovery must restore an
     # exact prior package state, including the prior "no installed agent" case.

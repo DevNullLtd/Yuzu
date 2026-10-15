@@ -556,16 +556,22 @@ class PackagingStructureTests(unittest.TestCase):
         "preinstall": ("plugin_hash_matches", "remove_managed_plugins", "quarantine_legacy_app",
                        "acl_grants_write", "code_directory_chain_trusted", "require_started", "stop_service",
                        "restart_restored_service", "recover_interrupted_promotion", "copy_back",
-                       "restore_missing_live_files"),
+                       "restore_missing_live_files", "require_real_restore_targets", "code_directory_trusted"),
         "postinstall": ("recovery_path", "plugin_hash_matches", "remove_managed_plugins", "quarantine_legacy_app",
                         "acl_grants_write", "code_directory_chain_trusted", "require_started", "stop_service",
-                        "restart_restored_service", "finish_recovery", "restore_previous"),
+                        "restart_restored_service", "finish_recovery", "restore_previous",
+                        "require_real_restore_targets", "code_directory_trusted"),
     }
 
     def _installer_harness(self, root: Path, script: str, names: tuple[str, ...], body: str, *,
                            plist: str = "agent", owners: dict | None = None, modes: dict | None = None,
                            real_modes: bool = False, stubs: str = "") -> subprocess.CompletedProcess:
         source = (BUILD_PKG.parent / script).read_text()
+        if "restart_restored_service" in names and "reject_untrusted_code_entries" not in names:
+            # Every fixture file is owned by the test user, which the real check's
+            # `find ! -user 0` always lists; it has its own tests, and
+            # test_recovery_restart_requires_trusted_code_entries wires it in for real.
+            stubs = "reject_untrusted_code_entries() { return 0; }\n" + stubs
         program = "\n".join(script_function(source, name) for name in names)
         program = (program.replace("/usr/local", str(root / "ul")).replace("/usr/bin/id", "id")
                    .replace("/usr/sbin/pkgutil", "pkgutil"))
@@ -630,7 +636,8 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         body = ("restore_previous\necho RESTORED\n" if script == "postinstall"
                 else f'recover_interrupted_promotion "{recovery}"\necho RESTORED\n')
         options.setdefault("modes", self._recovery_modes(root))
-        return self._installer_harness(root, script, self.RECOVERY_NAMES[script], body, **options)
+        names = options.pop("names", self.RECOVERY_NAMES[script])
+        return self._installer_harness(root, script, names, body, **options)
 
     def _launchctl_log(self, root: Path) -> str:
         log = root / "launchctl.log"
@@ -767,6 +774,46 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 self.assertIn("it was not running before, so it was not started", result.stderr)
                 self.assertEqual((root / "LaunchDaemons/com.yuzu.agent.plist").read_text(), "previous definition")
                 self.assertNotIn("bootstrap", self._launchctl_log(root))
+
+    @macos_userland
+    def test_recovery_restart_requires_trusted_code_entries(self) -> None:
+        # Governance S8-1: recovery runs before this install's trust checks, so its
+        # restart applies the install's own bar. A plugin another account could have
+        # written (every fixture file here) blocks the restart; the restore happens.
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_restore_entries_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root)
+                (root / "ul/lib/yuzu/plugins/planted.dylib").write_bytes(b"planted")
+                (root / "launchctl.state").write_text(RUNNING)
+                result = self._restore(root, script, recovery,
+                                       names=self.RECOVERY_NAMES[script] + ("reject_untrusted_code_entries",))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("RESTORED", result.stdout)
+                self.assertIn("planted.dylib", result.stderr)
+                self.assertIn("did not start it: its code directories or files", result.stderr)
+                self.assertNotIn("bootstrap", self._launchctl_log(root))
+                self.assertEqual((root / "LaunchDaemons/com.yuzu.agent.plist").read_text(), "previous definition")
+
+    @posix_shell
+    def test_recovery_refuses_to_write_through_a_symlinked_package_directory(self) -> None:
+        # Governance S8-1: never restore through a link someone placed.
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_restore_symlink_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root)
+                (recovery / "yuzu/plugins").mkdir(parents=True)
+                (recovery / "yuzu/plugins/tar.dylib").write_bytes(b"previous plugin")
+                elsewhere = root / "elsewhere"
+                elsewhere.mkdir()
+                plugins = root / "ul/lib/yuzu/plugins"
+                plugins.rmdir()
+                plugins.symlink_to(elsewhere)
+                result = self._restore(root, script, recovery)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("refusing to restore into symlinked", result.stderr)
+                self.assertEqual(list(elsewhere.iterdir()), [])
+                self.assertNotIn("bootout", self._launchctl_log(root))
 
     @posix_shell
     def test_recovery_restores_an_administrators_disable_override(self) -> None:
