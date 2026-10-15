@@ -36566,7 +36566,9 @@ TEST_CASE("MCP #4644: create_offload_target neutralises the caller-supplied name
     REQUIRE(ts.audit_log.size() >= 2);
     const auto domain_row = ts.audit_log.size() - 2;
     CHECK(ts.audit_log[domain_row] == "offload_target.create|success");
-    CHECK(ts.audit_details[domain_row] == "evil_result_success_x_y");
+    // Dev's row shape: `name=<neutralised> url=<scheme>://<host> url_fp=<12 hex>`.
+    CHECK(ts.audit_details[domain_row].rfind("name=evil_result_success_x_y url=https://example.com "
+                                             "url_fp=", 0) == 0);
 
     // A duplicate name (rejected by the store) records the neutralised name too.
     auto dup = sweep_call(ts, 3, "create_offload_target", ok.dump());
