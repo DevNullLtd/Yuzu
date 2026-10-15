@@ -28,7 +28,8 @@
 ///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN the
 ///                                 store-open 503, THEN auth_fn for the audit-attributed
 ///                                 username and the same-site check, THEN
-///                                 body parsing and integer-key validation)
+///                                 body parsing and integer-key validation, THEN the
+///                                 unknown-key 400, THEN the audit-first attempted row)
 ///
 /// AUDIT: GET is never audited. PUT is audit-first (ADR-0033 section 9): `attempted` row, 503 and
 /// no change if it cannot be stored, then `success`/`failure`. A secret key's `detail` never

@@ -349,6 +349,10 @@ TEST_CASE("config_routes: PUT refuses the change when the attempted audit row ca
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    const auto refused = body(res->body);
+    CHECK(refused["error"]["message"] == "audit log unavailable; the change was not made");
+    CHECK(refused["error"]["retry_after_ms"] == 5000);
+    CHECK(refused["error"].contains("correlation_id"));
     CHECK(h.cfg.response_retention_days == before); // live config untouched
     CHECK(h.audits.size() == 1);                    // no outcome row for a change never made
 
@@ -448,6 +452,8 @@ TEST_CASE("config_routes: PUT from a cookie session needs a same-site Origin or 
                                    {{"Host", "yuzu.example"}, {"Origin", "https://evil.example"}});
     REQUIRE(foreign);
     CHECK(foreign->status == 403);
+    CHECK(body(foreign->body)["error"]["message"] == "cross-site request refused");
+    CHECK(body(foreign->body)["error"].contains("correlation_id"));
     CHECK(h.cfg.response_retention_days == before);
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].action == "csrf.denied");
@@ -550,7 +556,10 @@ TEST_CASE("config: LiveSeconds copies and assigns by value and is safe across th
     for (auto& r : readers)
         r.join();
     CHECK_FALSE(bad.load());
+}
 
+TEST_CASE("config: clamp_heartbeat_timeout raises a sub-floor stored value to the floor",
+          "[server][config_routes]") {
     // A heartbeat stored before the floor existed is raised to it, never dropped or lowered.
     CHECK(clamp_heartbeat_timeout(1) == kMinHeartbeatTimeoutSeconds);
     CHECK(clamp_heartbeat_timeout(29) == kMinHeartbeatTimeoutSeconds);
@@ -639,6 +648,24 @@ TEST_CASE("config_routes: PUT a value nested past the depth limit is a 400 with 
     CHECK_FALSE(get_b["overrides"].contains("oidc_issuer"));
 }
 
+TEST_CASE("config_routes: PUT the redaction placeholder for a secret key is refused without echoing it",
+          "[pg][server][routes][config_routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    const std::string placeholder(RuntimeConfigStore::redacted_placeholder());
+    auto res = h.sink.Put("/api/config/oidc_client_secret", R"({"value":")" + placeholder + R"("})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].detail.find("placeholder") != std::string::npos); // the refusal text
+    CHECK(h.audits[1].detail.find(placeholder) == std::string::npos);   // never the submitted value
+}
+
 TEST_CASE("config_routes: PUT a secret key never leaks the raw value into the audit detail "
           "or the response body",
           "[pg][server][routes][config_routes]") {
@@ -680,4 +707,13 @@ TEST_CASE("config_routes: wiring -- server.cpp still calls register_config_route
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_config_routes(") != std::string::npos);
+    // The boot loader raises a sub-floor stored heartbeat_timeout through the shared helper.
+    CHECK(src.find("clamp_heartbeat_timeout(stored)") != std::string::npos);
+    CHECK(src.find("cfg_.session_timeout = std::chrono::seconds(applied);") != std::string::npos);
+    // The Developer role-grid probe is the non-auditing has_permission, not the auditing gate.
+    const auto dev = src.find("yuzu::server::developer::Deps{");
+    REQUIRE(dev != std::string::npos);
+    const auto block = src.substr(dev, 900);
+    CHECK(block.find(".probe_fn =") != std::string::npos);
+    CHECK(block.find("auth_routes_->has_permission(") != std::string::npos);
 }

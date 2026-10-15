@@ -4815,7 +4815,7 @@ another OIDC field, restart first so the process is not holding the old value.
 > **Two different error sources, two different shapes.** The shared authorization gate in front of
 > this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
 > authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
-> gated route. The bodies **the handler itself** emits do not — `/api/config` is a legacy
+> gated route. Most bodies **the handler itself** emits do not (the two A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
 > non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
@@ -4827,7 +4827,7 @@ another OIDC field, restart first so the process is not holding the old value.
 > alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
 > it, on every status. Two refusals added with the audit-first and same-site gates use the A4 envelope
 > (`correlation_id` present): `403` `cross-site request refused` and `503` `audit log unavailable; the
-> change was not made` (`retry_after_ms: 5000`, header `Sec-Audit-Failed: true`). An unknown key is a
+> change was not made` (`retry_after_ms: 5000`, a `remediation` hint, header `Sec-Audit-Failed: true`). An unknown key is a
 > bare `400` and writes no audit row.
 
 **Error (503) - runtime config store unavailable.** A genuine DB/crypto write failure, distinguished
@@ -4874,7 +4874,7 @@ client secret contains `<redacted>`, rotate it at the IdP to a value that does n
 { "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
 ```
 
-**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` before the change, then `success` (or `failure`). Only `success` carries the `detail`.
+**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error).
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
@@ -10637,7 +10637,7 @@ Convert a JSON result set to CSV format for download.
 
 **Cells.** A string cell and every header have a leading `=`, `+`, `-`, `@`, tab or carriage return neutralised with a leading `'` (CWE-1236), then RFC 4180 quoting. A missing or `null` cell is empty. Any other non-string cell (number, boolean, nested value) is written as its JSON text with RFC 4180 quoting only, so `-5` stays `-5` and a nested object keeps its commas inside one cell; those values cannot spell a formula.
 
-**Errors.** `400` `request body nests too deeply` when the raw text nests more than 32 levels (checked before parsing); `400` `invalid JSON array` when the body is not an array, is empty, or its first element is not a non-empty object (the first object's keys are the columns; later non-objects are skipped and keys absent from the first object are dropped); `403` without `Response:Read`. The reply is `text/csv` with `Content-Disposition: attachment; filename="export.csv"`.
+**Errors.** `400` `request body nests too deeply` when the raw text nests more than 32 levels (checked before parsing); `400` `invalid JSON array` when the body is not an array, is empty (`[]`), or its first element is not a non-empty object (the first object's keys are the columns; later non-objects are skipped and keys absent from the first object are dropped); `403` without `Response:Read`. The reply is `text/csv` with `Content-Disposition: attachment; filename="export.csv"`.
 
 ---
 
