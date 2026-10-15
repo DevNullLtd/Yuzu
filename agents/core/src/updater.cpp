@@ -980,6 +980,12 @@ std::expected<bool, UpdateError> Updater::apply_update(const std::filesystem::pa
 
 void Updater::cleanup_old_binary() {
     namespace fs = std::filesystem;
+    // Self-guarded, not just guarded by perform_startup_maintenance(): a disabled
+    // updater never touches files beside the executable, whichever caller asks
+    // (a sealed macOS app bundle's signature covers that directory).
+    if (!config_.enabled) {
+        return;
+    }
 
     auto old_path = exe_path_;
 #ifdef _WIN32
@@ -1010,6 +1016,9 @@ bool Updater::perform_startup_maintenance() {
 
 bool Updater::rollback_if_needed() {
     namespace fs = std::filesystem;
+    if (!config_.enabled) { // self-guarded; see cleanup_old_binary()
+        return false;
+    }
 
     auto old_path = exe_path_;
 #ifdef _WIN32

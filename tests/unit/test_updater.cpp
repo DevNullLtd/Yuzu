@@ -17,6 +17,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <future>
 #include <memory>
 #include <string>
@@ -216,6 +217,36 @@ TEST_CASE("disabled startup maintenance leaves executable-adjacent rollback file
     REQUIRE(fs::exists(exe_path));
     REQUIRE(fs::exists(old_path));
     REQUIRE(fs::exists(marker_path));
+}
+
+TEST_CASE("a disabled updater's rollback and cleanup primitives are self-guarded",
+          "[updater][maintenance]") {
+    // PR #4482 review: the disabled no-write mode must not depend on every caller
+    // going through perform_startup_maintenance().
+    TempUpdaterDir tmp("disabled_primitives");
+    const auto& dir = tmp.guard.path;
+
+#ifdef _WIN32
+    const auto exe_path = dir / "yuzu-agent.exe";
+    const auto old_path = dir / "yuzu-agent.old.exe";
+#else
+    const auto exe_path = dir / "yuzu-agent";
+    const auto old_path = dir / "yuzu-agent.old";
+#endif
+    write_fake_binary(exe_path);
+    { std::ofstream{old_path, std::ios::binary} << "previous-binary"; }
+    // No verification marker, so an ENABLED updater would roll back here.
+
+    UpdateConfig config;
+    config.enabled = false;
+    Updater updater(config, "test-agent", "0.1.0", "macos", "arm64", exe_path);
+
+    REQUIRE_FALSE(updater.rollback_if_needed());
+    updater.cleanup_old_binary();
+    REQUIRE(fs::exists(old_path));
+    std::ifstream current{exe_path, std::ios::binary};
+    const std::string content{std::istreambuf_iterator<char>{current}, {}};
+    REQUIRE(content == "fake-binary-content");
 }
 
 TEST_CASE("enabled startup maintenance retains rollback and cleanup semantics",

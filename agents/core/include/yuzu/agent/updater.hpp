@@ -95,9 +95,11 @@ public:
     [[nodiscard]] std::expected<bool, UpdateError> check_and_apply(void* stub);
 
     /// On startup: delete .old files from successful prior updates.
+    /// No-op when the updater is disabled (UpdateConfig::enabled == false).
     void cleanup_old_binary();
 
     /// On startup: if .old exists and current binary seems broken, roll back.
+    /// No-op returning false when the updater is disabled.
     [[nodiscard]] bool rollback_if_needed();
 
     /// Run the startup rollback/cleanup protocol when OTA is enabled.
