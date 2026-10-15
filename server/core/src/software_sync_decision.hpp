@@ -118,6 +118,7 @@ struct Selector {
         return std::unexpected("scope is required: __all__, group:<id>, an agent id, or a "
                                "scope_expression");
 
+    Selector sel;
     if (expression->has_value()) {
         const std::string& e = **expression;
         if (!token_ok(e, kMaxExpressionLen))
@@ -125,19 +126,21 @@ struct Selector {
                                    "characters");
         // classify_dispatch_arm is the one place the arm vocabulary is decided; an
         // expression of `__all__` or `group:<id>` lands on the same arm as via `scope`.
-        return Selector{classify_dispatch_arm(false, e), e};
+        sel = {classify_dispatch_arm(false, e), e};
+    } else {
+        const std::string& s = **scope;
+        if (!token_ok(s, kMaxIdLen))
+            return std::unexpected("scope must be 1-256 characters with no control characters");
+        const DispatchArm arm = s == kBroadcastScope               ? DispatchArm::Broadcast
+                                : s.starts_with(kGroupScopePrefix) ? DispatchArm::Group
+                                                                   : DispatchArm::Ids; // a bare agent id
+        sel = {arm, s};
     }
-    const std::string& s = **scope;
-    if (!token_ok(s, kMaxIdLen))
-        return std::unexpected("scope must be 1-256 characters with no control characters");
-    if (s == kBroadcastScope)
-        return Selector{DispatchArm::Broadcast, s};
-    if (s.starts_with("group:")) {
-        if (s.size() == 6)
-            return std::unexpected("group scope needs an id: group:<id>");
-        return Selector{DispatchArm::Group, s};
-    }
-    return Selector{DispatchArm::Ids, s}; // a bare agent id
+    // Either spelling of a group must name one: `group:` alone would reach the store with an
+    // empty id.
+    if (sel.arm == DispatchArm::Group && sel.expr.size() == kGroupScopePrefix.size())
+        return std::unexpected("group scope needs an id: group:<id>");
+    return sel;
 }
 
 /// Bounded rendering of caller text for an audit row. `log_token` neutralises control bytes,
@@ -233,11 +236,13 @@ struct Expansion {
             out.detail = "unwired";
             return out;
         }
-        if (!sel.expr.starts_with("group:")) {
+        // parse_request guarantees both; a selector built any other way never reaches the store
+        // with an empty or unprefixed id.
+        if (!sel.expr.starts_with(kGroupScopePrefix) || sel.expr.size() == kGroupScopePrefix.size()) {
             out.detail = "bad_selector";
             return out;
         }
-        auto members = ex.group_members(sel.expr.substr(6));
+        auto members = ex.group_members(sel.expr.substr(kGroupScopePrefix.size()));
         if (!members) {
             out.detail = "db_degraded";
             return out;

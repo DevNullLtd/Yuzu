@@ -104,6 +104,7 @@ TEST_CASE("sync request: ambiguous, empty or mistyped selectors are refused", "[
         R"({"scope_expression":["a"]})",
         R"({"scope":null})",
         R"({"scope":"group:"})",                                   // group needs an id
+        R"({"scope_expression":"group:"})",                        // same rule on the expression path
         R"({"scope":"a\nb"})",                                     // control byte in an id
         R"({"scope_expression":"ostype\t== x"})",                  // control byte in an expression
         R"({"scope":"__all__","source":"all"})",                   // only installed_software fans out
@@ -127,6 +128,20 @@ TEST_CASE("sync request: id and expression length bounds are inclusive", "[serve
     CHECK_FALSE(ss::parse_request(json{{"scope", id_long}}).has_value());
     CHECK(ss::parse_request(json{{"scope_expression", ex_ok}}).has_value());
     CHECK_FALSE(ss::parse_request(json{{"scope_expression", ex_long}}).has_value());
+}
+
+TEST_CASE("sync request: both spellings of an empty group name are refused with the same message",
+          "[server][software_sync]") {
+    CHECK(kGroupScopePrefix == "group:");
+    const auto via_scope = ss::parse_request(json{{"scope", "group:"}});
+    const auto via_expression = ss::parse_request(json{{"scope_expression", "group:"}});
+    REQUIRE_FALSE(via_scope.has_value());
+    REQUIRE_FALSE(via_expression.has_value());
+    CHECK(via_scope.error() == via_expression.error());
+    // One character after the prefix is a group id.
+    const auto one = ss::parse_request(json{{"scope_expression", "group:x"}});
+    REQUIRE(one.has_value());
+    CHECK(one->arm == DispatchArm::Group);
 }
 
 TEST_CASE("sync request: only a group, scope or fleet run needs the run guard", "[server][software_sync]") {
@@ -409,10 +424,15 @@ TEST_CASE("sync resolve: a group asks the store for the id after the prefix, and
     CHECK(bad.detail == "db_degraded");
     CHECK(bad.ids.empty());
 
-    // A Group arm whose expression lost its prefix never reaches the store.
+    // A Group arm whose expression lost its prefix, or names no id, never reaches the store.
     Fakes g;
-    const auto odd = ss::resolve_targets({DispatchArm::Group, "finance"}, authz::VisibleSet{}, g.expansion());
-    CHECK(odd.status == ss::Resolved::Status::Aborted);
+    for (const char* expr : {"finance", "group:"}) {
+        INFO(expr);
+        const auto odd = ss::resolve_targets({DispatchArm::Group, expr}, authz::VisibleSet{}, g.expansion());
+        CHECK(odd.status == ss::Resolved::Status::Aborted);
+        CHECK(odd.detail == "bad_selector");
+        CHECK(odd.ids.empty());
+    }
     CHECK(g.group_calls == 0);
 }
 
