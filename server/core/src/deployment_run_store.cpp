@@ -217,11 +217,20 @@ bool DeploymentRunStore::create_deployment(const DeploymentRow& dep,
 
 std::optional<DeploymentRow> DeploymentRunStore::get_deployment(const std::string& deployment_id,
                                                                 const std::string& created_by) {
-    if (!open_ || deployment_id.empty())
-        return std::nullopt;
+    // Fail-soft wrapper for the engine/fragment callers: a store fault reads as absent.
+    return get_deployment_checked(deployment_id, created_by).value_or(std::nullopt);
+}
+
+std::expected<std::optional<DeploymentRow>, std::string>
+DeploymentRunStore::get_deployment_checked(const std::string& deployment_id,
+                                           const std::string& created_by) {
+    if (deployment_id.empty())
+        return std::optional<DeploymentRow>{std::nullopt}; // caller-input miss, not a store fault
+    if (!open_)
+        return std::unexpected("deployment run store not open");
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::nullopt;
+        return std::unexpected("pool acquire timeout");
     std::string sql = std::string("SELECT ") + kDeploymentCols +
                       " FROM deployment_run_store.deployments WHERE deployment_id = $1";
     std::vector<std::string> params{deployment_id};
@@ -230,39 +239,51 @@ std::optional<DeploymentRow> DeploymentRunStore::get_deployment(const std::strin
         params.push_back(created_by);
     }
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
-        return std::nullopt;
-    return read_deployment(res.get(), 0);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::optional<DeploymentRow>{std::nullopt};
+    return std::optional<DeploymentRow>{read_deployment(res.get(), 0)};
 }
 
 std::vector<DeploymentRow> DeploymentRunStore::list_deployments(const std::string& viewer,
                                                                 bool is_admin, int limit) {
-    std::vector<DeploymentRow> out;
+    auto page = list_deployments_checked(viewer, is_admin, limit);
+    return page ? std::move(page->rows) : std::vector<DeploymentRow>{};
+}
+
+std::expected<DeploymentListPage, std::string>
+DeploymentRunStore::list_deployments_checked(const std::string& viewer, bool is_admin, int limit) {
     if (!open_)
-        return out;
+        return std::unexpected("deployment run store not open");
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return out;
+        return std::unexpected("pool acquire timeout");
     const int cap = (limit > 0 && limit < kListCap) ? limit : kListCap;
+    const int fetch = cap + 1; // one past the cap, so truncation is observed rather than guessed
     const std::string sql_admin =
         std::string("SELECT ") + kDeploymentCols +
-        " FROM deployment_run_store.deployments ORDER BY created_at_ms DESC LIMIT $1::bigint";
+        " FROM deployment_run_store.deployments ORDER BY created_at_ms DESC, deployment_id DESC "
+        "LIMIT $1::bigint";
     const std::string sql_owner =
         std::string("SELECT ") + kDeploymentCols +
-        " FROM deployment_run_store.deployments WHERE created_by = $1 ORDER BY created_at_ms DESC "
-        "LIMIT $2::bigint";
+        " FROM deployment_run_store.deployments WHERE created_by = $1 "
+        "ORDER BY created_at_ms DESC, deployment_id DESC LIMIT $2::bigint";
     pg::PgResult res =
         is_admin ? pg::exec_params(lease.get(), sql_admin.c_str(),
-                                   std::vector<std::string>{std::to_string(cap)})
+                                   std::vector<std::string>{std::to_string(fetch)})
                  : pg::exec_params(lease.get(), sql_owner.c_str(),
-                                   std::vector<std::string>{viewer, std::to_string(cap)});
+                                   std::vector<std::string>{viewer, std::to_string(fetch)});
     if (res.status() != PGRES_TUPLES_OK)
-        return out;
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    DeploymentListPage page;
     const int rows = PQntuples(res.get());
-    out.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i)
-        out.push_back(read_deployment(res.get(), i));
-    return out;
+    page.truncated = rows > cap;
+    const int keep = page.truncated ? cap : rows;
+    page.rows.reserve(static_cast<std::size_t>(keep));
+    for (int i = 0; i < keep; ++i)
+        page.rows.push_back(read_deployment(res.get(), i));
+    return page;
 }
 
 std::optional<std::string>
@@ -310,20 +331,28 @@ DeploymentRunStore::succeeded_agents_for_run(const std::string& source_run_id,
 }
 
 std::vector<DeploymentDeviceRow> DeploymentRunStore::get_devices(const std::string& deployment_id) {
-    std::vector<DeploymentDeviceRow> out;
-    if (!open_ || deployment_id.empty())
-        return out;
+    return get_devices_checked(deployment_id).value_or(std::vector<DeploymentDeviceRow>{});
+}
+
+std::expected<std::vector<DeploymentDeviceRow>, std::string>
+DeploymentRunStore::get_devices_checked(const std::string& deployment_id, int limit) {
+    if (deployment_id.empty())
+        return std::vector<DeploymentDeviceRow>{};
+    if (!open_)
+        return std::unexpected("deployment run store not open");
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return out;
+        return std::unexpected("pool acquire timeout");
+    const int cap = (limit > 0 && limit < kRowCap) ? limit : kRowCap;
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT agent_id, hostname, os, step, exit_code, error, updated_at_ms "
         "FROM deployment_run_store.deployment_device WHERE deployment_id = $1 "
-        "ORDER BY hostname LIMIT $2::bigint",
-        std::vector<std::string>{deployment_id, std::to_string(kRowCap)});
+        "ORDER BY hostname, agent_id LIMIT $2::bigint",
+        std::vector<std::string>{deployment_id, std::to_string(cap)});
     if (res.status() != PGRES_TUPLES_OK)
-        return out;
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    std::vector<DeploymentDeviceRow> out;
     const int rows = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i) {

@@ -73,6 +73,10 @@ public:
     policy_agent_statuses(const std::string&) const override {
         return std::vector<PolicyAgentStatus>{};
     }
+    std::expected<std::vector<ComplianceSummary>, PolicyReadError>
+    compliance_by_policy() const override {
+        return std::vector<ComplianceSummary>{};
+    }
 };
 
 ComplianceRoutes::ComplianceApiPtr empty_seam() {
@@ -927,15 +931,16 @@ TEST_CASE("compliance page: hosts the summary, detail, fragments and tag panels 
     CHECK(page.find("addEventListener('htmx:timeout'") != std::string::npos);
     CHECK(page.find("Could not reach the server") != std::string::npos);
     CHECK(page.find("taking too long to answer") != std::string::npos);
-    // An expired session redirects a fragment GET to /login and XHR follows it:
-    // the page must catch that by final URL, before the login page is swapped
-    // into a panel, since no 401 ever reaches htmx.
+    // An expired session redirects a fragment GET to the landing page (/home; the old
+    // /login forwards there) and XHR follows it: the page must catch that by final URL,
+    // before the sign-in page is swapped into a panel, since no 401 ever reaches htmx.
     const auto before = page.find("addEventListener('htmx:beforeSwap'");
     REQUIRE(before != std::string::npos);
     const std::string swap = page.substr(before, 500);
     CHECK(swap.find("responseURL") != std::string::npos);
     CHECK(swap.find("shouldSwap = false") != std::string::npos);
-    CHECK(swap.find("location.assign('/login')") != std::string::npos);
+    CHECK(swap.find("pn !== '/home' && pn !== '/login'") != std::string::npos);
+    CHECK(swap.find("location.assign('/home')") != std::string::npos);
     CHECK(page.find("htmx.config.timeout") != std::string::npos);
     // CSP forbids hx-on; the page also carries no inline handler attributes.
     CHECK(page.find("hx-on") == std::string::npos);

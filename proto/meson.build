@@ -47,7 +47,7 @@ gen = custom_target(
         'reflex.pb.cc', 'reflex.pb.h', 'reflex.grpc.pb.cc', 'reflex.grpc.pb.h',
     ],
     command: [
-        find_program('python3', 'python'),
+        yuzu_python,
         files('gen_proto.py'),
         '@OUTDIR@',
         protoc.full_path(),

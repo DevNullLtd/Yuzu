@@ -15,8 +15,9 @@
 ///
 /// Product UI: HTMX core attrs only (CSP blocks hx-on); every string escaped at
 /// render (verify_ui.cpp). EVIDENTIAL ONLY — no verdict. NO cohort floor (real
-/// canaries are 2-3 devices); a sub-floor paired set renders "indicative", never
-/// suppressed. The numbers come from the ONE pure engine (build_comparison), so
+/// canaries are 2-3 devices); a sub-floor paired set renders "indicative" (never rendered at the
+/// one-device floor; the flag stays on the wire), never suppressed. The numbers
+/// come from the ONE pure engine (build_comparison), so
 /// this surface and the REST/MCP twins agree. The dashboard renders honest notes
 /// at HTTP 200 on bad input / degrade (the dashboard htmx config drops 4xx/5xx
 /// bodies — REST/MCP keep their fail-states; this is the HTML surface).

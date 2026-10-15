@@ -13,6 +13,7 @@
 #include "nvd_sync.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
@@ -25,6 +26,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2106,4 +2108,192 @@ TEST_CASE("NvdClient parse+append stays memory-clean across 2 synthetic 2000-CVE
     REQUIRE(combined.records[500].matches.size() == 2);
     REQUIRE(combined.records[500].matches[0].cpe_vendor == "vendor500");
     REQUIRE(combined.records[3000].matches[1].cpe_product == "product3000b");
+}
+
+// ── parse_nvd_proxy_url: where the proxy points, and nothing of who configured it ──
+
+TEST_CASE("parse_nvd_proxy_url: scheme port and no-scheme shapes", "[nvd][proxy]") {
+    struct Case {
+        const char* url;
+        const char* host;
+        int port;
+    };
+    const Case cases[] = {
+        {"http://proxy.lan:3128", "proxy.lan", 3128},
+        {"https://proxy.lan:8443", "proxy.lan", 8443},
+        {"HTTP://Proxy.LAN:3128", "Proxy.LAN", 3128}, // a scheme is case-insensitive; the host is kept
+        {"Https://proxy.lan", "proxy.lan", 8080},
+        {"proxy.lan:3128", "proxy.lan", 3128},         // no scheme
+        {"proxy.lan", "proxy.lan", 8080},              // no port: the long-standing default
+        {"  proxy.lan:3128\n", "proxy.lan", 3128},     // a flag, env var or file leaves whitespace
+        {"http://proxy.lan:3128/", "proxy.lan", 3128}, // trailing slash
+        {"http://proxy.lan:3128/some/path?x=1#f", "proxy.lan", 3128}, // path/query/fragment dropped
+        {"http://proxy.lan:notaport", "proxy.lan", 8080},
+        {"http://proxy.lan:0", "proxy.lan", 8080},
+        {"http://proxy.lan:65536", "proxy.lan", 8080},
+        {"http://proxy.lan:80x", "proxy.lan", 8080}, // the old parse read this as 80
+    };
+    for (const auto& c : cases) {
+        INFO("url: " << c.url);
+        const auto ep = parse_nvd_proxy_url(c.url);
+        CHECK(ep.host == c.host);
+        CHECK(ep.port == c.port);
+    }
+    CHECK(parse_nvd_proxy_url("").host.empty());
+}
+
+TEST_CASE("parse_nvd_proxy_url: userinfo never reaches the host or the port",
+          "[nvd][proxy][security]") {
+    struct Case {
+        const char* url;
+        const char* host;
+        int port;
+    };
+    const Case cases[] = {
+        {"http://svc:hunter2@proxy.lan:3128", "proxy.lan", 3128}, // the reported case
+        {"svc:hunter2@proxy.lan:3128", "proxy.lan", 3128},         // no scheme
+        {"http://svc@proxy.lan:3128", "proxy.lan", 3128},          // user only
+        {"http://svc:p@ss@proxy.lan:3128", "proxy.lan", 3128},     // '@' inside the password
+        {"http://svc:p%40ss%3A@proxy.lan:3128", "proxy.lan", 3128}, // percent-encoded password
+        {"http://svc:hunter2@proxy.lan", "proxy.lan", 8080},        // credentials, no port
+        {"http://svc:hunter2@[::1]:3128", "::1", 3128},             // IPv6 literal
+        {"http://svc:hunter2@[2001:db8::5]", "2001:db8::5", 8080},  // IPv6, no port
+        {"[::1]:3128", "::1", 3128},                                // IPv6, no scheme or userinfo
+        // Over-stripping on ambiguity, like the settings-panel sanitiser: a path '@' cannot be told
+        // from the end of a password, so everything up to the last '@' is treated as userinfo.
+        {"http://svc:hunter2@proxy.lan:3128/p@th", "th", 8080},
+        {"admin:1234/ss@proxy.lan:3128", "proxy.lan", 3128}, // '/' in a password, digit-led
+    };
+    for (const auto& c : cases) {
+        INFO("url: " << c.url);
+        const auto ep = parse_nvd_proxy_url(c.url);
+        CHECK(ep.host == c.host);
+        CHECK(ep.port == c.port);
+        // The credential text appears nowhere in the parsed endpoint.
+        CHECK(ep.host.find("hunter2") == std::string::npos);
+        CHECK(ep.host.find("svc") == std::string::npos);
+        CHECK(ep.host.find("admin") == std::string::npos);
+        CHECK(ep.host.find("1234") == std::string::npos); // a digit-led password prefix
+        CHECK(ep.host.find('@') == std::string::npos);
+    }
+}
+
+TEST_CASE("parse_nvd_proxy_url: an unusable URL yields no host", "[nvd][proxy][security]") {
+    // Each of these must come back with an EMPTY host (the caller then refuses to fetch): none may
+    // become a bogus host that resolves somewhere, or leak any part of the value.
+    for (const char* url : {
+             "http://svc:p?ss@proxy.lan:3128",    // '?' ahead of the userinfo '@' (ambiguous)
+             "http://svc:p#ss@proxy.lan:3128",    // '#' ahead of the userinfo '@' (ambiguous)
+             "socks5://proxy.lan:1080",           // not an HTTP proxy
+             "socks5h://u:p@proxy.lan:1080",
+             "ftp://proxy.lan",
+             "http://",
+             "https://@",
+             "@",
+             ":3128",
+             "http://proxy.lan\r\nX-Injected: 1", // control characters in the host
+             "proxy .lan:3128",                    // whitespace inside the host
+             "   ",
+         }) {
+        INFO("url: " << url);
+        CHECK(parse_nvd_proxy_url(url).host.empty());
+    }
+}
+
+// ── NvdClient: the startup line, and the fail-closed refusal ──
+
+TEST_CASE("NvdClient: the startup line names the proxy host and port and no credentials",
+          "[nvd][proxy][security]") {
+    yuzu::test::LogCapture capture;
+    { NvdClient client{"", "http://svc:hunter2@proxy.lan:3128"}; }
+    capture.stop();
+    const auto line = capture.text();
+    CHECK(line.find("proxy.lan:3128") != std::string::npos);
+    CHECK(line.find("svc") == std::string::npos);
+    CHECK(line.find("hunter2") == std::string::npos);
+    CHECK(line.find("@") == std::string::npos);
+    CHECK(line.find("credentials in the URL are ignored") != std::string::npos);
+}
+
+namespace {
+std::size_t count_of(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto pos = hay.find(needle); pos != std::string::npos; pos = hay.find(needle, pos + 1))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("NvdClient: an unusable proxy is reported and every fetch is refused",
+          "[nvd][proxy][security]") {
+    yuzu::test::LogCapture capture;
+    NvdFetchResult published;
+    NvdFetchResult modified;
+    {
+        // A closed loopback port as the base URL: if the refusal ever regressed into a direct
+        // dial, this would fail to connect locally and never reach the real NVD host.
+        NvdClient client{"", "http://svc:p?ss@proxy.lan:3128", "http://127.0.0.1:1"};
+        published = client.fetch_by_published_window("2026-01-01T00:00:00.000",
+                                                     "2026-01-02T00:00:00.000");
+        modified = client.fetch_modified_between("2026-01-01T00:00:00.000",
+                                                 "2026-01-02T00:00:00.000");
+    }
+    capture.stop();
+    for (const auto* r : {&published, &modified}) {
+        CHECK_FALSE(r->ok);
+        CHECK(r->reason == NvdFailureReason::kConnection);
+        CHECK(r->records.empty());
+    }
+    const auto text = capture.text();
+    CHECK(text.find("[error]") != std::string::npos);
+    CHECK(text.find("no usable host") != std::string::npos);
+    // One refusal per entry point: both fetchers went through the refusal, and nothing else
+    // (no connection attempt) logged a failure of its own.
+    CHECK(count_of(text, "NVD fetch refused") == 2);
+    // Nothing of the configured value is echoed.
+    CHECK(text.find("svc") == std::string::npos);
+    CHECK(text.find("p?ss") == std::string::npos);
+    CHECK(text.find("@") == std::string::npos);
+}
+
+TEST_CASE("NvdClient: a whitespace-only proxy value is unusable and refuses fetches",
+          "[nvd][proxy][security]") {
+    yuzu::test::LogCapture capture;
+    NvdFetchResult r;
+    {
+        NvdClient client{"", "   ", "http://127.0.0.1:1"};
+        r = client.fetch_modified_between("2026-01-01T00:00:00.000", "2026-01-02T00:00:00.000");
+    }
+    capture.stop();
+    CHECK_FALSE(r.ok);
+    CHECK(r.reason == NvdFailureReason::kConnection);
+    CHECK(count_of(capture.text(), "NVD fetch refused") == 1);
+}
+
+TEST_CASE("NvdClient: a proxy without credentials does not mention credentials",
+          "[nvd][proxy]") {
+    yuzu::test::LogCapture capture;
+    { NvdClient client{"", "proxy.lan:3128"}; }
+    capture.stop();
+    const auto line = capture.text();
+    CHECK(line.find("proxy.lan:3128") != std::string::npos);
+    CHECK(line.find("credentials") == std::string::npos);
+}
+
+TEST_CASE("nvd_sync_wait: retries soon while backfilling and never spins",
+          "[nvd][sync]") {
+    using std::chrono::seconds;
+    CHECK(nvd_sync_wait(seconds{14400}, /*backfill_complete=*/false) == seconds{60});
+    CHECK(nvd_sync_wait(seconds{14400}, /*backfill_complete=*/true) == seconds{14400});
+    CHECK(nvd_sync_wait(seconds{30}, false) == seconds{60});
+    // An interval of 0 (the flag accepts it) must not make a zero wait.
+    CHECK(nvd_sync_wait(seconds{0}, true) == seconds{60});
+    CHECK(nvd_sync_wait(seconds{0}, false) == seconds{60});
+}
+
+TEST_CASE("NvdClient: no proxy configured logs nothing about a proxy", "[nvd][proxy]") {
+    yuzu::test::LogCapture capture;
+    { NvdClient client{"", ""}; }
+    capture.stop();
+    CHECK(capture.text().find("proxy") == std::string::npos);
 }

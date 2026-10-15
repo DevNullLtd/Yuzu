@@ -18,7 +18,7 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
   <style>
-    body { display: flex; flex-direction: column; min-height: calc(100vh - var(--shell-top-h, 0px)); }
+    body { display: flex; flex-direction: column; min-height: calc(100vh - var(--shell-top-h)); }
     .tar-content {
       width: 100%; flex: 1; padding: 22px 28px 36px;
       display: flex; flex-direction: column; gap: 22px;
@@ -29,42 +29,20 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     }
     .tar-subtitle { color: var(--mut); font-size: 14px; margin: 4px 0 0; max-width: 70ch; }
 
-    /* Frames: bordered panels with a header row; tables run edge to edge */
-    .tar-frame {
-      background: var(--surface); border: 1px solid var(--line);
-      border-radius: var(--rad-panel); min-width: 0; overflow: hidden;
-    }
+    /* Frames are yuzu.css panels (.panel / .tw); the header row stays local because look's .hd also sets
+       font-size / weight on everything inside it. Tables in a frame take the shared .tw table skin. */
+    .tar-frame { overflow: hidden; }
     .tar-frame-header {
       display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
       padding: 12px 16px; border-bottom: 1px solid var(--line);
     }
     .tar-frame-title { font-size: 14px; font-weight: 600; margin: 0; }
     .tar-frame-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-left: auto; }
-    .tar-frame-body { overflow-x: auto; }
     .tar-pad { padding: 16px; }
     #retention-paused-body > :not(table):not(.result-degrade-banner),
     #capture-sources > .picker-row,
     #cap-sources-body > :not(table):not(.apply-bar):not(.result-degrade-banner) { margin: 0; padding: 14px 16px; }
-    .tar-frame-body table { width: 100%; border-collapse: collapse; }
-    .tar-frame-body th {
-      text-align: left; padding: 8px 16px; white-space: nowrap;
-      font-size: 12.5px; font-weight: 500; color: var(--mut);
-      background: var(--surface2); border-bottom: 1px solid var(--line);
-    }
-    .tar-frame-body td {
-      padding: var(--cell-y) 16px; white-space: nowrap;
-      color: var(--ink2); border-bottom: 1px solid var(--line);
-    }
-    .tar-frame-body tbody tr:last-child td { border-bottom: 0; }
-    .tar-frame-body tbody tr:hover td { background: var(--surface2); }
-    .tar-frame-body th.r, .tar-frame-body td.r { text-align: right; }
     .tar-content code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
-    .tar-frame-body .source-pill {
-      display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 3px;
-      font-size: 12.5px; font-weight: 500; color: var(--warn);
-      background: color-mix(in srgb, var(--warn) 15%, transparent);
-    }
-    .tar-frame-body .badge { height: auto; padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; }
     .tar-meta { font-size: 13px; color: var(--mut); }
     .tar-meta strong, .tar-meta b { color: var(--ink); font-weight: 600; }
     .tar-frame-body .placeholder, .tar-frame-body .empty-state {
@@ -93,11 +71,10 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     .tar-content button:hover:not(:disabled) { background: var(--surface2); border-color: var(--mut); }
     .tar-content button:disabled { opacity: .5; cursor: default; }
     .tar-content button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-    .tar-sql-controls button, .tar-content .apply-push {
+    .tar-content .apply-push {
       color: var(--on-primary); background: var(--primary); border-color: var(--primary); font-weight: 600;
     }
-    .tar-sql-controls button { height: var(--ctl); padding: 0 14px; font-size: 14px; }
-    .tar-sql-controls button:hover:not(:disabled), .tar-content .apply-push:hover:not(:disabled) {
+    .tar-content .apply-push:hover:not(:disabled) {
       background: var(--primary-h); border-color: var(--primary-h);
     }
     .tar-content td .btn-secondary, .tar-content td .btn-danger {
@@ -109,36 +86,19 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     }
 
     /* Form fields */
-    .scope-chip-row, .picker-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
-    .scope-chip-row { margin-bottom: 12px; }
-    .scope-chip-label, .picker-row label, .filter-label, .tt-filter-label {
+    .picker-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .picker-row label, .filter-label, .tt-filter-label {
       font-size: 13px; font-weight: 500; color: var(--ink2);
     }
-    .scope-chip-select, .tar-sql-name, .tar-tree-filter, .tar-tree-custom input[type="datetime-local"],
-    .tar-sql-textarea {
+    .tar-tree-filter, .tar-tree-custom input[type="datetime-local"] {
       color: var(--ink); background: var(--bg); border: 1px solid var(--line2);
       border-radius: var(--rad-ctl);
-    }
-    .scope-chip-select, .tar-sql-name, .tar-tree-filter, .tar-tree-custom input[type="datetime-local"] {
       height: var(--ctl); padding: 0 10px; min-width: 0; font: inherit; font-size: 14px;
     }
-    .scope-chip-select { max-width: 24rem; }
-    .scope-chip-meta, .src-note { font-size: 12.5px; color: var(--mut); }
+    .src-note { font-size: 12.5px; color: var(--mut); }
     .tar-content input[type="checkbox"] { accent-color: var(--primary); }
-    .tar-sql-textarea {
-      width: 100%; min-height: 84px; padding: 8px 10px; resize: vertical;
-      font-family: var(--mds-font-family-mono); font-size: 12.5px;
-    }
-    .tar-sql-textarea::placeholder, .tar-tree-filter::placeholder, .tar-sql-name::placeholder { color: var(--faint); }
-    .tar-sql-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
-    .tar-sql-name { flex: 1 1 16rem; min-width: 12rem; }
-    .tar-sql-empty { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink2); }
-    .tar-sql-result { margin-top: 12px; font-size: 13.5px; color: var(--mut); }
-    .tar-sql-result a { color: var(--primary); }
-    .tar-sql-result code {
-      color: var(--ink2); background: var(--surface2); padding: 1px 6px; border-radius: 3px;
-    }
-    .tar-sql-result.error { color: var(--bad); }
+    .tar-tree-filter::placeholder { color: var(--faint); }
+    .tar-sql-moved a { color: var(--primary); }
 
     /* ── Process tree viewer (Phase 15.H) ───────────────────────────────── */
     .tar-tree-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -228,7 +188,7 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     .tar-tree-layout { display: flex; gap: 16px; align-items: flex-start; margin-top: 12px; }
     .tar-tree-main { flex: 1 1 auto; min-width: 0; overflow-x: auto; }
     .tar-tree-side {
-      flex: 0 0 340px; position: sticky; top: 8px; max-height: calc(100vh - var(--shell-top-h, 72px) - 2rem); overflow: auto;
+      flex: 0 0 340px; max-height: calc(100vh - var(--shell-top-h) - 2rem); overflow: auto;
       border: 1px solid var(--line); border-radius: var(--rad-panel);
     }
     .tar-tree-side > div > .tar-tree-mute { padding: 14px 16px; font-size: 13px; }
@@ -249,11 +209,11 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     .tar-detail-anom { padding: 10px 16px; color: var(--bad); border-bottom: 1px solid var(--line); }
     .tar-detail > .tar-tree-mute { padding: 0 16px 14px; }
     .tar-detail-conns { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-    .tar-detail-conns th, .tar-detail-conns td {
+    table.tar-detail-conns th, table.tar-detail-conns td {
       text-align: left; padding: 6px 8px; white-space: nowrap; border-bottom: 1px solid var(--line);
     }
     .tar-detail-conns th:first-child, .tar-detail-conns td:first-child { padding-left: 16px; }
-    .tar-detail-conns th { font-weight: 500; color: var(--mut); background: var(--surface2); }
+    table.tar-detail-conns th { font-weight: 500; color: var(--mut); background: var(--surface2); }
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate
 // (still one continuous <style> block in the rendered HTML).
@@ -276,10 +236,11 @@ R"HTM(
     .devnet-body { max-height: 18rem; overflow: auto; }
     .devnet-table { width: 100%; border-collapse: collapse;
       font-family: var(--mds-font-family-mono); font-size: 12.5px; }
-    .devnet-table th { position: sticky; top: 0; background: var(--surface2); text-align: left;
+    /* table.-prefixed: ties with look's (0,1,2) .tw table th/td and wins by source order */
+    table.devnet-table th { position: sticky; top: 0; background: var(--surface2); text-align: left;
       padding: 6px 12px; color: var(--mut); font-weight: 500; border-bottom: 1px solid var(--line); }
-    .devnet-table td { padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-    /* Table-prefixed so the cell colours outrank .tar-frame-body td */
+    table.devnet-table td { padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    /* Table-prefixed so the cell colours outrank look's .tw table td */
     .devnet-table .dn-type { color: var(--ink); font-weight: 500; }
     .devnet-table .dn-data, .devnet-table .arp-mac, .devnet-table .arp-type-dynamic { color: var(--ink2); }
     .devnet-table .dn-ttl { color: var(--mut); text-align: right; }
@@ -314,13 +275,11 @@ R"HTM(
     .state-cell { display: flex; align-items: center; gap: 10px; }
     .state-txt { font-size: 12.5px; color: var(--mut); }
     .state-on { color: var(--ok); font-weight: 500; }
-    .pending-txt { color: var(--warn) !important; font-weight: 500; }
+    .pending-txt { color: var(--warn); font-weight: 500; }
     #capTable tr.pending td { background: color-mix(in srgb, var(--warn) 10%, transparent); }
     #capTable tr.pending td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
-    .apply-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 16px;
-      padding: 12px 14px; background: var(--surface2); border-radius: var(--rad-panel);
-      border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line2));
-      font-size: 13.5px; color: var(--ink2); }
+    /* Notes and warning frame come from yuzu.css (.note.warn); only the flex row and margin are local */
+    .apply-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 16px; }
     .apply-bar[hidden] { display: none; }
     .apply-icon { color: var(--warn); }
     .apply-spacer { flex: 1; }
@@ -336,15 +295,15 @@ R"HTM(</head>
 
   <div class="tar-content">
     <div class="tar-ph">
-      <h1>TAR &mdash; Timeline Activity Record</h1>
+      <h1>TAR</h1>
       <p class="tar-subtitle">
-        Forensic + inventory data warehouse on each agent. Disable a
-        collector to freeze its data for analysis; re-enable when finished.
+        Timeline Activity Record: what ran, what it connected to, and what
+        changed, recorded on each device.
       </p>
     </div>
 
     <!-- ── Retention-paused sources (Phase 15.A) ─────────────────────── -->
-    <div class="tar-frame" id="frame-retention-paused">
+    <div class="tar-frame panel" id="frame-retention-paused">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Retention-paused sources</h2>
         <div class="tar-frame-actions">
@@ -361,7 +320,7 @@ R"HTM(</head>
           </button>
         </div>
       </div>
-      <div class="tar-frame-body" id="retention-paused-body"
+      <div class="tar-frame-body tw" id="retention-paused-body"
            hx-get="/fragments/tar/retention-paused"
            hx-trigger="load"
            hx-swap="innerHTML">
@@ -372,11 +331,11 @@ R"HTM(</head>
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate.
 R"HTM(    <!-- ── Capture sources (ADR-0015) ───────────────────────────────── -->
-    <div class="tar-frame" id="frame-capture-sources">
+    <div class="tar-frame panel" id="frame-capture-sources">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Capture sources</h2>
       </div>
-      <div class="tar-frame-body" id="capture-sources"
+      <div class="tar-frame-body tw" id="capture-sources"
            hx-get="/fragments/tar/capture-sources" hx-trigger="load" hx-swap="innerHTML">
         <div class="placeholder">Loading capture sources&hellip;</div>
       </div>
@@ -408,46 +367,24 @@ R"HTM(    <!-- ── Capture sources (ADR-0015) ──────────�
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate.
 R"HTM(
-    <!-- ── Ad-hoc TAR SQL frame (Phase 15.D — scope walking) ────────── -->
-    <div class="tar-frame" id="frame-tar-sql">
+    <!-- Ad-hoc TAR SQL moved to Result sets > From TAR query (it carries the same parent
+         scope, SQL, name and include-empty fields, behind a confirm that shows the SQL). -->
+    <div class="tar-frame panel" id="frame-tar-sql">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Ad-hoc TAR SQL</h2>
-        <div class="tar-frame-actions">
-          <button class="btn-secondary" id="tar-sql-refresh-scopes"
-                  title="Reload your result sets">Refresh scopes</button>
-        </div>
       </div>
-      <div class="tar-frame-body tar-pad">
-        <!-- Scope chip (design §8.3): pick the candidate scope this query
-             narrows. Submitting creates a NEW result set parented at the
-             selected set. Standard scopes (__all__) carry no parent. -->
-        <div class="scope-chip-row">
-          <label class="scope-chip-label" for="tar-sql-scope">Scope</label>
-          <select id="tar-sql-scope" class="scope-chip-select">
-            <option value="__all__">__all__ — entire fleet</option>
-          </select>
-          <span class="scope-chip-meta" id="tar-sql-scope-meta"></span>
-        </div>
-        <textarea id="tar-sql-text" class="tar-sql-textarea" rows="4" spellcheck="false"
-                  placeholder="SELECT DISTINCT pid FROM process_live WHERE name = 'chrome.exe'"></textarea>
-        <div class="tar-sql-controls">
-          <input type="text" id="tar-sql-name" class="tar-sql-name"
-                 placeholder="Name (optional) e.g. windows-chrome-suspects" maxlength="120">
-          <label class="tar-sql-empty">
-            <input type="checkbox" id="tar-sql-include-empty"> include responders with 0 rows
-          </label>
-          <button id="tar-sql-run">Run &amp; create result set</button>
-        </div>
-        <div class="tar-sql-result" id="tar-sql-result"></div>
+      <div class="tar-frame-body tar-pad tar-sql-moved">
+        Ad-hoc TAR queries now start from <a href="/result-sets">Result sets</a>: choose
+        <strong>From TAR query</strong> to run a SELECT on a scope and keep the devices that answer.
       </div>
     </div>
 
     <!-- ── Process tree viewer (Phase 15.H) ─────────────────────────── -->
-    <div class="tar-frame" id="frame-process-tree">
+    <div class="tar-frame panel" id="frame-process-tree">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Process tree viewer</h2>
       </div>
-      <div class="tar-frame-body tar-pad">
+      <div class="tar-frame-body tw tar-pad">
         <!-- No hx-target here: the default target is this element itself. An
              explicit hx-target="this" would be INHERITED by descendants (the poll
              div), making their swaps clobber this whole frame body. -->
@@ -541,125 +478,6 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
   }
 });
 
-// ── Scope-walking SQL frame (Phase 15.D) ─────────────────────────────────
-// Drives the scope chip + ad-hoc TAR SQL against the REST result-set API.
-// Selecting a scope picks the candidate set; running the query dispatches
-// tar.sql to that scope and creates a NEW result set parented at it, then
-// polls until the async maintenance thread materialises membership.
-(function() {
-  var scopeSel  = document.getElementById('tar-sql-scope');
-  var scopeMeta = document.getElementById('tar-sql-scope-meta');
-  var sqlText   = document.getElementById('tar-sql-text');
-  var nameInput = document.getElementById('tar-sql-name');
-  var emptyChk  = document.getElementById('tar-sql-include-empty');
-  var runBtn    = document.getElementById('tar-sql-run');
-  var resultBox = document.getElementById('tar-sql-result');
-  var refreshBtn= document.getElementById('tar-sql-refresh-scopes');
-  if (!scopeSel || !runBtn) return;
-
-  // id -> {name, device_count, status} for the meta line.
-  var scopeIndex = {};
-
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
-      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c];
-    });
-  }
-
-  function renderMeta() {
-    var v = scopeSel.value;
-    if (v === '__all__') { scopeMeta.textContent = 'entire fleet — no parent'; return; }
-    var s = scopeIndex[v];
-    if (!s) { scopeMeta.textContent = ''; return; }
-    var bits = [s.device_count + ' devices'];
-    if (s.status && s.status !== 'materialized') bits.push(s.status);
-    scopeMeta.textContent = bits.join(' · ');
-  }
-
-  function loadScopes() {
-    fetch('/api/v1/result-sets?limit=200').then(function(r){return r.json();}).then(function(j){
-      var sets = (j.data && j.data.result_sets) || [];
-      var keep = scopeSel.value;
-      scopeIndex = {};
-      while (scopeSel.options.length > 1) scopeSel.remove(1);
-      sets.forEach(function(s){
-        scopeIndex[s.id] = s;
-        var label = (s.name ? s.name : s.id) + ' — ' + s.device_count + ' devices'
-                  + (s.status && s.status !== 'materialized' ? ' (' + s.status + ')' : '');
-        var opt = document.createElement('option');
-        opt.value = s.id; opt.textContent = label;
-        scopeSel.appendChild(opt);
-      });
-      if (keep && (keep === '__all__' || scopeIndex[keep])) scopeSel.value = keep;
-      renderMeta();
-    }).catch(function(){ /* leave __all__ only */ });
-  }
-
-  // Poll a freshly-created pending set until membership materialises.
-  function pollSet(id, name, tries) {
-    fetch('/api/v1/result-sets/' + encodeURIComponent(id)).then(function(r){return r.json();})
-      .then(function(j){
-        var s = j.data || {};
-        if (s.status === 'pending' && tries > 0) {
-          setTimeout(function(){ pollSet(id, name, tries - 1); }, 2000);
-          return;
-        }
-        if (s.status === 'failed') {
-          resultBox.className = 'tar-sql-result error';
-          resultBox.innerHTML = 'Result set <code>' + esc(id) + '</code> failed to materialise.';
-        } else if (s.status === 'pending') {
-          resultBox.className = 'tar-sql-result';
-          resultBox.innerHTML = 'Result set <code>' + esc(id) + '</code> still pending — '
-            + '<a href="/result-sets">view in Result Sets</a>.';
-        } else {
-          resultBox.className = 'tar-sql-result';
-          resultBox.innerHTML = 'Created <code>' + esc(name || id) + '</code> — <strong>'
-            + esc(s.device_count) + '</strong> device(s). '
-            + 'Copy scope token <code>from_result_set:' + esc(id) + '</code> · '
-            + '<a href="/result-sets">open</a>';
-          loadScopes();
-        }
-        runBtn.disabled = false;
-      }).catch(function(){ runBtn.disabled = false; });
-  }
-
-  function run() {
-    var sql = sqlText.value.trim();
-    if (!sql) { showToast('Enter a SQL query', 'warning'); return; }
-    var body = { sql: sql, include_empty: !!emptyChk.checked };
-    var nm = nameInput.value.trim();
-    if (nm) body.name = nm;
-    if (scopeSel.value && scopeSel.value !== '__all__') body.parent_id = scopeSel.value;
-    runBtn.disabled = true;
-    resultBox.className = 'tar-sql-result';
-    resultBox.textContent = 'Dispatching to agents…';
-    fetch('/api/v1/result-sets/from-tar-query', {
-      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
-    }).then(function(r){ return r.json().then(function(j){ return {status:r.status, body:j}; }); })
-      .then(function(res){
-        if (res.status === 202 && res.body.data) {
-          var s = res.body.data;
-          resultBox.innerHTML = 'Dispatched (execution <code>' + esc(s.source_execution_id)
-            + '</code>) — awaiting responses…';
-          pollSet(s.id, s.name, 150);
-        } else {
-          var msg = (res.body.error && (res.body.error.message || res.body.error)) || 'request failed';
-          resultBox.className = 'tar-sql-result error';
-          resultBox.textContent = msg;
-          runBtn.disabled = false;
-        }
-      }).catch(function(){
-        resultBox.className = 'tar-sql-result error';
-        resultBox.textContent = 'network error';
-        runBtn.disabled = false;
-      });
-  }
-
-  scopeSel.addEventListener('change', renderMeta);
-  runBtn.addEventListener('click', run);
-  if (refreshBtn) refreshBtn.addEventListener('click', loadScopes);
-  loadScopes();
-})();
 </script>
 </body></html>
 )HTM";

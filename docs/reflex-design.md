@@ -720,8 +720,8 @@ from starving Guardian, and Guardian's own enforcement evidence, of that shared,
   sweep (`docs/clock-guarded-retention.md`; R10 records the adoption-register row), **bounded below
   by the evidentiary retention floor above** — the TTL can be lengthened by the operator, never
   shortened past the floor.
-- Fleet-level aggregates are aggregate-first and floor at the shipped `kDexCohortFloor` (an
-  aggregate over 1-2 devices is a de facto per-device view); per-device drill stays audited per the
+- Fleet-level aggregates are aggregate-first and floor at the shipped `kDexCohortFloor` (one
+  device, so only an empty aggregate is withheld); per-device drill stays audited per the
   bullet above.
 - Deliberately deferred to the works-council enablement backlog (not omissions): per-category
   collection toggle, an individual-view kill switch, pseudonymization.

@@ -381,6 +381,8 @@ TEST_CASE("create_baseline_from_form reports a duplicate name without a second r
     // htmx does not swap 4xx bodies, so the conflict surfaces as 200 + a banner.
     CHECK(res->status == 200);
     CHECK(res->body.find("already exists") != std::string::npos);
+    // The banner keeps its stable gs-error-banner marker (the Spark load generator keys on it).
+    CHECK(res->body.find("gs-error-banner") != std::string::npos);
     CHECK(h.baselines->list_baselines().size() == 1);
 }
 

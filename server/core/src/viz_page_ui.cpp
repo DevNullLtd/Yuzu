@@ -96,6 +96,7 @@ const char* const kVizFleetPageTemplate = R"HTM(<!DOCTYPE html>
       margin-right: 6px;
       border-radius: 2px;
       vertical-align: -1px;
+      forced-color-adjust: none; /* the swatch is the legend: keep it in forced-colors */
     }
     /* The stage paints the canvas backdrop (the WebGL scene is transparent),
        so it follows the theme without a JS read. */

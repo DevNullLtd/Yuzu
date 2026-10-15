@@ -770,7 +770,7 @@ TEST_CASE("render_status_sparkbar: zero-count buckets emit no <rect>",
     // fallback tail; assert on the token name only.
     REQUIRE(svg.find("--mds-color-bg-success-emphasis") != std::string::npos);
     REQUIRE(svg.find("--mds-color-theme-indicator-error") == std::string::npos);
-    REQUIRE(svg.find("--mds-color-theme-indicator-stable") == std::string::npos);
+    REQUIRE(svg.find("--mds-color-theme-indicator-info") == std::string::npos);
     REQUIRE(svg.find("--mds-color-theme-text-tertiary") == std::string::npos);
 }
 
@@ -861,7 +861,7 @@ TEST_CASE("render_status_sparkbar: every fill has a two-arg var() fallback (UP-1
             != std::string::npos);
     REQUIRE(svg.find("var(--mds-color-theme-indicator-error,var(--red))")
             != std::string::npos);
-    REQUIRE(svg.find("var(--mds-color-theme-indicator-stable,var(--accent))")
+    REQUIRE(svg.find("var(--mds-color-theme-indicator-info,var(--info))")
             != std::string::npos);
     REQUIRE(svg.find("var(--mds-color-theme-text-tertiary,var(--muted))")
             != std::string::npos);
@@ -1160,6 +1160,10 @@ TEST_CASE("is_login_exempt_path: unrelated API paths are NOT exempt",
 
 TEST_CASE("is_login_exempt_path: every pre-existing exempt path is unchanged",
           "[web_utils][login_exempt][regression]") {
+    // The landing and sign-in page renders for a visitor with no session.
+    CHECK(is_login_exempt_path("/home"));
+    CHECK_FALSE(is_login_exempt_path("/home/"));
+    CHECK_FALSE(is_login_exempt_path("/homes"));
     CHECK(is_login_exempt_path("/login"));
     CHECK(is_login_exempt_path("/login/mfa"));
     CHECK(is_login_exempt_path("/login/mfa/enroll"));

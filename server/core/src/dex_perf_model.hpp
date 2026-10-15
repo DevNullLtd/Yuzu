@@ -13,7 +13,8 @@
 ///
 /// Honesty rules: a metric nobody reported is ABSENT (std::nullopt), never 0;
 /// every aggregate carries its reporting population; cohorts below
-/// kDexCohortFloor are suppressed ("n too small"), and devices without the
+/// kDexCohortFloor (one device: only an empty cohort) are suppressed ("n too
+/// small"), and devices without the
 /// chosen tag key form an explicit "(untagged)" residual, never a silent
 /// omission. A Cohort is a read-side analytical grouping over an
 /// operator-chosen tag key (CONTEXT.md "Cohort") — no authorization meaning.
@@ -63,7 +64,11 @@ using DexPerfFn = std::function<DexPerfSnapshot(const std::string& cohort_key)>;
 /// Statistical floor: cohorts with fewer reporting devices than this render
 /// "n too small" instead of noisy percentiles. Deliberately a constant, not a
 /// setting (grill 2026-06-12) — make it tunable only if a real fleet asks.
-inline constexpr int64_t kDexCohortFloor = 10;
+/// One device since the maintainer ruling of 2026-10-14 (previously 10): a
+/// cohort, point or figure is published whenever at least one device
+/// contributed, so suppression only ever marks an empty cohort or point. Every
+/// consumer derives from this ONE constant; none carries its own threshold.
+inline constexpr int64_t kDexCohortFloor = 1;
 
 /// The conventional default cohort key (the asset-tagging recipe's key) —
 /// the ONE spelling shared by the fragment, REST and MCP defaults so the
