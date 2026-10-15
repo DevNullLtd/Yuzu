@@ -1,0 +1,13 @@
+- **macOS agent package installs transactionally and can refuse (every `.pkg`, including the release package).**
+  - The new agent is staged and validated before the running one is stopped. A replaced agent that does not stay running is rolled back and restarted.
+  - A first install of the stock package installs the agent but does not start it until a server trust anchor is configured. An agent that was stopped or disabled stays stopped.
+  - Upgrades now keep the service definition's arguments, every `YUZU_*` variable (OTA signing and opt-outs included) and the proxy settings. Previously the definition was replaced.
+  - The installer refuses, before changing anything, when:
+    - a `/usr/local` directory the agent runs from is not root-owned, or is group- or world-writable (common on Intel Macs with Homebrew);
+    - agent code or plugins there could have been written by another account;
+    - the data directory is not owned by root or `_yuzu`;
+    - a retained signed-plugin requirement meets an unsigned package.
+  - A planted `yuzu-agent.old` is never promoted by an OTA rollback.
+  - See *Behaviour change: the macOS agent package installs transactionally* in `docs/user-manual/upgrading.md` and the new *Deploying with MDM* runbook.
+  - Released macOS agents still use the process poll, not Endpoint Security.
+- **`--no-auto-update` now also disables the agent's startup OTA rollback, its `.old` cleanup and the post-update verification marker, on every platform.** A disabled updater writes nothing beside the agent executable, which the signed macOS app bundle requires. After OTA is re-enabled on an agent that ran disabled, the first update can be rolled back once at the next restart and then re-applied; it settles after one cycle.

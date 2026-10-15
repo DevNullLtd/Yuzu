@@ -9,12 +9,27 @@ The default package remains the loose-binary lane:
 bash deploy/packaging/macos/build-pkg.sh --bin-dir build-macos --version <version> --output dist
 ```
 
-The loose lane runs the root LaunchDaemon from `/usr/local/bin`, a directory
-the package shares with other tools and never re-owns. Installation therefore
-requires `/usr/local` and `/usr/local/bin` to be root-owned and not group- or
-world-writable (some Intel-Mac Homebrew setups loosen them); otherwise it stops
-before the running agent is touched. The signed app lane does not use
-`/usr/local/bin`.
+Both lanes run root code from below `/usr/local`, a tree the package shares
+with other tools and never re-owns: plugins and the plist-merge helper from
+`/usr/local/lib/yuzu`, and in the loose lane the daemon itself from
+`/usr/local/bin`. Installation therefore requires each existing directory of
+`/usr/local`, `/usr/local/lib` and `/usr/local/lib/yuzu` (plus `/usr/local/bin`
+for the loose lane) to be root-owned and not group- or world-writable; otherwise
+it stops before the running agent is touched. Hosts this can stop:
+
+- Intel Macs where Homebrew was installed into `/usr/local`; its installer gives
+  the admin user ownership of `/usr/local/bin` and `/usr/local/lib`. Apple
+  silicon Homebrew lives in `/opt/homebrew` and is not affected.
+- Hosts where an MDM or provisioning script loosened `/usr/local` modes.
+
+Making the directories root-owned does not undo what another account already
+wrote into them. The installer also refuses when any `yuzu-agent*`,
+`libyuzu_agent_core*` or `.yuzu-update-verified` entry in `/usr/local/bin`, or
+any entry in `/usr/local/lib/yuzu/plugins`, is a symlink, is not root-owned, or
+is group- or world-writable, and it lists each one. Inspect them, remove
+anything you did not install as root, then retry. Package promotion removes the
+updater's `yuzu-agent.old` rollback file and its marker, because they belong to
+the code being replaced.
 
 The opt-in development lane stages a signed, immutable `YuzuAgent.app` and keeps
 plugins external at `/usr/local/lib/yuzu/plugins`:
@@ -66,10 +81,14 @@ The bundle LaunchDaemon runs as root, retains external plugins, and always passe
 `/Library/Application Support/YuzuAgent/YuzuAgent.app`; data stays in
 `/Library/Application Support/Yuzu` and is never ownership-reset or removed by
 this lane. Because it is the root daemon's data and working directory, an existing one
-must already be root-owned and not group- or world-writable; otherwise installation
-stops before anything is staged, and the directory is left exactly as it was. Logs, configuration, and trust anchors also remain outside the sealed
-app, with existing configuration and certificate-directory ownership and modes
-preserved.
+must be owned by root or by the `_yuzu` service account that
+`scripts/install-agent-user.sh` provisions, and must not be group- or
+world-writable; otherwise installation stops before anything is staged, and the
+directory is left exactly as it was. It holds the agent's identity and
+enrolment, so never delete it to get past this check; remove the write bit or
+restore its owner instead. Logs, configuration, and trust anchors also remain
+outside the sealed app, with existing configuration and certificate-directory
+ownership and modes preserved.
 When upgrading an earlier development build that placed `YuzuAgent.app` below
 the data directory, the installer snapshots that package-owned child for
 recovery and removes it only after the new daemon is healthy; it never changes
@@ -98,13 +117,34 @@ recovery. The package first writes its code and LaunchDaemon plist to package-ow
 incoming paths. To prevent Installer from relocating an upgradeable `.app` before
 the transaction, the sealed bundle arrives as a private archive of `Contents`;
 postinstall extracts it only inside the trusted incoming root, rejects symlinks,
-strictly verifies the reconstructed app, then promotes it and removes the
-recovery snapshot only after launchd reports `running` with a PID for three
-consecutive observations (up to six seconds). Interrupted-promotion recovery has
-the same sustained check; a failure restores the previous state and retains the
-recovery journal. A payload failure before postinstall therefore leaves the active
-installation in place. Development app signing does not installer-sign or notarize
-the `.pkg`.
+strictly verifies the reconstructed app, and merges the existing service
+settings into the new definition, all before anything active is stopped. A
+failure there leaves the running agent untouched.
+
+Whether the new agent is started depends on what it replaces:
+
+- **A running agent.** The new one is started and must report `running` with a
+  PID for three consecutive observations (up to six seconds), or the previous
+  package state is restored and restarted.
+- **A service an administrator disabled** (`launchctl disable`). It is installed
+  and left stopped.
+- **Nothing running, but a server trust anchor is configured** (`--ca-cert`,
+  `--tls-system-roots`, `--no-tls`, the matching `YUZU_*` variable, or
+  `/etc/yuzu/certs/default-ca.pem`). It is started and its state is reported, with
+  no rollback, since nothing running was replaced.
+- **Nothing configured** (a first install of the stock package). It is installed
+  but not started, because the agent refuses to run without a trust anchor. The
+  Installer output says how to configure and start it.
+
+Recovery restarts a restored agent only if it was running when the snapshot was
+taken. A restored definition that recovery does not start (because the agent
+was not running before, its code directory is untrusted, it cannot be read, or
+it points into the data directory) is still in `/Library/LaunchDaemons`, so
+launchd starts it at the next boot, exactly as before the install. Disable it
+(`launchctl disable system/com.yuzu.agent`) if it must stay stopped. A restored agent that does not stay running is reported, and recovery
+still completes, so the next install is never blocked by it. A payload failure
+before postinstall leaves the active installation in place. Development app
+signing does not installer-sign or notarize the `.pkg`.
 
 Do not install the root LaunchDaemon, grant Full Disk Access, or test live
 Endpoint Security without explicit test-rig authorization. A valid signature, a
@@ -117,10 +157,20 @@ Apple-signed plugin bytes; stale sidecars are rejected. When input plugins carry
 sidecars, provide `--final-plugin-sig-dir`, `--plugin-trust-bundle` and
 `--runtime-plugin-trust-bundle`. The helper invokes Yuzu's shared CMS verifier on
 the final plugin bytes and the generated LaunchDaemon enforces that runtime trust
-bundle with `--plugin-require-signature`. During an upgrade, existing server/TLS
-arguments and supported `YUZU_*` environment settings are retained. A generated
-sidecar policy deliberately replaces existing plugin-signing arguments and
-environment settings; bundle-owned paths and `--no-auto-update` are forced.
+bundle with `--plugin-require-signature`. During an upgrade, existing arguments
+other than the package-owned paths are retained. Every existing `YUZU_*`
+environment variable is retained (OTA signing, inventory and licence-scan
+opt-outs included), as are the standard proxy variables. Exceptions: the
+generated definition's own keys, `YUZU_PLUGIN_DIR` and `YUZU_DATA_DIR`. Any
+other variable is dropped, and each drop is named in the Installer log. A
+generated sidecar policy deliberately replaces existing plugin-signing
+arguments and environment settings; bundle-owned paths and `--no-auto-update`
+are forced. If the existing definition cannot be parsed, the package default is
+installed with a warning, and earlier settings must be re-applied. If the
+existing definition requires plugin signatures and this package ships an
+unsigned plugin (every release `.pkg` does), the install stops before anything
+is changed: remove `--plugin-require-signature` first, or install a signed
+package.
 If the bundle contains CMS sidecars, pass the same build-time
 `--plugin-trust-bundle` to `build-pkg.sh`: packaging reruns the shared verifier
 over the bytes it is about to copy, so a stale or final-byte-modified sidecar
@@ -176,14 +226,18 @@ sudo /usr/sbin/installer -pkg YuzuAgent-<version>-macos-<arch>.pkg -target /
 
 The same command performs loose-to-bundle, bundle-to-bundle, and bundle-to-loose
 transitions. It stages the new payload under incoming names while the old daemon
-continues to run, validates the bundle, then stops and replaces the selected lane.
-The postinstall script restores the saved plist and package-owned files if that
-promotion or its sustained launchd health observation fails. It leaves data, logs,
-configuration, certificates, and third-party plugins alone. The recovery snapshot records a
-durable `prepared` or `promoting` phase; a later package invocation discards an
-unused prepared snapshot or restores an interrupted promotion before taking a
-new snapshot. The root-owned recovery state rejects symlinked,
-group/world-writable, or out-of-root pointers rather than using them.
+continues to run, validates it, then stops and replaces the selected lane.
+The postinstall script restores the saved plist and package-owned files if
+promotion or the health observation of a previously running agent fails. It
+leaves data, logs, configuration, certificates, and third-party plugins alone.
+The recovery snapshot records a durable `prepared` or `promoting` phase. A later
+package run discards an unused prepared snapshot, or restores an interrupted
+promotion, before taking a new snapshot. A recovery pointer that is unusable
+(dangling after an interrupted cleanup, empty after a torn write, or a symlink)
+is reported and dropped, and a phase that cannot be read is treated as an
+interrupted promotion, so no recovery state can block later installs. Installs
+and `uninstall.sh` take one lock (`/var/db/.yuzu-agent-transition.lock`), so an
+uninstall waits for an install in progress rather than racing it.
 
 Older loose packages did not ship `package-files.list`. Their first upgrade
 derives that manifest only from the system Installer receipt for `com.yuzu.agent`
@@ -192,10 +246,18 @@ overwriting same-named plugins: an unrecognized collision stops before unloading
 the running service. Current packages also record each plugin's SHA-256 in
 `package-files.sha256`: a listed plugin whose bytes no longer match is not treated
 as package-owned (a collision with it stops the upgrade) and is never re-owned by
-the installer. The plugin directory must be root-owned, non-symlinked, and
-not group/world writable. A missing data working directory is created; an existing
-one must be root-owned and not group/world writable, and keeps its owner, mode,
-and contents.
+the installer. Removal follows the same rule: a listed plugin whose bytes were
+changed by an operator is kept, with a warning. Packages from before the hash
+sidecar existed remove listed plugins by name. The plugin directory must be
+root-owned, non-symlinked, and not group/world writable. A missing data working
+directory is created; an existing one keeps its owner, mode, and contents.
+
+The first line of `package-files.list` names the package version that wrote it.
+A package without a manifest (any release from before this one), installed over
+a newer one, leaves that manifest behind. The next install sees that its version
+differs from the Installer receipt. It then re-derives ownership: the receipt's
+plugins, plus each listed plugin whose bytes still match its recorded hash. So
+rolling back a fleet and forward again does not refuse every later upgrade.
 
 For an authorized silent uninstall, run:
 
@@ -203,15 +265,58 @@ For an authorized silent uninstall, run:
 sudo /usr/local/lib/yuzu/uninstall.sh
 ```
 
-It removes only Yuzu's manifest-listed plugin files and both package-owned code
-lanes; it retains operational data, logs, configuration, trust anchors, and
-third-party plugins. If the legacy app in the data root is unrecognized, the
-script moves it to a root-only `/var/db/yuzu-agent/uninstall-legacy.*` recovery
-directory, exits nonzero, and leaves the package-owned code lanes and plist in
-place. Inspect that retained app and deliberately retry or remediate the
-installation; the daemon remains unloaded until a later successful package
-transition, so do not restart it before that inspection. Do not delete the
-recovery directory to force an uninstall. If
-an installation reports an error, retain
-`/var/db/yuzu-agent/install-recovery.*` and the Installer log for diagnosis;
-do not delete them before comparing the restored plist and package manifest.
+It removes Yuzu's manifest-listed plugin files (except ones an operator
+changed), both package-owned code lanes and the updater's rollback file. It
+retains operational data, logs, configuration, trust anchors, and third-party
+plugins. It first discards any interrupted-install recovery state, so a later
+install can never restore the agent it removed. An unrecognized legacy app in
+the data root is quarantined, as the installer does, and the uninstall
+continues. `/var/db/yuzu-agent` is removed unless its `quarantine/` directory
+holds something; then it is kept, and the script names it.
+
+If an installation reports an error, keep the Installer log
+(`/var/log/install.log`) for diagnosis. The installer has already restored the
+previous state. You do not need to clear `/var/db/yuzu-agent` by hand, because
+the next package run repairs or discards whatever it finds there.
+
+## Deploying with MDM
+
+The package needs no interaction. To have the agent start on its first install,
+make its configuration available before the package runs:
+
+1. Deploy the server's CA certificate, for example
+   `/etc/yuzu-agent/certs/server-ca.pem` (root-owned, mode 644).
+2. Deploy `/Library/LaunchDaemons/com.yuzu.agent.plist` (root:wheel, 644). Its
+   `ProgramArguments` carries the server and trust settings, and its
+   `EnvironmentVariables` carries any `YUZU_*` settings, for example
+   `YUZU_UPDATE_TRUST_BUNDLE` or `YUZU_AGENT_INVENTORY_DISABLE`. Do not load it.
+3. Install the package, for example as an MDM package payload or with
+   `installer -pkg … -target /`.
+
+The installer treats that plist as the existing definition. It keeps your
+arguments and `YUZU_*` variables, adds its own fixed paths, and starts the agent
+because a trust anchor is configured. A minimal plist:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.yuzu.agent</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/local/bin/yuzu-agent</string>
+    <string>--server</string><string>yuzu.example.com:50051</string>
+    <string>--ca-cert</string><string>/etc/yuzu-agent/certs/server-ca.pem</string>
+    <string>--enrollment-token</string><string>REPLACE-ME</string>
+  </array>
+</dict></plist>
+```
+
+A LaunchDaemon plist is readable by every local account, so use a single-use,
+short-lived enrollment token there. It is only needed until the agent has
+enrolled.
+
+Without step 2, the package installs the agent but does not start it. A later
+script can add the settings to the installed plist and run
+`launchctl bootstrap system /Library/LaunchDaemons/com.yuzu.agent.plist`. To keep
+an installed agent stopped across upgrades, disable it
+(`launchctl disable system/com.yuzu.agent`); upgrades then leave it stopped.
