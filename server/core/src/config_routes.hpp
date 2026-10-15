@@ -30,15 +30,9 @@
 ///                                 username and the same-site check, THEN
 ///                                 body parsing and integer-key validation)
 ///
-/// AUDIT (ADR-0033 section 9, no audit row, no mutation): GET is a pure read, never audited. PUT
-/// is audit-first. After the gates and body/integer validation (rejections there are not
-/// audited) it writes a `config.update` row with result `attempted` and an empty detail; if that
-/// row cannot be stored the call is a 503 with `Sec-Audit-Failed` and nothing is stored or
-/// applied. A `success` row (or `failure` when the store refuses) follows; a lost outcome row
-/// leaves the change applied and sets `Sec-Audit-Failed`. A cookie session without a same-site
-/// Origin/Referer is refused 403 and audited `csrf.denied` before the body is read (token
-/// callers are exempt). A secret key's audited `detail` never carries the raw value --
-/// `RuntimeConfigStore::redacted_placeholder()` substitutes for it.
+/// AUDIT: GET is never audited. PUT is audit-first (ADR-0033 section 9): `attempted` row, 503 and
+/// no change if it cannot be stored, then `success`/`failure`. A secret key's `detail` never
+/// carries the raw value. Contract: docs/user-manual/rest-api.md, `PUT /api/config/:key`.
 ///
 /// This route IS now TestRouteSink-registered (`test_config_routes.cpp`) —
 /// the original inline code's comment noting the opposite ("this route is
