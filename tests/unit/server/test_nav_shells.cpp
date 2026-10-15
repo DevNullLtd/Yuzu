@@ -38,6 +38,7 @@ extern const char* const kComplianceHtml;
 extern const char* const kGuardianHtml;
 extern const char* const kGuardianDetailPageHtml;
 extern const char* const kSettingsHtml;
+extern const char* const kSettingsIntegrationsHtml;
 extern const char* const kSettingsGeneralHtml;
 extern const char* const kSettingsDataHtml;
 extern const char* const kSettingsDeveloperHtml;
@@ -556,6 +557,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"settings", kSettingsHtml, {"/settings"}},
         // A sub-item: its own link is the current page and the parent is lit as the family.
         {"settings general", kSettingsGeneralHtml, {"/settings", "/settings/general"}},
+        {"settings integrations", kSettingsIntegrationsHtml, {"/settings", "/settings/integrations"}},
         {"settings data", kSettingsDataHtml, {"/settings", "/settings/data"}},
         {"settings developer", kSettingsDeveloperHtml, {"/settings", "/settings/developer"}},
         {"users", kAccessUsersHtml, {"/access/users"}},

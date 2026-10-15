@@ -300,7 +300,15 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # events settings as GET /fragments/settings/general-runtime and /fragments/settings/analytics-events,
 # +2. Merged with the Access pages (212 above), the count is 214, the value the checker reports on the
 # merged tree, not hand-picked. Whether the ADR-1005 exception extends to these rows is the owner's decision on #5873.
-BASELINE_UNTWINNED = 214
+#
+# Integrations page, webhook panel (System pages SYS-5, #5872): the two webhook fragments
+# (GET /fragments/settings/webhooks and .../{id}/deliveries) are `composed-of:` the legacy /api/webhooks
+# routes, which are themselves `planned:#2146` with no REST v1 or MCP twin yet, so they cannot be
+# `twinned`: +2. Merged with the General and Access rows above (214), the count is 216, the value the
+# checker reports on the merged tree, not hand-picked. OWNER DECISION PENDING: this raise is not covered by
+# the ADR-1005 exception recorded for the four Dashboard fragments of PR #5859. The twins that would remove
+# it are tracked in #5885.
+BASELINE_UNTWINNED = 216
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
