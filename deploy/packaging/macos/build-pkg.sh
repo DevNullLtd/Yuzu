@@ -27,6 +27,9 @@ if [[ -z "$VERSION" || ( -z "$BIN_DIR" && -z "$BUNDLE_DIR" ) || ( -n "$BIN_DIR" 
     echo "ERROR: exactly one of --bin-dir or --bundle-dir and --version are required" >&2
     usage; exit 1
 fi
+# The version is written into the payload manifest and the distribution XML.
+[[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]] || {
+    echo "ERROR: --version must be a plain version string: $VERSION" >&2; exit 1; }
 
 STAGING="$(mktemp -d)"
 SCRIPTS="$(mktemp -d)"
@@ -47,17 +50,24 @@ trap cleanup EXIT
 install -m 755 "$SCRIPT_DIR/preinstall" "$SCRIPTS/preinstall"
 install -m 755 "$SCRIPT_DIR/postinstall" "$SCRIPTS/postinstall"
 install -d "${STAGING}/usr/local/lib/yuzu/.plugins.incoming"
-: > "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
+# The first manifest line names the package version. preinstall compares it
+# with the Installer receipt: a mismatch means an older package without this
+# manifest was installed over it, so the manifest and hashes are stale.
+printf '# package-version %s\n' "$VERSION" > "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
 : > "${STAGING}/usr/local/lib/yuzu/.package-files.sha256.incoming"
 # Ownership of an installed plugin is its exact bytes, not just its name: the
 # installer re-verifies these hashes before treating a file as package-owned.
 record_plugin() {
-    local staged="$1" name
+    local staged="$1" name digest
     name="$(basename "$staged")"
     [[ "$name" != *[[:space:]]* ]] || { echo "ERROR: plugin name contains whitespace: $name" >&2; return 1; }
+    # Hash in its own statement: inside a printf argument a failing shasum's
+    # status is discarded and an empty hash would be recorded.
+    digest="$(shasum -a 256 "$staged")" || { echo "ERROR: cannot hash plugin: $name" >&2; return 1; }
+    digest="${digest%% *}"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "ERROR: invalid SHA-256 for plugin: $name" >&2; return 1; }
     printf 'plugins/%s\n' "$name" >> "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
-    printf '%s  plugins/%s\n' "$(shasum -a 256 "$staged" | awk '{print $1}')" "$name" \
-        >> "${STAGING}/usr/local/lib/yuzu/.package-files.sha256.incoming"
+    printf '%s  plugins/%s\n' "$digest" "$name" >> "${STAGING}/usr/local/lib/yuzu/.package-files.sha256.incoming"
 }
 install -m 644 "$SCRIPT_DIR/merge-launchd-plist.js" "$STAGING/usr/local/lib/yuzu/merge-launchd-plist.js"
 

@@ -3,6 +3,12 @@
 # script neither stops nor removes the active installation.
 set -euo pipefail
 
+# One package transition at a time (see postinstall; PR #4482 governance ch-3).
+if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
+    exec /usr/bin/lockf -k -t 600 /var/db/.yuzu-agent-transition.lock \
+        /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"
+fi
+
 PLIST="/Library/LaunchDaemons/com.yuzu.agent.plist"
 STATE_DIR="/var/db/yuzu-agent"
 DATA_DIR="/Library/Application Support/Yuzu"
@@ -13,6 +19,8 @@ LEGACY_APP_ID="7RLSYL2JM7.co.uk.devnullsecurity.yuzu-agent"
 LEGACY_SIGNING_AUTHORITY="Mac Developer: Nathan Dornbrook (YA95685L8R)"
 LEGACY_PROFILE_SHA256="3e764aafaa5cd29398ef6646b98c7b00332404c5ea57f79b92663695acdd70e1"
 YUZU_LIB="/usr/local/lib/yuzu"
+PLUGIN_DIR="$YUZU_LIB/plugins"
+LOOSE_BIN="/usr/local/bin"
 RECOVERY_FILE="$STATE_DIR/current-recovery"
 
 require_trusted_directory() {
@@ -23,6 +31,40 @@ require_trusted_directory() {
     mode="$(stat -f '%Lp' "$path")"
     [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || {
         echo "ERROR: package payload parent must be root-owned and not group/world writable: $path" >&2; exit 1; }
+}
+
+# See postinstall: the /usr/local chain is checked, never repaired (sec-2).
+code_directory_chain_trusted() {
+    local lane="${1:-bundle}" path owner mode
+    local paths="/usr/local /usr/local/lib /usr/local/lib/yuzu"
+    [[ "$lane" != loose ]] || paths="$paths $LOOSE_BIN"
+    for path in $paths; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        [[ -d "$path" && ! -L "$path" ]] || return 1
+        owner="$(stat -f '%u' "$path")"
+        mode="$(stat -f '%Lp' "$path")"
+        [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || return 1
+    done
+}
+
+# See postinstall: content a non-root account could have written is refused (ch-4).
+reject_untrusted_code_entries() {
+    local entry owner mode bad=""
+    for entry in "$LOOSE_BIN"/yuzu-agent* "$LOOSE_BIN"/libyuzu_agent_core* \
+                 "$LOOSE_BIN/.yuzu-update-verified" "$PLUGIN_DIR"/* "$PLUGIN_DIR"/.[!.]*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        if [[ -L "$entry" ]]; then
+            bad="$bad$entry"$'\n'; continue
+        fi
+        owner="$(stat -f '%u' "$entry")"
+        mode="$(stat -f '%Lp' "$entry")"
+        [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || bad="$bad$entry"$'\n'
+    done
+    [[ -z "$bad" ]] && return 0
+    echo "ERROR: refusing to install beside code a non-root account could have written:" >&2
+    printf '%s' "$bad" | while IFS= read -r entry; do echo "         $entry" >&2; done
+    echo "       Inspect each entry and remove anything you did not install as root, then retry." >&2
+    return 1
 }
 
 secure_payload_parent() {
@@ -68,18 +110,23 @@ require_recovery_directory() {
         echo "ERROR: recovery snapshot must be root:wheel mode 700" >&2; return 1; }
 }
 
+# Prints the pending snapshot, or nothing when there is none usable. The state
+# root is root:wheel 700 (ensure_state_dir), so only root wrote the pointer: a
+# torn or dangling one is an interrupted cleanup, not tampering. It is reported
+# and dropped (the snapshot it names, if any, is left in place) instead of
+# failing every later install (PR #4482 governance uh-1).
 read_recovery_path() {
-    local owner group mode pending
-    [[ -f "$RECOVERY_FILE" && ! -L "$RECOVERY_FILE" ]] || {
-        echo "ERROR: refusing missing or symlinked recovery pointer" >&2; return 1; }
-    owner="$(stat -f '%u' "$RECOVERY_FILE")"
-    group="$(stat -f '%g' "$RECOVERY_FILE")"
-    mode="$(stat -f '%Lp' "$RECOVERY_FILE")"
-    [[ "$owner" == 0 && "$group" == 0 && "$mode" == 600 ]] || {
-        echo "ERROR: recovery pointer must be root:wheel mode 600" >&2; return 1; }
-    pending="$(cat "$RECOVERY_FILE")"
-    require_recovery_directory "$pending" || return 1
-    printf '%s\n' "$pending"
+    local pending
+    if [[ -f "$RECOVERY_FILE" && ! -L "$RECOVERY_FILE" ]]; then
+        pending="$(cat "$RECOVERY_FILE")"
+        if require_recovery_directory "$pending" 2>/dev/null; then
+            printf '%s\n' "$pending"
+            return 0
+        fi
+    fi
+    echo "WARNING: discarding an unusable installation recovery pointer (an interrupted earlier install or cleanup)" >&2
+    rm -f "$RECOVERY_FILE"
+    sync
 }
 
 write_recovery_phase() {
@@ -93,13 +140,23 @@ write_recovery_phase() {
 # their ownership without accepting a symlink before the privileged extraction.
 # The Yuzu data directory may be provisioned by EDR/FDA policy with a
 # non-package owner. Never change it: stage sealed code in its own trusted root.
+# Owner root, or the _yuzu service account that scripts/install-agent-user.sh
+# provisions (docs/agent-privilege-model.md); never group/world writable.
+data_directory_owner_trusted() {
+    local owner="$1" service_uid
+    [[ "$owner" == 0 ]] && return 0
+    service_uid="$(/usr/bin/id -u _yuzu 2>/dev/null)" || return 1
+    [[ -n "$service_uid" && "$owner" == "$service_uid" ]]
+}
+
 require_trusted_data_directory() {
     local owner mode
     owner="$(stat -f '%u' "$DATA_DIR")"
     mode="$(stat -f '%Lp' "$DATA_DIR")"
-    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || {
-        echo "ERROR: existing data directory must be root-owned and not group/world writable: $DATA_DIR" >&2
-        echo "       (owner uid $owner, mode $mode). The installer never changes it; fix it or remove it, then retry." >&2
+    data_directory_owner_trusted "$owner" && [[ $((8#$mode & 8#022)) == 0 ]] || {
+        echo "ERROR: existing data directory must be owned by root or _yuzu and not group/world writable: $DATA_DIR" >&2
+        echo "       (owner uid $owner, mode $mode). It holds the agent's identity and enrolment; do not delete it." >&2
+        echo "       Remove the group/world write bit (chmod go-w) or restore its owner, then retry." >&2
         return 1; }
 }
 if [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then
@@ -107,24 +164,83 @@ if [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then
         echo "ERROR: data path is not a real directory: $DATA_DIR" >&2; exit 1; }
     require_trusted_data_directory || exit 1
 fi
+# Both lanes deliver code below /usr/local/lib/yuzu, so its whole existing chain
+# must be root-owned and non-writable before the payload lands (PR #4482
+# governance sec-2). /usr/local/bin is checked by postinstall for the loose lane.
+code_directory_chain_trusted bundle || {
+    echo "ERROR: /usr/local, /usr/local/lib and /usr/local/lib/yuzu must be root-owned and not group/world writable" >&2
+    exit 1; }
 secure_payload_parent "$APP_ROOT" 755
 secure_payload_parent "$YUZU_LIB" 755
-if [[ -e "$YUZU_LIB/plugins" || -L "$YUZU_LIB/plugins" ]]; then
-    require_trusted_directory "$YUZU_LIB/plugins"
+if [[ -e "$PLUGIN_DIR" || -L "$PLUGIN_DIR" ]]; then
+    require_trusted_directory "$PLUGIN_DIR"
 fi
+reject_untrusted_code_entries || exit 1
 ensure_state_dir
 
 
+# Exit 0: the file's SHA-256 equals the hash recorded at build time.
+plugin_hash_matches() {
+    local plugin="$1" hashes="$2" recorded actual
+    recorded="$(awk -v n="plugins/$plugin" '$2 == n {print $1; exit}' "$hashes")"
+    [[ -n "$recorded" && -f "$PLUGIN_DIR/$plugin" ]] || return 1
+    actual="$(shasum -a 256 "$PLUGIN_DIR/$plugin")" || return 1
+    [[ "${actual%% *}" == "$recorded" ]]
+}
+
+# See postinstall: an operator-modified listed plugin is kept (sec-3).
 remove_managed_plugins() {
-    local manifest="$1" relative plugin
+    local manifest="$1" hashes="${2:-}" relative plugin
     [[ -f "$manifest" ]] || return 0
     while IFS= read -r relative; do
         [[ "$relative" == plugins/* ]] || continue
         plugin="${relative#plugins/}"
         [[ -n "$plugin" && "$plugin" != */* && "$plugin" != .* ]] || {
             echo "ERROR: invalid package plugin manifest entry" >&2; return 1; }
-        rm -f "$YUZU_LIB/plugins/$plugin" "$YUZU_LIB/plugins/$plugin.sig"
+        if [[ -n "$hashes" && -f "$hashes" && -e "$PLUGIN_DIR/$plugin" ]] && \
+           ! plugin_hash_matches "$plugin" "$hashes"; then
+            echo "WARNING: kept $PLUGIN_DIR/$plugin: its bytes differ from the package's, so it is not package-owned" >&2
+            continue
+        fi
+        rm -f "$PLUGIN_DIR/$plugin" "$PLUGIN_DIR/$plugin.sig"
     done < "$manifest"
+}
+
+# The manifest's first line names the package that wrote it. An older package
+# without a manifest, installed over this one (a fleet rollback), leaves it
+# stale: its hashes then disown every plugin both versions ship and every later
+# upgrade refuses (PR #4482 governance rd-2). Ownership is then re-derived: the
+# Installer receipt's plugins, plus each formerly listed plugin whose bytes
+# still match its recorded hash. The result records names only.
+discard_stale_manifest() {
+    local manifest="$YUZU_LIB/package-files.list" hashes="$YUZU_LIB/package-files.sha256"
+    local recorded installed kept digest relative name actual
+    [[ -f "$manifest" && ! -L "$manifest" ]] || return 0
+    recorded="$(awk 'NR == 1 && $1 == "#" && $2 == "package-version" {print $3}' "$manifest")"
+    [[ -n "$recorded" ]] || return 0
+    installed="$(/usr/sbin/pkgutil --pkg-info com.yuzu.agent 2>/dev/null)" || return 0
+    installed="$(awk '/^version: / {print $2; exit}' <<<"$installed")"
+    [[ -n "$installed" && "$installed" != "$recorded" ]] || return 0
+    echo "WARNING: the package manifest was written by $recorded but the installed package is $installed; re-deriving plugin ownership" >&2
+    kept="$(mktemp "$YUZU_LIB/.still-owned.XXXXXX")"
+    if [[ -f "$hashes" ]]; then
+        while read -r digest relative; do
+            [[ "$relative" == plugins/* ]] || continue
+            name="${relative#plugins/}"
+            [[ -n "$name" && "$name" != */* && "$name" != .* ]] || continue
+            [[ -f "$PLUGIN_DIR/$name" && ! -L "$PLUGIN_DIR/$name" ]] || continue
+            actual="$(shasum -a 256 "$PLUGIN_DIR/$name")" || continue
+            [[ "${actual%% *}" != "$digest" ]] || printf '%s\n' "$relative" >> "$kept"
+        done < "$hashes"
+    fi
+    rm -f "$manifest" "$hashes"
+    adopt_receipted_plugins
+    while IFS= read -r relative; do
+        [[ -f "$manifest" ]] && grep -Fqx -- "$relative" "$manifest" && continue
+        printf '%s\n' "$relative" >> "$manifest"
+    done < "$kept"
+    rm -f "$kept"
+    [[ ! -f "$manifest" ]] || chmod 644 "$manifest"
 }
 
 copy_if_present() {
@@ -160,23 +276,6 @@ adopt_receipted_plugins() {
 # it is moved to a root-only quarantine OUTSIDE the data root and the recovery
 # snapshot, and reported. Keeping it inside the recovery snapshot (as before)
 # blocked every later recovery and install permanently (PR #4482 review).
-# The loose lane runs the root daemon from /usr/local/bin. Unlike the package's
-# own directories it is shared with other tools (Homebrew on Intel Macs, MDM
-# scripts) and must never be chmod/chown-ed by this package, so it is checked,
-# not repaired: /usr/local and /usr/local/bin must be real, root-owned and not
-# group/world writable, or a non-root user could swap the executable that
-# launchd then runs as root (PR #4482 review). Returns 1 instead of exiting so
-# recovery can decide what to do.
-loose_code_directory_trusted() {
-    local path owner mode
-    for path in /usr/local /usr/local/bin; do
-        [[ -d "$path" && ! -L "$path" ]] || return 1
-        owner="$(stat -f '%u' "$path")"
-        mode="$(stat -f '%Lp' "$path")"
-        [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || return 1
-    done
-}
-
 quarantine_legacy_app() {
     local source="$1" quarantine destination
     [[ -e "$source" || -L "$source" ]] || return 0
@@ -222,20 +321,52 @@ require_started() {
     return 1
 }
 
+# Recovery restarts only a service that was running when the snapshot was
+# taken. A restored service that will not stay up is reported, never retried
+# forever: the pending install is the remedy (PR #4482 governance sec-1).
+restart_restored_service() {
+    local recovery="$1" lane=bundle program_args
+    [[ -e "$PLIST" ]] || return 0
+    [[ -e "$recovery/service-was-running" ]] || {
+        echo "WARNING: restored the previous service definition; it was not running before, so it was not started" >&2
+        return 0; }
+    [[ ! -e "$recovery/loose/yuzu-agent" ]] || lane=loose
+    if ! code_directory_chain_trusted "$lane"; then
+        echo "WARNING: restored the previous agent but did not start it: a directory below /usr/local is not root-owned and non-writable" >&2
+        return 0
+    fi
+    # Read first, then match: a failed read must never look like "not the
+    # legacy program".
+    program_args="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST")" || {
+        echo "WARNING: could not read the restored service definition, so it was not started" >&2
+        return 0; }
+    if [[ "$program_args" == *"$LEGACY_APP/Contents/MacOS/yuzu-agent"* ]]; then
+        # Never start code from the non-package-owned data root.
+        echo "WARNING: restored the previous legacy service definition but did not start it from non-package-owned data" >&2
+        return 0
+    fi
+    launchctl enable "system/com.yuzu.agent" >/dev/null 2>&1 || true
+    if launchctl bootstrap system "$PLIST" && require_started; then
+        return 0
+    fi
+    echo "WARNING: restored the previous agent, but it did not stay running. This installation continues; it is the remedy." >&2
+}
+
 recover_interrupted_promotion() {
     local recovery="$1"
     launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
-    remove_managed_plugins "$YUZU_LIB/package-files.list"
-    remove_managed_plugins "$YUZU_LIB/.package-files.incoming"
+    remove_managed_plugins "$YUZU_LIB/package-files.list" "$YUZU_LIB/package-files.sha256"
+    remove_managed_plugins "$YUZU_LIB/.package-files.incoming" "$YUZU_LIB/.package-files.sha256.incoming"
     rm -f "$PLIST" "$YUZU_LIB/package-mode" "$YUZU_LIB/package-files.list" "$YUZU_LIB/package-files.sha256"
     rm -rf "$APP_ROOT/YuzuAgent.app"
-    rm -f /usr/local/bin/yuzu-agent /usr/local/bin/libyuzu_agent_core.dylib /usr/local/lib/libyuzu_agent_core.dylib
+    rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib \
+          "$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"
     [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || \
         ditto "$recovery/LaunchDaemons/com.yuzu.agent.plist" "$PLIST"
     [[ ! -d "$recovery/YuzuAgent.app" ]] || ditto "$recovery/YuzuAgent.app" "$APP_ROOT/YuzuAgent.app"
-    [[ ! -e "$recovery/loose/yuzu-agent" ]] || ditto "$recovery/loose/yuzu-agent" /usr/local/bin/yuzu-agent
+    [[ ! -e "$recovery/loose/yuzu-agent" ]] || ditto "$recovery/loose/yuzu-agent" "$LOOSE_BIN/yuzu-agent"
     [[ ! -e "$recovery/loose/libyuzu_agent_core.dylib" ]] || \
-        ditto "$recovery/loose/libyuzu_agent_core.dylib" /usr/local/bin/libyuzu_agent_core.dylib
+        ditto "$recovery/loose/libyuzu_agent_core.dylib" "$LOOSE_BIN/libyuzu_agent_core.dylib"
     # A package from before #5144 kept the core dylib in /usr/local/lib.
     [[ ! -e "$recovery/loose/legacy-lib/libyuzu_agent_core.dylib" ]] || \
         ditto "$recovery/loose/legacy-lib/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib
@@ -244,59 +375,64 @@ recover_interrupted_promotion() {
         ditto "$recovery/package-files.list" "$YUZU_LIB/package-files.list"
     [[ ! -e "$recovery/package-files.sha256" ]] || \
         ditto "$recovery/package-files.sha256" "$YUZU_LIB/package-files.sha256"
-    [[ ! -d "$recovery/yuzu/plugins" ]] || mkdir -p "$YUZU_LIB/plugins"
-    [[ ! -d "$recovery/yuzu/plugins" ]] || ditto "$recovery/yuzu/plugins" "$YUZU_LIB/plugins"
+    [[ ! -d "$recovery/yuzu/plugins" ]] || mkdir -p "$PLUGIN_DIR"
+    [[ ! -d "$recovery/yuzu/plugins" ]] || ditto "$recovery/yuzu/plugins" "$PLUGIN_DIR"
     quarantine_legacy_app "$recovery/legacy-retired.app"
-    if [[ -e "$recovery/loose/yuzu-agent" ]] && ! loose_code_directory_trusted; then
-        echo "WARNING: restored the previous loose-lane agent but did not start it: /usr/local or /usr/local/bin is not root-owned and non-writable" >&2
-        return 0
-    fi
-    if [[ -e "$PLIST" ]]; then
-        # Read first, then match: a failed read must never look like "not the
-        # legacy program" (it did through a pipe into grep -q), and grep -q
-        # closing the pipe early must never look like a failed read.
-        local program_args
-        program_args="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST")" || {
-            echo "WARNING: could not read the restored service definition, so it was not started" >&2
-            return 0
-        }
-        if [[ "$program_args" == *"$LEGACY_APP/Contents/MacOS/yuzu-agent"* ]]; then
-            # Never start code from the non-package-owned data root. The restore is
-            # complete, so report and return success: the pending installation (or
-            # the next one) then installs a package-owned agent instead of failing
-            # on this same check forever.
-            echo "WARNING: restored the previous legacy service definition but did not start it from non-package-owned data" >&2
-            return 0
-        fi
-        launchctl bootstrap system "$PLIST"
-        require_started
-    fi
+    sync
+    restart_restored_service "$recovery"
+}
+
+# Pointer first: an orphaned snapshot is harmless, a pointer to a missing
+# snapshot is not (PR #4482 governance uh-1).
+discard_recovery() {
+    local recovery="$1"
+    rm -f "$RECOVERY_FILE"
+    sync
+    rm -rf "$recovery"
 }
 
 if [[ -e "$RECOVERY_FILE" || -L "$RECOVERY_FILE" ]]; then
-    pending="$(read_recovery_path)" || exit 1
-    phase="$(cat "$pending/phase" 2>/dev/null || true)"
-    case "$phase" in
-        prepared)
-            rm -rf "$pending"
-            rm -f "$RECOVERY_FILE"
-            ;;
-        promoting)
-            recover_interrupted_promotion "$pending"
-            rm -rf "$pending"
-            rm -f "$RECOVERY_FILE"
-            ;;
-        *)
-            echo "ERROR: unknown pending Yuzu installation recovery state" >&2
-            exit 1
-            ;;
-    esac
+    pending="$(read_recovery_path)"
+    if [[ -n "$pending" ]]; then
+        phase="$(cat "$pending/phase" 2>/dev/null || true)"
+        case "$phase" in
+            prepared)
+                discard_recovery "$pending"
+                ;;
+            promoting)
+                recover_interrupted_promotion "$pending"
+                discard_recovery "$pending"
+                ;;
+            *)
+                # A torn or hand-edited phase. The pointer is written only after
+                # "prepared" is durable, so the snapshot is complete: restoring
+                # it is always safe, discarding it might not be (uh-1).
+                echo "WARNING: unreadable installation phase; restoring the recorded snapshot" >&2
+                recover_interrupted_promotion "$pending"
+                discard_recovery "$pending"
+                ;;
+        esac
+    fi
 fi
+
+# Nothing is pending any more, so every remaining snapshot is an orphan of an
+# interrupted cleanup; repeated failed installs would otherwise accumulate them
+# (PR #4482 governance uh-5). Only well-formed snapshot directories are removed.
+for orphan in "$STATE_DIR"/install-recovery.*; do
+    [[ -e "$orphan" || -L "$orphan" ]] || continue
+    require_recovery_directory "$orphan" 2>/dev/null && rm -rf "$orphan"
+done
 
 RECOVERY="$(mktemp -d "${STATE_DIR}/install-recovery.XXXXXX")"
 chmod 700 "$RECOVERY"
 
+discard_stale_manifest
 adopt_receipted_plugins
+# Recovery restarts only what was running (sec-1); postinstall refreshes this.
+if launchctl_state="$(launchctl print "system/com.yuzu.agent" 2>/dev/null)" && \
+   [[ "$launchctl_state" == *"state = running"* ]]; then
+    : > "$RECOVERY/service-was-running"
+fi
 copy_if_present "$PLIST" "$RECOVERY/LaunchDaemons/com.yuzu.agent.plist"
 copy_if_present "$APP_ROOT/YuzuAgent.app" "$RECOVERY/YuzuAgent.app"
 # Keep the old code tree out of the new data-root policy. The old app remains
@@ -335,7 +471,9 @@ rm -f "/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist" \
       "/usr/local/lib/yuzu/.package-files.incoming" \
       "/usr/local/lib/yuzu/.package-files.sha256.incoming"
 write_recovery_phase "$RECOVERY" prepared
+# Through a temporary name, so a torn write can never leave an empty pointer.
 umask 077
-printf '%s\n' "$RECOVERY" > "$RECOVERY_FILE"
-chmod 600 "$RECOVERY_FILE"
+printf '%s\n' "$RECOVERY" > "$RECOVERY_FILE.new"
+chmod 600 "$RECOVERY_FILE.new"
+mv -f "$RECOVERY_FILE.new" "$RECOVERY_FILE"
 sync

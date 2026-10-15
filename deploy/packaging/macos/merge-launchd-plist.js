@@ -38,19 +38,31 @@ function merge(prior, generated, forceNoAutoUpdate) {
         }
     }
     generated.ProgramArguments = newArgs.concat(preserved);
-    const allowed = ['YUZU_SERVER', 'YUZU_CA_CERT', 'YUZU_TLS_SYSTEM_ROOTS', 'YUZU_CLIENT_CERT',
-        'YUZU_CLIENT_KEY', 'YUZU_CERT_STORE', 'YUZU_CERT_SUBJECT', 'YUZU_CERT_THUMBPRINT',
-        'YUZU_PLUGIN_ALLOWLIST', 'YUZU_PLUGIN_TRUST_BUNDLE', 'YUZU_PLUGIN_REQUIRE_SIGNATURE'];
-    const oldEnvironment = prior.EnvironmentVariables === undefined ? {} : prior.EnvironmentVariables;
-    if (!oldEnvironment || Array.isArray(oldEnvironment) || typeof oldEnvironment !== 'object' ||
-        !Object.keys(oldEnvironment).every(key => typeof oldEnvironment[key] === 'string')) {
-        throw new Error('Invalid EnvironmentVariables');
+    // Every operator-set YUZU_* key survives an upgrade (OTA signing, inventory
+    // and licence opt-outs included), as do proxy settings. Dropped: keys the
+    // generated definition forces, and anything else, each named on stderr
+    // (PR #4482 governance er-2).
+    const forced = ['YUZU_PLUGIN_DIR', 'YUZU_DATA_DIR'];
+    if (generatedSigning) forced.push('YUZU_PLUGIN_TRUST_BUNDLE', 'YUZU_PLUGIN_REQUIRE_SIGNATURE');
+    const proxies = ['http_proxy', 'https_proxy', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+        'grpc_proxy'];
+    function stringMap(value, what) {
+        if (value === undefined) return {};
+        if (!value || Array.isArray(value) || typeof value !== 'object' ||
+            !Object.keys(value).every(key => typeof value[key] === 'string')) {
+            throw new Error('Invalid ' + what + ' EnvironmentVariables');
+        }
+        return value;
     }
-    const retained = {};
-    allowed.forEach(key => {
-        if (Object.prototype.hasOwnProperty.call(oldEnvironment, key) &&
-            !(generatedSigning && (key === 'YUZU_PLUGIN_TRUST_BUNDLE' || key === 'YUZU_PLUGIN_REQUIRE_SIGNATURE'))) {
+    const oldEnvironment = stringMap(prior.EnvironmentVariables, 'previous');
+    const retained = Object.assign({}, stringMap(generated.EnvironmentVariables, 'generated'));
+    Object.keys(oldEnvironment).forEach(key => {
+        if (forced.indexOf(key) >= 0 || Object.prototype.hasOwnProperty.call(retained, key)) {
+            console.log('merge-launchd-plist: not retaining ' + key + ': set by the package');
+        } else if (key.indexOf('YUZU_') === 0 || proxies.indexOf(key) >= 0) {
             retained[key] = oldEnvironment[key];
+        } else {
+            console.log('merge-launchd-plist: not retaining ' + key + ': not a Yuzu or proxy setting');
         }
     });
     if (Object.keys(retained).length) generated.EnvironmentVariables = retained;
@@ -67,7 +79,26 @@ function run(argv) {
         else throw new Error('Unknown argument');
     }
     if (!previous || !destination) throw new Error('Previous and destination plist paths required');
-    const result = merge(readPlist(previous), readPlist(destination), force);
+    const generated = readPlist(destination);
+    let prior;
+    try {
+        prior = readPlist(previous);
+        const args = prior.ProgramArguments, env = prior.EnvironmentVariables;
+        if (!Array.isArray(args) || args.length === 0 || !args.every(x => typeof x === 'string'))
+            throw new Error('invalid ProgramArguments');
+        if (env !== undefined && (!env || Array.isArray(env) || typeof env !== 'object' ||
+            !Object.keys(env).every(key => typeof env[key] === 'string')))
+            throw new Error('invalid EnvironmentVariables');
+    } catch (error) {
+        // An unparseable live definition (a hand-edit typo, a torn write) must not
+        // wedge every upgrade: install the package default, as before this merge
+        // existed, and say so (PR #4482 governance ch-1).
+        console.log('merge-launchd-plist: WARNING: the existing service definition cannot be read (' +
+            error.message + '); installing the package default, so earlier --server and other ' +
+            'settings must be re-applied');
+        return;
+    }
+    const result = merge(prior, generated, force);
     const error = Ref();
     const data = $.NSPropertyListSerialization.dataWithPropertyListFormatOptionsError(
         $(result), $.NSPropertyListXMLFormat_v1_0, 0, error);

@@ -8,6 +8,9 @@ import importlib.util
 import json
 import os
 import plistlib
+import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -44,6 +47,47 @@ spec.loader.exec_module(bundle)
 # stay portable to Linux, but native Windows cannot host the Bash fixtures.
 macos_userland = unittest.skipUnless(sys.platform == "darwin", "needs macOS userland (BSD stat, shasum, ditto)")
 posix_shell = unittest.skipIf(os.name == "nt", "POSIX Bash fixture; native Windows never runs these installers")
+
+# Production preamble of every installer script (governance qe-2): a harness
+# that drops pipefail or calls the function under test as `fn && echo X`
+# suspends errexit inside it and hides a mid-function failure.
+PREAMBLE = "set -euo pipefail\n"
+
+
+def _shell_case(table: dict, default: str) -> str:
+    arms = " ".join(f"{shlex.quote(str(path))}) echo {value} ;;" for path, value in table.items())
+    return f'case "$3" in {arms} *) {default} ;; esac'
+
+
+def stat_stub(owners: dict | None = None, modes: dict | None = None, real_modes: bool = False) -> str:
+    """`stat -f FMT PATH` stub: the installer runs as root, a test does not.
+
+    Owners and groups come from `owners` (default 0, root). Modes come from
+    `modes`, else the real BSD stat (`real_modes`, macOS only) or 755.
+    """
+    mode_default = 'command stat "$@"' if real_modes else "echo 755"
+    return ('stat() { case "$2" in '
+            f'%u|%g) {_shell_case(owners or {}, "echo 0")} ;; '
+            f'%Lp) {_shell_case(modes or {}, mode_default)} ;; '
+            '*) command stat "$@" ;; esac; }\n')
+
+
+def launchctl_stub(root: Path) -> str:
+    """launchd as a state fixture: `print` answers from launchctl.state (absent:
+    service not loaded), `print-disabled` from launchctl.disabled; every call
+    is logged. `sleep` is a no-op so the real require_started runs instantly."""
+    return f'''launchctl() {{
+    echo "$*" >> "{root}/launchctl.log"
+    case "$1" in
+        print) [[ -f "{root}/launchctl.state" ]] || return 113; cat "{root}/launchctl.state" ;;
+        print-disabled) cat "{root}/launchctl.disabled" 2>/dev/null || true ;;
+    esac
+}}
+sleep() {{ :; }}
+'''
+
+
+RUNNING = "state = running\npid = 4242\n"
 
 
 def profile(**changes: object) -> dict:
@@ -139,7 +183,12 @@ shasum() { echo 'testdigest fixture'; }
                 tools = root / "tools"
                 tools.mkdir()
                 captured = root / "manifest"
+                # The builder now fails when a plugin cannot be hashed (governance
+                # uh-2), so a host without macOS's shasum gets a sha256sum shim.
+                shim = {} if shutil.which("shasum") else {
+                    "shasum": '#!/bin/sh\n[ "$1" = -a ] && shift 2\nexec sha256sum "$@"\n'}
                 for name, body in {
+                    **shim,
                     "lipo": "#!/bin/sh\necho arm64\n",
                     "pkgbuild": "#!/bin/sh\nset -eu\nroot=; last=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift 2 ;; *) last=\"$1\"; shift ;; esac; done\ncp \"$root/usr/local/lib/yuzu/.package-files.incoming\" \"$CAPTURED_MANIFEST\"\n: > \"$last\"\n",
                     "productbuild": "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n",
@@ -158,9 +207,12 @@ shasum() { echo 'testdigest fixture'; }
                     self.assertFalse(captured.exists())
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(captured.read_text(), "" if layout == "empty" else "plugins/tar.dylib\n")
+                    # The first line names the package version (governance rd-2).
+                    self.assertEqual(captured.read_text(), "# package-version 1.0\n" +
+                                     ("" if layout == "empty" else "plugins/tar.dylib\n"))
 
-    def _build_loose(self, root: Path, plugin_name: str) -> subprocess.CompletedProcess:
+    def _build_loose(self, root: Path, plugin_name: str,
+                     extra_tools: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         binaries = root / "build"
         (binaries / "agents/core").mkdir(parents=True)
         (binaries / "agents/core/yuzu-agent").write_bytes(b"agent fixture")
@@ -172,6 +224,7 @@ shasum() { echo 'testdigest fixture'; }
             "lipo": "#!/bin/sh\necho arm64\n",
             "pkgbuild": "#!/bin/sh\nset -eu\nroot=; last=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift 2 ;; *) last=\"$1\"; shift ;; esac; done\ncp \"$root/usr/local/lib/yuzu/.package-files.sha256.incoming\" \"$CAPTURED_HASHES\"\n: > \"$last\"\n",
             "productbuild": "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n",
+            **(extra_tools or {}),
         }.items():
             (tools / name).write_text(body)
             (tools / name).chmod(0o755)
@@ -197,13 +250,27 @@ shasum() { echo 'testdigest fixture'; }
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("contains whitespace", result.stderr)
 
+    @posix_shell
+    def test_builder_fails_when_a_plugin_cannot_be_hashed(self) -> None:
+        # Governance uh-2: the hash was computed inside a printf argument, so a
+        # failing shasum recorded an empty hash and the build still succeeded.
+        for label, shasum in (("fails", "#!/bin/sh\nexit 1\n"),
+                              ("prints garbage", "#!/bin/sh\necho 'not-a-digest  x'\n")):
+            with self.subTest(shasum=label), tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_nohash_") as temporary:
+                root = Path(temporary)
+                result = self._build_loose(root, "tar.dylib", {"shasum": shasum})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("tar.dylib", result.stderr)
+                self.assertRegex(result.stderr, "cannot hash plugin|invalid SHA-256 for plugin")
+                self.assertFalse((root / "hashes").exists())
+                self.assertFalse((root / "dist").exists() and any((root / "dist").iterdir()))
+
     # PR #4482 review: package ownership of a plugin is its recorded bytes, not its name.
     def _ownership_harness(self, root: Path, body: str) -> subprocess.CompletedProcess:
         source = (BUILD_PKG.parent / "postinstall").read_text()
         program = "\n".join(script_function(source, name)
                             for name in ("plugin_hash_matches", "was_managed_plugin", "harden_managed_plugins"))
-        stubs = f"""set -eu
-chown() {{ echo "CHOWN $*" >> "{root}/chown.log"; }}
+        stubs = PREAMBLE + f"""chown() {{ echo "CHOWN $*" >> "{root}/chown.log"; }}
 PLUGIN_DIR="{root}/plugins"; MANIFEST="{root}/package-files.list"; HASHES="{root}/package-files.sha256"
 """
         return subprocess.run([PKG_SHELL, "-c", stubs + program + "\n" + body], text=True, capture_output=True)
@@ -218,20 +285,21 @@ PLUGIN_DIR="{root}/plugins"; MANIFEST="{root}/package-files.list"; HASHES="{root
             (root / "package-files.list").write_text("plugins/tar.dylib\n")
             (root / "package-files.sha256").write_text(
                 f"{hashlib.sha256(b'package bytes').hexdigest()}  plugins/tar.dylib\n")
-            ok = self._ownership_harness(root, 'was_managed_plugin tar.dylib && harden_managed_plugins "$MANIFEST" && echo OWNED')
+            ok = self._ownership_harness(
+                root, 'if was_managed_plugin tar.dylib; then echo MANAGED; fi\nharden_managed_plugins "$MANIFEST"\necho OWNED')
             self.assertEqual(ok.returncode, 0, ok.stderr)
-            self.assertIn("OWNED", ok.stdout)
+            self.assertEqual(ok.stdout.split(), ["MANAGED", "OWNED"])
             self.assertIn("CHOWN root:wheel", (root / "chown.log").read_text())
             (root / "chown.log").unlink()
             (root / "plugins/tar.dylib").write_bytes(b"replaced by someone else")
-            managed = self._ownership_harness(root, 'was_managed_plugin tar.dylib && echo MANAGED || echo NOT-MANAGED')
+            managed = self._ownership_harness(root, 'if was_managed_plugin tar.dylib; then echo MANAGED; else echo NOT-MANAGED; fi')
             self.assertIn("NOT-MANAGED", managed.stdout)
             harden = self._ownership_harness(root, 'harden_managed_plugins "$MANIFEST"')
             self.assertNotEqual(harden.returncode, 0)
             self.assertIn("does not match the package's recorded hash", harden.stderr)
             self.assertNotIn("tar.dylib", (root / "chown.log").read_text() if (root / "chown.log").exists() else "")
             (root / "package-files.sha256").unlink()   # an older, name-only package
-            legacy = self._ownership_harness(root, 'was_managed_plugin tar.dylib && echo MANAGED')
+            legacy = self._ownership_harness(root, 'if was_managed_plugin tar.dylib; then echo MANAGED; fi')
             self.assertIn("MANAGED", legacy.stdout)
 
     @unittest.skipIf(os.name == "nt", "POSIX receipt fixture")
@@ -251,8 +319,7 @@ PLUGIN_DIR="{root}/plugins"; MANIFEST="{root}/package-files.list"; HASHES="{root
                 root = Path(temporary)
                 (root / "plugins").mkdir()
                 (root / "plugins/third-party.dylib").write_bytes(b"unmanaged")
-                harness = '''set -eu
-pkgutil() { [[ "$1" == --files && "$2" == com.yuzu.agent ]] || exit 99; printf '%s' "$RECEIPT"; return "$RECEIPT_STATUS"; }
+                harness = PREAMBLE + '''pkgutil() { [[ "$1" == --files && "$2" == com.yuzu.agent ]] || exit 99; printf '%s' "$RECEIPT"; return "$RECEIPT_STATUS"; }
 ''' + function + "\nadopt_receipted_plugins\n"
                 result = subprocess.run(["bash", "-c", harness], text=True, capture_output=True,
                                         env={**os.environ, "YUZU_LIB": temporary, "RECEIPT": receipt,
@@ -264,47 +331,72 @@ pkgutil() { [[ "$1" == --files && "$2" == com.yuzu.agent ]] || exit 99; printf '
 
     @macos_userland
     def test_data_directory_created_when_missing_and_preserved_when_present(self) -> None:
-        source = (BUILD_PKG.parent / "postinstall").read_text()
-        start = source.index("ensure_data_directory() {")
-        function = source[start:source.index("\n}", start) + 2]
+        for script in ("postinstall", "preinstall"):
+            with self.subTest(script=script):
+                self._data_directory_contract(script)
+
+    def _data_directory_contract(self, script: str) -> None:
+        source = (BUILD_PKG.parent / script).read_text()
+        functions = "\n".join(script_function(source, name)
+                              for name in ("data_directory_owner_trusted", "require_trusted_data_directory"))
+        if script == "postinstall":
+            functions += "\n" + script_function(source, "ensure_data_directory")
+            call = "ensure_data_directory\n"
+        else:
+            call = "require_trusted_data_directory\n"
+        functions = functions.replace("/usr/bin/id", "id")
         with tempfile.TemporaryDirectory(prefix="yuzu_test_data_dir_") as temporary:
             data = Path(temporary) / "data"
-            check_start = source.index("require_trusted_data_directory() {")
-            function = source[check_start:source.index("\n}", check_start) + 2] + "\n" + function
             # The installer runs as root; the fixture reports the data directory's owner as
-            # FAKE_UID (default root) so ownership can be exercised without privileges.
+            # FAKE_UID (default root) and the _yuzu account's uid as YUZU_UID (unset: no
+            # such account), so ownership can be exercised without privileges.
             fake_stat = 'stat() { if [[ "$2" == "%u" ]]; then echo "${FAKE_UID:-0}"; else command stat "$@"; fi; }\n'
-            harness = "set -eu\n" + fake_stat + "require_trusted_directory() { return 0; }\nchown() { echo CHOWN; }\n" + function + "\nensure_data_directory\n"
+            fake_id = 'id() { [[ "$1 $2" == "-u _yuzu" && -n "${YUZU_UID:-}" ]] || return 1; echo "$YUZU_UID"; }\n'
+            harness = (PREAMBLE + fake_stat + fake_id + "require_trusted_directory() { return 0; }\nchown() { echo CHOWN; }\n"
+                       + functions + "\n" + call + "echo DONE\n")
             def invoke(**extra):
                 return subprocess.run([PKG_SHELL, "-c", harness], text=True, capture_output=True,
                                       env={**os.environ, "DATA_DIR": str(data), **extra})
-            result = invoke()
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(data.stat().st_mode & 0o777, 0o750)
-            self.assertEqual(result.stdout.strip(), "CHOWN")
+            if script == "postinstall":
+                result = invoke()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(data.stat().st_mode & 0o777, 0o750)
+                self.assertEqual(result.stdout.split(), ["CHOWN", "DONE"])
+            else:
+                data.mkdir(mode=0o750)
+                data.chmod(0o750)
             data.chmod(0o710)
             sentinel = data / "keep"
             sentinel.write_bytes(b"existing data")
-            before = data.stat()
-            result = invoke()
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "")
-            self.assertEqual(data.stat().st_uid, before.st_uid)
-            self.assertEqual(data.stat().st_mode, before.st_mode)
-            self.assertEqual(sentinel.read_bytes(), b"existing data")
-            link = Path(temporary) / "link"
-            link.symlink_to(data, target_is_directory=True)
-            result = subprocess.run([PKG_SHELL, "-c", harness], text=True, capture_output=True,
-                                    env={**os.environ, "DATA_DIR": str(link)})
-            self.assertNotEqual(result.returncode, 0)
-            # PR #4482 review: an existing data root that is not root-owned, or is
-            # group/world writable, is refused and left exactly as it was.
-            for mode, uid in ((0o777, "0"), (0o770, "0"), (0o750, "501")):
+            for uid, yuzu_uid in (("0", ""), ("0", "299"), ("299", "299")):
+                # Root-owned, or owned by the _yuzu service account that
+                # install-agent-user.sh provisions (governance rd-1): accepted, untouched.
+                before = data.stat()
+                result = invoke(FAKE_UID=uid, YUZU_UID=yuzu_uid)
+                self.assertEqual(result.returncode, 0, f"uid {uid} (_yuzu={yuzu_uid}): {result.stderr}")
+                self.assertEqual(result.stdout.strip(), "DONE")
+                self.assertEqual(data.stat().st_uid, before.st_uid)
+                self.assertEqual(data.stat().st_mode, before.st_mode)
+                self.assertEqual(sentinel.read_bytes(), b"existing data")
+            if script == "postinstall":
+                link = Path(temporary) / "link"
+                link.symlink_to(data, target_is_directory=True)
+                result = subprocess.run([PKG_SHELL, "-c", harness], text=True, capture_output=True,
+                                        env={**os.environ, "DATA_DIR": str(link)})
+                self.assertNotEqual(result.returncode, 0)
+            # Group/world writable, another account, or a _yuzu-owned directory on a
+            # host with no _yuzu account: refused and left exactly as it was.
+            for mode, uid, yuzu_uid in ((0o777, "0", ""), (0o770, "0", ""), (0o770, "299", "299"),
+                                        (0o750, "501", "299"), (0o750, "299", "")):
                 data.chmod(mode)
                 before = data.stat()
-                result = invoke(FAKE_UID=uid)
+                result = invoke(FAKE_UID=uid, YUZU_UID=yuzu_uid)
                 self.assertNotEqual(result.returncode, 0, f"mode {oct(mode)} uid {uid} was accepted")
-                self.assertIn("must be root-owned and not group/world writable", result.stderr)
+                self.assertNotIn("DONE", result.stdout)
+                self.assertIn("must be owned by root or _yuzu and not group/world writable", result.stderr)
+                # The data root holds the agent's identity: never advise removing it.
+                self.assertNotIn("remove it", result.stderr)
+                self.assertIn("do not delete it", result.stderr)
                 self.assertEqual(data.stat().st_mode, before.st_mode)
                 self.assertEqual(sentinel.read_bytes(), b"existing data")
             data.chmod(0o710)
@@ -380,95 +472,131 @@ pkgutil() { [[ "$1" == --files && "$2" == com.yuzu.agent ]] || exit 99; printf '
 
 
 class PackagingStructureTests(unittest.TestCase):
-    @unittest.skipIf(os.name == "nt", "POSIX recovery fixture")
+    # ── Shared installer harness ────────────────────────────────────────────────
+    # Real installer functions, extracted verbatim, run under the production
+    # preamble against a fixture tree. Only platform commands are stubbed:
+    # launchctl (a state fixture), sleep, stat (the installer runs as root),
+    # chown, ditto and, where noted, PlistBuddy/id/pkgutil. require_started is
+    # always the real one. /usr/local is rewritten to the fixture's "ul".
+    RECOVERY_NAMES = {
+        "preinstall": ("plugin_hash_matches", "remove_managed_plugins", "quarantine_legacy_app",
+                       "code_directory_chain_trusted", "require_started", "restart_restored_service",
+                       "recover_interrupted_promotion"),
+        "postinstall": ("recovery_path", "plugin_hash_matches", "remove_managed_plugins", "quarantine_legacy_app",
+                        "code_directory_chain_trusted", "require_started", "restart_restored_service",
+                        "finish_recovery", "restore_previous"),
+    }
+
+    def _installer_harness(self, root: Path, script: str, names: tuple[str, ...], body: str, *,
+                           plist: str = "agent", owners: dict | None = None, modes: dict | None = None,
+                           real_modes: bool = False, stubs: str = "") -> subprocess.CompletedProcess:
+        source = (BUILD_PKG.parent / script).read_text()
+        program = "\n".join(script_function(source, name) for name in names)
+        program = (program.replace("/usr/local", str(root / "ul")).replace("/usr/bin/id", "id")
+                   .replace("/usr/sbin/pkgutil", "pkgutil"))
+        if plist != "real":
+            program = program.replace("/usr/libexec/PlistBuddy", "plist_buddy")
+        plist_buddy = {
+            "agent": 'printf \'Array {\\n    %s\\n}\\n\' "$LOOSE_BIN/yuzu-agent"',
+            "legacy": 'printf \'Array {\\n    %s\\n}\\n\' "$LEGACY_APP/Contents/MacOS/yuzu-agent"',
+            "fail": "return 1",
+            "real": ":",
+        }[plist]
+        ul = root / "ul"
+        variables = f"""
+STATE_DIR="{root}/state"; RECOVERY_FILE="$STATE_DIR/current-recovery"
+DATA_DIR="{root}/data"; LEGACY_APP="$DATA_DIR/YuzuAgent.app"; LOG_DIR="{root}/logs"
+LOOSE_BIN="{ul}/bin"; YUZU_LIB="{ul}/lib/yuzu"; PLUGIN_DIR="$YUZU_LIB/plugins"
+INCOMING_PLUGIN_DIR="$YUZU_LIB/.plugins.incoming"; MODE_FILE="$YUZU_LIB/package-mode"
+MANIFEST="$YUZU_LIB/package-files.list"; INCOMING_MANIFEST="$YUZU_LIB/.package-files.incoming"
+HASHES="$YUZU_LIB/package-files.sha256"; INCOMING_HASHES="$YUZU_LIB/.package-files.sha256.incoming"
+INCOMING_BUNDLE_ARCHIVE="$YUZU_LIB/.bundle-contents.incoming.zip"
+APP_ROOT="{root}/app"; APP="$APP_ROOT/YuzuAgent.app"; INCOMING_APP="$APP_ROOT/.YuzuAgent.incoming.app"
+PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; INCOMING_PLIST="{root}/LaunchDaemons/.com.yuzu.agent.incoming.plist"
+DEFAULT_CA="{root}/etc/default-ca.pem"
+"""
+        harness = (PREAMBLE + stat_stub(owners, modes, real_modes) + launchctl_stub(root)
+                   + "chown() { :; }\n"
+                   + 'ditto() { if [[ -d "$1" ]]; then mkdir -p "$2"; cp -R "$1/." "$2/"; '
+                     'else mkdir -p "$(dirname "$2")"; cp "$1" "$2"; fi; }\n'
+                   + f"plist_buddy() {{ {plist_buddy}; }}\n" + variables + stubs + program + "\n" + body)
+        return subprocess.run([PKG_SHELL, "-c", harness], text=True, capture_output=True)
+
+    def _recovery_layout(self, root: Path, *, phase: str = "promoting", was_running: bool = True,
+                         loose: bool = False) -> Path:
+        for folder in ("LaunchDaemons", "app", "data", "logs", "etc", "ul/bin", "ul/lib/yuzu/plugins"):
+            (root / folder).mkdir(parents=True, exist_ok=True)
+        recovery = root / "state/install-recovery.TEST"
+        (recovery / "LaunchDaemons").mkdir(parents=True)
+        (recovery / "LaunchDaemons/com.yuzu.agent.plist").write_text("previous definition")
+        (recovery / "phase").write_text(phase + "\n")
+        if was_running:
+            (recovery / "service-was-running").touch()
+        if loose:
+            (recovery / "loose").mkdir()
+            (recovery / "loose/yuzu-agent").write_text("previous loose agent")
+        (root / "state/current-recovery").write_text(f"{recovery}\n")
+        return recovery
+
+    def _recovery_modes(self, root: Path, **extra: int) -> dict:
+        """recovery_path/require_recovery_directory demand pointer 600, snapshot 700."""
+        modes = {root / "state/current-recovery": 600, root / "state/install-recovery.TEST": 700}
+        modes.update({root / path: mode for path, mode in extra.items()})
+        return modes
+
+    def _restore(self, root: Path, script: str, recovery: Path, **options) -> subprocess.CompletedProcess:
+        # Plain statement, then a marker: production errexit applies inside (qe-2).
+        body = ("restore_previous\necho RESTORED\n" if script == "postinstall"
+                else f'recover_interrupted_promotion "{recovery}"\necho RESTORED\n')
+        options.setdefault("modes", self._recovery_modes(root))
+        return self._installer_harness(root, script, self.RECOVERY_NAMES[script], body, **options)
+
+    def _launchctl_log(self, root: Path) -> str:
+        log = root / "launchctl.log"
+        return log.read_text() if log.exists() else ""
+
+    @posix_shell
     def test_interrupted_plugin_promotion_restores_old_generation_and_allows_retry(self) -> None:
-        pre = (BUILD_PKG.parent / "preinstall").read_text()
         post = (BUILD_PKG.parent / "postinstall").read_text()
-        def function(source, name):
-            start = source.index(name + "() {")
-            return source[start:source.index("\n}", start) + 2]
         with tempfile.TemporaryDirectory(prefix="yuzu_test_retry_manifest_") as temporary:
             root = Path(temporary)
-            for folder in ("lib/plugins", "app", "recovery/yuzu/plugins", "bin", "next-incoming"):
-                (root / folder).mkdir(parents=True)
-            (root / "lib/package-files.list").write_text("plugins/old.dylib\n")
-            (root / "lib/.package-files.incoming").write_text("plugins/old.dylib\nplugins/new.dylib\n")
-            (root / "recovery/package-files.list").write_text("plugins/old.dylib\n")
-            (root / "recovery/yuzu/plugins/old.dylib").write_bytes(b"old generation")
-            (root / "lib/plugins/old.dylib").write_bytes(b"replacement")
-            (root / "lib/plugins/new.dylib").write_bytes(b"new before crash")
-            (root / "lib/plugins/third-party.dylib").write_bytes(b"unmanaged")
-            (root / "next-incoming/new.dylib").write_bytes(b"retry")
-            harness = '''set -eu
-launchctl() { :; }
-require_started() { :; }
-ditto() { if [[ -d "$1" ]]; then cp -R "$1/." "$2/"; else cp "$1" "$2"; fi; }
-'''
-            harness += "\n".join(function(pre, name) for name in ("quarantine_legacy_app", "remove_managed_plugins", "recover_interrupted_promotion"))
-            harness += "\n" + "\n".join(function(post, name) for name in ("was_managed_plugin", "reject_unmanaged_plugin_collisions"))
-            harness = harness.replace("/usr/local/bin", str(root / "bin")).replace("/usr/local/lib", str(root / "lib"))
-            harness += '''
-ROOT="$1"
-YUZU_LIB="$ROOT/lib"
-APP_ROOT="$ROOT/app"
-PLIST="$ROOT/absent.plist"
-LEGACY_APP="$ROOT/absent-legacy.app"
-MANIFEST="$YUZU_LIB/package-files.list"
-PLUGIN_DIR="$YUZU_LIB/plugins"
-INCOMING_PLUGIN_DIR="$ROOT/next-incoming"
-recover_interrupted_promotion "$ROOT/recovery"
-reject_unmanaged_plugin_collisions
-'''
-            result = subprocess.run(["bash", "-c", harness, "recovery-fixture", temporary],
-                                    text=True, capture_output=True)
+            recovery = self._recovery_layout(root)
+            lib = root / "ul/lib/yuzu"
+            (lib / ".plugins.incoming").mkdir()
+            (lib / "package-files.list").write_text("plugins/old.dylib\n")
+            (lib / ".package-files.incoming").write_text("plugins/old.dylib\nplugins/new.dylib\n")
+            (recovery / "package-files.list").write_text("plugins/old.dylib\n")
+            (recovery / "yuzu/plugins").mkdir(parents=True)
+            (recovery / "yuzu/plugins/old.dylib").write_bytes(b"old generation")
+            (lib / "plugins/old.dylib").write_bytes(b"replacement")
+            (lib / "plugins/new.dylib").write_bytes(b"new before crash")
+            (lib / "plugins/third-party.dylib").write_bytes(b"unmanaged")
+            (lib / ".plugins.incoming/new.dylib").write_bytes(b"retry")
+            collisions = "\n".join(script_function(post, name)
+                                   for name in ("was_managed_plugin", "reject_unmanaged_plugin_collisions"))
+            result = self._installer_harness(
+                root, "preinstall", self.RECOVERY_NAMES["preinstall"],
+                f'recover_interrupted_promotion "{recovery}"\nreject_unmanaged_plugin_collisions\necho DONE\n',
+                stubs=collisions + "\n")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse((root / "lib/plugins/new.dylib").exists())
-            self.assertEqual((root / "lib/plugins/old.dylib").read_bytes(), b"old generation")
-            self.assertEqual((root / "lib/plugins/third-party.dylib").read_bytes(), b"unmanaged")
+            self.assertIn("DONE", result.stdout)
+            self.assertFalse((lib / "plugins/new.dylib").exists())
+            self.assertEqual((lib / "plugins/old.dylib").read_bytes(), b"old generation")
+            self.assertEqual((lib / "plugins/third-party.dylib").read_bytes(), b"unmanaged")
 
     # ── PR #4482 review (Doomgoose blocker 1): an unrecognized legacy app must never
-    # deadlock recovery. Before the fix it stayed in the recovery snapshot, both
-    # recovery paths returned 1 before restarting the service, and every later
-    # install failed the same way.
-    @staticmethod
-    def _script_function(source: str, name: str) -> str:
-        return script_function(source, name)
-
-    def _legacy_harness(self, root: Path, script: str, names: tuple[str, ...], body: str,
-                        plist_points_to_legacy: bool = False,
-                        plist_read_fails: bool = False) -> subprocess.CompletedProcess:
-        source = (BUILD_PKG.parent / script).read_text()
-        program = "\n".join(self._script_function(source, name) for name in names)
-        program = (program.replace("/usr/local/bin", str(root / "bin")).replace("/usr/local/lib", str(root / "lib"))
-                   .replace("/usr/libexec/PlistBuddy", "plist_buddy"))
-        legacy = root / "data/YuzuAgent.app"
-        stubs = f"""set -eu
-launchctl() {{ echo "$*" >> "{root}/launchctl.log"; }}
-require_started() {{ :; }}
-chown() {{ :; }}
-legacy_app_is_managed() {{ return 1; }}
-plist_buddy() {{ {"return 1" if plist_read_fails else ("echo " + str(legacy) + "/Contents/MacOS/yuzu-agent" if plist_points_to_legacy else "echo /usr/local/bin/yuzu-agent")}; }}
-ditto() {{ if [[ -d "$1" ]]; then mkdir -p "$2"; cp -R "$1/." "$2/"; else cp "$1" "$2"; fi; }}
-STATE_DIR="{root}/state"; LEGACY_APP="{legacy}"; YUZU_LIB="{root}/lib"; APP_ROOT="{root}/app"; APP="{root}/app/YuzuAgent.app"
-PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/lib/plugins"; MANIFEST="{root}/lib/package-files.list"
-MODE_FILE="{root}/lib/package-mode"; recovery="{root}/state/install-recovery.TEST"
-"""
-        return subprocess.run([PKG_SHELL, "-c", stubs + program + "\n" + body], text=True, capture_output=True)
-
-    def _legacy_layout(self, root: Path) -> Path:
-        for folder in ("state/install-recovery.TEST/LaunchDaemons", "data/YuzuAgent.app/Contents",
-                       "LaunchDaemons", "app", "lib/plugins", "bin"):
-            (root / folder).mkdir(parents=True, exist_ok=True)
-        (root / "state/install-recovery.TEST/LaunchDaemons/com.yuzu.agent.plist").write_text("previous")
-        return root / "state/install-recovery.TEST"
-
+    # deadlock recovery. Governance qe-1: BOTH recovery paths are exercised — the
+    # preinstall recover_interrupted_promotion and the postinstall restore_previous.
     @posix_shell
     def test_unrecognized_legacy_app_is_quarantined_without_rolling_back_a_healthy_install(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_retire_") as temporary:
             root = Path(temporary)
-            recovery = self._legacy_layout(root)
-            result = self._legacy_harness(root, "postinstall", ("quarantine_legacy_app", "retire_legacy_app"),
-                                          "retire_legacy_app && echo RETIRED")
+            recovery = self._recovery_layout(root)
+            (root / "data/YuzuAgent.app/Contents").mkdir(parents=True)
+            result = self._installer_harness(
+                root, "postinstall", ("quarantine_legacy_app", "retire_legacy_app"),
+                f'recovery="{recovery}"\nretire_legacy_app\necho RETIRED\n',
+                stubs="legacy_app_is_managed() { return 1; }\n")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("RETIRED", result.stdout)
             self.assertIn("quarantined an unrecognized legacy", result.stderr)
@@ -478,123 +606,393 @@ MODE_FILE="{root}/lib/package-mode"; recovery="{root}/state/install-recovery.TES
 
     @posix_shell
     def test_recovery_with_a_retained_legacy_app_restarts_the_previous_service(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_recover_") as temporary:
-            root = Path(temporary)
-            recovery = self._legacy_layout(root)
-            (recovery / "legacy-retired.app/Contents").mkdir(parents=True)
-            for _attempt in (1, 2):    # recovery must also be repeatable, never a dead end
-                result = self._legacy_harness(root, "preinstall",
-                                              ("quarantine_legacy_app", "remove_managed_plugins", "recover_interrupted_promotion"),
-                                              f'recover_interrupted_promotion "{recovery}" && echo RECOVERED')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("RECOVERED", result.stdout)
-            self.assertFalse((recovery / "legacy-retired.app").exists())
-            self.assertIn("bootstrap system", (root / "launchctl.log").read_text())
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_recover_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root)
+                (recovery / "legacy-retired.app/Contents").mkdir(parents=True)
+                (root / "launchctl.state").write_text(RUNNING)
+                # preinstall's recovery must also be repeatable, never a dead end;
+                # postinstall's ends by discarding the pointer and snapshot.
+                for _attempt in ((1, 2) if script == "preinstall" else (1,)):
+                    result = self._restore(root, script, recovery)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("RESTORED", result.stdout)
+                self.assertFalse((recovery / "legacy-retired.app").exists())
+                self.assertEqual(len(list((root / "state/quarantine").glob("legacy-YuzuAgent.*/YuzuAgent.app"))), 1)
+                self.assertEqual((root / "LaunchDaemons/com.yuzu.agent.plist").read_text(), "previous definition")
+                log = self._launchctl_log(root)
+                self.assertIn("enable system/com.yuzu.agent", log)
+                self.assertIn("bootstrap system", log)
+                if script == "postinstall":
+                    self.assertFalse((root / "state/current-recovery").exists())
+                    self.assertFalse(recovery.exists())
 
     @posix_shell
     def test_recovery_never_starts_a_legacy_data_root_service_but_does_not_block(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_plist_") as temporary:
-            root = Path(temporary)
-            recovery = self._legacy_layout(root)
-            result = self._legacy_harness(root, "preinstall",
-                                          ("quarantine_legacy_app", "remove_managed_plugins", "recover_interrupted_promotion"),
-                                          f'recover_interrupted_promotion "{recovery}" && echo RECOVERED',
-                                          plist_points_to_legacy=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("did not start it from non-package-owned data", result.stderr)
-            log = root / "launchctl.log"
-            self.assertNotIn("bootstrap", log.read_text() if log.exists() else "")
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_plist_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root)
+                (root / "launchctl.state").write_text(RUNNING)
+                result = self._restore(root, script, recovery, plist="legacy")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("RESTORED", result.stdout)
+                self.assertIn("did not start it from non-package-owned data", result.stderr)
+                self.assertNotIn("bootstrap", self._launchctl_log(root))
 
     @posix_shell
     def test_recovery_does_not_start_a_service_whose_definition_cannot_be_read(self) -> None:
         # A failed read used to flow through `| grep -q` and look like "not the legacy
         # program", so the service was started anyway (PR #4482 review, pipefail item).
-        with tempfile.TemporaryDirectory(prefix="yuzu_test_plist_unreadable_") as temporary:
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_plist_unreadable_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root)
+                (root / "launchctl.state").write_text(RUNNING)
+                result = self._restore(root, script, recovery, plist="fail")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("RESTORED", result.stdout)
+                self.assertIn("could not read the restored service definition", result.stderr)
+                self.assertNotIn("bootstrap", self._launchctl_log(root))
+
+    @posix_shell
+    def test_recovery_does_not_start_a_loose_agent_from_an_untrusted_directory(self) -> None:
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_loose_recover_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root, loose=True)
+                (root / "launchctl.state").write_text(RUNNING)
+                result = self._restore(root, script, recovery,
+                                       modes=self._recovery_modes(root, **{"ul/bin": 775}))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("RESTORED", result.stdout)
+                self.assertIn("did not start it", result.stderr)
+                self.assertEqual((root / "ul/bin/yuzu-agent").read_text(), "previous loose agent")
+                self.assertNotIn("bootstrap", self._launchctl_log(root))
+
+    @posix_shell
+    def test_recovery_starts_only_a_service_that_was_running(self) -> None:
+        # Governance sec-1/hp-1: a service that was stopped (or never configured)
+        # when the snapshot was taken is restored, not started.
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_not_running_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root, was_running=False)
+                (root / "launchctl.state").write_text(RUNNING)
+                result = self._restore(root, script, recovery)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("RESTORED", result.stdout)
+                self.assertIn("it was not running before, so it was not started", result.stderr)
+                self.assertEqual((root / "LaunchDaemons/com.yuzu.agent.plist").read_text(), "previous definition")
+                self.assertNotIn("bootstrap", self._launchctl_log(root))
+
+    @posix_shell
+    def test_recovery_completes_when_the_restored_service_will_not_stay_running(self) -> None:
+        # Governance sec-1: the restored agent never reaches `state = running`. The
+        # real require_started gives up; recovery reports it and completes instead
+        # of failing (which left the pointer at "promoting" and wedged every install).
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_restore_unhealthy_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root)
+                (root / "launchctl.state").write_text("state = spawn scheduled\n")
+                result = self._restore(root, script, recovery)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("RESTORED", result.stdout)
+                self.assertIn("did not stay running", result.stderr)
+                self.assertIn("bootstrap system", self._launchctl_log(root))
+                self.assertEqual(self._launchctl_log(root).count("print system/com.yuzu.agent"), 6)
+                if script == "postinstall":
+                    self.assertFalse((root / "state/current-recovery").exists())
+                    self.assertFalse(recovery.exists())
+
+    @posix_shell
+    def test_restore_previous_is_a_no_op_before_promotion(self) -> None:
+        # Governance uh-3/ch-2: a failure before "promoting" has changed nothing
+        # active, so the restore must not bounce the service or touch any file.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_restore_prepared_") as temporary:
             root = Path(temporary)
-            recovery = self._legacy_layout(root)
-            result = self._legacy_harness(root, "preinstall",
-                                          ("quarantine_legacy_app", "remove_managed_plugins", "recover_interrupted_promotion"),
-                                          f'recover_interrupted_promotion "{recovery}" && echo RECOVERED',
-                                          plist_read_fails=True)
+            recovery = self._recovery_layout(root, phase="prepared")
+            (root / "ul/bin/yuzu-agent").write_text("active agent")
+            (root / "ul/lib/yuzu/plugins/third-party.dylib").write_text("operator plugin")
+            (root / "LaunchDaemons/com.yuzu.agent.plist").write_text("active definition")
+            result = self._restore(root, "postinstall", recovery)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("could not read the restored service definition", result.stderr)
-            log = root / "launchctl.log"
-            self.assertNotIn("bootstrap", log.read_text() if log.exists() else "")
+            self.assertIn("RESTORED", result.stdout)
+            self.assertEqual(self._launchctl_log(root), "")
+            self.assertEqual((root / "ul/bin/yuzu-agent").read_text(), "active agent")
+            self.assertEqual((root / "ul/lib/yuzu/plugins/third-party.dylib").read_text(), "operator plugin")
+            self.assertEqual((root / "LaunchDaemons/com.yuzu.agent.plist").read_text(), "active definition")
+            self.assertTrue((root / "state/current-recovery").exists())
+            self.assertTrue(recovery.exists())
+
+    @posix_shell
+    def test_recovery_removes_the_pointer_before_the_snapshot(self) -> None:
+        # Governance uh-1: an orphaned snapshot is harmless; a pointer to a deleted
+        # snapshot wedged every later install. `sync` records what exists when called.
+        sync = ('sync() { local p=absent s=absent; [[ -e "$RECOVERY_FILE" ]] && p=present; '
+                '[[ -d "$STATE_DIR/install-recovery.TEST" ]] && s=present; '
+                'echo "pointer=$p snapshot=$s" >> "$STATE_DIR/../sync.log"; }\n')
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_restore_order_") as temporary:
+            root = Path(temporary)
+            recovery = self._recovery_layout(root)
+            (root / "launchctl.state").write_text(RUNNING)
+            result = self._restore(root, "postinstall", recovery, stubs=sync)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "sync.log").read_text().splitlines()[-1], "pointer=absent snapshot=present")
+            self.assertFalse(recovery.exists())
+        pre = (BUILD_PKG.parent / "preinstall").read_text()
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_discard_order_") as temporary:
+            root = Path(temporary)
+            recovery = self._recovery_layout(root, phase="prepared")
+            result = self._installer_harness(root, "preinstall", ("discard_recovery",),
+                                             f'discard_recovery "{recovery}"\necho DONE\n', stubs=sync)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "sync.log").read_text().splitlines(), ["pointer=absent snapshot=present"])
+            self.assertFalse(recovery.exists())
+        self.assertNotIn('rm -rf "$pending"\n            rm -f "$RECOVERY_FILE"', pre)
+
+    # ── Governance uh-1: the preinstall recovery block never wedges ─────────────
+    def _preinstall_recovery_block(self) -> str:
+        pre = (BUILD_PKG.parent / "preinstall").read_text()
+        start = pre.index('if [[ -e "$RECOVERY_FILE" || -L "$RECOVERY_FILE" ]]; then\n    pending=')
+        return pre[start:pre.index('\nRECOVERY="$(mktemp', start)] + "\n"
+
+    def _run_recovery_block(self, root: Path, *, stub_recovery: bool, **options) -> subprocess.CompletedProcess:
+        names = ("require_recovery_directory", "read_recovery_path", "discard_recovery")
+        if not stub_recovery:
+            names += self.RECOVERY_NAMES["preinstall"]
+        stubs = options.pop("stubs", "")
+        if stub_recovery:
+            stubs += 'recover_interrupted_promotion() { echo "RECOVER $1" >> "$STATE_DIR/../recover.log"; }\n'
+        options.setdefault("modes", self._recovery_modes(root))
+        return self._installer_harness(root, "preinstall", names,
+                                       self._preinstall_recovery_block() + "echo PROCEEDED\n",
+                                       stubs=stubs, **options)
+
+    @posix_shell
+    def test_preinstall_recovery_block_resolves_every_phase(self) -> None:
+        for phase, recovers in (("prepared", False), ("promoting", True), ("", True), ("garbage", True),
+                                ("prepared  ", True)):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(prefix="yuzu_test_phase_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root, phase=phase)
+                result = self._run_recovery_block(root, stub_recovery=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("PROCEEDED", result.stdout)
+                log = root / "recover.log"
+                self.assertEqual(log.read_text() if log.exists() else "",
+                                 f"RECOVER {recovery}\n" if recovers else "")
+                self.assertFalse((root / "state/current-recovery").exists())
+                self.assertFalse(recovery.exists())
+
+    @posix_shell
+    def test_preinstall_recovery_with_an_unhealthy_service_is_not_repeated(self) -> None:
+        # Governance sec-1, end to end through the real block: the restored agent will
+        # not stay up, recovery still completes, and the next install finds nothing.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_recover_unhealthy_") as temporary:
+            root = Path(temporary)
+            recovery = self._recovery_layout(root)
+            (root / "launchctl.state").write_text("state = not running\n")
+            first = self._run_recovery_block(root, stub_recovery=False)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertIn("PROCEEDED", first.stdout)
+            self.assertIn("did not stay running", first.stderr)
+            self.assertFalse((root / "state/current-recovery").exists())
+            self.assertFalse(recovery.exists())
+            calls = self._launchctl_log(root)
+            second = self._run_recovery_block(root, stub_recovery=False)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("PROCEEDED", second.stdout)
+            self.assertEqual(self._launchctl_log(root), calls)
+
+    @posix_shell
+    def test_an_unusable_recovery_pointer_is_dropped_not_fatal(self) -> None:
+        for case in ("missing snapshot", "empty", "symlink", "outside state root", "valid"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(prefix="yuzu_test_pointer_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root)
+                pointer = root / "state/current-recovery"
+                elsewhere = root / "state/install-recovery.TEST"
+                if case == "missing snapshot":
+                    pointer.write_text(f"{root}/state/install-recovery.GONE\n")
+                elif case == "empty":
+                    pointer.write_text("")
+                elif case == "symlink":
+                    target = root / "pointer-target"
+                    target.write_text(f"{recovery}\n")
+                    pointer.unlink()
+                    pointer.symlink_to(target)
+                elif case == "outside state root":
+                    elsewhere = root / "app"
+                    pointer.write_text(f"{elsewhere}\n")
+                result = self._installer_harness(
+                    root, "preinstall", ("require_recovery_directory", "read_recovery_path"),
+                    'out="$(read_recovery_path)"\necho "OUT=[$out]"\n', modes=self._recovery_modes(root))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if case == "valid":
+                    self.assertIn(f"OUT=[{recovery}]", result.stdout)
+                    self.assertTrue(pointer.exists())
+                    continue
+                self.assertIn("OUT=[]", result.stdout)
+                self.assertIn("discarding an unusable installation recovery pointer", result.stderr)
+                self.assertFalse(pointer.exists() or pointer.is_symlink())
+                # The pointer's target is never deleted on the pointer's say-so.
+                self.assertTrue(recovery.exists())
+                self.assertTrue(elsewhere.exists())
+                if case == "symlink":
+                    self.assertTrue((root / "pointer-target").exists())
+
+    # ── Governance sec-5/uh-3/ch-2: postinstall's flag-guarded EXIT trap ───────
+    def _promotion_exit(self, body: str) -> subprocess.CompletedProcess:
+        post = (BUILD_PKG.parent / "postinstall").read_text()
+        harness = (PREAMBLE + script_function(post, "on_exit")
+                   + 'restore_previous() { echo RESTORE >> "$RESTORE_LOG"; }\ntrap on_exit EXIT\n' + body)
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_on_exit_") as temporary:
+            log = Path(temporary) / "restore.log"
+            result = subprocess.run([PKG_SHELL, "-c", harness], text=True, capture_output=True,
+                                    env={**os.environ, "RESTORE_LOG": str(log)})
+            result.restores = log.read_text().count("RESTORE") if log.exists() else 0  # type: ignore[attr-defined]
+        return result
+
+    @posix_shell
+    def test_promotion_failures_restore_exactly_when_armed(self) -> None:
+        cases = {
+            # Before the trap is armed nothing active has changed: plain failure.
+            "failure before arming": ("false\nPROMOTION_ARMED=1\n", 0, False),
+            # errexit inside a function skipped the non-inherited ERR trap (sec-5).
+            "failure inside a function": ("PROMOTION_ARMED=1\nstep() { false; echo unreachable; }\nstep\n", 1, False),
+            "failure at top level": ("PROMOTION_ARMED=1\nfalse\n", 1, False),
+            # bash 3.2 reports $?=0 to an EXIT trap after a `set -u` abort.
+            "set -u abort": ('PROMOTION_ARMED=1\necho "$NEVER_DEFINED_ANYWHERE"\nPROMOTION_ARMED=0\n', 1, False),
+            "explicit exit": ("PROMOTION_ARMED=1\nexit 3\n", 1, False),
+            # A handled failure inside a command substitution must never restore
+            # (with `set -E` bash 3.2 fired the ERR trap inside the subshell).
+            "handled substitution": ('PROMOTION_ARMED=1\nx="$(false)" || true\n'
+                                     'probe() { local o; o="$(false)" || return 0; }\nprobe\nPROMOTION_ARMED=0\n', 0, True),
+            "completed": ("PROMOTION_ARMED=1\ntrue\nPROMOTION_ARMED=0\n", 0, True),
+        }
+        for name, (body, restores, succeeds) in cases.items():
+            with self.subTest(case=name):
+                result = self._promotion_exit(body)
+                self.assertEqual(result.restores, restores, result.stderr)  # type: ignore[attr-defined]
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                self.assertNotIn("unreachable", result.stdout)
 
     def test_installer_scripts_run_with_pipefail(self) -> None:
         for name in ("preinstall", "postinstall", "uninstall.sh"):
-            self.assertIn("\nset -euo pipefail\n", (BUILD_PKG.parent / name).read_text(), name)
+            source = (BUILD_PKG.parent / name).read_text()
+            self.assertIn("\nset -euo pipefail\n", source, name)
+            self.assertNotRegex(source, r"(?m)^\s*set -[a-zA-Z]*E", name)
+            self.assertNotIn("trap 'restore_previous' ERR", source, name)
+        post = (BUILD_PKG.parent / "postinstall").read_text()
+        phase = post.index("mv -f \"$recovery/.phase.new\" \"$recovery/phase\"")
+        armed = post.index("PROMOTION_ARMED=1\n")
+        self.assertLess(phase, armed)
+        self.assertLess(armed, post.index("trap on_exit EXIT\nrequire_stopped\n"))
+        disarmed = post.index("PROMOTION_ARMED=0\nfinish_recovery \"$recovery\"")
+        self.assertLess(post.index("\nretire_legacy_app\n", armed), disarmed)
 
-    # ── PR #4482 review (Doomgoose blocker 3): the loose lane's code directory.
-    def _loose_dir_harness(self, root: Path, body: str, owners: dict[str, str], script: str = "postinstall",
-                           names: tuple[str, ...] = ("loose_code_directory_trusted",)) -> subprocess.CompletedProcess:
-        source = (BUILD_PKG.parent / script).read_text()
-        program = "\n".join(self._script_function(source, name) for name in names)
-        local, local_bin = root / "ul", root / "ul/bin"
-        program = (program.replace("for path in /usr/local /usr/local/bin", f'for path in "{local}" "{local_bin}"')
-                   .replace("/usr/local/bin", str(local_bin)).replace("/usr/local/lib", str(root / "ul/lib"))
-                   .replace("/usr/libexec/PlistBuddy", "plist_buddy"))
-        cases = " ".join(f'"{path}") echo {uid} ;;' for path, uid in owners.items())
-        stubs = f"""set -eu
-stat() {{ if [[ "$2" == "%u" ]]; then case "$3" in {cases} *) echo 0 ;; esac; else command stat "$@"; fi; }}
-launchctl() {{ echo "$*" >> "{root}/launchctl.log"; }}
-require_started() {{ :; }}
-plist_buddy() {{ echo {local_bin}/yuzu-agent; }}
-ditto() {{ if [[ -d "$1" ]]; then mkdir -p "$2"; cp -R "$1/." "$2/"; else cp "$1" "$2"; fi; }}
-STATE_DIR="{root}/state"; LEGACY_APP="{root}/data/YuzuAgent.app"; YUZU_LIB="{root}/ul/lib/yuzu"; APP_ROOT="{root}/app"
-PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuzu/plugins"
-"""
-        return subprocess.run([PKG_SHELL, "-c", stubs + program + "\n" + body], text=True, capture_output=True)
-
+    # ── Governance sec-2: the whole /usr/local chain, both lanes ───────────────
     @macos_userland
-    def test_loose_code_directory_must_be_root_owned_and_not_writable(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="yuzu_test_loose_dir_") as temporary:
-            root = Path(temporary)
-            local, local_bin = root / "ul", root / "ul/bin"
-            local_bin.mkdir(parents=True)
-            def trusted(owners: dict[str, str] | None = None) -> bool:
-                result = self._loose_dir_harness(root, "loose_code_directory_trusted && echo TRUSTED", owners or {})
-                return "TRUSTED" in result.stdout
-            local.chmod(0o755); local_bin.chmod(0o755)
-            self.assertTrue(trusted())
-            local_bin.chmod(0o775)                            # Intel-Homebrew-style group-writable bin
-            self.assertFalse(trusted())
-            local_bin.chmod(0o755); local.chmod(0o777)        # writable parent: bin itself can be renamed
-            self.assertFalse(trusted())
-            local.chmod(0o755)
-            self.assertFalse(trusted({str(local_bin): "501"}))  # user-owned bin
-            local_bin.rmdir(); (root / "elsewhere").mkdir(); local_bin.symlink_to(root / "elsewhere")
-            self.assertFalse(trusted())
+    def test_code_directory_chain_must_be_root_owned_and_not_writable(self) -> None:
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_chain_") as temporary:
+                root = Path(temporary)
+                ul = root / "ul"
+                levels = [ul, ul / "lib", ul / "lib/yuzu", ul / "bin"]
+                for level in levels:
+                    level.mkdir(parents=True, exist_ok=True)
+                    level.chmod(0o755)
+
+                def verdicts(owners: dict | None = None) -> tuple[str, str]:
+                    out = []
+                    for lane in ("bundle", "loose"):
+                        result = self._installer_harness(
+                            root, script, ("code_directory_chain_trusted",),
+                            f'if code_directory_chain_trusted {lane}; then echo TRUSTED; else echo REFUSED; fi\n',
+                            owners=owners, real_modes=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        out.append(result.stdout.strip())
+                    return out[0], out[1]
+
+                self.assertEqual(verdicts(), ("TRUSTED", "TRUSTED"))
+                for level in levels:
+                    lane_bin = level == ul / "bin"
+                    expected = ("TRUSTED", "REFUSED") if lane_bin else ("REFUSED", "REFUSED")
+                    level.chmod(0o775)
+                    self.assertEqual(verdicts(), expected, f"group-writable {level}")
+                    level.chmod(0o757)
+                    self.assertEqual(verdicts(), expected, f"world-writable {level}")
+                    level.chmod(0o755)
+                    self.assertEqual(verdicts({level: 501}), expected, f"user-owned {level}")
+                self.assertEqual(verdicts(), ("TRUSTED", "TRUSTED"))
+                # A symlinked level is refused; an absent one has nothing to swap.
+                (ul / "lib/yuzu").rmdir()
+                self.assertEqual(verdicts(), ("TRUSTED", "TRUSTED"))
+                (root / "elsewhere").mkdir()
+                (ul / "lib/yuzu").symlink_to(root / "elsewhere")
+                self.assertEqual(verdicts(), ("REFUSED", "REFUSED"))
 
     def test_loose_promotion_is_refused_before_the_active_service_is_touched(self) -> None:
-        postinstall = (BUILD_PKG.parent / "postinstall").read_text()
-        check = postinstall.index('if [[ "$MODE" == "loose" ]] && ! loose_code_directory_trusted; then')
-        self.assertLess(postinstall.index("loose_code_directory_trusted() {"), check)
-        self.assertLess(check, postinstall.index("require_stopped\nremove_managed_plugins"))
-        self.assertLess(check, postinstall.index("printf 'promoting\\n'"))
+        post = (BUILD_PKG.parent / "postinstall").read_text()
+        pre = (BUILD_PKG.parent / "preinstall").read_text()
+        stop = post.index("require_stopped\nremove_managed_plugins")
+        promoting = post.index("printf 'promoting\\n'")
+        for check in ('code_directory_chain_trusted "$MODE" || {', "reject_untrusted_code_entries || exit 1",
+                      "reject_unmanaged_plugin_collisions || exit 1",
+                      'recovery="$(recovery_path)" || {',
+                      '/usr/bin/osascript -l JavaScript "$recovery/merge-launchd-plist.js"',
+                      "reject_unsigned_plugins_under_enforcement || exit 1"):
+            at = post.index(check)
+            self.assertLess(at, stop, check)
+            self.assertLess(at, promoting, check)
+        self.assertLess(post.index("code_directory_chain_trusted() {"), post.index('code_directory_chain_trusted "$MODE" || {'))
+        # The merge helper runs from the root-only snapshot copy, never in place (sec-2).
+        self.assertIn('install -m 600 "$YUZU_LIB/merge-launchd-plist.js" "$recovery/merge-launchd-plist.js"', post)
+        self.assertNotIn("osascript -l JavaScript /usr/local/lib/yuzu/merge-launchd-plist.js", post)
+        # preinstall checks the chain and existing content before any payload parent.
+        payload = pre.index('secure_payload_parent "$APP_ROOT" 755')
+        self.assertLess(pre.index("code_directory_chain_trusted bundle || {"), payload)
+        self.assertLess(pre.index("reject_untrusted_code_entries || exit 1"), pre.index("ensure_state_dir\n\n"))
+        # The recovery pointer is written through a temporary name (uh-1).
+        self.assertLess(pre.index('> "$RECOVERY_FILE.new"'), pre.index('mv -f "$RECOVERY_FILE.new" "$RECOVERY_FILE"'))
 
+    # ── Governance ch-4: content a non-root account could have written ─────────
     @macos_userland
-    def test_recovery_does_not_start_a_loose_agent_from_an_untrusted_directory(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="yuzu_test_loose_recover_") as temporary:
-            root = Path(temporary)
-            recovery = root / "state/install-recovery.TEST"
-            for folder in ("loose", "LaunchDaemons"):
-                (recovery / folder).mkdir(parents=True)
-            (recovery / "loose/yuzu-agent").write_text("previous loose agent")
-            (recovery / "LaunchDaemons/com.yuzu.agent.plist").write_text("previous")
-            for folder in ("ul/bin", "ul/lib/yuzu/plugins", "LaunchDaemons", "app", "data"):
-                (root / folder).mkdir(parents=True, exist_ok=True)
-            (root / "ul").chmod(0o755); (root / "ul/bin").chmod(0o775)
-            result = self._loose_dir_harness(
-                root, f'recover_interrupted_promotion "{recovery}" && echo RECOVERED', {}, script="preinstall",
-                names=("loose_code_directory_trusted", "quarantine_legacy_app", "remove_managed_plugins",
-                       "recover_interrupted_promotion"))
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("RECOVERED", result.stdout)
-            self.assertIn("did not start it", result.stderr)
-            self.assertEqual((root / "ul/bin/yuzu-agent").read_text(), "previous loose agent")
-            log = root / "launchctl.log"
-            self.assertNotIn("bootstrap", log.read_text() if log.exists() else "")
+    def test_untrusted_code_entries_are_listed_and_refused(self) -> None:
+        for script in ("preinstall", "postinstall"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_entries_") as temporary:
+                root = Path(temporary)
+                bin_dir, plugins = root / "ul/bin", root / "ul/lib/yuzu/plugins"
+                bin_dir.mkdir(parents=True)
+                plugins.mkdir(parents=True)
+
+                def run(owners: dict | None = None) -> subprocess.CompletedProcess:
+                    return self._installer_harness(root, script, ("reject_untrusted_code_entries",),
+                                                   "reject_untrusted_code_entries\necho ACCEPTED\n",
+                                                   owners=owners, real_modes=True)
+
+                clean = run()
+                self.assertEqual(clean.returncode, 0, clean.stderr)
+                self.assertIn("ACCEPTED", clean.stdout)
+                files = {bin_dir / "yuzu-agent": 0o644, bin_dir / "yuzu-agent.old": 0o664,
+                         bin_dir / "libyuzu_agent_core.dylib": 0o644, bin_dir / ".yuzu-update-verified": 0o666,
+                         bin_dir / "other-tool": 0o666, plugins / "good.dylib": 0o644,
+                         plugins / ".hidden": 0o664}
+                for path, mode in files.items():
+                    path.write_text("fixture")
+                    path.chmod(mode)
+                (plugins / "evil.dylib").symlink_to(plugins / "good.dylib")
+                result = run({bin_dir / "libyuzu_agent_core.dylib": 501})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("ACCEPTED", result.stdout)
+                listed = {line.strip() for line in result.stderr.splitlines() if line.startswith("         /")}
+                self.assertEqual(listed, {str(bin_dir / "yuzu-agent.old"), str(bin_dir / "libyuzu_agent_core.dylib"),
+                                          str(bin_dir / ".yuzu-update-verified"), str(plugins / ".hidden"),
+                                          str(plugins / "evil.dylib")})
+                self.assertIn("remove anything you did not install as root", result.stderr)
 
     @unittest.skipUnless(sys.platform == "darwin", "native macOS archive/plist integration")
     def test_two_stage_final_output_cms_policy_is_verified_before_publication(self) -> None:
@@ -650,20 +1048,36 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
                                      "/etc/yuzu-agent/certs/plugins.pem")
 
     @unittest.skipUnless(sys.platform == "darwin", "native macOS plist integration")
-    def test_native_plist_merge_fails_without_replacing_destination(self) -> None:
+    def test_native_plist_merge_falls_back_on_an_unreadable_previous_definition(self) -> None:
+        # Governance ch-1: an unparseable or malformed live definition (a hand-edit
+        # typo, a torn write) installs the package default with a warning instead of
+        # wedging every upgrade. A malformed GENERATED definition is a package bug
+        # and still fails without touching the destination.
         with tempfile.TemporaryDirectory(prefix="yuzu_test_plist_native_") as temporary:
             root = Path(temporary)
             previous, destination = root / "previous.plist", root / "new.plist"
-            sentinel = plistlib.dumps({"ProgramArguments": ["/new/agent"]})
-            for prior in ({"ProgramArguments": []}, {"ProgramArguments": [42]},
-                          {"ProgramArguments": ["/old/agent"], "EnvironmentVariables": []}):
-                previous.write_bytes(plistlib.dumps(prior))
-                destination.write_bytes(sentinel)
-                result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", str(MERGE_PLIST_HELPER),
-                                         "--previous", str(previous), "--destination", str(destination)],
-                                        text=True, capture_output=True)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(destination.read_bytes(), sentinel)
+            generated = plistlib.dumps({"ProgramArguments": ["/new/agent"]})
+            for prior in (b"not a plist at all", b"", plistlib.dumps({"ProgramArguments": []}),
+                          plistlib.dumps({"ProgramArguments": [42]}),
+                          plistlib.dumps({"ProgramArguments": ["/old/agent"], "EnvironmentVariables": []}),
+                          plistlib.dumps({"ProgramArguments": ["/old/agent"], "EnvironmentVariables": {"A": 1}})):
+                with self.subTest(prior=prior[:40]):
+                    previous.write_bytes(prior)
+                    destination.write_bytes(generated)
+                    result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", str(MERGE_PLIST_HELPER),
+                                             "--previous", str(previous), "--destination", str(destination)],
+                                            text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(destination.read_bytes(), generated)
+                    self.assertIn("cannot be read", result.stderr)
+            previous.write_bytes(plistlib.dumps({"ProgramArguments": ["/old/agent"]}))
+            broken = plistlib.dumps({"ProgramArguments": []})
+            destination.write_bytes(broken)
+            result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", str(MERGE_PLIST_HELPER),
+                                     "--previous", str(previous), "--destination", str(destination)],
+                                    text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(destination.read_bytes(), broken)
 
     def test_vcpkg_macos_target_triplet_pins_the_documented_runtime_floor(self) -> None:
         triplet = MACOS_TRIPLET.read_text()
@@ -725,7 +1139,8 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
         self.assertIn('root-owned and not group/world writable', preinstall)
         self.assertIn('ensure_state_dir()', preinstall)
         self.assertIn('recovery state root must be root:wheel mode 700', preinstall)
-        self.assertIn('recovery pointer must be root:wheel mode 600', preinstall)
+        self.assertIn('recovery pointer must be root:wheel mode 600', postinstall)
+        self.assertIn('discarding an unusable installation recovery pointer', preinstall)
         self.assertIn('refusing recovery path outside the trusted state root', preinstall)
         self.assertIn('secure_payload_parent "$parent" 755', preinstall)
         self.assertIn('write_recovery_phase "$RECOVERY" prepared', preinstall)
@@ -751,12 +1166,21 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
         self.assertIn('require_trusted_directory "/private/etc"', postinstall)
         self.assertIn('remove_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('rm -rf "$recovery"', postinstall)
+        self.assertIn('finish_recovery "$recovery"', postinstall)
 
     def test_recovery_clears_both_lanes_and_uninstall_removes_transition_paths(self) -> None:
         preinstall = (ROOT / "deploy/packaging/macos/preinstall").read_text()
         postinstall = (ROOT / "deploy/packaging/macos/postinstall").read_text()
         uninstall = (ROOT / "deploy/packaging/macos/uninstall.sh").read_text()
-        self.assertIn('rm -f /usr/local/bin/yuzu-agent /usr/local/bin/libyuzu_agent_core.dylib /usr/local/lib/libyuzu_agent_core.dylib', postinstall)
+        clear_lanes = ('rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" '
+                       '/usr/local/lib/libyuzu_agent_core.dylib \\\n'
+                       '          "$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"')
+        # Promotion and restore (postinstall) and recovery (preinstall) also drop the
+        # updater's rollback file and marker (governance ch-4, rd-5).
+        pattern = re.escape(clear_lanes).replace(re.escape("\\\n          "), r"\\\n\s+")
+        self.assertEqual(len(re.findall(pattern, postinstall)), 2)
+        self.assertEqual(len(re.findall(pattern, preinstall)), 1)
+        self.assertIn('"$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"', uninstall)
         self.assertIn('remove_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('harden_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('collides with an unmanaged third-party plugin', postinstall)
@@ -788,8 +1212,9 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
         self.assertNotIn('recovery/legacy/YuzuAgent.app', postinstall)
         self.assertIn('retire_legacy_app', uninstall)
         self.assertIn('"/Library/Application Support/Yuzu/YuzuAgent.app"', uninstall)
-        self.assertIn('/usr/local/lib/yuzu/merge-launchd-plist.py', uninstall)
-        self.assertIn('/usr/local/lib/yuzu/plugin-signing-policy.json', uninstall)
+        self.assertIn('YUZU_LIB="/usr/local/lib/yuzu"', uninstall)
+        self.assertIn('"$YUZU_LIB/merge-launchd-plist.py"', uninstall)
+        self.assertIn('"$YUZU_LIB/plugin-signing-policy.json"', uninstall)
         self.assertIn('sync', postinstall)
         self.assertNotIn('rm -rf "$APP" "$PLUGIN_DIR"', postinstall)
         self.assertIn('.YuzuAgent.incoming.app', uninstall)
@@ -812,10 +1237,14 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
         package_readme = (ROOT / "deploy/packaging/macos/README.md").read_text()
         self.assertIn('--plugin-trust-bundle <build-trust.pem>', package_readme)
         self.assertIn('unrecognized', package_readme)
-        self.assertIn('uninstall-legacy.*', package_readme)
-        self.assertIn('exits nonzero', package_readme)
-        self.assertIn('daemon remains unloaded until a later successful package', package_readme)
-        self.assertIn('transition, so do not restart it before that inspection', package_readme)
+        # The README states what the scripts now do: an unrecognized app is
+        # quarantined and never blocks (uninstall included), and one lock
+        # serialises installs and uninstalls (governance ch-3).
+        self.assertIn('/var/db/yuzu-agent/quarantine/legacy-YuzuAgent.*/', package_readme)
+        self.assertIn('/var/db/.yuzu-agent-transition.lock', package_readme)
+        self.assertNotIn('uninstall-legacy.*', package_readme)
+        self.assertNotIn('uninstall stopped before deleting package code',
+                         (ROOT / "deploy/packaging/macos/uninstall.sh").read_text())
 
     @unittest.skipUnless(sys.platform == "darwin", "native macOS archive/plist integration")
     def test_package_builder_rejects_a_mixed_cms_plugin_set_before_publishing(self) -> None:
@@ -1171,6 +1600,298 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exactly one", result.stderr)
 
+    # ── Governance uh-5: orphaned snapshots are collected, nothing else ────────
+    @posix_shell
+    def test_preinstall_collects_only_well_formed_orphan_snapshots(self) -> None:
+        pre = (BUILD_PKG.parent / "preinstall").read_text()
+        start = pre.index('for orphan in "$STATE_DIR"/install-recovery.*; do')
+        loop = pre[start:pre.index("\ndone\n", start) + 6]
+        self.assertLess(pre.index('if [[ -e "$RECOVERY_FILE" || -L "$RECOVERY_FILE" ]]; then'), start)
+        self.assertLess(start, pre.index('RECOVERY="$(mktemp -d'))
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_orphans_") as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            for name in ("install-recovery.OLD/LaunchDaemons", "install-recovery.LOOSE_MODE", "quarantine/legacy-YuzuAgent.X"):
+                (state / name).mkdir(parents=True)
+            (state / "install-recovery.FILE").write_text("not a snapshot")
+            (root / "elsewhere").mkdir()
+            (root / "elsewhere/keep").write_text("kept")
+            (state / "install-recovery.LINK").symlink_to(root / "elsewhere")
+            result = self._installer_harness(root, "preinstall", ("require_recovery_directory",),
+                                             loop + "echo DONE\n",
+                                             modes={state / "install-recovery.OLD": 700,
+                                                    state / "install-recovery.LINK": 700})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("DONE", result.stdout)
+            self.assertFalse((state / "install-recovery.OLD").exists())
+            for kept in ("install-recovery.LOOSE_MODE", "install-recovery.FILE", "quarantine/legacy-YuzuAgent.X"):
+                self.assertTrue((state / kept).exists(), kept)
+            self.assertTrue((state / "install-recovery.LINK").is_symlink())
+            self.assertEqual((root / "elsewhere/keep").read_text(), "kept")
+
+    # ── Governance sec-3: removal honours the recorded hash in every script ────
+    @macos_userland
+    def test_plugin_removal_keeps_an_operator_modified_listed_plugin(self) -> None:
+        import hashlib
+        for script in ("preinstall", "postinstall", "uninstall.sh"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_remove_") as temporary:
+                root = Path(temporary)
+                lib = root / "ul/lib/yuzu"
+                plugins = lib / "plugins"
+                plugins.mkdir(parents=True)
+                manifest, hashes = lib / "package-files.list", lib / "package-files.sha256"
+
+                def populate() -> None:
+                    (plugins / "ours.dylib").write_bytes(b"package bytes")
+                    (plugins / "ours.dylib.sig").write_bytes(b"sidecar")
+                    (plugins / "theirs.dylib").write_bytes(b"operator rebuild")
+                    (plugins / "third-party.dylib").write_bytes(b"never listed")
+
+                populate()
+                manifest.write_text("# package-version 1.0\nplugins/ours.dylib\nplugins/theirs.dylib\n")
+                hashes.write_text(f"{hashlib.sha256(b'package bytes').hexdigest()}  plugins/ours.dylib\n"
+                                  f"{hashlib.sha256(b'original package bytes').hexdigest()}  plugins/theirs.dylib\n")
+                body = 'remove_managed_plugins "$MANIFEST" "$HASHES"\necho DONE\n'
+                result = self._installer_harness(root, script, ("plugin_hash_matches", "remove_managed_plugins"), body)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("DONE", result.stdout)
+                self.assertFalse((plugins / "ours.dylib").exists())
+                self.assertFalse((plugins / "ours.dylib.sig").exists())
+                self.assertEqual((plugins / "theirs.dylib").read_bytes(), b"operator rebuild")
+                self.assertIn("kept", result.stderr)
+                self.assertIn("theirs.dylib", result.stderr)
+                self.assertEqual((plugins / "third-party.dylib").read_bytes(), b"never listed")
+                # A package that recorded no hashes owned its files by name.
+                hashes.unlink()
+                populate()
+                result = self._installer_harness(root, script, ("plugin_hash_matches", "remove_managed_plugins"), body)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((plugins / "ours.dylib").exists())
+                self.assertFalse((plugins / "theirs.dylib").exists())
+                self.assertEqual((plugins / "third-party.dylib").read_bytes(), b"never listed")
+
+    # ── Governance rd-2: a manifest left behind by a rollback is re-derived ────
+    @macos_userland
+    def test_stale_manifest_after_a_rollback_is_re_derived(self) -> None:
+        import hashlib
+        pkgutil = '''pkgutil() {
+    case "$1" in
+        --pkg-info) [[ -n "${RECEIPT_VERSION:-}" ]] || return 1
+                    printf 'package-id: com.yuzu.agent\\nversion: %s\\nvolume: /\\n' "$RECEIPT_VERSION" ;;
+        --files) printf '%s\\n' usr/local/lib/yuzu/plugins/a.dylib usr/local/lib/yuzu/plugins/c.dylib usr/local/bin/yuzu-agent ;;
+    esac
+}
+'''
+        stale = "# package-version 2.0\nplugins/a.dylib\nplugins/b.dylib\nplugins/n.dylib\n"
+        for receipt, rederived in (("1.0", True), ("2.0", False), ("", False), ("header-less", False)):
+            with self.subTest(receipt=receipt), tempfile.TemporaryDirectory(prefix="yuzu_test_stale_manifest_") as temporary:
+                root = Path(temporary)
+                lib = root / "ul/lib/yuzu"
+                (lib / "plugins").mkdir(parents=True)
+                manifest, hashes = lib / "package-files.list", lib / "package-files.sha256"
+                written = stale.split("\n", 1)[1] if receipt == "header-less" else stale
+                manifest.write_text(written)
+                # The rollback overwrote a.dylib with the older release's bytes and left
+                # N-only n.dylib as N shipped it; b.dylib is gone.
+                (lib / "plugins/a.dylib").write_bytes(b"release O")
+                (lib / "plugins/n.dylib").write_bytes(b"release N only")
+                hash_text = "".join(f"{hashlib.sha256(data).hexdigest()}  plugins/{name}\n" for name, data in
+                                    (("a.dylib", b"release N"), ("b.dylib", b"b"), ("n.dylib", b"release N only")))
+                hashes.write_text(hash_text)
+                version = "1.0" if receipt == "header-less" else receipt
+                result = self._installer_harness(
+                    root, "preinstall", ("discard_stale_manifest", "adopt_receipted_plugins"),
+                    "discard_stale_manifest\necho DONE\n", stubs=f"RECEIPT_VERSION={version}\n" + pkgutil)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("DONE", result.stdout)
+                if rederived:
+                    self.assertEqual(manifest.read_text(), "plugins/a.dylib\nplugins/c.dylib\nplugins/n.dylib\n")
+                    self.assertFalse(hashes.exists())
+                    self.assertIn("re-deriving plugin ownership", result.stderr)
+                else:
+                    self.assertEqual(manifest.read_text(), written)
+                    self.assertEqual(hashes.read_text(), hash_text)
+                self.assertEqual(list(lib.glob(".still-owned.*")), [])
+
+    # ── Governance hp-1 / sre-2 / hp-2: the postinstall start decision ─────────
+    def _write_plist(self, path: Path, arguments: list[str] | None = None, environment: dict | None = None) -> None:
+        plist = plistlib.loads((BUILD_PKG.parent / "com.yuzu.agent.plist").read_bytes())
+        plist["ProgramArguments"] = plist["ProgramArguments"] + (arguments or [])
+        if environment:
+            plist["EnvironmentVariables"] = environment
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(plistlib.dumps(plist))
+
+    @macos_userland
+    def test_service_definition_configured_requires_a_trust_anchor(self) -> None:
+        cases = (([], None, False, False), (["--server", "s:50051"], {"YUZU_SERVER": "s:50051"}, False, False),
+                 (["--ca-cert", "/etc/ca.pem"], None, False, True), (["--ca-cert=/etc/ca.pem"], None, False, True),
+                 (["--tls-system-roots"], None, False, True), (["--no-tls"], None, False, True),
+                 ([], {"YUZU_CA_CERT": "/etc/ca.pem"}, False, True), ([], {"YUZU_TLS_SYSTEM_ROOTS": "1"}, False, True),
+                 ([], None, True, True))
+        for arguments, environment, default_ca, configured in cases:
+            with self.subTest(arguments=arguments, environment=environment, default_ca=default_ca), \
+                    tempfile.TemporaryDirectory(prefix="yuzu_test_configured_") as temporary:
+                root = Path(temporary)
+                self._write_plist(root / "LaunchDaemons/com.yuzu.agent.plist", arguments, environment)
+                if default_ca:
+                    (root / "etc").mkdir()
+                    (root / "etc/default-ca.pem").write_text("ca")
+                result = self._installer_harness(
+                    root, "postinstall", ("service_definition_configured",),
+                    'if service_definition_configured "$PLIST"; then echo CONFIGURED; else echo UNCONFIGURED; fi\n',
+                    plist="real")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "CONFIGURED" if configured else "UNCONFIGURED")
+
+    @posix_shell
+    def test_service_state_probes_read_launchd_exactly(self) -> None:
+        for state, running in ((RUNNING, True), ("state = not running\n", False), ("state = waiting\n", False), (None, False)):
+            with self.subTest(state=state), tempfile.TemporaryDirectory(prefix="yuzu_test_running_") as temporary:
+                root = Path(temporary)
+                if state is not None:
+                    (root / "launchctl.state").write_text(state)
+                result = self._installer_harness(root, "postinstall", ("service_running",),
+                                                 "if service_running; then echo RUNNING; else echo STOPPED; fi\n")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "RUNNING" if running else "STOPPED")
+        for overrides, disabled in (('\t"com.yuzu.agent" => disabled\n', True), ('\t"com.yuzu.agent" => true\n', True),
+                                    ('\t"com.yuzu.agent" => enabled\n', False), ('\t"com.yuzu.agent" => false\n', False),
+                                    ('\t"com.yuzu.agentx" => disabled\n', False), ("", False)):
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory(prefix="yuzu_test_disabled_") as temporary:
+                root = Path(temporary)
+                (root / "launchctl.disabled").write_text("disabled services = {\n" + overrides + "}\n")
+                result = self._installer_harness(root, "postinstall", ("service_disabled",),
+                                                 "if service_disabled; then echo DISABLED; else echo ENABLED; fi\n")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "DISABLED" if disabled else "ENABLED")
+
+    @macos_userland
+    def test_install_starts_only_what_it_should(self) -> None:
+        # The real start-decision block. A fresh install of the stock package must not
+        # be rolled back for an agent that exits until it is configured (hp-1); an
+        # administrator-disabled service is respected (sre-2); a previously running
+        # service is health-gated (a failure exits, and the EXIT trap restores).
+        post = (BUILD_PKG.parent / "postinstall").read_text()
+        block = post[post.index("# Start decision."):post.index("# The previous development bundle lived below")]
+        cases = {
+            "running before, healthy": (True, RUNNING, "", [], True, "installed and started", True),
+            "running before, unhealthy": (True, "state = not running\n", "", [], True, None, False),
+            "disabled by administrator": (False, RUNNING, '"com.yuzu.agent" => disabled', ["--ca-cert", "/c"], False,
+                                          "disabled by an administrator", True),
+            "configured, healthy": (False, RUNNING, "", ["--ca-cert", "/c"], True, "installed and started", True),
+            "configured, unhealthy": (False, "state = not running\n", "", ["--no-tls"], True,
+                                      "did not stay running", True),
+            "fresh, unconfigured": (False, "state = not running\n", "", [], False,
+                                    "not started: no server trust anchor", True),
+        }
+        for name, (was_running, state, disabled, arguments, bootstraps, outcome, succeeds) in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory(prefix="yuzu_test_start_") as temporary:
+                root = Path(temporary)
+                recovery = self._recovery_layout(root, was_running=was_running)
+                self._write_plist(root / "LaunchDaemons/com.yuzu.agent.plist", arguments)
+                (root / "launchctl.state").write_text(state)
+                (root / "launchctl.disabled").write_text("disabled services = {\n\t" + disabled + "\n}\n")
+                result = self._installer_harness(
+                    root, "postinstall", ("require_started", "service_disabled", "service_definition_configured"),
+                    f'recovery="{recovery}"\n' + block + 'echo "OUTCOME=$outcome"\n', plist="real")
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                log = self._launchctl_log(root)
+                self.assertEqual("bootstrap system" in log, bootstraps, log)
+                if was_running:
+                    self.assertIn("enable system/com.yuzu.agent", log)
+                if outcome is None:
+                    self.assertNotIn("OUTCOME=", result.stdout)
+                else:
+                    self.assertIn(outcome, result.stdout)
+
+    # ── Governance pd-1: retained signature enforcement vs unsigned plugins ────
+    @macos_userland
+    def test_unsigned_plugins_are_refused_when_signatures_will_be_required(self) -> None:
+        cases = (([], None, False, True), (["--plugin-require-signature"], None, False, False),
+                 (["--plugin-require-signature"], None, True, True),
+                 ([], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "0"}, False, False),
+                 ([], {"YUZU_PLUGIN_TRUST_BUNDLE": "/t.pem"}, False, True))
+        for arguments, environment, signed, accepted in cases:
+            with self.subTest(arguments=arguments, environment=environment, signed=signed), \
+                    tempfile.TemporaryDirectory(prefix="yuzu_test_unsigned_") as temporary:
+                root = Path(temporary)
+                self._write_plist(root / "LaunchDaemons/.com.yuzu.agent.incoming.plist", arguments, environment)
+                incoming = root / "ul/lib/yuzu/.plugins.incoming"
+                incoming.mkdir(parents=True)
+                (incoming / "tar.dylib").write_bytes(b"plugin")
+                if signed:
+                    (incoming / "tar.dylib.sig").write_bytes(b"sidecar")
+                result = self._installer_harness(
+                    root, "postinstall",
+                    ("service_definition_requires_plugin_signatures", "reject_unsigned_plugins_under_enforcement"),
+                    "reject_unsigned_plugins_under_enforcement\necho ACCEPTED\n", plist="real")
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                self.assertEqual("ACCEPTED" in result.stdout, accepted)
+                if not accepted:
+                    self.assertIn("tar.dylib has no signature", result.stderr)
+
+    # ── Governance er-2: every operator YUZU_* setting survives an upgrade ─────
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS plist integration")
+    def test_plist_merge_retains_every_operator_yuzu_setting(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_plist_env_") as temporary:
+            root = Path(temporary)
+            previous, destination = root / "previous.plist", root / "new.plist"
+            operator = {
+                "YUZU_UPDATE_TRUST_BUNDLE": "/etc/yuzu-agent/certs/update.pem",
+                "YUZU_UPDATE_REQUIRE_SIGNATURE": "1",
+                "YUZU_AGENT_INVENTORY_DISABLE": "1",
+                "YUZU_AGENT_LICENSE_SCAN_USER_REF": "omit",
+                "HTTPS_PROXY": "http://proxy.example:3128",
+            }
+            previous.write_bytes(plistlib.dumps({
+                "ProgramArguments": ["/usr/local/bin/yuzu-agent", "--server", "s:50051"],
+                "EnvironmentVariables": {**operator, "DYLD_INSERT_LIBRARIES": "/tmp/inject.dylib",
+                                         "YUZU_DATA_DIR": "/tmp/elsewhere"}}))
+            self._write_plist(destination)
+            result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", str(MERGE_PLIST_HELPER),
+                                     "--previous", str(previous), "--destination", str(destination)],
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            merged = plistlib.loads(destination.read_bytes())
+            self.assertEqual(merged["EnvironmentVariables"], operator)
+            self.assertIn("not retaining DYLD_INSERT_LIBRARIES", result.stderr)
+            self.assertIn("not retaining YUZU_DATA_DIR", result.stderr)
+            self.assertEqual(merged["ProgramArguments"][-2:], ["--server", "s:50051"])
+
+    # ── Governance ch-3: one transition at a time; uninstall clears recovery ───
+    def test_installer_scripts_take_the_transition_lock_first(self) -> None:
+        guard = ('if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then\n'
+                 '    exec /usr/bin/lockf -k -t 600 /var/db/.yuzu-agent-transition.lock \\\n'
+                 '        /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"\nfi\n')
+        for name in ("preinstall", "postinstall", "uninstall.sh"):
+            source = (BUILD_PKG.parent / name).read_text()
+            self.assertIn(guard, source, name)
+            first_work = min(source.index(marker) for marker in ("PLIST=", "DATA_DIR=") if marker in source)
+            self.assertLess(source.index(guard), first_work, name)
+        uninstall = (BUILD_PKG.parent / "uninstall.sh").read_text()
+        self.assertIn("ensure_state_dir\nclear_recovery_state\nlaunchctl bootout", uninstall)
+
+    @posix_shell
+    def test_uninstall_clears_recovery_state_pointer_first_and_keeps_the_quarantine(self) -> None:
+        sync = ('sync() { local p=absent s=absent; [[ -e "$RECOVERY_FILE" ]] && p=present; '
+                'compgen -G "$STATE_DIR/install-recovery.*" >/dev/null && s=present; '
+                'echo "pointer=$p snapshot=$s" >> "$STATE_DIR/../sync.log"; }\n')
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_uninstall_state_") as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            for name in ("install-recovery.A/LaunchDaemons", "install-recovery.B", "uninstall-legacy.C",
+                         "quarantine/legacy-YuzuAgent.Q/YuzuAgent.app"):
+                (state / name).mkdir(parents=True)
+            (state / "current-recovery").write_text(f"{state}/install-recovery.A\n")
+            (state / "current-recovery.new").write_text("torn")
+            result = self._installer_harness(root, "uninstall.sh", ("clear_recovery_state",),
+                                             "clear_recovery_state\necho DONE\n", stubs=sync)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("DONE", result.stdout)
+            self.assertEqual((root / "sync.log").read_text().splitlines(), ["pointer=absent snapshot=present"])
+            self.assertEqual(sorted(path.name for path in state.iterdir()), ["quarantine"])
+            self.assertTrue((state / "quarantine/legacy-YuzuAgent.Q/YuzuAgent.app").is_dir())
 
 if __name__ == "__main__":
     unittest.main()
