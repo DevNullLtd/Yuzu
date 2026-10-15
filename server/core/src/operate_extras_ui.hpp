@@ -36,10 +36,6 @@
 .ox-note.bad{border-color:color-mix(in srgb,var(--bad) 50%,var(--line2));background:var(--mds-color-bg-error-tinted)}
 .ox-note.warn{border-color:color-mix(in srgb,var(--warn) 50%,var(--line2))}
 .ox-ids{margin:0;padding:0;list-style:none;display:grid;gap:2px;font-family:var(--mds-font-family-mono);font-size:12px;color:var(--ink2)}
-.ox-kinds{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:8px;font-size:12.5px}
-.ox-kinds code{font-family:var(--mds-font-family-mono);color:var(--ink)}
-.ox-kinds span{display:block;color:var(--mut)}
-details.ox-det>summary{cursor:pointer;padding:10px 16px;font-size:13px;font-weight:600;color:var(--ink);border-top:1px solid var(--line)}
 .ox-facts{margin:0;border:1px solid var(--line);border-radius:var(--rad-panel);background:var(--surface)}
 .ox-facts>div{display:flex;justify-content:space-between;gap:16px;padding:8px 12px;border-bottom:1px solid var(--line)}
 .ox-facts>div:last-child{border-bottom:0}

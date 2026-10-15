@@ -737,8 +737,9 @@ template <typename Req>
 /// handler (H1, 2026-07-08 SCIM review) — extracted from `server.cpp`'s
 /// `set_pre_routing_handler` lambda so the login/SSO/health/PKI/SCIM
 /// exemption list has direct unit coverage instead of only being exercised
-/// by booting a real server. Every existing exempt path is unchanged; the
-/// only addition is the `/scim/v2/` prefix (see below).
+/// by booting a real server. Additions since: the `/scim/v2/` prefix (see
+/// below) and `/home`, the landing and sign-in page a signed-out request is
+/// redirected to.
 ///
 /// Caller contract: this MUST be consulted AFTER the rate limiter and
 /// (once it lands) any on-behalf-of/ADR-1005 rejection in the pre-routing
@@ -746,7 +747,11 @@ template <typename Req>
 /// must stay in effect for every path this allows through unauthenticated.
 /// Returns true iff `path` should skip session/bearer resolution entirely.
 inline bool is_login_exempt_path(std::string_view path) {
-    return path == "/login" || path == "/login/mfa" || path == "/login/mfa/enroll" ||
+    // `/home` is the landing and sign-in page: it must render for a visitor with
+    // no session (it IS where the chokepoint below sends them), and it shows the
+    // signed-in panel itself when a session exists.
+    return path == "/home" || path == "/login" || path == "/login/mfa" ||
+           path == "/login/mfa/enroll" ||
            path == "/health" || path == "/api/health" || path == "/auth/oidc/start" ||
            path == "/auth/callback" ||
            // #2057: /api/v1/openapi.json used to be listed here as
