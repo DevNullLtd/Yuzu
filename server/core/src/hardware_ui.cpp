@@ -162,7 +162,6 @@ std::string hw_style() {
   .hw-pill.ok{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
   .hw-pill.warn{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
   .hw-pill.bad{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
-  .hw-os{padding:0 5px;border:1px solid var(--line2);border-radius:3px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:11.5px}
   .hw-tag{display:inline-flex;align-items:center;margin-right:4px;padding:1px 8px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500}
   a.hw-tag.link{cursor:pointer}
   a.hw-tag.link:hover{color:var(--ink)}
@@ -260,7 +259,7 @@ std::string dex_badge(int score) {
     if (score < 0)
         return "<span class=\"hw-grey\">&mdash;</span>";
     const char* tone = score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad");
-    return "<span class=\"hw-pill " + std::string(tone) + "\">" + std::to_string(score) + "</span>";
+    return "<span class=\"pill " + std::string(tone) + "\">" + std::to_string(score) + "</span>";
 }
 
 // A clickable tag chip that narrows the list to this exact key[=value] — targets the
@@ -334,8 +333,8 @@ std::string pagination(const HardwareListQuery& q, std::size_t total_matching) {
 std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q, bool quarantined) {
     const std::string name = d.hostname.empty() ? d.agent_id : d.hostname;
     const std::string status_pill = d.online
-        ? "<span class=\"hw-pill ok\">online</span>"
-        : (d.stale ? "<span class=\"hw-pill warn\">stale</span>" : "<span class=\"hw-pill\">offline</span>");
+        ? "<span class=\"pill ok\">online</span>"
+        : (d.stale ? "<span class=\"pill warn\">stale</span>" : "<span class=\"pill idle\">offline</span>");
     // Quarantined pill + the row's route into the Containment lens. The link is a plain
     // anchor (the create dialog needs OS/online/whitelist context, and 50 live buttons
     // would need 50 scoped probes); yuzu-estate.js stops the row's own click handler from
@@ -377,7 +376,7 @@ std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q, bo
            "<td><a class=\"hw-name\" href=\"/hardware/ci?id=" + url_encode(d.agent_id) + "\">" +
            esc(name) + "</a></td>"
            "<td class=\"hw-mono\">" + ip_cell + "</td>"
-           "<td><span class=\"hw-os\">" + os_label(d.os) + "</span></td>"
+           "<td><span class=\"os-tag\">" + os_label(d.os) + "</span></td>"
            "<td>" + status_pill + " " + quarantine_cell + "</td>"
            "<td>" + dex_badge(d.dex_score) + "</td>"
            "<td class=\"hw-mono\">" + version_cell + "</td>"
@@ -731,10 +730,10 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
     h += "<div class=\"hw-wrap\">";
     h += "<div class=\"hw-hdr\"><a class=\"gp-btn\" href=\"/hardware\">&larr; Hardware</a></div>";
     h += "<div class=\"hw-hdr\">";
-    h += std::string("<span class=\"hw-pill") + (online ? " ok\">online" : "\">offline") + "</span>";
+    h += std::string("<span class=\"pill") + (online ? " ok\">online" : " idle\">offline") + "</span>";
     h += "<h1 class=\"hw-h1\" style=\"margin:0\">" + esc(hostname) + "</h1>";
     if (!os.empty())
-        h += "<span class=\"hw-os\">" + os_label(os) + "</span>";
+        h += "<span class=\"os-tag\">" + os_label(os) + "</span>";
     h += "<span class=\"hw-mono\">" + esc(agent_id) + "</span>";
     h += "<span class=\"hw-lab\">last seen " + esc(last_seen.empty() ? "?" : last_seen) + "</span>";
     h += "<span style=\"flex:1\"></span>";

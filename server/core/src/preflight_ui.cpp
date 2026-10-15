@@ -5,9 +5,10 @@
 /// `new Function` it compiles). The script re-runs on every self-poll swap and
 /// re-applies the operator's filter from a `window.__pf` global, so the bucket /
 /// failure-type selection survives the outerHTML repoll. Every agent-supplied
-/// string is HTML-escaped at render. The `.af-*` CSS is inlined ONCE in
+/// string is HTML-escaped at render. The `.af-*` CSS (kAutoCss) is inlined ONCE in
 /// render_auto_config (the config fragment loads with the page; the result fragment
-/// only swaps a child). See preflight_routes.hpp.
+/// only swaps a child) and also serves the deploy and verify fragments, which render
+/// only inside /auto. See preflight_routes.hpp.
 
 #include "preflight_routes.hpp"
 
@@ -57,7 +58,6 @@ const char* kAutoCss = R"CSS(<style>
 .af-btn{display:inline-flex;align-items:center;height:var(--ctl);padding:0 14px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--raise);color:var(--ink);font:inherit;font-weight:500;white-space:nowrap;cursor:pointer}
 .af-btn:hover{border-color:var(--mut);background:var(--surface2)}
 .af-btn.pri{border-color:var(--primary);background:var(--primary);color:var(--on-primary);font-weight:600}.af-btn.pri:hover{border-color:var(--primary-h);background:var(--primary-h)}
-.af-btn.sm{height:28px;padding:0 10px;font-size:13px}
 .af-rail{display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;padding:12px 16px;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
 .af-rail-lbl{margin-right:6px;font-size:13px;font-weight:600;color:var(--ink)}
 .af-rail-keep{font-weight:400;color:var(--mut)}
