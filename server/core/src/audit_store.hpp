@@ -1,5 +1,7 @@
 #pragma once
 
+#include "utf8_sanitize.hpp"
+
 /// @file audit_store.hpp
 /// SOC 2 evidence chain — operator actions, agent enrolment, fleet-topology
 /// events, background schedule execution, and every behavioural-PII access.
@@ -134,6 +136,23 @@ struct AuditQuery {
 // auditor (#4 / SOC 2 CC7.2 evidence honesty).
 inline constexpr std::size_t kAuditSampleScanCap = 10000;
 
+/// Largest `offset` any audit read surface accepts (REST v1, legacy REST, MCP).
+/// An offset above it is a 400, never a silent clamp: a client must not receive a
+/// different page than it asked for. Auditors narrow with `since`/`until`.
+inline constexpr int kAuditMaxOffset = 10000;
+
+/// True when every string filter of `q` is safe to bind: no NUL (it would truncate the bound
+/// value at the C-string boundary and widen the filter) and valid UTF-8 (Postgres rejects the
+/// bind, which would surface as a false 503 plus a false read-degrade count). One copy for the
+/// legacy and v1 REST routes; MCP gets valid UTF-8 from its JSON parser.
+inline bool audit_string_filters_wellformed(const AuditQuery& q) {
+    for (const std::string* v : {&q.principal, &q.action, &q.target_type, &q.target_id}) {
+        if (v->find('\0') != std::string::npos || sanitize_utf8_strict(*v) != *v)
+            return false;
+    }
+    return true;
+}
+
 // ── Retention clock guard (#2360) ──────────────────────────────────────────
 //
 // Retention deletes rows whose TTL has passed, with "has passed" decided by the
@@ -259,6 +278,11 @@ public:
     AuditStore& operator=(AuditStore&&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
+    /// The retention window this store was constructed with and actually
+    /// enforces (days; <= 0 means "never expire"). Read-only: the value is
+    /// copied at construction and never re-read, so this is the ENFORCED
+    /// figure, which can differ from Config / a stored runtime override.
+    [[nodiscard]] int retention_days() const noexcept { return retention_days_; }
 
     /// Wire a metrics registry for `yuzu_server_audit_read_degrade_total{reason}`
     /// (degrade-distinguishable reads). Set ONCE during single-threaded startup,

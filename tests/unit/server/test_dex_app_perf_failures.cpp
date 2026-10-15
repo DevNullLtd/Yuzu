@@ -172,14 +172,15 @@ TEST_CASE("version join: figures are published at any device count", "[dex][app_
         CHECK(rep.stat_failures == 0);
     }
     SECTION("a one-device version against a nine-device version publishes a ratio") {
-        // 2.0.0.0: 2 exposed events over 1 device; 1.0.0.0: 6 over 9. Both arms sit
-        // under the default exposure guard of 10, so only the lowered minimum admits it.
+        // 2.0.0.0: 2 exposed events over 1 device; 1.0.0.0: 6 over 9. The join
+        // states its minimum exposure of 1 explicitly; the default guard is 1 too
+        // since the cohort floor became one device.
         const auto rep = app_perf_version_failure_join(
             two_version_points(),
             {fail_row("1.0.0.0", 9, 5, 1, 6, 5, 1), fail_row("2.0.0.0", 1, 2, 0, 1, 2, 0)}, 30);
         const auto& v2 = rep.versions.at(0);
         REQUIRE(v2.failure_rate_ratio);
-        CHECK_FALSE(dex_rate_ratio(2, 1.0, 6, 9.0)); // the default guard would refuse
+        CHECK(dex_rate_ratio(2, 1.0, 6, 9.0)); // the default guard admits one device-unit
         const auto oracle = dex_rate_ratio(2, 1.0, 6, 9.0, 1.0);
         REQUIRE(oracle);
         CHECK(v2.failure_rate_ratio->estimate == oracle->estimate);

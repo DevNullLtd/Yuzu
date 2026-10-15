@@ -23,6 +23,7 @@
  * then `warn_if_legacy_rows()` at boot instead.
  */
 
+#include "integrations_sync_routes.hpp"
 #include "webhook_store.hpp"
 
 #include "pg/pg_exec.hpp"
@@ -386,3 +387,51 @@ TEST_CASE("WebhookStore[pg]: a non-NULL secret with has_secret=false is also a C
     CHECK(res.status() == PGRES_FATAL_ERROR); // CHECK constraint violation
 }
 
+
+TEST_CASE("WebhookStore[pg]: get separates not-found from a failed read and deliveries report the failure",
+          "[webhook_store][pg]") {
+    WebhookStorePg store;
+    auto id = store->create_webhook("https://example.com/hook", "*", "");
+    REQUIRE(id.has_value());
+
+    bool ok = false;
+    REQUIRE(store->get(*id, &ok).has_value());
+    CHECK(ok);
+    ok = false;
+    CHECK_FALSE(store->get(*id + 1000, &ok).has_value());
+    CHECK(ok); // no such id is a business answer, not a degraded read
+    auto empty = store->get_deliveries_checked(*id, 5);
+    REQUIRE(empty.has_value());
+    CHECK(empty->empty());
+
+    // The production adapter maps the same facts onto the fragment's read states.
+    auto deps = integrations::bind_stores(store.get(), nullptr, nullptr, nullptr);
+    auto found = deps.webhook_get(*id);
+    REQUIRE(found.has_value());
+    CHECK(found->has_value());
+    auto missing = deps.webhook_get(*id + 1000);
+    REQUIRE(missing.has_value());
+    CHECK_FALSE(missing->has_value());
+
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), "DROP TABLE webhook_store.webhook_deliveries",
+                                std::vector<std::string>{}).ok());
+    }
+    CHECK_FALSE(store->get_deliveries_checked(*id, 5).has_value());
+    CHECK(store->get_deliveries(*id, 5).empty()); // the legacy read still degrades to empty
+
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), "DROP TABLE webhook_store.webhooks CASCADE",
+                                std::vector<std::string>{}).ok());
+    }
+    ok = true;
+    CHECK_FALSE(store->get(*id, &ok).has_value());
+    CHECK_FALSE(ok); // a failed query is "could not be read", never "not found"
+    auto failed = deps.webhook_get(*id);
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(failed.error() == integrations::ReadError::failed);
+}

@@ -153,7 +153,10 @@ TEST_CASE("stability: rare widespread-mild and half-fleet cases", "[dex][stabili
 
 TEST_CASE("stability: withheld ladder", "[dex][stability]") {
     require_withheld(compute_stability_score(mk(0, -4, 99), kFloor), "no_population");
-    require_withheld(compute_stability_score(mk(9, 1, 1), kFloor), "below_floor");
+    // The module enforces whatever floor it is handed (a literal 10 here); with
+    // kDexCohortFloor at one device a one-device population is scored.
+    require_withheld(compute_stability_score(mk(9, 1, 1), 10), "below_floor");
+    CHECK(compute_stability_score(mk(1, 1, 1), kFloor).score.has_value());
     CHECK(compute_stability_score(mk(10, 1, 1), kFloor).score.has_value());
     require_withheld(compute_stability_score(mk(1000, 1001, 1001), kFloor), "inconsistent");
     require_withheld(compute_stability_score(mk(1000, 0, -1), kFloor), "inconsistent");
@@ -502,10 +505,16 @@ TEST_CASE("stability: rank flip under perturbed weights", "[dex][stability]") {
     REQUIRE(s5.has_value());
     CHECK(s5->first == 0);
     CHECK(s5->second == 1);
+    // At kDexCohortFloor (one device) the 5-device app is comparable too, so the
+    // flip is the same pair as at floor 5 (it was (1, 2) at the old floor of 10).
     auto sf = stability_rank_flip({small, x, y}, kFloor, pert);
     REQUIRE(sf.has_value());
-    CHECK(sf->first == 1);
-    CHECK(sf->second == 2);
+    CHECK(sf->first == 0);
+    CHECK(sf->second == 1);
+    auto s10 = stability_rank_flip({small, x, y}, 10, pert); // a handed-in floor still applies
+    REQUIRE(s10.has_value());
+    CHECK(s10->first == 1);
+    CHECK(s10->second == 2);
 
     CHECK_FALSE(stability_rank_flip({x, y}, kFloor, {kNaN, 70, 8, 12}).has_value());
 

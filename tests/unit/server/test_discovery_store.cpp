@@ -29,6 +29,7 @@
  * documented on that macro.
  */
 
+#include "discovered_devices_reader.hpp"
 #include "discovery_store.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -294,4 +295,144 @@ TEST_CASE("DiscoveryStore: clear_results", "[pg][discovery][crud]") {
         CHECK(find(*rows, "10.0.7.1") == nullptr);
         CHECK(find(*rows, "10.0.7.2") == nullptr);
     }
+}
+
+// ── bounded read + summary (the discovered-devices read twin) ───────────────
+
+TEST_CASE("DiscoveryStore: list_devices_checked bounds, filters and orders",
+          "[pg][discovery][twin]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DiscoveryStore store{pool};
+    REQUIRE(store.is_open());
+
+    for (int i = 1; i <= 5; ++i)
+        REQUIRE(store.upsert_device(make_device("10.0.0." + std::to_string(i))));
+    REQUIRE(store.upsert_device(make_device("10.0.1.1", "10.0.1.0/24")));
+    REQUIRE(store.upsert_device(make_device("10.0.2.1", ""))); // no subnet recorded
+
+    SECTION("limit caps the rows; a non-positive limit still reads one") {
+        auto three = store.list_devices_checked("", 3);
+        REQUIRE(three.has_value());
+        CHECK(three->size() == 3);
+        auto floor = store.list_devices_checked("", 0);
+        REQUIRE(floor.has_value());
+        CHECK(floor->size() == 1);
+    }
+    SECTION("subnet filter is exact") {
+        auto rows = store.list_devices_checked("10.0.1.0/24", 50);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK((*rows)[0].ip_address == "10.0.1.1");
+        auto none = store.list_devices_checked("10.9.9.0/24", 50);
+        REQUIRE(none.has_value());
+        CHECK(none->empty()); // a genuine empty value, not a failure
+    }
+    SECTION("summarize counts rows and distinct non-empty subnets, filtered or not") {
+        auto all = store.summarize();
+        REQUIRE(all.has_value());
+        CHECK(all->total == 7);
+        CHECK(all->subnets == 2);
+        auto one = store.summarize("10.0.0.0/24");
+        REQUIRE(one.has_value());
+        CHECK(one->total == 5);
+        CHECK(one->subnets == 1);
+    }
+    SECTION("the reader flags truncation only when more rows matched") {
+        auto read = yuzu::server::make_discovered_devices_reader(&store);
+        auto cut = read("10.0.0.0/24", 3);
+        REQUIRE(cut.has_value());
+        CHECK(cut->devices.size() == 3);
+        CHECK(cut->truncated);
+        CHECK(cut->summary.total == 5); // counts are over the filter, not the page
+        auto exact = read("10.0.0.0/24", 5);
+        REQUIRE(exact.has_value());
+        CHECK(exact->devices.size() == 5);
+        CHECK_FALSE(exact->truncated);
+    }
+}
+
+// ── read-twin fault + ordering probes ───────────────────────────────────────
+
+namespace {
+void exec_sql(const std::string& dsn, const char* sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql)};
+    REQUIRE(r.ok());
+}
+} // namespace
+
+TEST_CASE("DiscoveryStore: a closed store reads as an error, never an empty list",
+          "[pg][discovery][twin]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    exec_sql(db.dsn(), "CREATE SCHEMA discovery_store");
+    exec_sql(db.dsn(), "CREATE TABLE discovery_store.discovered_devices (bogus int)");
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    DiscoveryStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+
+    CHECK_FALSE(store.list_devices_checked("", 10).has_value());
+    CHECK_FALSE(store.summarize().has_value());
+    auto read = yuzu::server::make_discovered_devices_reader(&store);
+    CHECK_FALSE(read("", 10).has_value());
+}
+
+TEST_CASE("DiscoveryStore: a failing query reads as an error, never an empty list",
+          "[pg][discovery][twin]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    DiscoveryStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.upsert_device(make_device("10.0.0.1")));
+
+    exec_sql(db.dsn(), "DROP TABLE discovery_store.discovered_devices");
+
+    CHECK_FALSE(store.list_devices_checked("", 10).has_value());
+    CHECK_FALSE(store.summarize().has_value());
+    auto read = yuzu::server::make_discovered_devices_reader(&store);
+    CHECK_FALSE(read("", 10).has_value());
+}
+
+TEST_CASE("DiscoveryStore: list_devices_checked orders newest last_seen first, id breaks ties",
+          "[pg][discovery][twin]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    DiscoveryStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* ip : {"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"})
+        REQUIRE(store.upsert_device(make_device(ip)));
+    exec_sql(db.dsn(),
+             "UPDATE discovery_store.discovered_devices SET last_seen = CASE ip_address "
+             "WHEN '10.0.0.1' THEN 300 WHEN '10.0.0.2' THEN 100 WHEN '10.0.0.3' THEN 300 "
+             "ELSE 200 END");
+
+    auto rows = store.list_devices_checked("", 10);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 4);
+    // 300 (id desc: .3 inserted after .1), then 200, then 100.
+    CHECK((*rows)[0].ip_address == "10.0.0.3");
+    CHECK((*rows)[1].ip_address == "10.0.0.1");
+    CHECK((*rows)[2].ip_address == "10.0.0.4");
+    CHECK((*rows)[3].ip_address == "10.0.0.2");
+}
+
+TEST_CASE("DiscoveryStore: the reader caps a 501-row inventory at 500 and flags truncation",
+          "[pg][discovery][twin]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    DiscoveryStore store{pool};
+    REQUIRE(store.is_open());
+    exec_sql(db.dsn(),
+             "INSERT INTO discovery_store.discovered_devices (ip_address, subnet, discovered_at, "
+             "last_seen) SELECT '10.1.' || (g / 256) || '.' || (g % 256), '10.1.0.0/16', 1, g "
+             "FROM generate_series(1, 501) g");
+
+    auto read = yuzu::server::make_discovered_devices_reader(&store);
+    auto page = read("", yuzu::server::kDiscoveredDevicesMaxLimit);
+    REQUIRE(page.has_value());
+    CHECK(page->devices.size() == 500);
+    CHECK(page->truncated);
+    CHECK(page->summary.total == 501);
+    CHECK(page->devices.front().last_seen == 501); // newest first
 }

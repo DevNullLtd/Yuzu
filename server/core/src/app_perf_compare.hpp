@@ -33,7 +33,9 @@
 /// The engine reports the measured shift + the per-machine spread; the operator
 /// (or the AI colleague over MCP) judges. Small cohorts are NOT suppressed (real
 /// canaries are 2–3 devices — a floor would gut the feature); a sub-`kDexCohortFloor`
-/// paired set is flagged `small_cohort` so the surface can mark it "indicative".
+/// paired set is flagged `small_cohort` so the surface can mark it "indicative" —
+/// with the floor at one device (ruling 2026-10-14) the flag stays on the wire
+/// but is never true (a paired set is never both non-empty and below one).
 ///
 /// ── The candidate-source seam ──
 /// `reduce_version_window` turns B1 rows into per-machine scalars; `compare` pairs
@@ -151,7 +153,8 @@ struct PairedComparison {
     std::int64_t moved_down{0};
 
     /// `paired` is non-zero but below `kDexCohortFloor` — NOT suppressed (canaries
-    /// are small by design); the surface marks the aggregate "indicative".
+    /// are small by design); the surface marks the aggregate "indicative". Always
+    /// false while the floor is one device; kept on the wire (additive contract).
     bool small_cohort{false};
     /// `paired == 0` — no machine ran both versions in-window; nothing to compare.
     bool insufficient{false};

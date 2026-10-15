@@ -38,6 +38,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -71,6 +72,31 @@ struct DexAppCrashCount {          // top unreliable apps + blast radius
     int64_t crashes{0};
     int64_t hangs{0};
     int64_t distinct_devices{0};   // blast radius = distinct devices, not event count
+    std::string last_seen;
+};
+/// One grouped row of the application-stability read: an application TOTAL
+/// (`version` == nullopt) or one of its versions (`version` == "" is the
+/// unknown-version bucket, the same convention as AppPerfVersionFailureRow).
+/// `crashes`, `hangs` and `affected_devices` are window-wide. The `*_online`
+/// figures cover only the devices in the caller's online set (the share, rate
+/// and score numerators, so they are members of the population they are
+/// divided by); `capped_*` are sums over those online devices of
+/// min(events_d, per-device cap), the stability score's caller duty.
+/// `version_count` and `apps_total` (every application with a signal in the
+/// window, before the top-N cut) are set on total rows only.
+struct DexAppStabilityRow {
+    std::string subject;
+    std::optional<std::string> version;
+    int64_t crashes{0};
+    int64_t hangs{0};
+    int64_t affected_devices{0};
+    int64_t affected_online{0};
+    int64_t crashes_online{0};
+    int64_t hangs_online{0};
+    int64_t capped_crashes{0};
+    int64_t capped_hangs{0};
+    int64_t version_count{0};
+    int64_t apps_total{0};
     std::string last_seen;
 };
 struct DexModuleCrashCount {       // top faulting modules (crash-scoped)
@@ -151,6 +177,8 @@ struct DexDeviceBoot {             // slowest-booting devices
 /// lenses. `total_online` is context. A struct (not a registry dep) keeps
 /// render pure + testable.
 struct DexFleet {
+    /// Equals the count of `connected_agents` whose os is "windows": the Apps list
+    /// (DexApi::apps) takes its population and its numerator ids from that list.
     int64_t windows_online{0};
     int64_t total_online{0};
     /// Distinct OS tokens (lowercased: "windows"/"linux"/"darwin") of the agents
