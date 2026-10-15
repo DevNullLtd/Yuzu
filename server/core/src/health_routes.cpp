@@ -897,7 +897,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         {
             httplib::Response scratch;
             if (deps.deny_service_scoped_fn(req, scratch, "dashboard.fragment.access_denied",
-                                            "service-scoped tokens may not read the Console health panel",
+                                            "service-scoped tokens may not read the Dashboard health panel",
                                             "", "")) {
                 serve(Fact<HealthPanel>::with(FactState::Denied, "an interactive session"));
                 return;

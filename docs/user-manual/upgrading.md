@@ -28,6 +28,27 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: web UI wording and layout (Console, Home after sign-in, hidden quarantine controls)
+
+- **"Dashboard" is now "Console".** The navigation item, the Home tile, the page title,
+  the "back to" links and the related Settings labels use the new name. Routes
+  (`/`, `/fragments/dashboard/...`), API paths, MCP tool names and permission names are
+  unchanged, so bookmarks and scripts keep working. Prose elsewhere in this manual still
+  says "dashboard" for the web UI as a whole.
+- **Home lists the screens only after sign-in.** Signed out, `/home` shows the sign-in
+  form and nothing else; the fifteen screen tiles appear once you are signed in. Health
+  probes that fetch `/home` still receive `200`.
+- **The Hardware pages no longer show quarantine controls.** The Quarantine link, the
+  Quarantined pill, the Quarantined devices panel, the containment banner and tab, and the
+  quarantine plugin's rows in the Actions lens are hidden until the approval workflow
+  lands. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
+  plugin and the role-gated quarantine instructions on the Instructions page all work as
+  before, and server-side enforcement does not depend on the UI. While the controls are
+  hidden, an operator who needs to see or release a quarantined device uses
+  `GET`/`DELETE /api/v1/quarantine` (or the MCP tools). No configuration change is needed.
+- **Colour schemes.** Settings > General > Appearance now offers six schemes (Slate stays
+  the default). The choice is stored in the browser, not on the server.
+
 ## Behaviour change: the Settings link follows the server's own admin decision (#5779, #4208)
 
 `GET /api/me` and `GET /api/v1/me` now report `effective_role`, `elevated`,

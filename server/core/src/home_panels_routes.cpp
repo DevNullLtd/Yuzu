@@ -46,7 +46,7 @@ void register_dashboard_panel_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/fragments/dashboard/policies", [deps](const httplib::Request& req, httplib::Response& res) {
         const auto now = deps.now_fn();
         if (service_scoped_refused(deps, req,
-                                   "service-scoped tokens may not read the Console policies panel")) {
+                                   "service-scoped tokens may not read the Dashboard policies panel")) {
             serve(res, render_policies_panel(Fact<PolicyPanel>::with(FactState::Denied, "Policy:Read"),
                                              now));
             return;
@@ -77,7 +77,7 @@ void register_dashboard_panel_routes(HttpRouteSink& sink, Deps deps) {
             serve(res, render_activity_panel(f, now, deps.audit_href));
         };
         if (service_scoped_refused(deps, req,
-                                   "service-scoped tokens may not read the Console events panel")) {
+                                   "service-scoped tokens may not read the Dashboard events panel")) {
             out(Fact<Rows>::with(FactState::Denied, "AuditLog:Read"));
             return;
         }

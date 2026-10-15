@@ -56,8 +56,9 @@
  * Direction: utilitarian ops console. Blue is the action colour (buttons,
  * links, switches). Yellow (--hl) is the highlight: brand mark, active nav,
  * active tab, selected row - nothing else. Green / orange / red / sky are
- * status colours only. No gradients, glow, blur or decorative shadow
- * (--shadow appears on pop-overs and menus alone); state changes take 120ms.
+ * status colours only. No glow or blur. Depth is limited to --shadow on
+ * pop-overs and menus, the chart-card elevation (--mds-elevation-2) and the
+ * sparkline gradient fill; state changes take 120ms.
  */
 :root {
   color-scheme: dark;

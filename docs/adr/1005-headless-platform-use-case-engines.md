@@ -494,7 +494,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
    - **2026-09-16 — Hardware CI list/record (`GET /api/v1/hardware`,
      `GET /api/v1/hardware/{id}`, `POST /api/v1/hardware/{id}/sync`, PR
-     `feat/hardware-ci-view`).** REST-only, no MCP twin, and absent from
+     `feat/hardware-ci-view`; extended 2026-10-15 with the fleet/group/scope
+     fan-out `POST /api/v1/hardware/sync`).** REST-only, no MCP twin, and absent from
      route discovery only in the sense that no `get_hardware_ci`/
      `list_hardware`/equivalent MCP tool exists yet — the REST routes
      themselves ARE in `openapi_spec()` and `GET /api/v1/routes` (A2/A3
@@ -512,8 +513,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        NOT part of this gap — they reuse the pre-existing generic
        live-info/bundle dispatch mechanism, which already has its own MCP
        reachability via `execute_instruction`, unaffected by this row.
-     - Scoping and building the list/detail/sync-dispatch MCP twin is out
-       of scope for this PR; tracked as **#4456**. Until it lands, this row
+     - Scoping and building the list/detail/sync-dispatch MCP twin (including the
+       fleet/group/scope fan-out route `POST /api/v1/hardware/sync`, which is
+       REST-only on the same terms) is out of scope for this PR; tracked as
+       **#4456**. Until it lands, this row
        stands as the open exception.
      - Full design record: the round-3 hardware-ci-view plan
        (`docs/user-manual/inventory.md`'s Dashboard section describes the
