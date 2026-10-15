@@ -977,8 +977,11 @@ function swSync() {
       count = null;
       if (v.kind !== 'scope' || e.indexOf('group:') === 0) return Promise.resolve(null);
       return D.request('POST', '/api/v1/scope/preview', { json: { expression: e } }).then(function (r) {
-        if (!r.ok) return r.message || ('Scope preview failed (' + r.status + ')');
-        count = r.data && r.data.data ? r.data.data.matched_count : null;
+        /* The preview needs Infrastructure:Read, which Execution:Execute does not imply. Any refusal
+           just means no count: the confirm step words the scope without one and the sync route
+           enforces everything itself. */
+        count = r.ok && r.data && r.data.data && typeof r.data.data.matched_count === 'number'
+                  ? r.data.data.matched_count : null;
         return count === 0 ? 'That scope matches no devices you can sync.' : null;
       });
     }
