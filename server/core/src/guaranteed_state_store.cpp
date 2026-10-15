@@ -55,9 +55,9 @@ constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
 // The Applications stability read holds one lease for its whole multi-second
 // 30-day aggregation, so it gets its own in-flight budget (the default pool is
-// 16 and the per-principal cap is also 16): a request over the budget is
-// refused at once with this reason and the caller's retryable 503, instead of
-// queueing behind the pool.
+// 16 and no per-principal limit bounds synchronous reads): a request over the
+// budget is refused at once with this reason and the caller's retryable 503,
+// instead of queueing behind the pool.
 constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // JC-8 (coordinator review): label parity with InventoryStore's
 // yuzu_inventory_read_degrade_total{reason, source} family — a constant
@@ -1256,18 +1256,26 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                                                 std::int64_t per_device_cap,
                                                 const std::vector<std::string>& online_agent_ids) const {
     static DegradeSampler sampler;
+    static DegradeSampler budget_sampler; // a refusal storm must not hide a real fault's log line
     struct Slot {
         std::atomic<int>& n;
         ~Slot() { n.fetch_sub(1, std::memory_order_relaxed); }
     };
     const Slot slot{apps_reads_in_flight_};
+    // A refused caller holds its increment until it returns, so a burst can refuse
+    // one read too many for an instant; the refusal is retryable and the budget
+    // is never exceeded.
     if (apps_reads_in_flight_.fetch_add(1, std::memory_order_relaxed) >= apps_read_budget_.load()) {
-        if (const auto d = note_read_degrade(metrics_, kReasonConcurrencyBudget, kDegradeSource, sampler);
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonConcurrencyBudget, kDegradeSource, budget_sampler);
             d.should_log)
             spdlog::warn("GuaranteedStateStore::dex_app_stability: concurrency budget ({}) reached",
                          apps_read_budget_.load());
         return std::nullopt;
     }
+    // Ceiling: every online id travels as one text[] parameter per request;
+    // measured flat to 30,000 ids (2.6 s vs 2.7 s). Beyond a few hundred thousand
+    // devices replace it with a join against shared presence in the database.
     std::vector<std::string_view> online_views;
     online_views.reserve(online_agent_ids.size());
     for (const auto& a : online_agent_ids)

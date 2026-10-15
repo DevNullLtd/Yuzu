@@ -337,8 +337,9 @@ TEST_CASE("apps model: devices that crashed and went offline are in the counts a
     CHECK(f.share_affected->estimate == Approx(0.0));
     REQUIRE(f.rate_per_1000);
     CHECK(f.rate_per_1000->estimate == Approx(0.0));
-    REQUIRE(f.score.score);
-    CHECK(*f.score.score == Approx(100.0));
+    // A healthy-looking 100 for an app that took its devices offline is the wrong answer.
+    CHECK_FALSE(f.score.score);
+    CHECK(std::string(f.score.withheld) == "offline_affected");
 }
 
 TEST_CASE("apps model: share and rate and score use the online figures only", "[dex][apps_model]") {
@@ -355,7 +356,28 @@ TEST_CASE("apps model: share and rate and score use the online figures only", "[
     CHECK(f.share_affected->estimate == Approx(2.0 / 50.0));
     REQUIRE(f.rate_per_1000);
     CHECK(f.rate_per_1000->estimate == Approx(80.0)); // 4 events / (50 / 1000)
+    // 5 of the 7 affected devices are offline: the score would be built from the other
+    // 2 only, so it is withheld.
+    CHECK_FALSE(f.score.score);
+    CHECK(std::string(f.score.withheld) == "offline_affected");
+}
+
+TEST_CASE("apps model: the score is published when every affected device is online",
+          "[dex][apps_model]") {
+    // The affected devices are all in the online set, so the online figures are the whole picture.
+    auto r = total_row("a.exe", 4, 1, 2, 3, 1);
+    r.affected_online = 2;
+    r.crashes_online = 4;
+    r.hangs_online = 1;
+    const auto m = dex_apps_model_from_rows("7d", {r}, 50, def());
+    const auto& f = m.apps[0].figures;
     // 100 - (60*2/50 + 20*3/(50*5) + 8*1/(50*5)) = 100 - (2.4 + 0.24 + 0.032)
     REQUIRE(f.score.score);
     CHECK(*f.score.score == Approx(97.328));
+    CHECK(f.score.withheld[0] == '\0');
+    // An unknown population keeps its own reason, not offline_affected.
+    auto o = r;
+    o.affected_online = 1;
+    const auto u = dex_apps_model_from_rows("7d", {o}, std::nullopt, def());
+    CHECK(std::string(u.apps[0].figures.score.withheld) == "no_population");
 }

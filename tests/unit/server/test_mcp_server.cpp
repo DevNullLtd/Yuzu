@@ -8399,6 +8399,8 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
                         "distinct_devices_online") !=
               out["properties"]["apps"]["items"]["required"].end());
         CHECK(row["distinct_devices_online"]["type"] == nlohmann::json::array({"integer", "null"}));
+        CHECK(row["versions"]["items"]["properties"]["distinct_devices_online"]["type"] ==
+              nlohmann::json::array({"integer", "null"}));
         CHECK(row["versions"]["items"]["required"] ==
               nlohmann::json::array({"version", "crashes", "hangs", "distinct_devices",
                                      "distinct_devices_online", "last_seen", "share_affected",

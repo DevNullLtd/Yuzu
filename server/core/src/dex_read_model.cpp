@@ -213,6 +213,13 @@ DexStabilityFigures apps_figures(const DexAppStabilityRow& r, std::optional<int6
     // device below_floor is unreachable here (no_population is checked first),
     // and any later floor change reaches this read through the one constant.
     f.score = dex_score_under_policy(in, kDexCohortFloor, eff);
+    // The score is built from the online devices only. When any affected device
+    // is not online the evidence is incomplete: an application that crashes and
+    // takes its devices offline would read 100. Withhold rather than publish a
+    // healthy-looking score; the share and rate stay (they state their
+    // population) and `distinct_devices` vs `distinct_devices_online` show the gap.
+    if (f.score.score && r.affected_devices > affected)
+        f.score = stability_detail::withheld_result("offline_affected");
     return f;
 }
 

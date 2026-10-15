@@ -118,6 +118,8 @@ std::string dex_app_json(const DexAppModel& model, bool audit_persisted = true);
 /// population, the Windows devices online now: their numerators count only
 /// devices in that set (`distinct_devices_online` is the share's numerator), so
 /// a device that crashed and went offline is in the counts but not in the share.
+/// The score is withheld as `offline_affected` when any affected device is not
+/// online, since it would otherwise read healthy for an app that takes devices offline.
 struct DexStabilityFigures {
     int64_t crashes{0};
     int64_t hangs{0};
@@ -151,8 +153,9 @@ inline constexpr const char* kDexAppsPopulationBasis = "windows_online";
 
 /// The whole-fleet apps-by-reliability list - no per-agent identity (a
 /// distinct-device COUNT per app, never an agent_id). `degraded` means the
-/// read could not be completed (null store, failed read, or an invalid score
-/// policy): never render it as an empty or perfect list.
+/// read could not be completed (null store, failed read, a read over its
+/// concurrency budget, or an invalid score policy): never render it as an empty
+/// or perfect list.
 struct DexAppsModel {
     std::string window;
     /// Windows devices online now; nullopt = no fleet source wired (unknown),

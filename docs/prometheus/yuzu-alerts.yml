@@ -2821,7 +2821,8 @@ groups:
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
       # Two sources on the SAME counter, both keyed by reason
-      # (store_not_open/pool_acquire_timeout/query_error): "guardian_state"
+      # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
+      # on guardian_state for the Apps list's in-flight budget): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"

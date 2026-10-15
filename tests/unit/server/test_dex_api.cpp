@@ -755,7 +755,7 @@ TEST_CASE("DexApi: apps share numerator is the affected devices that are online"
     seed_obs_v(store, "ch" + std::to_string(++n), "up2", "other.exe", "process.hung", "1.0.0.0", kTs);
 
     yuzu::server::DexFleet fleet;
-    fleet.windows_online = 50;
+    fleet.windows_online = 999; // deliberately not the id count: the population follows the ids
     fleet.connected_agents.emplace_back("up1", "windows");
     fleet.connected_agents.emplace_back("up2", "windows");
     fleet.connected_agents.emplace_back("lin1", "linux"); // not Windows: never in the set
@@ -775,13 +775,9 @@ TEST_CASE("DexApi: apps share numerator is the affected devices that are online"
     CHECK(app.figures.share_affected->estimate == yuzu::server::dex_proportion(1, 50)->estimate);
     REQUIRE(app.figures.rate_per_1000);
     CHECK(app.figures.rate_per_1000->estimate == yuzu::server::dex_rate(2, 0.05)->estimate);
-    yuzu::server::StabilityInputs in;
-    in.reporting_devices = 50;
-    in.devices_affected = 1;
-    in.crash_events = 2;
-    in.hang_events = 0;
-    REQUIRE(app.figures.score.score);
-    CHECK(*app.figures.score.score == *yuzu::server::compute_stability_score(in, 0).score);
+    // Seven of the eight affected devices are offline: the score is withheld, not 99.
+    CHECK_FALSE(app.figures.score.score);
+    CHECK(std::string(app.figures.score.withheld) == "offline_affected");
     // Versions: 1.0.0.0 has eight devices (one online), 2.0.0.0 has two (one online).
     REQUIRE(app.versions.size() == 2);
     CHECK(app.versions[0].version == "1.0.0.0");
@@ -789,6 +785,14 @@ TEST_CASE("DexApi: apps share numerator is the affected devices that are online"
     CHECK(app.versions[0].figures.distinct_devices_online == 1);
     CHECK(app.versions[1].figures.distinct_devices == 2);
     CHECK(app.versions[1].figures.distinct_devices_online == 1);
+    // Version rows use the online figures too: each has one online device (up1) with one crash.
+    for (const auto& v : app.versions) {
+        REQUIRE(v.figures.share_affected);
+        CHECK(v.figures.share_affected->estimate == yuzu::server::dex_proportion(1, 50)->estimate);
+        REQUIRE(v.figures.rate_per_1000);
+        CHECK(v.figures.rate_per_1000->estimate == yuzu::server::dex_rate(1, 0.05)->estimate);
+        CHECK(std::string(v.figures.score.withheld) == "offline_affected");
+    }
     // other.exe: its only device is online.
     CHECK(m.apps[1].figures.distinct_devices_online == 1);
 }
@@ -816,11 +820,11 @@ TEST_CASE("DexApi: apps with nothing online keeps the counts and publishes no sh
 TEST_CASE("DexApi: apps read over its concurrency budget is refused as a degrade",
           "[pg][dex][apps_model][degraded]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the store so it outlives it
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     seed_apps_fixture(store);
-    yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
     const auto counter = [&] {
         return metrics
@@ -839,7 +843,9 @@ TEST_CASE("DexApi: apps read over its concurrency budget is refused as a degrade
     CHECK(counter() == 1.0); // counted once under the documented reason and source
     CHECK_FALSE(store.dex_app_stability_checked("", "windows", 10, 20, 5, {}));
     CHECK(counter() == 2.0);
-    // The slot is released after a refusal: restoring the budget serves again.
-    store.set_apps_read_budget_for_test(GuaranteedStateStore::kDexAppsConcurrentReads);
+    // A refusal releases its slot: with a budget of one, two reads in a row both serve,
+    // and a leaked slot would refuse the first (the count would already be at the budget).
+    store.set_apps_read_budget_for_test(1);
+    CHECK_FALSE(api->apps("7d").degraded);
     CHECK_FALSE(api->apps("7d").degraded);
 }
