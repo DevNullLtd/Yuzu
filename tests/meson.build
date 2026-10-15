@@ -3414,10 +3414,12 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 
 # Access Users page: pins the production wiring in server.cpp (the real require_admin gate and the
 # AuthDB::list_users() account source), which every route test stubs. Source-text only, so Python.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# no-build gate labelled 'server' fails that check on the Windows legs.
 test('access users production wiring lexical gate',
   _python3_test,
   args: [files('test_access_wiring_lexical.py')],
-  suite: 'server',
+  suite: 'docs',
   timeout: 30,
 )
 
