@@ -623,8 +623,11 @@ place, **Hardware** and **Software**, each its own page:
     management-group-scoped operator is refused (`403`) and should pick a group or a scope
     instead. One request reaches at most 500 devices (`413` above that, counted after the
     skips: narrow the scope). A group, scope or fleet run is limited to one per operator per
-    60 seconds (`429` with `Retry-After`) and one at a time across the server (`409`); a
-    single device is exempt. The request is audited as `inventory.sync.request` before
+    60 seconds (`429` with `Retry-After`) and one at a time per server process (`409`); a
+    single device is exempt. Both limits are held in each server process, not across a
+    cluster: with several active servers (active-active) each one allows its own run and
+    keeps its own per-operator cooldown, and every run is still bounded by the 500-device
+    cap. The request is audited as `inventory.sync.request` before
     anything is sent, and is refused if the audit row cannot be written. `202` means the
     request was sent, not that the devices have synced: the page's figures change when each
     device reports back.

@@ -17,6 +17,11 @@
 /// the single in-flight run. ponytail: hard cap; ADR-3007 wants a paced, unbounded run,
 /// tracked as a follow-up rather than built here.
 ///
+/// The cooldown stamps and the in-flight flag live in the route's owner, so both are per
+/// server PROCESS, not cluster-wide: under active-active each replica can run one fan-out at
+/// a time and keeps its own per-operator cooldown. Every run is still bounded by the
+/// 500-target cap, so replicas multiply the ceiling by their number, not without limit.
+///
 /// Nothing here authorises anything. Execution:Execute is checked by the route; targets
 /// arrive already intersected with the caller's Execution:Execute visible set by
 /// `resolve_targets` (server.cpp only supplies the store reads it calls), and

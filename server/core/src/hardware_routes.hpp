@@ -346,7 +346,8 @@ private:
     Deps deps_;
 
     // POST /api/v1/hardware/sync run state. `sync_run_mu_` guards the per-operator cooldown
-    // stamps; `sync_run_active_` is the single in-flight multi-device run.
+    // stamps; `sync_run_active_` is the single in-flight multi-device run. Both are per server
+    // PROCESS, not cluster-wide (each active-active replica has its own).
     std::mutex sync_run_mu_;
     std::unordered_map<std::string, std::int64_t> sync_last_run_;
     std::atomic<bool> sync_run_active_{false};
