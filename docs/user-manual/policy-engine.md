@@ -57,7 +57,7 @@ Each fragment stores:
 
 | Field | Description |
 |---|---|
-| `id` | Auto-generated unique identifier |
+| `id` | Auto-generated unique identifier, or an explicit `id` of letters, digits, `.`, `_` and `-` (1 to 128 characters, not only dots); existing records are unaffected |
 | `name` | Human-readable fragment name |
 | `description` | What this fragment checks and fixes |
 | `yaml_source` | Verbatim YAML source (source of truth) |
@@ -103,7 +103,7 @@ checks run.
 
 | Field | Description |
 |---|---|
-| `id` | Auto-generated unique identifier |
+| `id` | Auto-generated unique identifier, or an explicit `id` of letters, digits, `.`, `_` and `-` (1 to 128 characters, not only dots); existing records are unaffected |
 | `name` | Human-readable policy name |
 | `description` | What this policy enforces |
 | `yaml_source` | Verbatim YAML source (source of truth) |

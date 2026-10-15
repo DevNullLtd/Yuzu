@@ -27,6 +27,7 @@
 #include "pg/pg_raii.hpp"
 #include "test_route_sink.hpp"
 #include "update_registry.hpp"
+#include "url_attr_scan.hpp"
 #include "../test_helpers.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -436,4 +437,54 @@ TEST_CASE("a rollout write does not clobber a concurrent change to another colum
     CHECK(pkgs.front().mandatory == true);
     REQUIRE(h.audited.size() == 1);
     CHECK(h.audited.front().detail.find("mandatory=true") != std::string::npos);
+}
+
+// ── Update-package row URLs: platform/arch/version are encoded segments ──────
+
+TEST_CASE("update package rows encode each path part, and offer no action for an empty or "
+          "dot-only part",
+          "[ota][settings_routes][pg][url_path_segment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+
+    auto put = [&](const std::string& platform, const std::string& arch,
+                   const std::string& version) {
+        UpdatePackage pkg;
+        pkg.platform = platform;
+        pkg.arch = arch;
+        pkg.version = version;
+        pkg.sha256 = std::string(64, 'a');
+        pkg.filename = "f";
+        pkg.file_size = 1024;
+        REQUIRE(h.registry->upsert_package(pkg));
+    };
+    put("linux", "x86_64", "1.2.3+4/5?x#y");   // every delimiter in one part
+    put("lin/ux", "x 86", "9.9.9");           // other parts
+    put("..", "x86_64", "1.0.0");              // dot-only platform
+    put("linux", ".", "1.0.1");                // dot-only arch
+    put("linux", "x86_64", "..");              // dot-only version
+
+    auto res = h.sink.Get("/fragments/settings/updates");
+    REQUIRE(res);
+    const auto urls = yuzu::test::url_attr_values(res->body);
+
+    const std::string a = "/api/settings/updates/linux/x86_64/" +
+                          yuzu::server::url_path_segment("1.2.3+4/5?x#y");
+    const std::string b = "/api/settings/updates/" + yuzu::server::url_path_segment("lin/ux") +
+                          "/" + yuzu::server::url_path_segment("x 86") + "/9.9.9";
+    CHECK(yuzu::test::has_url(urls, a + "/rollout"));
+    CHECK(yuzu::test::has_url(urls, a));
+    CHECK(yuzu::test::has_url(urls, b + "/rollout"));
+    CHECK(yuzu::test::has_url(urls, b));
+    for (const auto& u : urls) {
+        CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+        if (u.rfind("/api/settings/updates/", 0) == 0 && u != "/api/settings/updates/upload") {
+            // exactly /api/settings/updates/<p>/<a>/<v>[/rollout]; the upload form
+            // posts to the fixed /api/settings/updates/upload and is not a package row
+            const auto n = yuzu::test::path_slashes(u);
+            CHECK((n == 6 || n == 7));
+        }
+    }
+    // The three dot-only packages are listed but carry no rollout/delete action.
+    CHECK(res->body.find("identifier not supported for actions") != std::string::npos);
 }

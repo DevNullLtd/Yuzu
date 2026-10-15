@@ -3119,6 +3119,7 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 - The certificate file may contain the full chain (leaf + intermediates).
 - The private key must not be password-protected.
 - On Unix, the private key file must not be readable by group or others. The server will refuse to start if permissions are too open. Fix with: `chmod 600 /path/to/key.pem`.
+- A key uploaded or pasted in Settings is created owner-only (0600) and replaced atomically by rename. Mount the certificate directory, not the single `server-key.pem` file, into a container: a single-file bind mount cannot be replaced and the upload fails with an error in the server log.
 - For production, use certificates signed by a trusted CA. Self-signed certificates work but require agents to trust the CA.
 
 ### Certificate Hot-Reload
@@ -5159,6 +5160,8 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `DELETE` | `/api/settings/pending-agents/{id}` | Remove a pending agent from the queue. `409` if the row is no longer `pending` (already `approved`/`denied`) — removal only succeeds against a genuinely pending row, by design (WS-6 6.2). |
 
 The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin routes) may not contain an ASCII control character or a comma — both are rejected before the row is ever created, closing an audit-log injection path (WS-6 6.2). A UUID, hostname, or MAC-derived id is unaffected.
+
+An agent id seen for the first time must also use only letters, digits, `.`, `_`, `:` and `-`, and must not consist only of dots; otherwise `Register` (and the gateway's `ProxyRegister`) answers `INVALID_ARGUMENT` and no row is created. The check applies only when the enrollment store holds no row for the id: an agent that is already enrolled, pending or denied keeps registering under its existing id. The agent generates a UUID, so only an operator-chosen `--agent-id` / `YUZU_AGENT_ID` is affected. In the pending list, an id that is empty or is `.` or `..` is shown without row actions and the approve, deny and remove routes answer `400` for it; the Approve All / Deny All buttons are shown for such a row (even when it is the only pending one), and they act on every pending agent, so review the queue first.
 
 ### Auto-Approval Policies
 
