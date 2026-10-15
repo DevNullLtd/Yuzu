@@ -105,7 +105,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // A present-but-wrong-typed field (e.g. batch_size as a
                       // string) throws type_error out of body.value() — that's
                       // still a caller mistake, not a server fault (#3097).
-                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", name,
                                "invalid_field_type");
                       send_bad_json(res);
                       return;
@@ -124,7 +124,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // "bearre" into an unauthenticated target instead of
                       // rejecting it — round-trip through to_string() to catch
                       // exactly that case without touching the shared helper.
-                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", name,
                                "invalid_auth_type");
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "unrecognized auth_type"),
@@ -146,7 +146,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // store/infra degradation (503) — distinct in the
                       // audit record even where the HTTP status collapses.
                       if (result.error() == OffloadWriteError::invalid_input) {
-                          audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                          (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", name,
                                    "validation_failed");
                           res.status = 400;
                           res.set_content(
@@ -157,7 +157,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                           const char* failure = result.error() == OffloadWriteError::store_unavailable
                                                     ? "store_unavailable"
                                                     : "db_error";
-                          audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                          (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", name,
                                    failure);
                           send_unavailable(res);
                       }
@@ -167,10 +167,10 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                   // Same `name=.. url=.. url_fp=..` shape as the delete row, so the
                   // create row also records where data was sent. The URL is a
                   // bearer secret: the row carries scheme+host and a fingerprint,
-                  // never the path or query (ADR-0010 Decision 4).
+                  // never the path or query.
                   (void)detail::emit_behavioral_audit(
                       audit_fn, req, res, "offload_target.create", "success", "offload_target",
-                      std::to_string(id), "name=" + name + " " + url_audit_detail(url));
+                      std::to_string(id), "name=" + audit_token(name) + " " + url_audit_detail(url));
                   res.status = 201;
                   res.set_content(
                       nlohmann::json({{"id", id}, {"status", "created"}}).dump(),
@@ -220,7 +220,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                     }
                     auto id_opt = parse_id_segment(req.matches[1].str());
                     if (!id_opt) {
-                        audit_fn(req, "offload_target.delete", "denied", "offload_target",
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.delete", "denied", "offload_target",
                                  req.matches[1].str(), "not_found");
                         send_not_found(res);
                         return;
@@ -233,7 +233,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                     auto target_snapshot = offload_store->get(*id_opt);
                     std::string snapshot_detail;
                     if (target_snapshot) {
-                        snapshot_detail = "name=" + target_snapshot->name + " " +
+                        snapshot_detail = "name=" + audit_token(target_snapshot->name) + " " +
                                           url_audit_detail(target_snapshot->url);
                     }
                     if (!detail::audit_attempted(audit_fn, req, res, "offload_target.delete",
@@ -249,7 +249,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                             result.error() == OffloadWriteError::store_unavailable
                                 ? "store_unavailable"
                                 : "db_error";
-                        audit_fn(req, "offload_target.delete", "denied", "offload_target",
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.delete", "denied", "offload_target",
                                  std::to_string(*id_opt), write_err_detail);
                         send_unavailable(res);
                         return;
@@ -260,7 +260,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                             "offload_target", std::to_string(*id_opt), snapshot_detail);
                         res.set_content(R"({"status":"deleted"})", "application/json");
                     } else {
-                        audit_fn(req, "offload_target.delete", "denied", "offload_target",
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.delete", "denied", "offload_target",
                                  std::to_string(*id_opt), "not_found");
                         send_not_found(res);
                     }

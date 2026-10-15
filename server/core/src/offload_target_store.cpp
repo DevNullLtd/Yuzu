@@ -350,7 +350,7 @@ void OffloadTargetStore::set_metrics(yuzu::MetricsRegistry* metrics) { metrics_ 
 void OffloadTargetStore::log_dropped_delivery(const std::string& target_url) {
     spdlog::warn("OffloadTargetStore: dropped delivery to {} - worker pool queue full or "
                  "server shutting down",
-                 url_scheme_host(target_url));
+                 url_log_host(target_url));
     if (metrics_)
         metrics_->counter("yuzu_server_offload_delivery_dropped_total").increment();
 }
@@ -516,7 +516,7 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
             return std::unexpected(OffloadWriteError::invalid_input);
         }
         spdlog::error("OffloadTargetStore::create_target: insert failed: {}",
-                      PQresultErrorMessage(res.get()));
+                      first_line(PQresultErrorMessage(res.get())));
         return std::unexpected(OffloadWriteError::db_error);
     }
     return id;
@@ -807,7 +807,7 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             // made at all.
             spdlog::warn("OffloadTargetStore: delivery to {} (target {}) skipped - credential "
                          "unavailable ({})",
-                         url_scheme_host(tgt.url), tgt.id, pg::SecretCodec::to_external_error());
+                         url_log_host(tgt.url), tgt.id, pg::SecretCodec::to_external_error());
             if (metrics_)
                 metrics_->counter("yuzu_server_offload_delivery_credential_unavailable_total")
                     .increment();
@@ -875,12 +875,12 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
         } else {
             error = "connection_failed";
             spdlog::warn("OffloadTargetStore: delivery to {} (target {}) failed: connection error",
-                         url_scheme_host(tgt.url), tgt.id);
+                         url_log_host(tgt.url), tgt.id);
         }
     } catch (const std::exception& ex) {
         error = ex.what();
         spdlog::warn("OffloadTargetStore: delivery to {} (target {}) failed: {}",
-                     url_scheme_host(tgt.url), tgt.id, error);
+                     url_log_host(tgt.url), tgt.id, error);
     }
 
     if (metrics_) {

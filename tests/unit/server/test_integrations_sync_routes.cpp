@@ -150,7 +150,7 @@ TEST_CASE("sync routes: lists request one row past the shown cap", "[integration
     CHECK(h.list_limits[1] == 101);
 }
 
-TEST_CASE("sync routes: responses are HTML, 200 and no-store, even when degraded",
+TEST_CASE("sync routes: responses are HTML and 200 and no-store and even when degraded",
           "[integrations][routes]") {
     Harness h;
     h.webhooks = std::unexpected(ReadError::failed);
@@ -177,7 +177,7 @@ TEST_CASE("sync routes: webhook list populated and per-row last delivery",
     CHECK_THAT(res->body, ContainsSubstring("2025-10-09 08:53 UTC"));
 }
 
-TEST_CASE("sync routes: a failed history read marks the row unknown, not empty",
+TEST_CASE("sync routes: a failed history read marks the row unknown and not empty",
           "[integrations][routes]") {
     Harness h;
     h.webhooks = std::vector<Webhook>{wh(4)};
@@ -187,7 +187,7 @@ TEST_CASE("sync routes: a failed history read marks the row unknown, not empty",
     CHECK_THAT(res->body, ContainsSubstring("Unknown (history could not be read)"));
 }
 
-TEST_CASE("sync routes: webhook deliveries distinguish failed, empty and missing",
+TEST_CASE("sync routes: webhook deliveries distinguish failed and empty and missing",
           "[integrations][routes]") {
     Harness h;
     h.deliveries = std::nullopt;
@@ -210,7 +210,7 @@ TEST_CASE("sync routes: webhook deliveries distinguish failed, empty and missing
                ContainsSubstring("No deliveries recorded."));
 }
 
-TEST_CASE("sync routes: an id that overflows int64 is not found, not a throw",
+TEST_CASE("sync routes: an id that overflows int64 is not found and not a throw",
           "[integrations][routes]") {
     Harness h;
     auto a = h.get("/fragments/settings/webhooks/99999999999999999999999/deliveries");
@@ -222,7 +222,7 @@ TEST_CASE("sync routes: an id that overflows int64 is not found, not a throw",
     CHECK_THAT(b->body, ContainsSubstring("The offload target was not found."));
 }
 
-TEST_CASE("sync routes: offload deliveries use the checked get, degraded is not not-found",
+TEST_CASE("sync routes: offload deliveries use the checked get and degraded is not not-found",
           "[integrations][routes]") {
     Harness h;
     h.offload_one = std::unexpected(ReadError::failed);
@@ -239,7 +239,7 @@ TEST_CASE("sync routes: offload deliveries use the checked get, degraded is not 
                ContainsSubstring("could not be read"));
 }
 
-TEST_CASE("sync routes: directory panel reads status, count, groups and roles",
+TEST_CASE("sync routes: directory panel reads status and count and groups and roles",
           "[integrations][routes]") {
     Harness h;
     SyncStatus st;
@@ -406,7 +406,7 @@ TEST_CASE("sync routes: controller script is served no-store", "[integrations][r
 
 // ── controller script pins ───────────────────────────────────────────────────
 
-TEST_CASE("controller script: no eval, no inline handler, no innerHTML of server data",
+TEST_CASE("controller script: no eval and no inline handler and no innerHTML of server data",
           "[integrations][js]") {
     const auto& js = kYuzuIntegrationsSyncJs;
     REQUIRE(js.size() > 2000);

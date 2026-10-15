@@ -67,6 +67,7 @@ struct OffloadHarness {
     std::optional<OffloadTargetStorePg> store;
     bool perm_grant{true};
     bool audit_persists{true}; // false: the audit sink reports a failed write
+    std::string fail_result;   // non-empty: only rows with this result report a failed write
     std::vector<AuditRecord> audit_log;
     OffloadRoutes routes;
 
@@ -95,6 +96,8 @@ struct OffloadHarness {
                                const std::string& r, const std::string& tt,
                                const std::string& ti, const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
+            if (!fail_result.empty() && r == fail_result)
+                return false;
             return audit_persists;
         };
         auto resolve_fn = [](const httplib::Request&) -> std::optional<auth::Session> {
@@ -155,7 +158,7 @@ TEST_CASE("REST offload-targets: create returns 201 and id", "[rest][offload][pg
     CHECK(h.audit_log[0].detail == h.audit_log[1].detail);
 }
 
-TEST_CASE("REST offload-targets: rejects userinfo in the URL, audited, nothing stored",
+TEST_CASE("REST offload-targets: rejects userinfo in the URL and audited and nothing stored",
           "[rest][offload][pg][security]") {
     OffloadHarness h;
     nlohmann::json body = {{"name", "creds-in-url"},
@@ -456,4 +459,39 @@ TEST_CASE("REST offload-targets: GET /:id/deliveries 404 on missing target",
     auto res = h.sink.Get("/api/v1/offload-targets/99999/deliveries");
     REQUIRE(res);
     CHECK(res->status == 404);
+}
+
+TEST_CASE("REST offload-targets: a lost outcome row keeps the 2xx and marks Sec-Audit-Failed",
+          "[rest][offload][pg][security]") {
+    OffloadHarness h;
+    h.fail_result = "success";
+    auto made = h.sink.Post("/api/v1/offload-targets",
+                            R"({"name":"keep","url":"https://x.example.com/h"})");
+    REQUIRE(made);
+    CHECK(made->status == 201);
+    CHECK(made->get_header_value("Sec-Audit-Failed") == "true");
+    const auto id = nlohmann::json::parse(made->body)["id"].get<int64_t>();
+    auto del = h.sink.Delete("/api/v1/offload-targets/" + std::to_string(id));
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(del->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("REST offload-targets: a name that mimics audit fields cannot forge the destination",
+          "[rest][offload][pg][security]") {
+    OffloadHarness h;
+    nlohmann::json body = {{"name", "x url=https://good.example url_fp=000000000000"},
+                           {"url", "https://evil.example/exfil?k=SECRET"}};
+    auto res = h.sink.Post("/api/v1/offload-targets", body.dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    const auto id = nlohmann::json::parse(res->body)["id"].get<int64_t>();
+    REQUIRE(h.sink.Delete("/api/v1/offload-targets/" + std::to_string(id)));
+    // attempted + success (create) then attempted + success (delete): one real destination each.
+    REQUIRE(h.audit_log.size() == 4);
+    for (const auto& rec : h.audit_log) {
+        CHECK(rec.detail.find("url_fp=") == rec.detail.rfind("url_fp="));
+        CHECK(rec.detail.find("SECRET") == std::string::npos);
+        CHECK(rec.detail.find("url=https://evil.example url_fp=") != std::string::npos);
+    }
 }

@@ -77,7 +77,7 @@ TEST_CASE("integrations routes: the page is admin-gated and a refused caller is 
     CHECK(js->body == yuzu::server::kYuzuIntegrationsJs);
 }
 
-TEST_CASE("integrations page: structure, loaders at the existing ids, CSP-safe markup",
+TEST_CASE("integrations page: structure and loaders at the existing ids and CSP-safe markup",
           "[integrations][settings][page]") {
     const std::string html = kSettingsIntegrationsHtml;
     CHECK(count_of(html, "<!--yuzu:shell-->") == 1);
@@ -123,7 +123,7 @@ TEST_CASE("integrations page: structure, loaders at the existing ids, CSP-safe m
     CHECK_THAT(html, !ContainsSubstring("eval("));
 }
 
-TEST_CASE("integrations script: delegated listeners, textContent only, no eval",
+TEST_CASE("integrations script: delegated listeners and textContent only and no eval",
           "[integrations][settings][page]") {
     const std::string& js = yuzu::server::kYuzuIntegrationsJs;
     CHECK_FALSE(js.empty());

@@ -394,7 +394,7 @@ TEST_CASE("DirectorySync[pg]: update_status is reflected by get_status", "[direc
     CHECK(failed.last_error == "graph unreachable");
 }
 
-TEST_CASE("DirectorySync[pg]: checked reads succeed on an open store, never-synced is a value",
+TEST_CASE("DirectorySync[pg]: checked reads succeed on an open store and never-synced is a value",
           "[directory_sync][pg]") {
     DirectorySyncPg store;
     DirectorySyncTestAccess acc{*store};
@@ -746,7 +746,7 @@ TEST_CASE("DirectorySync[pg]: a closed store degrades to empty/default, never cr
     REQUIRE_FALSE(apply_result.has_value());
 }
 
-TEST_CASE("DirectorySync[pg]: a failed membership lookup fails the checked read, not the legacy one",
+TEST_CASE("DirectorySync[pg]: a failed membership lookup fails the checked read and not the legacy one",
           "[directory_sync][pg]") {
     DirectorySyncPg store;
     DirectorySyncTestAccess acc{*store};
@@ -789,6 +789,7 @@ struct DirectoryRouteHarness {
     std::vector<Row> audits;   // outcome rows
     std::vector<Row> attempts; // the audit-first `attempted` rows, written before any change
     bool audit_persists{true}; // false: the audit sink reports a failed write
+    std::string fail_result;   // non-empty: only rows with this result report a failed write
     DiscoveryRoutes routes;
     yuzu::server::test::TestRouteSink sink; // declared after what its handlers capture
 
@@ -805,6 +806,8 @@ struct DirectoryRouteHarness {
                                const std::string& result, const std::string&,
                                const std::string& target_id, const std::string& detail) -> bool {
             (result == "attempted" ? attempts : audits).push_back({action, result, target_id, detail});
+            if (!fail_result.empty() && result == fail_result)
+                return false;
             return audit_persists;
         };
         auto resolve_fn = [](const httplib::Request&) -> std::optional<auth::Session> {
@@ -847,7 +850,7 @@ TEST_CASE("DiscoveryRoutes[pg]: directory sync failures are audited with fixed n
     CHECK(h.audits[1].detail == "missing_credentials");
 }
 
-TEST_CASE("DiscoveryRoutes[pg]: group mapping audit records what is stored, not what was asked",
+TEST_CASE("DiscoveryRoutes[pg]: group mapping audit records what is stored and not what was asked",
           "[directory_sync][pg][routes]") {
     DirectorySyncPg store;
     DirectoryRouteHarness h{store.get()};
@@ -902,7 +905,7 @@ TEST_CASE("DiscoveryRoutes[pg]: group mapping audit records what is stored, not 
     CHECK(h.audits[0].detail == "1 mappings not confirmed by read-back: g2=(removed)");
 }
 
-TEST_CASE("DiscoveryRoutes[pg]: a large mapping request is audited in full, over several rows",
+TEST_CASE("DiscoveryRoutes[pg]: a large mapping request is audited in full and over several rows",
           "[directory_sync][pg][routes]") {
     DirectorySyncPg store;
     DirectoryRouteHarness h{store.get()};
@@ -928,6 +931,9 @@ TEST_CASE("DiscoveryRoutes[pg]: a large mapping request is audited in full, over
     }
     CHECK(found);
     CHECK(pairs == 121);
+    // The audit-first row states the TOTAL asked for, not the size of its first chunk.
+    REQUIRE(h.attempts.size() == 1);
+    CHECK(h.attempts[0].detail.starts_with("121 mappings requested (first listed): decoy-group-0="));
 }
 
 TEST_CASE("DiscoveryRoutes[pg]: a malformed mapping entry refuses the whole batch and stores nothing",
@@ -999,4 +1005,18 @@ TEST_CASE("DiscoveryRoutes[pg]: a cross-site or header-less cookie write is refu
     auto stored = store.get()->get_group_role_mappings_checked();
     REQUIRE(stored);
     CHECK(stored->empty());
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a lost outcome row keeps the 2xx and marks Sec-Audit-Failed",
+          "[directory_sync][pg][routes][security]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+    h.fail_result = "success";
+    auto save = h.put_mappings(R"({"mappings":[{"group_id":"g1","role_name":"Operator"}]})");
+    REQUIRE(save);
+    CHECK(save->status == 200);
+    CHECK(save->get_header_value("Sec-Audit-Failed") == "true");
+    auto stored = store.get()->get_group_role_mappings_checked();
+    REQUIRE(stored);
+    CHECK(stored->size() == 1); // the change was made
 }

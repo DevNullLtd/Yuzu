@@ -22364,7 +22364,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool audit_ok =
                     audit_fn(req, "offload_target.create", "success", "offload_target",
                              std::to_string(new_target_id),
-                             "name=" + name + " " + url_audit_detail(url));
+                             "name=" + audit_token(name) + " " + url_audit_detail(url));
                 nlohmann::json payload_j = {{"id", new_target_id}, {"status", "created"}};
                 if (!audit_ok)
                     payload_j["audit_persisted"] = false;
@@ -22450,7 +22450,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto target_snapshot = offload_target_store->get(target_id);
                 std::string snapshot_detail;
                 if (target_snapshot)
-                    snapshot_detail = "name=" + target_snapshot->name + " " +
+                    snapshot_detail = "name=" + audit_token(target_snapshot->name) + " " +
                                       url_audit_detail(target_snapshot->url);
                 const std::string target_id_str = std::to_string(target_id);
                 if (!yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.delete",

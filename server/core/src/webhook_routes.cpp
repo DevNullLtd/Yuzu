@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <stdexcept>
 
 namespace yuzu::server {
@@ -89,14 +90,14 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  try {
                      body = nlohmann::json::parse(req.body);
                  } catch (...) {
-                     audit_fn(req, "webhook.create", "failure", "webhook", "", "invalid_json");
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create", "failure", "webhook", "", "invalid_json");
                      res.status = 400;
                      res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                      return;
                  }
                  auto url = body.value("url", "");
                  if (url.empty()) {
-                     audit_fn(req, "webhook.create", "failure", "webhook", "", "url_required");
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create", "failure", "webhook", "", "url_required");
                      res.status = 400;
                      res.set_content(detail::a4_error(res, "url is required"), "application/json");
                      return;
@@ -114,7 +115,7 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                      // #3097 classification: caller error (bad URL) is 400,
                      // never conflated with a store/DB degradation (503).
                      if (result.error() == WebhookWriteError::invalid_url) {
-                         audit_fn(req, "webhook.create", "failure", "webhook", "", "invalid_url");
+                         (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create", "failure", "webhook", "", "invalid_url");
                          res.status = 400;
                          res.set_content(
                              detail::a4_error(res, "url must be http:// or https:// without "
@@ -123,7 +124,7 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                                                    "characters"),
                              "application/json");
                      } else {
-                         audit_fn(req, "webhook.create", "failure", "webhook", "",
+                         (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create", "failure", "webhook", "",
                                   std::string(audit_detail_for(result.error())));
                          res.status = 503;
                          res.set_content(detail::a4_error(res, "webhook store unavailable"),
@@ -135,7 +136,7 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  // The analytics event carries scheme+host only: a Slack-style
                  // URL path is a bearer secret and the stream can leave the host.
                  // The audit row follows the same rule (scheme+host plus a
-                 // fingerprint, ADR-0010 Decision 4). It records WHERE the
+                 // fingerprint). It records WHERE the
                  // data goes, not just the id (PR #3563 review): a
                  // compromise-and-cleanup attacker who creates a webhook,
                  // exfiltrates to it, then deletes it must not be able to
@@ -170,6 +171,11 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                    try {
                        id = std::stoll(req.matches[1].str());
                    } catch (const std::out_of_range&) { // names no webhook: nothing to delete
+                       // Audited like the in-range not-found below (and the offload twin), so
+                       // probing with absurd ids is visible; the id is digits only (route regex).
+                       (void)detail::emit_behavioral_audit(
+                           audit_fn, req, res, "webhook.delete", "failure", "webhook",
+                           req.matches[1].str().substr(0, 40), "not_found");
                        res.status = 404;
                        res.set_content(detail::a4_error(res, "webhook not found"),
                                        "application/json");
@@ -194,7 +200,7 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                        // #3097 classification: a query failure against an
                        // open store is 503, distinct from the plain
                        // not-found case below (never conflated).
-                       audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),
+                       (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.delete", "failure", "webhook", std::to_string(id),
                                 std::string(audit_detail_for(result.error())));
                        res.status = 503;
                        res.set_content(detail::a4_error(res, "webhook store unavailable"),
@@ -207,7 +213,7 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                                                            std::to_string(id), snapshot_detail);
                        res.set_content(R"({"status":"deleted"})", "application/json");
                    } else {
-                       audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),
+                       (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.delete", "failure", "webhook", std::to_string(id),
                                 "not_found");
                        res.status = 404;
                        res.set_content(detail::a4_error(res, "webhook not found"),
@@ -226,7 +232,15 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                                     "application/json");
                     return;
                 }
-                auto webhook_id = std::stoll(req.matches[1].str());
+                std::int64_t webhook_id = 0;
+                try {
+                    webhook_id = std::stoll(req.matches[1].str());
+                } catch (const std::out_of_range&) { // names no webhook
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "webhook not found"),
+                                    "application/json");
+                    return;
+                }
                 int limit = 50;
                 auto limit_str = req.get_param_value("limit");
                 if (!limit_str.empty()) {

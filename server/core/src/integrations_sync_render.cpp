@@ -173,7 +173,7 @@ std::string render_webhooks(const std::expected<std::vector<WebhookRow>, ReadErr
             const auto& w = r.webhook;
             const std::string host = url_scheme_host(w.url);
             const std::string id = std::to_string(w.id);
-            out += "<tr><td><span class=\"mono\">" + esc(host.empty() ? "(unparseable URL)" : host) +
+            out += "<tr><td><span class=\"mono\">" + esc(host.empty() ? "(host not shown)" : host) +
                    "</span>" + display_url_block(w.url) + "</td><td>" + events_cell(w.event_types) +
                    "</td><td>" + pill(w.enabled ? "ok" : "idle", w.enabled ? "Enabled" : "Disabled") +
                    " " + pill(w.has_secret ? "info" : "idle", w.has_secret ? "Signed" : "Unsigned") +
@@ -266,7 +266,7 @@ std::string render_offload_targets(const std::expected<std::vector<OffloadRow>, 
             const std::string host = url_scheme_host(t.url);
             const std::string id = std::to_string(t.id);
             out += "<tr><td><b>" + esc(clip_text(t.name, 128)) + "</b></td><td><span class=\"mono\">" +
-                   esc(host.empty() ? "(unparseable URL)" : host) + "</span>" +
+                   esc(host.empty() ? "(host not shown)" : host) + "</span>" +
                    display_url_block(t.url) + "<div class=\"mut\">Events: " + events_cell(t.event_types) +
                    "; batch size " + std::to_string(t.batch_size) + "</div></td><td>" +
                    esc(offload_auth_type_to_string(t.auth_type)) + " " +

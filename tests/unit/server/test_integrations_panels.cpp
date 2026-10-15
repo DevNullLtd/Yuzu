@@ -71,7 +71,7 @@ std::string browser_body(const std::string& html) {
 
 // ── parse_mcp_form ──────────────────────────────────────────────────────
 
-TEST_CASE("mcp form: exactly one enabled and one read_only, true or false",
+TEST_CASE("mcp form: exactly one enabled and one read_only and true or false",
           "[integrations][mcp][settings]") {
     auto ok = parse_mcp_form("enabled=true&read_only=false");
     REQUIRE(ok);
@@ -121,7 +121,7 @@ TEST_CASE("mcp form: the bodies the old panel and partial callers sent are refus
 
 // ── MCP panel ───────────────────────────────────────────────────────────
 
-TEST_CASE("mcp panel: one control per field, no hidden fallback, all four states parse",
+TEST_CASE("mcp panel: one control per field and no hidden fallback and all four states parse",
           "[integrations][mcp][settings]") {
     for (const bool enabled : {true, false})
         for (const bool read_only : {true, false}) {
@@ -159,7 +159,7 @@ TEST_CASE("mcp panel: the three confirms ride on the form and fall back to hx-co
     CHECK(std::string(kMcpConfirmReadOnly).find("write and execute tools?") == std::string::npos);
 }
 
-TEST_CASE("mcp panel: restart caveat always, --mcp-disable note only when disabled",
+TEST_CASE("mcp panel: restart caveat always and --mcp-disable note only when disabled",
           "[integrations][mcp][settings]") {
     const auto on = render_mcp_panel({true, false, "http://h:1/mcp/v1/"});
     CHECK_THAT(on, ContainsSubstring("Changes apply until the server restarts"));
@@ -171,7 +171,7 @@ TEST_CASE("mcp panel: restart caveat always, --mcp-disable note only when disabl
     CHECK_THAT(off, ContainsSubstring("has no effect until it restarts"));
 }
 
-TEST_CASE("mcp panel: endpoint is read-only text, escaped, with no Copy control and no 'section above'",
+TEST_CASE("mcp panel: endpoint is read-only text and escaped and with no Copy control and no 'section above'",
           "[integrations][mcp][settings][security]") {
     const auto hostile = render_mcp_panel({true, true, "http://x\"><img src=x onerror=1>/mcp/v1/"});
     CHECK_THAT(hostile, !ContainsSubstring("<img"));
@@ -189,7 +189,7 @@ TEST_CASE("mcp panel: endpoint is read-only text, escaped, with no Copy control 
 
 // ── Gateway panel ───────────────────────────────────────────────────────
 
-TEST_CASE("gateway panel: running shows address, mode and the honestly named session count",
+TEST_CASE("gateway panel: running shows address and mode and the honestly named session count",
           "[integrations][gateway][settings]") {
     const auto html = render_gateway_panel({true, "0.0.0.0:50055", true, 7});
     CHECK_THAT(html, ContainsSubstring("<span>Upstream service</span><b><span class=\"pill ok\">"
@@ -218,7 +218,7 @@ TEST_CASE("gateway panel: not running keeps the flag guidance verbatim and hides
     CHECK_THAT(html, !ContainsSubstring("Agents via gateway"));
 }
 
-TEST_CASE("gateway panel: no invented figures, the env reference is complete and collapsed",
+TEST_CASE("gateway panel: no invented figures and the env reference is complete and collapsed",
           "[integrations][gateway][settings]") {
     const auto html = render_gateway_panel({true, "0.0.0.0:50055", true, 3});
     // Drawn on the artboard but with no source in the code.
@@ -381,7 +381,7 @@ TEST_CASE("mcp POST: a cross-site Origin is refused 403 and changes nothing",
     CHECK(h.attempts.empty());
 }
 
-TEST_CASE("mcp POST: an accepted body sets exactly the two flags, audits and re-renders",
+TEST_CASE("mcp POST: an accepted body sets exactly the two flags and audits and re-renders",
           "[integrations][mcp][settings][routes]") {
     McpHarness h;
     h.cfg.mcp_disable = true;

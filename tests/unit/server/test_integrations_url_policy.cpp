@@ -43,15 +43,23 @@ TEST_CASE("url policy: scheme+host drops userinfo path query and fragment", "[in
     CHECK(url_scheme_host("https://host.example") == "https://host.example");
     CHECK(url_scheme_host("host.example/path").empty());
     CHECK(url_scheme_host("host.example/p?r=http://x").empty()); // "://" inside a query
-    // Only a bare host[:port] is echoed: anything else could forge a neighbouring audit field.
-    CHECK(url_scheme_host("http://[::1]:8080/x") == "http://[::1]:8080");
-    CHECK(url_scheme_host("https://Host-1.example.invalid:65535") ==
-          "https://Host-1.example.invalid:65535");
-    for (const char* bad : {"https://a url_fp=aaaaaaaaaaaa/x", "https://a,b=c/x",
-                            "https://tok:SECRET/path", "https://host:SECRET", "https://host:/x",
-                            "https://host:123456/x", "https:///x", "https://[]/x",
-                            "https://[zz]/x", "https://host\xc3\xa9/x"})
+    // Hosts that deliver but are not plain DNS: underscore names, IDN and zone ids still show.
+    CHECK(url_scheme_host("http://my_svc:8080/x") == "http://my_svc:8080");
+    CHECK(url_scheme_host("https://b\xc3\xbc" "cher.example/h") == "https://b%C3%BCcher.example");
+    CHECK(url_scheme_host("http://[fe80::1%25eth0]:80/x") == "http://[fe80::1%25eth0]:80");
+    CHECK(url_scheme_host("https://host.example:/x") == "https://host.example"); // empty port
+    // Bytes that could forge a neighbouring audit field are percent-encoded, never echoed raw.
+    CHECK(url_scheme_host("https://a url_fp=aaaaaaaaaaaa/x") == "https://a%20url_fp%3Daaaaaaaaaaaa");
+    CHECK(url_scheme_host("https://a,b=c/x") == "https://a%2Cb%3Dc");
+    // Structure that is not host[:port] is withheld entirely.
+    for (const char* bad : {"https://tok:SECRET/path", "https://host:SECRET", "https://host:123456/x",
+                            "https:///x", "https://[]/x", "https://a:b:80/x", "https://:80/x",
+                            "averyveryverylongscheme://h/x"}) {
+        INFO(bad);
         CHECK(url_scheme_host(bad).empty());
+    }
+    CHECK(url_scheme_host("https://" + std::string(262, 'a')).empty()); // over 261 bytes
+    CHECK(url_scheme_host("https://" + std::string(261, 'a')).size() == 8 + 261);
 }
 
 TEST_CASE("url audit detail: scheme+host and a fingerprint and never the path or query",
@@ -69,20 +77,27 @@ TEST_CASE("url audit detail: scheme+host and a fingerprint and never the path or
     // fingerprint alone.
     CHECK(url_audit_detail(std::string("https://h.example/\r\nforged=1")).starts_with("url_fp="));
     CHECK(url_audit_detail("no-scheme/path").starts_with("url_fp="));
-    // A crafted authority cannot plant a first `url_fp=` or carry a pasted `token:secret`.
+    // A crafted authority cannot plant a first `url_fp=` (it is encoded) or carry a pasted
+    // `token:secret` (withheld): exactly one raw `url_fp=` ever appears.
     const auto forged = url_audit_detail("https://h url_fp=deadbeefdead/x");
-    CHECK(forged.starts_with("url_fp="));
-    CHECK(forged.find("deadbeef") == std::string::npos);
+    CHECK(forged.starts_with("url=https://h%20url_fp%3Ddeadbeefdead url_fp="));
+    CHECK(forged.find("url_fp=") == forged.rfind("url_fp="));
     CHECK(url_audit_detail("https://tok:SECRETVALUE/p").find("SECRETVALUE") == std::string::npos);
+    CHECK(url_audit_detail("https://my_svc:8080/x").starts_with("url=https://my_svc:8080 url_fp="));
     // A later "://" in the path or query is not a scheme: nothing before it is echoed.
     const auto fake = url_audit_detail("hooks.example/services/T/B/SECRET?r=http://x");
     CHECK(fake.starts_with("url_fp="));
     CHECK(fake.find("SECRET") == std::string::npos);
     // An oversized authority (the audit-first row precedes validation) is not echoed.
     CHECK(url_audit_detail("https://" + std::string(400, 'a')).starts_with("url_fp="));
+    // ... and neither is an oversized scheme.
+    CHECK(url_audit_detail(std::string(2000, 'a') + "://h.example/x").starts_with("url_fp="));
+    CHECK(url_log_host("not a url") == "(host withheld)");
+    CHECK(first_line("ERROR:  violates check\nDETAIL:  Failing row contains (https://h/SECRET)") ==
+          "ERROR:  violates check");
 }
 
-TEST_CASE("url delivery parts: the authority ends at '/', '?' or '#'",
+TEST_CASE("url delivery parts: the authority ends at '/' and '?' or '#'",
           "[integrations][url]") {
     auto parts = url_delivery_parts("https://hooks.example?token=x");
     CHECK(parts.scheme == "https");
@@ -102,7 +117,7 @@ TEST_CASE("url delivery parts: the authority ends at '/', '?' or '#'",
           url_delivery_parts("https://hooks.example?token=x").host_port);
 }
 
-TEST_CASE("mapping audit detail: pairs, removal marker, count", "[integrations][audit]") {
+TEST_CASE("mapping audit detail: pairs and removal marker and count", "[integrations][audit]") {
     const auto d = integrations::mapping_audit_chunks({{"g-1", "Operator"}, {"g-2", ""}});
     REQUIRE(d.size() == 1);
     CHECK(d[0] == "2 mappings updated: g-1=Operator, g-2=(removed)");
@@ -149,7 +164,7 @@ TEST_CASE("mapping read-back: a group named twice counts as its last entry", "[i
     CHECK(out.confirmed.size() == 2);
 }
 
-TEST_CASE("mapping read-back: a failed read confirms nothing, removals included",
+TEST_CASE("mapping read-back: a failed read confirms nothing and removals included",
           "[integrations][audit]") {
     using integrations::MappingChange;
     const auto out = integrations::classify_mapping_changes(
@@ -173,7 +188,7 @@ TEST_CASE("mapping audit detail: control bytes cannot split the row", "[integrat
     CHECK(d[0] == "1 mappings updated: g??1=Ro?le");
 }
 
-TEST_CASE("mapping audit detail: a long list is split, never truncated", "[integrations][audit]") {
+TEST_CASE("mapping audit detail: a long list is split and never truncated", "[integrations][audit]") {
     // Padding a request must not push an applied pair out of the trail.
     std::vector<integrations::MappingChange> many;
     for (int i = 0; i < 300; ++i)

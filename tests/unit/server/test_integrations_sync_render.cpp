@@ -92,7 +92,7 @@ TEST_CASE("event catalogue: exactly the four events the server fires", "[integra
 
 // ── webhooks ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("webhooks: populated list shows host only, full URL on demand", "[integrations][render]") {
+TEST_CASE("webhooks: populated list shows host only and full URL on demand", "[integrations][render]") {
     std::vector<WebhookRow> rows{hook(7, "https://hooks.example.invalid/services/T0/B0/SECRETPATH",
                                       "agent.registered,dex.signal", true)};
     const auto html = render_webhooks(rows);
@@ -145,7 +145,7 @@ TEST_CASE("webhooks: hostile strings are escaped everywhere", "[integrations][re
     CHECK_THAT(html, ContainsSubstring("&lt;img src=x onerror=1&gt;"));
 }
 
-TEST_CASE("webhooks: last delivery distinguishes none, unknown and an answer",
+TEST_CASE("webhooks: last delivery distinguishes none and unknown and an answer",
           "[integrations][render]") {
     auto none = hook(1, "https://a.example.invalid");
     auto unknown = hook(2, "https://b.example.invalid");
@@ -158,7 +158,7 @@ TEST_CASE("webhooks: last delivery distinguishes none, unknown and an answer",
     CHECK_THAT(html, ContainsSubstring("No answer"));
 }
 
-TEST_CASE("webhook create form: confirm names host and data classes, secret has no value",
+TEST_CASE("webhook create form: confirm names host and data classes and secret has no value",
           "[integrations][render]") {
     const auto html = render_webhooks(std::vector<WebhookRow>{});
     // Server-owned confirm template; the controller fills {events}/{host}/{data}.
@@ -189,7 +189,7 @@ TEST_CASE("webhook create form: confirm names host and data classes, secret has 
     }
 }
 
-TEST_CASE("webhook deliveries: failed read, empty, and rows", "[integrations][render]") {
+TEST_CASE("webhook deliveries: failed read and empty and and rows", "[integrations][render]") {
     CHECK_THAT(render_webhook_deliveries(std::unexpected(ReadError::failed)),
                ContainsSubstring("Delivery history could not be read."));
     CHECK_THAT(render_webhook_deliveries(std::vector<WebhookDelivery>{}),
@@ -208,7 +208,7 @@ TEST_CASE("webhook deliveries: failed read, empty, and rows", "[integrations][re
 
 // ── offload targets ──────────────────────────────────────────────────────────
 
-TEST_CASE("offload: list, auth, credential flag, host only", "[integrations][render]") {
+TEST_CASE("offload: list and auth and credential flag and host only", "[integrations][render]") {
     std::vector<OffloadRow> rows{target(3, "siem", "https://ingest.example.invalid/v1/events?k=SECRETQ")};
     const auto html = render_offload_targets(rows);
     CHECK_THAT(html, ContainsSubstring("<b>siem</b>"));
@@ -222,7 +222,7 @@ TEST_CASE("offload: list, auth, credential flag, host only", "[integrations][ren
     CHECK(!contains(html, "Syslog"));
 }
 
-TEST_CASE("offload: empty, degraded and truncated are three different states",
+TEST_CASE("offload: empty and degraded and truncated are three different states",
           "[integrations][render]") {
     CHECK_THAT(render_offload_targets(std::vector<OffloadRow>{}),
                ContainsSubstring("No offload targets configured."));
@@ -235,7 +235,7 @@ TEST_CASE("offload: empty, degraded and truncated are three different states",
     CHECK_THAT(render_offload_targets(many), ContainsSubstring("Showing the first 100. More exist."));
 }
 
-TEST_CASE("offload create form: bounds, creds write-only, shutdown wording is truthful",
+TEST_CASE("offload create form: bounds and creds write-only and shutdown wording is truthful",
           "[integrations][render]") {
     const auto html = render_offload_targets(std::vector<OffloadRow>{});
     CHECK_THAT(html, ContainsSubstring("name=\"name\" type=\"text\" required maxlength=\"256\""));
@@ -268,7 +268,7 @@ TEST_CASE("offload deliveries: states", "[integrations][render]") {
 
 // ── directory sync ───────────────────────────────────────────────────────────
 
-TEST_CASE("directory: completed shows counts from the snapshot, provider is a constant",
+TEST_CASE("directory: completed shows counts from the snapshot and provider is a constant",
           "[integrations][render]") {
     const auto html = render_directory_panel(ok_view());
     CHECK_THAT(html, ContainsSubstring("Microsoft Entra ID (the only provider; LDAP is not supported)"));
@@ -316,7 +316,7 @@ TEST_CASE("directory: a failed status read is not never-synced", "[integrations]
     CHECK(!contains(html, "data-int-action=\"directory-sync\""));
 }
 
-TEST_CASE("directory sync form: write-only fields, confirm wording", "[integrations][render]") {
+TEST_CASE("directory sync form: write-only fields and confirm wording", "[integrations][render]") {
     const auto html = render_directory_panel(ok_view());
     CHECK_THAT(html, ContainsSubstring("The client secret is used for this run only and is not stored."));
     const auto pos = html.find("name=\"client_secret\"");
@@ -369,7 +369,7 @@ TEST_CASE("directory mappings: group cap shows first 200 of N", "[integrations][
     CHECK(!contains(html, "data-group-id=\"g200\""));
 }
 
-TEST_CASE("directory users are lazy: the panel carries a button, not the rows",
+TEST_CASE("directory users are lazy: the panel carries a button and not the rows",
           "[integrations][render]") {
     auto v = ok_view();
     const auto html = render_directory_panel(v);
@@ -378,7 +378,7 @@ TEST_CASE("directory users are lazy: the panel carries a button, not the rows",
     CHECK(!contains(html, "@example"));
 }
 
-TEST_CASE("directory users: rows, escaping, group truncation, caps and states",
+TEST_CASE("directory users: rows and escaping and group truncation and caps and states",
           "[integrations][render]") {
     DirectoryUser u;
     u.display_name = kXss;

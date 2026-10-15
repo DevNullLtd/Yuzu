@@ -48,7 +48,7 @@ Routes that serve per-person behavioural / compliance PII (the `dex.device.view`
 
 This is intentional cross-surface behaviour: during an audit-store blip a browsing operator sees data while a wired REST integration receives `503`. Alert on `Sec-Audit-Failed: true` (or `audit_persisted: false`) from any surface as a SOC 2 CC7.2 evidence-gap signal. (Mutating routes such as token/session revoke use the related `audit_emitted` body field — see those endpoints.)
 
-A separate, narrower shape applies to ordinary mutation routes that audit a change **after** it already durably committed (not the behavioural-PII read routes above): `POST /api/v1/software-packages`, `POST /api/v1/software-deployments`, and its `.../start`, `.../rollback`, `.../cancel` actions. These **always set-and-proceed** — the mutation cannot be un-committed, so the response stays `2xx` and only `Sec-Audit-Failed: true` signals a dropped audit row, with no `audit_emitted`/`audit_persisted` body field. Treat the header the same way as the behavioural-PII surfaces: a CC7.2 evidence-gap signal, not an error.
+A separate, narrower shape applies to ordinary mutation routes that audit a change **after** it already durably committed (not the behavioural-PII read routes above): `POST /api/v1/software-packages`, `POST /api/v1/software-deployments`, and its `.../start`, `.../rollback`, `.../cancel` actions. These **always set-and-proceed** — the mutation cannot be un-committed, so the response stays `2xx` and only `Sec-Audit-Failed: true` signals a dropped audit row, with no `audit_emitted`/`audit_persisted` body field. The Integrations writes share the shape for their OUTCOME row: `POST`/`DELETE /api/webhooks`, `POST`/`DELETE /api/v1/offload-targets`, `POST /api/directory/sync` and `PUT /api/directory/group-mappings` write a `result=attempted` row first (a failure there is a `503` and nothing changes), and if the later outcome row cannot be stored they keep their `2xx` and set `Sec-Audit-Failed: true`, which means the change WAS made and only the `attempted` row stands — do not retry the create. Treat the header the same way as the behavioural-PII surfaces: a CC7.2 evidence-gap signal, not an error.
 
 ---
 
@@ -5428,7 +5428,7 @@ result `failure`, a distinct detail string per cause). Create and delete write a
 #### `DELETE /api/webhooks/{id}`
 
 Delete a webhook by numeric ID. `200` on success, `404` if no webhook has that id, `503` on a
-store/database error. Every outcome (including `404`) is audited as `webhook.delete`; a
+store/database error. Every outcome (including `404`, and a well-formed id too large for a 64-bit integer) is audited as `webhook.delete`; a
 successful delete's audit detail carries the webhook's scheme, host and URL fingerprint (captured just before deletion), so
 the record of where a webhook pointed survives its removal. Same audit-first and same-site rules as create.
 

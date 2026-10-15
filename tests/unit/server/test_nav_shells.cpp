@@ -122,7 +122,7 @@ TEST_CASE("app shell: only Instructions Software and Fleet have sub-items; Setti
     CHECK(groups.back().items[0].href == "/settings");
 }
 
-TEST_CASE("app shell: Settings sub-items are System pages in artboard order, none on the "
+TEST_CASE("app shell: Settings sub-items are System pages in artboard order and none on the "
           "parent's own href",
           "[nav][shell]") {
     const std::vector<std::string_view> artboard = {

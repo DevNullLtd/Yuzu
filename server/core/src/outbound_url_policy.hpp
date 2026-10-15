@@ -7,14 +7,15 @@
 /// definition.
 ///
 /// A destination URL is a bearer secret in practice (Slack-style hooks), so it
-/// must never reach a Postgres audit column or the analytics stream in full
-/// (ADR-0010 Decision 4): audit rows and events carry `url_audit_detail()`
+/// must never reach a Postgres audit column, a log line or the analytics stream in full (the
+/// ADR-0010 "no recoverable secret at rest" rule applied to audit text): audit rows and events carry `url_audit_detail()`
 /// (scheme, host and a fingerprint) instead. Two shapes are also refused at
 /// create time: embedded userinfo (`https://user:pass@host`) and control bytes
 /// (CR/LF/NUL would split an audit row). Existing rows are not rewritten.
 
 #include <array>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -59,10 +60,10 @@ namespace detail {
     return c >= '0' && c <= '9';
 }
 
-/// A URI scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). Anything else before "://" is part
-/// of a path or query, not a scheme.
+/// A URI scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ), at most 16 bytes. Anything else before
+/// "://" is part of a path or query, not a scheme.
 [[nodiscard]] constexpr bool is_url_scheme(std::string_view s) noexcept {
-    if (s.empty() || !is_ascii_alpha(s.front()))
+    if (s.empty() || s.size() > 16 || !is_ascii_alpha(s.front()))
         return false;
     for (char c : s)
         if (!is_ascii_alpha(c) && !is_ascii_digit(c) && c != '+' && c != '-' && c != '.')
@@ -70,42 +71,72 @@ namespace detail {
     return true;
 }
 
-/// A bare `host[:port]`: a DNS name or IPv4 address ([A-Za-z0-9.-]), or a bracketed IPv6 literal,
-/// then optionally `:` and 1-5 digits. Anything else (a space, '=', ',', text after a colon) is not
-/// echoed into an audit row or log line, where it could forge a neighbouring field.
-[[nodiscard]] constexpr bool is_plain_host_port(std::string_view a) noexcept {
-    if (a.empty() || a.size() > 261) // 253-byte DNS name + ":65535"
-        return false;
+/// The echo-safe form of an authority (`host[:port]`, userinfo already removed), or nullopt when
+/// it is not one. Host bytes outside the RFC 3986 unreserved set (`A-Za-z0-9._~-`), including
+/// space, '=', ',', '%' and every byte >= 0x80, are percent-encoded, so an underscore name, a raw
+/// IDN or a zone id still reads as itself while a crafted host cannot forge a neighbouring audit
+/// or log field. A bracketed IPv6 literal keeps `A-Za-z0-9:.%_~-` (address and zone id) and encodes the rest. A port is 1-5
+/// digits (an empty one after a trailing ':' is dropped); text after the last colon that is not a
+/// port (a pasted `token:secret`), an unbracketed host with a colon, an empty host and anything
+/// over 261 bytes (253-byte name + ":65535") yield nullopt.
+[[nodiscard]] inline std::optional<std::string> display_host_port(std::string_view a) {
+    if (a.empty() || a.size() > 261)
+        return std::nullopt;
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    auto push_encoded = [](std::string& out, char c) {
+        const auto u = static_cast<unsigned char>(c);
+        out.push_back('%');
+        out.push_back(kHex[u >> 4]);
+        out.push_back(kHex[u & 0x0f]);
+    };
+    std::string out;
     std::size_t host_end = 0;
     if (a.front() == '[') {
         const auto close = a.find(']');
         if (close == std::string_view::npos || close == 1)
-            return false;
-        for (char c : a.substr(1, close - 1))
-            if (!is_ascii_digit(c) && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') &&
-                c != ':' && c != '.')
-                return false;
+            return std::nullopt;
+        out.push_back('[');
+        for (char c : a.substr(1, close - 1)) {
+            // Hex digits, ':' and '.' for the address; '%' and the unreserved set cover a zone id
+            // (`%25eth0`). Anything else is encoded.
+            if (is_ascii_alpha(c) || is_ascii_digit(c) || c == ':' || c == '.' || c == '%' ||
+                c == '-' || c == '_' || c == '~')
+                out.push_back(c);
+            else
+                push_encoded(out, c);
+        }
+        out.push_back(']');
         host_end = close + 1;
     } else {
         const auto colon = a.rfind(':');
         host_end = colon == std::string_view::npos ? a.size() : colon;
         if (host_end == 0)
-            return false;
-        for (char c : a.substr(0, host_end))
-            if (!is_ascii_alpha(c) && !is_ascii_digit(c) && c != '.' && c != '-')
-                return false;
+            return std::nullopt;
+        for (char c : a.substr(0, host_end)) {
+            if (c == ':')
+                return std::nullopt; // unbracketed IPv6 or "a:b:80"
+            if (is_ascii_alpha(c) || is_ascii_digit(c) || c == '.' || c == '-' || c == '_' ||
+                c == '~')
+                out.push_back(c);
+            else
+                push_encoded(out, c);
+        }
     }
     if (host_end == a.size())
-        return true;
+        return out;
     if (a[host_end] != ':')
-        return false;
+        return std::nullopt;
     const auto port = a.substr(host_end + 1);
-    if (port.empty() || port.size() > 5)
-        return false;
+    if (port.empty())
+        return out;
+    if (port.size() > 5)
+        return std::nullopt;
     for (char c : port)
         if (!is_ascii_digit(c))
-            return false;
-    return true;
+            return std::nullopt;
+    out.push_back(':');
+    out.append(port);
+    return out;
 }
 } // namespace detail
 
@@ -115,9 +146,10 @@ namespace detail {
 }
 
 /// `scheme://host[:port]` with any userinfo, path, query and fragment removed.
-/// Returns an empty string when `url` does not start with `<scheme>://` or its authority is not a
-/// plain `host[:port]` (never echo an unparseable value, never mistake a later "://" in a path or
-/// query for the scheme, never let a crafted authority forge an audit or log field).
+/// The host is percent-encoded where needed (`detail::display_host_port`), so a crafted authority
+/// cannot forge an audit or log field. Returns an empty string when `url` does not start with
+/// `<scheme>://` or its authority is not a `host[:port]` (never echo an unparseable value, never
+/// mistake a later "://" in a path or query for the scheme).
 [[nodiscard]] inline std::string url_scheme_host(std::string_view url) {
     const auto scheme_end = url.find("://");
     if (scheme_end == std::string_view::npos || !detail::is_url_scheme(url.substr(0, scheme_end)))
@@ -125,10 +157,11 @@ namespace detail {
     auto authority = detail::url_authority(url);
     if (const auto at = authority.rfind('@'); at != std::string_view::npos)
         authority = authority.substr(at + 1);
-    if (!detail::is_plain_host_port(authority))
+    const auto shown = detail::display_host_port(authority);
+    if (!shown)
         return {};
     std::string out(url.substr(0, scheme_end + 3));
-    out.append(authority);
+    out.append(*shown);
     return out;
 }
 
@@ -160,6 +193,20 @@ struct UrlDeliveryParts {
     if (!rest.empty())
         out.path = rest.front() == '/' ? std::string(rest) : "/" + std::string(rest);
     return out;
+}
+
+/// The destination for a log line: scheme://host[:port], or a placeholder when none can be shown.
+/// Never the path or query.
+[[nodiscard]] inline std::string url_log_host(std::string_view url) {
+    auto host = url_scheme_host(url);
+    return host.empty() ? std::string("(host withheld)") : host;
+}
+
+/// The first line of a Postgres error message. The `DETAIL:` line of a constraint violation
+/// quotes the failing row, which for these tables includes the destination URL.
+[[nodiscard]] inline std::string first_line(const char* message) {
+    const std::string_view m = message ? message : "";
+    return std::string(m.substr(0, m.find('\n')));
 }
 
 /// First 12 lowercase hex characters (48 bits) of SHA-256 over the whole URL:

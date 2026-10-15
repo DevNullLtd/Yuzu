@@ -58,8 +58,8 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
     // POST /api/directory/sync — trigger directory sync
     sink.Post("/api/directory/sync",
-             [auth_fn, perm_fn, audit_fn, directory_sync, write_gate](const httplib::Request& req,
-                                                                       httplib::Response& res) {
+             [perm_fn, audit_fn, directory_sync, write_gate](const httplib::Request& req,
+                                                              httplib::Response& res) {
                  if (!perm_fn(req, res, "Directory", "Write"))
                      return;
                  if (write_gate.refuse_cross_site(audit_fn, req, res, "/api/directory/sync"))
@@ -76,9 +76,9 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  try {
                      body = nlohmann::json::parse(req.body);
                  } catch (const std::exception& e) {
-                     if (auto session = auth_fn(req, res))
-                         audit_fn(req, "directory.sync", "failure", "Directory", "",
-                                  "invalid_json");
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res, "directory.sync",
+                                                         "failure", "Directory", "",
+                                                         "invalid_json");
                      res.status = 400;
                      res.set_content(nlohmann::json({{"error", e.what()}}).dump(),
                                      "application/json");
@@ -95,9 +95,9 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                      if (ec.tenant_id.empty() || ec.client_id.empty() ||
                          ec.client_secret.empty()) {
-                         if (auto session = auth_fn(req, res))
-                             audit_fn(req, "directory.sync", "failure", "Directory", "entra",
-                                      "missing_credentials");
+                         (void)detail::emit_behavioral_audit(
+                             audit_fn, req, res, "directory.sync", "failure", "Directory",
+                             "entra", "missing_credentials");
                          res.status = 400;
                          res.set_content(
                              R"({"error":"tenant_id, client_id, and client_secret are required"})",
@@ -125,18 +125,17 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                              res.set_content(
                                  nlohmann::json({{"error", result.error()}}).dump(),
                                  "application/json");
-                             auto session = auth_fn(req, res);
-                             if (session)
-                                 audit_fn(req, "directory.sync", "denied", "Directory", "entra",
-                                          std::string(yuzu::server::kEntraSyncAlreadyInProgress));
+                             (void)detail::emit_behavioral_audit(
+                                 audit_fn, req, res, "directory.sync", "denied", "Directory",
+                                 "entra", std::string(yuzu::server::kEntraSyncAlreadyInProgress));
                              return;
                          }
                          // Fixed detail: the upstream error text can carry
                          // tenant and client identifiers and is already in the
                          // status row's last_error.
-                         if (auto s500 = auth_fn(req, res))
-                             audit_fn(req, "directory.sync", "failure", "Directory", "entra",
-                                      "sync_failed");
+                         (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                             "directory.sync", "failure",
+                                                             "Directory", "entra", "sync_failed");
                          res.status = 500;
                          res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                          "application/json");
@@ -189,9 +188,9 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
     // and the MCP tool list_directory_users) — Rule 1, no more independent
     // drift on this PII-bearing shape. Also closes a real pre-existing gap
     // the #4031 issue flagged: this route exposed email/UPN/group PII with
-    // NO audit call at all. Ignores AuditFn's bool result (a
-    // legacy read; the Integrations writes in this file use it, directory.sync and
-    // directory.group_mapping.update among them) rather than
+    // NO audit call at all. Discards AuditFn's bool result (the
+    // Integrations writes in this file, directory.sync and
+    // directory.group_mapping.update, use it) rather than
     // the newer bool/fail-closed rest_audit.hpp contract the REST v1 twin
     // uses — upgrading DiscoveryRoutes wholesale onto that contract is a
     // separate, broader modernization, not scoped to this PR.
@@ -319,12 +318,17 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                 // Audit-first (ADR-0033 section 9): no `attempted` row, no mapping change. The
                 // per-pair rows below follow the read-back.
-                // The row names the requested pairs (the first chunk; the per-pair rows below carry
-                // the whole list), so a lone surviving `attempted` row still says what was asked.
-                if (!detail::audit_attempted(
-                        audit_fn, req, res, "directory.group_mapping.update", "Directory",
-                        "group-mappings",
-                        integrations::mapping_audit_chunks(applied, "requested").front()))
+                // The row states the TOTAL requested and names the pairs that fit its first chunk
+                // (the per-pair rows below carry the whole list), so a lone surviving `attempted`
+                // row still says how much was asked and, for a short request, exactly what.
+                const auto requested = integrations::mapping_audit_chunks(applied, "requested");
+                const auto pairs_at = requested.front().find(':');
+                const std::string attempted_detail =
+                    std::to_string(applied.size()) + " mappings requested" +
+                    (requested.size() > 1 ? " (first listed)" : "") +
+                    (pairs_at == std::string::npos ? std::string{} : requested.front().substr(pairs_at));
+                if (!detail::audit_attempted(audit_fn, req, res, "directory.group_mapping.update",
+                                             "Directory", "group-mappings", attempted_detail))
                     return;
                 for (const auto& [group_id, role_name] : applied) {
                     if (role_name.empty())

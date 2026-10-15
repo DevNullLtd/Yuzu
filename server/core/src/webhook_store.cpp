@@ -359,7 +359,7 @@ WebhookStore::create_webhook(const std::string& url, const std::string& event_ty
         if (!enc.has_value()) {
             // Encrypt failure aborts here — never write plaintext, never
             // write anything at all (ADR-0010 encrypt-failure semantics).
-            spdlog::error("WebhookStore::create_webhook: secret encrypt failed for {}", url_scheme_host(url));
+            spdlog::error("WebhookStore::create_webhook: secret encrypt failed for {}", url_log_host(url));
             return std::unexpected(WebhookWriteError::db_error);
         }
         encrypted = std::move(*enc);
@@ -386,8 +386,8 @@ WebhookStore::create_webhook(const std::string& url, const std::string& event_ty
         "RETURNING id",
         params);
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
-        spdlog::error("WebhookStore::create_webhook: insert failed for {}: {}", url_scheme_host(url),
-                      PQerrorMessage(lease.get()));
+        spdlog::error("WebhookStore::create_webhook: insert failed for {}: {}", url_log_host(url),
+                      first_line(PQerrorMessage(lease.get())));
         return std::unexpected(WebhookWriteError::db_error);
     }
     return id;
@@ -597,7 +597,7 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
         if (!dec.has_value()) {
             spdlog::warn("WebhookStore: delivery to {} (webhook {}) skipped - signing secret "
                          "unavailable ({})",
-                         url_scheme_host(wh.url), wh.id, pg::SecretCodec::to_external_error());
+                         url_log_host(wh.url), wh.id, pg::SecretCodec::to_external_error());
             if (metrics_)
                 metrics_->counter("yuzu_server_webhook_delivery_secret_unavailable_total")
                     .increment();
@@ -645,11 +645,11 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
         } else {
             error = "connection_failed";
             spdlog::warn("WebhookStore: delivery to {} (webhook {}) failed: connection error",
-                         url_scheme_host(wh.url), wh.id);
+                         url_log_host(wh.url), wh.id);
         }
     } catch (const std::exception& ex) {
         error = ex.what();
-        spdlog::warn("WebhookStore: delivery to {} (webhook {}) failed: {}", url_scheme_host(wh.url),
+        spdlog::warn("WebhookStore: delivery to {} (webhook {}) failed: {}", url_log_host(wh.url),
                      wh.id, error);
     }
     // `signature` is a hex digest, not secret material — nothing left to
@@ -726,7 +726,7 @@ void WebhookStore::fire_event(const std::string& event_type, const std::string& 
         if (!queued) {
             spdlog::warn("WebhookStore: dropped delivery to {} (webhook {}) - worker pool queue "
                          "full or server shutting down",
-                         url_scheme_host(wh.url), wh.id);
+                         url_log_host(wh.url), wh.id);
             if (metrics_)
                 metrics_->counter("yuzu_server_webhook_delivery_dropped_total").increment();
         }

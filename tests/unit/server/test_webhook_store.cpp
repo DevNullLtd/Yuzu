@@ -388,7 +388,7 @@ TEST_CASE("WebhookStore[pg]: a non-NULL secret with has_secret=false is also a C
 }
 
 
-TEST_CASE("WebhookStore[pg]: get separates not-found from a failed read, deliveries report the failure",
+TEST_CASE("WebhookStore[pg]: get separates not-found from a failed read and deliveries report the failure",
           "[webhook_store][pg]") {
     WebhookStorePg store;
     auto id = store->create_webhook("https://example.com/hook", "*", "");
