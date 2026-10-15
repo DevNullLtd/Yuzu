@@ -38,11 +38,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include "agent.pb.h"
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -233,8 +235,17 @@ TEST_CASE("AgentRegistry: register_agent refuses the registration when the devic
 
     // Re-registration now hits a genuine store failure on the revoke sweep —
     // must be REFUSED, not installed.
+    yuzu::test::LogCapture cap;
     auto refused = registry.register_agent(make_info("endpoint-99", "attacker.local"));
+    cap.stop();
     REQUIRE(!refused.has_value());
+
+    // #5513: the store's error text is printed through log_key_token, so the refusal is ONE
+    // physical log line however many lines the store's own message spans.
+    const std::string log_text = cap.text();
+    CHECK(log_text.find("device token revoke-by-device failed for 'endpoint-99'") !=
+          std::string::npos);
+    CHECK(std::count(log_text.begin(), log_text.end(), '\n') == 1);
 
     // The prior (legitimate) session must still be the one on record.
     CHECK(registry.agent_count() == 1);

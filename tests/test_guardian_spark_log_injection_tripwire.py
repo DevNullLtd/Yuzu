@@ -152,9 +152,17 @@ string that can quote the device id) to be wholly one wrap call. The `register_a
 also runs on agent_service_impl.cpp and gateway_service_impl.cpp (REGISTRY_FREE_TEXT_FILES).
 A fifth, narrower rule (COMMAND_TEXT_FILES, agent_service_impl.cpp and gateway_service_impl.cpp)
 requires every spdlog:: argument that is `.command_id()` or `.plugin()` on a message receiver
-(these are free-form bytes on a CommandResponse frame the agent sends) to be wholly one
+(these are free-form bytes on a CommandResponse frame the agent sends), `.gateway_node()` on a
+message receiver or a `.cluster_id()` accessor or the bare local `cluster_id` (gateway-asserted
+provenance fields on the stream-status and heartbeat notifications) to be wholly one
 log_id_token / log_key_token / audit_token / sanitize_for_log call. It reads argument text
-only: a command id copied into a local first is not seen.
+only: a value copied into a local under another name first is not seen.
+A sixth guard (UNSCANNED_LOGGING_FILES, the same five files as the second check) fails on any
+logging FORM the scanner does not parse: an `SPDLOG_TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL(`
+macro, `spdlog::log(` or `default_logger`. The rules above only understand `spdlog::<level>(`
+and `<logger>-><level>(` calls, so a different form would otherwise escape them silently;
+this makes it fail loudly instead. A new file added to the second check is covered by
+extending that tuple, not by this note.
 A third, narrower rule (PQ_ERROR_FILES) requires every spdlog:: argument that contains a
 PQerrorMessage( or PQresultErrorMessage( call in custom_properties_store.cpp to be wrapped
 (libpq error text can quote the claimed agent id). It matches the call name only: a value
@@ -1045,19 +1053,25 @@ def find_registry_free_text_violations_in_text(text: str) -> list[tuple[int, str
 
 
 # Fifth, narrower rule: `.command_id()` / `.plugin()` on a message receiver are free-form bytes
-# on a CommandResponse frame the agent sends. In the two files below every spdlog argument that
-# contains one (not merely sized or emptiness-tested) must be wholly one wrap call. Lexical:
-# a value copied into a local first, a longer receiver chain through a call result other than
-# a plain accessor, and the same lexical gaps as the agent-id check (SPDLOG_* macros,
-# spdlog::log(, default_logger()->, helper lambdas) are not seen.
+# on a CommandResponse frame the agent sends, and `.gateway_node()` / `.cluster_id()` / the local
+# `cluster_id` are gateway-asserted provenance strings on the stream-status and heartbeat
+# notifications. In the two files below every spdlog argument that contains one (not merely
+# sized or emptiness-tested) must be wholly one wrap call. Lexical: a value copied into a local
+# under another name first, a longer receiver chain through a call result other than a plain
+# accessor, and helper lambdas are not seen; the logging forms the scanner does not parse at all
+# are refused outright by the UNSCANNED_LOGGING_FILES guard below.
 COMMAND_TEXT_FILES: tuple[str, ...] = (
     "server/core/src/agent_service_impl.cpp",
     "server/core/src/gateway_service_impl.cpp",
 )
 
 _RAW_COMMAND_TEXT_ACCESSOR_RE = re.compile(
-    r"(?:\.|->)\s*(?:command_id|plugin)\(\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
+    r"(?:\.|->)\s*(?:command_id|plugin|gateway_node|cluster_id)\(\)"
+    r"(?!\s*\.\s*(?:size|empty|length)\s*\()"
 )
+# The bare local `cluster_id` (gateway_service_impl.cpp binds `std::string cluster_id =
+# request->cluster_id();` and clamps it); not a member access, not a call.
+_RAW_BARE_CLUSTER_ID_RE = re.compile(r"(?<![\w.>:])cluster_id\b(?!\s*[(.])")
 
 
 def find_command_text_violations_in_text(text: str) -> list[tuple[int, str]]:
@@ -1067,11 +1081,38 @@ def find_command_text_violations_in_text(text: str) -> list[tuple[int, str]]:
         if parsed is None:
             continue
         for arg in split_top_level_args(parsed[1]):
-            if _RAW_COMMAND_TEXT_ACCESSOR_RE.search(arg) is not None and not (
+            raw = (
+                _RAW_COMMAND_TEXT_ACCESSOR_RE.search(arg) is not None
+                or _RAW_BARE_CLUSTER_ID_RE.search(arg) is not None
+            )
+            if raw and not (
                 argument_is_wrapped(arg) or _is_whole_call_wrapped(arg, _SANITIZE_CALL_NAME_RE)
             ):
                 out.append((text.count("\n", 0, pos) + 1, stmt))
                 break
+    return out
+
+
+# Sixth guard: logging forms the scanner above does not parse. find_spdlog_statements only
+# understands `spdlog::<level>(` and `<logger>-><level>(`; any other form in the five files of
+# the second check would print its arguments unexamined. They are absent today, so the guard
+# fails on any occurrence (a mention in a comment too: reword it) rather than trying to scan them.
+UNSCANNED_LOGGING_FILES: tuple[str, ...] = tuple(AGENT_ID_FILES)
+
+_UNSCANNED_LOGGING_FORM_RE = re.compile(
+    r"\bSPDLOG_(?:TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL)\s*\("
+    r"|\bspdlog\s*::\s*log\s*\("
+    r"|\bdefault_logger\b"
+)
+
+
+def find_unscanned_logging_forms_in_text(text: str) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for m in _UNSCANNED_LOGGING_FORM_RE.finditer(text):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        line = text[line_start : line_end if line_end != -1 else len(text)]
+        out.append((text.count("\n", 0, m.start()) + 1, " ".join(line.split())))
     return out
 
 
@@ -1469,6 +1510,11 @@ def _selfcheck() -> None:
         'spdlog::warn("x {}", request->response().command_id());',
         'spdlog::warn("x {}", "id=" + resp.command_id());',
         'spdlog::warn("x {}", ::yuzu::log_id_token(a) + resp.plugin());',
+        'spdlog::info("node \'{}\'", request->gateway_node());',
+        'spdlog::debug("node \'{}\'", req.gateway_node());',
+        'spdlog::warn("cluster \'{}\'", cluster_id);',
+        'spdlog::warn("cluster \'{}\'", request->cluster_id());',
+        'spdlog::warn("x {} {}", ::yuzu::log_id_token(agent_id), "c=" + cluster_id);',
     ]
     for src in cmd_must_match:
         if not find_command_text_violations_in_text(src):
@@ -1481,10 +1527,39 @@ def _selfcheck() -> None:
         'spdlog::warn("empty? {}", resp.command_id().empty());',
         'spdlog::warn("len {}", resp.command_id().size());',
         'spdlog::info("n {}", n);',
+        'spdlog::info("node \'{}\'", onbehalf::sanitize_for_log(request->gateway_node(), 64));',
+        'spdlog::warn("cluster \'{}\'", onbehalf::sanitize_for_log(cluster_id, 64));',
+        'spdlog::warn("cluster \'{}\'", ::yuzu::log_key_token(request->cluster_id()));',
+        'spdlog::warn("cluster {}", unmapped_cluster_id);',
+        'spdlog::warn("n {}", request->cluster_id().size());',
+        'spdlog::warn("cap {}", kMaxClusterIdLen);',
     ]
     for src in cmd_must_not:
         if find_command_text_violations_in_text(src):
             raise SystemExit(f"selfcheck: unexpected command-id/plugin violation: {src!r}")
+
+    # 12. The unscanned-logging-forms guard (find_unscanned_logging_forms_in_text).
+    form_must_match = [
+        'SPDLOG_INFO("x {}", agent_id);',
+        '  SPDLOG_CRITICAL ("x");',
+        'spdlog::log(spdlog::level::warn, "x {}", id);',
+        'spdlog::log (lvl, "x");',
+        'auto lg = spdlog::default_logger();',
+        'default_logger()->warn("x {}", id);',
+    ]
+    for src in form_must_match:
+        if not find_unscanned_logging_forms_in_text(src):
+            raise SystemExit(f"selfcheck: expected an unscanned-logging-form hit: {src!r}")
+    form_must_not = [
+        'spdlog::warn("x {}", id);',
+        'logger->info("x {}", id);',
+        'spdlog::set_level(spdlog::level::info);',
+        'const auto catalog = spdlog_log_path;',
+        'MY_SPDLOG_INFO_MARK();',
+    ]
+    for src in form_must_not:
+        if find_unscanned_logging_forms_in_text(src):
+            raise SystemExit(f"selfcheck: unexpected unscanned-logging-form hit: {src!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -1554,6 +1629,17 @@ def main() -> int:
         for line_no, stmt in find_command_text_violations_in_text(text):
             snippet = " ".join(stmt.split())[:160]
             agent_hits.append(f"{rel}:{line_no}: {snippet}")
+    for rel in UNSCANNED_LOGGING_FILES:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            agent_hits.append(f"{rel}: file listed in UNSCANNED_LOGGING_FILES does not exist")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for line_no, line in find_unscanned_logging_forms_in_text(text):
+            agent_hits.append(
+                f"{rel}:{line_no}: logging form the scanner does not parse "
+                f"(use spdlog::<level>(...)): {line[:160]}"
+            )
     rc = 0
     if hits:
         print(

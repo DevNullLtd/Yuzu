@@ -1694,8 +1694,9 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     }
 
     response->set_acknowledged_count(acked);
-    spdlog::debug("[gateway] BatchHeartbeat from node '{}': {}/{} acked", request->gateway_node(),
-                  acked, request->heartbeats_size());
+    spdlog::debug("[gateway] BatchHeartbeat from node '{}': {}/{} acked",
+                  onbehalf::sanitize_for_log(request->gateway_node(), 64), acked,
+                  request->heartbeats_size());
     if (metrics_) {
         const bool degraded = store_degraded || presence_batch.failed > 0;
         metrics_
@@ -2125,7 +2126,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                         "claims cluster_id '{}', which differs from this agent's already-bound "
                         "cluster affinity — REFUSING as a likely cross-cluster identity claim "
                         "(#4669), not publishing this placement anywhere",
-                        ::yuzu::log_id_token(agent_id), session_id, cluster_id);
+                        ::yuzu::log_id_token(agent_id), session_id,
+                        onbehalf::sanitize_for_log(cluster_id, 64));
                     record_directory_desync(metrics_, "announce_connected",
                                             "cluster_affinity_violation");
                     if (audit_store_ && audit_store_->is_open()) {
@@ -2329,7 +2331,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                              "not in --gateway-cluster-addr's configured map — commands for this "
                              "agent (and any other agent on this cluster) will be dropped as "
                              "unknown_cluster until it is added",
-                             ::yuzu::log_id_token(agent_id), cluster_id);
+                             ::yuzu::log_id_token(agent_id),
+                             onbehalf::sanitize_for_log(cluster_id, 64));
             }
             if (cap_reached_transition) {
                 spdlog::warn("[gateway] unmapped cluster_id tracking reached its cap ({} "
@@ -2347,7 +2350,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         }
         spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}' ({} wire "
                      "capabilit{})",
-                     ::yuzu::log_id_token(agent_id), request->gateway_node(),
+                     ::yuzu::log_id_token(agent_id),
+                     onbehalf::sanitize_for_log(request->gateway_node(), 64),
                      request->wire_capabilities_size(),
                      request->wire_capabilities_size() == 1 ? "y" : "ies");
         break;
@@ -2490,7 +2494,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             lost_race_sessions_.erase(session_id);
         }
         spdlog::info("[gateway] Agent {} stream DISCONNECTED at gateway node '{}'",
-                     ::yuzu::log_id_token(agent_id), request->gateway_node());
+                     ::yuzu::log_id_token(agent_id),
+                     onbehalf::sanitize_for_log(request->gateway_node(), 64));
         break;
     }
 

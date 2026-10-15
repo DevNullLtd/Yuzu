@@ -23,11 +23,13 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <stdexcept>
@@ -865,4 +867,74 @@ TEST_CASE("CustomPropertiesStore: delete schema removes validation",
     // Accepted without schema
     auto r2 = store.set_property("agent-1", "env", "testing");
     REQUIRE(r2.has_value());
+}
+
+// ============================================================================
+// libpq error text in the store's log lines is neutralised (#5513)
+// ============================================================================
+
+TEST_CASE("CustomPropertiesStore: a failed statement logs the libpq error text on one line",
+          "[pg][custom_props][log_injection][5513]") {
+    // libpq error text ends in a newline and, for a statement error, carries "LINE 1:" and caret
+    // continuation lines, and it can quote the claimed agent id. Each of the nine
+    // PQerrorMessage log sites wraps it in log_key_token, so one failing call is exactly one
+    // physical log line (five sites asserted by name, four sampled ones by the line count).
+    // Per-test cloned database: the tables are renamed away and the clone is dropped with the
+    // test, so nothing is restored.
+    YUZU_REQUIRE_PG_DB_TPL(db, props_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    CustomPropertiesStore store{pool};
+    REQUIRE(store.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        for (const char* sql :
+             {"ALTER TABLE custom_properties_store.custom_properties RENAME TO gone_p",
+              "ALTER TABLE custom_properties_store.custom_property_schemas RENAME TO gone_s"}) {
+            auto r = pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        }
+    }
+
+    yuzu::test::LogCapture cap;
+    CHECK(store.get_properties("agent-1").error() == CustomPropertiesReadError::kDegraded);
+    CHECK(store.get_property("agent-1", "k").error() == CustomPropertiesReadError::kDegraded);
+    CHECK(store.get_property_map("agent-1").error() == CustomPropertiesReadError::kDegraded);
+    CHECK(store.get_values_for_keys({"k"}).error() == CustomPropertiesReadError::kDegraded);
+    CHECK_FALSE(store.delete_property("agent-1", "k"));
+    store.delete_all_properties("agent-1");
+    CHECK(store.list_schemas().empty());
+    CHECK(store.get_schema("k").error() == CustomPropertiesReadError::kDegraded);
+    CHECK(store.delete_schema("k").error() == CustomPropertiesReadError::kDegraded);
+    cap.stop();
+
+    const std::string text = cap.text();
+    // Every log line this store wrote carries "CustomPropertiesStore::" exactly once and ends in
+    // exactly one newline, so the two counts match. Without the wrap, libpq's own trailing newline
+    // and its "LINE 1:" continuation add more newlines than lines. The four read sites
+    // (get_properties, get_property, get_property_map, get_values_for_keys) log through a
+    // process-wide sampler (first degrade per 60 s episode, then every 100th), so whether they
+    // appear depends on earlier tests in the same process: they are exercised above but not
+    // asserted by name. The five sites below are unsampled and asserted.
+    std::size_t lines = 0;
+    for (std::size_t pos = text.find("CustomPropertiesStore::"); pos != std::string::npos;
+         pos = text.find("CustomPropertiesStore::", pos + 1))
+        ++lines;
+    CHECK(lines >= 5);
+    CHECK(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) == lines);
+    for (const char* site :
+         {"delete_property: query failed", "delete_all_properties: delete failed",
+          "list_schemas: query failed", "get_schema: query failed",
+          "delete_schema: query failed"}) {
+        INFO("site=" << site);
+        CHECK(text.find(site) != std::string::npos);
+    }
+    // The statement-error continuation is folded into the same line: the newline after the
+    // "ERROR: ..." sentence became '_' before "LINE 1:".
+    CHECK(text.find("does not exist_LINE 1:") != std::string::npos);
+    CHECK(std::count_if(text.begin(), text.end(), [](char ch) {
+              const auto c = static_cast<unsigned char>(ch);
+              return (c < 0x20 && c != '\n') || c == 0x7F;
+          }) == 0);
 }
