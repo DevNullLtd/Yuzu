@@ -23,6 +23,8 @@
 
 #include "dispatch_target_shape.hpp" // DispatchArm, classify_dispatch_arm, kBroadcastScope
 
+#include <yuzu/log_token.hpp>
+
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
@@ -51,7 +53,7 @@ inline constexpr std::size_t kMaxExpressionLen = 1024;
 /// The one source a fan-out may request (the per-device route accepts more; a herd of
 /// `all` is not what the Software page asks for).
 inline constexpr std::string_view kSource = "installed_software";
-/// Audit wording for a caller-supplied expression: bounded, control bytes defanged.
+/// Audit wording for a caller-supplied expression: bounded, field delimiters defanged.
 inline constexpr std::size_t kAuditTokenMax = 128;
 
 // ── request ───────────────────────────────────────────────────────────────────────
@@ -142,12 +144,11 @@ struct Request {
     return out;
 }
 
-/// Short, bounded, control-free rendering of caller text for an audit row.
+/// Bounded rendering of caller text for an audit row. `log_token` neutralises control bytes,
+/// DEL, space, '=' and ',' (CWE-117), so a hostile expression cannot start a new line or forge
+/// a neighbouring `key=value` field such as `reached=0` in `audit_detail`.
 [[nodiscard]] inline std::string audit_token(std::string_view s, std::size_t max_len = kAuditTokenMax) {
-    std::string out;
-    out.reserve(std::min(s.size(), max_len));
-    for (const unsigned char c : s.substr(0, max_len))
-        out.push_back((c < 0x20 || c == 0x7f) ? '?' : static_cast<char>(c));
+    std::string out = ::yuzu::log_token(s.substr(0, max_len));
     if (s.size() > max_len)
         out += "...";
     return out;

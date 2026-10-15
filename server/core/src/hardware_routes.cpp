@@ -560,7 +560,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const auto parsed = ss::parse_request(nlohmann::json::parse(req.body, nullptr, false));
         if (!parsed) {
             (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "denied", "Scope", "",
-                                            "bad request: " + ss::audit_token(parsed.error()));
+                                            "bad request: " + parsed.error());
             res.status = 400;
             res.set_content(detail::a4_error(res, parsed.error()), "application/json");
             return;

@@ -217,9 +217,11 @@ TEST_CASE("sync cooldown state: bounded, oldest stamp evicted, a returning opera
 
 // ── wording ───────────────────────────────────────────────────────────────────────
 
-TEST_CASE("sync audit token: control bytes defanged, length bounded", "[server][software_sync]") {
+TEST_CASE("sync audit token: control bytes and field delimiters defanged, length bounded",
+          "[server][software_sync]") {
     CHECK(ss::audit_token("plain") == "plain");
-    CHECK(ss::audit_token("a\r\nb\tc\x7f") == "a??b?c?");
+    CHECK(ss::audit_token("a\r\nb\tc\x7f") == "a__b_c_");
+    CHECK(ss::audit_token("x reached=0, skipped_offline=99") == "x_reached_0__skipped_offline_99");
     const std::string longer(ss::kAuditTokenMax + 50, 'x');
     const auto t = ss::audit_token(longer);
     CHECK(t.size() == ss::kAuditTokenMax + 3);
@@ -245,9 +247,33 @@ TEST_CASE("sync audit detail carries scope, arm, source and all four counts", "[
     rq.sel = {DispatchArm::Scope, "x\nrequested=0"};
     const auto d = ss::audit_detail(rq, c);
     CHECK(d.find('\n') == std::string::npos);
-    CHECK(d.starts_with("scope=x?requested=0 arm=scope "));
+    CHECK(d.starts_with("scope=x_requested_0 arm=scope "));
     CHECK(std::string(ss::audit_result({.requested = 5, .reached = 1})) == "requested");
     CHECK(std::string(ss::audit_result({.requested = 5, .reached = 0, .skipped_offline = 5})) == "no_agents");
+}
+
+TEST_CASE("sync audit detail: a hostile expression cannot forge a neighbouring count field",
+          "[server][software_sync][security]") {
+    const auto occurrences = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+    ss::Request rq;
+    const ss::Counts c{.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2};
+    for (const char* hostile : {"x reached=0 skipped_offline=99", "x,reached=0,skipped_version=99",
+                                "x\treached=0\r\nskipped_offline=99", "reached=0 requested=0 arm=group"}) {
+        INFO(hostile);
+        rq.sel = {DispatchArm::Scope, hostile};
+        const auto d = ss::audit_detail(rq, c);
+        // Exactly one of each count key, and it is the real one, after the scope token.
+        for (const char* key : {"requested=", "reached=", "skipped_offline=", "skipped_version=", "arm="})
+            CHECK(occurrences(d, key) == 1);
+        CHECK(d.find("reached=7 skipped_offline=3 skipped_version=2") != std::string::npos);
+        CHECK(d.find('\n') == std::string::npos);
+        CHECK(d.find('\r') == std::string::npos);
+    }
 }
 
 TEST_CASE("sync summary: counts only, never a per-device list", "[server][software_sync]") {
