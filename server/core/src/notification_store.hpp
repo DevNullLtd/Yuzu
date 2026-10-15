@@ -14,9 +14,9 @@
 /// #1033-banning idiom), never `sqlite3_changes()`.
 ///
 /// Posture (ADR-0012 §1): construction is AUTHORITATIVE/fail-closed — a
-/// Postgres store that cannot open is a fatal startup error. Runtime
-/// reads/writes below stay plain container/bool returns (never
-/// `std::expected`) because NONE of them feed an authorization, targeting,
+/// Postgres store that cannot open is a fatal startup error. The plain runtime
+/// reads/writes below stay container/bool returns (the `_checked` variants add the
+/// failure channel the bell route needs) because NONE of them feed an authorization, targeting,
 /// enforcement, or skip decision — `list_unread`/`list_all`/`count_unread`
 /// back a dashboard badge and a display list, and `mark_read`/`dismiss`
 /// affect only what is shown, never what runs. A transient DB error on any
@@ -33,6 +33,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,20 @@ public:
     /// Count unread, non-dismissed notifications. 0 on a closed store or
     /// query error (same display-only degrade as list_unread).
     std::size_t count_unread();
+
+    /// Failure-distinguishing readers and mutators (PR #5859 review). The plain methods above
+    /// keep the display-only degrade for callers that only draw a badge; the operator-facing
+    /// bell route uses these so that a lease timeout or a query error is an error the page can
+    /// show, not "No unread notifications." A closed store is also an error here.
+    /// `mark_read_checked` / `dismiss_checked`: `true` = exactly one row changed, `false` = no
+    /// such id, error = the write may not have reached Postgres.
+    [[nodiscard]] std::expected<std::vector<Notification>, std::string>
+    list_unread_checked(int limit = 50);
+    [[nodiscard]] std::expected<std::vector<Notification>, std::string>
+    list_all_checked(int limit = 100, int offset = 0);
+    [[nodiscard]] std::expected<std::size_t, std::string> count_unread_checked();
+    [[nodiscard]] std::expected<bool, std::string> mark_read_checked(int64_t id);
+    [[nodiscard]] std::expected<bool, std::string> dismiss_checked(int64_t id);
 
 private:
     pg::PgPool& pool_;

@@ -12020,15 +12020,15 @@ Returns the unread feed, newest first. Requires `Infrastructure:Read`.
 }
 ```
 
-`timestamp` is epoch milliseconds. `level` is a free string (`success`, `warn`, `error` and `info` in practice). `title` and `message` can contain agent-supplied text; render them as text only. `503` is returned when the store is unavailable. A degraded database read answers `200` with an empty list and `unread_count` 0, so an empty list does not prove nothing is waiting.
+`timestamp` is epoch milliseconds. `level` is a free string (`success`, `warn`, `error` and `info` in practice). `title` and `message` can contain agent-supplied text; render them as text only. `503` (A4 envelope, `retry_after_ms` 5000) is returned when the store is closed or a read fails, including a database connection timeout; an empty `notifications` array therefore means nothing is waiting.
 
 #### `POST /api/notifications/{id}/read`
 
-Marks one notification read. Requires `Infrastructure:Write`. `200 {"status":"ok"}`; `404` when no row matches. Writes no audit row.
+Marks one notification read. Requires `Infrastructure:Write`. `200 {"status":"ok"}`; `404` when no row matches. A browser (session-cookie) call must carry an `Origin` or `Referer` naming this site, else `403` (audit `csrf.denied`); token callers are exempt. Audit-first: a `notification.mark_read` row with result `attempted` is written before the change and the call answers `503` with `Sec-Audit-Failed: true` if it cannot be written; a `success` or `failure` row follows. `503` also when the database write fails.
 
 #### `POST /api/notifications/{id}/dismiss`
 
-Soft-deletes one notification. Requires `Infrastructure:Write`. `200`; `404` when no row matches. Writes a `notification.dismiss` audit row.
+Soft-deletes one notification. Requires `Infrastructure:Write`. `200`; `404` when no row matches. Same-site rule, audit-first order and `503` behaviour as `read`, with the audit action `notification.dismiss`.
 
 Behaviour to know:
 

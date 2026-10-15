@@ -19113,7 +19113,8 @@ private:
         // NotificationRoutes — /api/notifications/*
         notification_routes_ = std::make_unique<NotificationRoutes>();
         notification_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
-                                              notification_store_.get());
+                                              notification_store_.get(), resolve_session_fn,
+                                              cfg_.csrf_trusted_origins);
 
         // WebhookRoutes — /api/webhooks/*
         webhook_routes_ = std::make_unique<WebhookRoutes>();

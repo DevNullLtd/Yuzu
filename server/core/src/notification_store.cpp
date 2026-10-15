@@ -116,15 +116,15 @@ int64_t NotificationStore::create(const std::string& level, const std::string& t
     return to_i64(PQgetvalue(res.get(), 0, 0));
 }
 
-std::vector<Notification> NotificationStore::list_unread(int limit) {
-    std::vector<Notification> out;
+std::expected<std::vector<Notification>, std::string>
+NotificationStore::list_unread_checked(int limit) {
     if (!open_)
-        return out;
+        return std::unexpected("notification store is not open");
     auto lease = pool_.try_acquire_for(kReadAcquireTimeout);
     if (!lease) {
         spdlog::debug("NotificationStore: list_unread skipped, no connection in time ({})",
                       pool_.last_error());
-        return out;
+        return std::unexpected("no database connection in time");
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -134,8 +134,9 @@ std::vector<Notification> NotificationStore::list_unread(int limit) {
         std::vector<std::string>{std::to_string(limit)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("NotificationStore: list_unread failed: {}", PQerrorMessage(lease.get()));
-        return out;
+        return std::unexpected("query failed");
     }
+    std::vector<Notification> out;
     const int rows = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
@@ -143,15 +144,19 @@ std::vector<Notification> NotificationStore::list_unread(int limit) {
     return out;
 }
 
-std::vector<Notification> NotificationStore::list_all(int limit, int offset) {
-    std::vector<Notification> out;
+std::vector<Notification> NotificationStore::list_unread(int limit) {
+    return list_unread_checked(limit).value_or(std::vector<Notification>{});
+}
+
+std::expected<std::vector<Notification>, std::string>
+NotificationStore::list_all_checked(int limit, int offset) {
     if (!open_)
-        return out;
+        return std::unexpected("notification store is not open");
     auto lease = pool_.try_acquire_for(kReadAcquireTimeout);
     if (!lease) {
         spdlog::debug("NotificationStore: list_all skipped, no connection in time ({})",
                       pool_.last_error());
-        return out;
+        return std::unexpected("no database connection in time");
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -161,8 +166,9 @@ std::vector<Notification> NotificationStore::list_all(int limit, int offset) {
         std::vector<std::string>{std::to_string(limit), std::to_string(offset)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("NotificationStore: list_all failed: {}", PQerrorMessage(lease.get()));
-        return out;
+        return std::unexpected("query failed");
     }
+    std::vector<Notification> out;
     const int rows = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
@@ -170,21 +176,25 @@ std::vector<Notification> NotificationStore::list_all(int limit, int offset) {
     return out;
 }
 
-bool NotificationStore::mark_read(int64_t id) {
+std::vector<Notification> NotificationStore::list_all(int limit, int offset) {
+    return list_all_checked(limit, offset).value_or(std::vector<Notification>{});
+}
+
+std::expected<bool, std::string> NotificationStore::mark_read_checked(int64_t id) {
     if (!open_)
-        return false;
+        return std::unexpected("notification store is not open");
     auto lease = pool_.try_acquire_for(kWriteAcquireTimeout);
     if (!lease) {
         spdlog::debug("NotificationStore: mark_read skipped, no connection in time ({})",
                       pool_.last_error());
-        return false;
+        return std::unexpected("no database connection in time");
     }
     pg::PgResult res = pg::exec_params(
         lease.get(), "UPDATE notification_store.notifications SET read = TRUE WHERE id = $1::bigint",
         std::vector<std::string>{std::to_string(id)});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::debug("NotificationStore: mark_read({}) failed: {}", id, PQerrorMessage(lease.get()));
-        return false;
+        return std::unexpected("query failed");
     }
     // PQcmdTuples(), not the bare PGRES_COMMAND_OK check above: that status
     // is identical whether the WHERE clause matched a row or not — the
@@ -193,14 +203,16 @@ bool NotificationStore::mark_read(int64_t id) {
     return std::string_view(PQcmdTuples(res.get())) != "0";
 }
 
-bool NotificationStore::dismiss(int64_t id) {
+bool NotificationStore::mark_read(int64_t id) { return mark_read_checked(id).value_or(false); }
+
+std::expected<bool, std::string> NotificationStore::dismiss_checked(int64_t id) {
     if (!open_)
-        return false;
+        return std::unexpected("notification store is not open");
     auto lease = pool_.try_acquire_for(kWriteAcquireTimeout);
     if (!lease) {
         spdlog::debug("NotificationStore: dismiss skipped, no connection in time ({})",
                       pool_.last_error());
-        return false;
+        return std::unexpected("no database connection in time");
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -208,19 +220,21 @@ bool NotificationStore::dismiss(int64_t id) {
         std::vector<std::string>{std::to_string(id)});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::debug("NotificationStore: dismiss({}) failed: {}", id, PQerrorMessage(lease.get()));
-        return false;
+        return std::unexpected("query failed");
     }
     return std::string_view(PQcmdTuples(res.get())) != "0";
 }
 
-std::size_t NotificationStore::count_unread() {
+bool NotificationStore::dismiss(int64_t id) { return dismiss_checked(id).value_or(false); }
+
+std::expected<std::size_t, std::string> NotificationStore::count_unread_checked() {
     if (!open_)
-        return 0;
+        return std::unexpected("notification store is not open");
     auto lease = pool_.try_acquire_for(kReadAcquireTimeout);
     if (!lease) {
         spdlog::debug("NotificationStore: count_unread skipped, no connection in time ({})",
                       pool_.last_error());
-        return 0;
+        return std::unexpected("no database connection in time");
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -229,9 +243,11 @@ std::size_t NotificationStore::count_unread() {
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("NotificationStore: count_unread failed: {}", PQerrorMessage(lease.get()));
-        return 0;
+        return std::unexpected("query failed");
     }
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
+
+std::size_t NotificationStore::count_unread() { return count_unread_checked().value_or(0); }
 
 } // namespace yuzu::server
