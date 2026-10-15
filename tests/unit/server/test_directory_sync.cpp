@@ -33,6 +33,9 @@
  */
 
 #include "directory_sync.hpp"
+#include "discovery_routes.hpp"
+#include "integrations_sync_routes.hpp"
+#include "test_route_sink.hpp"
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -53,6 +56,7 @@
 #include <future>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -390,6 +394,48 @@ TEST_CASE("DirectorySync[pg]: update_status is reflected by get_status", "[direc
     CHECK(failed.last_error == "graph unreachable");
 }
 
+TEST_CASE("DirectorySync[pg]: checked reads succeed on an open store and never-synced is a value",
+          "[directory_sync][pg]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    // No status row yet: a legitimate answer, not an error.
+    auto never = store->get_status_checked();
+    REQUIRE(never.has_value());
+    CHECK(never->status == "idle");
+    CHECK(never->last_sync_at == 0);
+    REQUIRE(store->get_synced_users_checked().has_value());
+    CHECK(store->get_synced_users_checked()->empty());
+    REQUIRE(store->get_synced_user_count_checked().has_value());
+    CHECK(*store->get_synced_user_count_checked() == 0);
+
+    DirectorySyncTestAccess::EntraSyncData data;
+    data.users.push_back(make_user("u1", "Alice"));
+    data.users.push_back(make_user("u2", "Bob"));
+    data.groups.push_back(make_group("g1", "Engineering"));
+    data.memberships["g1"] = {"u1"};
+    REQUIRE(acc.apply_entra_sync(data).has_value());
+
+    CHECK(*store->get_synced_user_count_checked() == 2);
+    REQUIRE(store->get_synced_groups_checked().has_value());
+    CHECK(store->get_synced_groups_checked()->size() == 1);
+    CHECK(store->get_synced_users_checked()->size() == 2);
+    // `limit` caps the rows read (the Integrations users fragment asks for a page).
+    auto one = store->get_synced_users_checked({}, 1);
+    REQUIRE(one.has_value());
+    CHECK(one->size() == 1);
+    auto g1 = store->get_synced_users_checked("g1", 5);
+    REQUIRE(g1.has_value());
+    REQUIRE(g1->size() == 1);
+    CHECK(g1->front().groups.size() == 1);
+
+    // A failed sync's status row carries counts of a snapshot that was never
+    // stored; the snapshot count must not follow it.
+    acc.update_status("entra", "failed", 9999, 9999, "graph unreachable");
+    CHECK(store->get_status_checked()->user_count == 9999);
+    CHECK(*store->get_synced_user_count_checked() == 2);
+}
+
 // ── sync_entra / sync_ldap: pure-logic branches (no HTTP reached) ──────────
 
 TEST_CASE("DirectorySync[pg]: sync_entra rejects an incomplete Entra config",
@@ -680,6 +726,14 @@ TEST_CASE("DirectorySync[pg]: a closed store degrades to empty/default, never cr
     CHECK(status.provider == "entra");
     CHECK(status.status == "idle");
     CHECK(store.get_group_role_mappings().empty());
+    CHECK(store.get_group_role_mappings_checked().error() == DirectoryReadError::store_unavailable);
+
+    // The checked reads report the failure instead of the default value, so a
+    // page can tell "could not read" from "never synced" / "no users".
+    CHECK(store.get_status_checked().error() == DirectoryReadError::store_unavailable);
+    CHECK(store.get_synced_users_checked().error() == DirectoryReadError::store_unavailable);
+    CHECK(store.get_synced_groups_checked().error() == DirectoryReadError::store_unavailable);
+    CHECK(store.get_synced_user_count_checked().error() == DirectoryReadError::store_unavailable);
 
     // Void mutators must not crash on a closed store.
     store.configure_group_role_mapping("g1", "Operator");
@@ -690,4 +744,292 @@ TEST_CASE("DirectorySync[pg]: a closed store degrades to empty/default, never cr
     data.users.push_back(make_user("u1", "Alice"));
     auto apply_result = acc.apply_entra_sync(data);
     REQUIRE_FALSE(apply_result.has_value());
+}
+
+TEST_CASE("DirectorySync[pg]: a failed membership lookup fails the checked read and not the legacy one",
+          "[directory_sync][pg]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+    DirectorySyncTestAccess::EntraSyncData data;
+    data.users.push_back(make_user("u1", "Alice"));
+    data.users.push_back(make_user("u2", "Bob"));
+    data.groups.push_back(make_group("g1", "Engineering"));
+    data.memberships["g1"] = {"u1"};
+    REQUIRE(acc.apply_entra_sync(data).has_value());
+
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), "DROP TABLE directory_sync.directory_memberships",
+                                std::vector<std::string>{}).ok());
+    }
+    // Without the groups the users would read as members of nothing.
+    auto strict = store->get_synced_users_checked({}, 5);
+    REQUIRE_FALSE(strict.has_value());
+    CHECK(strict.error() == DirectoryReadError::query_failed);
+    // Callers that never asked for the strict contract keep the best-effort read.
+    auto loose = store->get_synced_users_checked({}, 5, /*require_groups=*/false);
+    REQUIRE(loose.has_value());
+    CHECK(loose->size() == 2);
+    CHECK(store->get_synced_users().size() == 2);
+
+    // The Integrations adapter passes the limit through and maps the failure.
+    auto deps = integrations::bind_stores(nullptr, nullptr, store.get(), nullptr);
+    auto page = deps.directory_users(1);
+    REQUIRE_FALSE(page.has_value());
+    CHECK(page.error() == integrations::ReadError::failed);
+}
+
+namespace {
+/// DiscoveryRoutes over a real DirectorySync with a capturing audit sink.
+struct DirectoryRouteHarness {
+    struct Row {
+        std::string action, result, target_id, detail;
+    };
+    std::vector<Row> audits;   // outcome rows
+    std::vector<Row> attempts; // the audit-first `attempted` rows, written before any change
+    bool audit_persists{true}; // false: the audit sink reports a failed write
+    std::string fail_result;   // non-empty: only rows with this result report a failed write
+    DiscoveryRoutes routes;
+    yuzu::server::test::TestRouteSink sink; // declared after what its handlers capture
+
+    explicit DirectoryRouteHarness(DirectorySync* store) {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "dir-admin";
+            return s;
+        };
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) { return true; };
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&,
+                               const std::string& target_id, const std::string& detail) -> bool {
+            (result == "attempted" ? attempts : audits).push_back({action, result, target_id, detail});
+            if (!fail_result.empty() && result == fail_result)
+                return false;
+            return audit_persists;
+        };
+        auto resolve_fn = [](const httplib::Request&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "dir-admin";
+            s.auth_source = "local"; // a cookie session, so the same-site gate applies
+            return s;
+        };
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, store, nullptr, nullptr, nullptr,
+                               WriteGate{resolve_fn, {}});
+    }
+    auto put_mappings(const std::string& body) {
+        return sink.Put("/api/directory/group-mappings", body, "application/json");
+    }
+};
+} // namespace
+
+TEST_CASE("DiscoveryRoutes[pg]: directory sync failures are audited with fixed non-secret details",
+          "[directory_sync][pg][routes]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+
+    auto bad = h.sink.Post("/api/directory/sync", "{", "application/json");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "directory.sync");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].detail == "invalid_json");
+
+    auto missing = h.sink.Post("/api/directory/sync",
+                               R"({"provider":"entra","tenant_id":"t","client_id":"c"})",
+                               "application/json");
+    REQUIRE(missing);
+    CHECK(missing->status == 400);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].target_id == "entra");
+    CHECK(h.audits[1].detail == "missing_credentials");
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: group mapping audit records what is stored and not what was asked",
+          "[directory_sync][pg][routes]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+
+    // Stored as asked: one success row naming the pair.
+    auto ok = h.put_mappings(R"({"mappings":[{"group_id":"g1","role_name":"Operator"}]})");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "directory.group_mapping.update");
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail == "1 mappings updated: g1=Operator");
+    REQUIRE(h.attempts.size() == 1); // audit-first: written before the change, names the pairs
+    CHECK(h.attempts[0].action == "directory.group_mapping.update");
+    CHECK(h.attempts[0].detail == "1 mappings requested: g1=Operator");
+
+    // A group named twice ends with its last entry: audited once, as stored.
+    h.audits.clear();
+    auto dup = h.put_mappings(R"({"mappings":[{"group_id":"g2","role_name":"bogus"},)"
+                              R"({"group_id":"g2","role_name":"Administrator"}]})");
+    REQUIRE(dup);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail == "1 mappings updated: g2=Administrator");
+
+    // A removal that took effect is a success.
+    h.audits.clear();
+    REQUIRE(h.put_mappings(R"({"mappings":[{"group_id":"g1","role_name":""}]})"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail == "1 mappings updated: g1=(removed)");
+
+    // Break the table: the writes are swallowed and the read-back fails too.
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DROP TABLE directory_sync.directory_group_role_mappings",
+                                std::vector<std::string>{}).ok());
+    }
+    h.audits.clear();
+    REQUIRE(h.put_mappings(R"({"mappings":[{"group_id":"g2","role_name":"Operator"}]})"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].detail == "1 mappings not confirmed by read-back: g2=Operator");
+
+    // A removal must not read as confirmed just because nothing could be read.
+    h.audits.clear();
+    REQUIRE(h.put_mappings(R"({"mappings":[{"group_id":"g2","role_name":""}]})"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].detail == "1 mappings not confirmed by read-back: g2=(removed)");
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a large mapping request is audited in full and over several rows",
+          "[directory_sync][pg][routes]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+
+    // Decoys ahead of the pair that matters must not push it out of the trail.
+    nlohmann::json body = {{"mappings", nlohmann::json::array()}};
+    for (int i = 0; i < 120; ++i)
+        body["mappings"].push_back({{"group_id", "decoy-group-" + std::to_string(i)},
+                                    {"role_name", "Operator"}});
+    body["mappings"].push_back({{"group_id", "the-real-group"}, {"role_name", "Administrator"}});
+    REQUIRE(h.put_mappings(body.dump()));
+
+    REQUIRE(h.audits.size() > 1);
+    bool found = false;
+    std::size_t pairs = 0;
+    for (const auto& a : h.audits) {
+        CHECK(a.action == "directory.group_mapping.update");
+        CHECK(a.result == "success");
+        CHECK(a.detail.size() <= 1000);
+        found = found || a.detail.find("the-real-group=Administrator") != std::string::npos;
+        for (std::size_t at = 0; (at = a.detail.find('=', at)) != std::string::npos; ++at)
+            ++pairs;
+    }
+    CHECK(found);
+    CHECK(pairs == 121);
+    // The audit-first row states the TOTAL asked for, not the size of its first chunk.
+    REQUIRE(h.attempts.size() == 1);
+    CHECK(h.attempts[0].detail.starts_with("121 mappings requested (first listed): decoy-group-0="));
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a malformed mapping entry refuses the whole batch and stores nothing",
+          "[directory_sync][pg][routes][security]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+
+    // The bad entry comes LAST: a loop that wrote as it read would store g1 first.
+    for (const char* body : {R"({"mappings":[{"group_id":"g1","role_name":"Operator"},"oops"]})",
+                             R"({"mappings":[{"group_id":"g1","role_name":"Operator"},)"
+                             R"({"group_id":7,"role_name":"Operator"}]})",
+                             R"({"mappings":[{"group_id":"g1","role_name":"Operator"},)"
+                             R"({"group_id":"g2","role_name":["x"]}]})"}) {
+        INFO(body);
+        auto res = h.put_mappings(body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->get_header_value("X-Correlation-Id") != "");
+        CHECK(h.attempts.empty()); // validated before the audit-first row
+        CHECK(h.audits.empty());
+        auto stored = store.get()->get_group_role_mappings_checked();
+        REQUIRE(stored);
+        CHECK(stored->empty());
+    }
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: mapping save and sync fail closed when the attempted row cannot be "
+          "written (mutation: mutate before auditing)",
+          "[directory_sync][pg][routes][security]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+    h.audit_persists = false;
+
+    auto save = h.put_mappings(R"({"mappings":[{"group_id":"g1","role_name":"Operator"}]})");
+    REQUIRE(save);
+    CHECK(save->status == 503);
+    CHECK(save->get_header_value("Sec-Audit-Failed") == "true");
+    auto sync = h.sink.Post("/api/directory/sync",
+                            R"({"provider":"entra","tenant_id":"t","client_id":"c","client_secret":"s"})",
+                            "application/json");
+    REQUIRE(sync);
+    CHECK(sync->status == 503);
+    CHECK(sync->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.audits.empty()); // nothing followed the attempted rows
+    REQUIRE(h.attempts.size() == 2);
+    CHECK(h.attempts[1].action == "directory.sync");
+    CHECK(h.attempts[1].detail.empty()); // the credentials never reach the row
+    auto stored = store.get()->get_group_role_mappings_checked();
+    REQUIRE(stored);
+    CHECK(stored->empty());
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a cross-site or header-less cookie write is refused 403",
+          "[directory_sync][pg][routes][security]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+    using Hdrs = std::unordered_map<std::string, std::string>;
+    for (const auto& headers : {Hdrs{{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}},
+                                Hdrs{{"Host", "yuzu.test"}}}) {
+        h.sink.default_headers = headers;
+        auto save = h.put_mappings(R"({"mappings":[{"group_id":"g1","role_name":"Operator"}]})");
+        REQUIRE(save);
+        CHECK(save->status == 403);
+        auto sync = h.sink.Post("/api/directory/sync", R"({"provider":"entra"})", "application/json");
+        REQUIRE(sync);
+        CHECK(sync->status == 403);
+    }
+    CHECK(h.attempts.empty());
+    auto stored = store.get()->get_group_role_mappings_checked();
+    REQUIRE(stored);
+    CHECK(stored->empty());
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a lost outcome row keeps the 2xx and marks Sec-Audit-Failed",
+          "[directory_sync][pg][routes][security]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+    h.fail_result = "success";
+    auto save = h.put_mappings(R"({"mappings":[{"group_id":"g1","role_name":"Operator"}]})");
+    REQUIRE(save);
+    CHECK(save->status == 200);
+    CHECK(save->get_header_value("Sec-Audit-Failed") == "true");
+    auto stored = store.get()->get_group_role_mappings_checked();
+    REQUIRE(stored);
+    CHECK(stored->size() == 1); // the change was made
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a lost failure row still marks Sec-Audit-Failed on a refused sync",
+          "[directory_sync][pg][routes][security]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+    h.fail_result = "failure";
+    auto missing = h.sink.Post("/api/directory/sync",
+                               R"({"provider":"entra","tenant_id":"t","client_id":"c"})",
+                               "application/json");
+    REQUIRE(missing);
+    CHECK(missing->status == 400);
+    CHECK(missing->get_header_value("Sec-Audit-Failed") == "true");
 }

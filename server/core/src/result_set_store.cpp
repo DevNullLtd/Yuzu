@@ -478,31 +478,51 @@ std::vector<ResultSet> ResultSetStore::list_by_owner(const std::string& owner,
     return std::move(r->sets);
 }
 
+MembersPageSql build_members_page_sql(const std::string& id, const std::string& cursor,
+                                      int limit, const authz::VisibleSet& visible) {
+    MembersPageSql out;
+    out.sql = "SELECT device_id FROM result_set_store.result_set_members WHERE result_set_id = $1";
+    out.params.push_back(id);
+    int idx = 2;
+    // Visibility MUST precede ORDER BY/LIMIT: ADR-0017 INV-3 (CRITICAL). Applied after, a
+    // device the caller can no longer see would take a page slot and a confined caller would
+    // page through (and be shown a "Show more" for) ids that are not theirs.
+    if (visible) {
+        if (visible->empty()) {
+            out.sql += " AND 1=0"; // visible to nobody
+        } else {
+            std::vector<std::string_view> sv(visible->begin(), visible->end());
+            out.sql += " AND device_id = ANY($" + std::to_string(idx++) + "::text[])";
+            out.params.push_back(pg::to_text_array(sv));
+        }
+    }
+    // Keyset over device_id ASC.
+    if (!cursor.empty()) {
+        out.sql += " AND device_id > $" + std::to_string(idx++);
+        out.params.push_back(cursor);
+    }
+    out.sql += " ORDER BY device_id ASC LIMIT $" + std::to_string(idx) + "::bigint";
+    out.params.push_back(std::to_string(limit + 1)); // fetch one extra to detect next page
+    return out;
+}
+
 std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::members_checked(
-    const std::string& id, const std::string& cursor, int limit) {
+    const std::string& id, const std::string& cursor, int limit,
+    const authz::VisibleSet& visible) {
     if (!open_)
         return std::unexpected(ResultSetError::DbError);
     if (limit <= 0)
         limit = 1000;
+    if (visible && visible->empty())
+        return MembersPage{}; // deny-all: nothing to read, nothing to disclose
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::error("ResultSetStore::members_checked: no connection ({})", pool_.last_error());
         return std::unexpected(ResultSetError::DbError);
     }
 
-    // Keyset over device_id ASC.
-    std::string sql =
-        "SELECT device_id FROM result_set_store.result_set_members WHERE result_set_id = $1";
-    std::vector<std::string> params{id};
-    if (!cursor.empty()) {
-        sql += " AND device_id > $2 ORDER BY device_id ASC LIMIT $3::bigint";
-        params.push_back(cursor);
-    } else {
-        sql += " ORDER BY device_id ASC LIMIT $2::bigint";
-    }
-    params.push_back(std::to_string(limit + 1));
-
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    const auto built = build_members_page_sql(id, cursor, limit, visible);
+    pg::PgResult res = pg::exec_params(lease.get(), built.sql.c_str(), built.params);
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::members_checked: query failed: {}",
                       PQerrorMessage(lease.get()));

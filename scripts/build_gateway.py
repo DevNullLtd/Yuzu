@@ -9,12 +9,17 @@ Toolchain resolution, the Windows hazards (the MSYS2 temp dir, console
 stdio, invisible git prompts) and the process-tree kill are shared with
 test_gateway.py through erlang_toolchain.py - handle them there, not here.
 
-On Windows the child never touches an inherited stdio handle: its merged
-stdout+stderr go to a pipe this wrapper relays to its own stdout and tees to
-<build dir>/meson-logs/yuzu_gateway_build.log. An IDE-launched Ninja (CLion)
-can hand its children handles the Erlang VM cannot write to; without the pipe
-the VM dies on its first write ("Writer crashed ('The handle is invalid.')",
-exit 127) having printed nothing anywhere.
+On every platform the child never touches an inherited stdio handle: its
+merged stdout+stderr go to a pipe this wrapper relays to its own stdout and
+tees to <build dir>/meson-logs/yuzu_gateway_build.log, beside Meson's own
+meson-log.txt. The log is the durable record of the Erlang compile: the target
+runs in Ninja's console pool, so a redirected or IDE build otherwise keeps
+nothing but the command line, and meson-log.txt itself is rewritten by every
+(re)configure, so it cannot hold build-time output. On Windows the pipe is
+also load-bearing: an IDE-launched Ninja (CLion) can hand its children handles
+the Erlang VM cannot write to, and without the pipe the VM dies on its first
+write ("Writer crashed ('The handle is invalid.')", exit 127) having printed
+nothing anywhere.
 """
 import os
 import subprocess
@@ -27,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from erlang_toolchain import (  # noqa: E402
     base_env,
     kill_tree,
+    otp_version,
     rebar3_prefix,
     windows_stdio_isolation,
 )
@@ -272,11 +278,12 @@ def _log_hint(log_path, relay, drained):
 def run_build(cmd, cwd, env, timeout_s, log_dir, relay_output=None):
     """Run cmd under the timeout; return the wrapper's exit code.
 
-    relay_output (default: on Windows only) routes the child's output through
-    the pipe + Relay described in the module docstring.
+    relay_output (default: on, every platform) routes the child's output
+    through the pipe + Relay described in the module docstring, which also
+    writes the build log.
     """
     if relay_output is None:
-        relay_output = sys.platform == "win32"
+        relay_output = True
     popen_kwargs = {"cwd": cwd, "env": env}
     popen_kwargs.update(windows_stdio_isolation())
     if sys.platform != "win32":
@@ -290,6 +297,20 @@ def run_build(cmd, cwd, env, timeout_s, log_dir, relay_output=None):
         if log_fd is None and log_dir and os.path.isdir(log_dir):
             _say(sys.stderr, f"build_gateway: could not create a build log in "
                  f"{log_dir}; output goes to the console only.")
+        if log_fd is not None:
+            # Header: which toolchain built this, so a log read later answers
+            # "which OTP?" without re-running anything.
+            otp_bin = (env if env is not None else os.environ).get("YUZU_OTP_BIN", "")
+            header = (
+                f"build_gateway: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
+                f"build_gateway: command {cmd!r} in {cwd}\n"
+                f"build_gateway: OTP {otp_version(otp_bin) if otp_bin else 'unresolved'}"
+                f" from {otp_bin or 'PATH'}\n"
+            )
+            try:
+                _write_all(log_fd, header.encode("utf-8", "replace"))
+            except OSError:
+                pass
 
     _say(sys.stdout, f"build_gateway: running {cmd!r} in {cwd}")
     try:

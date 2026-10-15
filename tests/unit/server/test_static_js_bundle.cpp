@@ -365,6 +365,26 @@ TEST_CASE("static_js_bundle: kYuzuVizJs declares per-OS palette for linux/darwin
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("default: '#9aa2ae'"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuVizJs pins the listener coral, talking-socket blue and local edge",
+          "[static-js][viz]") {
+    // Reverting the listener sphere to yellow (or the :port label away from the coral chart
+    // token) must fail loud: the invariants doc and the legend both name these colours.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xff6b7a"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("ctx.fillStyle = '#ff6b7a'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("TALKING_SOCKET_COLOR = 0x7ab6ff"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xe9ecf0"));
+}
+
+TEST_CASE("static_js_bundle: the Fleet page keeps its error banner and the Host page its Refresh button",
+          "[static-js][viz][page]") {
+    REQUIRE(kVizFleetPageHtml != nullptr);
+    REQUIRE(kVizHostPageHtml != nullptr);
+    const std::string fleet(kVizFleetPageHtml);
+    CHECK_THAT(fleet, ContainsSubstring("id=\"viz-error\" role=\"alert\""));
+    CHECK_THAT(fleet, ContainsSubstring("#viz-error.shown { display: flex; }"));
+    CHECK_THAT(std::string(kVizHostPageHtml), ContainsSubstring("id=\"refresh-btn\""));
+}
+
 TEST_CASE("static_js_bundle: kYuzuVizJs leaves the stage backdrop to the page CSS",
           "[static-js][viz]") {
     // The page's .viz-stage rule paints the backdrop so it follows the

@@ -258,7 +258,7 @@ TEST_CASE("hardware row: DEX badge tone — ok from 90 and warn from 75 and bad 
         row.hostname = "WS-1";
         row.dex_score = score;
         CHECK(nth_td(first_row(render_row(row)), 5) ==
-              std::string("<span class=\"hw-pill ") + tone + "\">" + std::to_string(score) + "</span>");
+              std::string("<span class=\"pill ") + tone + "\">" + std::to_string(score) + "</span>");
     }
 }
 
@@ -280,19 +280,19 @@ TEST_CASE("hardware row: status pill — online ok and stale warn and offline ne
     row.hostname = "WS-1";
 
     row.online = true;
-    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"hw-pill ok\">online</span>");
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill ok\">online</span>");
 
     row.online = true;
     row.stale = true; // a live stream outranks a stale heartbeat
-    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"hw-pill ok\">online</span>");
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill ok\">online</span>");
 
     row.online = false;
     row.stale = true;
-    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"hw-pill warn\">stale</span>");
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill warn\">stale</span>");
 
     row.online = false;
     row.stale = false;
-    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"hw-pill\">offline</span>");
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill idle\">offline</span>");
 }
 
 // ── IP cell ────────────────────────────────────────────────────────────────────
@@ -595,14 +595,14 @@ TEST_CASE("hardware CI fragment: header status pill — online ok and otherwise 
     identity.online = true;
     d.identity = identity;
     const auto on = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
-    CHECK(on.find("<span class=\"hw-pill ok\">online</span>") != std::string::npos);
-    CHECK(on.find("<span class=\"hw-pill\">offline</span>") == std::string::npos);
+    CHECK(on.find("<span class=\"pill ok\">online</span>") != std::string::npos);
+    CHECK(on.find("<span class=\"pill idle\">offline</span>") == std::string::npos);
 
     identity.online = false;
     d.identity = identity;
     const auto off = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
-    CHECK(off.find("<span class=\"hw-pill\">offline</span>") != std::string::npos);
-    CHECK(off.find("<span class=\"hw-pill ok\">online</span>") == std::string::npos);
+    CHECK(off.find("<span class=\"pill idle\">offline</span>") != std::string::npos);
+    CHECK(off.find("<span class=\"pill ok\">online</span>") == std::string::npos);
 }
 
 // Kills: rendering the KPI strip (all zeros) above the roster-unavailable banner. The marker is

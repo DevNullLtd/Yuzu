@@ -22,8 +22,7 @@
 ///     never a silent empty. An empty member list or empty `app_name` is a
 ///     precondition miss → empty value, not a degrade.
 ///
-/// The percentile floor a small group needs (a named set of specific devices ⇒
-/// small-N aggregate = de-facto individual behaviour) is applied by the READ
+/// The floor (one device: an empty point is withheld) is applied by the READ
 /// model (`app_perf_group_trend`), not here — this reader just produces the
 /// honest aggregate + its device_count.
 
