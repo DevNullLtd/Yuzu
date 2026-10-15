@@ -381,6 +381,23 @@ The `/auto` deploy verbs share this pattern: `deployment.create` emits `resumed`
 
 ## REST API
 
+**Who may read the audit trail.** Reading it needs the `AuditLog:Read`
+permission, on every surface: the REST routes below, the dashboard viewer, and
+the MCP `query_audit_log` / `audit_engine_no_admin` tools and
+`yuzu://audit/recent` resource.
+
+- **RBAC disabled (the shipped default):** only an `admin`-role session may
+  read the trail (#5771). Any other authenticated session gets `403`, audited with a `detail` beginning
+  `topology floor: non-admin role denied AuditLog:Read` (match on the prefix: an
+  MCP-tier token's row appends `(mcp_tier=<tier>)`). Engine principals and
+  service-scoped tokens are refused as before.
+- **RBAC enabled:** `AuditLog:Read` is an ordinary grant. The seeded
+  `Administrator`, `PlatformEngineer`, `Operator`, `ITServiceOwner` and `Viewer`
+  roles hold it; a custom role can be granted it. A holder sees every row.
+
+See [RBAC](rbac.md#the-authorization-topology-floor-2376) for the floor and for
+how to grant a non-admin the read.
+
 ### GET /api/v1/audit
 
 Query audit events with filtering and pagination. Maximum page size is 1000.
@@ -392,10 +409,11 @@ Query audit events with filtering and pagination. Maximum page size is 1000.
 | `limit` | integer | Number of events to return (default 100, max 1000) |
 | `principal` | string | Filter by principal username |
 | `action` | string | Filter by action (exact match) |
-
-Note: the v1 endpoint supports `principal` and `action` filters only. For
-additional filters (`target_type`, `target_id`, `since`, `until`, `offset`),
-use the legacy `/api/audit` endpoint.
+| `target_type` | string | Filter by target type (exact match) |
+| `target_id` | string | Filter by target id (exact match); requires `target_type` |
+| `since` | integer | Inclusive lower bound, epoch seconds; `0` or absent is unbounded |
+| `until` | integer | Inclusive upper bound, epoch seconds; `0` or absent is unbounded |
+| `offset` | integer | Rows to skip, `0`..`10000` (default 0) |
 
 **Example --- fetch the 20 most recent events:**
 
@@ -410,6 +428,7 @@ curl -s -b cookies.txt \
 {
   "data": [
     {
+      "id": 4101,
       "timestamp": 1710849600,
       "principal": "admin",
       "action": "tag.set",
@@ -422,7 +441,7 @@ curl -s -b cookies.txt \
   "pagination": {
     "total": 20,
     "start": 0,
-    "page_size": 50
+    "page_size": 100
   },
   "meta": {
     "api_version": "v1"
@@ -431,17 +450,17 @@ curl -s -b cookies.txt \
 ```
 
 **`total` is the number of rows returned in this response, not the number of
-rows that matched** — the route caps at `limit` (max 1000) with no `offset`
-support, so a response at exactly `limit` rows can mean there are older
-matches you have not seen, not that you have everything. `page_size` is
-likewise always `50`, independent of the `limit` you actually passed
-([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If you hit the cap,
-narrow with `principal=`/`action=`, or use the legacy `GET /api/audit`
-endpoint, which also accepts `offset`. `since`/`until` alone only bounds the
-time window — it does not by itself guarantee completeness inside that
-window if more rows matched than one call returns. The reliable recipe is
-both together: freeze a bounded window with `since`/`until` first, then page
-through it with `offset`.
+rows that matched.** `start` echoes `offset` and `page_size` echoes `limit`; a
+page shorter than `limit` is the last page.
+The MCP `query_audit_log` tool also returns `has_more`, true when more matching rows exist
+past the page. Rows are ordered newest first and
+rows with an identical timestamp break by `id` (newest first). On an unchanging
+result set `offset` paging neither repeats nor skips rows; the log is live, so a
+new event or a retention delete between page fetches shifts later pages. Pin the
+window with a fixed `until` in the past and use `id` to de-duplicate. `offset` is
+capped at 10000 and never clamped (a larger value is a `400`). To read deeper,
+set `until` to the oldest `timestamp` already seen (inclusive), restart at
+`offset=0`, and de-duplicate on `id`.
 
 **Example --- filter by principal and action:**
 
@@ -459,16 +478,18 @@ curl -s -b cookies.txt \
 
 ### GET /api/audit (legacy)
 
-The legacy endpoint supports the full set of query parameters and has no
-hard-coded limit cap. New integrations should prefer `/api/v1/audit` once
-additional filters are added there.
+The legacy endpoint caps `limit` at 1000 and rejects `offset` above 10000, the
+same ceilings as `/api/v1/audit`. It answers `400` for a negative `since`/`until`, an
+inverted window, and a string filter holding a NUL or invalid UTF-8 (the v1 route does the
+same for the string filters). New integrations should prefer `/api/v1/audit`, which also
+rejects a `target_id` given without `target_type`.
 
 **Query parameters:**
 
 | Parameter | Type | Description |
 |---|---|---|
-| `limit` | integer | Number of events to return (default 100, no hard cap) |
-| `offset` | integer | Offset for pagination (default 0) |
+| `limit` | integer | Number of events to return (default 100, max 1000) |
+| `offset` | integer | Offset for pagination, `0`..`10000` (default 0; larger is a `400`) |
 | `principal` | string | Filter by principal username |
 | `action` | string | Filter by action (exact match) |
 | `target_type` | string | Filter by target type |
@@ -487,11 +508,11 @@ The legacy response envelope differs from v1:
 ```
 
 The legacy response includes additional fields per event not present in the v1
-response: `id`, `principal_role`, `source_ip`.
+response: `principal_role`, `source_ip` (`id` is on both).
 
 ```bash
 curl -s -b cookies.txt \
-  'http://localhost:8080/api/audit?limit=5000&principal=admin' | jq .
+  'http://localhost:8080/api/audit?limit=1000&principal=admin' | jq .
 ```
 
 ## Dashboard viewer
@@ -499,7 +520,8 @@ curl -s -b cookies.txt \
 The Yuzu dashboard includes a built-in audit log viewer accessible from the
 navigation menu. The viewer renders audit events as an HTMX-powered table with
 live filtering by principal, action, and date range. No additional
-configuration is required.
+configuration is required. It is backed by `GET /api/audit`, so the same
+`AuditLog:Read` rule applies (admin-only while RBAC is disabled).
 
 ## Retention and cleanup
 

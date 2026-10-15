@@ -266,13 +266,17 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # the two Estate changes net 0 on their own (+1 NVD status card exception, -1 discovery row
 # twinned), so the count after this merge is the value the checker reports, set from its output.
 #
-# The System General page (merged from this branch) adds the two composed-of fragments
-# described above (general-runtime, analytics-events): 208 + 2 = 210, the value the checker
-# reports on the merged tree.
+# The System General page (this branch) adds the two composed-of fragments described above
+# (general-runtime, analytics-events): +2. Landing on dev's 207 (after the audit filter parity
+# flip below), the count is 209, the value the checker reports on the merged tree.
+#
+# Audit filter parity: get.api-audit flips "planned:#2146" -> "twinned" (GET /api/v1/audit +
+# MCP query_audit_log, now at filter/paging parity), the checker reports 208 - 1 = 207 on the merged tree
+# (dev's 208 above, less this flip).
 #
 # Merged onto the Estate changes: the count is the value the checker reports on the merged
 # tree, set from its output.
-BASELINE_UNTWINNED = 210
+BASELINE_UNTWINNED = 209
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

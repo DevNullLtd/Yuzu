@@ -1262,6 +1262,39 @@ via a fire-and-forget path that cannot detect a dropped audit row — see
 three-way posture (REST v1 fail-closed / MCP set-and-proceed-with-signal /
 legacy silent).
 
+### vNEXT — the audit trail is admin-only while RBAC is disabled (#5771) (breaking)
+
+**Who this affects.** Deployments with RBAC enforcement off (the
+shipped default; see `GET /api/v1/rbac/enforcement`) where a non-admin, authenticated session or API token reads
+the audit trail — a SIEM export, an evidence-collection script or a
+dashboard user signed in as a plain `user`. RBAC-**enabled** deployments are
+unaffected.
+
+**What changes.** `AuditLog:Read` joins the authorization topology floor (see
+the #2376 note above). With RBAC disabled, every audit read surface now
+requires the `admin` session role: `GET /api/audit`, `GET /api/v1/audit`,
+`GET /api/v1/audit/auth-sample`,
+`GET /api/v1/engine-principals/audit/no-admin`, the MCP `query_audit_log` and
+`audit_engine_no_admin` tools, and the `yuzu://audit/recent` resource. A
+non-admin gets `403`, audited with a `detail` beginning `topology floor: non-admin role denied
+AuditLog:Read` (match on the prefix: an MCP-tier token's row appends
+`(mcp_tier=<tier>)`) and counted in
+`yuzu_auth_topology_floor_denied_total{permission="AuditLog:Read"}`. Why: the
+trail is the SOC 2 CC6.1/CC7.2 evidence chain, and the legacy route also
+returns each actor's role and source IP.
+
+**What does not change.** An `admin`-role session, and an MCP token minted by
+one, still read the trail. Under RBAC-**enabled** enforcement a role holding
+`AuditLog:Read` (the seeded `Administrator`, `PlatformEngineer`, `Operator`,
+`ITServiceOwner` and `Viewer`, or any custom role granted it) is admitted
+exactly as before. Engine principals and service-scoped tokens were already
+refused with RBAC off.
+
+**What to do.** If a non-admin identity needs the trail, either enable RBAC
+and assign it a role that holds `AuditLog:Read`, or run the automation as an
+admin-owned token. See [`rbac.md`](rbac.md) "The authorization topology
+floor".
+
 ### vNEXT — approval tickets outstanding at the upgrade must be re-requested (#2442) (breaking)
 
 **Who this affects.** Any deployment holding an **MCP** approval that was granted but not yet

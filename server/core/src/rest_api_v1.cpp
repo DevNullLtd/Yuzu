@@ -62,6 +62,7 @@
 #include "password_policy.hpp"       // #5342 — check_password_policy for the password routes
 #include "credential_change_owner.hpp" // #5342 — CredentialChangeRequest/Outcome (the one-transaction write)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
+#include "admin_gate.hpp"
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_catalogue_model.hpp" // shared REST+MCP software catalogue model
@@ -874,14 +875,18 @@ const std::string& openapi_spec() {
   "security": [{"bearerAuth": [], "apiKeyHeader": [], "cookieAuth": []}],
   "paths": {
     "/me": {
-      "get": {"summary": "Get current user info", "tags": ["Authentication"], "responses": {"200": {"description": "Current user details"}}}
+      "get": {"summary": "Get current user info (adds effective_role, elevated, elevated_until, can_access_settings)", "tags": ["Authentication"], "responses": {"200": {"description": "Current user details"}}}
     },
     "/devices": {
       "get": {"summary": "Fleet device list (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint — SOLE gate, never stacked with a bare permission check). Row shape matches the pre-existing MCP list_agents tool exactly: agent_id/hostname/os/arch/agent_version, 5 fields, sourced from the live AgentRegistry. devices_omitted counts agents dropped by the caller's management-group/service-scope confinement (0 = unfiltered or nothing dropped). Not audited on success (device identity is machine metadata, not behavioural PII) — require_fleet_read itself audits every denial path internally.", "responses": {"200": {"description": "{data: {devices[], count, devices_omitted}, pagination, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "503": {"description": "Route misconfigured (fleet_read_fn/device registry unwired) or authorization store unavailable"}}}
     },
     "/devices/{id}": {
       "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Always includes a tags array (key/value/source), empty when the device has no tags (a null/unwired TagStore degrades to an empty array, never an omitted key). Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags[]}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
-    },
+    },)json"
+        // Split before /hardware: the /me summary growth (#5779) took the first
+        // segment past 15,000 bytes. Adjacent literals concatenate at compile
+        // time, so the emitted OpenAPI JSON is byte-identical.
+        R"json(
     "/hardware": {
       "get": {"summary": "Hardware CI list (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint). Query params q/os/status/sort/dir/tag/offset/limit — an unrecognised sort/os/status token or an invalid tag key is a 400, and any dir other than desc sorts ascending. Rows carry the same identity fields as /devices plus CI blob fields (manufacturer/model/serial/cpu/ram/os_version), a per-page DEX score, agent_version/arch, claimed IPs, and tags. `dex_score` is `null` both when the device has no DEX data and when the per-device DEX read degraded (#4855) — this list/badge view does not distinguish the two (tracked at #4909); see `GET /api/v1/dex/devices/{id}` for a degrade-distinguishing per-device read. Audited as inventory.devices (result=failure when the roster read failed); a persist failure on the success audit fails the request closed (503).", "responses": {"200": {"description": "{data: {devices[], kpis, query}, pagination, meta}"}, "400": {"description": "Unrecognised sort, os, or status token, or an invalid tag key"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "503": {"description": "Route misconfigured (roster unwired), the device roster could not be read (retry_after_ms set), the authorization store unavailable (retry_after_ms 5000), or audit subsystem degraded"}}}
     },
@@ -1014,10 +1019,10 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/rbac/roles": {
-      "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "responses": {"200": {"description": "List of roles"}}}
+      "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "description": "Requires UserManagement:Read. A degraded RBAC store is a retryable 503 (retry_after_ms 5000), never an empty 200 list.", "responses": {"200": {"description": "List of roles"}, "403": {"description": "Requires UserManagement:Read"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
     },
     "/rbac/roles/{role}/permissions": {
-      "get": {"summary": "Get permissions for a role", "tags": ["RBAC"], "parameters": [{"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of permissions"}}}
+      "get": {"summary": "Get permissions for a role", "tags": ["RBAC"], "parameters": [{"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "description": "Requires UserManagement:Read. A role the roles table does not hold is 404 (not an empty 200); a degraded RBAC store is a retryable 503 (retry_after_ms 5000).", "responses": {"200": {"description": "List of permissions"}, "403": {"description": "Requires UserManagement:Read"}, "404": {"description": "No such role"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
     },
     "/rbac/check": {
       "post": {"summary": "Check if current user has a permission", "tags": ["RBAC"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"securable_type": {"type": "string"}, "operation": {"type": "string"}}}}}}, "responses": {"200": {"description": "Permission check result"}}}
@@ -1034,7 +1039,11 @@ const std::string& openapi_spec() {
     "/rbac/enforcement": {
       "put": {"summary": "Enable or disable RBAC enforcement fleet-wide (A1)", "tags": ["RBAC"], "description": "Gated on the SAME durable is_rbac_administrator check as the role-assignment routes above, not an ordinary permission check, plus MFA step-up. On a real transition, refused (403) unless the caller ALSO holds authority under the regime that is durably true right now (an authenticatable fleet-wide Administrator grant while currently on, local admin role while currently off), and refused (409) unless the caller would remain a durable administrator under the destination regime: enabling requires the caller's own fleet-wide Administrator grant, disabling requires the caller's own local account to hold the admin role. Idempotent: requesting the current state returns changed=false without evaluating either check. No GET twin — read the current state via GET /api/v1/me (rbac_enabled) or this route's own response.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}}}}, "responses": {"200": {"description": "Enforcement state applied (or already matched — changed=false)"}, "400": {"description": "Invalid JSON, or enabled missing/not a JSON boolean (strict — no string/number coercion)"}, "401": {"description": "Not authenticated, or MFA step-up required or failed (stale/absent proof; api_token/mcp_token bearer sessions are exempt) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the set_rbac_enforcement tool instead, which requires the supervised tier plus an approval ticket), or (on a real transition) does not hold authority under the regime that is durably true right now"}, "409": {"description": "Refused: the caller would not remain a durable administrator after the switch"}, "503": {"description": "RBAC/AuthDB store unavailable (including when the admin gate itself cannot confirm authority — now audited too), or the audit write for this mutation failed (fail-closed)"}}}
     },
-    "/tag-categories": {
+)json"
+        // Split again (MSVC C2026 16,380-byte cap): the merged /rbac/roles (role-read
+        // 404/503 docs) and /audit (filter parity) entries pushed this segment past the
+        // 15,000-byte working ceiling; concatenated at compile time, byte-identical JSON.
+        R"json(    "/tag-categories": {
       "get": {"summary": "List tag categories and allowed values", "tags": ["Tags"], "responses": {"200": {"description": "List of tag categories"}}}
     },
     "/tag-compliance": {
@@ -1051,7 +1060,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "List instruction definitions", "tags": ["Instructions"], "responses": {"200": {"description": "List of instruction definitions"}}}
     },
     "/audit": {
-      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1 (a client error, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
+      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}, {"name": "target_type", "in": "query", "schema": {"type": "string"}}, {"name": "target_id", "in": "query", "description": "Requires target_type", "schema": {"type": "string"}}, {"name": "since", "in": "query", "description": "Inclusive epoch seconds; 0 = unbounded", "schema": {"type": "integer", "minimum": 0}}, {"name": "until", "in": "query", "description": "Inclusive epoch seconds; 0 = unbounded", "schema": {"type": "integer", "minimum": 0}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 10000}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1, malformed since/until/offset, since > until, or target_id without target_type (client errors, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
     },
     "/audit/auth-sample": {
       "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
@@ -2831,6 +2840,19 @@ void RestApiV1::register_routes(
             data.add("rbac_enabled", false);
             data.add("rbac_role", session->role == auth::Role::admin ? "Administrator" : "Viewer");
         }
+        // Same session self-description as legacy GET /api/me (#5779, #4208).
+        const bool elevated = auth::is_elevated(*session);
+        data.add("effective_role", auth::role_to_string(auth::effective_role(*session)))
+            .add("elevated", elevated);
+        if (elevated) {
+            data.add("elevated_until",
+                     format_iso_utc(std::chrono::duration_cast<std::chrono::seconds>(
+                                        session->elevated_until.time_since_epoch())
+                                        .count()));
+        }
+        data.add("can_access_settings",
+                 authz::admin_gate_verdict(*session) == authz::AdminGate::Admit);
+        res.set_header("Cache-Control", "no-store, private");
         res.set_content(ok_json(data.str()), "application/json");
     });
 
@@ -6185,8 +6207,26 @@ void RestApiV1::register_routes(
 
     // ── RBAC (/api/v1/rbac) ──────────────────────────────────────────────
 
+    // Both role reads below are on the CHECKED store reads: a closed store, a
+    // pool-acquire timeout or a query error is a retryable 503, never the empty
+    // `200 {"data":[]}` the fail-soft `list_roles()` / `get_role_permissions()`
+    // returned — an empty role list or permission set reads as "nobody has any
+    // access". The message is fixed on purpose: the store's libpq text is never
+    // echoed (#5063 family), the 503 and its correlation_id are the signal.
+    // No audit: neither read captures `audit_fn`, and no audit verb exists for
+    // either (same as the /rbac/roles/assignments genuine-failure path).
+    const auto rbac_read_degraded = [](httplib::Response& res) {
+        res.status = 503;
+        res.set_content(
+            detail::a4_error(res, "rbac store read degraded",
+                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                 .remediation = "retry shortly"}),
+            "application/json");
+    };
+
     sink.Get("/api/v1/rbac/roles",
-             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+             [perm_fn, rbac_store, rbac_read_degraded](const httplib::Request& req,
+                                                       httplib::Response& res) {
                  if (!perm_fn(req, res, "UserManagement", "Read"))
                      return;
                  if (!rbac_store) {
@@ -6195,21 +6235,26 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 auto roles = rbac_store->list_roles();
+                 auto roles = rbac_store->list_roles_checked();
+                 if (!roles) {
+                     rbac_read_degraded(res);
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& r : roles) {
+                 for (const auto& r : *roles) {
                      arr.add(JObj()
                                  .add("name", r.name)
                                  .add("description", r.description)
                                  .add("is_system", r.is_system)
                                  .add("created_at", r.created_at));
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(roles.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(roles->size())),
                                  "application/json");
              });
 
     sink.Get(R"(/api/v1/rbac/roles/(.+)/permissions)",
-             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+             [perm_fn, rbac_store, rbac_read_degraded](const httplib::Request& req,
+                                                       httplib::Response& res) {
                  if (!perm_fn(req, res, "UserManagement", "Read"))
                      return;
                  if (!rbac_store) {
@@ -6218,10 +6263,33 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 auto role_name = req.matches[1].str();
-                 auto perms = rbac_store->get_role_permissions(role_name);
+                 const auto role_name = req.matches[1].str();
+                 // Existence on a CHECKED read, then the permissions on another: a degrade
+                 // at either step is a 503 and can never surface as a 404, and a name the
+                 // roles table does not hold is a 404, not `200 {"data":[]}`. get_role()
+                 // is not usable here — it reads a degrade as "no such role". The scan is
+                 // over a handful of rows and compares the name exactly (no libpq text
+                 // parameter, so an embedded NUL cannot truncate into a real role).
+                 auto roles = rbac_store->list_roles_checked();
+                 if (!roles) {
+                     rbac_read_degraded(res);
+                     return;
+                 }
+                 const bool known = std::any_of(roles->begin(), roles->end(),
+                                                [&](const RbacRole& r) { return r.name == role_name; });
+                 if (!known) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "role not found"), "application/json");
+                     return;
+                 }
+
+                 auto perms = rbac_store->get_role_permissions_checked(role_name);
+                 if (!perms) {
+                     rbac_read_degraded(res);
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& p : perms) {
+                 for (const auto& p : *perms) {
                      arr.add(JObj()
                                  .add("securable_type", p.securable_type)
                                  .add("operation", p.operation)
@@ -8155,6 +8223,50 @@ void RestApiV1::register_routes(
                  }
                  q.principal = req.get_param_value("principal");
                  q.action = req.get_param_value("action");
+                 q.target_type = req.get_param_value("target_type");
+                 q.target_id = req.get_param_value("target_id");
+                 auto bad_request = [&res](const char* msg) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, msg), "application/json");
+                 };
+                 // A NUL (%00) or invalid UTF-8 breaks the bind: truncation silently widens
+                 // the filter, a bad byte surfaces as a false 503 and read-degrade count.
+                 if (!audit_string_filters_wellformed(q)) {
+                     bad_request("string filters must be valid UTF-8 without NUL");
+                     return;
+                 }
+                 // since/until: epoch seconds, whole value one non-negative integer;
+                 // absent or 0 = that side unbounded; both bounds inclusive.
+                 for (const auto& [name, dst] :
+                      {std::pair<const char*, int64_t*>{"since", &q.since},
+                       std::pair<const char*, int64_t*>{"until", &q.until}}) {
+                     const auto s = req.get_param_value(name);
+                     if (s.empty())
+                         continue;
+                     const auto v = parse_query_int<int64_t>(s);
+                     if (!v || *v < 0) {
+                         bad_request("since/until must be non-negative epoch seconds");
+                         return;
+                     }
+                     *dst = *v;
+                 }
+                 if (q.since > 0 && q.until > 0 && q.since > q.until) {
+                     bad_request("since must be <= until");
+                     return;
+                 }
+                 if (const auto off = req.get_param_value("offset"); !off.empty()) {
+                     const auto v = parse_query_int<int>(off);
+                     if (!v || *v < 0 || *v > kAuditMaxOffset) {
+                         bad_request("offset must be 0..10000");
+                         return;
+                     }
+                     q.offset = *v;
+                 }
+                 // The index leads with target_type, so a bare target_id is a scan.
+                 if (!q.target_id.empty() && q.target_type.empty()) {
+                     bad_request("target_id requires target_type");
+                     return;
+                 }
 
                  // ADR-0040: degrade-distinguishable read — nullopt on a
                  // store/pool failure. Surface 503, never a false-empty 200 (an
@@ -8162,14 +8274,18 @@ void RestApiV1::register_routes(
                  auto events = audit_store->query(q);
                  if (!events) {
                      res.status = 503;
-                     res.set_content(detail::a4_error(res, "audit store degraded"),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res, "audit store degraded",
+                                          detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                              .remediation = "retry shortly"}),
+                         "application/json");
                      return;
                  }
                  JArr arr;
                  for (size_t i = 0; i < events->size(); ++i) {
                      const auto& e = (*events)[i];
                      arr.add(JObj()
+                                 .add("id", e.id)
                                  .add("timestamp", e.timestamp)
                                  .add("principal", e.principal)
                                  .add("action", e.action)
@@ -8178,7 +8294,9 @@ void RestApiV1::register_routes(
                                  .add("target_id", e.target_id)
                                  .add("detail", e.detail));
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events->size())),
+                 // total = rows on this page; a page shorter than `limit` is the last.
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events->size()),
+                                           q.offset, q.limit),
                                  "application/json");
              });
 
