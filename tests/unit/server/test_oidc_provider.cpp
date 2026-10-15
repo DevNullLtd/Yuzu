@@ -3431,7 +3431,8 @@ TEST_CASE("OIDC discovery: endpoints must be absolute and carry the issuer's own
 TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test - "
           "add_test_pending_flow - set_http_timeouts_for_test - "
           "set_discovery_negative_cache_for_test - set_resolver_for_test - "
-          "set_jwks_key_age_for_test - age_jwks_keys_for_test or pending_flow_count_for_test "
+          "set_jwks_key_age_for_test - age_jwks_keys_for_test - "
+          "clear_nat64_discovery_cache_for_test or pending_flow_count_for_test "
           "(source pin)",
           "[oidc][oidc_binding][source_pin]") {
     // The seams are public members of the production class and the first makes the binding
@@ -3445,6 +3446,7 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
                                              "set_resolver_for_test",
                                              "set_jwks_key_age_for_test",
                                              "age_jwks_keys_for_test",
+                                             "clear_nat64_discovery_cache_for_test",
                                              "pending_flow_count_for_test"};
     std::size_t scanned = 0;
     const fs::path src_dir = fs::path(YUZU_SERVER_SRC_DIR);

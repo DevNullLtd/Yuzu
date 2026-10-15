@@ -22,6 +22,7 @@
 
 #include <CLI/CLI.hpp>
 
+#include "oidc_egress_policy.hpp"
 #include "secret_file.hpp"        // --postgres-dsn-file / --oidc-client-secret-file (#5272)
 #include "server_gateway_peer_options.hpp"
 #include "server_ota_options.hpp"
@@ -881,6 +882,23 @@ int main(int argc, char* argv[]) {
                  "carrier-grade NAT and IPv6 unique-local addresses (an IdP on the internal "
                  "network). Link-local and cloud-metadata addresses are refused either way")
         ->envname("YUZU_OIDC_ALLOW_PRIVATE_NETWORKS");
+    app.add_option("--oidc-nat64-prefix", cfg.oidc_nat64_prefixes,
+                   "Comma-separated NAT64 prefixes (RFC 6052: /32, /40, /48, /56, /64 or /96, "
+                   "e.g. 2001:db8:122:344::/64) used on this network. An IPv6 address inside one "
+                   "is classified by the IPv4 address it embeds, so a translator cannot be used "
+                   "to reach a private or link-local destination. Prefixes announced by the "
+                   "network's DNS64 (RFC 7050) are learned automatically; use this when the "
+                   "network does not announce them. Default: none")
+        ->envname("YUZU_OIDC_NAT64_PREFIXES")
+        ->check(CLI::Validator(
+            [](const std::string& value) -> std::string {
+                return yuzu::server::oidc::egress::parse_nat64_prefix_list(value)
+                           ? std::string{}
+                           : std::string{"expected a comma-separated list of IPv6 prefixes with a "
+                                         "length of 32, 40, 48, 56, 64 or 96 and no bits set "
+                                         "after the prefix (at most 16)"};
+            },
+            "NAT64 PREFIX LIST"));
     // ADR-2001 §1 — selects which validated ID token claim is used as the
     // SCIM-externalId join key at login. "sub" (default) matches Okta's
     // typical externalId; "oid" matches Entra (whose externalId rides the

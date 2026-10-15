@@ -28,18 +28,28 @@
 // address stays governed by `--oidc-allow-private-networks` alone, and stays exposed to anyone on
 // that network path.
 //
-// KNOWN LIMIT: the classification is of the address AS THE SERVER SEES IT. Besides the well-known
-// NAT64 prefix and 6to4 above, it cannot know an operator's network-specific NAT64 prefix
-// (RFC 6052 section 2.2), a proxy, a VPN or any other translator in the path, so an address in
-// 2000::/3 that such a translator maps to a private IPv4 destination classifies as Public. Plain
-// http to it is refused by the cleartext rule; https to it is limited to a blind TCP connect,
-// because TLS verification still uses the host name.
+// NAT64 with a NETWORK-SPECIFIC prefix (RFC 6052 section 2.2: /32, /40, /48, /56, /64 or /96): an
+// address inside a prefix the caller KNOWS is classified by the IPv4 address embedded in it, so
+// `Pref64 + 169.254.169.254` is link-local and not "public IPv6". The caller learns prefixes from
+// the operator (`--oidc-nat64-prefix`) and from RFC 7050 (`discover_prefix_from_ipv4only_answer`);
+// this header stays pure and only decodes. A prefix never relaxes an address that is already in
+// the never-allowed tier.
+//
+// KNOWN LIMIT: the classification is of the address AS THE SERVER SEES IT, plus the prefixes it
+// learned. It cannot know a translator whose prefix is neither discoverable nor configured, nor a
+// proxy, a VPN or CLAT/464XLAT outside the host, so an address in 2000::/3 that such a path maps
+// to a private IPv4 destination classifies as Public. Plain http to it is refused by the cleartext
+// rule; https to it is limited to a blind TCP connect, because TLS verification still uses the
+// host name.
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace yuzu::server::oidc::egress {
 
@@ -73,6 +83,20 @@ constexpr std::uint32_t pack(const Ipv4& a) {
 constexpr bool in_cidr(const Ipv4& a, const Ipv4& net, int prefix_bits) {
     const std::uint32_t mask = prefix_bits == 0 ? 0u : (~std::uint32_t{0} << (32 - prefix_bits));
     return (pack(a) & mask) == (pack(net) & mask);
+}
+
+/// The "never allowed" tier: no operator switch opens it.
+constexpr bool never_allowed(AddressClass c) {
+    switch (c) {
+    case AddressClass::Unspecified:
+    case AddressClass::LinkLocal:
+    case AddressClass::CloudMetadata:
+    case AddressClass::Multicast:
+    case AddressClass::Reserved:
+        return true;
+    default:
+        return false;
+    }
 }
 
 } // namespace detail
@@ -267,18 +291,183 @@ constexpr std::optional<Ipv6> parse_ipv6(std::string_view s) {
     return out;
 }
 
+// ── NAT64 network-specific prefixes (RFC 6052 section 2.2, RFC 7050) ─────────────────────────
+
+/// A NAT64 prefix: the first `length` bits of `bytes`. `length` is one of 32, 40, 48, 56, 64, 96;
+/// any other value matches nothing and embeds nothing.
+struct Nat64Prefix {
+    Ipv6 bytes{};
+    int length{96};
+    constexpr bool operator==(const Nat64Prefix&) const = default;
+};
+
+constexpr bool nat64_length_valid(int length) {
+    return length == 32 || length == 40 || length == 48 || length == 56 || length == 64 ||
+           length == 96;
+}
+
+/// True when the first `p.length` bits of `a` equal those of `p.bytes`.
+constexpr bool matches(const Ipv6& a, const Nat64Prefix& p) {
+    if (!nat64_length_valid(p.length))
+        return false;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(p.length) / 8; ++i)
+        if (a[i] != p.bytes[i])
+            return false;
+    return true;
+}
+
+/// The IPv4 address embedded in `a` under prefix `p`, nullopt when `a` is outside `p`. RFC 6052
+/// section 2.2, figure 1, as byte offsets into the address: the IPv4 octets are contiguous only
+/// for /32 and /96; for /40, /48 and /56 they straddle the reserved "u" octet (byte 8, bits 64..71,
+/// always skipped), and /64 starts right after it. The u octet and the suffix are not inspected:
+/// a receiver ignores them.
+///   /32: bytes 4 5 6 7     /40: bytes 5 6 7 9     /48: bytes 6 7 9 10
+///   /56: bytes 7 9 10 11   /64: bytes 9 10 11 12  /96: bytes 12 13 14 15
+constexpr std::optional<Ipv4> embedded_ipv4(const Ipv6& a, const Nat64Prefix& p) {
+    if (!matches(a, p))
+        return std::nullopt;
+    const auto at = [&a](std::size_t i0, std::size_t i1, std::size_t i2, std::size_t i3) {
+        return Ipv4{a[i0], a[i1], a[i2], a[i3]};
+    };
+    switch (p.length) {
+    case 32:
+        return at(4, 5, 6, 7);
+    case 40:
+        return at(5, 6, 7, 9);
+    case 48:
+        return at(6, 7, 9, 10);
+    case 56:
+        return at(7, 9, 10, 11);
+    case 64:
+        return at(9, 10, 11, 12);
+    case 96:
+        return at(12, 13, 14, 15);
+    default:
+        return std::nullopt;
+    }
+}
+
+/// Classify an IPv6 address, also decoding the NAT64 prefixes in `extra`: an address inside one is
+/// classified by the IPv4 address embedded in it. A prefix never relaxes an address the built-in
+/// rules already put in the never-allowed tier, and when several prefixes match the strictest
+/// embedded class wins (never-allowed, then any non-public class, then public).
+constexpr AddressClass classify_ipv6(const Ipv6& a, std::span<const Nat64Prefix> extra) {
+    const AddressClass base = classify_ipv6(a);
+    if (detail::never_allowed(base))
+        return base;
+    const auto rank = [](AddressClass c) {
+        return detail::never_allowed(c) ? 2 : (c == AddressClass::Public ? 0 : 1);
+    };
+    std::optional<AddressClass> best;
+    for (const auto& p : extra)
+        if (const auto v4 = embedded_ipv4(a, p)) {
+            const AddressClass c = classify_ipv4(*v4);
+            if (!best || rank(c) > rank(*best))
+                best = c;
+        }
+    return best ? *best : base;
+}
+
+/// "2001:db8:122:344::/64": a valid IPv6 address (no brackets, no zone), a decimal length from the
+/// legal set without a sign or leading zero, and every bit after the prefix zero. Anything else
+/// is nullopt.
+constexpr std::optional<Nat64Prefix> parse_nat64_prefix(std::string_view s) {
+    const auto slash = s.find('/');
+    if (slash == std::string_view::npos)
+        return std::nullopt;
+    const std::string_view len_text = s.substr(slash + 1);
+    if (len_text.empty() || len_text.size() > 3 || (len_text.size() > 1 && len_text[0] == '0'))
+        return std::nullopt;
+    int length = 0;
+    for (const char c : len_text) {
+        if (c < '0' || c > '9')
+            return std::nullopt;
+        length = length * 10 + (c - '0');
+    }
+    if (!nat64_length_valid(length))
+        return std::nullopt;
+    const auto addr = parse_ipv6(s.substr(0, slash));
+    if (!addr)
+        return std::nullopt;
+    for (std::size_t i = static_cast<std::size_t>(length) / 8; i < addr->size(); ++i)
+        if ((*addr)[i] != 0)
+            return std::nullopt;
+    return Nat64Prefix{*addr, length};
+}
+
+inline constexpr std::size_t kMaxNat64Prefixes = 16;
+
+/// A comma-separated list of `parse_nat64_prefix` entries (blanks around an entry are ignored).
+/// The empty string is the empty list; an empty entry, an unparsable entry or more than
+/// `kMaxNat64Prefixes` entries is nullopt.
+inline std::optional<std::vector<Nat64Prefix>> parse_nat64_prefix_list(std::string_view csv) {
+    std::vector<Nat64Prefix> out;
+    const auto blank = [](char c) {
+        return c == ' ' || c == '\t';
+    };
+    const auto trim = [&blank](std::string_view t) {
+        while (!t.empty() && blank(t.front()))
+            t.remove_prefix(1);
+        while (!t.empty() && blank(t.back()))
+            t.remove_suffix(1);
+        return t;
+    };
+    if (trim(csv).empty())
+        return out;
+    while (true) {
+        const auto comma = csv.find(',');
+        const auto entry = trim(csv.substr(0, comma));
+        const auto prefix = parse_nat64_prefix(entry);
+        if (!prefix || out.size() >= kMaxNat64Prefixes)
+            return std::nullopt;
+        out.push_back(*prefix);
+        if (comma == std::string_view::npos)
+            return out;
+        csv.remove_prefix(comma + 1);
+    }
+}
+
+/// RFC 7050 section 3: the prefix a DNS64 resolver advertises in its AAAA answer for
+/// `ipv4only.arpa`, which embeds the well-known 192.0.0.170 / 192.0.0.171. Every legal length is
+/// tried; the one whose embedded IPv4 address is one of those two (for /32../64 with the u octet
+/// zero, as RFC 6052 requires) is the prefix length. nullopt when no length fits or more than one
+/// does (an ambiguous answer is not trusted). The result has every bit after the prefix cleared.
+constexpr std::optional<Nat64Prefix> discover_prefix_from_ipv4only_answer(const Ipv6& answer) {
+    std::optional<Nat64Prefix> found;
+    int hits = 0;
+    for (const int length : {32, 40, 48, 56, 64, 96}) {
+        Nat64Prefix candidate{answer, length};
+        const auto v4 = embedded_ipv4(answer, candidate);
+        if (!v4 || !(*v4 == Ipv4{192, 0, 0, 170} || *v4 == Ipv4{192, 0, 0, 171}))
+            continue;
+        if (length < 96 && answer[8] != 0) // the u octet must be zero (RFC 6052 section 2.2)
+            continue;
+        for (std::size_t i = static_cast<std::size_t>(length) / 8; i < candidate.bytes.size(); ++i)
+            candidate.bytes[i] = 0;
+        ++hits;
+        found = candidate;
+    }
+    return hits == 1 ? found : std::nullopt;
+}
+
 /// The class of `host` when it is a canonical IPv4 dotted quad or an IPv6 literal (brackets
 /// already stripped), nullopt when it is anything else (a name, or a numeric spelling the OS
 /// resolver may read differently). A literal needs no DNS: this is the direct classification.
-constexpr std::optional<AddressClass> classify_literal(std::string_view host) {
+/// `extra` are the NAT64 prefixes to decode for an IPv6 literal.
+constexpr std::optional<AddressClass> classify_literal(std::string_view host,
+                                                       std::span<const Nat64Prefix> extra) {
     if (host.find(':') != std::string_view::npos) {
         if (const auto v6 = parse_ipv6(host))
-            return classify_ipv6(*v6);
+            return classify_ipv6(*v6, extra);
         return std::nullopt;
     }
     if (const auto v4 = parse_ipv4(host))
         return classify_ipv4(*v4);
     return std::nullopt;
+}
+
+constexpr std::optional<AddressClass> classify_literal(std::string_view host) {
+    return classify_literal(host, std::span<const Nat64Prefix>{});
 }
 
 enum class Verdict : std::uint8_t { Allow, Refuse };

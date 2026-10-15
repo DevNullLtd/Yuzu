@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -1040,8 +1041,107 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 }
 #endif
 
+// ── NAT64 prefix discovery (RFC 7050) ────────────────────────────────────────
+// A DNS64 resolver answers AAAA for `ipv4only.arpa` with the NAT64 prefix wrapped around the
+// well-known 192.0.0.170/171; decoding that answer tells the policy which IPv6 addresses are
+// really translated IPv4 destinations. Process-wide, because the prefix belongs to the network the
+// server sits on and not to one provider. A failed or empty lookup is "none discovered", not a
+// refusal: DNS64 is absent on most networks and a transient resolver error must not break every
+// IPv6 destination.
+constexpr const char* kNat64ProbeName = "ipv4only.arpa";
+constexpr std::chrono::minutes kNat64PositiveTtl{10};
+constexpr std::chrono::minutes kNat64NegativeTtl{1};
+constexpr std::size_t kMaxDiscoveredNat64Prefixes = 8;
+
+struct Nat64DiscoveryCache {
+    std::mutex mu;
+    bool filled{false};
+    std::chrono::steady_clock::time_point expires{};
+    std::vector<::yuzu::server::oidc::egress::Nat64Prefix> prefixes;
+};
+Nat64DiscoveryCache& nat64_discovery_cache() {
+    static Nat64DiscoveryCache c;
+    return c;
+}
+
+// The IPv6 answers for `ipv4only.arpa`. False when the lookup failed or timed out (no answer at
+// all); an answer with no IPv6 address is true and empty.
+bool lookup_ipv4only_answers(int dns_timeout_ms,
+                             std::vector<::yuzu::server::oidc::egress::Ipv6>& out) {
+    namespace egress = ::yuzu::server::oidc::egress;
+    OidcProvider::ResolverForTest test_resolver;
+    {
+        std::lock_guard lock(test_resolver_mutex());
+        test_resolver = test_resolver_slot();
+    }
+    if (test_resolver) {
+        for (const auto& text : test_resolver(kNat64ProbeName))
+            if (text.find(':') != std::string::npos)
+                if (const auto v6 = egress::parse_ipv6(text))
+                    out.push_back(*v6);
+        return true;
+    }
+    std::vector<ResolvedAddress> resolved;
+    if (!resolve_host_addresses(kNat64ProbeName, std::max(1, (dns_timeout_ms + 999) / 1000),
+                                resolved))
+        return false;
+    for (const auto& address : resolved)
+        if (address.family == AF_INET6) {
+            egress::Ipv6 bytes{};
+            std::memcpy(bytes.data(), address.bytes.data(), bytes.size());
+            out.push_back(bytes);
+        }
+    return true;
+}
+
+// The prefixes learned from `ipv4only.arpa`, from the cache while it is fresh. The cache mutex
+// is never held across the lookup (two concurrent lookups are harmless).
+std::vector<::yuzu::server::oidc::egress::Nat64Prefix>
+discovered_nat64_prefixes(int dns_timeout_ms) {
+    namespace egress = ::yuzu::server::oidc::egress;
+    auto& cache = nat64_discovery_cache();
+    {
+        std::lock_guard lock(cache.mu);
+        if (cache.filled && std::chrono::steady_clock::now() < cache.expires)
+            return cache.prefixes;
+    }
+    std::vector<egress::Ipv6> answers;
+    const bool answered = lookup_ipv4only_answers(dns_timeout_ms, answers);
+    std::vector<egress::Nat64Prefix> found;
+    for (const auto& answer : answers)
+        if (const auto prefix = egress::discover_prefix_from_ipv4only_answer(answer))
+            if (found.size() < kMaxDiscoveredNat64Prefixes &&
+                std::find(found.begin(), found.end(), *prefix) == found.end())
+                found.push_back(*prefix);
+    if (!answered)
+        spdlog::warn("OIDC egress: the NAT64 prefix lookup (ipv4only.arpa) failed; IPv6 "
+                     "destinations are classified without it until the lookup is retried");
+    bool learned = false;
+    std::vector<egress::Nat64Prefix> result;
+    {
+        std::lock_guard lock(cache.mu);
+        // A failed lookup keeps what was learned before (a transient resolver error must not
+        // forget a prefix); an answer, even an empty one, replaces it.
+        if (answered) {
+            learned = !found.empty() && (!cache.filled || cache.prefixes != found);
+            cache.prefixes = std::move(found);
+        }
+        cache.filled = true;
+        cache.expires =
+            std::chrono::steady_clock::now() +
+            (answered && !cache.prefixes.empty() ? kNat64PositiveTtl : kNat64NegativeTtl);
+        result = cache.prefixes;
+    }
+    if (learned)
+        spdlog::info("OIDC egress: learned {} NAT64 prefix(es) from ipv4only.arpa (RFC 7050); "
+                     "IPv6 destinations inside them are classified by the IPv4 address they embed",
+                     result.size());
+    return result;
+}
+
 std::expected<std::vector<std::string>, const char*>
-vet_egress_target(const std::string& host, bool allow_private, bool cleartext, int dns_timeout_ms) {
+vet_egress_target(const std::string& host, bool allow_private, bool cleartext, int dns_timeout_ms,
+                  std::span<const ::yuzu::server::oidc::egress::Nat64Prefix> nat64_prefixes) {
     namespace egress = ::yuzu::server::oidc::egress;
     const auto refuse = [&](egress::AddressClass cls) -> std::unexpected<const char*> {
         // Plain http to a public address is refused whatever the switch says (a distinct reason).
@@ -1059,7 +1159,33 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
         return std::unexpected(kEgressRefusedReason);
     };
 
-    if (const auto literal = egress::classify_literal(host)) {
+    // The class of an IPv6 address: the configured NAT64 prefixes always apply; the learned ones
+    // (RFC 7050) are looked up only for an address that would otherwise be permitted, because only
+    // then can a hidden translation change the answer. An IPv4-only fetch never reaches this.
+    std::optional<std::vector<egress::Nat64Prefix>> active_prefixes;
+    const auto classify_v6 = [&](const egress::Ipv6& bytes) {
+        const auto cls = egress::classify_ipv6(bytes, nat64_prefixes);
+        if (egress::decision(cls, allow_private, cleartext) != egress::Verdict::Allow)
+            return cls;
+        if (!active_prefixes) {
+            active_prefixes.emplace(nat64_prefixes.begin(), nat64_prefixes.end());
+            for (const auto& learned : discovered_nat64_prefixes(dns_timeout_ms))
+                if (std::find(active_prefixes->begin(), active_prefixes->end(), learned) ==
+                    active_prefixes->end())
+                    active_prefixes->push_back(learned);
+        }
+        return egress::classify_ipv6(bytes, *active_prefixes);
+    };
+    const auto classify_text = [&](const std::string& text) -> std::optional<egress::AddressClass> {
+        if (text.find(':') != std::string::npos) {
+            if (const auto v6 = egress::parse_ipv6(text))
+                return classify_v6(*v6);
+            return std::nullopt;
+        }
+        return egress::classify_literal(text);
+    };
+
+    if (const auto literal = classify_text(host)) {
         if (egress::decision(*literal, allow_private, cleartext) != egress::Verdict::Allow)
             return refuse(*literal);
         return std::vector<std::string>{};
@@ -1084,7 +1210,7 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
     }
     if (test_resolver) {
         for (const auto& text : test_resolver(host))
-            if (const auto cls = egress::classify_literal(text))
+            if (const auto cls = classify_text(text))
                 consider(*cls, text.c_str());
     } else {
         std::vector<ResolvedAddress> resolved;
@@ -1103,7 +1229,7 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
                 if (::inet_ntop(AF_INET6, address.bytes.data(), text, sizeof(text)) != nullptr) {
                     egress::Ipv6 bytes{};
                     std::memcpy(bytes.data(), address.bytes.data(), bytes.size());
-                    consider(egress::classify_ipv6(bytes), text);
+                    consider(classify_v6(bytes), text);
                 }
             }
             // any other address family is never connected to
@@ -1159,7 +1285,8 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     if (!egress_target)
         return std::unexpected("invalid token endpoint URL");
     if (const auto vet = vet_egress_target(egress_target->host, config_.allow_private_networks,
-                                           egress_target->cleartext, kHttpOperationTimeoutMs);
+                                           egress_target->cleartext, kHttpOperationTimeoutMs,
+                                           config_.nat64_prefixes);
         !vet) {
         spdlog::error("OIDC token exchange: request refused: {}", vet.error());
         return std::unexpected(std::string("token endpoint request failed: ") + vet.error());
@@ -1188,8 +1315,9 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
         // function the GETs use); nothing is sent to an address the policy refuses. A failed
         // CONNECT moves on to the next permitted address (no request was sent, so a retry is
         // safe); any other outcome is final.
-        const auto pins = vet_egress_target(target->host, config_.allow_private_networks,
-                                            target->cleartext, kHttpOperationTimeoutMs);
+        const auto pins =
+            vet_egress_target(target->host, config_.allow_private_networks, target->cleartext,
+                              kHttpOperationTimeoutMs, config_.nat64_prefixes);
         if (!pins) {
             spdlog::error("OIDC token exchange: request refused: {}", pins.error());
             return std::unexpected(std::string("token endpoint request failed: ") + pins.error());
@@ -1430,7 +1558,7 @@ bool OidcProvider::fetch_jwks() {
 
     spdlog::info("OidcProvider: fetching JWKS from {}", ::yuzu::log_key_token(*jwks_uri));
     auto body = http_get_bounded(*jwks_uri, config_.skip_tls_verify, config_.allow_private_networks,
-                                 http_timeout_ms_.load());
+                                 http_timeout_ms_.load(), config_.nat64_prefixes);
     if (!body) {
         spdlog::error("OidcProvider: JWKS fetch failed: {}", body.error());
         return false;
@@ -1996,10 +2124,10 @@ private:
 
 } // namespace
 
-std::expected<std::string, std::string> OidcProvider::http_get_bounded(const std::string& url,
-                                                                       bool skip_tls_verify,
-                                                                       bool allow_private_networks,
-                                                                       int timeout_ms) {
+std::expected<std::string, std::string>
+OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify,
+                               bool allow_private_networks, int timeout_ms,
+                               std::span<const egress::Nat64Prefix> nat64_prefixes) {
     const auto target = split_http_url(url);
     if (!target)
         return std::unexpected("not an http or https URL");
@@ -2015,8 +2143,8 @@ std::expected<std::string, std::string> OidcProvider::http_get_bounded(const std
         // Egress policy: resolve and classify the target BEFORE any socket exists, then pin the
         // connect to a vetted address (see vet_egress_target). Name resolution is part of the
         // total bound below.
-        const auto pins =
-            vet_egress_target(target->host, allow_private_networks, target->cleartext, timeout_ms);
+        const auto pins = vet_egress_target(target->host, allow_private_networks, target->cleartext,
+                                            timeout_ms, nat64_prefixes);
         if (!pins)
             return std::unexpected(std::string("request failed: ") + pins.error());
 
@@ -2085,7 +2213,8 @@ std::expected<std::string, std::string> OidcProvider::http_get_bounded(const std
 
 std::expected<OidcProvider::DiscoveryDocument, std::string>
 OidcProvider::fetch_discovery_document(const std::string& issuer, bool skip_tls_verify,
-                                       bool allow_private_networks, int timeout_ms) {
+                                       bool allow_private_networks, int timeout_ms,
+                                       std::span<const egress::Nat64Prefix> nat64_prefixes) {
     if (issuer_scheme(issuer).empty())
         return std::unexpected("the issuer must be an http or https URL");
     if (issuer.size() > kMaxIdpUrlBytes)
@@ -2104,7 +2233,8 @@ OidcProvider::fetch_discovery_document(const std::string& issuer, bool skip_tls_
         url.pop_back();
     url += "/.well-known/openid-configuration";
 
-    auto body = http_get_bounded(url, skip_tls_verify, allow_private_networks, timeout_ms);
+    auto body =
+        http_get_bounded(url, skip_tls_verify, allow_private_networks, timeout_ms, nat64_prefixes);
     if (!body)
         return std::unexpected(body.error());
     return parse_discovery_document(*body, issuer);
@@ -2215,7 +2345,7 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
                              ::yuzu::log_key_token(config_.issuer));
                 return fetch_discovery_document(config_.issuer, config_.skip_tls_verify,
                                                 config_.allow_private_networks,
-                                                http_timeout_ms_.load());
+                                                http_timeout_ms_.load(), config_.nat64_prefixes);
             } catch (const std::exception& e) {
                 return std::unexpected(std::string("discovery exception: ") +
                                        ::yuzu::log_key_token(e.what()));
@@ -2248,6 +2378,13 @@ void OidcProvider::set_resolver_for_test(ResolverForTest resolver) {
     test_resolver_slot() = std::move(resolver);
 }
 
+void OidcProvider::clear_nat64_discovery_cache_for_test() {
+    auto& cache = nat64_discovery_cache();
+    std::lock_guard lock(cache.mu);
+    cache.filled = false;
+    cache.prefixes.clear();
+}
+
 void OidcProvider::set_http_timeouts_for_test(int ms) {
     http_timeout_ms_.store(ms);
 }
@@ -2274,7 +2411,7 @@ OidcProvider::OidcProvider(OidcConfig config) : config_(std::move(config)) {
     // Posture warnings about the configured issuer, once per construction, folded.
     namespace egress = ::yuzu::server::oidc::egress;
     if (const auto url = split_http_url(config_.issuer)) {
-        const auto literal = egress::classify_literal(url->host);
+        const auto literal = egress::classify_literal(url->host, config_.nat64_prefixes);
         // The scheme matters: plain http to a public address is refused whatever the switch says.
         const bool cleartext = url->cleartext;
         if (literal && egress::decision(*literal, config_.allow_private_networks, cleartext) !=

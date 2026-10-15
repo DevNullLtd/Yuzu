@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -24,6 +25,8 @@
 // clash. If a future edit adds <openssl/x509.h> (etc.) here, that guarantee
 // breaks — such includers would then need OpenSSL-before-windows.h ordering.
 #include <openssl/evp.h>
+
+#include "oidc_egress_policy.hpp"
 
 namespace yuzu::server::oidc {
 
@@ -51,6 +54,11 @@ struct OidcConfig {
     // from the Settings form or a REST body (an admin who could set it could aim the server at
     // the internal network).
     bool allow_private_networks{false};
+    // NAT64 prefixes (RFC 6052 section 2.2) the operator named with `--oidc-nat64-prefix`: an
+    // address inside one is classified by the IPv4 address embedded in it. Prefixes learned from
+    // RFC 7050 (`ipv4only.arpa`) are added to these at run time. Set ONLY from the process
+    // operator's flag, never from the Settings form or a REST body.
+    std::vector<egress::Nat64Prefix> nat64_prefixes;
     // ADR-2001 §1 — which claim `validate_claims` treats as the SCIM link
     // key (`"sub"` default or `"oid"`), threaded from
     // Config::oidc_scim_link_claim. Only `"oid"` changes validate_claims'
@@ -250,10 +258,10 @@ public:
     /// this instance's binding SHA-256 fail exactly as a broken crypto provider would;
     /// `add_test_pending_flow` plants a pending flow with a chosen binding hash (hex), bypassing
     /// `start_auth_flow`, so the stored-hash validation can be driven with a value no honest
-    /// flow stores. TEST-ONLY: none of the eight test seams in this block (these two,
+    /// flow stores. TEST-ONLY: none of the nine test seams in this block (these two,
     /// `set_http_timeouts_for_test`, `set_discovery_negative_cache_for_test`,
-    /// `set_resolver_for_test`, `set_jwks_key_age_for_test`, `age_jwks_keys_for_test` and
-    /// `pending_flow_count_for_test`) has
+    /// `set_resolver_for_test`, `set_jwks_key_age_for_test`, `age_jwks_keys_for_test`,
+    /// `clear_nat64_discovery_cache_for_test` and `pending_flow_count_for_test`) has
     /// a production caller, and tests/unit/server/ test_oidc_provider.cpp pins (source scan) that
     /// no other file in server/core/src references them.
     void set_binding_digest_failure_for_test(bool fail);
@@ -283,6 +291,9 @@ public:
     /// overwrite the stamp, so a test can tell whether an intervening fetch outcome renewed it.
     /// Same source-scan pin.
     void age_jwks_keys_for_test(std::chrono::seconds more);
+    /// Test-only seam: forgets the process-wide cache of NAT64 prefixes learned from
+    /// `ipv4only.arpa`, so the next eligible fetch looks them up again. Same source-scan pin.
+    static void clear_nat64_discovery_cache_for_test();
     /// Test-only seam: how many authorization flows are pending (a failed start must leave 0
     /// and a refused callback leaves the count unchanged). Same source-scan pin.
     std::size_t pending_flow_count_for_test() const;
@@ -327,7 +338,8 @@ public:
     /// exactly what a login will.
     [[nodiscard]] static std::expected<DiscoveryDocument, std::string>
     fetch_discovery_document(const std::string& issuer, bool skip_tls_verify,
-                             bool allow_private_networks, int timeout_ms = kHttpOperationTimeoutMs);
+                             bool allow_private_networks, int timeout_ms = kHttpOperationTimeoutMs,
+                             std::span<const egress::Nat64Prefix> nat64_prefixes = {});
 
     /// The validation half of `fetch_discovery_document`, on an already fetched body. Pure: no
     /// network. Public so the scheme rules can be pinned for an https issuer without a TLS IdP.
@@ -359,9 +371,18 @@ public:
     /// whatever `allow_private_networks` says; plain http to a loopback/private address still
     /// needs that flag. Name resolution is inside the total bound. Up to four permitted addresses
     /// are tried in order while the connect fails (any other outcome is final).
+    ///
+    /// NAT64. An IPv6 address the policy would otherwise permit is also decoded under
+    /// `nat64_prefixes` (the operator's `--oidc-nat64-prefix`) and under the prefixes the server
+    /// learns from RFC 7050 by resolving `ipv4only.arpa` (cached 10 minutes, a failed or empty
+    /// answer 1 minute); an address inside one is classified by the IPv4 address embedded in it.
+    /// The lookup runs only for such an address, never for an IPv4-only fetch, and a lookup that
+    /// fails means "none discovered", not a refusal. A translator whose prefix is neither
+    /// discoverable nor configured stays invisible (see `oidc_egress_policy.hpp`).
     [[nodiscard]] static std::expected<std::string, std::string>
     http_get_bounded(const std::string& url, bool skip_tls_verify, bool allow_private_networks,
-                     int timeout_ms = kHttpOperationTimeoutMs);
+                     int timeout_ms = kHttpOperationTimeoutMs,
+                     std::span<const egress::Nat64Prefix> nat64_prefixes = {});
 
     /// Parse a JWKS document into verifying keys (RSA, `use` absent or "sig"; others skipped).
     [[nodiscard]] static std::expected<std::vector<CachedJwk>, std::string>

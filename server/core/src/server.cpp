@@ -4394,6 +4394,20 @@ public:
             oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
             oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
             oidc_cfg.allow_private_networks = cfg_.oidc_allow_private_networks;
+            bool nat64_prefixes_valid = true;
+            if (auto prefixes = oidc::egress::parse_nat64_prefix_list(cfg_.oidc_nat64_prefixes)) {
+                oidc_cfg.nat64_prefixes = std::move(*prefixes);
+                if (!oidc_cfg.nat64_prefixes.empty())
+                    spdlog::info("OIDC egress: --oidc-nat64-prefix is set; {} NAT64 prefix(es) "
+                                 "are decoded before OIDC requests are vetted",
+                                 oidc_cfg.nat64_prefixes.size());
+            } else {
+                // main.cpp refuses to start on an unparsable list; a Config built elsewhere must
+                // not silently run without the declared prefixes (fail closed: no provider).
+                nat64_prefixes_valid = false;
+                spdlog::error("OIDC egress: --oidc-nat64-prefix is not a valid list; OIDC login "
+                              "is disabled");
+            }
             oidc_cfg.scim_link_claim = cfg_.oidc_scim_link_claim;
             if (cfg_.oidc_skip_tls_verify)
                 spdlog::warn(
@@ -4405,7 +4419,8 @@ public:
                              "addresses stay refused)");
             // Endpoints and jwks_uri are NOT derived here: OidcProvider reads them from the
             // issuer's discovery document on first use (#5692).
-            oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
+            if (nat64_prefixes_valid)
+                oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         }
 
         // Initialize SAML 2.0 SP provider if configured.

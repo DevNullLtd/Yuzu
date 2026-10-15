@@ -551,4 +551,68 @@ TEST_CASE("Settings OIDC: the egress switch is OS-level and no form field can ch
     CHECK(r->body.find("address not permitted") != std::string::npos);
     CHECK(idp.discovery_calls.load() == 0);
 }
+TEST_CASE("Settings OIDC: the NAT64 declaration is OS-level and no form field can change it",
+          "[settings][oidc][oidc_egress][security]") {
+    MockIdp idp;
+    OidcHarness h{"", /*open_store=*/false};
+    h.cfg.oidc_allow_private_networks = true;
+    const std::string declared = "2001:db8:122:344::/64";
+    h.cfg.oidc_nat64_prefixes = declared;
+    for (const char* field :
+         {"oidc_nat64_prefixes", "nat64_prefixes", "oidc-nat64-prefix", "oidc_nat64_prefix"}) {
+        CAPTURE(field);
+        auto res =
+            h.sink.Post("/api/settings/oidc", discovery_form(idp) + "&" + field + "=2a0e:b107::/32",
+                        "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        REQUIRE(h.oidc_provider != nullptr);
+        CHECK(h.cfg.oidc_nat64_prefixes == declared);
+        // An empty field does not clear it either.
+        auto blank =
+            h.sink.Post("/api/settings/oidc/test", "issuer=" + idp.base() + "&" + field + "=",
+                        "application/x-www-form-urlencoded");
+        REQUIRE(blank);
+        CHECK(h.cfg.oidc_nat64_prefixes == declared);
+    }
+}
+
+TEST_CASE("Settings OIDC: Test Connection decodes the server's NAT64 declaration",
+          "[settings][oidc][oidc_egress][oidc_nat64][security]") {
+    MockIdp idp;
+    OidcHarness h{"", /*open_store=*/false};
+    h.cfg.oidc_allow_private_networks = true;
+    h.cfg.oidc_nat64_prefixes = "2001:db8:122:344::/64";
+    // idp.test -> declared Pref64 + 169.254.169.254; the documentation prefix is allowed by the
+    // switch on its own, so only the decode can refuse it.
+    oidc::OidcProvider::set_resolver_for_test(
+        [](const std::string& host) -> std::vector<std::string> {
+            if (host == "idp.test")
+                return {"2001:db8:122:344:a9:fea9:fe00:0"};
+            return {};
+        });
+    struct Restore {
+        ~Restore() { oidc::OidcProvider::set_resolver_for_test({}); }
+    } restore;
+
+    auto r = h.sink.Post("/api/settings/oidc/test", "issuer=http://idp.test:1",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->body.find("feedback-error") != std::string::npos);
+    CHECK(r->body.find("address not permitted") != std::string::npos);
+    CHECK(r->body.find("a9fe") == std::string::npos);
+
+    // An unparsable declaration cannot come from the flag (startup refuses it); a Config built
+    // any other way fails closed instead of running without it.
+    h.cfg.oidc_nat64_prefixes = "garbage";
+    auto bad = h.sink.Post("/api/settings/oidc/test", "issuer=" + idp.base(),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(bad);
+    CHECK(bad->body.find("--oidc-nat64-prefix") != std::string::npos);
+    CHECK(idp.discovery_calls.load() == 0);
+    auto save =
+        h.sink.Post("/api/settings/oidc", discovery_form(idp), "application/x-www-form-urlencoded");
+    REQUIRE(save);
+    CHECK(save->status == 500);
+    CHECK(h.oidc_provider == nullptr);
+}
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN

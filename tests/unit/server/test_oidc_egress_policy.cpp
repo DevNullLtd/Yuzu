@@ -11,7 +11,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cstdint>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -351,4 +354,448 @@ TEST_CASE("OIDC egress: class names are fixed labels that carry no address",
     CHECK(std::string(class_name(AddressClass::LinkLocal)) == "link-local");
     CHECK(std::string(class_name(AddressClass::CloudMetadata)) == "cloud-metadata");
     CHECK(std::string(class_name(static_cast<AddressClass>(200))) == "unknown");
+}
+
+// ── NAT64 network-specific prefixes (RFC 6052 section 2.2, RFC 7050) ────────────────────────
+
+namespace {
+
+Ipv6 v6(const char* text) {
+    const auto a = parse_ipv6(text);
+    REQUIRE(a.has_value());
+    return *a;
+}
+
+Ipv4 v4(const char* text) {
+    const auto a = parse_ipv4(text);
+    REQUIRE(a.has_value());
+    return *a;
+}
+
+Nat64Prefix prefix(const std::string& text) {
+    const auto p = parse_nat64_prefix(text);
+    REQUIRE(p.has_value());
+    return *p;
+}
+
+// An INDEPENDENT bit-level encoder of RFC 6052 section 2.2 figure 1 (each IPv4 bit placed one at
+// a time into the listed bit ranges), so the byte-offset table in the header is not checked
+// against itself. `u` and `suffix_fill` let a case put noise in the reserved octet / suffix.
+Ipv6 synthesize(const Ipv6& pfx, int length, const Ipv4& addr, std::uint8_t u = 0,
+                std::uint8_t suffix_fill = 0) {
+    struct Range {
+        int start;
+        int bits;
+    };
+    std::vector<Range> v4_ranges;
+    switch (length) {
+    case 32:
+        v4_ranges = {{32, 32}};
+        break;
+    case 40:
+        v4_ranges = {{40, 24}, {72, 8}};
+        break;
+    case 48:
+        v4_ranges = {{48, 16}, {72, 16}};
+        break;
+    case 56:
+        v4_ranges = {{56, 8}, {72, 24}};
+        break;
+    case 64:
+        v4_ranges = {{72, 32}};
+        break;
+    default:
+        v4_ranges = {{96, 32}};
+        break;
+    }
+    std::array<int, 128> bits{};
+    std::array<int, 128> taken{}; // 0 free, 1 prefix, 2 v4
+    const auto bit_of = [](const auto& bytes, int i) {
+        return (bytes[i / 8] >> (7 - i % 8)) & 1;
+    };
+    for (int i = 0; i < length; ++i) {
+        bits[i] = bit_of(pfx, i);
+        taken[i] = 1;
+    }
+    int k = 0;
+    for (const auto& r : v4_ranges)
+        for (int i = 0; i < r.bits; ++i, ++k) {
+            bits[r.start + i] = bit_of(addr, k);
+            taken[r.start + i] = 2;
+        }
+    for (int i = 0; i < 128; ++i)
+        if (taken[i] == 0)
+            bits[i] = (i >= 64 && i < 72) ? bit_of(std::array<std::uint8_t, 1>{u}, i - 64)
+                                          : bit_of(std::array<std::uint8_t, 1>{suffix_fill}, i % 8);
+    Ipv6 out{};
+    for (int i = 0; i < 128; ++i)
+        out[i / 8] = static_cast<std::uint8_t>(out[i / 8] | (bits[i] << (7 - i % 8)));
+    return out;
+}
+
+Ipv6 mask_to(Ipv6 a, int length) {
+    for (std::size_t i = static_cast<std::size_t>(length) / 8; i < a.size(); ++i)
+        a[i] = 0;
+    return a;
+}
+
+struct Rfc6052Row {
+    int length;
+    const char* prefix;
+    const char* v4;
+    const char* address;
+};
+
+// Derived with a separate Python implementation of the RFC (bit-level), including the six
+// examples of RFC 6052 section 2.4 for 192.0.2.33 under 2001:db8:122:344::/n (the first row of
+// each length): /32 2001:db8:c000:221::, /40 2001:db8:1c0:2:21::, /48 2001:db8:122:c000:2:2100::,
+// /56 2001:db8:122:3c0:0:221::, /64 2001:db8:122:344:c0:2:2100:0, /96 2001:db8:122:344::c000:221
+// (there the prefix carries extra bits, so the /96 address differs from the RFC's /96 example only
+// in the prefix bits the table's base address contributes).
+const Rfc6052Row kRfc6052Rows[] = {
+    {32, "2001:db8::", "192.0.2.33", "2001:db8:c000:221::"},
+    {32, "2001:db8::", "192.0.0.170", "2001:db8:c000:aa::"},
+    {32, "2001:db8::", "192.0.0.171", "2001:db8:c000:ab::"},
+    {32, "2001:db8::", "169.254.169.254", "2001:db8:a9fe:a9fe::"},
+    {32, "2001:db8::", "10.0.0.5", "2001:db8:a00:5::"},
+    {32, "2001:db8::", "8.8.8.8", "2001:db8:808:808::"},
+    {40, "2001:db8:100::", "192.0.2.33", "2001:db8:1c0:2:21::"},
+    {40, "2001:db8:100::", "192.0.0.170", "2001:db8:1c0:0:aa::"},
+    {40, "2001:db8:100::", "192.0.0.171", "2001:db8:1c0:0:ab::"},
+    {40, "2001:db8:100::", "169.254.169.254", "2001:db8:1a9:fea9:fe::"},
+    {40, "2001:db8:100::", "10.0.0.5", "2001:db8:10a:0:5::"},
+    {40, "2001:db8:100::", "8.8.8.8", "2001:db8:108:808:8::"},
+    {48, "2001:db8:122::", "192.0.2.33", "2001:db8:122:c000:2:2100::"},
+    {48, "2001:db8:122::", "192.0.0.170", "2001:db8:122:c000:0:aa00::"},
+    {48, "2001:db8:122::", "192.0.0.171", "2001:db8:122:c000:0:ab00::"},
+    {48, "2001:db8:122::", "169.254.169.254", "2001:db8:122:a9fe:a9:fe00::"},
+    {48, "2001:db8:122::", "10.0.0.5", "2001:db8:122:a00:0:500::"},
+    {48, "2001:db8:122::", "8.8.8.8", "2001:db8:122:808:8:800::"},
+    {56, "2001:db8:122:300::", "192.0.2.33", "2001:db8:122:3c0:0:221::"},
+    {56, "2001:db8:122:300::", "192.0.0.170", "2001:db8:122:3c0:0:aa::"},
+    {56, "2001:db8:122:300::", "192.0.0.171", "2001:db8:122:3c0:0:ab::"},
+    {56, "2001:db8:122:300::", "169.254.169.254", "2001:db8:122:3a9:fe:a9fe::"},
+    {56, "2001:db8:122:300::", "10.0.0.5", "2001:db8:122:30a:0:5::"},
+    {56, "2001:db8:122:300::", "8.8.8.8", "2001:db8:122:308:8:808::"},
+    {64, "2001:db8:122:344::", "192.0.2.33", "2001:db8:122:344:c0:2:2100:0"},
+    {64, "2001:db8:122:344::", "192.0.0.170", "2001:db8:122:344:c0:0:aa00:0"},
+    {64, "2001:db8:122:344::", "192.0.0.171", "2001:db8:122:344:c0:0:ab00:0"},
+    {64, "2001:db8:122:344::", "169.254.169.254", "2001:db8:122:344:a9:fea9:fe00:0"},
+    {64, "2001:db8:122:344::", "10.0.0.5", "2001:db8:122:344:a:0:500:0"},
+    {64, "2001:db8:122:344::", "8.8.8.8", "2001:db8:122:344:8:808:800:0"},
+    {96, "2001:db8:122:344:5566:7788::", "192.0.2.33", "2001:db8:122:344:5566:7788:c000:221"},
+    {96, "2001:db8:122:344:5566:7788::", "192.0.0.170", "2001:db8:122:344:5566:7788:c000:aa"},
+    {96, "2001:db8:122:344:5566:7788::", "192.0.0.171", "2001:db8:122:344:5566:7788:c000:ab"},
+    {96, "2001:db8:122:344:5566:7788::", "169.254.169.254", "2001:db8:122:344:5566:7788:a9fe:a9fe"},
+    {96, "2001:db8:122:344:5566:7788::", "10.0.0.5", "2001:db8:122:344:5566:7788:a00:5"},
+    {96, "2001:db8:122:344:5566:7788::", "8.8.8.8", "2001:db8:122:344:5566:7788:808:808"},
+};
+
+constexpr std::array<int, 6> kLengths = {32, 40, 48, 56, 64, 96};
+
+} // namespace
+
+TEST_CASE("OIDC egress NAT64: the RFC 6052 section 2.2 layouts decode to the embedded IPv4",
+          "[oidc][oidc_egress][oidc_nat64]") {
+    for (const auto& row : kRfc6052Rows) {
+        CAPTURE(row.length, row.prefix, row.v4, row.address);
+        const Nat64Prefix p{v6(row.prefix), row.length};
+        const auto addr = v6(row.address);
+        // The independent encoder reproduces the table (checks the table AND the encoder) ...
+        CHECK(synthesize(p.bytes, row.length, v4(row.v4)) == addr);
+        // ... and the header's decoder inverts it.
+        REQUIRE(matches(addr, p));
+        const auto embedded = embedded_ipv4(addr, p);
+        REQUIRE(embedded.has_value());
+        CHECK(*embedded == v4(row.v4));
+    }
+}
+
+TEST_CASE("OIDC egress NAT64: the six RFC 6052 section 2.4 example addresses",
+          "[oidc][oidc_egress][oidc_nat64]") {
+    struct Example {
+        const char* prefix;
+        const char* address;
+    };
+    // Prefix lengths 32, 40, 48, 56, 64, 96 for 192.0.2.33 (the RFC's own table).
+    const Example examples[] = {{"2001:db8::/32", "2001:db8:c000:221::"},
+                                {"2001:db8:100::/40", "2001:db8:1c0:2:21::"},
+                                {"2001:db8:122::/48", "2001:db8:122:c000:2:2100::"},
+                                {"2001:db8:122:300::/56", "2001:db8:122:3c0:0:221::"},
+                                {"2001:db8:122:344::/64", "2001:db8:122:344:c0:2:2100:0"},
+                                {"2001:db8:122:344::/96", "2001:db8:122:344::c000:221"}};
+    for (const auto& e : examples) {
+        CAPTURE(e.prefix, e.address);
+        const auto p = prefix(e.prefix);
+        const auto embedded = embedded_ipv4(v6(e.address), p);
+        REQUIRE(embedded.has_value());
+        CHECK(*embedded == v4("192.0.2.33"));
+        CHECK(synthesize(p.bytes, p.length, v4("192.0.2.33")) == v6(e.address));
+    }
+}
+
+TEST_CASE("OIDC egress NAT64: round trip over many random addresses, the u octet and suffix are "
+          "ignored",
+          "[oidc][oidc_egress][oidc_nat64]") {
+    std::mt19937_64 rng(0x5692'6052u); // fixed seed: deterministic
+    for (const int length : kLengths) {
+        for (int i = 0; i < 400; ++i) {
+            Ipv6 pfx{};
+            for (auto& b : pfx)
+                b = static_cast<std::uint8_t>(rng());
+            pfx = mask_to(pfx, length);
+            Ipv4 addr{};
+            for (auto& b : addr)
+                b = static_cast<std::uint8_t>(rng());
+            const std::uint8_t u = (i % 2 == 0) ? 0 : static_cast<std::uint8_t>(rng());
+            const auto suffix = static_cast<std::uint8_t>(rng());
+            const auto a = synthesize(pfx, length, addr, u, suffix);
+            const Nat64Prefix p{pfx, length};
+            CAPTURE(length, i);
+            REQUIRE(matches(a, p));
+            const auto embedded = embedded_ipv4(a, p);
+            REQUIRE(embedded.has_value());
+            CHECK(*embedded == addr);
+        }
+    }
+}
+
+TEST_CASE("OIDC egress NAT64: matching is exactly the first `length` bits",
+          "[oidc][oidc_egress][oidc_nat64]") {
+    for (const int length : kLengths) {
+        CAPTURE(length);
+        const Nat64Prefix p{mask_to(v6("2001:db8:122:344:5566:7788:99aa:bbcc"), length), length};
+        const auto inside = synthesize(p.bytes, length, v4("8.8.8.8"));
+        CHECK(matches(inside, p));
+        // Flip the last bit of the prefix, then the first bit after it.
+        auto outside = inside;
+        outside[static_cast<std::size_t>(length) / 8 - 1] ^= 0x01;
+        CHECK_FALSE(matches(outside, p));
+        CHECK_FALSE(embedded_ipv4(outside, p).has_value());
+        // A bit after the prefix is NOT part of the match.
+        auto tail = inside;
+        tail[15] ^= 0x80;
+        CHECK(matches(tail, p));
+    }
+    // An illegal length matches and embeds nothing, however the address looks.
+    for (const int bad : {-1, 0, 8, 16, 24, 33, 65, 97, 112, 128, 4096}) {
+        CAPTURE(bad);
+        const Nat64Prefix p{v6("2001:db8::"), bad};
+        CHECK_FALSE(matches(v6("2001:db8::1"), p));
+        CHECK_FALSE(embedded_ipv4(v6("2001:db8::1"), p).has_value());
+    }
+}
+
+TEST_CASE("OIDC egress NAT64: an address inside a prefix is classified by its embedded IPv4",
+          "[oidc][oidc_egress][oidc_nat64][security]") {
+    struct Dest {
+        const char* v4;
+        AddressClass cls;
+    };
+    const Dest dests[] = {{"169.254.169.254", AddressClass::LinkLocal},
+                          {"100.100.100.200", AddressClass::CloudMetadata},
+                          {"10.0.0.5", AddressClass::Private},
+                          {"127.0.0.1", AddressClass::Loopback},
+                          {"0.0.0.0", AddressClass::Unspecified},
+                          {"224.0.0.1", AddressClass::Multicast},
+                          {"8.8.8.8", AddressClass::Public}};
+    // One documentation prefix (which is non-global on its own) and one in global space.
+    for (const char* base : {"2001:db8:122:344:5566:7788::", "2a0e:b107:122:344:5566:7788::"}) {
+        for (const int length : kLengths) {
+            const Nat64Prefix p{mask_to(v6(base), length), length};
+            const std::array<Nat64Prefix, 1> extra{p};
+            for (const auto& d : dests) {
+                CAPTURE(base, length, d.v4);
+                const auto a = synthesize(p.bytes, length, v4(d.v4));
+                CHECK(classify_ipv6(a, extra) == d.cls);
+                // Without the prefix the same address is merely "some IPv6 address".
+                const auto bare = classify_ipv6(a);
+                CHECK((bare == AddressClass::Public || bare == AddressClass::OtherNonGlobal));
+            }
+        }
+    }
+}
+
+TEST_CASE("OIDC egress NAT64: what the prefix list does not touch stays as it was",
+          "[oidc][oidc_egress][oidc_nat64][security]") {
+    const std::array<Nat64Prefix, 2> extra{prefix("2a0e:b107:122:344::/64"),
+                                           prefix("2001:db8:122::/48")};
+    // The well-known prefix and the other embedded forms are unchanged.
+    CHECK(classify_ipv6(v6("64:ff9b::a9fe:a9fe"), extra) == AddressClass::LinkLocal);
+    CHECK(classify_ipv6(v6("64:ff9b::808:808"), extra) == AddressClass::Public);
+    CHECK(classify_ipv6(v6("::ffff:10.0.0.5"), extra) == AddressClass::Private);
+    CHECK(classify_ipv6(v6("2002:a00:5::1"), extra) == AddressClass::Private);
+    // An address outside every prefix is untouched.
+    CHECK(classify_ipv6(v6("2606:4700:4700::1111"), extra) == AddressClass::Public);
+    CHECK(classify_ipv6(v6("2a0e:b107:122:345::1"), extra) == AddressClass::Public);
+    CHECK(classify_ipv6(v6("fd00::1"), extra) == AddressClass::UniqueLocal);
+    CHECK(classify_ipv6(v6("::1"), extra) == AddressClass::Loopback);
+    // The one-argument form is the empty list.
+    CHECK(classify_ipv6(v6("2a0e:b107:122:344:a9:fea9:fe00:0")) == AddressClass::Public);
+    CHECK(classify_ipv6(v6("2a0e:b107:122:344:a9:fea9:fe00:0"), extra) == AddressClass::LinkLocal);
+    // A prefix never relaxes an address the built-in rules already put in the never-allowed tier:
+    // here fe80::/32 would "embed" 8.8.8.8 in bytes 4..7.
+    const std::array<Nat64Prefix, 1> hostile{prefix("fe80::/32")};
+    CHECK(classify_ipv6(v6("fe80:0:808:808::"), hostile) == AddressClass::LinkLocal);
+    const std::array<Nat64Prefix, 1> multicast{prefix("ff00::/32")};
+    CHECK(classify_ipv6(v6("ff00:0:808:808::"), multicast) == AddressClass::Multicast);
+}
+
+TEST_CASE("OIDC egress NAT64: overlapping prefixes - the strictest embedded class wins",
+          "[oidc][oidc_egress][oidc_nat64][security]") {
+    // The /32 reads bytes 4..7 of an address, the /96 inside it reads bytes 12..15.
+    const auto wide = prefix("2a0e:b107::/32");
+    // bytes 4..7 = 8.8.8.8 (public), bytes 12..15 = 169.254.169.254 (link-local)
+    const auto a = v6("2a0e:b107:808:808:0:0:a9fe:a9fe");
+    const std::array<Nat64Prefix, 2> both{wide, prefix("2a0e:b107:808:808::/96")};
+    const std::array<Nat64Prefix, 2> both_reversed{both[1], both[0]};
+    CHECK(classify_ipv6(a, both) == AddressClass::LinkLocal);
+    CHECK(classify_ipv6(a, both_reversed) == AddressClass::LinkLocal);
+    // A private class beats a public one: /32 reads 10.0.0.5, /96 reads 8.8.8.8.
+    const auto b = v6("2a0e:b107:a00:5:0:0:808:808");
+    const std::array<Nat64Prefix, 2> mixed{wide, prefix("2a0e:b107:a00:5::/96")};
+    const std::array<Nat64Prefix, 2> mixed_reversed{mixed[1], mixed[0]};
+    CHECK(classify_ipv6(b, mixed) == AddressClass::Private);
+    CHECK(classify_ipv6(b, mixed_reversed) == AddressClass::Private);
+}
+
+TEST_CASE("OIDC egress NAT64: prefix text parsing is strict", "[oidc][oidc_egress][oidc_nat64]") {
+    for (const char* ok : {"2001:db8::/32", "2001:db8:100::/40", "2001:db8:122::/48",
+                           "2001:db8:122:300::/56", "2001:db8:122:344::/64",
+                           "2001:db8:122:344:5566:7788::/96", "64:ff9b::/96", "FD00:64::/32"}) {
+        CAPTURE(ok);
+        const auto p = parse_nat64_prefix(ok);
+        REQUIRE(p.has_value());
+        CHECK(std::to_string(p->length) == std::string(ok).substr(std::string(ok).rfind('/') + 1));
+    }
+    CHECK(prefix("2001:db8:122:344::/64").bytes == v6("2001:db8:122:344::"));
+    for (const char* bad : {"",
+                            "/64",
+                            "2001:db8::",
+                            "2001:db8::/",
+                            "2001:db8::/0",
+                            "2001:db8::/8",
+                            "2001:db8::/24",
+                            "2001:db8::/33",
+                            "2001:db8::/65",
+                            "2001:db8::/95",
+                            "2001:db8::/97",
+                            "2001:db8::/112",
+                            "2001:db8::/128",
+                            "2001:db8::/0032",
+                            "2001:db8::/032",
+                            "2001:db8::/+32",
+                            "2001:db8::/-32",
+                            "2001:db8::/32 ",
+                            " 2001:db8::/32",
+                            "2001:db8::/3x",
+                            "2001:db8::/32/32",
+                            "2001:db8::/3200",
+                            "2001:db8::1/32",              // host bits set
+                            "2001:db8:122:344::1/64",      // host bits set
+                            "2001:db8:122:344:1::/64",     // host bit just past the prefix
+                            "2001:db8:122:344:0:0:0:1/96", // host bits set (byte 15)
+                            "192.0.2.0/24",
+                            "192.0.2.0/32",
+                            "[2001:db8::]/32",
+                            "fe80::1%eth0/32",
+                            "2001:db8:::/32",
+                            "2001:db8::g/32",
+                            "garbage",
+                            "2001:db8::/32,2001:db8:100::/40"}) {
+        CAPTURE(bad);
+        CHECK_FALSE(parse_nat64_prefix(bad).has_value());
+    }
+}
+
+TEST_CASE("OIDC egress NAT64: the operator list", "[oidc][oidc_egress][oidc_nat64]") {
+    const auto empty = parse_nat64_prefix_list("");
+    REQUIRE(empty.has_value());
+    CHECK(empty->empty());
+    CHECK(parse_nat64_prefix_list("   ")->empty());
+
+    const auto one = parse_nat64_prefix_list("2001:db8:122:344::/64");
+    REQUIRE(one.has_value());
+    CHECK(one->size() == 1);
+
+    const auto two = parse_nat64_prefix_list(" 2001:db8::/32 ,\t2a0e:b107:122::/48 ");
+    REQUIRE(two.has_value());
+    REQUIRE(two->size() == 2);
+    CHECK((*two)[0].length == 32);
+    CHECK((*two)[1].length == 48);
+
+    for (const char* bad : {",", "2001:db8::/32,", ",2001:db8::/32", "2001:db8::/32,,2a0e::/32",
+                            "2001:db8::/32,nonsense", "2001:db8::/33", "2001:db8::1/32",
+                            "2001:db8::/32 2a0e::/32", "2001:db8::/32;2a0e::/32"}) {
+        CAPTURE(bad);
+        CHECK_FALSE(parse_nat64_prefix_list(bad).has_value());
+    }
+    // The count is bounded.
+    std::string many;
+    for (std::size_t i = 0; i < kMaxNat64Prefixes; ++i)
+        many += (i ? ",2a0e:b107::/32" : "2a0e:b107::/32");
+    CHECK(parse_nat64_prefix_list(many).has_value());
+    CHECK_FALSE(parse_nat64_prefix_list(many + ",2a0e:b107::/32").has_value());
+}
+
+TEST_CASE("OIDC egress NAT64: RFC 7050 discovery from the ipv4only.arpa answer",
+          "[oidc][oidc_egress][oidc_nat64]") {
+    for (const int length : kLengths) {
+        for (const char* wk : {"192.0.0.170", "192.0.0.171"}) {
+            CAPTURE(length, wk);
+            const auto pfx = mask_to(v6("2001:db8:122:344:5566:7788:99aa:bbcc"), length);
+            const auto answer = synthesize(pfx, length, v4(wk));
+            const auto found = discover_prefix_from_ipv4only_answer(answer);
+            REQUIRE(found.has_value());
+            CHECK(found->length == length);
+            CHECK(found->bytes == pfx);
+            // The learned prefix decodes a metadata address under the same layout.
+            const std::array<Nat64Prefix, 1> extra{*found};
+            CHECK(classify_ipv6(synthesize(pfx, length, v4("169.254.169.254")), extra) ==
+                  AddressClass::LinkLocal);
+        }
+    }
+    // Suffix bits in the answer are not part of the learned prefix.
+    {
+        const auto pfx = mask_to(v6("2a0e:b107:122:344::"), 64);
+        const auto answer = synthesize(pfx, 64, v4("192.0.0.170"), 0, 0x55);
+        const auto found = discover_prefix_from_ipv4only_answer(answer);
+        REQUIRE(found.has_value());
+        CHECK(found->length == 64);
+        CHECK(found->bytes == pfx);
+    }
+    // The well-known prefix is discoverable too (and already decoded by the built-in rules).
+    {
+        const auto found = discover_prefix_from_ipv4only_answer(v6("64:ff9b::c000:aa"));
+        REQUIRE(found.has_value());
+        CHECK(found->length == 96);
+    }
+}
+
+TEST_CASE("OIDC egress NAT64: RFC 7050 discovery refuses what is not an unambiguous answer",
+          "[oidc][oidc_egress][oidc_nat64][security]") {
+    // Not an ipv4only.arpa answer.
+    CHECK_FALSE(discover_prefix_from_ipv4only_answer(v6("2001:db8::1")).has_value());
+    CHECK_FALSE(discover_prefix_from_ipv4only_answer(v6("::")).has_value());
+    CHECK_FALSE(discover_prefix_from_ipv4only_answer(v6("2606:4700:4700::1111")).has_value());
+    // Embeds a neighbour of the well-known addresses, at every length.
+    for (const int length : kLengths)
+        for (const char* near : {"192.0.0.169", "192.0.0.172", "192.0.2.170", "193.0.0.170"}) {
+            CAPTURE(length, near);
+            CHECK_FALSE(
+                discover_prefix_from_ipv4only_answer(
+                    synthesize(mask_to(v6("2a0e:b107:122:344::"), length), length, v4(near)))
+                    .has_value());
+        }
+    // A non-zero u octet is not a legal /32../64 layout.
+    for (const int length : {32, 40, 48, 56, 64}) {
+        CAPTURE(length);
+        CHECK_FALSE(discover_prefix_from_ipv4only_answer(
+                        synthesize(mask_to(v6("2a0e:b107:122:344::"), length), length,
+                                   v4("192.0.0.170"), 0x01))
+                        .has_value());
+    }
+    // Two lengths fit at once (192.0.0.170 at bytes 4..7 AND at bytes 12..15): ambiguous.
+    CHECK_FALSE(
+        discover_prefix_from_ipv4only_answer(v6("2a0e:b107:c000:aa:0:0:c000:aa")).has_value());
 }

@@ -4688,6 +4688,12 @@ void SettingsRoutes::register_routes(
             oidc_cfg.skip_tls_verify = skip_tls;
             // OS-level egress switch: copied from the server config, never from the request.
             oidc_cfg.allow_private_networks = cfg_->oidc_allow_private_networks;
+            // Same for the NAT64 declaration (--oidc-nat64-prefix); validated at startup, so an
+            // unparsable value here can only mean a Config built outside main.cpp: fail closed.
+            if (auto prefixes = oidc::egress::parse_nat64_prefix_list(cfg_->oidc_nat64_prefixes))
+                oidc_cfg.nat64_prefixes = std::move(*prefixes);
+            else
+                throw std::runtime_error("the server's --oidc-nat64-prefix value is invalid");
             // ADR-2001 §1 gap (Task 2 follow-up): this hot-reload path builds its
             // own local OidcConfig and previously left scim_link_claim at its
             // struct default ("sub"), silently reverting an operator's
@@ -4805,11 +4811,13 @@ void SettingsRoutes::register_routes(
         // lock); the network I/O below runs without it.
         bool saved_skip_tls = false;
         bool allow_private = false; // OS-level egress switch; never read from the form
+        std::string nat64_text;     // OS-level NAT64 declaration; never read from the form
         std::string saved_issuer;
         {
             std::shared_lock lock(*oidc_mu_);
             saved_skip_tls = cfg_->oidc_skip_tls_verify;
             allow_private = cfg_->oidc_allow_private_networks;
+            nat64_text = cfg_->oidc_nat64_prefixes;
             saved_issuer = cfg_->oidc_issuer;
         }
         bool skip_tls = (skip_tls_str == "true") || saved_skip_tls;
@@ -4832,13 +4840,20 @@ void SettingsRoutes::register_routes(
                                 html_escape(what) + "</span>",
                             "text/html; charset=utf-8");
         };
-        auto doc = oidc::OidcProvider::fetch_discovery_document(issuer, skip_tls, allow_private);
+        const auto nat64 = oidc::egress::parse_nat64_prefix_list(nat64_text);
+        if (!nat64) {
+            fail("The server's --oidc-nat64-prefix value is invalid; fix it and restart.");
+            return;
+        }
+        auto doc = oidc::OidcProvider::fetch_discovery_document(
+            issuer, skip_tls, allow_private, oidc::OidcProvider::kHttpOperationTimeoutMs, *nat64);
         if (!doc) {
             fail("Discovery failed: " + doc.error());
             return;
         }
-        auto jwks_body =
-            oidc::OidcProvider::http_get_bounded(doc->jwks_uri, skip_tls, allow_private);
+        auto jwks_body = oidc::OidcProvider::http_get_bounded(
+            doc->jwks_uri, skip_tls, allow_private, oidc::OidcProvider::kHttpOperationTimeoutMs,
+            *nat64);
         if (!jwks_body) {
             fail("Discovery succeeded but the JWKS could not be fetched: " + jwks_body.error());
             return;
