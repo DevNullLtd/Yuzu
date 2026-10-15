@@ -104,7 +104,7 @@ TEST_CASE("GET /home?next=<key>: a known key drives the notice; paths, URLs and 
     }
 }
 
-TEST_CASE("GET /home signed in: the signed-in region in place, Open Dashboard or Open <area>, no redirect",
+TEST_CASE("GET /home signed in: the signed-in region in place, Open Console or Open <area>, no redirect",
           "[login][home][route][next]") {
     Harness h;
     h.wire();
@@ -117,9 +117,9 @@ TEST_CASE("GET /home signed in: the signed-in region in place, Open Dashboard or
     CHECK(r->get_header_value("Location").empty());
     CHECK(has(r->body, "aria-label=\"Signed in\""));
     CHECK(has(r->body, "<div class=\"who\"><b>dave.rae</b><span>Administrator</span></div>"));
-    CHECK(has(r->body, "id=\"open-area\" href=\"/\">Open Dashboard</a>"));
+    CHECK(has(r->body, "id=\"open-area\" href=\"/\">Open Console</a>"));
     CHECK(has(r->body, "hx-post=\"/logout\">Sign out</button>"));
-    CHECK(has(r->body, "You are signed in. Open the Dashboard, or pick an area below."));
+    CHECK(has(r->body, "You are signed in. Open the Console, or pick an area below."));
     CHECK_FALSE(has(r->body, "id=\"signin\""));
     CHECK_FALSE(has(r->body, "<form"));
 
@@ -132,7 +132,7 @@ TEST_CASE("GET /home signed in: the signed-in region in place, Open Dashboard or
     auto bad = h.sink.Get("/home?next=https://evil.example/", hdrs);
     REQUIRE(bad);
     CHECK(bad->status == 200);
-    CHECK(has(bad->body, "id=\"open-area\" href=\"/\">Open Dashboard</a>"));
+    CHECK(has(bad->body, "id=\"open-area\" href=\"/\">Open Console</a>"));
     CHECK_FALSE(has(bad->body, "evil.example"));
 
     auto viewer = h.sink.Get("/home", h.cookie("alice", auth::Role::user));
