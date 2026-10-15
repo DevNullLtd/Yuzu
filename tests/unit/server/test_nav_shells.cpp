@@ -275,7 +275,9 @@ TEST_CASE("app shell: styles come from tokens, never hex literals", "[nav][shell
     static const std::regex hex(R"(#[0-9a-fA-F]{3,8}\b)");
     const auto html = render_shell({.active_key = "dashboard"});
     CHECK_FALSE(std::regex_search(html, hex));
-    CHECK_THAT(html, !ContainsSubstring("box-shadow"));
+    // The one shadow is the bell pop-over's (--shadow is for pop-overs and menus alone).
+    CHECK(count_of(html, "box-shadow") == 1);
+    CHECK_THAT(html, ContainsSubstring("box-shadow:var(--shadow)"));
     // Fonts only ever come from the page's font tokens.
     static const std::regex literal_family(R"(font-family:\s*(?!var\())");
     CHECK_FALSE(std::regex_search(html, literal_family));
@@ -284,18 +286,22 @@ TEST_CASE("app shell: styles come from tokens, never hex literals", "[nav][shell
 
 TEST_CASE("app shell: each raw literal in the renderer stays under MSVC's string limit",
           "[nav][shell]") {
-    // The CSS and the script are the two large literals (C2026 at 16,380 bytes); each renders
-    // verbatim between its own tags, so measure each one, not the whole block. The limit is
-    // documented in docs/cpp-conventions.md; 16,000 leaves this test its own headroom.
+    // The shell CSS/script and the bell CSS/script are the large literals (C2026 at 16,380
+    // bytes); each renders verbatim between its own tags, so measure every block, not the
+    // first. The limit is documented in docs/cpp-conventions.md; 16,000 leaves this test its
+    // own headroom.
     const auto html = render_shell({.active_key = "dashboard"});
     for (const auto& [open, close] : {std::pair<std::string_view, std::string_view>{"<style>", "</style>"},
                                       {"<script>", "</script>"}}) {
         INFO(open);
-        const auto b = html.find(open);
-        const auto e = html.find(close);
-        REQUIRE(b != std::string::npos);
-        REQUIRE(e != std::string::npos);
-        CHECK(e + close.size() - b < 16000);
+        std::size_t blocks = 0;
+        for (auto b = html.find(open); b != std::string::npos; b = html.find(open, b + 1)) {
+            const auto e = html.find(close, b);
+            REQUIRE(e != std::string::npos);
+            CHECK(e + close.size() - b < 16000);
+            ++blocks;
+        }
+        CHECK(blocks == 2); // shell + bell
     }
 }
 
@@ -367,6 +373,104 @@ TEST_CASE("app shell: toasts sit below the header so one never covers Sign out",
     CHECK_THAT(render_shell({}), ContainsSubstring(".shell-search{flex-basis:100%;margin-left:0}\n.toast-container{top:auto;bottom:var(--sp-4)}\n}"));
 }
 
+// ── Notifications bell ──────────────────────────────────────────────────────
+
+TEST_CASE("app shell: the bell is one hidden <details> before the account block", "[nav][shell][bell]") {
+    for (const auto* key : {"dashboard", "settings", "dex", ""}) {
+        INFO(key);
+        const auto html = render_shell({.active_key = key});
+        CHECK(count_of(html, "<details class=\"shell-pop\" id=\"shell-bell\" hidden>") == 1);
+        CHECK(html.find("id=\"shell-bell\"") < html.find("class=\"shell-acct\""));
+        CHECK_THAT(html, ContainsSubstring("<summary id=\"shell-bell-sum\" aria-label=\"Notifications\">"));
+        CHECK_THAT(html, ContainsSubstring("Shared by all operators"));
+        // Approvals are not drawn here: no feed rows, no link until the page exists.
+        // (the sidebar's own Approvals link is outside the bell, so scope to the <details>.)
+        const auto b0 = html.find("id=\"shell-bell\"");
+        const auto b1 = html.find("</details>", b0);
+        REQUIRE(b1 != std::string::npos);
+        const auto bell = html.substr(b0, b1 - b0);
+        CHECK_THAT(bell, !ContainsSubstring("Open approvals"));
+        CHECK_THAT(bell, !ContainsSubstring("/approvals"));
+    }
+}
+
+TEST_CASE("app shell: re-baking keeps exactly one bell, style and script", "[nav][shell][bell]") {
+    const std::string page = "<body><!--yuzu:shell--><!--/yuzu:shell--></body>";
+    const auto once = apply_shell(page, {.active_key = "dex"});
+    const auto twice = apply_shell(once, {.active_key = "tar"});
+    CHECK(count_of(twice, "id=\"shell-bell\"") == 1);
+    CHECK(count_of(twice, "(function(){\n  var POLL_MS=") == 1);
+    CHECK(count_of(twice, "<style>") == 2);
+    CHECK(count_of(twice, "<script>") == 2);
+    // The bell script sits inside the marker pair, before the end marker.
+    CHECK(twice.find("var POLL_MS=") < twice.find(kShellEnd));
+}
+
+TEST_CASE("app shell: bell requests use the three existing routes, credentialed, bounded",
+          "[nav][shell][bell]") {
+    const auto html = render_shell({});
+    CHECK_THAT(html, ContainsSubstring("var POLL_MS=60000, IDLE_MS=300000, TIMEOUT_MS=5000, LIMIT=10, CONFIRM_MS=3000, MSG_MAX=500;"));
+    CHECK_THAT(html, ContainsSubstring("fetch('/api/notifications?limit='+LIMIT,{signal:AbortSignal.timeout(TIMEOUT_MS)})"));
+    CHECK_THAT(html, ContainsSubstring("'/api/notifications/'+n.id+'/'+(kind==='read'?'read':'dismiss'),{method:'POST',signal:AbortSignal.timeout(TIMEOUT_MS)}"));
+    CHECK_THAT(html, ContainsSubstring("Number.isSafeInteger(n.id)&&n.id>0"));
+    // Default credentials: the session cookie is the whole auth, unlike the online counter.
+    CHECK(count_of(html, "credentials:'omit'") == 1);
+    // Shape guard: a 2xx with any other body is a failure, not an empty list.
+    CHECK_THAT(html, ContainsSubstring("!Array.isArray(d.notifications)||typeof d.unread_count!=='number'"));
+    // 401 and 403 hide the bell and stop; 403 on an action disables the buttons.
+    CHECK_THAT(html, ContainsSubstring("if(r.status===401||r.status===403){root.hidden=true;stopped=true;return null;}"));
+    CHECK_THAT(html, ContainsSubstring("if(r.status===403){return r.json()"));
+    CHECK_THAT(html, ContainsSubstring("else{readOnly=true;"));
+    CHECK_THAT(html, ContainsSubstring("Your account can view notifications but not change them."));
+    // A same-site refusal is told apart from a read-only account, with the remedy named.
+    CHECK_THAT(html, ContainsSubstring("refused as cross-site"));
+    CHECK_THAT(html, ContainsSubstring("--csrf-trusted-origin"));
+    CHECK_THAT(html, ContainsSubstring("No unread notifications."));
+}
+
+TEST_CASE("app shell: both bell actions take the two-click confirm", "[nav][shell][bell]") {
+    const auto html = render_shell({});
+    CHECK_THAT(html, ContainsSubstring("btn(n,'read','Mark read',it)"));
+    CHECK_THAT(html, ContainsSubstring("btn(n,'dismiss','Dismiss',it)"));
+    // One shared handler: the first click arms, only a second click on the same button sends.
+    CHECK(count_of(html, "if(armed&&armed.btn===b){act(n,kind,itemEl);return;}") == 1);
+    CHECK_THAT(html, ContainsSubstring("b.classList.add('btn-confirming');"));
+    CHECK_THAT(html, ContainsSubstring("armTimer=setTimeout(disarm,CONFIRM_MS);"));
+    CHECK_THAT(html, ContainsSubstring("b.textContent='Confirm '+label.toLowerCase();"));
+}
+
+TEST_CASE("app shell: bell polling is gated on recent input", "[nav][shell][bell]") {
+    const auto html = render_shell({});
+    CHECK_THAT(html, ContainsSubstring("['keydown','pointerdown','pointermove','scroll'].forEach("));
+    // The age check lives in poll() so the timer and a foregrounded tab share it.
+    CHECK_THAT(html, ContainsSubstring("if(!force&&Date.now()-last>IDLE_MS){paused=true;return;}"));
+    CHECK_THAT(html, ContainsSubstring("function input(){last=Date.now();if(paused){paused=false;poll(false);}}"));
+    // Not polled while the tab is hidden or the panel is open.
+    CHECK_THAT(html, ContainsSubstring("(!force&&(document.hidden||root.open))"));
+}
+
+TEST_CASE("app shell: bell renders server text as text only", "[nav][shell][bell]") {
+    const auto html = render_shell({});
+    for (const auto* banned : {"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(",
+                               "new Function", " onclick=", "hx-on", "localStorage", "sessionStorage",
+                               "__bellRefresh"}) {
+        INFO(banned);
+        CHECK_THAT(html, !ContainsSubstring(banned));
+    }
+    CHECK_THAT(html, ContainsSubstring("textContent"));
+    // The message is clamped before it reaches the paragraph or the title attribute.
+    const auto clamp = html.find("txt(n.message).slice(0,MSG_MAX)");
+    REQUIRE(clamp != std::string::npos);
+    CHECK(clamp < html.find("m.setAttribute('title',msg)"));
+    // The level goes through a fixed map; the raw string is never a class.
+    CHECK_THAT(html, ContainsSubstring("var LV={success:'s-on',warn:'s-w',error:'s-bad',info:'s-off'};"));
+    CHECK_THAT(html, ContainsSubstring("Object.prototype.hasOwnProperty.call(LV,n.level)?n.level:'info'"));
+    // Own row class (yuzu.css has no .row), hidden must beat the display rule.
+    CHECK_THAT(html, ContainsSubstring("shell-pop-r"));
+    CHECK_THAT(html, !ContainsSubstring("class=\"row\""));
+    CHECK_THAT(html, ContainsSubstring(".shell-pop[hidden]{display:none}"));
+}
+
 // ── apply_shell / bake ──────────────────────────────────────────────────────
 
 TEST_CASE("apply_shell: fills an empty marker pair and keeps the rest of the page", "[nav][shell]") {
@@ -430,6 +534,8 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},
+        // Not listed on purpose: /home is the landing and sign-in page and carries no
+        // shell at all (test_home_ui.cpp pins that). The logo reaches it (below).
     };
     for (const auto& p : pages) {
         INFO(p.name);
@@ -459,6 +565,14 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
     }
 }
 
+TEST_CASE("app shell: the brand link reaches the landing page, which has no nav item", "[nav][shell]") {
+    const auto html = render_shell({.active_key = "dashboard"});
+    CHECK(count_of(html, R"(<a class="shell-brand" href="/home" aria-label="Yuzu home">Yuzu<i></i></a>)") == 1);
+    for (const auto& g : nav_groups())
+        for (const auto& it : g.items)
+            CHECK(it.href != "/home");
+}
+
 TEST_CASE("app shell: approvals badge is hidden until the count answers, polls every 30 s and stops on a refusal",
           "[nav][shell]") {
     const std::string_view badge =
@@ -478,12 +592,14 @@ TEST_CASE("app shell: approvals badge is hidden until the count answers, polls e
     CHECK(count_of(html, "if(typeof n!=='number')throw new Error('payload');") == 2);
     CHECK(count_of(html, ".catch(function(){badge.hidden=true;})") == 1);
     CHECK(count_of(html, "badge.hidden=n<=0;") == 1);
-    CHECK(count_of(html, "n>99?'99+'") == 1);
+    // The bell script (a separate <script>, emitted after this one) also caps its chip at 99+.
+    const auto shell_js = html.substr(0, html.rfind("<script>"));
+    CHECK(count_of(shell_js, "n>99?'99+'") == 1);
     // Only the health poll omits credentials; the badge fetch rides the session cookie.
     CHECK(count_of(html, "credentials:'omit'") == 1);
     // No aria-label on the span (A18) and no event dispatch (O7).
-    CHECK_THAT(html, !ContainsSubstring("setAttribute('aria-label'"));
-    CHECK_THAT(html, !ContainsSubstring("yuzu:approvals-count"));
+    CHECK_THAT(shell_js, !ContainsSubstring("setAttribute('aria-label'"));
+    CHECK_THAT(shell_js, !ContainsSubstring("yuzu:approvals-count"));
 }
 
 TEST_CASE("the shared detail shell re-targets to every route that reuses it", "[nav][shell][pages]") {

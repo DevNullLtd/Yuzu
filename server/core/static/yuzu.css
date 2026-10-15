@@ -214,6 +214,12 @@
   --c3: var(--mds-color-chart-3);
   --c4: var(--mds-color-chart-4);
   --c5: var(--mds-color-chart-5);
+  /* Home tile families (delta 2026-10-14): one colour per menu family. */
+  --fam-operate: var(--c1);
+  --fam-posture: var(--c2);
+  --fam-estate:  var(--c5);
+  --fam-access:  var(--c3);
+  --fam-system:  var(--mds-color-theme-text-tertiary);
   --shadow:    var(--mds-elevation-3);
   --font:      var(--mds-font-family-default);
   --ctl:       36px;              /* control height; 28px for .btn-sm */
@@ -608,3 +614,100 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important; }
 }
+
+/* Home landing (delta 2026-10-14) — the sign-in landing page at /home: slim bar,
+   hero with the sign-in panel, and the fifteen screens as family-coloured tiles.
+   Flat: nothing in this block casts a shadow, lifts, fades, glows or blurs. */
+.fam { display: flex; flex-wrap: wrap; gap: 14px 24px; align-items: flex-start; }
+.fam > .fh { flex: 0 0 140px; padding-top: 2px; }
+.fam > .fh h2 { font-size: 16px; font-weight: 600; color: var(--fam); }
+.fam > .fh p { color: var(--mut); font-size: 13px; margin-top: 4px; }
+.tiles { flex: 1 1 560px; display: grid; grid-template-columns: repeat(auto-fill, 176px); gap: 16px; }
+.tile { position: relative; width: 176px; height: 176px; display: flex; flex-direction: column; gap: 4px; padding: 16px;
+        border-radius: var(--rad-panel); color: var(--ink); text-decoration: none;
+        background: color-mix(in srgb, var(--fam) 10%, var(--surface));
+        border: 1px solid color-mix(in srgb, var(--fam) 38%, var(--line)); }
+.tile:hover { background: color-mix(in srgb, var(--fam) 17%, var(--surface)); border-color: var(--fam); }
+.tile:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.tile svg { width: 26px; height: 26px; fill: none; stroke: var(--fam); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; margin-bottom: auto; }
+.tile .tt { font-size: 17px; font-weight: 600; letter-spacing: -.01em; line-height: 1.2; }
+.tile .ts { font-size: 12.5px; color: var(--mut); line-height: 1.35; }
+.f-operate { --fam: var(--fam-operate); } .f-posture { --fam: var(--fam-posture); } .f-estate { --fam: var(--fam-estate); }
+.f-access { --fam: var(--fam-access); } .f-system { --fam: var(--fam-system); }
+
+.land { display: block; min-height: 100vh; }
+.land .lh { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 40px; }
+.land .lh .brand { display: flex; align-items: center; gap: 9px; padding: 0; color: var(--ink); font-size: 22px; font-weight: 600; letter-spacing: -.01em; text-decoration: none; }
+.land .lh .brand i { width: 9px; height: 9px; margin-top: 5px; background: var(--hl); border-radius: 2px; transform: rotate(45deg); }
+.land .lh .srv { color: var(--mut); font-size: 13px; font-family: var(--mono); }
+.land .hero { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 32px 48px; padding: 28px 40px 0; }
+.land .ht { flex: 1 1 560px; display: flex; flex-direction: column; gap: 18px; align-items: flex-start; }
+.land .ht h1 { font-size: 56px; font-weight: 600; letter-spacing: -.03em; line-height: 1.06; }
+.land .ht .lede { color: var(--ink2); font-size: 17px; line-height: 1.55; max-width: 56ch; text-wrap: balance; }
+.land .rule { width: 44px; height: 4px; background: var(--hl); border-radius: 1px; }
+.land .lc { flex: 0 1 380px; min-width: 300px; }
+.land .login .form { gap: 14px; }
+.land .login .btn { width: 100%; justify-content: center; height: 40px; }
+.land .or { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 12.5px; }
+.land .or::before, .land .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.land .small { color: var(--mut); font-size: 13px; line-height: 1.5; }
+.land .who { display: flex; flex-direction: column; gap: 2px; }
+.land .who b { font-size: 16px; font-weight: 600; color: var(--ink); }
+.land .who span { color: var(--mut); font-size: 13px; }
+.land .error-msg { min-height: 1.2em; font-size: 13px; color: var(--bad); }
+.land .error-msg:empty { display: none; }
+.land .login code.mono { font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
+.land .enroll-qr-box { overflow: hidden; border-radius: var(--rad-ctl); line-height: 0; }
+.land .recovery-list { margin: 0; padding: 12px 12px 12px 28px; background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+                       font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
+.land .lb { display: flex; flex-direction: column; gap: 24px; padding: 64px 40px 72px; }
+.land .lb > h2 { font-size: 15px; font-weight: 600; color: var(--ink2); }
+.land .fams { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 40px; }
+.land .fam { flex-direction: column; flex-wrap: nowrap; gap: 12px; align-items: flex-start; max-width: 100%; }
+.land .fam > .fh { flex: none; padding: 0; display: flex; align-items: baseline; gap: 12px; }
+.land .fam > .fh p { margin: 0; }
+.land .fam .tiles { flex: none; }
+.land .tiles.n1 { grid-template-columns: repeat(1, 176px); } .land .tiles.n3 { grid-template-columns: repeat(3, 176px); } .land .tiles.n4 { grid-template-columns: repeat(4, 176px); }
+.land .tile .ts { font-size: 13px; }
+@media (max-width: 820px) {
+  .land .fam, .land .fam .tiles { width: 100%; }
+  .land .fam .tiles { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+  .land .tile { width: auto; }
+}
+@media (max-width: 700px) {
+  .land .ht h1 { font-size: 34px; }
+  .land .lh, .land .hero, .land .lb { padding-left: 20px; padding-right: 20px; }
+}
+
+/* Dashboard rows (delta 2026-10-14) */
+/* One grid for every Dashboard row: two thirds / one third, three equal, or full
+   width, with a 22px gutter between panels and between rows. Panels in a row share
+   a height; lists grow to fill their panel. Below 1140px every row
+   is one column; the three-equal row wraps at a 300px minimum. The attention list
+   (.att-*) moved here from the Home page's scoped sheet with the panels. */
+.dash { display: flex; flex-direction: column; gap: 22px; }
+.dash .rw { display: grid; gap: 22px; align-items: stretch; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+.dash .rw.t3 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+.dash .rw.t1 { grid-template-columns: minmax(0, 1fr); }
+.dash .col { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
+.dash .col > .panel:last-child { flex: 1; }
+.dash .panel { display: flex; flex-direction: column; }
+.dash .panel > .hd { min-height: 52px; flex-wrap: nowrap; }
+.dash .panel > .hd :is(h2, h3) { white-space: nowrap; }
+.dash .panel > .hd .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.dash .panel > .hd .end { flex: 0 0 auto; }
+.dash .kvl.fill > div { flex: 1; align-items: center; }
+.dash .kinds { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 22px; padding: 10px 16px; border-top: 1px solid var(--line); font-size: 13px; color: var(--mut); }
+.dash .kinds .k0 { color: var(--ink2); font-weight: 500; }
+.dash .kinds b { color: var(--ink); font-weight: 500; margin-left: 6px; font-size: 12.5px; }
+.dash .kinds .end { margin-left: auto; }
+/* Needs attention rows (rendered by home_render.cpp's attention panel). */
+.att-list, .panel > .pb.att-list { display: flex; flex-direction: column; gap: 0; padding: 0; }
+.att-list .note { margin: 12px 16px 0; }
+.att-row { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.att-row:last-child { border-bottom: 0; }
+.att-rowb { flex: 1 1 auto; min-width: 0; }
+.att-rowb b { color: var(--ink); font-weight: 500; }
+.att-row .sd { flex: 0 0 auto; margin-right: 0; }
+.dash .panel > .att-list { flex: 1; }
+@media (max-width: 1140px) { .dash .rw, .dash .rw.t3 { grid-template-columns: minmax(0, 1fr); } }

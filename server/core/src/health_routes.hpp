@@ -94,6 +94,8 @@
 ///   GET /readyz                     (no gate — draining_, runtime pg_reachable, boot-latched store checks)
 ///   GET /fragments/health/summary   (deny_service_scoped_fn THEN auth_fn)
 
+#include "authz_gates.hpp" // authz::FleetReadGate (Dashboard health panel)
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
@@ -204,9 +206,18 @@ struct Deps {
                            const std::string& action, const std::string& message,
                            const std::string& target_type, const std::string& target_id)>;
 
+    /// Dashboard health panel only (`/fragments/dashboard/health`): the admit-then-filter
+    /// gate for the "Executions running" row. Optional: unbound -> the row is
+    /// omitted (never shown unfiltered).
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+
     AuthFn auth_fn;                          // /fragments/health/summary
     ResolveSessionFn resolve_session_fn;      // /health, /api/health
     DenyServiceScopedFn deny_service_scoped_fn; // /fragments/health/summary
+    FleetReadFn fleet_read_fn;                  // /fragments/dashboard/health (optional)
 
     // ---- REQUIRED (registration throws std::invalid_argument if null) ----
     Config* cfg{nullptr};

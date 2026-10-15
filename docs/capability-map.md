@@ -1000,7 +1000,7 @@ The `command_id → execution_id` map + `ExecutionEventBus` SSE stream unifying 
 
 ### 21.3 System Notifications :white_check_mark: `T2`
 
-`NotificationStore` (migrated to PostgreSQL; verified 2026-09-07 via `pg::PgPool` constructor in `notification_store.cpp`, previous row text stale-claimed SQLite). Create notifications with level (info/warn/error/success), title, and message. List unread/all, mark as read, dismiss (soft-delete), count unread. Server generates notifications for system events (agent registration, policy violations, deployment completions). REST API and dashboard bell icon integration.
+`NotificationStore` (migrated to PostgreSQL; verified 2026-09-07 via `pg::PgPool` constructor in `notification_store.cpp`, previous row text stale-claimed SQLite). Create notifications with level (info/warn/error/success), title, and message. List unread/all, mark as read, dismiss (soft-delete), count unread. The server writes a notification from five producer sites covering four events: first agent enrolment, a failed command (on both the Subscribe and gateway paths), a fleet incident (blast radius) and a DEX alert. Policy violations and deployment completions produce none. The dashboard header bell lists the unread feed and offers Mark read and Dismiss over the three dashboard JSON routes in `rest-api.md` ("Notifications feed"); there is no REST v1 or MCP twin yet.
 
 ### 21.4 Event Subscriptions (Webhook / Email) :white_check_mark: `T3`
 
