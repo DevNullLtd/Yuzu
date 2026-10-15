@@ -85,6 +85,7 @@ constexpr std::string_view kHead = R"HTM(<!DOCTYPE html>
 <title>Yuzu</title>
 <link rel="icon" href="data:,"><link rel="stylesheet" href="/static/yuzu.css">
 <script src="/static/htmx.js"></script>
+<script>try{var t=localStorage.getItem('yuzu-theme');if(/^(slate|navy|jade|light|light-baby|light-hot)$/.test(t))document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
 </head><body>
 <div class="land">
 <header class="lh"><a class="brand" href="/home" aria-label="Yuzu home">Yuzu<i></i></a>)HTM";
