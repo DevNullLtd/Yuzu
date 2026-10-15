@@ -43,8 +43,10 @@ namespace yuzu::server::software_sync {
 /// How long one run may hold the in-flight slot before another run may take it over. The send
 /// loop is sequential and a connected agent that has stopped reading blocks its own write, so
 /// without a lease one stalled stream would hold the slot (and answer every other run 409)
-/// until that agent reads or disconnects. The stalled run keeps going; it is bounded by the
-/// 500-target cap, and a takeover only ever lets a second bounded run start.
+/// until that agent reads or disconnects. The stalled run keeps going (it is bounded by the
+/// 500-target cap) and a takeover starts another bounded run, so the physical bound is the
+/// current lease holder plus every predecessor still stuck on a stalled write, with takeovers at
+/// least one lease (120 s) apart; there is no cancellation of a blocked send.
 inline constexpr std::int64_t kSlotLeaseMs = 120'000;
 
 /// The seams a run needs. The server wires them; a test fakes them.
