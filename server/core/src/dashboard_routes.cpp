@@ -104,8 +104,9 @@ static int col_index_for_name(const std::vector<std::string>& cols, const std::s
 }
 
 // -- Helper: does any exact-value facet filter exceed the ingest bound? (#5623) ----
-// A facet value over kMaxFacetValueBytes is never indexed, so such a filter can match nothing;
-// the results page says so rather than let an empty table read as "no agent has this value".
+// A facet value over kMaxFacetValueBytes is not indexed in newly stored responses (rows an older
+// server stored may still match), so such a filter may match nothing; the results page says so
+// rather than let an empty table read as "no agent has this value".
 static bool any_filter_value_too_long(const std::vector<FacetFilter>& filters) {
     return std::any_of(filters.begin(), filters.end(),
                        [](const FacetFilter& f) { return f.value.size() > kMaxFacetValueBytes; });
@@ -2705,8 +2706,8 @@ std::string DashboardRoutes::render_results(
     if (any_filter_value_too_long(filters)) {
         html += " <span class=\"result-degrade-banner\" data-filter-too-long=\"true\">"
                 "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
-                " bytes. Values that long are not indexed, so this filter cannot match "
-                "anything. Shorten the value.</span>";
+                " bytes. Newly stored responses do not index values that long, so this "
+                "filter may match nothing. Try the Search box.</span>";
     }
     html += "</div>";
 
