@@ -531,6 +531,9 @@ struct ExecHarness {
         wf_deps.capability_registry = &capability_registry; // BR-001 targeting gate
         wf_deps.param_validators = std::move(param_validators_override);
         routes.register_routes(sink, std::move(wf_deps));
+        // A browser sends these on every same-origin write; execute refuses a cookie-session
+        // dispatch without them (the cross-site tests clear or override them).
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
     }
 
     ~ExecHarness() {
@@ -2863,6 +2866,45 @@ TEST_CASE("SSE handler: 410 Gone for terminal execution", "[pg][workflow][execut
     auto res = h.sink.Get("/sse/executions/" + exec_id);
     REQUIRE(res);
     CHECK(res->status == 410);
+}
+
+// #4644: the Last-Event-ID wiring of THIS route (the one that has no gap probe and no
+// `?since`). The sink hands back the real httplib::Response, so the chunked provider is driven once with
+// a capturing DataSink and the frames the route queued are counted. A route that mapped a malformed header
+// to cursor 0 (replay the whole ring) or dropped the strict cursor goes red.
+TEST_CASE("SSE handler: Last-Event-ID wiring replays exactly the tail and a malformed one is live only",
+          "[pg][workflow][executions][pr3][numeric_params]") {
+    auto frames = [](const std::string& wire) {
+        int n = 0;
+        for (auto at = wire.find("event: agent-transition"); at != std::string::npos;
+             at = wire.find("event: agent-transition", at + 1))
+            ++n;
+        return n;
+    };
+    struct Case {
+        const char* header;
+        int expected_replayed;
+    };
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-SSE-CURSOR", "SseCursor");
+    for (const Case c : {Case{"0", 3}, Case{"1", 2}, Case{"002", 1}, Case{"3", 0}, Case{"5abc", 0},
+                         Case{"-1", 0}, Case{"99999999999999999999", 0}}) {
+        INFO("Last-Event-ID=" << c.header);
+        auto exec_id = h.make_exec("def-SSE-CURSOR", "running", 1, 0, 0);
+        for (int i = 0; i < 3; ++i)
+            h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a"})", false);
+        auto res = h.sink.Get("/sse/executions/" + exec_id, {{"Last-Event-ID", c.header}});
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        // One live event so the provider never idles; it is counted with the replayed ones.
+        h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"live"})", false);
+        REQUIRE(res->content_provider_);
+        const auto wire = yuzu::server::test::drain_chunked_provider_once(*res);
+        CHECK(frames(wire) == c.expected_replayed + 1);
+        CHECK(wire.find("live") != std::string::npos);
+    }
 }
 
 // Governance fix (#2146 A2-R1 Gate 8 re-review): this route used the plain
@@ -5494,4 +5536,70 @@ TEST_CASE("GET /api/v1/schedules: an unrecognized enabled_only value answers 400
     auto res = h.sink.Get("/api/v1/schedules?enabled_only=maybe");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+// #4644: the workflow list routes read `limit` strictly.
+TEST_CASE("GET /api/workflows and /api/v1/workflows: a trailing-garbage or overflowing limit is "
+          "a 400 not its numeric prefix",
+          "[pg][workflow][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    for (const char* route : {"/api/workflows", "/api/v1/workflows"}) {
+        for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=4294967296"}) {
+            INFO(route << "?" << bad);
+            auto res = h.sink.Get(std::string(route) + "?" + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+    }
+}
+
+// The legacy product-pack list reads `limit` strictly too (a malformed value used to be its numeric
+// prefix). It answers 503 before the parse when no pack store is wired, so wire one.
+TEST_CASE("GET /api/product-packs: a trailing-garbage or overflowing limit is a 400 a clean one "
+          "is served",
+          "[pg][workflow][list][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/true);
+    for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=", "limit=4294967296"}) {
+        INFO(bad);
+        auto res = h.sink.Get(std::string("/api/product-packs?") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    for (const char* ok : {"limit=10", "limit=007", ""}) {
+        INFO(ok);
+        auto res = h.sink.Get(std::string("/api/product-packs?") + ok);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+}
+
+TEST_CASE("instruction execute: a cookie-session dispatch that is cross-site or header-less is "
+          "refused with 403 before anything is dispatched",
+          "[pg][workflow][executions][execute][csrf]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-CSRF", "CSRF");
+    const std::unordered_map<std::string, std::string> hostile[] = {
+        {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}},
+        {{"Host", "yuzu.test"}}, // neither Origin nor Referer
+    };
+    for (const auto& hdrs : hostile) {
+        h.sink.default_headers = hdrs;
+        auto res = h.sink.Post("/api/instructions/def-CSRF/execute", R"({"agent_ids":["agent-1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    // ... and the same-site request is not refused for that reason.
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+    auto ok = h.sink.Post("/api/instructions/def-CSRF/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(ok);
+    CHECK(ok->status != 403);
 }

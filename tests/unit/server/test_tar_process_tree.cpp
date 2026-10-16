@@ -321,6 +321,25 @@ TEST_CASE("tar parse_ts_param: epoch, datetime-local, and rejection", "[tar][tre
     CHECK(parse_ts_param("2026-06-18T12:00:30.123") == 1781784030); // fractional suffix ignored
 }
 
+TEST_CASE("tar parse_ts_param_strict: refuses what the lenient parser reads as unset or shifted",
+          "[tar][tree][parse]") {
+    CHECK(parse_ts_param_strict("") == std::optional<std::int64_t>{0}); // absent
+    CHECK(parse_ts_param_strict("1718000000") == std::optional<std::int64_t>{1718000000});
+    CHECK(parse_ts_param_strict("2026-06-18T12:00:00") == std::optional<std::int64_t>{1781784000});
+    CHECK(parse_ts_param_strict("2026-06-18T12:00") == std::optional<std::int64_t>{1781784000});
+    CHECK_FALSE(parse_ts_param_strict("9999999999999999999")); // 19 digits
+    CHECK_FALSE(parse_ts_param_strict("2026-13-01T00:00"));    // invalid month
+    CHECK_FALSE(parse_ts_param_strict("99999-01-01T00:00"));   // five-digit year
+    CHECK_FALSE(parse_ts_param_strict("not-a-time"));
+    CHECK_FALSE(parse_ts_param_strict(" 2026-06-18T12:00:00"));    // leading whitespace
+    CHECK_FALSE(parse_ts_param_strict("2026-06-18T12:00:"));       // bare trailing ':'
+    CHECK_FALSE(parse_ts_param_strict("2026-06-18T12:00:30xyz"));  // trailing junk
+    CHECK_FALSE(parse_ts_param_strict("2026-06-18T12:00:30.123")); // fractional suffix
+    CHECK_FALSE(parse_ts_param_strict("2026-+6-+18T+12:+00:+30")); // sign acceptance
+    CHECK_FALSE(parse_ts_param_strict("2026-06-18 12:00:00"));     // space instead of 'T'
+    CHECK_FALSE(parse_ts_param_strict("-5"));
+}
+
 TEST_CASE("tar anchors: non-positive ts cannot poison observed_since", "[tar][tree][anchor]") {
     std::vector<TarProcEvent> e{ev(0, "started", 9, 0, "garbage"),     // ts<=0 ignored
                                 ev(-5, "started", 8, 0, "garbage"),    // negative ignored
@@ -664,10 +683,11 @@ TEST_CASE("TAR page: the capture-sources push bar stays hidden until a change is
     CHECK(page.find(".apply-bar[hidden] { display: none; }") != std::string::npos);
 }
 
-TEST_CASE("TAR page: cell colour rules are table-prefixed so they outrank the td default",
+TEST_CASE("TAR page CSS declares the table-prefixed cell colour selectors",
           "[tar][page]") {
-    // `.tar-frame-body td { color: var(--ink2) }` has specificity (0,1,1); a bare single-class
-    // cell rule (0,1,0) loses to it and the support-state / ARP-type colours never apply.
+    // yuzu.css's `:is(.panel table, .tw table) td { color: var(--ink2) }` has specificity (0,1,2);
+    // a bare single-class cell rule loses to it, so these selectors carry a table / id prefix.
+    // This pins that the selectors are declared, not their computed outcome.
     const std::string page = kTarPageHtml;
     CHECK(page.find("#capTable .os-ok { color: var(--ok); }") != std::string::npos);
     CHECK(page.find("#capTable .os-con { color: var(--warn); }") != std::string::npos);

@@ -1,8 +1,9 @@
 /// @file verify_ui.cpp
 /// PURE render functions for the `/auto` VERIFY stage. Dark-theme, htmx CORE
 /// attrs only (no hx-on — CSP). Every operator/agent string HTML-escaped. The
-/// `.vf-*` CSS is inlined ONCE in render_verify_config (loads with the page; the
-/// result/drill fragments only swap a child). See verify_routes.hpp.
+/// `.vf-*` CSS (kVerifyCss) is inlined ONCE in render_verify_config (loads with the
+/// page; the result/drill fragments only swap a child); the `.af-*` fields and
+/// buttons it reuses come from kAutoCss (preflight_ui.cpp). See verify_routes.hpp.
 
 #include "verify_ui.hpp"
 
@@ -95,6 +96,9 @@ const char* kVerifyCss = R"CSS(<style>
 .vf-d.up{color:var(--bad)}.vf-d.dn{color:var(--ok)}.vf-d.flat{color:var(--mut)}
 .vf-d .pp{margin-left:4px;font-family:var(--font);font-size:12.5px;font-weight:400;color:var(--mut)}
 .vf-card .s2{margin-top:8px;padding-top:6px;border-top:1px solid var(--line);font-size:12.5px;color:var(--mut)}
+.vf-card .s2.vf-nojoin{border:0;padding-top:.55rem}
+.vf-drill-btn{margin-top:8px}
+#verify-drill{margin-top:.5rem}
 .vf-card.def{opacity:.62}
 .vf-card .deft{margin-left:8px;padding:0 6px;border-radius:3px;background:var(--surface2);font-size:12px;font-weight:500;color:var(--mut)}
 .vf-dist{padding:14px 16px;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
@@ -236,7 +240,7 @@ std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_
          " \xE2\x86\x92 " + fmt_bytes(static_cast<double>(c.ws_after_p95)) + "</div></div>";
     // Crashes/hangs deferred (shown honestly, not omitted)
     h += "<div class=\"vf-card def\"><div class=\"m\">Crashes / hangs<span class=\"deft\">deferred</span></div>"
-         "<div class=\"s2\" style=\"border:0;padding-top:.55rem\">Per-version stability join isn\xE2\x80\x99t "
+         "<div class=\"s2 vf-nojoin\">Per-version stability join isn\xE2\x80\x99t "
          "built \xE2\x80\x94 lands when the central crash-store carries the version key on the read side.</div></div>";
     h += "</div>"; // vf-shift
 
@@ -274,9 +278,9 @@ std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_
     h += "<div class=\"af-note\">Opening the "
          "per-machine table records a <span class=\"vf-mono\">dex.app_perf.compare.drill</span> "
          "access-audit row.</div>";
-    h += "<button class=\"af-btn\" style=\"margin-top:8px\" hx-get=\"" + esc(drill_url) +
+    h += "<button class=\"af-btn vf-drill-btn\" hx-get=\"" + esc(drill_url) +
          "\" hx-target=\"#verify-drill\" hx-swap=\"innerHTML\">Show per-machine pairs</button>";
-    h += "<div id=\"verify-drill\" style=\"margin-top:.5rem\"></div>";
+    h += "<div id=\"verify-drill\"></div>";
 
     // Honesty footer.
     h += "<div class=\"vf-audit\">Cohort-paired \xE2\x80\x94 every number "
@@ -305,7 +309,7 @@ std::string render_verify_drill(const PairedComparison& c, bool truncated) {
     for (const auto& p : c.pairs) { // engine already sorts largest CPU mover first
         const std::string dc = cpu_dir(p.cpu_delta);
         const std::string dw = ws_dir(p.ws_delta);
-        h += "<tr><td><a href=\"/hardware/ci?id=" + esc(p.agent_id) + "\">" + esc(p.agent_id) +
+        h += "<tr><td><a href=\"/hardware/ci?id=" + url_query_value(p.agent_id) + "\">" + esc(p.agent_id) +
              "</a></td>";
         h += "<td class=\"n\">" + fmt_pct(p.cpu_before) + "</td>";
         h += "<td class=\"n\">" + fmt_pct(p.cpu_after) + "</td>";

@@ -40,7 +40,10 @@
   src: url('/static/fonts/ibm-plex-mono-latin-500-normal.woff2') format('woff2');
 }
 
-/* Yuzu Design System - slate dark theme (docs/design/ui-redesign).
+/* Yuzu Design System - slate dark theme (docs/design/ui-redesign), plus five
+ * alternates selected by html[data-theme] (navy, jade; light, light-baby,
+ * light-hot). Slate is :root; each alternate block below overrides only the
+ * tokens that differ.
  *
  * Token-driven: every visual primitive (colour / type / spacing / radius /
  * elevation) is a --mds-* semantic token; the design's short names (--ink
@@ -53,8 +56,9 @@
  * Direction: utilitarian ops console. Blue is the action colour (buttons,
  * links, switches). Yellow (--hl) is the highlight: brand mark, active nav,
  * active tab, selected row - nothing else. Green / orange / red / sky are
- * status colours only. No gradients, glow, blur or decorative shadow
- * (--shadow appears on pop-overs and menus alone); state changes take 120ms.
+ * status colours only. No glow or blur. Depth is limited to --shadow on
+ * pop-overs and menus, the chart-card elevation (--mds-elevation-2) and the
+ * sparkline gradient fill; state changes take 120ms.
  */
 :root {
   color-scheme: dark;
@@ -154,9 +158,10 @@
   --mds-border-radius-md: 3px;
   --mds-border-radius-lg: 4px;
 
-  /* Elevation - panels are flat; only pop-overs and menus lift */
+  /* Elevation - panels are flat; pop-overs and menus lift (-3), chart cards
+     lift a little (-2: the one deliberate exception to "no decorative shadow") */
   --mds-elevation-1: none;
-  --mds-elevation-2: none;
+  --mds-elevation-2: 0 6px 18px rgba(0,0,0,.35);
   --mds-elevation-3: 0 12px 32px rgba(0,0,0,.6);
 
   /* Interaction state colours - translucent layers stacked on any surface
@@ -214,6 +219,12 @@
   --c3: var(--mds-color-chart-3);
   --c4: var(--mds-color-chart-4);
   --c5: var(--mds-color-chart-5);
+  /* Home tile families (delta 2026-10-14): one colour per menu family. */
+  --fam-operate: var(--c1);
+  --fam-posture: var(--c2);
+  --fam-estate:  var(--c5);
+  --fam-access:  var(--c3);
+  --fam-system:  var(--mds-color-theme-text-tertiary);
   --shadow:    var(--mds-elevation-3);
   --font:      var(--mds-font-family-default);
   --ctl:       36px;              /* control height; 28px for .btn-sm */
@@ -266,6 +277,183 @@
   --radius-sm: var(--mds-border-radius-sm);
   --radius-md: var(--mds-border-radius-md);
   --radius-lg: var(--mds-border-radius-lg);
+}
+
+/* -- Alternate colour schemes ------------------------------------------
+   Selected by html[data-theme] (boot script in the shell and /home head; the
+   picker is Settings > General > Appearance). Each block sits on html, the
+   same element as :root, so the short-name aliases above re-resolve, and
+   redefines the minimal token set: UA colour scheme, surfaces and outlines,
+   text, action, highlight, focus, status colours and the two shadows. Chart
+   colours stay as they are on the dark schemes; the light ones darken
+   chart-1..5 (blue, teal, amber, red, violet) because Home's family headings,
+   tile icons and the Trends line use them as text and strokes, which needs 4.5:1
+   on every light surface. Every text pair on the light schemes is held to
+   4.5:1 (primary-button hover included); highlight and focus to 3:1. */
+html[data-theme="navy"] {
+  color-scheme: dark;
+  --mds-color-theme-background-canvas: #0b1526;
+  --mds-color-theme-background-solid-primary: #101e36;
+  --mds-color-theme-background-solid-secondary: #172845;
+  --mds-color-theme-outline-primary: #1f3354;
+  --mds-color-theme-outline-secondary: #2f4a74;
+  --raise: #1c2f50;
+  --mds-color-theme-text-primary: #e8eef9;
+  --mds-color-theme-text-secondary: #bfcce3;
+  --mds-color-theme-text-tertiary: #93a6c4;
+  --mds-color-theme-text-disabled: #62769a;
+  --faint: #8a9dbb;
+  --mds-color-theme-accent-primary-normal: #22d3ee;
+  --mds-color-theme-accent-primary-hover: #67e8f9;
+  --mds-color-theme-accent-primary-active: #06b6d4;
+  --mds-color-text-on-accent: #04141c;
+  --hl: #f5c542;
+  --focus: #67e8f9;
+  --mds-color-theme-indicator-success: #34d399;
+  --mds-color-theme-indicator-warning: #fbbf24;
+  --mds-color-theme-indicator-error: #fb7185;
+  --mds-color-theme-indicator-info: #7aa7ff;
+  --mds-color-indicator-success-bright: #6ee7b7;
+  --mds-color-indicator-warning-bright: #fcd34d;
+  --mds-color-indicator-error-bright: #fda4af;
+  --mds-color-indicator-info-bright: #a5c4ff;
+  --mds-elevation-2: 0 6px 18px rgba(0,6,20,.45);
+  --mds-elevation-3: 0 12px 32px rgba(0,6,20,.7);
+}
+html[data-theme="jade"] {
+  color-scheme: dark;
+  --mds-color-theme-background-canvas: #0a1714;
+  --mds-color-theme-background-solid-primary: #0f211d;
+  --mds-color-theme-background-solid-secondary: #152b26;
+  --mds-color-theme-outline-primary: #1d3a33;
+  --mds-color-theme-outline-secondary: #2b5247;
+  --raise: #1a332d;
+  --mds-color-theme-text-primary: #e6f3ef;
+  --mds-color-theme-text-secondary: #bcd6cd;
+  --mds-color-theme-text-tertiary: #8fb0a5;
+  --mds-color-theme-text-disabled: #5f8478;
+  --faint: #86a89c;
+  --mds-color-theme-accent-primary-normal: #2fd6a0;
+  --mds-color-theme-accent-primary-hover: #5eeabb;
+  --mds-color-theme-accent-primary-active: #1fb585;
+  --mds-color-text-on-accent: #03150f;
+  --hl: #e8c76a;
+  --focus: #5eeabb;
+  --mds-color-theme-indicator-success: #4ade80;
+  --mds-color-theme-indicator-warning: #fbbf24;
+  --mds-color-theme-indicator-error: #ff7a85;
+  --mds-color-theme-indicator-info: #5cc8ff;
+  --mds-color-indicator-success-bright: #86efac;
+  --mds-color-indicator-warning-bright: #fcd34d;
+  --mds-color-indicator-error-bright: #ffa3ab;
+  --mds-color-indicator-info-bright: #8fd9ff;
+  --mds-elevation-2: 0 6px 18px rgba(0,12,8,.45);
+  --mds-elevation-3: 0 12px 32px rgba(0,12,8,.7);
+}
+html[data-theme="light"] {
+  color-scheme: light;
+  --mds-color-theme-background-canvas: #f5f6f8;
+  --mds-color-theme-background-solid-primary: #ffffff;
+  --mds-color-theme-background-solid-secondary: #eef0f4;
+  --mds-color-theme-outline-primary: #dfe3ea;
+  --mds-color-theme-outline-secondary: #b4bcc9;
+  --raise: #ffffff;
+  --mds-color-theme-text-primary: #12161c;
+  --mds-color-theme-text-secondary: #3a424f;
+  --mds-color-theme-text-tertiary: #566070;
+  --mds-color-theme-text-disabled: #98a0ad;
+  --faint: #5f6979;
+  --mds-color-theme-accent-primary-normal: #1a5fd0;
+  --mds-color-theme-accent-primary-hover: #154eab;
+  --mds-color-theme-accent-primary-active: #103f8a;
+  --mds-color-text-on-accent: #ffffff;
+  --hl: #b87900;
+  --focus: #1a5fd0;
+  --mds-color-theme-indicator-success: #146a35;
+  --mds-color-theme-indicator-warning: #8c4a00;
+  --mds-color-theme-indicator-error: #b3222f;
+  --mds-color-theme-indicator-info: #0a6091;
+  --mds-color-indicator-success-bright: #0d5429;
+  --mds-color-indicator-warning-bright: #703c00;
+  --mds-color-indicator-error-bright: #911a2a;
+  --mds-color-indicator-info-bright: #064d70;
+  --mds-color-chart-1: #1d5fc2;  /* blue   */
+  --mds-color-chart-2: #13766b;  /* teal   */
+  --mds-color-chart-3: #86610a;  /* amber  */
+  --mds-color-chart-4: #c8293a;  /* red    */
+  --mds-color-chart-5: #6b44d6;  /* violet */
+  --mds-elevation-2: 0 4px 14px rgba(16,24,40,.10);
+  --mds-elevation-3: 0 12px 32px rgba(16,24,40,.18);
+}
+html[data-theme="light-baby"] {
+  color-scheme: light;
+  --mds-color-theme-background-canvas: #fff4f7;
+  --mds-color-theme-background-solid-primary: #ffffff;
+  --mds-color-theme-background-solid-secondary: #ffe9ef;
+  --mds-color-theme-outline-primary: #f3d3dc;
+  --mds-color-theme-outline-secondary: #e0b0c0;
+  --raise: #ffffff;
+  --mds-color-theme-text-primary: #2a3340;
+  --mds-color-theme-text-secondary: #434d5e;
+  --mds-color-theme-text-tertiary: #566073;
+  --mds-color-theme-text-disabled: #a3a8b5;
+  --faint: #5e687a;
+  --mds-color-theme-accent-primary-normal: #c2255c;
+  --mds-color-theme-accent-primary-hover: #a61e4d;
+  --mds-color-theme-accent-primary-active: #8a1840;
+  --mds-color-text-on-accent: #ffffff;
+  --hl: #d6336c;
+  --focus: #c2255c;
+  --mds-color-theme-indicator-success: #146f36;
+  --mds-color-theme-indicator-warning: #9a4407;
+  --mds-color-theme-indicator-error: #b3222a;
+  --mds-color-theme-indicator-info: #095a86;
+  --mds-color-indicator-success-bright: #0f5f2d;
+  --mds-color-indicator-warning-bright: #833804;
+  --mds-color-indicator-error-bright: #8f1b21;
+  --mds-color-indicator-info-bright: #064a6f;
+  --mds-color-chart-1: #1d5fc2;  /* blue   */
+  --mds-color-chart-2: #13766b;  /* teal   */
+  --mds-color-chart-3: #86610a;  /* amber  */
+  --mds-color-chart-4: #c8293a;  /* red    */
+  --mds-color-chart-5: #6b44d6;  /* violet */
+  --mds-elevation-2: 0 4px 14px rgba(190,60,100,.12);
+  --mds-elevation-3: 0 12px 32px rgba(120,40,70,.2);
+}
+html[data-theme="light-hot"] {
+  color-scheme: light;
+  --mds-color-theme-background-canvas: #ffffff;
+  --mds-color-theme-background-solid-primary: #fff6fa;
+  --mds-color-theme-background-solid-secondary: #ffeaf3;
+  --mds-color-theme-outline-primary: #f6cfe1;
+  --mds-color-theme-outline-secondary: #e8a3c3;
+  --raise: #ffffff;
+  --mds-color-theme-text-primary: #1f1a24;
+  --mds-color-theme-text-secondary: #3d3445;
+  --mds-color-theme-text-tertiary: #5a4f63;
+  --mds-color-theme-text-disabled: #a89cb0;
+  --faint: #63586c;
+  --mds-color-theme-accent-primary-normal: #cf006b;
+  --mds-color-theme-accent-primary-hover: #b8005f;
+  --mds-color-theme-accent-primary-active: #9c0050;
+  --mds-color-text-on-accent: #ffffff;
+  --hl: #cf006b;
+  --focus: #cf006b;
+  --mds-color-theme-indicator-success: #146f36;
+  --mds-color-theme-indicator-warning: #9a4407;
+  --mds-color-theme-indicator-error: #b3222a;
+  --mds-color-theme-indicator-info: #095a86;
+  --mds-color-indicator-success-bright: #0f5f2d;
+  --mds-color-indicator-warning-bright: #833804;
+  --mds-color-indicator-error-bright: #8f1b21;
+  --mds-color-indicator-info-bright: #064a6f;
+  --mds-color-chart-1: #1d5fc2;  /* blue   */
+  --mds-color-chart-2: #13766b;  /* teal   */
+  --mds-color-chart-3: #86610a;  /* amber  */
+  --mds-color-chart-4: #c8293a;  /* red    */
+  --mds-color-chart-5: #6b44d6;  /* violet */
+  --mds-elevation-2: 0 4px 14px rgba(212,0,111,.12);
+  --mds-elevation-3: 0 12px 32px rgba(120,0,60,.2);
 }
 
 /* Global reset */
@@ -346,7 +534,6 @@ a:where(:not([class])):hover { color: var(--primary-h); }
    state - no pulse. The doubled class lets the hover rule outrank the
    -primary / -danger hover rules the armed button also carries. */
 .btn-confirming, .btn-confirming.btn-confirming:hover:not(:disabled) { background: var(--bad); border-color: var(--bad); color: var(--on-primary); filter: none; }
-.rowact { display: flex; gap: 4px; justify-content: flex-end; }
 
 /* -- Segmented control: <div class="seg"> of buttons (.on) or radio labels -- */
 .seg { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 2px; background: var(--bg);
@@ -368,14 +555,13 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 .pill.bad, .badge-danger { color: var(--bad); background: var(--mds-color-bg-error-tinted); }
 .pill.info, .badge-info { color: var(--info); background: var(--mds-color-bg-info-tinted); }
 .pill.idle, .badge-neutral { color: var(--mut); background: var(--surface2); }
-.chip { font-size: 13px; color: var(--mut); }
-.chip b { color: var(--ink); font-weight: 600; margin-left: 3px; }
+/* OS name tag: a hairline-boxed mono label */
+.os-tag { padding: 0 5px; white-space: nowrap; border: 1px solid var(--line2); border-radius: 3px; color: var(--mut);
+          font-family: var(--mds-font-family-mono); font-size: 11.5px; }
 /* Status square beside a name */
 .sd { width: 8px; height: 8px; display: inline-block; margin-right: 8px; }
 .s-on { background: var(--ok); }
 .s-off { background: var(--faint); }
-.s-bad { background: var(--bad); }
-.s-w { background: var(--warn); }
 
 /* -- Notes and alerts: bordered, never a coloured slab -- */
 .note, .alert { padding: 12px 14px; border: 1px solid var(--line2); border-radius: var(--rad-panel);
@@ -403,18 +589,13 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 :is(.data-table, .panel table, .tw table) :is(td, th).r { text-align: right; }
 :is(.data-table, .panel table, .tw table) td b { color: var(--ink); font-weight: 600; }
 .data-table th { position: sticky; top: 0; }
-/* Density toggle (.density-toggle) puts .compact or .comfortable on the results table */
+/* The dashboard's density toggle (its own button, styled in dashboard_ui.cpp) puts .compact or .comfortable on the results table */
 :is(.data-table, table).compact { --cell-y: 6px; }
 :is(.data-table, table):is(.compact, .comfortable) td { padding: var(--cell-y) 16px; font-size: var(--text-base); }
 :is(.data-table, table).compact td { font-size: var(--text-sm); }
 :is(.data-table, table):is(.compact, .comfortable) th { padding: 8px 16px; font-size: 12.5px; }
-.density-toggle { display: inline-flex; align-items: center; gap: var(--sp-1); background: transparent; border: 1px solid var(--line2);
-                  color: var(--mut); padding: 2px var(--sp-2); border-radius: var(--rad-ctl); cursor: pointer; font: inherit; font-size: var(--text-xs);
-                  transition: color .12s, border-color .12s; }
-.density-toggle:hover { color: var(--ink); border-color: var(--mut); }
-.density-toggle svg { width: 14px; height: 14px; }
 
-/* -- Forms -- */
+/* -- Forms: .input / .in are the text controls; .fld wraps a labelled field (the shared dialog builds these) -- */
 .input, .in, .fld select, .fld textarea { height: var(--ctl); padding: 0 10px; background: var(--bg); color: var(--ink);
                                          border: 1px solid var(--line2); border-radius: var(--rad-ctl); font: inherit; min-width: 0;
                                          transition: border-color .12s; }
@@ -426,28 +607,18 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 .fld textarea { height: auto; padding: 8px 10px; min-height: 84px; resize: vertical; font-family: var(--mds-font-family-mono); font-size: 12.5px; }
 .form { display: grid; gap: 16px; padding: 16px; }
 .fld { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
-.fld > label, .fld > .lb { font-size: 13px; font-weight: 500; color: var(--ink2); }
+.fld > label { font-size: 13px; font-weight: 500; color: var(--ink2); }
 .fld .hint { color: var(--mut); font-size: 12.5px; }
 .fld .seg { align-self: flex-start; }
 .row2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 16px; }
-.btns { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px 16px; }
-/* Toggle row: label + hint on the left, .sw on the right */
-.tog { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--line); }
-.tog:last-child { border-bottom: 0; }
-.tog .t b { display: block; font-weight: 500; color: var(--ink); }
-.tog .t span { color: var(--mut); font-size: 13px; }
+.chk { accent-color: var(--primary); width: 16px; height: 16px; }
+/* Switch: a checkbox drawn as a track and knob (Compliance policy enable) */
 .sw { appearance: none; -webkit-appearance: none; width: 36px; height: 20px; flex: 0 0 36px; margin: 2px 0 0; position: relative;
       background: var(--line2); border: 0; border-radius: 3px; cursor: pointer; transition: background-color .12s; }
 .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 2px; background: var(--raise); transition: left .12s; }
 .sw:checked { background: var(--primary); }
 .sw:checked::after { left: 18px; background: var(--on-primary); }
 .sw:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-.chk { accent-color: var(--primary); width: 16px; height: 16px; }
-/* Key-value list inside a panel */
-.kvl > div { display: flex; justify-content: space-between; gap: 16px; padding: 9px 16px; border-bottom: 1px solid var(--line); font-size: 13.5px; }
-.kvl > div:last-child { border-bottom: 0; }
-.kvl span { color: var(--mut); }
-.kvl b { font-weight: 500; color: var(--ink); text-align: right; }
 
 /* -- Progress bar (.compliance-bar is the product's older name) -- */
 .bar, .compliance-bar { height: 6px; border-radius: 2px; background: var(--line); overflow: hidden; }
@@ -456,11 +627,6 @@ td > .bar { min-width: 110px; }
 .bar.w > i, .compliance-fill.warn { background: var(--warn); }
 .bar.b > i, .compliance-fill.bad { background: var(--bad); }
 .compliance-fill.good { background: var(--ok); }
-
-/* -- Chart legend -- */
-.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 10px 16px 0; font-size: 13px; color: var(--mut); }
-.legend i { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 2px; }
-.legend b { color: var(--ink); font-weight: 600; margin-left: 4px; }
 
 /* -- Tabs: .tabs of links (.on) - or the product's .tab (.active). The active
    tab takes the yellow underline. -- */
@@ -475,6 +641,15 @@ td > .bar { min-width: 110px; }
 .page-header h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2; }
 .page-header .subtitle { color: var(--mut); margin-top: 4px; max-width: 70ch; }
 .page-header .header-actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+/* Operate pages (approvals, executions): count chip, key-value list, button row */
+.chip { font-size: 13px; color: var(--mut); }
+.chip b { color: var(--ink); font-weight: 600; margin-left: 3px; }
+.btns { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px 16px; }
+.kvl > div { display: flex; justify-content: space-between; gap: 16px; padding: 9px 16px; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+.kvl > div:last-child { border-bottom: 0; }
+.kvl span { color: var(--mut); }
+.kvl b { font-weight: 500; color: var(--ink); text-align: right; }
 
 /* Toasts - pop-overs, so they alone carry the shadow. No entrance animation. */
 .toast-container { position: fixed; top: var(--sp-4); right: var(--sp-4); z-index: 5000;
@@ -502,31 +677,6 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 /* Icons (inline SVG via sprite) */
 .icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2;
         stroke-linecap: round; stroke-linejoin: round; vertical-align: middle; }
-.icon-lg { width: 20px; height: 20px; }
-.icon-xl { width: 24px; height: 24px; }
-
-/* Nav bar (to be used in Wave B) */
-.nav-bar { height: 40px; background: var(--surface); border-bottom: 1px solid var(--line);
-           display: flex; align-items: center; padding: 0 var(--sp-4); gap: var(--sp-4); }
-.nav-brand { color: var(--ink); text-decoration: none; font-weight: 600; font-size: var(--text-lg);
-             display: flex; align-items: center; gap: var(--sp-2); }
-.nav-link { color: var(--mut); text-decoration: none; font-size: var(--text-sm); padding: var(--sp-2) 0;
-            border-bottom: 2px solid transparent; transition: color .12s; }
-.nav-link:hover { color: var(--ink); }
-.nav-link.active { color: var(--ink); border-bottom-color: var(--hl); }
-.nav-spacer { flex: 1; }
-.nav-user { font-size: var(--text-sm); color: var(--mut); display: flex; align-items: center; gap: var(--sp-2); }
-.nav-logout { background: transparent; border: 1px solid var(--line2); color: var(--mut);
-              padding: var(--sp-1) var(--sp-3); border-radius: var(--rad-ctl); cursor: pointer;
-              font-size: var(--text-sm); }
-
-/* Context bar (to be used in Wave B) */
-.context-bar { height: 32px; background: var(--bg); border-bottom: 1px solid var(--line);
-               display: flex; align-items: center; padding: 0 var(--sp-4); gap: var(--sp-3); }
-.context-user { font-size: var(--text-sm); color: var(--mut); }
-.context-spacer { flex: 1; }
-.context-bell { background: transparent; border: none; color: var(--mut); cursor: pointer; padding: var(--sp-1); }
-.context-bell:hover { color: var(--ink); }
 
 /* Command palette - a pop-over on a scrim (no blur) */
 .cmd-palette-overlay {
@@ -629,7 +779,8 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 /* Row detail drawer */
 .result-row { cursor: pointer; }
 .result-row:hover td { background: var(--surface2); }
-.result-row.expanded td { background: var(--raise); }
+.result-row.expanded td { background: var(--mds-color-state-selected); }
+.result-row.expanded td:first-child { box-shadow: inset 3px 0 0 var(--hl); }
 .result-detail { display: none; }
 .result-detail.open { display: table-row; }
 .result-detail td { padding: var(--sp-3) var(--sp-4); background: var(--bg);
@@ -645,3 +796,155 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important; }
 }
+
+/* System: general ---------------------------------------------------------
+   Appearance card (colour-scheme radios: one .pal per palette, swatches carry
+   their own colours inline) and the table-density preview on /settings/general. */
+.pals { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); max-width: 720px; gap: 12px; }
+.pal { position: relative; display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--line2);
+       border-radius: var(--rad-panel); background: var(--bg); cursor: pointer; }
+.pal:hover { border-color: var(--mut); }
+.pal:has(input:checked) { border-color: var(--primary); box-shadow: inset 0 0 0 1px var(--primary); }
+.pal:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 2px; }
+.pal input { position: absolute; opacity: 0; pointer-events: none; }
+.pal b { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.pal:has(input:checked) b::after { content: "Current"; padding: 1px 8px; border-radius: 3px; font-size: 12.5px;
+                                   font-weight: 500; color: var(--mut); background: var(--surface2); }
+.pal small { color: var(--mut); font-size: 12.5px; }
+.sw-row { display: flex; gap: 6px; }
+.swatch { width: 28px; height: 28px; border-radius: 3px; border: 1px solid var(--line2); }
+.s-bg { background: var(--bg); } .s-surface { background: var(--surface); } .s-raise { background: var(--raise); }
+.s-primary { background: var(--primary); } .s-hl { background: var(--hl); } .s-ok { background: var(--ok); }
+.prev { border: 1px solid var(--line2); border-radius: var(--rad-panel); overflow: hidden; margin-bottom: 8px; }
+
+/* Home landing (delta 2026-10-14) — the sign-in landing page at /home: slim bar,
+   hero with the sign-in panel, and the fifteen screens as family-coloured tiles.
+   Flat: nothing in this block casts a shadow, lifts, fades, glows or blurs. */
+.fam { display: flex; flex-wrap: wrap; gap: 14px 24px; align-items: flex-start; }
+.fam > .fh { flex: 0 0 140px; padding-top: 2px; }
+.fam > .fh h2 { font-size: 16px; font-weight: 600; color: var(--fam); }
+.fam > .fh p { color: var(--mut); font-size: 13px; margin-top: 4px; }
+.tiles { flex: 1 1 560px; display: grid; grid-template-columns: repeat(auto-fill, 176px); gap: 16px; }
+.tile { position: relative; width: 176px; height: 176px; display: flex; flex-direction: column; gap: 4px; padding: 16px;
+        border-radius: var(--rad-panel); color: var(--ink); text-decoration: none;
+        background: color-mix(in srgb, var(--fam) 10%, var(--surface));
+        border: 1px solid color-mix(in srgb, var(--fam) 38%, var(--line)); }
+.tile:hover { background: color-mix(in srgb, var(--fam) 17%, var(--surface)); border-color: var(--fam); }
+.tile:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.tile svg { width: 26px; height: 26px; fill: none; stroke: var(--fam); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; margin-bottom: auto; }
+.tile .tt { font-size: 17px; font-weight: 600; letter-spacing: -.01em; line-height: 1.2; }
+.tile .ts { font-size: 12.5px; color: var(--mut); line-height: 1.35; }
+.f-operate { --fam: var(--fam-operate); } .f-posture { --fam: var(--fam-posture); } .f-estate { --fam: var(--fam-estate); }
+.f-access { --fam: var(--fam-access); } .f-system { --fam: var(--fam-system); }
+
+.land { display: block; min-height: 100vh; }
+.land .lh { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 40px; }
+.land .lh .brand { display: flex; align-items: center; gap: 9px; padding: 0; color: var(--ink); font-size: 22px; font-weight: 600; letter-spacing: -.01em; text-decoration: none; }
+.land .lh .brand i { width: 9px; height: 9px; margin-top: 5px; background: var(--hl); border-radius: 2px; transform: rotate(45deg); }
+.land .lh .srv { color: var(--mut); font-size: 13px; font-family: var(--mono); }
+.land .hero { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 32px 48px; padding: 28px 40px 0; }
+.land .ht { flex: 1 1 560px; display: flex; flex-direction: column; gap: 18px; align-items: flex-start; }
+.land .ht h1 { font-size: 56px; font-weight: 600; letter-spacing: -.03em; line-height: 1.06; }
+.land .ht .lede { color: var(--ink2); font-size: 17px; line-height: 1.55; max-width: 56ch; text-wrap: balance; }
+.land .rule { width: 44px; height: 4px; background: var(--hl); border-radius: 1px; }
+.land .lc { flex: 0 1 380px; min-width: 300px; }
+.land .login .form { gap: 14px; }
+.land .login .btn { width: 100%; justify-content: center; height: 40px; }
+.land .or { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 12.5px; }
+.land .or::before, .land .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.land .small { color: var(--mut); font-size: 13px; line-height: 1.5; }
+.land .who { display: flex; flex-direction: column; gap: 2px; }
+.land .who b { font-size: 16px; font-weight: 600; color: var(--ink); }
+.land .who span { color: var(--mut); font-size: 13px; }
+.land .error-msg { min-height: 1.2em; font-size: 13px; color: var(--bad); }
+.land .error-msg:empty { display: none; }
+.land .login code.mono { font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
+.land .enroll-qr-box { overflow: hidden; border-radius: var(--rad-ctl); line-height: 0; }
+.land .recovery-list { margin: 0; padding: 12px 12px 12px 28px; background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+                       font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
+.land .lb { display: flex; flex-direction: column; gap: 24px; padding: 64px 40px 72px; }
+.land .lb > h2 { font-size: 15px; font-weight: 600; color: var(--ink2); }
+.land .fams { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 40px; }
+.land .fam { flex-direction: column; flex-wrap: nowrap; gap: 12px; align-items: flex-start; max-width: 100%; }
+.land .fam > .fh { flex: none; padding: 0; display: flex; align-items: baseline; gap: 12px; }
+.land .fam > .fh p { margin: 0; }
+.land .fam .tiles { flex: none; }
+.land .tiles.n1 { grid-template-columns: repeat(1, 176px); } .land .tiles.n3 { grid-template-columns: repeat(3, 176px); } .land .tiles.n4 { grid-template-columns: repeat(4, 176px); }
+.land .tile .ts { font-size: 13px; }
+@media (max-width: 820px) {
+  .land .fam, .land .fam .tiles { width: 100%; }
+  .land .fam .tiles { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+  .land .tile { width: auto; }
+}
+@media (max-width: 700px) {
+  .land .ht h1 { font-size: 34px; }
+  .land .lh, .land .hero, .land .lb { padding-left: 20px; padding-right: 20px; }
+}
+
+/* Dashboard rows (delta 2026-10-14) */
+/* One grid for every Dashboard row: two thirds / one third, three equal, or full
+   width, with a 22px gutter between panels and between rows. Panels in a row share
+   a height; lists grow to fill their panel. Below 1140px every row
+   is one column; the three-equal row wraps at a 300px minimum. The attention list
+   (.att-*) moved here from the Home page's scoped sheet with the panels. */
+.dash { display: flex; flex-direction: column; gap: 22px; }
+.dash .rw { display: grid; gap: 22px; align-items: stretch; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+.dash .rw.t3 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+.dash .rw.t1 { grid-template-columns: minmax(0, 1fr); }
+.dash .col { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
+.dash .col > .panel:last-child { flex: 1; }
+.dash .panel { display: flex; flex-direction: column; }
+.dash .panel > .hd { min-height: 52px; flex-wrap: nowrap; }
+.dash .panel > .hd :is(h2, h3) { white-space: nowrap; }
+.dash .panel > .hd .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.dash .panel > .hd .end { flex: 0 0 auto; }
+.dash .kvl.fill > div { flex: 1; align-items: center; }
+.dash .kinds { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 22px; padding: 10px 16px; border-top: 1px solid var(--line); font-size: 13px; color: var(--mut); }
+.dash .kinds .k0 { color: var(--ink2); font-weight: 500; }
+.dash .kinds b { color: var(--ink); font-weight: 500; margin-left: 6px; font-size: 12.5px; }
+.dash .kinds .end { margin-left: auto; }
+/* Needs attention rows (rendered by home_render.cpp's attention panel). */
+.att-list, .panel > .pb.att-list { display: flex; flex-direction: column; gap: 0; padding: 0; }
+.att-list .note { margin: 12px 16px 0; }
+.att-row { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.att-row:last-child { border-bottom: 0; }
+.att-rowb { flex: 1 1 auto; min-width: 0; }
+.att-rowb b { color: var(--ink); font-weight: 500; }
+.att-row .sd { flex: 0 0 auto; margin-right: 0; }
+.dash .panel > .att-list { flex: 1; }
+@media (max-width: 1140px) { .dash .rw, .dash .rw.t3 { grid-template-columns: minmax(0, 1fr); } }
+
+/* -- Access pages: shared page layout (Phase 2). One delimited block; first page to need a
+   class defines it here, later pages reuse it. Tokens only, no hex. ---------------------- */
+.page { padding: 22px 28px 36px; display: flex; flex-direction: column; gap: 22px; }
+.split { display: flex; flex-wrap: wrap; gap: 22px; align-items: flex-start; }
+.split > .grow { flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 22px; }
+.split > .side2 { flex: 1 1 320px; max-width: 400px; min-width: 0; display: flex; flex-direction: column; gap: 22px; }
+.side2 td, .side2 th { white-space: normal; padding-left: 10px; padding-right: 10px; }
+.panel > .hd .sub { font-weight: 400; }
+.panel table td.long, .panel .hd h2.long { white-space: normal; overflow-wrap: anywhere; }
+.panel table td.long { max-width: 340px; min-width: 140px; }
+.panel .empty { padding: 26px 16px; color: var(--mut); text-align: center; }
+.panel .empty b { display: block; color: var(--ink); font-weight: 500; margin-bottom: 4px; }
+.hint { color: var(--mut); font-size: 12.5px; }
+.rowact { flex-wrap: wrap; gap: 2px; }
+.pill.tag { color: var(--ink2); background: var(--surface2); border: 1px solid var(--line2); }
+.failbox { display: flex; gap: 12px; align-items: flex-start; padding: 12px 16px; border: 1px solid color-mix(in srgb, var(--bad) 55%, var(--line2)); border-radius: var(--rad-panel); background: var(--mds-color-bg-error-tinted); color: var(--ink2); font-size: 13.5px; }
+.failbox b { color: var(--bad); font-weight: 600; }
+.failbox .end { margin-left: auto; }
+.guard { color: var(--mut); font-size: 12.5px; }
+@media (max-width: 820px) { .page { padding: 18px 16px 36px; } .panel .tw { overflow-x: auto; } .split > .side2 { max-width: none; } }
+/* -- end Access ------------------------------------------------------------------------- */
+
+/* -- Tokens page ------------------------------------------------------------------------ */
+.strip { margin: 12px 16px 0; }
+.strip:empty { display: none; }
+/* The token and principal fragments are swapped into a body div that sits between .panel and the
+   fragment's header and body, so the direct-child panel rules (.panel > .hd, .panel > .pb) do not
+   reach them; give those two bodies the same header and padding. */
+:is(#tokens-body, #principals-body) > .hd { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+:is(#tokens-body, #principals-body) > .hd h2 { font-size: 14px; font-weight: 600; }
+:is(#tokens-body, #principals-body) > .hd .sub { color: var(--mut); font-size: 13px; }
+:is(#tokens-body, #principals-body) > .hd .end { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+:is(#tokens-body, #principals-body) > .pb { padding: 12px 16px; }
+/* -- end Tokens page -------------------------------------------------------------------- */

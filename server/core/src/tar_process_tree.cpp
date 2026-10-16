@@ -488,6 +488,34 @@ std::int64_t parse_ts_param(const std::string& s) {
            H * 3600 + Mi * 60 + Se;
 }
 
+std::optional<std::int64_t> parse_ts_param_strict(const std::string& s) {
+    if (s.empty())
+        return std::int64_t{0}; // absent: the same "unset" the lenient parser reports
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    if (std::all_of(s.begin(), s.end(), digit)) {
+        if (s.size() > 18) // cannot be a real epoch; refuse rather than report "unset"
+            return std::nullopt;
+        return parse_ts_param(s);
+    }
+    // Exactly YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS -- no sign, whitespace, bare trailing ':'
+    // or trailing junk, all of which the lenient parser tolerates.
+    constexpr std::string_view kShortShape = "dddd-dd-ddTdd:dd";
+    constexpr std::string_view kLongShape = "dddd-dd-ddTdd:dd:dd";
+    const std::string_view shape = s.size() == kShortShape.size()  ? kShortShape
+                                   : s.size() == kLongShape.size() ? kLongShape
+                                                                   : std::string_view{};
+    if (shape.empty())
+        return std::nullopt;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (shape[i] == 'd' ? !digit(s[i]) : s[i] != shape[i])
+            return std::nullopt;
+    }
+    const auto v = parse_ts_param(s);
+    if (v == 0) // range-checked inside: invalid month, year outside [1970,9999], ...
+        return std::nullopt;
+    return v;
+}
+
 namespace {
 
 /// A pid's lifetime as walked from the event stream (one incarnation).
@@ -1304,7 +1332,7 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     h += "</tbody></table>";
     if (rendered == 0)
         return "<div class=\"devnet-empty\">No capture sources reported by this device.</div>";
-    h += "<div class=\"apply-bar\" id=\"capApplyBar\" hidden><span class=\"apply-icon\">&#9888;</span>"
+    h += "<div class=\"apply-bar note warn\" id=\"capApplyBar\" hidden><span class=\"apply-icon\">&#9888;</span>"
          "<span id=\"capApplyMsg\">0 pending changes</span><span class=\"apply-spacer\"></span>"
          "<button class=\"btn-secondary\" onclick=\"discardCapChanges()\">Discard</button>"
          "<button class=\"apply-push\" onclick=\"pushCapChanges()\">Push changes &#8594;</button></div>";

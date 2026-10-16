@@ -2,6 +2,87 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the macOS agent package installs transactionally and can refuse
+
+This applies to every macOS `.pkg`, including the release package.
+
+**What changed.**
+
+- The installer stages the new agent beside the running one and validates it.
+  The running agent is stopped only after that succeeds. If a running agent was
+  replaced and the new one does not stay running, the previous version is
+  restored and restarted.
+- The installer now **refuses** in these cases, before anything is stopped or
+  changed, and says which one applies:
+  - `/usr/local`, `/usr/local/lib` or `/usr/local/lib/yuzu`, or `/usr/local/bin`
+    for the loose-binary package, is not root-owned or is group- or
+    world-writable. That is typical of Macs whose Homebrew lives in
+    `/usr/local`: Intel Macs, and Apple silicon Macs running an Intel or
+    migrated Homebrew.
+  - An agent binary, rollback file or plugin (at any depth) in those directories
+    is a symlink, or another account could have written it, including through
+    an access control list. The installer lists each entry.
+  - `/etc/yuzu-agent` or `/etc/yuzu-agent/certs` is not root-owned, or is group-
+    or world-writable.
+  - `/Library/Application Support/Yuzu` or `/Library/Logs/Yuzu`, or anything
+    in them, is not root-owned, is group- or world-writable, or has an access
+    control list that lets another account write to it; or an entry in them is
+    a symlink, a special file or a hard-linked file. The agent runs as root and
+    opens files there by name. A Mac where `scripts/install-agent-user.sh` gave
+    them to `_yuzu` needs them returned to root first. The refusal lists each
+    entry; inspect and fix them one at a time, and never `chown -R`, which would
+    make a planted symlink look root-owned (see the packaging README).
+  - `/var/db/yuzu-agent`, or a recovery snapshot in it, has an access control
+    list. The installer never sets one, so it refuses rather than remove it.
+  - A new plugin has the same name as one no Yuzu package installed, or as a
+    Yuzu plugin whose bytes were changed after installation.
+  - The existing service requires signed plugins (`--plugin-require-signature`)
+    and the package contains an unsigned plugin. Every release `.pkg` does.
+- A first install of the stock package is **installed but not started**,
+  because the agent will not run without a server trust anchor. An agent that
+  was stopped is left stopped, including one disabled with
+  `launchctl disable system/com.yuzu.agent`; a disabled agent that was still
+  running is restarted and stays disabled for the next boot. Previously the installer loaded
+  the service every time.
+- Upgrades keep the existing service definition's arguments, every `YUZU_*`
+  environment variable and the standard proxy variables. Previously an upgrade
+  replaced `/Library/LaunchDaemons/com.yuzu.agent.plist`, losing anything added
+  to it. Any other environment variable is dropped and named in
+  `/var/log/install.log`. If the existing definition cannot be parsed, the
+  package default is installed with a warning and the agent is not started;
+  earlier settings must be re-applied.
+- An unrecognized development app under the data directory is moved to
+  `/var/db/yuzu-agent/quarantine/` and reported; it no longer blocks the install
+  or `uninstall.sh`.
+
+**What to check.**
+
+- If a refusal names a `/usr/local` directory, make it root-owned and remove
+  the group and world write bits. Then inspect the files it lists: changing
+  the directory's mode does not change who wrote what is already in it. Do not
+  `chown -R` them: that makes another account's files look root-installed.
+- If the data directory is refused, never delete it: it holds the agent's
+  identity and enrolment. Run `chmod go-w` on it, or restore its owner.
+- For signed-plugin enforcement, remove `--plugin-require-signature` before
+  upgrading to an unsigned package, or build a signed one.
+- Fleet deployment: pre-stage the server address and trust anchor so the first
+  install starts the agent. See
+  [Deploying with MDM](../../deploy/packaging/macos/README.md#deploying-with-mdm).
+- Rolling a fleet back to an older package and forward again is supported. A
+  package from before this installer replaces the service definition with its
+  default, so re-apply the server and trust settings after such a rollback.
+- After a failed install there is nothing to clean up: the next package run
+  repairs or discards any recovery state it finds under `/var/db/yuzu-agent`.
+
+The opt-in signed-app development lane (Endpoint Security) additionally moves
+the executable into `/Library/Application Support/YuzuAgent/YuzuAgent.app` and
+always runs with `--no-auto-update`, which preserves the bundle signature.
+Update that lane by installing a new package (for example through MDM), not
+over the air. The development `.pkg` is intentionally unsigned; it is not a
+customer-distribution lane. Before switching lanes, read the
+[packaging and recovery runbook](../../deploy/packaging/macos/README.md) and the
+[macOS development foundation](../macos-development-foundation.md).
+
 ## Version Compatibility
 
 | Server Version | Min Agent Version | Min Gateway Version | Notes |
@@ -10,6 +91,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.5.x | 0.5.0 | 0.5.0 | Compiler hardening flags (`-fstack-protector-strong`, `_FORTIFY_SOURCE=2`, full RELRO), config file permission enforcement (`0600` on Unix), SRI integrity attributes on CDN scripts, configurable trigger limit (default 2000), git-derived version strings, chargen instruction definitions. |
 | 0.6.x – 0.9.x | same as 0.5.x | same as 0.5.x | No on-disk format changes from 0.5.x; upgrade directly to 0.10.x. |
 | 0.10.x | 0.10.0 | 0.10.0 | Server-side schema migration runner wired into every SQLite store. Upgrading from 0.9.x or earlier is data-preserving: the first 0.10.x startup stamps each database at schema v1 and runs a one-time legacy compatibility shim for stores that historically added columns via silent `ALTER TABLE` (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`). Failed migrations close the affected store's DB handle and are reported via `/readyz` with the failed store name — **check `/readyz`, not `/livez`, to confirm upgrade success**. |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **The audit log is admin-only while RBAC is off, and audit reads are bounded (breaking; #5771).** Non-admin sessions and tokens get `403` on every `AuditLog:Read` surface until RBAC is enabled with a role holding it; legacy `GET /api/audit` clamps `limit` to 1000 and refuses `offset` above 10000; MCP `query_audit_log` rejects wrong-typed filters. Server restart only; see the section below. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the (keyword-scoped) sync populates. No config change required to benefit. **OIDC JWT signature verification now enforced on the Windows server (#1856/#1782, CRITICAL).** A Windows *server* build previously **skipped OIDC `id_token` signature verification entirely** — accepting forged RS256/384/512 tokens (session minting / account takeover). It now verifies on every platform via the same OpenSSL path. **Operator-visible only if you run a Windows server with OIDC SSO:** verification now genuinely depends on the IdP's JWKS being reachable, so a misconfigured or unreachable `jwks_uri` that the old Windows build *silently tolerated* (by accepting everything) will now cause **all OIDC logins to fail closed**. **Before upgrading a Windows + OIDC deployment**, confirm the server can reach the IdP `jwks_uri` and that system clock skew is within tolerance; if OIDC logins start failing fleet-wide post-upgrade, check JWKS reachability first. Local-password and API-token auth are unaffected; Linux/macOS servers already verified and are unchanged. **MCP `execute_instruction`'s zero-agents-reached response schema gained three new fields and a widened `status` enum (#3424/#3511).** The published `outputSchema`'s `oneOf` grew from 2 branches to 5: the success branch is unchanged, but the single `{status:"no_agents_reached", ...}` zero-reach branch is now four mutually-exclusive branches — `no_agents_reached` (same trigger condition, but now REQUIRES `retry_after_ms` where it was previously absent/unspecified), plus new `quarantined`, `containment_unreadable`, and `plugin_not_found` — each REQUIRING three new fields that were not previously present: `retry_after_ms` (a per-branch `const` — `5000` for the two retryable branches `containment_unreadable` and `no_agents_reached`, `null` for the two permanent branches `quarantined` and `plugin_not_found`), `agents_quarantined`, and `agents_unknown_plugin` (integer counts, present on every zero-reach branch regardless of which status matched). **Strict-validating consumers pinned to the old 2-branch `oneOf` or the old `no_agents_reached`-only zero-reach shape will reject a response using one of the three new statuses, or reject the new required fields on the shape they already recognized.** Relax any pinned `oneOf`/`const` validation to accept the widened schema (`GET /mcp/v1/` `tools/list` always reflects the current, authoritative shape) before upgrading an agentic client with strict response validation. A client that only branches on `status == "no_agents_reached"` string-equality (rather than treating an unrecognized status as "some non-retryable or retryable failure, check `message`") should add explicit handling for the three new values — see `docs/user-manual/mcp.md`'s `execute_instruction` row for the full semantics and retry guidance. **Alert-rule change (action may be required if you maintain a fork).** `YuzuDispatchTargetRejected`'s exclusion widens from `reason!="quarantined"` alone to `reason!~"quarantined\|unknown_plugin"` — same reasoning as the #881 exclusion above: a misconfigured automation retrying against an absent plugin is a caller mistake, not a fleet outage, and without the exclusion it clears the alert's `>3/15m` threshold on its own. If you maintain a fork of `docs/prometheus/yuzu-alerts.yml`, apply the same widened exclusion (`!~`, not `=~` — the fork's rule excludes both reasons, it does not match only them). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the sync populates. No config change required to benefit. **NVD sync now builds the FULL CVE catalog (newest-first), not ~20 keywords.** The sync backfills every CVE published within a configurable window — `--nvd-backfill-years` / `YUZU_NVD_BACKFILL_YEARS` (default **8 years**; `0` = full history) — newest-first and **resumable across restarts**, then settles into a periodic last-modified freshness re-check. **Operator-visible:** the server makes sustained HTTPS requests to `services.nvd.nist.gov`, the local NVD DB grows into the hundreds of MB, and `/api/nvd/status` `total_cves` climbs continuously while `backfill_complete` stays `false` until the backfill floor is first reached — `last_sync_time` advances after every successful fetch window and is **not** a completion signal (use the new `backfill_complete` + `backfill_oldest_published` fields, and the `yuzu_nvd_total_cves` / `yuzu_nvd_backfill_complete` metrics, for progress). **`/api/nvd/status` `enabled` semantics corrected:** it now reflects whether sync is configured on, so under `--no-nvd-sync` it reports `enabled:false` (was `true`); a monitor keying on `enabled` to mean "mirror usable" should check `total_cves` instead. The initial backfill is NVD-rate-limited (hours without an `--nvd-api-key`, minutes with one) and resumes where it left off if interrupted. Set `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress. Product matching stays name-based (vendor-precise CPE identity pending ADR-0018). **Certificate inventory now reads System/SystemRoot keychains and Linux `/etc/ssl/certs` natively (no more `openssl`/`security` CLI shell-out for those stores).** The `certificates` plugin's `list`/`details`/`delete` actions are unchanged in output shape (same pipe-delimited columns, same field values) — this is a collection-mechanism change only, verified byte-parity against the prior CLI-based output. The macOS login keychain read has ALSO moved off its governed-shell path in this same release (#3406): it now runs as a pre-split argv through the bounded runner, with the console user's home directory resolved in-process instead of by the shell. Output shape is unchanged. **One operator-visible correction:** when the console user cannot be determined — most often a slow or unreachable directory service on a domain-joined Mac — `certificates.list`/`details` with `store=login` or `all` now return an explicit `not_available|<reason>` row and mark the result PARTIAL. Previously that case silently dropped the login keychain and the list read as complete, and `details` could answer a confident `not_found` for a certificate it had never looked for. Expect to SEE partial results where output previously looked clean on such hosts; that is the bug being fixed, not a regression. No operator action required; mixed old/new-agent fleets and rollback are safe (no server-side or schema change). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the sync populates. No config change required to benefit. **NVD sync now builds the FULL CVE catalog (newest-first), not ~20 keywords.** The sync backfills every CVE published within a configurable window — `--nvd-backfill-years` / `YUZU_NVD_BACKFILL_YEARS` (default **8 years**; `0` = full history) — newest-first and **resumable across restarts**, then settles into a periodic last-modified freshness re-check. **Operator-visible:** the server makes sustained HTTPS requests to `services.nvd.nist.gov`, the local NVD DB grows into the hundreds of MB, and `/api/nvd/status` `total_cves` climbs continuously while `backfill_complete` stays `false` until the backfill floor is first reached — `last_sync_time` advances after every successful fetch window and is **not** a completion signal (use the new `backfill_complete` + `backfill_oldest_published` fields, and the `yuzu_nvd_total_cves` / `yuzu_nvd_backfill_complete` metrics, for progress). **`/api/nvd/status` `enabled` semantics corrected:** it now reflects whether sync is configured on, so under `--no-nvd-sync` it reports `enabled:false` (was `true`); a monitor keying on `enabled` to mean "mirror usable" should check `total_cves` instead. The initial backfill is NVD-rate-limited (hours without an `--nvd-api-key`, minutes with one) and resumes where it left off if interrupted. Set `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress. Product matching stays name-based (vendor-precise CPE identity pending ADR-0018). **Certificate inventory now reads System/SystemRoot keychains and Linux `/etc/ssl/certs` natively (no more `openssl`/`security` CLI shell-out for those stores).** The `certificates` plugin's `list`/`details`/`delete` actions are unchanged in output shape (same pipe-delimited columns, same field values) — this is a collection-mechanism change only, verified byte-parity against the prior CLI-based output. The macOS login keychain is unchanged (still reads via the existing governed-shell path, a deliberate exception — see `docs/agent-spawn-sink-manifest.md`). No operator action required; mixed old/new-agent fleets and rollback are safe (no server-side or schema change). |
@@ -26,6 +108,119 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
+
+## Behaviour change: web UI wording and layout (Console, Home after sign-in, hidden quarantine controls)
+
+- **"Dashboard" is now "Console".** The navigation item, the Home tile, the page title,
+  the "back to" links and the related Settings labels use the new name. Routes
+  (`/`, `/fragments/dashboard/...`), API paths, MCP tool names and permission names are
+  unchanged, so bookmarks and scripts keep working. Prose elsewhere in this manual still
+  says "dashboard" for the web UI as a whole.
+- **Home lists the screens only after sign-in.** Signed out, `/home` shows the sign-in
+  form and nothing else; the fifteen screen tiles appear once you are signed in. Health
+  probes that fetch `/home` still receive `200`.
+- **The Hardware pages no longer show quarantine controls.** The Quarantine link, the
+  Quarantined pill, the Quarantined devices panel, the containment banner and tab, and the
+  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
+  plugin and the role-gated quarantine instructions on the Instructions page all work as
+  before, and server-side enforcement does not depend on the UI. While the controls are
+  hidden, use `GET /api/v1/quarantine` to list records. `DELETE /api/v1/quarantine/{agent_id}`
+  ends the server record only; to remove the device's firewall rules, run the quarantine
+  plugin's release instruction (`security.quarantine.release`, "Release Device from Quarantine")
+  from the Instructions page (or through `execute_instruction`) and confirm with the
+  status instruction. No configuration change is needed.
+- **Colour schemes.** Settings > General > Appearance now offers six schemes (Slate stays
+  the default). The choice is stored in the browser, not on the server.
+
+## Behaviour change: new agent, policy and fragment identifiers are restricted; page links encode identifiers
+
+- A `Register` (direct or through the gateway) with an agent id the server has not seen before is now refused with `INVALID_ARGUMENT` unless the id uses only letters, digits, `.`, `_`, `:` and `-` and is not only dots (counted in `yuzu_register_invalid_agent_id_total{reason="charset"}`). Agents that are already enrolled, pending or denied are not affected, and the agent's own generated UUID always passes. If you set `--agent-id` or `YUZU_AGENT_ID` to a value with other characters (for example `DOMAIN\HOST`, `user@host` or a space), change it before the agent first registers. An agent whose enrollment row no longer exists is treated as new again: a pending row an administrator removed, or an enrollment store restored from an older backup, reset or rebuilt. Such an agent, if its id has other characters, gets the refusal on every attempt (retrying with backoff up to 300 seconds) until you change its `--agent-id` / `YUZU_AGENT_ID` to a conforming value. Through the gateway the agent sees the server message wrapped in an `INTERNAL` status. Before upgrading, check any explicit agent ids you set against the rule.
+- A new policy or policy fragment with an explicit `id` must use letters, digits, `.`, `_` and `-` (up to 128 characters) and not only dots, the same rule instruction definitions use. Existing records are not changed.
+- Dashboard links and actions that carry an agent, policy or update-package identifier now percent-encode it. A row whose identifier is empty, `.` or `..` is shown without actions, and the pending-agent approve, deny and remove routes answer `400` for such an identifier.
+
+## Behaviour change: the Settings link follows the server's own admin decision (#5779, #4208)
+
+`GET /api/me` and `GET /api/v1/me` now report `effective_role`, `elevated`,
+`elevated_until` (only while elevated) and `can_access_settings`, and the shell
+shows the Settings entry only when `can_access_settings` is `true`. Users with an
+active just-in-time elevation now see the link; RBAC PlatformEngineer or
+`Administrator`-label holders who are not legacy admins no longer see a link that
+redirected away. During a rolling upgrade an older replica omits the new keys, so
+the Settings link is hidden for every user, administrators included, whenever
+`/api/me` is answered by an older replica; open `/settings` directly by URL (it is
+unaffected) or wait for the upgrade to finish. Tabs opened before the upgrade keep
+the old shell until reloaded. No configuration change is needed.
+
+## ⚠️ Breaking: the audit log is admin-only while RBAC is off, and audit reads are bounded (#5771)
+
+**Audit trail access.** With role-based access control switched off (the shipped
+default), only administrators can now read the audit log. A non-admin signed-in
+user or API token gets `403` on `GET /api/audit`, `GET /api/v1/audit`,
+`GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`,
+the MCP tools `query_audit_log` and `audit_engine_no_admin`, and the
+`yuzu://audit/recent` resource. Previously any signed-in user could read it.
+To give a non-admin the trail, enable RBAC and assign a role that holds
+`AuditLog:Read`. Admins and RBAC-enabled `AuditLog:Read` holders are unchanged.
+
+**Find what broke.** Denials are audited and counted. As an admin, run
+`GET /api/v1/audit?action=auth.permission_required&since=<upgrade epoch>&limit=1000`
+and read `principal` on the rows whose `detail` begins
+`topology floor: non-admin role denied AuditLog:Read`. Alert on
+`sum(yuzu_auth_topology_floor_denied_total{permission="AuditLog:Read"}) > 0`. A
+poller that treats `403` as "no new events" stops collecting evidence silently,
+so make evidence collectors fail loudly on any non-200.
+
+**Two ways to restore access.** (1) Enable RBAC and assign a role holding
+`AuditLog:Read`; read [Enabling RBAC](rbac.md#enabling-rbac) first, because a user
+with no management-group role then sees no agents. (2) Run the collector on an
+admin-owned token; while RBAC is off that token carries full admin authority, so
+prefer (1) for evidence collectors.
+
+**Rolling upgrade.** An older replica still serves the trail to non-admins until
+every replica is upgraded.
+
+**Bounded audit reads.** `GET /api/audit` now clamps `limit` to 1000 and returns
+`400` for an `offset` above 10000, matching `GET /api/v1/audit` and the MCP tool.
+Callers that paged deeper or asked for more than 1000 rows should narrow the
+window with `since`/`until`. MCP `query_audit_log` now rejects a wrong-typed or
+negative filter with an invalid-params error (`-32602`) instead of silently
+ignoring it.
+`query_audit_log` string filters are now limited to 1024 characters and a longer value is `-32602`. `GET /api/audit` and `GET /api/v1/audit` return `400` for a NUL or invalid UTF-8 in a string filter (a NUL used to truncate the filter and widen the read), and `GET /api/audit` also returns `400` for a negative `since`/`until` or an inverted window. `query_audit_log` now returns `has_more` beside `entries` in its structured result; the text channel is unchanged. During a rolling upgrade an older replica omits `has_more`, so a client that validates `structuredContent` against the new output schema can fail against it until every replica is upgraded. Clients that sent such filters should shorten or drop them.
+
+**Role reads fail closed.** `GET /api/v1/rbac/roles` and
+`GET /api/v1/rbac/roles/{role}/permissions` now answer `503` when the permission
+store is degraded (previously an empty `200`) and `404` for an unknown role
+(previously `200 {"data":[]}`).
+
+## Behaviour change: `POST /api/v1/hardware/{id}/sync` refuses cross-site cookie writes
+
+**What changed.** A call to `POST /api/v1/hardware/{id}/sync` (and the new fleet form `POST /api/v1/hardware/sync`) authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise it answers `403 cross-site request refused` and is audited as `csrf.denied`. API, MCP and engine token callers are not affected.
+
+**What to check.** A script that signs in with a cookie and calls the per-device sync route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. The Hardware and Software pages already send it. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`.
+
+## Behaviour change: `PUT /api/config/{key}` is audit-first, refuses cross-site cookie writes and floors `heartbeat_timeout` at 30 seconds
+
+**What changed.**
+
+- A call to `PUT /api/config/{key}` now writes a `config.update` audit row with result `attempted` before it changes anything, then a `success` or `failure` row. Each accepted call leaves two rows where it left one. If the `attempted` row cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and nothing is changed, so a runtime setting (including the log level) cannot be changed during an audit-store outage.
+- A call authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise it answers `403 cross-site request refused` and is audited as `csrf.denied`. API, MCP and engine token callers are not affected.
+- `heartbeat_timeout` below 30 seconds is refused with `400`. A value below 30 that an earlier build stored is raised to 30 when the server starts (a WARN line names it); `GET /api/config` keeps listing the stored override until you `PUT` a value of 30 or more.
+
+**What to check.** A script that signs in with a cookie and calls this route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. A SIEM or alert rule that counts one `config.update` row per change now sees two; match on `result=success`. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin` or the General page's Save is refused. A stored value below 30 cannot be cleared by saving 30 on the General page, because that page already shows 30 as the current value: save another value first, or `PUT` it with a token. The Developer page's fragments are now administrators only (a non-admin holding `Infrastructure:Read` gets `403` from them), and the permission grid no longer writes a denial row on each load. Whatever you set, keep `heartbeat_timeout` well above the heartbeat interval your agents run with: 30 leaves no margin for a late heartbeat.
+
+## Behaviour change: sign-in moves to the landing page, `/login` redirects
+
+**What changed.** `/home` is now the sign-in page (and the landing page for a signed-in user). A page requested
+without a session is redirected to `/home?next=<screen key>` instead of `/login`, and `GET /login` answers
+`302` to `/home`, forwarding only a valid screen key and a known SSO error code. `POST /login`, `/login/mfa`,
+`/login/mfa/enroll`, the OIDC and SAML callbacks and the session cookie are unchanged. Signing in no longer
+leaves the user on the Dashboard: password and single-sign-on sign-ins both end on `/home`, which offers an
+"Open Dashboard" button. A request sent by htmx without a session now answers `401` with an `HX-Redirect: /home`
+header rather than a redirect, so a panel never swaps the sign-in page into itself.
+
+**What to check.** Any monitor, load-balancer health check or script that expects `GET /login` to answer `200`
+must probe `/livez`, `/readyz`, `/health` or `/home` instead (`/home` answers `200` without a session). Scripts
+that sign in with `POST /login` need no change. Bookmarks to `/login` keep working through the redirect.
 
 ## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
 
@@ -162,6 +357,10 @@ too large for its type were already `400`.
   `now - n` that went past the epoch silently returned the whole result. Omit the parameter for
   "no bound on that side". `since=0` stays valid and matches exactly what omitting `since`
   matches; no script that sends `since=0` changes behaviour.
+- Scripts that send a **negative** `since` or `until`, or `until=0`, to other epoch-bounded reads
+  (the execution-statistics, legacy audit, auth-sample and inventory-query routes): it is `400`
+  now too, with the same fix (omit the parameter for no bound). The list is under
+  [Behaviour change: numeric query parameters on other routes](#behaviour-change-numeric-query-parameters-on-other-routes-are-parsed-strictly-too-4644).
 - MCP clients that send `"limit": null` or `"status": null`, or a float or string for either: omit
   the key to get the default. A `status` above `2147483647` and an unsigned value above
   `9223372036854775807` are `-32602` too (the latter used to wrap to `-1`, "any status"; the same
@@ -199,6 +398,184 @@ migration is needed. Two new counters report the effect:
 `yuzu_server_response_param_rejected_total{surface}` and
 `yuzu_server_response_export_truncated_total{surface,cause}`
 ([Metrics](metrics.md#response-store-metrics)).
+
+## Behaviour change: numeric query parameters on other routes are parsed strictly too (#4644)
+
+**Breaking for scripts that relied on a malformed value being silently misread.** The strict
+parsing the response routes got (above) now also covers the routes listed in the REST API
+reference under [Numeric Query Parameters](rest-api.md#numeric-query-parameters-4644): the
+execution-statistics routes, the executions lists, the audit routes, the instruction, product-pack,
+workflow and compliance lists, the patch lists, the software-inventory list, the fleet-topology
+`machines_max` and the app-performance compare `window`. A value that is not one whole base-10
+integer now returns `400` where it used to be read as something else: `limit=100abc` (was `100`),
+`since=junk` on the statistics routes (was `0`, "from the beginning"), `?limit=abc` on
+`/api/analytics/recent` and the patch lists (was ignored), `window=7days` (was `7`).
+
+On MCP, `query_audit_log` answers `-32602` for a `since`, `until` or `limit` that is not a JSON
+integer or does not fit a signed 64-bit value (a string used to mean `0`, unbounded, and
+`18446744073709551615` wrapped to `-1`), and the app-performance compare tool does the same for
+`window`. Other integer arguments that do not fit saturate instead of wrapping, except three tools
+where a saturated value would be harmful and the argument is strict and bounded instead (`-32602`
+otherwise): `create_offload_target` `batch_size` must be 1 to 10000 (the declared schema range, now
+enforced), `mint_upload_grant` `declared_max_size` must be a JSON integer that fits a signed 64-bit
+value, and `create_guardian_rule` `version` must be 1 to 2147483647. `mint_engine_credential`
+`ttl_days` of the wrong JSON type is `-32602` too (nothing is minted; it used to fall back to the
+90-day maximum). Security-gating MCP arguments are strict too: `issue_code_signing_cert` `validity_days` must be a
+JSON integer from 1 to 730 (`4294967297` wrapped to a 1-day certificate; a string, float or `null` took the
+365-day default), `mint_upload_grant` `ttl_secs` must be a JSON integer of at least 1 (a wrong type, `0` or a
+negative value minted the 900 s maximum; larger values still clamp), `create_api_token` `expires_at` must be `0`
+or a future epoch (a negative value minted a token that never expires), and `activate_platform_license`
+`seat_count` and `expires_at` must be integers of at least 0 (a negative `expires_at` was perpetual); each is
+`-32602` and creates nothing. A wrong-typed boolean on `create_guardian_rule`/`update_guardian_rule` `enabled`,
+`push_guardian_rules` `full_sync` and the engine-principal `include_revoked` is `-32602` instead of a bare
+HTTP 500, and `create_offload_target` now neutralises the name it writes to audit rows. The two bounds now hold
+at the REST twins and in the stores, so no writer bypasses them: `POST /api/v1/offload-targets`
+reads `batch_size` as a 64-bit value and answers `400` outside 1 to 10000 (an oversized number is
+rejected, not wrapped) and for a float, string, boolean or `null` (a float such as `5.5` used to be
+truncated), `POST /api/v1/guaranteed-state/rules` answers `400`
+for a `version` outside 1 to 2147483647, and `PUT /api/v1/guaranteed-state/rules/{id}` and MCP
+`update_guardian_rule` refuse a rule whose stored version is already at 2147483647 or above (`409` on REST,
+`-32602` on MCP) instead of overflowing the version bump. The store enforces the range only when a
+write changes the version, so a rule that already holds an out-of-range stored version can still be
+enabled or disabled from the dashboard. The MCP tools `get_execution_statistics_by_agent` and
+`get_execution_statistics_by_definition` answer `-32602` for a `limit` below 1 (the schema minimum;
+it used to be replaced by the default 50), and so do their REST twins, `GET /api/v1/execution-statistics/agents` and `/definitions` (`400` for a `limit` below 1 or malformed). Two more REST inputs are new `400`s: the `limit` in the body of `POST /api/v1/inventory/query` and `POST /api/inventory/query` (below 1 or not an integer; above 1000 still clamps to 1000, and 4294967297 no longer wraps to 1), and the `ttl_days` of `POST /api/v1/engine-principals/{id}/credentials` (present but not a JSON integer from 1 to 90; absent still means 90). That mint route's body is optional only when it is empty or whitespace-only: a truncated document or a body that is not a JSON object (`[]`, `5`, `"x"`, `null`) is now `400` and mints nothing, where it used to mint the default 90-day credential. `{}` and an object without `ttl_days` still mint 90 days.
+
+A negative `since` is refused (`400`, `-32602` on MCP) on the legacy `GET /api/audit` and MCP
+`query_audit_log`, and so is an `until` of `0` or below (a negative `since` or `until`, and an `until`
+of `0`, each used to mean no bound and are new `400`s here). The same holds for a negative `since` on
+`GET /api/v1/execution-statistics/definitions`/`agents` and their MCP twins, for `to=0` on
+`GET /api/v1/audit/auth-sample`, and for an `until` of `0` or below (or a non-integer bound) in the
+body of `POST /api/v1/inventory/query` and `POST /api/inventory/query`; a non-integer `since` or
+`until` in an inventory query body made the body read throw and is a clean `400` now. The bounds are
+presence-tracked now: `-3600` and `until=0` used to mean no bound and returned the whole log,
+statistics set or inventory. Omit the parameter for no bound; `since=0` (`from=0` on the auth sample)
+is accepted and matches the same rows as omitting it. On the auth-sample export a present but empty
+`from` or `to` is accepted as unbounded on that side. `GET /api/v1/audit` follows the same rule: an
+earlier build of this release line read `0` as unbounded there; an `until` of `0` or below (or a
+negative `since`) is now `400`.
+
+The same strictness now covers the dashboard fragments' `page`/`per_page`, the software
+inventory (the three software fragments answer `200` with an `inv-caveat` note for a malformed
+`limit` and ignore a well-formed one, which uses a fixed page size), DEX perf, network quality, hardware and CA-issued lists, the notification, webhook and
+offload delivery lists, the DEX, network and result-set `limit` and the Guaranteed State events `limit`/`offset` (trailing characters are `400`; an integer outside the result-set page range still uses the default page size),
+the pre-flight run list `limit`, the pre-flight run form's `min_gib` and `window` (a malformed value
+or a negative `min_gib` is `400`; an empty field keeps its default; a `window` of zero or below uses 30
+minutes and a larger value is clamped to 1 to 2880 as a 64-bit value, so one beyond a signed 64-bit
+integer is `400`; see [Pre-flight](preflight.md)), the hardware sync poll's `await_since`
+(a malformed freshness bound used to read as "no bound"), the TAR process-tree `node` and the
+`GET /api/v1/events` `?since` cursor (the workflow stream has the header only). A malformed
+`Last-Event-ID` header is served live only (nothing replayed, never the whole buffer) rather than
+a `400`, and `-1` and `5abc` are never accepted as cursors (`5abc` used to replay from 5). On the
+query-parameter routes, a parameter that is present but empty (`?limit=`) is malformed, not
+absent, `GET /api/v1/audit` `limit` included, except `limit` on the software list and catalogue
+routes and fragments, where an empty `limit=` means the default (see
+[the software installs read](#behaviour-change-the-software-installs-read-validates-its-inputs-and-audits-an-out-of-scope-target)).
+The verify fragment's `window`
+is refused with its usual `200` note instead of a `4xx` (the dashboard drops `4xx` bodies).
+
+Four admin forms stop silently saving a different value than the one typed. A malformed
+`min_devices`, `window_seconds` or `cooldown_seconds` on the DEX blast-radius thresholds is a `400`
+and saves nothing (it used to persist the clamped minimum). On the enrollment-token forms and the
+API-token `ttl_hours`, `0x5` used to read as `0`; `max_uses` `0` means unlimited and a TTL of `0`
+means no expiry, so a mistyped limit minted an unlimited or never-expiring credential. Only an
+empty field, or a value that parses to a literal `0` (`0`, `-0`, `00`), means unlimited or no
+expiry now, and a negative `ttl_hours` is refused (it would have computed `0`). The API-token form
+refuses with its usual `200` feedback span and mints nothing; the other forms answer `400` plus an
+error toast. On the batch route an empty `max_uses` defaults to `1`. A malformed `rollout_pct` on an OTA
+package upload or rollout change is a `400` instead of silently becoming `100`. **Behaviour change on
+the rollout change route only:** an empty `rollout_pct` and a value above `100` are now `400` as well
+(an empty value used to mean `100` and a larger one was clamped to `100`); a negative value still
+clamps to `0`; the upload route keeps an empty value as `100`, clamps a larger one to `100` and a negative one to `0`, and refuses only a malformed value. A negative `limit` or `offset` on `GET /api/notifications`, and a negative `limit` on the patch lists
+(`GET /api/patches`, `GET /api/patches/deployments`), is `400` too (the store answered an empty `200`),
+and so is a negative `limit` on the legacy `GET /api/policy-fragments` and `GET /api/policies` (it
+reached Postgres as `LIMIT -1` and answered `503`; the `/api/v1/` policy routes clamp it as before).
+A malformed or out-of-range enrollment-token number now also writes an `enrollment.token_create` or
+`enrollment.bulk_token_create` row with `result=denied` and `detail=invalid_numeric_parameter` (see
+[Audit Log](audit-log.md)).
+
+Security-gating numbers in JSON request bodies are strict too. **Before / after:** `POST /api/v1/tokens` `expires_at` of `-1`, or a value above 9223372036854775807 that wrapped to `-1`, minted a token that never expires, `5.5` or `1e3` minted an already-expired one, and a string, boolean or `null` (or a non-object body) was a bare `500`; now each is `400` and mints nothing (`0` or omitted still means never expires, and a past epoch is refused). `overlap_secs` on `POST /api/v1/tokens/{id}/rotate` and `POST /api/v1/engine-principals/{id}/credentials/rotate` must be a JSON integer, and a non-blank body that is truncated or not an object is `400` instead of rotating with the 7-day default (an empty body still takes the default). `version` on `POST /api/v1/guaranteed-state/rules` must be a JSON integer in range (`5.5` was stored as `5`). `ttl_secs` on `POST /api/v1/upload-grants` must be a JSON integer of at least 1 when present (a wrong type, `0` or a negative value used to mint the 900 s maximum). On `POST /api/settings/enrollment-tokens/batch` a JSON number for `count`, `max_uses` or `ttl_hours` used to be silently ignored, so the documented curl example minted single-use tokens that never expired; numbers and numeric strings are now both honoured, a float, boolean, `null`, overflow or malformed body is `400`, and an empty string still means the default. An `ip_subnet` auto-approve rule with a malformed prefix is refused when added (`400`); a malformed one already stored used to throw out of agent registration and now never matches, so it never auto-approves. `POST /api/schedules` `interval_minutes` (1 to 35791394), `day_of_week` (0 to 6) and `day_of_month` (1 to 28) must be JSON integers in range (`4294967297` minutes became an every-minute schedule); `POST /api/schedules/{id}/enable` `enabled` must be a JSON boolean, the integer `0` or `1`, or the exact string `"true"` or `"false"` (an omitted key or a blank, empty or whitespace-only, body still enables), and any other string, another number, `null` or a malformed body is `400` and changes nothing (`{"enabled":0}` used to arm the schedule). `POST /api/command` `stagger` and `delay` must be integers from 0 to 300 (a float, string or `null` read as 0, so a delayed command ran immediately; a value above 300 was silently capped by the agent at 300 seconds and is now a 400). A result-set matcher `{"kind":"tar_rows_ge","n":N}` needs an integer N from 1 to 2147483647 on `POST /api/v1/result-sets/from-instruction-result` and the MCP `create_result_set_from_instruction_result` (`400` / `-32602`), and a `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too (it used to be dropped, so every responder qualified; omit `matcher` for that default); a malformed `n` or `kind` already stored, or an `n` below 1, now matches no device instead of throwing in the maintenance tick or admitting everyone. The pre-flight form's `app_min`, `app_max` and `os_min` must be empty or a dotted-decimal version with an optional `-beta` / `+build` suffix; `abc`, `v4.2.0` or `4.2.x` is `400` and starts no run (it read as version 0 and passed every device). `POST /api/v1/license` `seat_count` and `expires_at` follow the MCP twin: JSON integers of at least 0, else `400` (the licence surface is dormant until the `LicenseStore` is wired, ADR-0048). Rolling upgrade: replicas on the old and new build answer these inputs differently.
+
+Three more inputs that used to be read as something else are refused (`400` on REST, `-32602` on MCP), and one stored value is repaired:
+a `conditions[].value` on the inventory evaluate and result-set routes that is a JSON number is
+accepted with `==`, `!=`, `>`, `>=`, `<`, `<=` (and a boolean with `==` or `!=`); all six compare it
+as a number against the raw stored value (exact for integers and for integer against a decimal, a stored
+numeric string counting as that number; JSON integers are exact and every JSON float (a number written with a decimal point or exponent, such as `5.0`, `1e3` or `5.5`, or an integer outside `-9223372036854775808` to `18446744073709551615`, which arrives as a float) is refused because its original text is lost once parsed: send the decimal as a JSON string under `>`, `>=`, `<` or `<=`, which is accepted as a whole number within int64/uint64 (digits or an integer-valued exponent form such as `"1e16"`, read exactly) or with at most 15 significant digits, a magnitude below 2^53, a value that is zero or at least the smallest normal double, and a value within the range of a double, and a plain-decimal string such as `"1e400"` is refused instead of ordering lexically; `==` and `!=` with a string stay a text compare, so numeric equality covers JSON integers only; write a whole number as an integer up to `18446744073709551615` or as digits, and a string such as `"9007199254740993.0"` is read as that exact integer; a non-integer at or above 2^53 such as `"9007199254740992.5"` is refused), so **behaviour change:** a stored value that is not a number,
+such as `"5 GB"` or `"N/A"`, no longer satisfies `>`, `>=`, `<` or `<=` against a numeric operand (it was read as `5`
+or compared as text), and any other operand type is refused (a number used to become the empty string, so `{"op":">","value":5}`
+selected every device that had the field); a string operand that is a plain decimal number (`"4"`, `"2e-7"`) is ordered numerically under `>`, `>=`, `<`, `<=`: a stored number or fully numeric string compares exactly (a stored integer within int64/uint64, including an integer-valued exponent spelling that fits (such as `"564141138995e7"`), and a stored decimal with a fraction of at most 15 significant digits and a magnitude below 2^53 compare exactly; any other stored decimal, one of more digits or a non-integer at or above 2^53, or a stored negative integer below `-9223372036854775808`, is compared as the nearest double), a stored string that merely starts with a number (a dotted version `"1.2.3"`, `"5 GB"`) has its leading number read and compared the same way (use `version_gte` / `version_lte` for dotted versions), and any other stored value (`"N/A"`, `""`, a boolean) never matches, where a JSON number operand never matches a stored string that is not a number in full; while `==` / `!=` and a non-numeric string operand such as `"v2"` are unchanged; a result-set matcher whose `column`, `op` or `value` is
+present with the wrong type no longer qualifies every responder; the DEX `window` on
+`GET /api/v1/dex/signals`, `/dex/scope`, `/dex/signals/{obs_type}` and their MCP tools (and `get_dex_device_score`) must be
+`24h`, `7d`, `30d` or `all` (`90d`, a non-string such as `30` or `null`, or an empty `?window=` was answered with 7 days; only an omitted `window` keeps `7d`). Separately, a stored schedule `interval_minutes`
+above 35791394 now advances instead of failing in Postgres on every tick (new schedules are capped at
+that value).
+
+Still lenient, and not an exhaustive list: the `n` retry-attempt counter on the live-snapshot poll
+fragments (the deployment, device, hardware, DEX, pre-flight and TAR process-tree polls), which is
+clamped to a fixed range per poll (1 to 100000 on the deployment and pre-flight polls, at most 50 on
+the others), and values parsed from stored rows, agent output or server configuration rather than
+from a request. Numeric path segments matched by a `(\d+)`
+pattern (notification read/dismiss and the webhook routes) now answer `404` for an id that does
+not fit a signed 64-bit integer; they used to fail with `500`. The auto-approve rule index answers
+`200` with an audited `denied` row (`rule_not_found`) and changes nothing.
+
+**What to do.** Send whole integers, and omit a parameter to get its default. No configuration or
+data migration is needed, but review Settings > Auto-Approve for `ip_subnet` rules with a sign or an odd prefix (they match nothing, so those agents go to the pending queue), and optionally list API tokens with `expires_at=0` and enrollment tokens minted before the upgrade. During a rolling upgrade, replicas on the old and new build answer a
+malformed value differently (`200` versus `400`).
+
+## Changed: a degraded execution-statistics read is a 503, not an empty 200 (#4644)
+
+`GET /api/v1/execution-statistics`, `/agents`, `/definitions`, `GET /api/v1/statistics` and the
+four MCP statistics tools used to answer a store failure (execution store not open, pool timeout,
+failed query) with `200` and an empty list or an all-zero summary, which reads as "no
+executions". They now answer `503` with `retry_after_ms: 2000` on REST and a retryable error with
+`retry_after_ms` on MCP. A filter or confined scope that genuinely matches nothing is still `200`
+with an empty `data` array. Each degraded read also logs a warning on the server
+(`ExecutionTracker::try_get_<reader> degraded: tracker not open`, `pool exhausted` or `query failed`).
+
+**What to do.** Treat a `503` from these routes as retryable. A dashboard or script that read
+`data: []` as "nothing to report" during an outage will now see the error instead.
+
+## Changed: a saturated pre-flight response window is inconclusive (#4644)
+
+Each pre-flight check reads its newest 50,000 responses for a run. On a very large cohort a
+device that had answered could be pushed out of that window and then read as "no response" while
+the runner kept re-dispatching. A device absent from a full window now shows **"inconclusive:
+response cap reached"**, stays Incomplete (never in Deploy's go cohort) and the runner stops
+re-dispatching that run; the run still completes at its deadline. Re-run against a smaller group
+to resolve those devices.
+
+## Behaviour change: per-agent execution statistics are confined to the caller's scope (#3526)
+
+`GET /api/v1/execution-statistics/agents` and the MCP tool `get_execution_statistics_by_agent` used
+to gate on a bare `Execution:Read` check. That check admits only a holder of a global grant, and it
+returned one row per agent across every execution of every operator with no per-agent filter. A
+management-group-scoped-only operator (no global grant) was refused with `403`. Both now go through
+the same admit-then-filter fleet-read gate as `GET /api/v1/executions` (ADR-0017): the visible-agent
+set is applied in the query before the grouping and the row limit, and an empty visible set returns
+no rows, never the fleet. This widens who is admitted and narrows what a confined caller sees:
+nothing a caller could read before is now refused, with one exception: the gate fails closed, so
+when the RBAC or management-group store is not open the route answers a retryable `503`
+(`retry_after_ms` 5000), even to a global admin, where the bare check answered `200`.
+
+- **A group-scoped-only operator** goes from `403` to a `200` that carries only the rows of the
+  agents it can see. A holder of a global grant sees the same rows as before.
+- **A service-scoped API token on the REST route** used to be refused (`403`) by the bare gate. With
+  RBAC enforcement on it is now admitted as a confined view: the token must clear the
+  `ITServiceOwner` authority ceiling (the seeded role holds `Execution:Read`), and the rows are then
+  intersected with the agents tagged for its service. A degraded tag store answers `503`. The MCP
+  tool still denies service-scoped tokens, and widening that is a separate decision, not made here.
+- **Confinement is effective only with RBAC enforcement on.** With RBAC off (the shipped default)
+  the rollup is unfiltered for every authenticated caller other than a service-scoped token or an
+  engine principal (a service-scoped token is refused `403` with RBAC off). Treat the confined view
+  as available once you enable RBAC enforcement, not before.
+- `GET /api/v1/execution-statistics/definitions` and the fleet summary carry no agent identity and
+  keep the plain `Execution:Read` gate (the summary's `active_agents` is a fleet-wide count).
+  `GET /fragments/executions` is not changed by this entry.
+- A negative `since` on `/agents` and `/definitions` is `400` (see the previous section).
+
+During a rolling upgrade, replicas on the old and the new build admit and return different row sets to
+a confined caller.
 
 ## Behaviour change: the software installs read validates its inputs and audits an out-of-scope target
 
@@ -715,8 +1092,9 @@ plus one new prerequisite.**
   whole-registry agent count (tracked in #4753, whose checklist, including `kind=fleet` and
   `get_fleet_posture_fast`, stays open; the executions-list move covers only `kind=execution`). The same
   whole-registry branch is also reached by `kind=execution` or `kind=agent` with an EMPTY id, or
-  when the execution tracker is unavailable (not separately tracked). `GET
-  /api/v1/execution-statistics/agents` has no per-agent filter (#3526).
+  when the execution tracker is unavailable (not separately tracked). (`GET
+  /api/v1/execution-statistics/agents` was listed here and is now confined; see "Behaviour change:
+  per-agent execution statistics are confined to the caller's scope (#3526)".)
 
 **Rollback.** Redeploy the previous binary. The plain `Execution:Read` gate returns, so
 group-scoped-only operators go back to `403` on the fragment. The `visible_agents` filter is a
@@ -857,6 +1235,16 @@ No config or data migration is required.
 - **`/viz/fleet` and MCP `get_fleet_topology`** now also show a departed device, flagged stale, for 7 days, so `yuzu_viz_offline_hosts_total` rises after the upgrade.
 - **Retention.** A row is deleted 37 days after its device was last seen (the 30-day roster window plus a 7-day margin). Each replica runs the prune hourly and deletes at most 12,000 rows per hour. The first pass runs about a minute after the server starts. On the first start after the upgrade it only records its clock anchor, so deletions begin with the next hourly pass; on every later start it already deletes; a large backlog inherited from an older release drains at that rate (100,000 rows in about 8 hours).
 - **Decommission erases the row.** `DELETE /api/v1/sle/agents/{id}` deletes the device's `endpoint_state` row (#5682), so a decommissioned device leaves `/hardware`. A still-enrolled agent that heartbeats again re-creates it, so stop the agent first. A device that is never decommissioned ages out under the 37-day rule.
+
+## Behaviour change: the DEX cohort floor is one device, and the Apps list fails closed
+
+**Not a Breaking lead:** no flag or route is removed and no response field is renamed. Three operator-visible behaviours change.
+
+- **The cohort floor is 1 (was 10).** A point, cohort or per-version figure with a single contributing device now publishes that device's exact CPU and memory aggregate on the un-audited DEX reads, including a cohort keyed by a per-device tag value (an asset tag, serial number or owner). No `agent_id` is emitted and the permission is unchanged (`GuaranteedState:Read`); the audited per-device drill is unchanged. The `floor` field those responses echo now reads 1.
+- **The Prometheus cohort export carries one-device cohorts.** With `dex_cohort_export_key` set, a one-device cohort exports as `yuzu_fleet_perf_cohort_*{cohort=<tag value>}` on `/metrics`, governed by `/metrics` authentication (loopback is always unauthenticated; remote scrapes need any authenticated session, with no `GuaranteedState:Read` check, unless `--metrics-no-auth` is set) rather than `GuaranteedState:Read`. Choose keys whose values do not name a device or person. `yuzu_fleet_perf_cohort_clipped` can now rise on high-cardinality keys.
+- **The Apps list answers `503` on a degraded read.** `GET /api/v1/dex/apps` answers `503` with `retry_after_ms: 2000`, and MCP `list_dex_apps` a retryable error, where they previously returned an empty list. Treat `503` as retry; it also answers `503` at once when four Apps reads are already running on that server (keep to four parallel calls and honour `retry_after_ms`; each refusal is counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`, which trips the warning alert `YuzuGuardianReadDegraded` if it persists). The rows gain `distinct_devices_online` (an integer, `null` when no fleet source is wired); the share, rate and score are over the Windows devices online now, and the score is withheld as `offline_affected` while any affected device is offline (expect that on most multi-device applications of a fleet with laptops; use the share and rate until an offline-aware score is decided, #5894). The list is now Windows-scoped and keeps the 100 applications affecting the most devices (`apps_total` and `apps_truncated` report the cut); the Apps tab is unchanged.
+
+No config or data migration is required.
 
 ## Behaviour change: a failed device-roster read is reported instead of shown as an empty fleet (#5531)
 

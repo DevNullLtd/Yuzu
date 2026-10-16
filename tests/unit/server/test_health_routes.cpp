@@ -42,6 +42,7 @@
 #include <fstream>
 #include <optional>
 #include <stdexcept>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -79,7 +80,13 @@ struct Harness {
 
     bool deny_scoped{false};
     bool deny_scoped_fn_called{false};
-    std::string last_deny_action, last_deny_target_type, last_deny_target_id;
+    std::string last_deny_action, last_deny_message, last_deny_target_type, last_deny_target_id;
+
+    // HM-2 /fragments/dashboard/health: the optional Execution:Read fleet gate.
+    bool fleet_wired{false};
+    bool fleet_admit{true};
+    bool fleet_scoped{false};
+    std::vector<std::string> fleet_calls; // "Securable:Op"
 
     yuzu::server::test::TestRouteSink sink;
 
@@ -110,11 +117,12 @@ struct Harness {
             return s;
         };
         deps.deny_service_scoped_fn = [this](const httplib::Request&, httplib::Response& res,
-                                             const std::string& action, const std::string&,
+                                             const std::string& action, const std::string& message,
                                              const std::string& target_type,
                                              const std::string& target_id) -> bool {
             deny_scoped_fn_called = true;
             last_deny_action = action;
+            last_deny_message = message;
             last_deny_target_type = target_type;
             last_deny_target_id = target_id;
             if (deny_scoped) {
@@ -126,6 +134,21 @@ struct Harness {
             }
             return false;
         };
+        if (fleet_wired)
+            deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
+                                        const std::string& sec,
+                                        const std::string& op) -> authz::FleetReadGate {
+                fleet_calls.push_back(sec + ":" + op);
+                if (!fleet_admit) {
+                    res.status = 403;
+                    return {};
+                }
+                authz::FleetReadGate g;
+                g.admitted = true;
+                g.scope = fleet_scoped ? authz::VisibleSet{std::unordered_set<std::string>{"a1"}}
+                                       : authz::VisibleSet{std::nullopt};
+                return g;
+            };
         deps.cfg = &cfg;
         deps.metrics = &metrics;
         deps.registry = &registry;
@@ -151,10 +174,10 @@ struct Harness {
 
 // ── Registration shape ────────────────────────────────────────────────────
 
-TEST_CASE("health_routes: registers exactly 6 routes", "[server][routes][health_routes]") {
+TEST_CASE("health_routes: registers exactly 7 routes", "[server][routes][health_routes]") {
     Harness h;
     h.wire();
-    CHECK(h.sink.route_count() == 6);
+    CHECK(h.sink.route_count() == 7);
 }
 
 TEST_CASE("health_routes: throws std::invalid_argument if cfg or metrics is unbound",
@@ -676,4 +699,117 @@ TEST_CASE("health_routes: /metrics exports the reachability gauges on scrape",
     CHECK(r->body.find("yuzu_server_pg_reachable 1") != std::string::npos);
     CHECK(r->body.find("yuzu_server_pg_reachability_last_success_age_seconds") !=
           std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// HM-2: /fragments/dashboard/health (Dashboard "Server health" panel)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("health_routes: /fragments/dashboard/health denies a service-scoped token first, as a 200 note",
+          "[server][routes][health_routes][home]") {
+    Harness h;
+    h.deny_scoped = true;
+    h.wire();
+    auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(h.deny_scoped_fn_called);
+    CHECK(h.last_deny_action == "dashboard.fragment.access_denied");
+    // The audited denial names the panel (this text is the audit detail, not the page).
+    CHECK(h.last_deny_message == "service-scoped tokens may not read the Dashboard health panel");
+    CHECK_FALSE(h.auth_fn_called); // deny runs BEFORE auth_fn
+    CHECK(r->body.find("service-scoped tokens") == std::string::npos); // gate text never reaches the page
+    CHECK(r->body.find("id=\"dash-health\"") != std::string::npos);
+    CHECK(r->body.find("You do not have access to this panel.") != std::string::npos);
+    CHECK(r->body.find("Agents connected to this server") == std::string::npos);
+    CHECK(r->get_header_value("Cache-Control") == "no-store");
+}
+
+TEST_CASE("health_routes: /fragments/dashboard/health without a session writes 401 and no panel",
+          "[server][routes][health_routes][home]") {
+    Harness h;
+    h.session_present = false;
+    h.wire();
+    auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+    REQUIRE(r);
+    CHECK(r->status == 401);
+}
+
+TEST_CASE("health_routes: /fragments/dashboard/health renders real rows, executions row only when unscoped",
+          "[server][routes][health_routes][home]") {
+    SECTION("unbound fleet gate omits the executions row") {
+        Harness h;
+        h.wire();
+        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("id=\"dash-health\"") != std::string::npos);
+        CHECK(r->body.find("Agents connected to this server") != std::string::npos);
+        CHECK(r->body.find("Executions running") == std::string::npos);
+        CHECK(h.fleet_calls.empty());
+    }
+    SECTION("admitted and unscoped shows it, gate asked for Execution:Read") {
+        Harness h;
+        h.fleet_wired = true;
+        h.wire();
+        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        REQUIRE(r);
+        CHECK(r->body.find("Executions running") != std::string::npos);
+        REQUIRE(h.fleet_calls.size() == 1);
+        CHECK(h.fleet_calls[0] == "Execution:Read");
+    }
+    SECTION("engaged scope omits it") {
+        Harness h;
+        h.fleet_wired = true;
+        h.fleet_scoped = true;
+        h.wire();
+        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        REQUIRE(r);
+        CHECK(r->body.find("Executions running") == std::string::npos);
+        CHECK(r->body.find("Agents connected to this server") != std::string::npos);
+    }
+    SECTION("denied omits it") {
+        Harness h;
+        h.fleet_wired = true;
+        h.fleet_admit = false;
+        h.wire();
+        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        REQUIRE(r);
+        CHECK(r->body.find("Executions running") == std::string::npos);
+    }
+}
+
+TEST_CASE("health_routes: /fragments/dashboard/health never renders system, tls or pending-agent fields",
+          "[server][routes][health_routes][home]") {
+    Harness h;
+    h.fleet_wired = true;
+    h.wire();
+    auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+    REQUIRE(r);
+    for (const char* banned : {"cpu_percent", "rss", "tls", "pending", "command_queue_depth"})
+        CHECK(r->body.find(banned) == std::string::npos);
+}
+
+TEST_CASE("health_routes: /fragments/dashboard/health agrees with /api/health on healthy versus degraded",
+          "[server][routes][health_routes][home]") {
+    // Kills: a panel that re-derives "healthy" instead of reusing the health document's decision.
+    PgReachabilityProbe ok_probe(fixed_ping(PgReachabilityProbe::PingResult::Kind::Ok));
+    ok_probe.probe_once();
+    PgReachabilityProbe bad_probe(fixed_ping(PgReachabilityProbe::PingResult::Kind::Failed));
+    bad_probe.probe_once();
+    bad_probe.probe_once();
+    for (PgReachabilityProbe* probe : {static_cast<PgReachabilityProbe*>(nullptr), &ok_probe, &bad_probe}) {
+        Harness h;
+        h.pg_probe = probe;
+        h.wire();
+        auto doc = h.sink.dispatch("GET", "/api/health");
+        auto panel = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        REQUIRE(doc);
+        REQUIRE(panel);
+        const std::string status = json::parse(doc->body)["status"].get<std::string>();
+        const bool healthy_pill = panel->body.find(">Healthy<") != std::string::npos;
+        const bool degraded_pill = panel->body.find(">Degraded<") != std::string::npos;
+        CHECK(healthy_pill == (status == "healthy"));
+        CHECK(degraded_pill == (status != "healthy"));
+    }
 }

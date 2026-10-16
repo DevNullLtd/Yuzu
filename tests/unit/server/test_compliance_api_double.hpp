@@ -37,6 +37,8 @@ public:
         const std::string&)>;
     using FleetComplianceFn =
         std::function<std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError>()>;
+    using ComplianceByPolicyFn = std::function<
+        std::expected<std::vector<yuzu::server::ComplianceSummary>, yuzu::server::PolicyReadError>()>;
     using ComplianceSummaryFn =
         std::function<std::expected<yuzu::server::ComplianceSummary, yuzu::server::PolicyReadError>(
             const std::string&)>;
@@ -48,6 +50,7 @@ public:
     ListPoliciesFn list_policies_fn;
     GetPolicyFn get_policy_fn;
     FleetComplianceFn fleet_compliance_fn;
+    ComplianceByPolicyFn compliance_by_policy_fn;
     ComplianceSummaryFn compliance_summary_fn;
     PolicyAgentStatusesFn policy_agent_statuses_fn;
 
@@ -79,6 +82,14 @@ public:
         if (!fleet_compliance_fn)
             return std::unexpected(yuzu::server::PolicyReadError::kDegraded);
         return fleet_compliance_fn();
+    }
+
+    [[nodiscard]] std::expected<std::vector<yuzu::server::ComplianceSummary>,
+                                yuzu::server::PolicyReadError>
+    compliance_by_policy() const override {
+        if (!compliance_by_policy_fn)
+            return std::unexpected(yuzu::server::PolicyReadError::kDegraded);
+        return compliance_by_policy_fn();
     }
 
     [[nodiscard]] std::expected<yuzu::server::ComplianceSummary, yuzu::server::PolicyReadError>

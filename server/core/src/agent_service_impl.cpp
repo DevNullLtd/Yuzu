@@ -197,6 +197,19 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             response->set_enrollment_status("denied");
             return grpc::Status::OK;
         }
+        // A NEW agent_id (no enrollment row at all) must use the agent's own
+        // identifier charset (`auth::is_valid_new_agent_id`). Existing rows —
+        // pending, approved or denied — are untouched above/below, so an
+        // already-enrolled agent with an unusual id is never locked out.
+        // Checked before any token is consumed or any row is written.
+        if (!prior && !auth::is_valid_new_agent_id(info.agent_id())) {
+            spdlog::warn("Register rejected: agent_id has characters outside [A-Za-z0-9._:-] "
+                         "(or is only dots)");
+            metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "charset"}})
+                .increment();
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                "agent_id may only contain letters, digits, '.', '_', ':' and '-'");
+        }
     }
 
     {

@@ -21,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -844,7 +845,9 @@ TEST_CASE("DEX overview: renders real multi-signal aggregations", "[pg][dex][rou
     seed_boot(store, "e6", "WS-2", 91000.0, kDayB + "T08:05:00Z");
 
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{10, 12});
-    CHECK(html.find("Digital Employee Experience") != std::string::npos);
+    // Heading matches the nav label; the long form is the subtitle only.
+    CHECK(html.find("<h1>DEX</h1>") != std::string::npos);
+    CHECK(html.find("gp-sub\">Digital Employee Experience:") != std::string::npos);
     // Hub slim: the All-signals / boot / faulting-modules panels moved to the
     // deep pages (Catalogue + App reliability) — the hub summarises and links.
     CHECK(html.find("All signals") == std::string::npos);
@@ -916,7 +919,7 @@ TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; cr
     // 2 connected Windows agents: WS-1 crashed (<100), WS-2 clean (100).
     DexFleet fleet{2, 2, {"windows"}, {{"WS-1", "windows"}, {"WS-2", "windows"}}};
     auto html = render_dex_overview_fragment(&store, "", 7, fleet);
-    CHECK(html.find("DEX health") != std::string::npos);         // new headline section
+    CHECK(html.find("<div class=\"gp-sech\">DEX score</div>") != std::string::npos); // headline section
     CHECK(html.find("Overall experience") != std::string::npos); // per-device median tile
     CHECK(html.find("great") != std::string::npos);              // the distribution bar
     CHECK(html.find("DEX score by segment") != std::string::npos); // the segment breakdown
@@ -1285,6 +1288,66 @@ TEST_CASE("DEX routes: /dex lights DEX in the sidebar and ends the breadcrumb on
     CHECK(page->body.find("<a class=\"shell-nav on\" href=\"/dex\" aria-current=\"page\">") !=
           std::string::npos);
     CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>DEX</b>") != std::string::npos);
+}
+
+// Kills: the Trends depth rules in the page shell (guardian_page_ui.cpp) going missing or turning
+// into literal colours. They sit in the baked page, not in a /fragments/dex payload, so the
+// fragment goldens never see them. Same Postgres-free harness as the sidebar test above.
+TEST_CASE("DEX routes: /dex page shell carries the Trends depth rules; tokens only",
+          "[dex][routes][ui]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, /*perm_fn=*/{}, /*store=*/nullptr, /*fleet_fn=*/{},
+                           /*audit_fn=*/{});
+
+    auto page = sink.Get("/dex");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+
+    // One rule's text, selector through closing brace, whitespace collapsed so the source's
+    // line wrapping cannot break a match.
+    auto rule = [&](const std::string& selector) {
+        const auto open = page->body.find(selector + " {");
+        REQUIRE(open != std::string::npos);
+        const auto close = page->body.find('}', open);
+        REQUIRE(close != std::string::npos);
+        std::string out;
+        for (auto i = open; i <= close; ++i) {
+            if (std::isspace(static_cast<unsigned char>(page->body[i]))) {
+                if (out.back() != ' ')
+                    out += ' ';
+            } else {
+                out += page->body[i];
+            }
+        }
+        return out;
+    };
+    auto has = [](const std::string& r, const char* decl) { return r.find(decl) != std::string::npos; };
+
+    const auto card = rule(".gp-sm");
+    CHECK(has(card, "box-shadow: var(--mds-elevation-2);"));
+    const auto lift = rule(".gp-sm:hover");
+    CHECK(has(lift, "transform: translateY(-1px);"));
+    CHECK(has(lift, "border-color: var(--line2);"));
+
+    const auto grid = rule(".gp-heat");
+    CHECK(has(grid, "gap: 2px;"));
+    const auto row = rule(".gp-heat .hrow");
+    CHECK(has(row, "gap: 2px;"));
+    const auto cell = rule(".gp-heat .hrow > i, .gp-hleg i");
+    CHECK(has(cell, "width: 16px; height: 16px;"));
+    CHECK(has(cell, "border-radius: 3px;"));
+    CHECK(has(cell, "box-shadow: inset 0 0 0 1px var(--line);"));
+    const auto hover = rule(".gp-heat .hrow > i:hover");
+    CHECK(has(hover, "outline: 2px solid var(--hl);"));
+    CHECK(has(hover, "transform: scale(1.15);"));
+
+    // Tokens only: none of these rules may carry a hex colour (or any '#').
+    for (const auto* r : {&card, &lift, &grid, &row, &cell, &hover})
+        CHECK(r->find('#') == std::string::npos);
 }
 
 TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") {
@@ -1861,13 +1924,12 @@ TEST_CASE("DEX perf cohort-diff fragment: unwired placeholder vs wired empty-coh
     }
 }
 
-// kDexCohortFloor suppression at the route level (fleet + group + tag/model
-// paths) — pinned before the DexPerfApi rewire so the floor can never
-// silently drop out when the handler switches from AppPerfProviders.fleet/
-// .group/.tag_cohort to DexPerfApi::app_fleet_trend/group_trend/tag_trend
-// (all three apply the SAME app_perf_fleet_trend/app_perf_group_trend pure
-// reduction + kDexCohortFloor — tag_trend shares group_trend's reduction).
-TEST_CASE("DEX perf/app fragment: kDexCohortFloor suppresses a sub-floor point "
+// kDexCohortFloor at the route level (fleet + group + tag/model paths): the
+// floor is one device (maintainer ruling 2026-10-14), so a three-device point
+// is published with its exact mean on all three paths (all three apply the
+// SAME app_perf_fleet_trend/app_perf_group_trend pure reduction + kDexCohortFloor
+// — tag_trend shares group_trend's reduction). Fails at the old floor of 10.
+TEST_CASE("DEX perf/app fragment: the one-device floor publishes a three-device point "
           "(fleet, group, and tag/model paths)",
           "[dex][app_perf][routes]") {
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
@@ -1884,14 +1946,14 @@ TEST_CASE("DEX perf/app fragment: kDexCohortFloor suppresses a sub-floor point "
         row.app_name = "chrome.exe";
         row.version = "125.0.0.0";
         row.day = 1'700'000'000;
-        row.device_count = 3; // < kDexCohortFloor (10)
+        row.device_count = 3; // >= kDexCohortFloor (1); was sub-floor at 10
         row.cpu_sum = 30.0;
         row.cpu_max = 40.0;
         row.hist_version = kAppPerfHistVersion;
         return row;
     };
 
-    SECTION("fleet path (no group/model) floors too") {
+    SECTION("fleet path (no group/model) publishes the point") {
         yuzu::server::test::FnDexPerfApi::Providers providers;
         providers.fleet = [&](std::string_view,
                               std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
@@ -1906,12 +1968,12 @@ TEST_CASE("DEX perf/app fragment: kDexCohortFloor suppresses a sub-floor point "
         auto r = sink.Get("/fragments/dex/perf/app?app=chrome.exe");
         REQUIRE(r);
         CHECK(r->status == 200);
-        CHECK(r->body.find("n too small (fewer than 10 devices") != std::string::npos);
-        // The exact CPU mean (30.0/3=10.0%) must be withheld once suppressed.
-        CHECK(r->body.find("10.0%") == std::string::npos);
+        CHECK(r->body.find("n too small") == std::string::npos);
+        // The exact CPU mean (30.0/3=10.0%) is published at the one-device floor.
+        CHECK(r->body.find("10.0%") != std::string::npos);
     }
 
-    SECTION("group path floors identically") {
+    SECTION("group path publishes identically") {
         yuzu::server::test::FnDexPerfApi::Providers providers;
         providers.group = [&](std::string_view, std::string_view,
                               std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
@@ -1926,11 +1988,11 @@ TEST_CASE("DEX perf/app fragment: kDexCohortFloor suppresses a sub-floor point "
         auto r = sink.Get("/fragments/dex/perf/app?app=chrome.exe&group=G1");
         REQUIRE(r);
         CHECK(r->status == 200);
-        CHECK(r->body.find("n too small (fewer than 10 devices") != std::string::npos);
-        CHECK(r->body.find("10.0%") == std::string::npos);
+        CHECK(r->body.find("n too small") == std::string::npos);
+        CHECK(r->body.find("10.0%") != std::string::npos);
     }
 
-    SECTION("tag/model path floors identically") {
+    SECTION("tag/model path publishes identically") {
         yuzu::server::test::FnDexPerfApi::Providers providers;
         providers.tag_cohort =
             [&](std::string_view, std::string_view, std::string_view,
@@ -1946,8 +2008,8 @@ TEST_CASE("DEX perf/app fragment: kDexCohortFloor suppresses a sub-floor point "
         auto r = sink.Get("/fragments/dex/perf/app?app=chrome.exe&model=Latitude+5420");
         REQUIRE(r);
         CHECK(r->status == 200);
-        CHECK(r->body.find("n too small (fewer than 10 devices") != std::string::npos);
-        CHECK(r->body.find("10.0%") == std::string::npos);
+        CHECK(r->body.find("n too small") == std::string::npos);
+        CHECK(r->body.find("10.0%") != std::string::npos);
     }
 }
 
@@ -3098,4 +3160,39 @@ TEST_CASE("DEX perf/apps picker route: q/platform/sort params reach the render "
         CHECK(r->status == 200);
         CHECK(r->body.find("chrome.exe") < r->body.find("sshd")); // c before s
     }
+}
+
+// #4644: the perf-devices fragment `limit` is ONE base-10 integer or a 400; it used to
+// fall back to 50 silently on `5x`, `0x10`, `1e2`.
+TEST_CASE("DEX perf devices fragment: a malformed limit is a 400 and a valid one is served",
+          "[pg][dex][perf][routes][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+    yuzu::server::DexPerfFn perf_fn = [](const std::string&) {
+        return yuzu::server::DexPerfSnapshot{};
+    };
+    test::TestRouteSink sink;
+    DexRoutes routes;
+    auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+        perf_fn, yuzu::server::test::FnDexPerfApi::Providers{});
+    routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                           /*responses_fn=*/{}, {}, {}, dex_perf_api);
+    for (const char* bad : {"5x", "0x10", "1e2", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto r = sink.Get(std::string("/fragments/dex/perf/devices?metric=cpu&limit=") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
+    auto ok = sink.Get("/fragments/dex/perf/devices?metric=cpu&limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status != 400);
 }

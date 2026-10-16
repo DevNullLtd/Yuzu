@@ -15,6 +15,7 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/env_util.hpp>
 #include <yuzu/agent/identity_store.hpp>
+#include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/version.hpp>
 
@@ -427,6 +428,14 @@ int main(int argc, char* argv[]) {
                  "Reject plugins that have no .sig sibling file (default: allow unsigned "
                  "if --plugin-trust-bundle is set, for transitional rollouts)")
         ->envname("YUZU_PLUGIN_REQUIRE_SIGNATURE");
+    // Packaging-time verifier (deploy/packaging/macos/build-pkg.sh, build-app.py):
+    // checks one plugin's CMS sidecar against --plugin-trust-bundle with the agent's
+    // own verifier, then exits. Hidden from --help; it returns before make_agent(),
+    // so no agent, Spark or Guardian state is ever constructed on this path.
+    std::filesystem::path plugin_signature_to_verify;
+    app.add_option("--verify-plugin-signature", plugin_signature_to_verify,
+                   "Verify one plugin CMS sidecar with --plugin-trust-bundle and exit")
+        ->group("");
     app.add_option("--update-trust-bundle", cfg.update_trust_bundle,
                    "PEM CA bundle for verifying the code-signing certificate on OTA update "
                    "binaries (#416). Place it at install time, NOT over the update channel: a "
@@ -501,6 +510,19 @@ int main(int argc, char* argv[]) {
     cfg.tls_allow_system_trust = yuzu::agent::env_truthy(std::getenv("YUZU_TLS_SYSTEM_ROOTS"));
 
     CLI11_PARSE(app, argc, argv);
+
+    if (!plugin_signature_to_verify.empty()) {
+        if (cfg.plugin_trust_bundle.empty()) {
+            std::cerr << "--verify-plugin-signature requires --plugin-trust-bundle\n";
+            return EXIT_FAILURE;
+        }
+        if (auto error = yuzu::agent::verify_plugin_signature(plugin_signature_to_verify,
+                                                              cfg.plugin_trust_bundle)) {
+            std::cerr << "Plugin signature rejected: " << *error << '\n';
+            return EXIT_FAILURE;
+        }
+        return EXIT_SUCCESS;
+    }
 
     // Fail closed on a combination that would silently fail OPEN.
     //

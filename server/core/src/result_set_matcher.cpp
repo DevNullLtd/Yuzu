@@ -3,6 +3,9 @@
 #include <nlohmann/json.hpp>
 
 #include <charconv>
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -123,8 +126,10 @@ bool json_column_match(std::string_view output, const std::string& column, const
         std::string cell;
         if (field.is_string())
             cell = field.get<std::string>();
+        else if (field.is_number_unsigned()) // before the signed case: see json_value_to_string
+            cell = std::to_string(field.get<std::uint64_t>());
         else if (field.is_number_integer())
-            cell = std::to_string(field.get<long long>());
+            cell = std::to_string(field.get<std::int64_t>());
         else if (field.is_number_float())
             cell = std::to_string(field.get<double>());
         else if (field.is_boolean())
@@ -137,7 +142,70 @@ bool json_column_match(std::string_view output, const std::string& column, const
     return false;
 }
 
+// The `n` of a `tar_rows_ge` matcher (#4644). ABSENT is the documented default 1. A PRESENT `n`
+// must be one JSON integer that fits an int; anything else (string, null, float, array, bool,
+// 4294967297) is nullopt. `m.value("n", 1)` THREW on a wrong type -- out of the maintenance tick,
+// where it re-threw every 2 s and starved the GC and retention reaps behind it -- and wrapped an
+// out-of-range integer into a different threshold.
+std::optional<int> read_row_threshold(const nlohmann::json& m) {
+    if (!m.contains("n"))
+        return 1;
+    const auto& v = m["n"];
+    if (!v.is_number_integer())
+        return std::nullopt;
+    if (v.is_number_unsigned()) {
+        if (v.get<std::uint64_t>() > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+            return std::nullopt;
+    } else {
+        const auto w = v.get<std::int64_t>();
+        if (w < std::numeric_limits<int>::min() || w > std::numeric_limits<int>::max())
+            return std::nullopt;
+    }
+    return v.get<int>();
+}
+
+// A kind-less (column-shape) matcher whose column / op / value / value_set is PRESENT with the
+// wrong JSON type, e.g. {"column":5,"op":"eq"}. A MISSING key is the documented "a typo cannot
+// silently empty the set" fallthrough and is NOT a defect here; a present wrong-typed one used to
+// fall through the same way and admit every responder, the fail-open shape the `kind` and `n`
+// checks above already closed. Shared by admission and evaluation so they cannot drift.
+std::optional<std::string> column_shape_defect(const nlohmann::json& m) {
+    if (m.contains("column") && !m["column"].is_string())
+        return "matcher.column must be a string";
+    if (m.contains("op") && !m["op"].is_string())
+        return "matcher.op must be a string";
+    if (m.contains("value") && !m["value"].is_string())
+        return "matcher.value must be a string";
+    if (m.contains("value_set") && !m["value_set"].is_array())
+        return "matcher.value_set must be an array";
+    return std::nullopt;
+}
+
 } // namespace
+
+std::optional<std::string> validate_matcher(std::string_view matcher_json) {
+    if (matcher_json.empty())
+        return std::nullopt;
+    const auto m = nlohmann::json::parse(matcher_json, nullptr, false);
+    if (m.is_discarded() || !m.is_object())
+        return std::nullopt; // the unrecognised-shape default is unchanged
+    if (m.contains("kind") && !m["kind"].is_string())
+        return "matcher.kind must be a string";
+    if (!m.contains("kind"))
+        return column_shape_defect(m);
+    if (m["kind"].get<std::string>() != "tar_rows_ge")
+        return std::nullopt;
+    const auto n = read_row_threshold(m);
+    if (!n || *n < 1)
+        return "matcher.n must be a JSON integer between 1 and 2147483647";
+    return std::nullopt;
+}
+
+std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher) {
+    if (!matcher.is_object())
+        return "matcher must be a JSON object";
+    return validate_matcher(matcher.dump());
+}
 
 int tar_row_count(std::string_view output) {
     if (output.starts_with("error|"))
@@ -174,16 +242,30 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
     if (m.is_discarded() || !m.is_object() || m.empty())
         return true;
 
-    if (m.contains("kind") && m["kind"].is_string()) {
+    // A PRESENT `kind` that is not a string is malformed, not absent: it must not fall through to
+    // the accept-all default below, so nobody qualifies (fail CLOSED, like an unknown kind).
+    if (m.contains("kind") && !m["kind"].is_string())
+        return false;
+
+    if (m.contains("kind")) {
         const auto kind = m["kind"].get<std::string>();
         if (kind == "any_response")
             return true;
         if (kind == "tar_rows_ge") {
-            int need = m.value("n", 1);
-            return tar_row_count(output) >= need;
+            // A malformed threshold fails CLOSED, like an unknown kind: nobody qualifies, and the
+            // tick carries on to the next set instead of throwing. n < 1 is malformed too
+            // (admission refuses it; `count >= 0` would admit every responder, a row stored
+            // before that refusal included).
+            const auto need = read_row_threshold(m);
+            return need && *need >= 1 && tar_row_count(output) >= *need;
         }
         return false; // unknown kind → conservatively exclude
     }
+
+    // A PRESENT but wrong-typed column / op / value / value_set is malformed, not absent: nobody
+    // qualifies (admission refuses it; this covers a row stored before that refusal).
+    if (column_shape_defect(m))
+        return false;
 
     if (m.contains("column") && m["column"].is_string() && m.contains("op") && m["op"].is_string()) {
         const auto column = m["column"].get<std::string>();
@@ -193,8 +275,8 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
         return tar_column_match(output, column, op, m) || json_column_match(output, column, op, m);
     }
 
-    // Matcher present but not a recognised shape → fall back to default so a
-    // typo can't silently empty the set; the operator still gets responders.
+    // Matcher present but a recognised key is MISSING (or no recognised key at all) → fall back to
+    // default so a typo can't silently empty the set; the operator still gets responders.
     return true;
 }
 

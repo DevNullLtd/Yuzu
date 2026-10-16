@@ -17,15 +17,12 @@ const char* const kSettingsPageTemplate =
   <script src="/static/htmx.js"></script>
   <script src="/static/sse.js"></script>
   <style>
-    body { min-height: calc(100vh - var(--shell-top-h, 0px)); }
+    body { min-height: calc(100vh - var(--shell-top-h)); }
 
     /* ── Page frame ────────────────────────────────────────── */
     .content {
       max-width: 1200px; padding: 22px 28px 36px;
       display: flex; flex-direction: column; gap: 22px;
-    }
-    .page-head h1 {
-      font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2;
     }
     code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
     .muted { color: var(--mut); }
@@ -52,6 +49,7 @@ const char* const kSettingsPageTemplate =
     .section-note {
       margin: 12px 0 0; font-size: 12.5px; color: var(--mut);
     }
+    .section-note.warn { color: var(--warn); }
 
     /* ── Form elements ─────────────────────────────────────── */
     .form-row {
@@ -75,6 +73,7 @@ const char* const kSettingsPageTemplate =
       font-family: var(--mds-font-family-mono); font-size: 12.5px;
     }
     .form-row input[type="text"], .form-row input[type="password"], .form-row select { flex: 1; }
+    .form-row input.num-narrow { width: 7rem; flex: 0 0 auto; }
     .form-row input[type="text"], .form-row input[type="password"] {
       font-family: var(--mds-font-family-mono); font-size: 12.5px;
     }
@@ -168,7 +167,7 @@ const char* const kSettingsPageTemplate =
     .feedback:empty { display: none; }
     .feedback-ok    { color: var(--ok); }
     .feedback-error { color: var(--bad); }
-    .callout, .feedback-warning {
+    .feedback-warning {
       padding: 12px 14px; border: 1px solid var(--line2);
       border-radius: var(--rad-panel); background: var(--surface2); color: var(--ink2);
       font-size: 13.5px;
@@ -241,7 +240,7 @@ const char* const kSettingsPageTemplate =
 
   <div class="content">
 
-    <div class="page-head"><h1>Settings</h1></div>
+    <div class="page-header"><h1>Settings</h1></div>
 
     <!-- ── Server Configuration ───────────────────────────── -->
     <div class="section">
@@ -274,12 +273,12 @@ const char* const kSettingsPageTemplate =
       </div>
     </div>
 
-    <!-- ── HTTPS Dashboard ────────────────────────────────── -->
+    <!-- ── HTTPS Console ────────────────────────────────── -->
     <div class="section">
-      <div class="section-header">HTTPS Dashboard</div>
+      <div class="section-header">HTTPS Console</div>
       <div class="section-body">
         <p class="section-intro">
-          TLS termination for the web dashboard and REST API.
+          TLS termination for the web Console and REST API.
         </p>
         <div id="https-section"
              hx-get="/fragments/settings/https"
@@ -296,7 +295,7 @@ const char* const kSettingsPageTemplate =
       <div class="section-body">
         <p class="section-intro">
           The built-in CA that issues the default server certificates and per-agent
-          mTLS client certificates. Download the root to trust the dashboard, review
+          mTLS client certificates. Download the root to trust the Console, review
           issued certificates, and revoke a compromised agent.
         </p>
         <div id="ca-section"

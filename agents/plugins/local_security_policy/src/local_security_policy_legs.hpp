@@ -135,7 +135,8 @@ inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
 
 #if !defined(_WIN32)
 
-/// Bounded regular-file read. On the non-strict path symlinks ARE followed:
+/// Bounded regular-file read. On the non-strict path symlinks ARE followed (a link whose target is
+/// missing is kReadDanglingSymlink, a failed read, not an absent file):
 /// /etc/pam.d/system-auth is a symlink into /etc/authselect on RHEL-family hosts (real capture,
 /// fedora:40); all paths are under /etc. `strict` (the sudoers sources, see is_sudoers_source)
 /// is the opposite: the leaf is opened O_NOFOLLOW (a link is kReadSymlink) and the opened object
@@ -156,7 +157,22 @@ inline FileRead posix_read_file_at(const std::string& path, bool strict,
                                    uid_t owner_uid = kSudoersOwnerUid) {
     yuzu::agent::ScopedFd fd(
         ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | (strict ? O_NOFOLLOW : 0)));
-    if (!fd) return {strict && errno == ELOOP ? kReadSymlink : errno, {}};
+    if (!fd) {
+        const int open_err = errno;
+        if (strict && open_err == ELOOP) return {kReadSymlink, {}};
+        // ENOENT, or ENOTDIR (the target path runs through a regular file), through a link means the
+        // link exists and its target cannot be reached. lstat does not follow the leaf, so it tells that
+        // apart from a path that is simply not there: if a PARENT component is missing or is not a
+        // directory, lstat of the path fails the same way and the result stays an absent file. Strict
+        // sources open O_NOFOLLOW and report a link as ELOOP above, so they do not reach this; a race
+        // between the open and this lstat only moves a source between absent and unreadable for one run.
+        if (open_err == ENOENT || open_err == ENOTDIR) {
+            struct stat lst{};
+            if (::lstat(path.c_str(), &lst) == 0 && S_ISLNK(lst.st_mode))
+                return {kReadDanglingSymlink, {}};
+        }
+        return {open_err, {}};
+    }
     struct stat st{};
     if (::fstat(fd.get(), &st) != 0) return {errno, {}};
     if (!S_ISREG(st.st_mode)) return {kReadNotRegular, {}};

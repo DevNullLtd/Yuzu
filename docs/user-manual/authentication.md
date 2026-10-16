@@ -220,7 +220,7 @@ Returns `200 OK` with `{"status":"ok"}`. The session is invalidated server-side 
 
 ### Session lifetime
 
-Dashboard cookie sessions have an **absolute lifetime of 8 hours** from login. When this expires the operator is redirected to `/login`. Sessions are also invalidated server-side by an **explicit action** — logout, session revocation (Settings → User Management → Revoke sessions, or "Sign out everywhere"), a role change, or removing elevation eligibility. For Postgres-backed deployments a session is a durable row (`SessionStore`, HA WS-1/1a, ADR-2002 §4) and therefore **survives a server restart** — a restart no longer drops it. Only config-file-only (non-Postgres) deployments keep the old behavior where a restart clears all sessions. See `docs/auth-architecture.md` "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
+Dashboard cookie sessions have an **absolute lifetime of 8 hours** from login. When this expires the operator is redirected to the sign-in page at `/home`, which remembers the screen that was requested (see `GET /home` in [server-admin.md](server-admin.md)). Sessions are also invalidated server-side by an **explicit action** — logout, session revocation (Settings → User Management → Revoke sessions, or "Sign out everywhere"), a role change, or removing elevation eligibility. For Postgres-backed deployments a session is a durable row (`SessionStore`, HA WS-1/1a, ADR-2002 §4) and therefore **survives a server restart** — a restart no longer drops it. Only config-file-only (non-Postgres) deployments keep the old behavior where a restart clears all sessions. See `docs/auth-architecture.md` "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
 
 An optional **idle (inactivity) timeout** can shorten this. When `--session-inactivity-secs` (`YUZU_SESSION_INACTIVITY_SECS`) is set to a positive value, a session idle longer than that window is invalidated server-side and the operator is prompted to log in again — regardless of the 8-hour absolute limit. The default `0` disables it (only the absolute lifetime applies). The window is **sliding**: any authenticated request resets it. Scope is **cookie sessions only** — API tokens and MCP tokens are never idle-timed-out, and OIDC users simply re-authenticate via SSO. A recommended hardened value is `900` (15 minutes).
 
@@ -230,7 +230,7 @@ See [Server Administration — CLI flags](server-admin.md) for configuration and
 
 | Client type | Unauthenticated behavior |
 |---|---|
-| Page request (path does not start with `/api/` or `/events`) | 302 redirect to `/login` |
+| Page request (path does not start with `/api/` or `/events`) | 302 redirect to `/home` (the sign-in landing page), with `?next=<screen key>` when the path is one of its screens |
 | API request (path starts with `/api/` or is `/events`) | `401 Unauthorized` with JSON error body `{"error":"unauthorized"}` |
 
 The middleware distinguishes browser from API by request path, not by the `Accept` header.
@@ -288,6 +288,8 @@ Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. En
 | `--oidc-admin-group` | Entra group object ID that maps to the admin role (the value is trimmed automatically, same as `--saml-admin-group` — #1830) |
 | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
+Saving the OIDC settings in the dashboard, or writing an `oidc_*` key through `PUT /api/config/{key}`, needs the administrator role on your own account: a session that is administrator only through a temporary elevation is refused with `403`. A stored `oidc_admin_group` still applies after a restart.
+
 Example startup:
 
 ```bash
@@ -304,7 +306,7 @@ Example startup:
 
 ### OIDC Login Flow
 
-1. User clicks "Sign in with SSO" on the login page.
+1. User clicks "Sign in with single sign-on" on the sign-in page (`/home`; the link appears only when a provider is configured).
 2. Browser is redirected to `GET /auth/oidc/start`, which generates a PKCE challenge, sets the browser-binding cookie, and redirects to the IdP's authorization endpoint.
 3. User authenticates at the IdP.
 4. IdP redirects back to `GET /auth/callback` with an authorization code. The browser presents the binding cookie.
@@ -597,7 +599,7 @@ regardless of flag values).
 
 ### SAML Login Flow
 
-1. The operator navigates directly to `GET /auth/saml/start`. There is no "Sign in with SAML" button on the login page in this release — the login-page SSO button for SAML is deferred.
+1. The operator clicks "Sign in with single sign-on" on the sign-in page (`/home`), which links to `GET /auth/saml/start` when SAML is enabled and no OIDC provider is (when both are enabled the button starts OIDC), or navigates directly to `GET /auth/saml/start`.
 2. The server generates a `<samlp:AuthnRequest>` and redirects the browser to the IdP via **HTTP-Redirect binding** (the request is deflate-compressed and URL-encoded in the `SAMLRequest` query parameter).
 3. The operator authenticates at the IdP.
 4. The IdP POSTs a `<samlp:Response>` containing a signed assertion to the ACS endpoint (`POST /saml/acs`) via **HTTP-POST binding**.
@@ -653,11 +655,11 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -H "Content-Type: application/json" \
   -d '{
     "name": "ci-pipeline",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 
-The `expires_at` field is a Unix epoch timestamp in seconds. Pass `0` or omit it for a non-expiring token.
+The `expires_at` field is a Unix epoch timestamp in seconds and must be in the future (the example value is 1 January 2030; use your own). Pass `0` or omit it for a non-expiring token. A negative, past or non-integer value is `400`.
 
 ```json
 {
@@ -752,7 +754,7 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -d '{
     "name": "finance-svc-token",
     "scope_service": "finance",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 
@@ -1081,7 +1083,7 @@ and `.../confirm` for the full error matrix.
 
 To reduce **standing** privilege (SOC 2 CC6.3/CC6.6), an operator can hold a non-admin role day-to-day and **activate** admin **just-in-time** for a short, justified window — so a compromised everyday session is not a standing admin session. Two steps:
 
-**1. An admin grants eligibility** (one-time, per operator):
+**1. An admin grants eligibility** (one-time, per operator). The granting administrator must hold the administrator role on their own account; a session that is administrator only through an elevation can revoke eligibility but not grant it:
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
@@ -1147,13 +1149,18 @@ The `supervised` tier marks destructive operations as approval-gated, and the be
 MCP tokens are created via the same `POST /api/v1/tokens` endpoint as regular API tokens, with the addition of the `mcp_tier` field. MCP tokens **require** an expiration date, with a maximum lifetime of 90 days.
 
 ```bash
+# expires_at: unix epoch seconds, in the future and at most 90 days out (here, 30 days).
+# macOS: EXPIRES_AT=$(date -v+30d +%s)
+EXPIRES_AT=$(date -d '+30 days' +%s)
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "claude-desktop-readonly",
-    "mcp_tier": "readonly",
-    "expires_at": 1750185000
-  }'
+  -d @- <<EOF
+{
+  "name": "claude-desktop-readonly",
+  "mcp_tier": "readonly",
+  "expires_at": $EXPIRES_AT
+}
+EOF
 ```
 
 ```json
@@ -1178,7 +1185,7 @@ MCP tokens have the following restrictions:
 }
 ```
 
-The `mcp_tier` field accepts `"readonly"`, `"operator"`, or `"supervised"`. If `expires_at` is omitted or set to `0` for an MCP token, the server rejects the request. Maximum expiration is 90 days from creation.
+The `mcp_tier` field accepts `"readonly"`, `"operator"`, or `"supervised"`. If `expires_at` is omitted or set to `0` for an MCP token, the server rejects the request, and so does a past or negative value. Maximum expiration is 90 days from creation.
 
 MCP tokens can also be created via the Settings UI under the API Tokens section, which provides an MCP tier dropdown when creating a new token.
 
@@ -1216,8 +1223,8 @@ The following audit actions are emitted for authentication and authorization eve
 
 | Action | Result | Description |
 |---|---|---|
-| `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin) |
-| `auth.permission_required` | `denied` | Token blocked from permission-gated operation |
+| `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin). Not written for an interactive cookie session refused on an auto-loading dashboard panel (Access Users); token and engine callers always are |
+| `auth.permission_required` | `denied` | Token blocked from permission-gated operation. Not written for an interactive cookie session refused on an auto-loading dashboard panel (the probe-gated Dashboard and Access panels), though `yuzu_auth_topology_floor_denied_total` still counts a floored refusal; token and engine callers always are |
 | `auth.scoped_permission_required` | `denied` | Token blocked from agent-scoped operation |
 | `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from an approval-gated operation **on a non-MCP (REST) transport**. On the MCP `/mcp/v1/` transport there is no such denial — the operation runs through the ticket-then-recall approval flow (the first call mints JSON-RPC `-32006` `ApprovalRequired`; a recall with the approved `approval_id` executes). See `mcp.md`. |
 | `auth.login` | `success` | Successful local password login |

@@ -113,19 +113,16 @@ std::string os_label(const std::string& os) {
     return os.empty() ? std::string("&mdash;") : esc(os);
 }
 
-// A small online/offline status square + word. Inline style (CSP allows style attrs)
-// so it doesn't depend on dashboard-only CSS classes.
+// A small online/offline status square (yuzu.css `.sd`) + word.
 std::string status_cell(bool online) {
-    const char* color = online ? "var(--ok)" : "var(--faint)";
-    return "<span style=\"display:inline-block;width:8px;height:8px;margin-right:8px;"
-           "background:" +
-           std::string(color) + "\"></span>" +
+    return std::string("<span class=\"sd ") + (online ? "s-on" : "s-off") + "\"></span>" +
            (online ? "<span style=\"color:var(--ok)\">online</span>"
                    : "<span class=\"gp-mute\">offline</span>");
 }
 
-// A tinted status pill in inline style (token colours; same look as the hardware page's
-// `.hw-pill`, but self-contained because these lens fragments also render without it).
+// A tinted status pill in inline style (token colours). Same look as the shared `.pill`
+// except the warn tint (14% here, 15% there); inline so these lens fragments stay
+// self-contained.
 std::string tone_pill(const char* tone, const std::string& text) {
     return "<span style=\"display:inline-block;padding:1px 8px;border-radius:3px;font-size:12.5px;"
            "font-weight:500;color:var(--" + std::string(tone) +
@@ -360,7 +357,6 @@ const char* live_snapshot_css() {
     .ls-ttl{font-size:14px;font-weight:600;color:var(--ink);white-space:nowrap}
     .ls-cnt{padding:0 8px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12.5px;font-variant-numeric:tabular-nums}
     .ls-cnt:empty{display:none}
-    .ls-os{padding:0 5px;white-space:nowrap;border:1px solid var(--line2);border-radius:3px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:11.5px}
     .ls-prev{flex:1 1 auto;overflow:hidden;color:var(--mut);font-size:13px;text-align:right;text-overflow:ellipsis;white-space:nowrap}
     .ls-pop{flex:0 0 auto;padding:2px 8px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:none;color:var(--mut);font-size:13px;line-height:1;cursor:pointer}
     .ls-pop:hover{border-color:var(--mut);color:var(--ink)}
@@ -460,7 +456,7 @@ std::string render_device_live_shell(const std::string& agent_id) {
                         std::string(title) + "</span><span class=\"ls-cnt\" id=\"ls-cnt-" + kind +
                         "\"></span>";
         if (os_tag && *os_tag)
-            c += "<span class=\"ls-os\">" + std::string(os_tag) + "</span>";
+            c += "<span class=\"os-tag\">" + std::string(os_tag) + "</span>";
         // Eager cards dispatch on load (the proven run/poll seam); the new Physical
         // cards are behind a collapsed <details> by default, so lazy=true defers
         // dispatch to first expand (htmx 2.0.4 `EVENT MODIFIER from:SELECTOR`

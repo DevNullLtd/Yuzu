@@ -193,6 +193,14 @@ TEST_CASE("GuaranteedStateStore: opens in-memory and runs migrations",
     CHECK(store.event_count() == 0);
 }
 
+TEST_CASE("GuaranteedStateStore: retention_days() reports the constructor-time window",
+          "[pg][guaranteed_state_store][db][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, 31);
+    REQUIRE(store.is_open());
+    CHECK(store.retention_days() == 31);
+}
 // ── M6 / #1209: monotonic policy generation ─────────────────────────────────
 
 TEST_CASE("GuaranteedStateStore: policy_generation bumps monotonically on mutations",
@@ -266,6 +274,86 @@ TEST_CASE("GuaranteedStateStore: rule round-trip", "[pg][guaranteed_state_store]
     CHECK((*fetched)->scope_expr == "tag:workstations");
     CHECK((*fetched)->created_by == "alice");
     CHECK((*fetched)->updated_by == "alice");
+}
+
+TEST_CASE("GuaranteedStateStore: rule version is bounded to 1..kMaxRuleVersion on create and update",
+          "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    int n = 0;
+    for (const int64_t bad : {int64_t{0}, int64_t{-1}, kMaxRuleVersion + 1,
+                              std::numeric_limits<int64_t>::max()}) {
+        INFO("version=" << bad);
+        auto rule = make_rule("bad-" + std::to_string(++n), "bad-name-" + std::to_string(n));
+        rule.version = bad;
+        auto r = store.create_rule(rule);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("out of range") != std::string::npos);
+    }
+    CHECK(store.rule_count() == 0);
+
+    auto edge = make_rule("edge", "edge-name");
+    edge.version = kMaxRuleVersion;
+    REQUIRE(store.create_rule(edge));
+
+    auto low = make_rule("low", "low-name");
+    REQUIRE(store.create_rule(low));
+    low.version = std::numeric_limits<int64_t>::max();
+    auto u = store.update_rule(low);
+    REQUIRE_FALSE(u.has_value());
+    CHECK(u.error().find("out of range") != std::string::npos);
+}
+
+// A row stored before the bound existed (or written out of band) can carry an out-of-range
+// version. `apply_guard_change` rewrites the stored version UNCHANGED when an operator disables
+// the rule, so update_rule must let an unchanged version through and refuse only a CHANGE to an
+// out-of-range one; otherwise such a rule could not even be disabled.
+TEST_CASE("GuaranteedStateStore: update_rule lets a legacy out-of-range version stay unchanged",
+          "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    int n = 0;
+    for (const int64_t legacy : {int64_t{0}, int64_t{1} << 40}) {
+        INFO("stored version=" << legacy);
+        const std::string id = "legacy-" + std::to_string(++n);
+        REQUIRE(store.create_rule(make_rule(id, "legacy-name-" + std::to_string(n))));
+        exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guaranteed_state_rules SET version = " +
+                               std::to_string(legacy) + " WHERE rule_id = '" + id + "'");
+
+        // Disable it: the version round-trips UNCHANGED.
+        auto row = store.get_rule(id);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        auto disabled = **row;
+        REQUIRE(disabled.version == legacy);
+        disabled.enabled = false;
+        auto ok = store.update_rule(disabled);
+        REQUIRE(ok.has_value());
+        CHECK(query_scalar(db.dsn(), "SELECT enabled::text FROM guaranteed_state_store."
+                                     "guaranteed_state_rules WHERE rule_id = '" + id + "'") ==
+              "false");
+
+        // A CHANGE to another out-of-range value is still refused; a change into range works.
+        auto bad = disabled;
+        bad.version = legacy == 0 ? -1 : legacy + 1; // legacy 0 + 1 would be IN range
+        auto refused = store.update_rule(bad);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find("out of range") != std::string::npos);
+        auto fixed = disabled;
+        fixed.version = 5;
+        REQUIRE(store.update_rule(fixed).has_value());
+    }
+
+    // An out-of-range version for a rule that does not exist is "not found", not "out of range".
+    auto ghost = make_rule("ghost", "ghost-name");
+    ghost.version = 0;
+    auto g = store.update_rule(ghost);
+    REQUIRE_FALSE(g.has_value());
+    CHECK(g.error().find("not found") != std::string::npos);
 }
 
 TEST_CASE("GuaranteedStateStore: list returns all rules ordered by name",

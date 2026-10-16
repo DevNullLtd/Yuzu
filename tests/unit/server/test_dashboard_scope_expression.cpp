@@ -1,0 +1,510 @@
+/**
+ * test_dashboard_scope_expression.cpp — operate-extras E-1: the optional
+ * `scope_expression` field on `POST /api/dashboard/execute`.
+ *
+ * WHAT IS BOUND HERE (each case fails if the matching guard is deleted):
+ *   rule 1  an absent field leaves the route byte-for-byte as it was,
+ *   rule 2  `scope` AND `scope_expression` together is a 400, never a silent
+ *           pick (the Console's hidden `scope=__all__` is why the UI must omit
+ *           it — see the JS pin in test_operate_extras_ui.cpp),
+ *   rule 3  a SUPPLIED but empty expression is refused, never widened to the
+ *           fleet,
+ *   rule 4  an over-long expression is refused (kExecInstrScopeMaxLen),
+ *   rule 5  a valid expression reaches the dispatch seam as `scope_expr`, and
+ *           the Destructive targeting gate still refuses it (a scope is not a
+ *           named agent),
+ *   rule 7  an attribute outside scope_kind_catalog() is a 400 and NOTHING is
+ *           dispatched. The typo-under-`!=` case is the mutation test: delete
+ *           the attribute check and `ostyp != "windows"` reaches every agent.
+ *
+ * `TestRouteSink` trap (CLAUDE.md → Test conventions): every POST goes through
+ * `post()`, which sets application/x-www-form-urlencoded so `req.params` is
+ * populated and the production (decoded-param) branch is the one driven.
+ */
+
+#include "dashboard_routes.hpp"
+#include "test_route_sink.hpp"
+
+#include "dispatch_destructive_gate.hpp"
+#include "dispatch_target_shape.hpp"
+#include "mcp_input_bounds.hpp"
+#include "test_real_capability_registry.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+using namespace yuzu::server;
+
+namespace {
+
+constexpr const char* kPath = "/api/dashboard/execute";
+constexpr std::pair<const char*, const char*> kReadOnly{"os_info", "os_version"};
+constexpr std::pair<const char*, const char*> kDestructive{"tar", "purge_source"};
+
+struct DispatchCall {
+    std::string plugin, action, scope_expr;
+    std::vector<std::string> agent_ids;
+};
+struct AuditRow {
+    std::string action, result, detail;
+};
+
+// Member order is load-bearing: `sink` last so it is destroyed first.
+struct Harness {
+    yuzu::MetricsRegistry metrics;
+    DashboardRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    std::vector<DispatchCall> calls;
+    std::vector<AuditRow> audits;
+    std::vector<AuditRow> persisted; // rows that went through the persist-reporting sink
+    std::vector<std::string> order;  // "audit:<result>" / "dispatch", in call order
+    bool persist_ok = true;          // false = the audit store refuses the row
+    std::string auth_source{"local"}; // the resolved session's source ("local" = cookie session)
+    int sent = 3;
+    std::pair<std::string, std::string> resolve_to{kReadOnly.first, kReadOnly.second};
+
+    Harness() {
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "expr-op";
+            s.role = auth::Role::admin;
+            s.auth_source = auth_source;
+            return s;
+        };
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> bool { return true; };
+        auto audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
+                               const std::string&, const std::string&, const std::string& d) {
+            audits.push_back({a, r, d});
+        };
+        DashboardRoutes::DispatchFn dispatch =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& ids, const std::string& scope,
+                   const std::unordered_map<std::string, std::string>&,
+                   const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            order.push_back("dispatch");
+            calls.push_back({plugin, action, scope, ids});
+            return {.sent = sent, .command_id = "cmd-" + std::to_string(calls.size())};
+        };
+        routes.register_routes(
+            sink, auth_fn, perm_fn, audit_fn, /*response_store=*/nullptr, /*mg=*/nullptr,
+            /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+            [] { return std::string{"[]"}; }, dispatch,
+            [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+                return yuzu::server::DispatchCaller{.principal = "expr-op",
+                                                    .exec_visible = std::nullopt};
+            },
+            [this](const std::string&) { return resolve_to; }, &metrics,
+            /*instruction_store=*/nullptr);
+        routes.set_capability_classify_fn(yuzu::test::real_classify_fn());
+        routes.set_persist_audit_fn([this](const httplib::Request&, const std::string& a,
+                                           const std::string& r, const std::string&,
+                                           const std::string&, const std::string& d) {
+            order.push_back("audit:" + r);
+            if (persist_ok)
+                persisted.push_back({a, r, d});
+            return persist_ok;
+        });
+    }
+
+    std::unique_ptr<httplib::Response> post(const std::string& body) {
+        return post_with(body, {{"Host", "yuzu.example:8080"}, {"Origin", "https://yuzu.example:8080"}});
+    }
+
+    std::unique_ptr<httplib::Response>
+    post_with(const std::string& body, const std::unordered_map<std::string, std::string>& headers) {
+        auto res = sink.dispatch("POST", kPath, body, "application/x-www-form-urlencoded", headers);
+        REQUIRE(res != nullptr);
+        return res;
+    }
+
+    int rows(const std::string& action, const std::string& result) const {
+        int n = 0;
+        for (const auto& a : audits)
+            if (a.action == action && a.result == result)
+                ++n;
+        for (const auto& a : persisted)
+            if (a.action == action && a.result == result)
+                ++n;
+        return n;
+    }
+
+    int denied_with(const std::string& needle) const {
+        int n = 0;
+        for (const auto& a : audits)
+            if (a.result == "denied" && a.detail.find(needle) != std::string::npos)
+                ++n;
+        return n;
+    }
+};
+
+// application/x-www-form-urlencoded encoding for the characters an expression uses.
+std::string enc(const std::string& s) {
+    std::string out;
+    for (unsigned char c : s) {
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            c == '_' || c == '-' || c == '.' || c == ':')
+            out += static_cast<char>(c);
+        else {
+            static const char* hex = "0123456789ABCDEF";
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+
+bool contains(const std::string& hay, std::string_view needle) {
+    return hay.find(needle) != std::string::npos;
+}
+
+} // namespace
+
+TEST_CASE("scope_expression rule 1: an absent field leaves the route unchanged",
+          "[server][dashboard][execute][scope_expression]") {
+    SECTION("explicit __all__ still broadcasts by name") {
+        Harness h;
+        auto res = h.post("instruction=version&scope=__all__");
+        REQUIRE(h.calls.size() == 1);
+        CHECK(h.calls[0].scope_expr == "__all__");
+        CHECK(res->status == 200);
+    }
+    SECTION("a single agent still dispatches by id") {
+        Harness h;
+        h.post("instruction=version&scope=agent-1");
+        REQUIRE(h.calls.size() == 1);
+        CHECK(h.calls[0].scope_expr.empty());
+        REQUIRE(h.calls[0].agent_ids.size() == 1);
+        CHECK(h.calls[0].agent_ids[0] == "agent-1");
+    }
+}
+
+TEST_CASE("scope_expression rule 5: a valid expression reaches dispatch as scope_expr",
+          "[server][dashboard][execute][scope_expression]") {
+    Harness h;
+    const std::string expr = R"(ostype == "windows" AND tag:role == "web")";
+    auto res = h.post("instruction=version&scope_expression=" + enc(expr));
+
+    CHECK(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].scope_expr == expr);
+    CHECK(h.calls[0].agent_ids.empty());
+    // The audit row says the target was an expression.
+    bool saw = false;
+    for (const auto& a : h.audits)
+        if (a.action == "command.dispatch" && a.result == "success" &&
+            contains(a.detail, "scope_expression="))
+            saw = true;
+    CHECK(saw);
+}
+
+TEST_CASE("scope_expression rule 5: a percent-encoded field NAME is still recognised",
+          "[server][dashboard][execute][scope_expression][security]") {
+    Harness h;
+    // `scope%5Fexpression` decodes to `scope_expression` in req.params; a
+    // raw-byte scan alone would miss it and fall through to the fleet.
+    auto res = h.post("instruction=version&scope%5Fexpression=" + enc(R"(ostype == "linux")"));
+    REQUIRE(h.calls.size() == 1);
+    const std::string expr1 = R"(ostype == "linux")";
+    CHECK(h.calls[0].scope_expr == expr1);
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("scope_expression rule 2: scope together with scope_expression is a 400",
+          "[server][dashboard][execute][scope_expression][security]") {
+    Harness h;
+    const auto expr = enc(R"(ostype == "windows")");
+
+    SECTION("the Console's hidden scope=__all__") {
+        auto res = h.post("instruction=version&scope=__all__&scope_expression=" + expr);
+        CHECK(res->status == 400);
+        CHECK(contains(res->body, "target_conflict"));
+    }
+    SECTION("a supplied but empty scope still conflicts") {
+        auto res = h.post("instruction=version&scope=&scope_expression=" + expr);
+        CHECK(res->status == 400);
+        CHECK(contains(res->body, "target_conflict"));
+    }
+    SECTION("a single agent id conflicts too") {
+        auto res = h.post("instruction=version&scope=agent-1&scope_expression=" + expr);
+        CHECK(res->status == 400);
+    }
+    CHECK(h.calls.empty()); // never picked one silently
+    CHECK(h.denied_with("target_conflict") == 1);
+}
+
+TEST_CASE("scope_expression rule 3: a supplied but empty expression is refused, never the fleet",
+          "[server][dashboard][execute][scope_expression][security]") {
+    Harness h;
+    auto res = h.post("instruction=version&scope_expression=");
+    CHECK(res->status == 400);
+    CHECK(contains(res->body, "scope_expression_empty"));
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("scope_expression rule 4: an over-long expression is refused",
+          "[server][dashboard][execute][scope_expression]") {
+    // httplib caps a urlencoded body at 8192 bytes before the handler runs, so the route's own
+    // bound is reached only through a body httplib does not parse into params (the raw-body
+    // fallback). Drive that path: text/plain carrying the form text.
+    Harness h;
+    std::string expr = "ostype == \"" + std::string(mcp::kExecInstrScopeMaxLen, 'a') + "\"";
+    std::unordered_map<std::string, std::string> headers{
+        {"Host", "yuzu.example:8080"}, {"Origin", "https://yuzu.example:8080"}};
+    auto res = h.sink.dispatch("POST", kPath, "instruction=version&scope_expression=" + expr,
+                               "text/plain", headers);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 400);
+    CHECK(contains(res->body, "scope_expression_too_long"));
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("scope_expression: a malformed expression is refused before dispatch",
+          "[server][dashboard][execute][scope_expression]") {
+    Harness h;
+    for (const char* bad : {"ostype ==", "tag:finance", "__all__", "group:eng", "(ostype == \"a\""}) {
+        INFO("expression: " << bad);
+        auto res = h.post("instruction=version&scope_expression=" + enc(bad));
+        CHECK(res->status == 400);
+        CHECK(contains(res->body, "scope_expression_invalid"));
+    }
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("scope_expression rule 7 (mutation test): a typo attribute under != or NOT is refused "
+          "and never dispatched",
+          "[server][dashboard][execute][scope_expression][security]") {
+    // These three MATCH EVERY AGENT if they reach the resolver (REVIEW G1):
+    // an unknown attribute resolves to "", and `!=` / NOT invert "matches
+    // nothing" into "matches everyone". Delete the attribute check and this
+    // case dispatches fleet-wide.
+    Harness h;
+    for (const char* bad : {R"(ostyp != "windows")", R"(NOT os == "windows")",
+                            R"(os != "linux")"}) {
+        INFO("expression: " << bad);
+        auto res = h.post("instruction=version&scope_expression=" + enc(bad));
+        CHECK(res->status == 400);
+        CHECK(contains(res->body, "scope_unknown_attribute"));
+    }
+    CHECK(h.calls.empty());
+    CHECK(h.denied_with("scope_unknown_attribute") == 3);
+}
+
+TEST_CASE("scope_expression rule 7: every catalogued attribute is accepted",
+          "[server][dashboard][execute][scope_expression]") {
+    Harness h;
+    int n = 0;
+    for (const char* ok : {R"(ostype != "windows")", R"(hostname LIKE "WIN-%")", R"(arch == "arm64")",
+                           R"(agent_version >= "0.12.0")", R"(tag:env != "prod")",
+                           R"(props.owner == "jdoe")", R"(EXISTS from_result_set:rs_abc)",
+                           R"(NOT ostype == "darwin")"}) {
+        INFO("expression: " << ok);
+        auto res = h.post("instruction=version&scope_expression=" + enc(ok));
+        CHECK(res->status == 200);
+        ++n;
+    }
+    CHECK(h.calls.size() == static_cast<std::size_t>(n));
+}
+
+TEST_CASE("scope_expression rule 5: the Destructive targeting gate still refuses an expression",
+          "[server][dashboard][execute][scope_expression][destructive][security]") {
+    Harness h;
+    h.resolve_to = {kDestructive.first, kDestructive.second};
+    auto res = h.post("instruction=purge&scope_expression=" + enc(R"(ostype == "windows")"));
+    CHECK(h.calls.empty());
+    CHECK(contains(res->body, std::string(yuzu::server::kDestructiveUntargetedMessage)));
+}
+
+// ── ADR-0033 section 9: no audit row, no mutation ──────────────────────────────────────────
+
+TEST_CASE("scope_expression audit: the attempted row is stored BEFORE the dispatch",
+          "[server][dashboard][execute][scope_expression][audit]") {
+    Harness h;
+    const std::string expr = R"(ostype == "windows")";
+    auto res = h.post("instruction=version&scope_expression=" + enc(expr));
+    CHECK(res->status == 200);
+    REQUIRE(h.persisted.size() == 1);
+    CHECK(h.persisted[0].action == "command.dispatch");
+    CHECK(h.persisted[0].result == "attempted");
+    CHECK(contains(h.persisted[0].detail, "os_info:os_version"));
+    CHECK(contains(h.persisted[0].detail, "scope_expression="));
+    REQUIRE(h.order.size() >= 2);
+    CHECK(h.order[0] == "audit:attempted");
+    CHECK(h.order[1] == "dispatch");
+}
+
+TEST_CASE("scope_expression audit: a row that is not stored means NOTHING is dispatched",
+          "[server][dashboard][execute][scope_expression][audit][security]") {
+    Harness h;
+    h.persist_ok = false;
+    auto res = h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+    CHECK(res->status == 503);
+    CHECK(res->has_header("Sec-Audit-Failed"));
+    CHECK(contains(res->body, "audit_unavailable"));
+    CHECK(h.calls.empty());
+    // No success row claims a send that did not happen.
+    for (const auto& a : h.audits)
+        CHECK(a.result != "success");
+}
+
+TEST_CASE("scope_expression audit: an unwired persist sink refuses rather than dispatches",
+          "[server][dashboard][execute][scope_expression][audit][security]") {
+    Harness h;
+    h.routes.set_persist_audit_fn({});
+    auto res = h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+    CHECK(res->status == 503);
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("scope_expression audit: refusals burn no attempted row, and plain sends skip the sink",
+          "[server][dashboard][execute][scope_expression][audit]") {
+    Harness h;
+    h.post("instruction=version&scope_expression=" + enc(R"(ostypo != "windows")"));
+    h.post("instruction=version&scope=__all__&scope_expression=" + enc(R"(ostype == "windows")"));
+    h.post("instruction=version&scope=agent-1");
+    CHECK(h.persisted.empty());
+    CHECK(h.order == std::vector<std::string>{"dispatch"});
+}
+
+TEST_CASE("scope_expression audit: a send that reaches no agent records a failure outcome",
+          "[server][dashboard][execute][scope_expression][audit]") {
+    Harness h;
+    h.sent = 0;
+    h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+    bool failure = false;
+    for (const auto& a : h.audits)
+        if (a.action == "command.dispatch" && a.result == "failure" &&
+            contains(a.detail, "scope_expression="))
+            failure = true;
+    CHECK(failure);
+}
+
+TEST_CASE("scope_expression: a zero-match answer does not claim no agents are connected "
+          "(mutation: revert the expression branch and the message blames connectivity)",
+          "[server][dashboard][execute][scope_expression]") {
+    SECTION("an expression that matches nothing says so") {
+        Harness h;
+        h.sent = 0;
+        auto res = h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+        CHECK(contains(res->body, "The expression matched no connected agent. Nothing was sent."));
+        CHECK_FALSE(contains(res->body, "No agents connected"));
+    }
+    SECTION("a named or broadcast send that reaches nobody still says no agents are connected") {
+        Harness h;
+        h.sent = 0;
+        auto res = h.post("instruction=version&scope=__all__");
+        CHECK(contains(res->body, "No agents connected. Cannot dispatch command."));
+    }
+}
+
+// ── History marker (PR #5846 review): the route answers 200 for refusals too ───────────────
+
+TEST_CASE("dashboard execute: only a dispatched send carries X-Yuzu-Dispatched, the marker the "
+          "History list waits for (mutation: set it before the refusals and a refused send is "
+          "logged as sent)",
+          "[server][dashboard][execute][history]") {
+    SECTION("a send that reaches agents carries the count") {
+        Harness h;
+        auto res = h.post("instruction=version&scope=__all__");
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("X-Yuzu-Dispatched") == "3");
+    }
+    SECTION("an expression send that reaches agents carries it too") {
+        Harness h;
+        auto res = h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+        CHECK(res->get_header_value("X-Yuzu-Dispatched") == "3");
+    }
+    SECTION("the Destructive refusal answers 200 and does not carry it") {
+        Harness h;
+        h.resolve_to = {kDestructive.first, kDestructive.second};
+        auto res = h.post("instruction=purge&scope=__all__");
+        CHECK(res->status == 200);
+        CHECK(h.calls.empty());
+        CHECK(contains(res->body, "is-error"));
+        CHECK_FALSE(res->has_header("X-Yuzu-Dispatched"));
+    }
+    SECTION("a send that reaches no agent answers 200 and does not carry it") {
+        Harness h;
+        h.sent = 0;
+        auto res = h.post("instruction=version&scope=__all__");
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "is-error"));
+        CHECK_FALSE(res->has_header("X-Yuzu-Dispatched"));
+    }
+    SECTION("an empty instruction, a refused expression and an unstored audit row do not carry it") {
+        Harness h;
+        CHECK_FALSE(h.post("instruction=")->has_header("X-Yuzu-Dispatched"));
+        CHECK_FALSE(h.post("instruction=version&scope_expression=" + enc(R"(ostypo != "windows")"))
+                        ->has_header("X-Yuzu-Dispatched"));
+        h.persist_ok = false;
+        CHECK_FALSE(h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"))
+                        ->has_header("X-Yuzu-Dispatched"));
+    }
+}
+
+// Same-site gate (browser_write_is_cross_site): a cookie session needs an Origin or Referer naming
+// this site. The refusal comes before any parsing, the audit-before-dispatch row and the dispatch.
+TEST_CASE("dashboard execute: a cookie-session write without a same-site Origin is refused",
+          "[server][dashboard][execute][csrf][security]") {
+    Harness h;
+    const std::string expr_body =
+        "instruction=version&scope_expression=" + enc(R"(ostype == "windows")");
+
+    SECTION("no Origin and no Referer") {
+        auto res = h.post_with(expr_body, {{"Host", "yuzu.example:8080"}});
+        CHECK(res->status == 403);
+    }
+    SECTION("a foreign Origin") {
+        auto res = h.post_with(expr_body,
+                               {{"Host", "yuzu.example:8080"}, {"Origin", "https://evil.example"}});
+        CHECK(res->status == 403);
+    }
+    SECTION("a foreign Referer and no Origin") {
+        auto res = h.post_with(expr_body, {{"Host", "yuzu.example:8080"},
+                                           {"Referer", "https://evil.example/page"}});
+        CHECK(res->status == 403);
+    }
+    SECTION("a plain picked-target send is gated the same way") {
+        auto res = h.post_with("instruction=version&scope=agent-1", {{"Host", "yuzu.example:8080"}});
+        CHECK(res->status == 403);
+    }
+    CHECK(h.calls.empty());                              // nothing dispatched
+    CHECK(h.rows("csrf.denied", "denied") == 1);         // the refusal is audited
+    CHECK(h.rows("command.dispatch", "attempted") == 0); // no attempted row burned
+    CHECK(h.persisted.empty());
+}
+
+TEST_CASE("dashboard execute: a token session is not gated by Origin",
+          "[server][dashboard][execute][csrf]") {
+    Harness h;
+    h.auth_source = "api_token";
+    auto res = h.post_with("instruction=version&scope=agent-1", {{"Host", "yuzu.example:8080"}});
+    CHECK(res->status == 200);
+    CHECK(h.calls.size() == 1);
+    CHECK(h.rows("csrf.denied", "denied") == 0);
+}
+
+TEST_CASE("dashboard execute: a same-site cookie-session write passes the gate",
+          "[server][dashboard][execute][csrf]") {
+    Harness h;
+    SECTION("Origin names this site") {
+        auto res = h.post("instruction=version&scope=agent-1");
+        CHECK(res->status == 200);
+    }
+    SECTION("Referer names this site, no Origin") {
+        auto res = h.post_with("instruction=version&scope=agent-1",
+                               {{"Host", "yuzu.example:8080"},
+                                {"Referer", "https://yuzu.example:8080/dashboard"}});
+        CHECK(res->status == 200);
+    }
+    CHECK(h.calls.size() == 1);
+    CHECK(h.rows("csrf.denied", "denied") == 0);
+}

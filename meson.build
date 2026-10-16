@@ -26,6 +26,23 @@ project(
 cxx = meson.get_compiler('cpp')
 host_os  = host_machine.system()   # 'linux', 'windows', 'darwin'
 host_cpu = host_machine.cpu_family() # 'x86_64', 'aarch64', ...
+
+# ── Python for build/test helper scripts ─────────────────────────────────────
+# One interpreter for every custom_target, run_command and test that runs a
+# repo script; use `yuzu_python`, never a fresh find_program for python
+# (tests/test_meson_python_lookup.py fails the build tests if one appears).
+# On Windows it is the interpreter running Meson itself (native CPython, per
+# the runner toolchain contract): under MSYS2 bash a bare find_program for
+# python3 resolves MSYS2's /usr/bin/python3 first, which cannot open the C:/ paths
+# Meson passes it, so every script target fails in ~0.04s ("can't open file
+# '/c/.../C:/...'"). Elsewhere it is unchanged: the first python3 on PATH, which
+# carries the modules the scripts import (PyYAML etc.) where a pipx/venv Meson's
+# own interpreter may not.
+if build_machine.system() == 'windows'
+  yuzu_python = import('python').find_installation()
+else
+  yuzu_python = find_program('python3', 'python')
+endif
 if cxx.get_id() == 'msvc'
   add_project_arguments(
     '/std:c++latest',           # meson's cpp_std has no MSVC c++23 option
@@ -162,7 +179,7 @@ if host_os == 'windows'
   # absl dep closure of protobuf+grpc is ~40 libs and shifts between
   # abseil versions; hand-listing would be a maintenance burden. Enumerating
   # here means a vcpkg abseil bump doesn't need a parallel meson.build edit.
-  _py = find_program('python3')
+  _py = yuzu_python
   _absl_enum = run_command(
     _py, '-c',
     'import glob, os, sys\n' +
@@ -371,46 +388,34 @@ if host_os == 'darwin'
   grpcpp_dep  = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
   httplib_dep = declare_dependency(dependencies: [httplib_dep, corefoundation_dep])
 
-  # ── Endpoint Security (shared probe, A0) ────────────────────────────────────
-  # CORRECTION (A0 governance fix round): EndpointSecurity is NOT an
-  # `.framework` bundle -- it ships as `usr/lib/libEndpointSecurity.tbd` +
-  # `usr/include/EndpointSecurity/` in BOTH the Command Line Tools SDK and the
-  # full Xcode SDK. The `dependency('appleframeworks', modules:
-  # ['EndpointSecurity'])` probe below therefore NEVER succeeds on any SDK --
-  # it always falls to the `else` branch below, so the real ES client never
-  # compiles today. The correct probe (`cxx.find_library('EndpointSecurity')`
-  # + `cxx.has_header('EndpointSecurity/EndpointSecurity.h')`) is a separate,
-  # deliberately isolated behaviour change -- see the follow-up slice
-  # (feat/macos-spark-a0.5-es-probe) rather than this comment-only fix. This
-  # is the SINGLE probe site for every ES consumer in the tree: TAR's process
-  # stream (tar_proc_es.cpp) and agent-core's pure ES helpers (es_client.hpp)
-  # both consume endpoint_security_dep/_deps/_args instead of probing
-  # independently (a shared full ES client lands in a later slice). Found:
-  # real ES client compiles (-DYUZU_HAVE_ENDPOINT_SECURITY -fblocks; -fblocks
-  # because the ES client passes an Objective-C block literal to
-  # es_new_client, which Apple Clang does not enable by default for a .cpp
-  # TU) and libbsm links (audit_token_to_pid / audit_token_to_ruid). Absent:
-  # every consumer's #if-guarded no-op path is used instead -- see
+  # ── Endpoint Security (shared probe) ────────────────────────────────────────
+  # EndpointSecurity is NOT an `.framework` bundle: it ships as
+  # `usr/lib/libEndpointSecurity.tbd` + `usr/include/EndpointSecurity/` in BOTH
+  # the Command Line Tools SDK and the full Xcode SDK, so it is probed as a
+  # library plus its header (an `appleframeworks` probe can never find it).
+  # This is the SINGLE probe site for every ES consumer in the tree: TAR's
+  # process stream (tar_proc_es.cpp), agent-core's pure ES helpers
+  # (es_client.hpp) and the test executables all consume
+  # endpoint_security_dep/_deps/_args instead of probing independently.
+  # Found: the real ES client compiles (-DYUZU_HAVE_ENDPOINT_SECURITY -fblocks;
+  # -fblocks because the ES client passes an Objective-C block literal to
+  # es_new_client, which Apple Clang does not enable by default for a .cpp TU)
+  # and libbsm links (audit_token_to_pid / audit_token_to_ruid).
+  # Compiling and linking need no entitlement. RUNNING a client needs the
+  # com.apple.developer.endpoint-security.client entitlement, root and Full
+  # Disk Access: unentitled (every CI leg), es_new_client fails and each
+  # consumer falls back cleanly (TAR to the sysctl poll). See
   # docs/darwin-compat.md's EndpointSecurity pitfalls-table row.
-  endpoint_security_dep = dependency('appleframeworks', modules: ['EndpointSecurity'],
-                                     required: false, include_type: 'system')
+  endpoint_security_dep = cxx.find_library('EndpointSecurity', required: false)
   endpoint_security_deps = []
   endpoint_security_args = []
-  if endpoint_security_dep.found()
+  if endpoint_security_dep.found() and cxx.has_header('EndpointSecurity/EndpointSecurity.h')
     endpoint_security_deps += endpoint_security_dep
     endpoint_security_deps += cxx.find_library('bsm')
     endpoint_security_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
   else
-    # rd-1 (governance A0 round-4, MEDIUM): this branch fires on EVERY host,
-    # SDK present or not -- see the accurate CORRECTION comment 8 lines above
-    # (the appleframeworks probe can never find EndpointSecurity, because it
-    # is not a `.framework` bundle). The previous wording here ("EndpointSecurity
-    # SDK not found") claimed the opposite and could resurrect the exact
-    # "needs full Xcode SDK" myth this A0 slice exists to correct.
-    message('EndpointSecurity probe cannot succeed on this SDK shape (appleframeworks '
-          + 'has no EndpointSecurity.framework to find -- see the CORRECTION comment '
-          + 'above; the SDK itself may well have the lib+header pair) -- ES-dependent '
-          + 'code compiles as a no-op on this host.')
+    message('EndpointSecurity library or header not found in this SDK -- '
+          + 'ES-dependent code compiles as a no-op on this host.')
   endif
 
   # ── Reusable per-target Apple frameworks + Objective-C++/ARC template ──────
@@ -472,6 +477,10 @@ if host_os == 'darwin'
     _apple_objcpp_std, '-fvisibility=hidden', '-fobjc-arc',
     '-mmacosx-version-min=13.3',
   ]
+  # Meson selects the Objective-C++ linker for a target containing a .mm TU;
+  # cpp_link_args from the native file do not reach that link. Keep the emitted
+  # LC_BUILD_VERSION aligned with the compilation floor.
+  apple_objcpp_link_args = ['-mmacosx-version-min=13.3']
 endif
 
 # ── Proto codegen ─────────────────────────────────────────────────────────────
@@ -613,7 +622,7 @@ endif
 # rather than a custom_target and never enters the default build graph.
 run_target('docs-regen',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('tools/plugin-doc-gen/plugin_doc_gen.py'),
     '--all', '--repo-root', meson.project_source_root(),
   ],
@@ -621,7 +630,50 @@ run_target('docs-regen',
 
 # ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────
 _rebar3 = find_program('rebar3', required: false)
+# The gateway builds and tests on ONE pinned OTP release, resolved here at
+# configure time so `ninja` alone uses it: no `source scripts/ensure-erlang.sh`
+# first, and no dependence on which `erl` the shell happens to put first (a
+# Homebrew `erlang` 29 ahead of kerl's 28.4 compiled chatterbox under 29 and
+# failed). The pin and the search (PATH, kerl, asdf, mise, Homebrew,
+# well-known prefixes, the Windows installers) live in one place,
+# scripts/erlang_toolchain.py, shared with the build/test wrappers and
+# ensure-erlang.sh. The resolved bin/ reaches them through YUZU_OTP_BIN, which
+# base_env() puts first on PATH. A new OTP install after configure needs a
+# reconfigure to be picked up.
+_gw_otp_bin = ''
+_gw_otp_pin = ''
+_gw_skip_reason = 'rebar3 not found'
+_gw_skip_summary = 'SKIPPED (rebar3 not found)'
 if _rebar3.found()
+  _gw_otp = run_command(
+    yuzu_python, meson.project_source_root() / 'scripts' / 'erlang_toolchain.py', 'find-otp',
+    check: false,
+  )
+  # Exit codes (erlang_toolchain.main): 0 found, 1 no install passes the pin
+  # (a legitimate skip), anything else is a usage error or a resolver crash -
+  # never let that masquerade as "no matching OTP".
+  if _gw_otp.returncode() == 0 and _gw_otp.stdout().strip().split('\n').length() != 4
+    error('scripts/erlang_toolchain.py find-otp exited 0 but did not print exactly 4 lines:\n'
+          + _gw_otp.stdout())
+  endif
+  if _gw_otp.returncode() == 0
+    _gw_otp_out = _gw_otp.stdout().strip().split('\n')
+    _gw_otp_bin = _gw_otp_out[0]
+    _gw_otp_pin = _gw_otp_out[3]
+    _gw_otp_desc = 'Erlang/OTP ' + _gw_otp_out[1] + ' (' + _gw_otp_out[2] + ') at ' + _gw_otp_bin + ', pin ' + _gw_otp_pin + ' or later ' + _gw_otp_pin.split('.')[0] + '.x'
+  elif _gw_otp.returncode() == 1
+    _gw_skip_reason = ('rebar3 found, but no Erlang/OTP passes the pin:\n'
+                       + _gw_otp.stderr().strip())
+    _gw_skip_summary = ('SKIPPED (rebar3 found, but no Erlang/OTP passes the pin; '
+                        + 'see the WARNING above)')
+  else
+    error('scripts/erlang_toolchain.py find-otp failed (exit '
+          + _gw_otp.returncode().to_string() + ': 2 = invalid YUZU_OTP_VERSION pin, '
+          + '3 = resolver error); this is not a missing Erlang/OTP:\n'
+          + _gw_otp.stderr().strip())
+  endif
+endif
+if _gw_otp_bin != ''
   _gw_src = meson.project_source_root() / 'gateway'
   _gw_build_script = meson.project_source_root() / 'scripts' / 'build_gateway.py'
   # rebar3 must run from inside the gateway/ directory.
@@ -629,7 +681,8 @@ if _rebar3.found()
   # because Ninja quotes compound commands as a single argument, which
   # breaks cmd.exe on Windows.
   custom_target('gateway',
-    command: [find_program('python3'), _gw_build_script, _gw_src],
+    command: [yuzu_python, _gw_build_script, _gw_src],
+    env: {'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
     output: '.gateway_built',
     build_always_stale: true,
     build_by_default: true,
@@ -641,9 +694,9 @@ if _rebar3.found()
   )
   # ── Gateway tests (EUnit + Common Test) ──────────────────────────────
   _gw_test_script = meson.project_source_root() / 'scripts' / 'test_gateway.py'
-  _python3 = find_program('python3')
-  # The test script prepends OTP 28 / rebar3 paths to PATH internally,
-  # handling the case where Meson inherits a system PATH with OTP 25.
+  _python3 = yuzu_python
+  # Both gateway tests run on the OTP resolved above: YUZU_OTP_BIN (set in
+  # each test's env) goes first on PATH via erlang_toolchain.base_env().
   #
   # Each suite gets its own REBAR_BASE_DIR so the eunit and ct tests
   # never share `_build/test/lib/<dep>/` on disk. Meson schedules
@@ -670,7 +723,7 @@ if _rebar3.found()
     args: [_gw_test_script, _gw_src, 'eunit'],
     suite: 'gateway',
     timeout: 600,
-    env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit'},
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit', 'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
   )
   # Timeout 600s — must stay ABOVE test_gateway.py's per-suite
   # `_SUITE_DEADLINE_SECS['ct']` (540) so the wrapper's process-tree dump
@@ -684,9 +737,9 @@ if _rebar3.found()
     args: [_gw_test_script, _gw_src, 'ct'],
     suite: 'gateway',
     timeout: 600,
-    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct'},
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct', 'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
   )
-  message('Erlang gateway: enabled (rebar3 found)')
+  message('Erlang gateway: enabled, ' + _gw_otp_desc)
 else
   if get_option('require_gateway')
     # A skipped gateway is invisible: the build and every test leg stay green
@@ -695,17 +748,24 @@ else
     # CI legs use scripts/ci/assert-gateway-tests.py after configure instead,
     # because a non-default option stored in a persistent, branch-shared CI build
     # dir makes every older branch's --reconfigure fail ("Unknown options").
-    error('Erlang gateway required (-Drequire_gateway=true) but rebar3 was not '
-          + 'found on PATH. Install Erlang/OTP 28 + rebar3 (CI: see this leg\'s Erlang install step in ci.yml).')
+    error('Erlang gateway required (-Drequire_gateway=true) but it cannot be built: '
+          + _gw_skip_reason + '\nInstall the pinned Erlang/OTP + rebar3 '
+          + '(CI: see this leg\'s Erlang install step in ci.yml).')
   endif
-  message('Erlang gateway: skipped (rebar3 not found)')
+  if _rebar3.found()
+    # rebar3 is present, so a gateway build was evidently intended: say so
+    # loudly rather than skip as quietly as a machine with no Erlang at all.
+    warning('Erlang gateway: SKIPPED. ' + _gw_skip_reason)
+  else
+    message('Erlang gateway: skipped (rebar3 not found)')
+  endif
 endif
 
 # ── Deploy DLLs (Windows) ────────────────────────────────────────────────
 # Copies vcpkg dependency DLLs alongside executables and gathers plugin
 # DLLs into builddir/plugins/ so the agent can find them at runtime.
 if host_machine.system() == 'windows'
-  _python3 = find_program('python3')
+  _python3 = yuzu_python
   _deploy_script = meson.project_source_root() / 'scripts' / 'deploy_build_dlls.py'
   _build_root = meson.project_build_root()
 
@@ -750,6 +810,8 @@ summary({
   'Examples':   build_examples,
   'Tests':      build_tests,
   'Enterprise': get_option('enable_enterprise'),
+  # The gateway is optional, so a skip is easy to miss mid-log: restate it here.
+  'Gateway':    _gw_otp_bin != '' ? _gw_otp_desc : _gw_skip_summary,
 }, section: 'Components')
 
 summary({

@@ -28,6 +28,10 @@ int dex_window_to_days(const std::string& window) {
     return 7; // "7d" / default
 }
 
+bool dex_window_is_valid(const std::string& window) {
+    return window == "24h" || window == "7d" || window == "30d" || window == "all";
+}
+
 // ISO-8601 UTC text of an absolute instant. Mirrors guardian_ingest's ts_to_iso8601.
 std::string dex_iso_at(std::int64_t epoch_seconds) {
     std::time_t tt = static_cast<std::time_t>(epoch_seconds);

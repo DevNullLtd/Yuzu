@@ -1,6 +1,7 @@
 #include "page_routes.hpp"
 
 #include "agent_registry.hpp"  // real yuzu::server::detail::AgentRegistry definition
+#include "home_ui.hpp"         // sign_in_location: a signed-out page request goes to the landing page
 #include "http_route_sink.hpp"
 #include "result_sets_ui.hpp" // yuzu::server::kResultSetsPageHtml
 
@@ -36,6 +37,7 @@ extern const std::string
 extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
 extern const std::string kYuzuOperateJs; // server/core/src/yuzu_operate_js_bundle.cpp (Operate O1)
 extern const std::string kYuzuDialogJs;  // server/core/src/yuzu_dialog_js_bundle.cpp (shared dialog)
+extern const std::string kYuzuOperateExtrasJs; // server/core/static/yuzu-operate-extras.js
 extern const std::string kYuzuEstateJs;  // server/core/src/yuzu_estate_js_bundle.cpp (containment controls)
 extern const std::string kYuzuDeviceDataJs; // yuzu_device_data_js_bundle.cpp (Hardware record controls)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
@@ -149,6 +151,12 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/static/yuzu-dialog.js", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(yuzu::server::kYuzuDialogJs, "application/javascript; charset=utf-8");
+    });
+    // Operate extras page controllers (Instructions, Dashboard, Result sets). Our own code, so
+    // it revalidates like the other operate scripts.
+    sink.Get("/static/yuzu-operate-extras.js", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(yuzu::server::kYuzuOperateExtrasJs, "application/javascript; charset=utf-8");
     });
     sink.Get("/static/yuzu-estate.js", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -290,7 +298,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/tar", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         res.set_content(kTarPageHtml, "text/html; charset=utf-8");
@@ -304,7 +312,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
              [deps](const httplib::Request& req, httplib::Response& res) {
                  auto session = deps.auth_fn(req, res);
                  if (!session) {
-                     res.set_redirect("/login");
+                     res.set_redirect(home_ui::sign_in_location(req.path));
                      return;
                  }
                  res.set_content(kResultSetsPageHtml, "text/html; charset=utf-8");
@@ -335,7 +343,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/viz/fleet", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         // Gate 7 sec-L1 / cons-N1 — honour the kill switch on the page
@@ -369,7 +377,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
         R"(/viz/host/([^/]+))", [deps](const httplib::Request& req, httplib::Response& res) {
             auto session = deps.auth_fn(req, res);
             if (!session) {
-                res.set_redirect("/login");
+                res.set_redirect(home_ui::sign_in_location(req.path));
                 return;
             }
             // Gate 7 sec-L1 / cons-N1 — kill switch on the host
@@ -407,7 +415,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
              [deps](const httplib::Request& req, httplib::Response& res) {
                  auto session = deps.auth_fn(req, res);
                  if (!session) {
-                     res.set_redirect("/login");
+                     res.set_redirect(home_ui::sign_in_location(req.path));
                      return;
                  }
                  res.set_content(kInstructionPageHtml, "text/html; charset=utf-8");
@@ -417,7 +425,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/approvals", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         res.set_content(kApprovalsPageHtml, "text/html; charset=utf-8");
@@ -427,7 +435,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/executions", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         res.set_content(kExecutionsPageHtml, "text/html; charset=utf-8");
@@ -437,7 +445,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/workflows", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         res.set_content(kWorkflowsPageHtml, "text/html; charset=utf-8");

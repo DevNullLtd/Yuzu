@@ -332,6 +332,10 @@ bool AutoApproveEngine::match_hostname_glob(const std::string& pattern,
 // ── CIDR subnet matching ─────────────────────────────────────────────────────
 
 bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::string& ip) const {
+    // A blank rule value never matches. load() accepts `ip_subnet::label:1`, and a registration
+    // that carries no peer IP (every gateway-proxied one) would otherwise equal it exactly.
+    if (cidr.empty())
+        return false;
     // Parse CIDR: "10.0.0.0/8"
     auto slash = cidr.find('/');
     if (slash == std::string::npos) {

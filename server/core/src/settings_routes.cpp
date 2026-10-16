@@ -3,9 +3,12 @@
 /// Extracted from server.cpp — Phase 1 of the god-object decomposition.
 
 #include "settings_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "cert_upload_files.hpp"
 #include "ota_signature_sidecar.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
+#include "rollout_pct_reject.hpp" // the shared malformed-rollout_pct 400 + toast
 
 #include <atomic>
 #include <cstdio>
@@ -21,6 +24,7 @@
 #include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
 #include "directory_sync.hpp"   // access-review read-model optional email enrichment
 #include "http_route_sink.hpp"
+#include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
@@ -30,6 +34,7 @@
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
+#include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
@@ -43,6 +48,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -78,6 +84,7 @@ template <typename Req> auto settings_req_get_file(const Req& req, const std::st
 
 // Settings page HTML template (defined in settings_ui.cpp).
 extern const char* const kSettingsHtml;
+extern const char* const kSettingsDataHtml; // settings_data_ui.cpp (SYS-4)
 
 // GatewayUpstreamServiceImpl and AgentRegistry are inner classes of server.cpp.
 // We use callbacks (AgentsJsonFn, GatewaySessionCountFn) to avoid depending on
@@ -282,6 +289,29 @@ std::string highlight_yaml_kv(const std::string& line) {
 // extract_json_string moved to json_extract.hpp (#2557) — SettingsRoutes
 // lives in namespace yuzu::server, so this unqualified name still resolves.
 
+// One OPTIONAL number of the batch enrollment-token body (#4644): `out` keeps its default when
+// the key is absent or an EMPTY string (the documented "empty or omitted" default). A JSON
+// integer and a numeric string are both accepted (the shipped curl example sends numbers,
+// scripts/ci/qa-stack.sh and the form-style callers send strings); a float, bool, null, array,
+// object, a non-numeric string and anything outside the `int` range throw std::invalid_argument
+// (the caller's single `invalid_numeric_parameter` branch). Before this, a JSON number was
+// silently ignored, so the documented example minted single-use tokens that never expire.
+void read_enrollment_int(const nlohmann::json& body, const char* key, int& out) {
+    if (!body.contains(key))
+        return;
+    const auto& v = body[key];
+    if (v.is_string()) {
+        const auto s = v.get<std::string>();
+        if (!s.empty())
+            out = yuzu::server::strict_stoi(s);
+        return;
+    }
+    const auto wide = yuzu::server::read_json_int_strict(body, key, 0);
+    if (!wide || *wide < std::numeric_limits<int>::min() || *wide > std::numeric_limits<int>::max())
+        throw std::invalid_argument("not an integer");
+    out = static_cast<int>(*wide);
+}
+
 // #4028 — success-envelope wrapper matching rest_api_v1.cpp's ok_json() wire
 // shape ({"data":...,"meta":{"api_version":"v1"}}) exactly. ok_json() itself
 // is TU-local to rest_api_v1.cpp (declared in its own anonymous namespace,
@@ -296,6 +326,15 @@ nlohmann::json settings_ok_envelope(nlohmann::json data) {
     return out;
 }
 
+/// The server-config builder input shared by the fragment and its REST twin: the fixed
+/// sign-in lifetime is `AuthManager::kSessionDuration`, passed in so settings_model.hpp
+/// stays free of the auth dependency (main.cpp derives its warn threshold the same way).
+nlohmann::json server_config_view(const Config& cfg) {
+    return settings_model::build_server_config_settings(
+        cfg, std::chrono::duration_cast<std::chrono::seconds>(auth::AuthManager::kSessionDuration)
+                 .count());
+}
+
 } // anonymous namespace
 
 // ── Fragment renderers ──────────────────────────────────────────────────────
@@ -304,7 +343,7 @@ std::string SettingsRoutes::render_server_config_fragment() {
     // #4028 — shared builder (settings_model.hpp); the REST twin
     // GET /api/v1/settings/server-config formats the SAME JSON as its
     // response body instead of re-deriving these fields from cfg_.
-    const auto v = settings_model::build_server_config_settings(*cfg_);
+    const auto v = server_config_view(*cfg_);
 
     std::string html;
 
@@ -321,8 +360,20 @@ std::string SettingsRoutes::render_server_config_fragment() {
     html += "<tr><td>Web UI Port</td><td><code>" + std::to_string(v.at("web_port").get<int>()) +
             "</code></td></tr>";
 
-    html += "<tr><td>Session Timeout</td><td><code>" +
+    // This is the AGENT heartbeat window (agents silent for longer are dropped), not the
+    // dashboard sign-in expiry; the two rows after it are the sign-in limits.
+    html += "<tr><td>Agent heartbeat timeout</td><td><code>" +
             std::to_string(v.at("session_timeout_seconds").get<std::int64_t>()) +
+            "s</code></td></tr>";
+    {
+        const auto idle = v.at("session_inactivity_seconds").get<std::int64_t>();
+        html += "<tr><td>Console idle timeout</td><td>" +
+                (idle > 0 ? "<code>" + std::to_string(idle) + "s</code>"
+                          : std::string("Off")) +
+                "</td></tr>";
+    }
+    html += "<tr><td>Console session lifetime</td><td><code>" +
+            std::to_string(v.at("session_absolute_lifetime_seconds").get<std::int64_t>()) +
             "s</code></td></tr>";
     html += "<tr><td>Max Agents</td><td><code>" +
             std::to_string(v.at("max_agents").get<std::int64_t>()) + "</code></td></tr>";
@@ -636,8 +687,8 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                 // Self-revoke is permitted (recoverable — operator just
                 // re-authenticates) and routes through `/api/v1/sessions/me`
                 // so the audit row records `session.revoke_all.self`.
-                html += "<span class=\"current-user-badge\" "
-                        "style=\"color:var(--mut);font-size:12.5px;margin-right:0.5rem\" "
+                html += "<span class=\"current-user-badge hint\" "
+                        "style=\"margin-right:0.5rem\" "
                         "title=\"You cannot remove your own account\">"
                         "Current user</span>"
                         "<button class=\"btn btn-secondary\" "
@@ -1237,8 +1288,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                             html_escape(p.principal_id) +
                             "\">"
                             "<input type=\"hidden\" name=\"ttl_days\" value=\"90\">"
-                            "<button class=\"btn btn-secondary\" type=\"submit\" "
-                            ">"
+                            "<button class=\"btn btn-secondary\" type=\"submit\">"
                             "Mint</button></form> ";
                 } else {
                     // Rotate credential — overlap-pair rotation (design doc §7).
@@ -1262,8 +1312,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                         "\">"
                         "<input type=\"text\" name=\"new_owner\" placeholder=\"new owner\" "
                         "style=\"width:110px\" required>"
-                        "<button class=\"btn btn-secondary\" type=\"submit\" "
-                        ">"
+                        "<button class=\"btn btn-secondary\" type=\"submit\">"
                         "Transfer</button></form> ";
 
                 // Revoke — terminal, never un-revocable (design doc §3.1 /
@@ -1914,17 +1963,25 @@ std::string SettingsRoutes::render_pending_fragment() {
                     "</span></td>"
                     "<td>";
 
-            if (a.status == auth::PendingStatus::pending) {
+            if (a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id)) {
+                // The id is empty, `.` or `..`: a browser collapses a dot-only
+                // path segment, so no per-row URL can be built for it. Offer no
+                // row action (the bulk buttons below act on the whole queue and show for it).
+                html += "<span class=\"muted\">identifier not supported for row actions</span>";
+            } else if (a.status == auth::PendingStatus::pending) {
+                // The id is agent-supplied: percent-encode it as ONE path segment
+                // (html_escape alone leaves `/`, `?`, `#` and `.` live in the URL).
+                const std::string seg = url_path_segment(a.agent_id);
                 html += "<button class=\"btn btn-primary\" "
                         "style=\"margin-right:0.3rem\" "
                         "hx-post=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
+                        seg +
                         "/approve\" "
                         "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
                         ">Approve</button>"
                         "<button class=\"btn btn-danger\" "
                         "hx-post=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
+                        seg +
                         "/deny\" "
                         "hx-target=\"#pending-section\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Deny agent enrollment?\""
@@ -1950,7 +2007,13 @@ std::string SettingsRoutes::render_pending_fragment() {
     auto pending_count = std::count_if(agents.begin(), agents.end(), [](const auto& a) {
         return a.status == auth::PendingStatus::pending;
     });
-    if (pending_count > 1) {
+    // The bulk bar also shows for a lone pending row whose id cannot be addressed
+    // per-row, so such a row is never left with no action at all.
+    const bool has_unaddressable_pending =
+        std::any_of(agents.begin(), agents.end(), [](const auto& a) {
+            return a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id);
+        });
+    if (pending_count > 1 || (pending_count == 1 && has_unaddressable_pending)) {
         html += "<div style=\"margin-top:0.75rem;display:flex;gap:0.5rem\">"
                 "<button class=\"btn btn-primary\" "
                 "onclick=\"twoClickConfirm(this, function() { "
@@ -2291,7 +2354,7 @@ std::string SettingsRoutes::render_updates_fragment() {
         } catch (...) {}
 
         if (!version_counts.empty()) {
-            html += "<div class=\"callout\" style=\"margin-bottom:1rem\">"
+            html += "<div class=\"note\" style=\"margin-bottom:1rem\">"
                     "<div class=\"sub-head\" style=\"margin-top:0\">Fleet versions</div>";
             for (const auto& [ver, cnt] : version_counts) {
                 html += "<span style=\"display:inline-block;margin-right:1rem\"><code>" +
@@ -2315,6 +2378,49 @@ std::string SettingsRoutes::render_updates_fragment() {
             auto size_str = pkg.file_size < 1024 * 1024
                                 ? std::to_string(pkg.file_size / 1024) + " KB"
                                 : std::to_string(pkg.file_size / (1024 * 1024)) + " MB";
+
+            // platform/arch/version are operator-uploaded path segments: encode
+            // each, and offer no rollout/delete URL when one is empty or only
+            // `.`/`..` (a browser collapses a dot segment).
+            const bool pkg_actionable = path_segment_ok(pkg.platform) &&
+                                        path_segment_ok(pkg.arch) && path_segment_ok(pkg.version);
+            std::string rollout_cell;
+            std::string delete_cell;
+            if (pkg_actionable) {
+                const std::string pkg_path = url_path_segment(pkg.platform) + "/" +
+                                             url_path_segment(pkg.arch) + "/" +
+                                             url_path_segment(pkg.version);
+                rollout_cell =
+                    "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
+                    "hx-post=\"/api/settings/updates/" +
+                    pkg_path +
+                    "/rollout\" "
+                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
+                    "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
+                    "value=\"" +
+                    std::to_string(pkg.rollout_pct) +
+                    "\" "
+                    "style=\"width:60px\" "
+                    "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
+                    "<span style=\"width:2.5em\">" +
+                    std::to_string(pkg.rollout_pct) +
+                    "%</span>"
+                    "<button class=\"btn btn-secondary\" type=\"submit\">Set</button>"
+                    "</form>";
+                delete_cell = "<button class=\"btn btn-danger\" "
+                              "hx-delete=\"/api/settings/updates/" +
+                              pkg_path +
+                              "\" "
+                              "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
+                              "hx-confirm=\"Delete update package " +
+                              html_escape(pkg.version) + " for " + html_escape(pkg.platform) +
+                              "/" + html_escape(pkg.arch) +
+                              "?\""
+                              ">Delete</button>";
+            } else {
+                rollout_cell = delete_cell =
+                    "<span class=\"muted\">identifier not supported for actions</span>";
+            }
 
             html += "<tr>"
                     "<td>" +
@@ -2370,39 +2476,14 @@ std::string SettingsRoutes::render_updates_fragment() {
                                        "--update-require-signature will refuse this "
                                        "package.\">unsigned</span>")) +
                     "</td>"
-                    "<td>"
-                    "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
-                    "hx-post=\"/api/settings/updates/" +
-                    html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "/" +
-                    html_escape(pkg.version) +
-                    "/rollout\" "
-                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
-                    "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
-                    "value=\"" +
-                    std::to_string(pkg.rollout_pct) +
-                    "\" "
-                    "style=\"width:60px\" "
-                    "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
-                    "<span style=\"width:2.5em\">" +
-                    std::to_string(pkg.rollout_pct) +
-                    "%</span>"
-                    "<button class=\"btn btn-secondary\" type=\"submit\" "
-                    ">Set</button>"
-                    "</form></td>"
+                    "<td>" +
+                    rollout_cell +
+                    "</td>"
                     "<td>" +
                     std::string(pkg.mandatory ? "Yes" : "No") +
                     "</td>"
-                    "<td><button class=\"btn btn-danger\" "
-                    "hx-delete=\"/api/settings/updates/" +
-                    html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "/" +
-                    html_escape(pkg.version) +
-                    "\" "
-                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Delete update package " +
-                    html_escape(pkg.version) + " for " + html_escape(pkg.platform) + "/" +
-                    html_escape(pkg.arch) +
-                    "?\""
-                    ">Delete</button></td></tr>";
+                    "<td>" +
+                    delete_cell + "</td></tr>";
         }
     }
 
@@ -2413,7 +2494,7 @@ std::string SettingsRoutes::render_updates_fragment() {
     // container (the <form>'s own inline `display:flex` is), so
     // `.add-user-form`'s `flex-wrap: wrap` never reached the row it was
     // meant to protect. It worked anyway, by coincidence — the row fits
-    // today purely from the `min-width:0`/`max-width:180px` compression —
+    // today purely from the `min-width:0`/`max-width:260px` compression —
     // but a future wider row would silently overflow again. Matching the
     // other `.add-user-form` consumers (add-user, enrollment-token,
     // api-token, engine-principal: class on the <form>, no div wrapper, no
@@ -2465,86 +2546,16 @@ std::string SettingsRoutes::render_updates_fragment() {
 std::string SettingsRoutes::render_gateway_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/gateway formats the SAME
     // JSON as its response body instead of re-deriving these fields.
+    // The markup lives in integrations_render.cpp (pure, on yuzu.css classes) so this
+    // fragment looks the same on /settings/integrations and on the monolith.
     auto count = gateway_session_count_fn_ ? gateway_session_count_fn_() : 0;
     const auto v = settings_model::build_gateway_settings(*cfg_, gateway_enabled_, count);
-    bool enabled = v.at("enabled").get<bool>();
-    std::string status_cls = enabled ? "role-badge role-ok" : "role-badge";
-    std::string status_text = enabled ? "Enabled" : "Disabled";
-
-    std::string html;
-
-    html += "<div class=\"form-row\">"
-            "  <label>Upstream Service</label>"
-            "  <span class=\"" + status_cls + "\">" + status_text +
-            "</span>"
-            "</div>";
-
-    if (enabled) {
-        html += "<div class=\"form-row\">"
-                "  <label>Listen Address</label>"
-                "  <code>" +
-                html_escape(v.at("listen_address").get<std::string>()) +
-                "</code>"
-                "</div>";
-
-        const bool gw_mode = v.at("gateway_mode").get<bool>();
-        html += "<div class=\"form-row\">"
-                "  <label>Gateway Mode</label>"
-                "  <span class=\"" +
-                std::string(gw_mode ? "role-badge role-ok" : "role-badge") + "\">" +
-                (gw_mode ? "Active" : "Inactive") +
-                "</span>"
-                "</div>";
-
-        auto shown_count = v.at("active_sessions").get<std::int64_t>();
-        html += "<div class=\"form-row\">"
-                "  <label>Active Sessions</label>"
-                "  <span>" +
-                std::to_string(shown_count) + " agent" + (shown_count != 1 ? "s" : "") +
-                " via gateway</span>"
-                "</div>";
-    } else {
-        html += "<p class=\"section-note\">"
-                "The gateway upstream service is not running. Start the server with "
-                "<code>--gateway-upstream 0.0.0.0:50055</code> to enable it. The service "
-                "requires an authorized gateway peer: pin the gateway's key with "
-                "<code>--gateway-peer-pin</code> or <code>--gateway-peer-pin-file</code> "
-                "(automatic on the built-in default certificates), or, on a plaintext "
-                "development rig only, acknowledge that peer authorization is disabled with "
-                "<code>--insecure-gateway-peer</code>. Without one of these the server "
-                "refuses to start. Pins are read once at boot; changing them needs a restart.</p>";
-    }
-
-    html += "<div style=\"margin-top:1rem;padding-top:0.75rem;border-top:1px solid var(--line)\">"
-            "<div class=\"sub-head\" style=\"margin-top:0\">"
-            "Erlang gateway environment variables</div>"
-            "<table class=\"user-table\">"
-            "<thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead>"
-            "<tbody>"
-            "<tr><td><code>YUZU_GW_UPSTREAM_ADDR</code></td>"
-            "    <td>C++ server hostname</td><td><code>127.0.0.1</code></td></tr>"
-            "<tr><td><code>YUZU_GW_UPSTREAM_PORT</code></td>"
-            "    <td>C++ server port</td><td><code>50055</code></td></tr>"
-            "<tr><td><code>YUZU_GW_AGENT_PORT</code></td>"
-            "    <td>Agent-facing listener port</td><td><code>50051</code></td></tr>"
-            "<tr><td><code>YUZU_GW_MGMT_PORT</code></td>"
-            "    <td>Management listener port</td><td><code>50052</code></td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_ENABLED</code></td>"
-            "    <td>TLS master switch</td><td><code>auto</code></td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_CERTFILE</code></td>"
-            "    <td>Gateway certificate path</td><td>&mdash;</td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_KEYFILE</code></td>"
-            "    <td>Gateway private key path</td><td>&mdash;</td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_CACERTFILE</code></td>"
-            "    <td>CA certificate bundle</td><td>&mdash;</td></tr>"
-            "<tr><td><code>YUZU_GW_PROMETHEUS_PORT</code></td>"
-            "    <td>Prometheus metrics port</td><td><code>9568</code></td></tr>"
-            "<tr><td><code>YUZU_GW_HEALTH_PORT</code></td>"
-            "    <td>Health endpoint port</td><td><code>8080</code></td></tr>"
-            "</tbody></table>"
-            "</div>";
-
-    return html;
+    integrations::GatewayView view;
+    view.enabled = v.at("enabled").get<bool>();
+    view.listen_address = v.at("listen_address").get<std::string>();
+    view.gateway_mode = v.at("gateway_mode").get<bool>();
+    view.active_sessions = v.at("active_sessions").get<std::int64_t>();
+    return integrations::render_gateway_panel(view);
 }
 
 std::string SettingsRoutes::render_https_fragment() {
@@ -2698,28 +2709,16 @@ std::string SettingsRoutes::render_analytics_fragment() {
     return html;
 }
 
+nlohmann::json SettingsRoutes::retention_view() const {
+    return settings_model::build_data_retention_settings(
+        *cfg_, retention_enforced_fn_ ? retention_enforced_fn_()
+                                      : settings_model::RetentionEnforced{});
+}
+
 std::string SettingsRoutes::render_data_retention_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/data-retention formats
     // the SAME JSON as its response body instead of re-deriving these fields.
-    const auto v = settings_model::build_data_retention_settings(*cfg_);
-
-    std::string html;
-
-    html += "<div class=\"form-row\">"
-            "  <label>Response Data</label>"
-            "  <code>" +
-            std::to_string(v.at("response_retention_days").get<int>()) +
-            " days</code>"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Audit Logs</label>"
-            "  <code>" +
-            std::to_string(v.at("audit_retention_days").get<int>()) +
-            " days</code>"
-            "</div>";
-
-    return html;
+    return settings_model::render_retention_table(retention_view());
 }
 
 namespace {
@@ -2818,7 +2817,7 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
             (export_key.empty() ? "Export off" : "Export on") + "</span></div></div>"
             "<div class=\"pb\"><p>When a tag key is set, per-cohort fleet performance gauges "
             "(<code>yuzu_fleet_perf_cohort_*</code>) are exported on /metrics for that key's "
-            "cohorts: top 50 by population, a 10-device statistical floor, and a "
+            "cohorts: top 50 by population, the one-device statistical floor (an empty cohort is withheld), and a "
             "<code>_clipped</code> gauge that makes any capping visible. Empty disables the "
             "export (the default). Fleet-level gauges are always exported.</p>"
             "<p><b>The key's tag values become Prometheus labels</b> visible to whatever scrapes "
@@ -2881,81 +2880,13 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
 std::string SettingsRoutes::render_mcp_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/mcp formats the SAME
     // JSON as its response body instead of re-deriving these fields.
+    // Markup and the form's one-value-per-field encoding: integrations_render.cpp.
     const auto v = settings_model::build_mcp_settings(*cfg_);
-
-    std::string html;
-    bool mcp_enabled = v.at("enabled").get<bool>();
-
-    std::string status_cls = mcp_enabled ? "role-badge role-ok" : "role-badge";
-    std::string status_text = mcp_enabled ? "Enabled" : "Disabled";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Status</label>"
-            "  <span class=\"" + status_cls + "\">" + status_text +
-            "</span>"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Endpoint</label>"
-            "  <code>POST /mcp/v1/</code>"
-            "</div>";
-
-    std::string enabled_checked = mcp_enabled ? " checked" : "";
-    html += "<form hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\" hx-swap=\"innerHTML\">"
-            "<div class=\"form-row\">"
-            "  <label>MCP Enabled</label>"
-            "  <label class=\"toggle\">"
-            "    <input type=\"hidden\" name=\"enabled\" value=\"false\">"
-            "    <input type=\"checkbox\" name=\"enabled\" value=\"true\"" +
-            enabled_checked +
-            " hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\""
-            " hx-swap=\"innerHTML\" hx-include=\"closest form\">"
-            "    <span class=\"slider\"></span>"
-            "  </label>"
-            "</div>";
-
-    const bool mcp_read_only = v.at("read_only").get<bool>();
-    std::string readonly_checked = mcp_read_only ? " checked" : "";
-    std::string readonly_cls = mcp_read_only ? "role-badge role-warn" : "role-badge";
-    std::string readonly_text = mcp_read_only ? "Read-Only" : "Full Access";
-    html += "<div class=\"form-row\">"
-            "  <label>Access Mode</label>"
-            "  <label class=\"toggle\">"
-            "    <input type=\"hidden\" name=\"read_only\" value=\"false\">"
-            "    <input type=\"checkbox\" name=\"read_only\" value=\"true\"" +
-            readonly_checked +
-            " hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\""
-            " hx-swap=\"innerHTML\" hx-include=\"closest form\">"
-            "    <span class=\"slider\"></span>"
-            "  </label>"
-            "  <span class=\"" +
-            readonly_cls + "\">" + readonly_text +
-            "</span>"
-            "</div>";
-
-    html += "</form>";
-
-    html += "<p class=\"section-note\">"
-            "MCP authentication uses API Tokens with an MCP tier. "
-            "Create tokens in the <strong>API Tokens</strong> section above — "
-            "select an MCP tier (readonly, operator, or supervised) from the dropdown."
-            "</p>";
-
-    std::string url = v.at("endpoint_url").get<std::string>();
-
-    html += "<div class=\"callout\" style=\"margin-top:0.75rem\">"
-            "  <div class=\"sub-head\" style=\"margin-top:0\">MCP client connection</div>"
-            "  <div style=\"margin-bottom:0.3rem\">"
-            "    Endpoint: <code>" +
-            html_escape(url) +
-            "</code></div>"
-            "  <div class=\"hint\">"
-            "    Transport: HTTP + JSON-RPC 2.0 &nbsp;|&nbsp; "
-            "    Auth: <code>Authorization: Bearer &lt;mcp-token&gt;</code>"
-            "  </div>"
-            "</div>";
-
-    return html;
+    integrations::McpView view;
+    view.enabled = v.at("enabled").get<bool>();
+    view.read_only = v.at("read_only").get<bool>();
+    view.endpoint_url = v.at("endpoint_url").get<std::string>();
+    return integrations::render_mcp_panel(view);
 }
 
 std::string SettingsRoutes::render_nvd_fragment() {
@@ -2989,7 +2920,9 @@ std::string SettingsRoutes::render_nvd_fragment() {
             "  <span>" +
             (cfg_->nvd_proxy.empty()
                  ? std::string("<span class=\"muted\">None</span>")
-                 : std::string("<code>") + html_escape(cfg_->nvd_proxy) + "</code>") +
+                 : std::string("<code>") +
+                       html_escape(settings_model::sanitize_url_userinfo(cfg_->nvd_proxy)) +
+                       "</code>") +
             "</span></div>";
 
     if (!cfg_->nvd_sync_enabled) {
@@ -3224,9 +3157,8 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
                     "<label>Subjects</label>"
                     "<div style=\"flex:1;min-width:0\">";
             for (const auto& s : subjects) {
-                html += "<div "
-                        "style=\"font-family:var(--mds-font-family-mono);font-size:12.5px;"
-                        "color:var(--ink2);overflow-wrap:anywhere\">" +
+                html += "<div class=\"mono\" "
+                        "style=\"color:var(--ink2);overflow-wrap:anywhere\">" +
                         html_escape(s) + "</div>";
             }
             html += "</div></div>";
@@ -3609,9 +3541,8 @@ void SettingsRoutes::register_routes(
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ServerConfig", "Read"))
                      return;
-                 res.set_content(
-                     settings_ok_envelope(settings_model::build_server_config_settings(*cfg_)).dump(),
-                     "application/json");
+                 res.set_content(settings_ok_envelope(server_config_view(*cfg_)).dump(),
+                                 "application/json");
              });
 
     sink.Get("/fragments/settings/https",
@@ -3689,15 +3620,24 @@ void SettingsRoutes::register_routes(
                  res.set_content(render_data_retention_fragment(), "text/html; charset=utf-8");
              });
 
+    // System > Data and retention page (SYS-4): same admin gate and redirect as
+    // GET /settings. A page route, not ledgered (the parity check covers only
+    // /fragments/* and /api/*).
+    sink.Get("/settings/data", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!admin_fn_(req, res)) {
+            res.set_redirect("/");
+            return;
+        }
+        res.set_content(kSettingsDataHtml, "text/html; charset=utf-8");
+    });
+
     // #4028 — REST v1 read-twin. ServerConfig:Read. NOT audited — "lowest
     // sensitivity of the eight" per #4028's Evidence section.
     sink.Get("/api/v1/settings/data-retention",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ServerConfig", "Read"))
                      return;
-                 res.set_content(settings_ok_envelope(
-                                     settings_model::build_data_retention_settings(*cfg_))
-                                     .dump(),
+                 res.set_content(settings_ok_envelope(retention_view()).dump(),
                                  "application/json");
              });
 
@@ -3868,18 +3808,33 @@ void SettingsRoutes::register_routes(
         // Clamp server-side to the same ranges update_alert_shape enforces, so
         // the STORED values always match the LIVE values (no silent divergence
         // between what the UI shows and what the detector runs).
+        // A present-but-malformed field is a 400 with NOTHING saved: `stoi("0x10")` is 0 and
+        // `stoi("5abc")` is 5, so a typo used to persist a different (clamped) threshold
+        // than the one the operator typed (#4644). Empty/absent keeps the default.
+        bool malformed = false;
         auto clamp_int = [&](const char* field, int lo, int hi, int fallback) {
-            try {
-                const auto v = extract_form_value(req.body, field);
-                if (!v.empty())
-                    return std::clamp(std::stoi(v), lo, hi);
-            } catch (...) {}
-            return fallback;
+            const auto v = extract_form_value(req.body, field);
+            if (v.empty())
+                return fallback;
+            const auto parsed = yuzu::server::parse_query_int<int>(v);
+            if (!parsed) {
+                malformed = true;
+                return fallback;
+            }
+            return std::clamp(*parsed, lo, hi);
         };
         const BlastRadiusConfig d{};
         const int min_dev = clamp_int("min_devices", 2, 100000, d.min_devices);
         const int win_s = clamp_int("window_seconds", 60, 86400, d.window_seconds);
         const int cool_s = clamp_int("cooldown_seconds", 0, 7 * 86400, d.cooldown_seconds);
+        if (malformed) {
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Thresholds must be whole numbers","level":"error"}})");
+            res.set_content(detail::a4_error(res, "invalid numeric parameter"),
+                            "application/json");
+            return;
+        }
         auto session = auth_fn_(req, res);
         const std::string by = session ? session->username : "unknown";
         bool ok = true;
@@ -4445,9 +4400,9 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto cert_dir = auth::default_cert_dir();
+        auto cert_dir = cert_dir_override_.empty() ? auth::default_cert_dir() : cert_dir_override_;
         std::error_code ec;
-        std::filesystem::create_directories(cert_dir, ec);
+        cert_upload::create_cert_dir(cert_dir, ec);
         if (ec) {
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Cannot create cert directory.</span>",
@@ -4470,15 +4425,12 @@ void SettingsRoutes::register_routes(
         }
 
         auto out_path = cert_dir / out_name;
-        {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-            if (!f.is_open()) {
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            f.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!cert_upload::write_cert_file(cert_dir, out_name, type == "key", content)) {
+            audit_fn_(req, "cert.upload", "failure", "Certificate", type, "write failed");
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
 
         if (type == "cert")
@@ -4487,14 +4439,6 @@ void SettingsRoutes::register_routes(
             cfg_->tls_server_key = out_path;
         else if (type == "ca")
             cfg_->tls_ca_cert = out_path;
-
-#ifndef _WIN32
-        if (type == "key") {
-            std::filesystem::permissions(
-                out_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                std::filesystem::perm_options::replace);
-        }
-#endif
 
         spdlog::info("Certificate uploaded: {} -> {}", type, out_path.string());
         audit_fn_(req, "cert.upload", "success", "Certificate", type, "");
@@ -4559,9 +4503,9 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto cert_dir = auth::default_cert_dir();
+        auto cert_dir = cert_dir_override_.empty() ? auth::default_cert_dir() : cert_dir_override_;
         std::error_code ec;
-        std::filesystem::create_directories(cert_dir, ec);
+        cert_upload::create_cert_dir(cert_dir, ec);
         if (ec) {
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Cannot create cert directory.</span>",
@@ -4570,24 +4514,13 @@ void SettingsRoutes::register_routes(
         }
 
         auto out_path = cert_dir / out_name;
-        {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-            if (!f.is_open()) {
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            f.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!cert_upload::write_cert_file(cert_dir, out_name, type == "key", content)) {
+            audit_fn_(req, "cert.paste", "failure", "Certificate", type, "write failed");
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
-
-#ifndef _WIN32
-        if (type == "key") {
-            std::filesystem::permissions(
-                out_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                std::filesystem::perm_options::replace);
-        }
-#endif
 
         if (type == "cert")
             cfg_->tls_server_cert = out_path;
@@ -4610,6 +4543,26 @@ void SettingsRoutes::register_routes(
     sink.Post("/api/settings/oidc", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        // admin_fn_ admits a JIT-elevated session, but the sign-in provider (issuer, client,
+        // admin group) decides who becomes a STANDING administrator at the next SSO login, so
+        // an elevated session must not change it. Same own-role rule as the role-change route.
+        const auto caller = auth_fn_(req, res);
+        if (!caller) {
+            res.status = 401;
+            return;
+        }
+        if (caller->role != auth::Role::admin) {
+            audit_fn_(req, "oidc.configure", "denied", "OidcConfig", "",
+                      "elevated_session_oidc_change_blocked");
+            res.status = 403;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Changing sign-in provider settings needs your own administrator role, not an elevation","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Changing sign-in provider settings needs your "
+                                                  "own administrator role, not a temporary "
+                                                  "elevation"),
+                            "application/json");
+            return;
+        }
 
         auto issuer = extract_form_value(req.body, "issuer");
         auto client_id = extract_form_value(req.body, "client_id");
@@ -5328,6 +5281,24 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // admin_fn_ admits a JIT-elevated session (effective_role). An elevation is temporary
+        // authority, and an account role is a STANDING grant: letting an elevated `user`
+        // change an account's role would turn the elevation into a durable administrator that
+        // outlives the window (the same principle as rbac_admin_predicate.hpp, decision 1).
+        // Require the session's own role (`session->role`, not `effective_role`): a local
+        // account's role, or the IdP-mapped role of an SSO session. Sessions are wiped on a
+        // role change, which bounds how stale that cached role can be.
+        if (session->role != auth::Role::admin) {
+            audit_fn_(req, "user.role_change", "denied", "User", req.matches[1].str(),
+                      "elevated_session_role_change_blocked");
+            res.status = 403;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Changing an account role needs your own administrator role, not an elevation","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Changing an account role needs your own "
+                                                  "administrator role, not a temporary elevation"),
+                            "application/json");
+            return;
+        }
         // PR2 — MFA step-up gate. Role changes promote/demote a
         // principal's authority; require fresh MFA proof.
         if (step_up_fn_ &&
@@ -5527,14 +5498,25 @@ void SettingsRoutes::register_routes(
         int max_uses = 0;
         int ttl_hours = 0;
         try {
+            // Strict: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit
+            // used to mint an unlimited token. Only an EMPTY field or a literal 0 means
+            // "unlimited" / "no expiry"; anything else must be one base-10 integer.
             if (!max_uses_s.empty())
-                max_uses = std::stoi(max_uses_s);
+                max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
-                ttl_hours = std::stoi(ttl_s);
+                ttl_hours = yuzu::server::strict_stoi(ttl_s);
+            // A negative TTL computes `ttl_hours > 0 ? ... : 0` and 0 means NEVER EXPIRES, so a
+            // typed `-1` used to mint a credential with no expiry. Refuse it. (`-0` and `00`
+            // parse to a literal 0 and keep the documented meaning.)
+            if (ttl_hours < 0)
+                throw std::invalid_argument("negative ttl_hours");
         } catch (const std::exception&) {
             audit_fn_(req, "enrollment.token_create", "denied", "EnrollmentToken", "",
                       "invalid_numeric_parameter");
             res.status = 400;
+            // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Invalid numeric parameter - nothing was created","level":"error"}})");
             res.set_content(detail::a4_error(res, "invalid numeric parameter"),
                             "application/json");
             return;
@@ -5610,25 +5592,47 @@ void SettingsRoutes::register_routes(
                                                               httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        auto label = extract_json_string(req.body, "label");
-        auto count_s = extract_json_string(req.body, "count");
-        auto max_uses_s = extract_json_string(req.body, "max_uses");
-        auto ttl_s = extract_json_string(req.body, "ttl_hours");
+        // A blank body keeps every default; any other body must be one JSON object (a truncated
+        // document used to mint the default 10 single-use tokens with no expiry).
+        nlohmann::json batch_body = nlohmann::json::object();
+        const bool body_blank =
+            std::all_of(req.body.begin(), req.body.end(),
+                        [](unsigned char c) { return std::isspace(c) != 0; });
+        if (!body_blank) {
+            batch_body = nlohmann::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+            if (batch_body.is_discarded() || !batch_body.is_object()) {
+                audit_fn_(req, "enrollment.bulk_token_create", "denied", "EnrollmentToken", "",
+                          "invalid_body");
+                res.status = 400;
+                res.set_header("HX-Trigger",
+                               R"({"showToast":{"message":"Request body must be a JSON object - nothing was created","level":"error"}})");
+                res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                                "application/json");
+                return;
+            }
+        }
+        auto label = extract_json_string(batch_body, "label");
 
         int count = 10;
         int max_uses = 1;
         int ttl_hours = 0;
         try {
-            if (!count_s.empty())
-                count = std::stoi(count_s);
-            if (!max_uses_s.empty())
-                max_uses = std::stoi(max_uses_s);
-            if (!ttl_s.empty())
-                ttl_hours = std::stoi(ttl_s);
+            // Strict (see the single-token route): a malformed limit must never read as 0.
+            read_enrollment_int(batch_body, "count", count);
+            read_enrollment_int(batch_body, "max_uses", max_uses);
+            read_enrollment_int(batch_body, "ttl_hours", ttl_hours);
+            // A negative TTL computes `ttl_hours > 0 ? ... : 0` and 0 means NEVER EXPIRES, so a
+            // typed `-1` used to mint a credential with no expiry. Refuse it. (`-0` and `00`
+            // parse to a literal 0 and keep the documented meaning.)
+            if (ttl_hours < 0)
+                throw std::invalid_argument("negative ttl_hours");
         } catch (const std::exception&) {
             audit_fn_(req, "enrollment.bulk_token_create", "denied", "EnrollmentToken", "",
                       "invalid_numeric_parameter");
             res.status = 400;
+            // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Invalid numeric parameter - nothing was created","level":"error"}})");
             res.set_content(detail::a4_error(res, "invalid numeric parameter"),
                             "application/json");
             return;
@@ -5733,7 +5737,10 @@ void SettingsRoutes::register_routes(
         int64_t expires_at = 0;
         if (!ttl_s.empty()) {
             try {
-                int ttl_hours = std::stoi(ttl_s);
+                // Strict: a mistyped TTL ("0x5" -> 0) used to mint a token that never expires.
+                int ttl_hours = yuzu::server::strict_stoi(ttl_s);
+                if (ttl_hours < 0) // would mint a token that never expires; refused, nothing minted
+                    throw std::invalid_argument("negative ttl_hours");
                 if (ttl_hours > 0) {
                     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                                    std::chrono::system_clock::now().time_since_epoch())
@@ -6034,13 +6041,33 @@ void SettingsRoutes::register_routes(
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
+    // A pending-agent id that is empty, `.` or `..` can never be addressed by a
+    // browser-built URL (dot segments collapse), so an API call carrying one is
+    // refused outright rather than matched against the store.
+    auto refuse_unaddressable_agent_id = [this](const httplib::Request& req,
+                                                httplib::Response& res, const char* verb,
+                                                const std::string& agent_id,
+                                                const std::string& by) -> bool {
+        if (path_segment_ok(agent_id))
+            return false;
+        audit_fn_(req, verb, "denied", "Agent", agent_id, "invalid_agent_id by=" + by);
+        res.status = 400;
+        res.set_header("HX-Trigger",
+                       R"({"showToast":{"message":"Invalid agent id","level":"error"}})");
+        res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+        return true;
+    };
+
     sink.Post(R"(/api/settings/pending-agents/(.+)/approve)",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto agent_id = req.matches[1].str();
                   auto session = auth_fn_(req, res);
                   if (!session)
+                      return;
+                  if (refuse_unaddressable_agent_id(req, res, "enrollment.approve", agent_id,
+                                                    session->username))
                       return;
                   auto approved = auth_mgr_->approve_pending_agent(agent_id, session->username);
                   if (!approved) {
@@ -6065,12 +6092,15 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Post(R"(/api/settings/pending-agents/(.+)/deny)",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto agent_id = req.matches[1].str();
                   auto session = auth_fn_(req, res);
                   if (!session)
+                      return;
+                  if (refuse_unaddressable_agent_id(req, res, "enrollment.deny", agent_id,
+                                                    session->username))
                       return;
                   auto denied = auth_mgr_->deny_pending_agent(agent_id, session->username);
                   if (!denied) {
@@ -6095,12 +6125,15 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Delete(R"(/api/settings/pending-agents/(.+))",
-                [this](const httplib::Request& req, httplib::Response& res) {
+                [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
                     auto agent_id = req.matches[1].str();
                     auto session = auth_fn_(req, res);
                     if (!session)
+                        return;
+                    if (refuse_unaddressable_agent_id(req, res, "enrollment.remove", agent_id,
+                                                      session->username))
                         return;
                     auto removed = auth_mgr_->remove_pending_agent(agent_id);
                     if (!removed) {
@@ -6433,18 +6466,49 @@ void SettingsRoutes::register_routes(
         });
 
     // -- Settings API: MCP toggle (HTMX POST) ---------------------------------
+    // The body is parsed at a key boundary and must carry exactly one `enabled` and one
+    // `read_only`, each `true` or `false` (integrations_render.cpp). The earlier first-match
+    // read treated an absent field as false, so a partial body switched MCP off or flipped
+    // Read-only to Full access. Nothing changes on a refused body.
     sink.Post("/api/settings/mcp", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        auto enabled_val = extract_form_value(req.body, "enabled");
-        auto read_only_val = extract_form_value(req.body, "read_only");
-        cfg_->mcp_disable = (enabled_val != "true");
-        cfg_->mcp_read_only = (read_only_val == "true");
+        // Same-site gate for a cookie-authorised write: unlike origin_safe above, a header-less
+        // cookie request is refused (browsers always send an Origin on a write); token callers
+        // are exempt.
+        const auto session = auth_fn_(req, res);
+        if (!session)
+            return;
+        if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
+                                        req.get_header_value("Origin"),
+                                        req.get_header_value("Referer"),
+                                        cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
+                                             : std::span<const std::string>{})) {
+            audit_fn_(req, "csrf.denied", "denied", "Endpoint", "/api/settings/mcp",
+                      "cross-site or header-less browser write refused");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "cross-site request refused"),
+                            "application/json");
+            return;
+        }
+        const auto form = integrations::parse_mcp_form(req.body);
+        if (!form) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, form.error()), "application/json");
+            return;
+        }
+        const std::string requested =
+            "enabled=" + std::string(form->enabled ? "true" : "false") +
+            ", read_only=" + std::string(form->read_only ? "true" : "false");
+        // Audit-first (ADR-0033 section 9): no `attempted` row, no change to the MCP switches.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "settings.mcp", "MCP",
+                                     "mcp_settings", requested))
+            return;
+        cfg_->mcp_disable = !form->enabled;
+        cfg_->mcp_read_only = form->read_only;
         spdlog::info("MCP settings changed: enabled={}, read_only={}", !cfg_->mcp_disable,
                      cfg_->mcp_read_only);
-        audit_fn_(req, "settings.mcp", "success", "MCP", "mcp_settings",
-                  "enabled=" + std::string(!cfg_->mcp_disable ? "true" : "false") +
-                      ", read_only=" + std::string(cfg_->mcp_read_only ? "true" : "false"));
+        audit_fn_(req, "settings.mcp", "success", "MCP", "mcp_settings", requested);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"MCP settings saved","level":"success"}})");
         res.set_content(render_mcp_fragment(), "text/html; charset=utf-8");
@@ -6527,15 +6591,14 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        int rollout_pct = 100;
-        try {
-            if (!rollout_s.empty())
-                rollout_pct = std::stoi(rollout_s);
-        } catch (...) {}
-        if (rollout_pct < 0)
-            rollout_pct = 0;
-        if (rollout_pct > 100)
-            rollout_pct = 100;
+        // A malformed percentage must NOT fall back to 100 (a full-fleet rollout the operator
+        // did not ask for): 400, nothing stored. Shared with the rollout route.
+        const auto rollout_parsed = yuzu::server::parse_rollout_pct(rollout_s);
+        if (!rollout_parsed) {
+            yuzu::server::reject_bad_rollout_pct(res, yuzu::server::RolloutRejectEffect::kStored);
+            return;
+        }
+        const int rollout_pct = *rollout_parsed;
 
         // Shape-check the signature BEFORE the binary is written. A well-sized
         // file of garbage would otherwise be stored, reported "signed" by the
@@ -6822,15 +6885,16 @@ void SettingsRoutes::register_routes(
                   auto version = req.matches[3].str();
                   auto pct_s = extract_form_value(req.body, "rollout_pct");
 
-                  int pct = 100;
-                  try {
-                      if (!pct_s.empty())
-                          pct = std::stoi(pct_s);
-                  } catch (...) {}
-                  if (pct < 0)
-                      pct = 0;
-                  if (pct > 100)
-                      pct = 100;
+                  // Malformed, EMPTY or above 100 => 400, never the 100% default or a clamp to
+                  // it: on an EXISTING package either would silently make it a full-fleet
+                  // rollout. (The upload route keeps its lenient default; it creates the row.)
+                  const auto pct_parsed = yuzu::server::parse_rollout_pct_strict(pct_s);
+                  if (!pct_parsed) {
+                      yuzu::server::reject_bad_rollout_pct(
+                          res, yuzu::server::RolloutRejectEffect::kChanged);
+                      return;
+                  }
+                  const int pct = *pct_parsed;
 
                   // Capture the PRIOR percentage before the write. It is the whole
                   // evidentiary value of this row: #3692's scenario is an admin —

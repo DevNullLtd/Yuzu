@@ -1,4 +1,5 @@
 #include "ca_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "rest_a4_envelope.hpp"
 #include "web_utils.hpp"
@@ -56,16 +57,17 @@ constexpr std::size_t kMaxIssueCodeSigningBody = 64 * 1024;
 // door instead of deferring entirely to the server-side refusal.
 constexpr int kMaxCodeSigningValidityDaysRest = 730;
 
-int clamp_int(const httplib::Request& req, const char* key, int def, int lo, int hi) {
+// nullopt when the parameter is present but not ONE base-10 integer: the caller answers
+// 400 (a malformed page size must not silently become the default, #4644).
+std::optional<int> clamp_int(const httplib::Request& req, const char* key, int def, int lo,
+                             int hi) {
     auto it = req.params.find(key);
     if (it == req.params.end())
         return def;
-    int v = def;
-    try {
-        v = std::stoi(it->second);
-    } catch (...) {
-        return def;
-    }
+    auto parsed = yuzu::server::parse_query_int<int>(it->second);
+    if (!parsed)
+        return std::nullopt;
+    int v = *parsed;
     if (v < lo)
         v = lo;
     if (v > hi)
@@ -254,10 +256,7 @@ std::string render_ca_fragment(CaStore* ca_store) {
     // more — say so + point at the paginated REST endpoint, so certs beyond the
     // cap aren't silently invisible/unrevocable from the dashboard.
     if (static_cast<int>(issued.size()) >= kPanelLimit) {
-        html += "<p class=\"section-note\" style=\"color:var(--warn)\">Showing the first " +
-                std::to_string(kPanelLimit) +
-                " certificates. Use <code>GET /api/v1/ca/issued?offset=</code> to page through the "
-                "full inventory.</p>";
+        html += ca_issued_paging_hint(kPanelLimit);
     }
     html += "<p class=\"section-note\">To replace the default certificates with operator- or "
             "HSM-issued material, use <strong>TLS / mTLS Configuration</strong> above. "
@@ -416,8 +415,17 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                                     kJson);
                     return;
                 }
-                const int limit = clamp_int(req, "limit", 200, 1, 1000);
-                const int offset = clamp_int(req, "offset", 0, 0, 1000000);
+                const auto limit_opt = clamp_int(req, "limit", 200, 1, 1000);
+                const auto offset_opt = clamp_int(req, "offset", 0, 0, 1000000);
+                if (!limit_opt || !offset_opt) {
+                    res.status = 400;
+                    res.set_content(error_json_a4(400, "invalid numeric query parameter",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                const int limit = *limit_opt;
+                const int offset = *offset_opt;
                 // Probe one extra row to derive a precise has_more without a
                 // separate COUNT query (agentic-first A1: a paginating client must
                 // be able to tell when to stop, not guess from count<limit). The

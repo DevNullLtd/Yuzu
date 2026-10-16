@@ -152,7 +152,7 @@ std::string hw_style() {
   table.hw-tbl tbody tr:hover td{background:var(--surface2)}
   table.hw-tbl tbody tr:has(.hw-sel:checked) td{background:color-mix(in srgb,var(--hl) 8%,transparent)}
   table.hw-tbl tbody tr:has(.hw-sel:checked) td:first-child{box-shadow:inset 3px 0 0 var(--hl)}
-  table.hw-tbl input[type=checkbox]{width:16px;height:16px;accent-color:var(--primary);color-scheme:dark;vertical-align:middle}
+  table.hw-tbl input[type=checkbox]{width:16px;height:16px;accent-color:var(--primary);vertical-align:middle}
   table.hw-tbl td.hw-mono{color:var(--ink2)}
   .hw-name{color:var(--ink);font-weight:600;text-decoration:none}
   .hw-mono{font-family:var(--mds-font-family-mono);font-size:12.5px;color:var(--mut)}
@@ -162,7 +162,6 @@ std::string hw_style() {
   .hw-pill.ok{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
   .hw-pill.warn{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
   .hw-pill.bad{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
-  .hw-os{padding:0 5px;border:1px solid var(--line2);border-radius:3px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:11.5px}
   .hw-tag{display:inline-flex;align-items:center;margin-right:4px;padding:1px 8px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500}
   a.hw-tag.link{cursor:pointer}
   a.hw-tag.link:hover{color:var(--ink)}
@@ -260,7 +259,7 @@ std::string dex_badge(int score) {
     if (score < 0)
         return "<span class=\"hw-grey\">&mdash;</span>";
     const char* tone = score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad");
-    return "<span class=\"hw-pill " + std::string(tone) + "\">" + std::to_string(score) + "</span>";
+    return "<span class=\"pill " + std::string(tone) + "\">" + std::to_string(score) + "</span>";
 }
 
 // A clickable tag chip that narrows the list to this exact key[=value] — targets the
@@ -331,17 +330,18 @@ std::string pagination(const HardwareListQuery& q, std::size_t total_matching) {
     return h;
 }
 
-std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q, bool quarantined) {
+std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q, bool quarantined,
+                     bool containment_ui) {
     const std::string name = d.hostname.empty() ? d.agent_id : d.hostname;
     const std::string status_pill = d.online
-        ? "<span class=\"hw-pill ok\">online</span>"
-        : (d.stale ? "<span class=\"hw-pill warn\">stale</span>" : "<span class=\"hw-pill\">offline</span>");
+        ? "<span class=\"pill ok\">online</span>"
+        : (d.stale ? "<span class=\"pill warn\">stale</span>" : "<span class=\"pill idle\">offline</span>");
     // Quarantined pill + the row's route into the Containment lens. The link is a plain
     // anchor (the create dialog needs OS/online/whitelist context, and 50 live buttons
     // would need 50 scoped probes); yuzu-estate.js stops the row's own click handler from
     // overriding its target.
-    const std::string quarantine_cell =
-        std::string(quarantined ? "<span class=\"hw-pill bad\">Quarantined</span> " : "") +
+    const std::string quarantine_cell = !containment_ui ? std::string() :
+        " " + std::string(quarantined ? "<span class=\"hw-pill bad\">Quarantined</span> " : "") +
         "<a class=\"hw-lab\" data-act=\"row-containment\" href=\"/hardware/ci?id=" + url_encode(d.agent_id) +
         "&amp;lens=containment\">" + (quarantined ? "Containment" : "Quarantine") + "</a>";
     const std::string cpu_ram = [&] {
@@ -377,8 +377,8 @@ std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q, bo
            "<td><a class=\"hw-name\" href=\"/hardware/ci?id=" + url_encode(d.agent_id) + "\">" +
            esc(name) + "</a></td>"
            "<td class=\"hw-mono\">" + ip_cell + "</td>"
-           "<td><span class=\"hw-os\">" + os_label(d.os) + "</span></td>"
-           "<td>" + status_pill + " " + quarantine_cell + "</td>"
+           "<td><span class=\"os-tag\">" + os_label(d.os) + "</span></td>"
+           "<td>" + status_pill + quarantine_cell + "</td>"
            "<td>" + dex_badge(d.dex_score) + "</td>"
            "<td class=\"hw-mono\">" + version_cell + "</td>"
            "<td>" + (d.last_seen.empty() ? "?" : esc(d.last_seen)) + "</td>"
@@ -437,7 +437,7 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
     if (tags_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
              "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
-    if (page.quarantine_degraded)
+    if (page.containment_ui && page.quarantine_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Quarantine state unavailable.</b> The quarantine "
              "records could not be read or checked &mdash; a row without a Quarantined pill here is "
              "not \"not quarantined\".</div>";
@@ -489,7 +489,7 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
         h += sortable_th("OS version", HwSortKey::OsVersion, q);
         h += "</tr></thead><tbody>";
         for (const auto& row : page.rows)
-            h += row_html(row, q, page.quarantined_ids.contains(row.agent_id));
+            h += row_html(row, q, page.quarantined_ids.contains(row.agent_id), page.containment_ui);
         h += "</tbody></table></div>";
         h += pagination(q, page.total_matching);
     }
@@ -544,7 +544,8 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
 
     h += render_hardware_results_region(page, ci_degraded, tags_degraded);
     h += "</section>";
-    h += quarantine_panel_placeholder();
+    if (page.containment_ui)
+        h += quarantine_panel_placeholder();
     h += "</div>";
     return h;
 }
@@ -572,7 +573,7 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
                                            aff.sync, detail.software_last_seen);
     } else if (lens == "tags") {
         h += render_hardware_tags_lens(agent_id, detail.tags, aff.can_write_tags, aff.can_delete_tags);
-    } else if (lens == "containment") {
+    } else if (aff.containment_ui && lens == "containment") {
         // Lazy: the fragment takes its own Security:Read / Security:Execute probes, so a
         // viewer who never opens this lens never pays the denied-probe audit rows.
         h += containment_lens_placeholder(agent_id);
@@ -731,10 +732,10 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
     h += "<div class=\"hw-wrap\">";
     h += "<div class=\"hw-hdr\"><a class=\"gp-btn\" href=\"/hardware\">&larr; Hardware</a></div>";
     h += "<div class=\"hw-hdr\">";
-    h += std::string("<span class=\"hw-pill") + (online ? " ok\">online" : "\">offline") + "</span>";
+    h += std::string("<span class=\"pill") + (online ? " ok\">online" : " idle\">offline") + "</span>";
     h += "<h1 class=\"hw-h1\" style=\"margin:0\">" + esc(hostname) + "</h1>";
     if (!os.empty())
-        h += "<span class=\"hw-os\">" + os_label(os) + "</span>";
+        h += "<span class=\"os-tag\">" + os_label(os) + "</span>";
     h += "<span class=\"hw-mono\">" + esc(agent_id) + "</span>";
     h += "<span class=\"hw-lab\">last seen " + esc(last_seen.empty() ? "?" : last_seen) + "</span>";
     h += "<span style=\"flex:1\"></span>";
@@ -751,21 +752,24 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
     // Quarantine banner: one lazily loaded placeholder, empty unless the device has an
     // active record. It sits above the lens bar so it shows on every lens, including Live
     // and Actions, whose instructions a quarantined device withholds.
-    h += containment_banner_placeholder(agent_id);
-    h += render_hardware_lens_bar(agent_id, active_lens, /*oob=*/false);
+    if (aff.containment_ui)
+        h += containment_banner_placeholder(agent_id);
+    h += render_hardware_lens_bar(agent_id, active_lens, /*oob=*/false, aff.containment_ui);
     h += "<div id=\"hw-ci-lens\">";
     h += render_hardware_lens_body(agent_id, detail, active_lens, now_secs, aff);
     h += "</div></div>";
     return h;
 }
 
-std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob) {
+std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob,
+                                     bool containment_ui) {
     std::string h = "<div class=\"gp-subnav\" id=\"hw-lens-bar\"" +
                     std::string(oob ? " hx-swap-oob=\"true\"" : "") + ">";
     h += device_lens_tab("overview", "Overview", agent_id, active);
     h += device_lens_tab("software", "Installed software", agent_id, active);
     h += device_lens_tab("tags", "Tags and properties", agent_id, active);
-    h += device_lens_tab("containment", "Containment", agent_id, active);
+    if (containment_ui)
+        h += device_lens_tab("containment", "Containment", agent_id, active);
     h += device_lens_tab("dex", "DEX", agent_id, active);
     h += device_lens_tab("guardian", "Guardian", agent_id, active);
     h += device_lens_tab("live", "Live", agent_id, active);

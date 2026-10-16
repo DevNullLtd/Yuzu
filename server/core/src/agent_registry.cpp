@@ -1300,7 +1300,7 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
     // OOB side-effects: context label + row count (extracted by HTMX
     // regardless of position, won't break the tbody parse context)
     result += "<span id=\"result-context\" hx-swap-oob=\"innerHTML\" "
-              "style=\"font-size:0.75rem;color:#8b949e\">" +
+              "class=\"result-context\">" +
               esc(context) + "</span>";
     result +=
         "<span id=\"row-count\" hx-swap-oob=\"innerHTML\">" + std::to_string(row_count) + "</span>";
@@ -1536,6 +1536,18 @@ std::vector<std::string> AgentRegistry::all_ids() const {
             ids.push_back(p.agent_id);
     }
     return ids;
+}
+
+std::expected<std::size_t, PresenceReadError> AgentRegistry::known_agent_count() const {
+    auto presence = live_presence(); // cached, runs OFF mu_ (see all_ids)
+    if (!presence)
+        return std::unexpected(presence.error());
+    std::lock_guard lock(mu_);
+    std::size_t n = agents_.size();
+    for (const auto& p : *presence)
+        if (!agents_.contains(p.agent_id))
+            ++n;
+    return n;
 }
 
 std::size_t AgentRegistry::local_agent_count() const {
