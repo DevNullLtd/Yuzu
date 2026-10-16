@@ -612,15 +612,23 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
    - **2026-10-15 - temporary UI-only fragment exceptions (Dashboard,
      Integrations webhooks, General, Access).** The ADR owner (Dave Rae)
-     accepted these server-rendered fragments, which have no REST v1 or MCP
-     twin yet, as exceptions to Decision 4 (#5859, #5872, #5873, #5880). The
-     acceptance is quoted, with its 2026-10-15 date, in the body of #5955
-     (opened 2026-10-16); the evidence artefact is the approving review of
-     this change by a reviewer other than its author. The exceptions are temporary, 13 rows at
-     acceptance, and are to be revisited by **2026-11-30**. This is not a
-     general waiver: a new UI-only capability needs its own ruling. The list
-     of record is issue #5955 plus the rows carrying
-     `exception:#5955 revisit:2026-11-30` in `scripts/ci/api-parity/*.json`.
+     is reported to have accepted these server-rendered fragments, which have
+     no REST v1 or MCP twin yet, as temporary exceptions to Decisions 1 and 4
+     on 2026-10-15 (#5859, #5872, #5873, #5880). The recorded ground, for
+     #5859, is that the Dashboard rework should not wait on building its
+     twins; the same ruling was extended to the other three. That acceptance
+     is attributed to a retrospective quotation in the body of #5955 (opened
+     2026-10-16); there is no contemporaneous ruling on the four pull
+     requests that this entry can cite, and no independent approving review
+     of the entry yet, so it is recorded on that basis until a colleague's
+     review of the change that carries it endorses the bounded exception. It
+     covers only the missing REST v1 and MCP twins of 13 rows in this change
+     and changes no authentication, authorization or audit behaviour. The
+     exceptions are to be revisited by **2026-11-30**. This is not a general
+     waiver: a new UI-only capability, or any extension, needs its own
+     recorded ruling. The list of record is issue #5955 plus the rows
+     carrying `exception:#5955 revisit:2026-11-30` in
+     `scripts/ci/api-parity/*.json`.
      The gate requires the dated shape for any new exception but does not yet
      cap how many there are. Growth is review-enforced for now, as is
      re-dating, re-pointing or relabelling an existing exception row. A
