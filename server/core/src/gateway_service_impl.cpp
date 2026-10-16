@@ -1288,7 +1288,7 @@ gw_enrolled:
         // there is nothing to renew.
         spdlog::debug("[gateway] ProxyRegister: adopted presented session {} for agent {} "
                       "(store-confirmed={})",
-                      session_id, safe_agent_id, store_confirmed_adopt);
+                      ::yuzu::log_key_token(session_id), safe_agent_id, store_confirmed_adopt);
     } else {
         // -- Fresh registration (unchanged behavior) --------------------------
         session_id =
@@ -1340,7 +1340,7 @@ gw_enrolled:
                 lost_epoch_race = true;
                 spdlog::debug("[gateway] ProxyRegister: register_fresh for agent {} session {} "
                               "lost the epoch race to a newer connection",
-                              safe_agent_id, session_id);
+                              safe_agent_id, ::yuzu::log_key_token(session_id));
             }
         }
     }
@@ -1425,7 +1425,7 @@ gw_enrolled:
     }
 
     spdlog::info("[gateway] ProxyRegister succeeded: agent={}, session={}", safe_agent_id,
-                 session_id);
+                 ::yuzu::log_key_token(session_id));
     return grpc::Status::OK;
 }
 

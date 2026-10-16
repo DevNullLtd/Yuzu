@@ -1431,22 +1431,42 @@ TEST_CASE("Register increment sites only use the closed reason set, and ServerIm
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
     // Wiring pin: the seed function above is only useful while server.cpp still calls it.
-    // The pin is the exact call spelling and the line it sits on must not be a comment, so a
-    // commented-out call or a prose mention of it does not satisfy the pin. The limit: a line is
-    // rejected only when its first non-blank characters are `//`, so a mention after code on the
-    // same line, or inside a block comment, is still counted.
+    // The pin is the exact call spelling, counted after every `/* ... */` block and every `//`
+    // line remainder is removed in one left-to-right pass (whichever comment opener comes first
+    // wins, so a `/*` inside a line comment opens nothing), so a commented-out call, a trailing
+    // comment and a prose mention in a block or line comment do not satisfy it. The call text
+    // contains no quote or slash, so a plain strip is enough. The limits: the strip is not
+    // string-literal aware (a `//` or `/*` inside a string literal removes text that is code),
+    // and it does not see preprocessor exclusion (`#if 0`), so a call inside a disabled region
+    // still counts. The first limit already applies to server.cpp: the literal "/scim/v2/*" near
+    // the SCIM request counter opens a phantom block comment that removes a stretch of real code
+    // after it, so a duplicate call placed there would not be counted (the pin around the real
+    // call, which is far from that stretch, is unaffected).
     {
-        const std::string server_src = read_server_source("server.cpp");
+        const std::string raw_src = read_server_source("server.cpp");
+        std::string server_src;
+        server_src.reserve(raw_src.size());
+        for (std::size_t i = 0; i < raw_src.size();) {
+            if (raw_src.compare(i, 2, "/*") == 0) {
+                const auto close = raw_src.find("*/", i + 2);
+                if (close == std::string::npos)
+                    break;
+                i = close + 2;
+                server_src += ' ';
+            } else if (raw_src.compare(i, 2, "//") == 0) {
+                const auto eol = raw_src.find('\n', i);
+                if (eol == std::string::npos)
+                    break;
+                i = eol;
+            } else {
+                server_src += raw_src[i++];
+            }
+        }
         const std::string call = "seed_register_invalid_agent_id_series(metrics_)";
         std::size_t live_calls = 0;
         for (auto pos = server_src.find(call); pos != std::string::npos;
-             pos = server_src.find(call, pos + 1)) {
-            const auto line_start = server_src.rfind('\n', pos);
-            const auto from = line_start == std::string::npos ? 0 : line_start + 1;
-            const auto first = server_src.find_first_not_of(" \t", from);
-            if (first != std::string::npos && server_src.compare(first, 2, "//") != 0)
-                ++live_calls;
-        }
+             pos = server_src.find(call, pos + 1))
+            ++live_calls;
         CHECK(live_calls == 1);
     }
 

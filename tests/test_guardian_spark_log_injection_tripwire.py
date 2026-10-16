@@ -189,7 +189,8 @@ escape them silently;
 this makes it fail loudly instead. A new file added to check 2 is covered by
 extending that tuple, not by this note.
 
-CHECK 6 (PQ_ERROR_FILES, STORE_ERROR_FILES, POOL_ERROR_FILES): store error text. Every spdlog::
+CHECK 6 (PQ_ERROR_FILES, STORE_ERROR_FILES, STORE_ERROR_MEMBER_FILES, POOL_ERROR_FILES): store
+error text. Every spdlog::
 argument that contains a PQerrorMessage( or PQresultErrorMessage( call in
 custom_properties_store.cpp, tag_store.cpp and pg/pg_pool.cpp must be wrapped (libpq error text can
 quote the claimed agent id), and so must every argument that contains a `last_error()` call (the
@@ -197,7 +198,9 @@ pool's connection-failure text, which can carry libpq text) in custom_properties
 tag_store.cpp. It matches the call name only, with no data flow: a value copied into a local first
 is not seen, which is why pg_pool.cpp's connect-failure line (it prints a local `err` copied from
 PQerrorMessage) is wrapped by hand but not covered here. The same rule keyed on a store `.error()`
-argument covers config_routes.cpp and custom_properties_routes.cpp (STORE_ERROR_FILES).
+argument covers config_routes.cpp and custom_properties_routes.cpp (STORE_ERROR_FILES), and the
+store result's `error` MEMBER (`res.error`, not a call) is covered in guardian_ingest.cpp
+(STORE_ERROR_MEMBER_FILES): an spdlog argument containing it must be wrapped.
 
 CHECK 7 (PKI_SIGNER_FILES, server/core/src/server.cpp only) covers the PKI signer
 legs of the Register / ProxyRegister path: an spdlog:: statement whose format literal starts with
@@ -270,9 +273,10 @@ STILL OPEN (stated plainly; every check is lexical, a regression net and not a p
     macros are not recognised at all, in any file;
   - a call whose first argument is not a string literal, including `fmt::format(...)` handed to
     spdlog, is skipped (the SECOND KNOWN LIMITATION above);
-  - guardian_ingest.cpp's ingest-error line wraps the store's `res.error` MEMBER (not a `.error()`
-    call), which no marker matches: that line is wrapped by hand, and the unit test for it only
-    observes the printed text, not the fold;
+  - the store `error` MEMBER rule (STORE_ERROR_MEMBER_FILES) matches the name `res` only, in
+    guardian_ingest.cpp only: another variable name for a store result, a member read through a
+    differently named local, or an error string copied into a local first is not seen, and the
+    unit test for that line only observes the printed text, not the fold;
   - the registry check proves the groups are registered and live, not that REQUIRED_RULE_GROUPS
     and the `*_FILES` constants themselves are complete: a deliberate edit of both still passes.
 
@@ -1239,11 +1243,22 @@ def _marker_regex(marker: str) -> "re.Pattern[str]":
 PQ_ERROR_MARKERS: tuple[str, ...] = ("PQerrorMessage(", "PQresultErrorMessage(")
 
 
+# Same rule, fourth marker: a store result's `error` MEMBER (not a `.error()` call), which no
+# call-shaped marker matches. guardian_ingest.cpp prints the store's `res.error` (fixed text plus
+# libpq error text that can quote an offending value) in its ingest-error warning. The marker is a
+# compiled pattern so find_pq_error_violations_in_text takes it beside the call-name markers: the
+# name `res` must not be the tail of a longer name or member chain, and `res.error()`, `res.errors`
+# and `res.error_code` are not the member.
+STORE_ERROR_MEMBER_FILES: tuple[str, ...] = ("server/core/src/guardian_ingest.cpp",)
+STORE_ERROR_MEMBER_RE = re.compile(r"(?<![\w.>:])res\s*\.\s*error\b(?!\s*\()")
+STORE_ERROR_MEMBER_MARKERS: tuple["str | re.Pattern[str]", ...] = (STORE_ERROR_MEMBER_RE,)
+
+
 def find_pq_error_violations_in_text(
-    text: str, markers: tuple[str, ...] = PQ_ERROR_MARKERS
+    text: str, markers: "tuple[str | re.Pattern[str], ...]" = PQ_ERROR_MARKERS
 ) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
-    marker_res = [_marker_regex(m) for m in markers]
+    marker_res = [m if isinstance(m, re.Pattern) else _marker_regex(m) for m in markers]
     for pos, stmt in find_spdlog_statements_with_pos(text):
         parsed = parse_call(stmt)
         if parsed is None:
@@ -1937,6 +1952,35 @@ def _selfcheck() -> None:
     for src in routes_error_must_not:
         if find_pq_error_violations_in_text(src, (".error()",)):
             raise SystemExit(f"selfcheck: unexpected routes store .error() violation: {src!r}")
+    # 9c. The store `error` MEMBER rule (guardian_ingest.cpp's `res.error`).
+    member_must_match = [
+        'spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}", '
+        "log_id_token(agent_id), log_id_token(ev_row.rule_id), res.error);",
+        'spdlog::warn("x {}", res . error);',
+        'spdlog::warn("x {}", std::string(res.error));',
+        'spdlog::warn("x {}", log_key_token(res.error) + res.error);',
+    ]
+    for src in member_must_match:
+        if not find_pq_error_violations_in_text(src, STORE_ERROR_MEMBER_MARKERS):
+            raise SystemExit(f"selfcheck: expected a store error member violation: {src!r}")
+    member_must_not = [
+        'spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}", '
+        "log_id_token(agent_id), log_id_token(ev_row.rule_id), log_key_token(res.error));",
+        'spdlog::warn("x {}", ::yuzu::log_key_token (res . error));',
+        'spdlog::warn("x {}", res.error());',
+        'spdlog::warn("x {}", res.errors);',
+        'spdlog::warn("x {}", res.error_code);',
+        'spdlog::warn("x {}", other_res.error);',
+        'spdlog::warn("x {}", s.res.error);',
+        'spdlog::warn("x {}", res.status);',
+    ]
+    for src in member_must_not:
+        if find_pq_error_violations_in_text(src, STORE_ERROR_MEMBER_MARKERS):
+            raise SystemExit(f"selfcheck: unexpected store error member violation: {src!r}")
+    if not _store_error_member_hits('spdlog::warn("x {}", renamed.error);', "anchor.cpp"):
+        raise SystemExit("selfcheck: a file with no res.error member use must be reported")
+    if _store_error_member_hits('spdlog::warn("x {}", log_key_token(res.error));', "anchor.cpp"):
+        raise SystemExit("selfcheck: a wrapped res.error member use must not be reported")
     path_key_must_match = 'spdlog::error("PUT /api/config/{}: failed", key);'
     if not find_agent_id_violations_in_text(path_key_must_match, ("key",)):
         raise SystemExit(f"selfcheck: expected a raw path-key violation: {path_key_must_match!r}")
@@ -2173,6 +2217,21 @@ def _snippet(stmt: str) -> str:
     return " ".join(stmt.split())[:160]
 
 
+def _store_error_member_hits(text: str, rel: str) -> list[str]:
+    """Hits for the store error MEMBER rule, plus an anchor check.
+
+    The rule matches the name `res` only, so a rename or a removal of the wrapped site would
+    leave it matching nothing and the group would pass silently. The file therefore has to
+    contain at least one spdlog statement that uses `res.error` (a comment mention does not
+    count); if it does not, that is reported as a hit so
+    the rule gets re-pointed at the new name instead of going quiet.
+    """
+    hits = _fmt_stmt_hits(rel, find_pq_error_violations_in_text(text, STORE_ERROR_MEMBER_MARKERS))
+    if not any(STORE_ERROR_MEMBER_RE.search(stmt) for _, stmt in find_spdlog_statements_with_pos(text)):
+        hits.append(f"{rel}: no spdlog statement uses `res.error` any more; update STORE_ERROR_MEMBER_RE")
+    return hits
+
+
 class RuleGroup(NamedTuple):
     """One rule group of the scan, as main() runs it.
 
@@ -2248,6 +2307,13 @@ RULE_GROUPS: tuple[RuleGroup, ...] = (
         'spdlog::error("write failed: {}", result.error());',
     ),
     RuleGroup(
+        "STORE_ERROR_MEMBER_FILES",
+        lambda: STORE_ERROR_MEMBER_FILES,
+        lambda text, rel: _store_error_member_hits(text, rel),
+        "agent",
+        'spdlog::warn("ingest error: {}", res.error);',
+    ),
+    RuleGroup(
         "POOL_ERROR_FILES",
         lambda: POOL_ERROR_FILES,
         lambda text, rel: _fmt_stmt_hits(rel, find_pq_error_violations_in_text(text, POOL_ERROR_MARKERS)),
@@ -2291,6 +2357,7 @@ REQUIRED_RULE_GROUPS: tuple[str, ...] = (
     "AGENT_ID_FILES",
     "PQ_ERROR_FILES",
     "STORE_ERROR_FILES",
+    "STORE_ERROR_MEMBER_FILES",
     "POOL_ERROR_FILES",
     "REGISTRY_FREE_TEXT_FILES",
     "COMMAND_TEXT_FILES",
