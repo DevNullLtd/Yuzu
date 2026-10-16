@@ -1,5 +1,5 @@
 #include "healthcheck_probe.hpp"
-#include "file_utils.hpp"
+#include "gateway_peer_pinset.hpp"
 
 #include <yuzu/server/auth.hpp>
 
@@ -39,15 +39,29 @@ std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) 
         // (`CERTIFICATE`, `X509 CERTIFICATE`, `TRUSTED CERTIFICATE`), so a file this function
         // cannot read as "plain certificate first" would trust the issuing CA behind the leaf and,
         // with hostname checking off, any sibling leaf under it. An unreadable or
-        // certificate-less file is a loading error naming the anchor instead.
-        const auto pem = first_pem_certificate(detail::read_file_contents(t.trust_anchor));
+        // certificate-less file is a loading error naming the anchor instead. The read is
+        // bounded (regular files only, 64 KiB): a FIFO, /dev/zero or a huge file cannot hold
+        // the probe or its memory, and a non-Ok read takes the same loading-error path.
+        const auto anchor = gateway_peer::read_file_bounded(t.trust_anchor.string(), 64 * 1024);
+        const auto pem = anchor.status == gateway_peer::FileReadResult::Status::Ok
+                             ? first_pem_certificate(anchor.content)
+                             : std::string{};
         if (pem.empty())
             throw std::runtime_error(
-                "SSL certificate loading failed: the anchor file has no usable "
-                "-----BEGIN CERTIFICATE----- block (the first certificate in it must be a plain "
-                "CERTIFICATE block holding the server certificate)");
+                "SSL certificate loading failed: the anchor file is missing, unreadable, larger "
+                "than 64 KiB, or holds no usable -----BEGIN CERTIFICATE----- block (the first "
+                "certificate in it must be a plain CERTIFICATE block holding the server "
+                "certificate)");
         X509_STORE_set_flags(SSL_CTX_get_cert_store(ctx), X509_V_FLAG_PARTIAL_CHAIN);
         c->load_ca_cert_store(pem.data(), pem.size());
+        // httplib's load_ca_cert_store is void and drops the PEM reader's result: a block with
+        // the right markers but an undecodable body would load nothing and surface as a
+        // misleading verification failure. The store is empty before this call (no CA path is
+        // set; httplib loads certificates only at connect), so exactly one object means it took.
+        if (sk_X509_OBJECT_num(X509_STORE_get0_objects(SSL_CTX_get_cert_store(ctx))) != 1)
+            throw std::runtime_error(
+                "SSL certificate loading failed: the first -----BEGIN CERTIFICATE----- block of "
+                "the anchor file does not decode as a certificate");
     } else {
         // Default-CA mode: the one-CA default-ca.pem the server itself writes, loaded whole.
         c->set_ca_cert_path(t.trust_anchor.string());
@@ -161,18 +175,19 @@ int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag
     } catch (...) {
         outcome = HealthcheckOutcome{.status = 0, .error = "unknown exception"};
     }
-    const HealthcheckOutcome timed_out{
-        .status = 0, .error = "timed out after " + std::to_string(deadline.count()) + " ms"};
-    const HealthcheckOutcome& result = outcome ? *outcome : timed_out;
+    const bool timed_out = !outcome;
+    if (timed_out)
+        outcome = HealthcheckOutcome{
+            .status = 0, .error = "timed out after " + std::to_string(deadline.count()) + " ms"};
+    const HealthcheckOutcome& result = *outcome;
     const int code = healthcheck_exit_code(result);
     if (code != 0) {
         diag << healthcheck_diagnostic(target, result) << '\n';
         diag.flush(); // required before hard_exit: _Exit runs no stream destructors
     }
     // The abandoned worker is blocked in httplib/OpenSSL, so production skips static destructors
-    // (std::_Exit). A test hook that returns falls through to `return code`, which never
-    // dereferences *outcome on this branch.
-    if (!outcome)
+    // (std::_Exit). A test hook that returns falls through to `return code`.
+    if (timed_out)
         hard_exit(code);
     return code;
 }

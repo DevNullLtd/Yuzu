@@ -18,7 +18,8 @@
 ///   - /health, /api/health call ONLY resolve_session_fn (non-blocking) —
 ///     always 200, response SHAPE differs by session presence.
 ///   - /fragments/health/summary calls deny_service_scoped_fn THEN auth_fn
-///     (blocking) — the one route in this cluster that actually gates.
+///     (blocking) — one of the two routes in this cluster that gate on a session
+///     (with /fragments/dashboard/health).
 
 #include "health_routes.hpp"
 #include "http_route_sink.hpp"
@@ -553,7 +554,7 @@ TEST_CASE("health_routes: /health's TLS block degrades gracefully with a "
     CHECK(body["tls"]["ca_fingerprint"] == "");
 }
 
-// ── /fragments/health/summary — the one route in this cluster that gates ───
+// ── /fragments/health/summary — one of the two routes in this cluster that gate ──
 
 TEST_CASE("health_routes: /fragments/health/summary gates on "
           "deny_service_scoped_fn BEFORE auth_fn",
@@ -683,6 +684,11 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // request counter, and the bounded shutdown wait that covers its thread.
     expect("redirect_server_->new_task_queue = [redirect_pool]", 1,
            "the redirect listener has its own fixed pool, not httplib's dynamic default");
+    // The pool size is a value, not just a shape: 0 or 1 threads would wedge or starve the probe
+    // port, and an uncapped size scales with the host's core count (a pids-limit boot failure).
+    expect("const std::size_t redirect_pool = "
+           "std::min<std::size_t>(CPPHTTPLIB_THREAD_POOL_MAX_COUNT, 64);",
+           1, "the redirect pool is httplib's maximum capped at 64 threads");
     expect("new httplib::ThreadPool(redirect_pool, redirect_pool)", 1,
            "base == max: the dynamic-growth branch stays dead");
     expect("install_plaintext_post_routing(*redirect_server_", 1,
@@ -703,15 +709,25 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
            1, "the shared counter lambda carries the metric name and all three labels");
     // The method label is normalised: a rejected request's raw request-line token is
     // attacker-controlled on the plain port, so a revert to req.method must redden on its own,
-    // by name, not only via the exact-spelling check above (#5906 CODEX-R3-1).
+    // by name, not only via the exact-spelling check above (#5906, adversarial review round 3).
     expect("http_method_label(req.method)", 1,
            "the request counter's method label is bounded, never the raw request-line token");
     expect("count_http_request(req, res);", 1,
            "the main post-routing handler counts through the shared lambda");
-    expect("redirect_thread_done_ = true;", 1,
-           "the redirect thread signals stop()'s bounded wait");
-    expect("(redirect_thread_done_ || !redirect_thread_.joinable())", 1,
-           "stop() waits for the redirect thread inside the one 15s bound");
+    expect("redirect_thread_done_ = true; } web_thread_done_cv_.notify_all();", 1,
+           "the redirect thread sets its flag under the mutex and wakes stop()'s bounded wait");
+    expect("return (web_thread_done_ || !web_thread_.joinable()) && "
+           "(redirect_thread_done_ || !redirect_thread_.joinable());",
+           1, "stop() waits for BOTH listener threads inside the one 15s bound");
+    expect("const bool web_wedged = web_thread_.joinable() && !web_thread_done_;", 1,
+           "the web thread's wedged state reads the web flag");
+    expect("const bool redirect_wedged = redirect_thread_.joinable() && !redirect_thread_done_;", 1,
+           "the redirect thread's wedged state reads the redirect flag");
+    expect(R"(const char* const who = web_wedged ? (redirect_wedged
+                                                          ? "web and redirect listener threads"
+                                                          : "web listener thread")
+                                                   : "redirect listener thread";)",
+           1, "the force-exit line names the thread(s) that are actually wedged");
     // The bound and the force-exit line are what an operator sees on a wedged shutdown. The
     // behaviour itself is proven by a real-process shutdown run (the redirect-trickle probe),
     // which the unit suite cannot host (ServerImpl needs Postgres), so these are source-text
@@ -730,6 +746,10 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
            "the false 'cannot hang' comment (and its bare join) stays gone");
     expect("listener failed to bind or exited with an error", 2,
            "both listen() results are checked and logged");
+    expect("if (!redirect_server_->listen(cfg_.web_address, cfg_.web_port))", 1,
+           "a failed redirect bind or accept error is the branch that logs");
+    expect("if (!web_server_->listen(cfg_.web_address, listen_port))", 1,
+           "a failed web bind or accept error is the branch that logs");
     // The redirect listener exists only behind the guard, and is built at exactly one site.
     expect("if (cfg_.https_enabled && cfg_.https_redirect)", 1,
            "the redirect listener is built only when HTTPS and the redirect are on");
@@ -738,6 +758,13 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // The pre-routing lambda must not be re-forked inline in server.cpp.
     expect("redirect_server_->set_pre_routing_handler", 0,
            "the redirect pre-routing is not re-forked in server.cpp");
+    // httplib REPLACES a re-set handler, so a later post-routing registration on the redirect
+    // listener would silently drop its headers and request counter.
+    expect("redirect_server_->set_post_routing_handler", 0,
+           "the redirect post-routing is installed once, through install_plaintext_post_routing");
+    // stop() must stop the redirect listener, or its thread never returns and every shutdown
+    // burns the whole 15 s bound before the force-exit.
+    expect("redirect_server_->stop();", 1, "stop() stops the redirect listener");
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,7 +1261,8 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
     counted(6, "GET", 400);
 
     // Two distinct request-line methods httplib REJECTS (400) are still handed to post-routing
-    // with the raw token; the counter must collapse them into one label (#5906 CODEX-R3-1).
+    // with the raw token; the counter must collapse them into one label (#5906, adversarial
+    // review round 3).
     // The client writes req.method verbatim and no body byte is sent (no #2757 RST hazard).
     // This case injects its own callback, so it cannot observe the production lambda: it proves
     // the parser hands rejected tokens to post-routing and that http_method_label collapses

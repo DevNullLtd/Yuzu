@@ -200,6 +200,35 @@ TEST_CASE("healthcheck: first_pem_certificate refuses a certificate under anothe
                                 a) == a);
 }
 
+TEST_CASE("healthcheck: first_pem_certificate reads a block the way OpenSSL does",
+          "[server][healthcheck]") {
+    // OpenSSL's reader (the server's own chain loader, on the same --https-cert file) accepts
+    // a BEGIN line only at the start of a line, after an optional UTF-8 BOM on the first. A
+    // marker in mid-line text is not the first certificate: returning it would anchor the
+    // probe on the CA body that follows, while the server presents the LEAF behind it.
+    const std::string a = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    const std::string b = "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
+    // The mid-line marker shape: `# CA: <ca block>` ahead of the real leaf.
+    CHECK(first_pem_certificate("# CA: " + a + b).empty());
+    CHECK(first_pem_certificate("x" + a).empty());
+    CHECK(first_pem_certificate("  " + a).empty()); // an indented BEGIN is not a line start
+    // A BOM is skipped only as the very first three bytes.
+    const std::string bom = "\xEF\xBB\xBF";
+    CHECK(first_pem_certificate(bom + a) == a);
+    CHECK(first_pem_certificate(bom + a + b) == a);
+    CHECK(first_pem_certificate("x" + bom + a).empty());
+    CHECK(first_pem_certificate(bom + bom + a).empty());
+    // A marker after a newline is a line start (CRLF files included).
+    CHECK(first_pem_certificate("prose\r\n" + a) == a);
+    // A block carrying a PEM header is refused: OpenSSL would prompt for a pass phrase on
+    // stderr, a second line against the one-line contract (a base64 body never holds ':').
+    CHECK(first_pem_certificate("-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n"
+                                "DEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF\n\n"
+                                "AAAA\n-----END CERTIFICATE-----\n" +
+                                b)
+              .empty());
+}
+
 TEST_CASE("healthcheck: only HTTP 200 is healthy", "[server][healthcheck]") {
     CHECK(healthcheck_exit_code({200, {}}) == 0);
     CHECK(healthcheck_exit_code({301, {}}) == 1);
@@ -747,9 +776,18 @@ TEST_CASE("healthcheck: an anchor that cannot be loaded fails as a loading error
     const auto ca = gwt::make_ca("hc-ca");
     const auto leaf = gwt::make_leaf(ca, "hc-server", true, false);
     write_file(tmp.path / "garbage.pem", "this is not a certificate\n");
+    // Right markers but half a body: httplib's load_ca_cert_store drops the PEM reader's result,
+    // so only the store count turns this into a loading error (not a verification failure).
+    {
+        const auto& pem = leaf.cert_pem;
+        const auto body = pem.find('\n') + 1;
+        const auto half = body + (pem.rfind("-----END") - body) / 2;
+        write_file(tmp.path / "truncated.pem",
+                   pem.substr(0, pem.find('\n', half) + 1) + "-----END CERTIFICATE-----\n");
+    }
     auto srv = tls_server(tmp.path, leaf);
 
-    for (const char* name : {"missing.pem", "garbage.pem"}) {
+    for (const char* name : {"missing.pem", "garbage.pem", "truncated.pem"}) {
         INFO("anchor: " << name);
 
         const auto t = tls_target(srv->port, tmp.path / name, false);
@@ -763,17 +801,52 @@ TEST_CASE("healthcheck: an anchor that cannot be loaded fails as a loading error
         CHECK(operator_mode_diagnostic(srv->port, op.trust_anchor).find(name) !=
               std::string::npos);
     }
+
+    // Operator mode: a first block that will not decode is a loading error too.
+    {
+        const auto op = tls_target(srv->port, tmp.path / "truncated.pem", true);
+        CHECK_THROWS_WITH(probe_once(op), ContainsSubstring("does not decode"));
+        const auto line = operator_mode_diagnostic(srv->port, op.trust_anchor);
+        CHECK(line.find("SSL certificate loading failed") != std::string::npos);
+        CHECK(line.find("verification") == std::string::npos);
+    }
+
+    // The anchor read is bounded at 64 KiB: a valid leaf first, then padding. At exactly the
+    // bound it loads and the probe answers 200; one byte over, the file is refused as a loading
+    // error (a FIFO or /dev/zero would otherwise hold the probe or its memory).
+    {
+        constexpr std::size_t kBound = 64 * 1024;
+        const auto padded = [&](std::size_t size) {
+            std::string content = leaf.cert_pem;
+            content.resize(size, '#');
+            return content;
+        };
+        write_file(tmp.path / "at-bound.pem", padded(kBound));
+        write_file(tmp.path / "over-bound.pem", padded(kBound + 1));
+
+        const auto at = tls_target(srv->port, tmp.path / "at-bound.pem", true);
+        CHECK(probe_once(at).status == 200);
+
+        const auto over = tls_target(srv->port, tmp.path / "over-bound.pem", true);
+        CHECK_THROWS_WITH(probe_once(over), ContainsSubstring("larger than 64 KiB"));
+        const auto line = operator_mode_diagnostic(srv->port, over.trust_anchor);
+        CHECK(line.find("exception: SSL certificate loading failed") != std::string::npos);
+    }
 }
 
-TEST_CASE("healthcheck: operator mode refuses a first certificate under an alias label - never "
+TEST_CASE("healthcheck: operator mode refuses a first certificate it cannot read as plain - never "
           "the CA behind it",
           "[server][healthcheck][live]") {
     // `openssl x509 -trustout` writes TRUSTED CERTIFICATE, and some tools write X509 CERTIFICATE;
     // the server's own chain loader reads both. Here the leaf carries the alias label and the
     // plain CA follows it. Skipping the leaf would anchor the probe on the CA, and with
     // PARTIAL_CHAIN set and hostname checking off a SIBLING leaf under that CA would pass.
-    // Mutation: make first_pem_certificate step over the alias block (or fall back to
-    // set_ca_cert_path in operator mode) and the sibling answers 200.
+    // The same hole, third spelling: marker text MID-LINE ahead of the CA body. OpenSSL's reader
+    // skips that line and reads the real leaf, but a scanner matching the marker anywhere
+    // returned the CA body.
+    // Mutation: make first_pem_certificate step over the alias block, match a marker that is
+    // not at a line start (or fall back to set_ca_cert_path in operator mode) and the sibling
+    // answers 200.
     yuzu::test::TempDir tmp{"yuzu_test_healthcheck-"};
     fs::create_directories(tmp.path);
     const auto ca = gwt::make_ca("hc-ca");
@@ -790,17 +863,22 @@ TEST_CASE("healthcheck: operator mode refuses a first certificate under an alias
         }
         return pem;
     };
-    for (const char* label : {"X509 CERTIFICATE", "TRUSTED CERTIFICATE"}) {
-        INFO("label: " << label);
-        const auto anchor = tmp.path / "alias-anchor.pem";
-        write_file(anchor, relabel(leaf.cert_pem, label) + ca.cert_pem);
+    const auto expect_refused = [&](const char* name, const std::string& content) {
+        INFO("anchor: " << name);
+        const auto anchor = tmp.path / name;
+        write_file(anchor, content);
 
         const auto t = tls_target(srv_sibling->port, anchor, true);
         CHECK_THROWS_WITH(probe_once(t), ContainsSubstring("SSL certificate loading failed"));
         const auto line = operator_mode_diagnostic(srv_sibling->port, anchor);
         CHECK(line.find("exception: SSL certificate loading failed") != std::string::npos);
-        CHECK(line.find("alias-anchor.pem") != std::string::npos);
+        CHECK(line.find(name) != std::string::npos);
+    };
+    for (const char* label : {"X509 CERTIFICATE", "TRUSTED CERTIFICATE"}) {
+        INFO("label: " << label);
+        expect_refused("alias-anchor.pem", relabel(leaf.cert_pem, label) + ca.cert_pem);
     }
+    expect_refused("midline-anchor.pem", "# CA: " + ca.cert_pem + leaf.cert_pem);
 }
 
 TEST_CASE("healthcheck: a leaf from another CA is refused with the OpenSSL reason",

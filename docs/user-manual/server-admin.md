@@ -5452,14 +5452,14 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 
 ### Probing a TLS-enabled server
 
-The shipped images contain no `curl` (the chiselled image ships a static busybox with `wget`, see `deploy/docker/Dockerfile.server.chisel`), and images built before this change answer every request on the HTTP port with a redirect when HTTPS is on. Two mechanisms let an orchestrator probe such a server.
+The shipped images contain no `curl` (the chiselled image ships a static busybox with `wget`, see `deploy/docker/Dockerfile.server.chisel`), and images built before `--healthcheck` existed (#5906) answer every request on the HTTP port with a redirect when HTTPS is on. Two mechanisms let an orchestrator probe such a server.
 
-**1. The HTTP port answers the four probes directly, in cleartext.** With HTTPS on, the redirect listener (`--web-port`, `8080` by default) serves `/livez`, `/readyz`, `/health` and `/api/health` without redirecting. The port is **unencrypted and unauthenticated**: `/health` returns the version, the store names, `agents.online` and the `tls` block (whether default certificates are active, the install CA fingerprint and its expiry), and a failing `/readyz` names the failed stores and the Postgres state. Publish it only to the orchestrator network or `127.0.0.1`, bind it to loopback with `--web-address 127.0.0.1`, or remove it with `--no-https-redirect`. The rules:
+**1. The HTTP port answers the four probes directly, in cleartext.** With HTTPS on, the redirect listener (`--web-port`, `8080` by default) serves `/livez`, `/readyz`, `/health` and `/api/health` without redirecting. The port is **unencrypted and unauthenticated**: `/health` returns the version, the store names, `agents.online` and the `tls` block (whether default certificates are active, the install CA fingerprint and its expiry), and a failing `/readyz` names the failed stores and the Postgres state. Publish it only to the orchestrator network or `127.0.0.1`, or remove it with `--no-https-redirect`. `--web-address 127.0.0.1` binds the HTTPS dashboard to loopback too (both listeners share that address), so it is not a way to restrict only the plain port: for that, use network placement or `--no-https-redirect`. The rules:
 
 - `GET` and `HEAD` only, on those exact paths. Every other path, any other method, and a probe that declares a request body (`Content-Length`, even `0`, or `Transfer-Encoding`) still receives the `301` to HTTPS; the HTTPS listener does answer a probe with `Content-Length: 0`.
 - No session is ever resolved on this port. `/health` and `/api/health` always return the unauthenticated shape here (no `agents.pending`, `executions.*` or `system.*`), even when the request carries a valid session cookie.
 - Every answer is `503 {"status":"not ready","reason":"https_listener_not_serving"}` while the HTTPS listener is not bound or has exited. The check means "bound and not yet exited", not "accepting": if the HTTPS listener hits a fatal accept error, requests it had already accepted keep answering normally until they finish, while new connections are refused. A broken certificate reload that leaves the socket open is not seen by this check; use `--healthcheck` for that. A failed HTTPS bind logs an error and turns plain `/livez` into `503` as well, so a liveness probe on this port restarts the server: that is intended, the port never reports healthy for a server whose HTTPS listener is down.
-- The listener has a fixed worker pool and no request deadline, so many idle or trickling connections can make plain-port probes time out while the server itself is fine. Keep it on the orchestrator network, and use `--healthcheck` for any check that restarts the container.
+- The listener has a fixed worker pool (at most 64 threads, created at boot; count them in any `pids`/`TasksMax` budget) and no request deadline, so many idle or trickling connections can make plain-port probes time out while the server itself is fine. Keep it on the orchestrator network, and use `--healthcheck` for any check that restarts the container.
 - A server started with `--no-https-redirect` has no HTTP listener, so there is nothing to probe on this port.
 
 **2. `yuzu-server --healthcheck`.** Probes the real HTTPS listener from inside the container and exits `0` only on HTTP 200:
@@ -5489,15 +5489,21 @@ Operator certificate (the same `--https-cert` the server uses; the probe trusts 
 ```yaml
 healthcheck:
   test: ["CMD", "yuzu-server", "--healthcheck", "--https-cert", "/etc/yuzu/tls/server.pem"]
-  interval: 10s
+  interval: 30s
   timeout: 5s
   retries: 3
   start_period: 30s
 ```
 
-Kubernetes `exec` probe. `timeoutSeconds` defaults to 1, which is under the probe's own 4 s bound, so always set it to 5 or more:
+Kubernetes `exec` probe. `timeoutSeconds` defaults to 1, which is under the probe's own 4 s bound, so always set it to 5 or more. The `startupProbe` holds the liveness probe off for up to 5 minutes, because a large upgrade's first boot builds an index before anything answers (see `docs/user-manual/upgrading.md`):
 
 ```yaml
+startupProbe:
+  exec:
+    command: ["yuzu-server", "--healthcheck", "--healthcheck-path", "/livez"]
+  failureThreshold: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
 livenessProbe:
   exec:
     command: ["yuzu-server", "--healthcheck", "--healthcheck-path", "/livez"]
@@ -5511,8 +5517,8 @@ Notes:
 - A check that restarts the container (Kubernetes liveness, Swarm, autoheal) should use `--healthcheck-path /livez`: a database outage turns `/readyz` red on every replica, and restarting them all fixes nothing. Keep the default `/readyz` for readiness and Compose `depends_on: condition: service_healthy`. Never set `timeout` below 5 s.
 - If the server runs with a non-default `--ca-dir` or `--https-port`, repeat them on the healthcheck line.
 - Once `--https-cert` is set, a `default-ca.pem` left in the certificate directory by an earlier default-certs boot is **not** used. Omitting `--https-cert` from the healthcheck line while the server uses an operator certificate makes the probe anchor on that stale file and report `SSL server verification failed`.
-- After you rotate the `--https-cert` file, the probe anchors on the new certificate while the server keeps serving the old one until its next reload (`--cert-reload-interval`, 60 s by default), and reports `SSL server verification failed` in between. Make `interval` × `retries` longer than the reload interval, or restart the server after rotating.
-- Images built before this change exit on the unknown argument; keep their existing probes.
+- After you rotate the `--https-cert` file, the probe anchors on the new certificate while the server keeps serving the old one until its next reload (`--cert-reload-interval`, 60 s by default), and reports `SSL server verification failed` in between. Make `interval` × `retries` longer than the reload interval, or restart the server after rotating. An expired certificate fails the probe with `certificate has expired`, and a restart cannot fix that: renew the certificate.
+- Images built before `--healthcheck` existed (#5906) exit on the unknown argument; keep their existing probes.
 
 ### Load balancers and shutdown drain
 
@@ -5580,7 +5586,8 @@ A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first s
 
 | Port | Service | Deployment |
 |---|---|---|
-| 8080 | Web dashboard + REST API | Always |
+| 8080 | HTTP→HTTPS redirect + cleartext health probes (`--no-https-redirect` removes it) | Always when HTTPS is on |
+| 8443 | Web dashboard + REST API (HTTPS) | Always |
 | 50051 | gRPC (agent connections) | Always -- server in standalone, gateway in scaled |
 | 50052 | gRPC (management) | Always |
 | 50055 | gRPC (gateway upstream) | Gateway deployments only |

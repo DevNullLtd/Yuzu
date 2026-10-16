@@ -10337,8 +10337,8 @@ public:
             // signal handler, so this wait is silent-by-design up to 15s with no
             // progress evidence — indistinguishable from a genuine wedge to an operator
             // watching logs. One line here costs nothing and closes that gap.
-            spdlog::info("Shutting down server: waiting up to 15s for the web and redirect "
-                         "listener threads to finish...");
+            spdlog::info("Shutting down server: waiting up to 15s for the listener thread(s) "
+                         "to finish...");
             std::unique_lock<std::mutex> lk(web_thread_done_mtx_);
             // One 15s bound covers both listeners. A listener thread that was never started
             // (not joinable) counts as done.
@@ -15371,7 +15371,8 @@ private:
         // handed the same callable, so a label change reaches both listeners' series (#5906).
         // The method is normalised through http_method_label: httplib counts requests it rejects
         // (400) with the raw request-line token, which an unauthenticated peer on the plain port
-        // controls, so the raw value would mint an unbounded series set (#5906 CODEX-R3-1).
+        // controls, so the raw value would mint an unbounded series set (#5906, adversarial
+        // review round 3).
         //
         // principal_class: bounded actor class (ADR-1005, execution-plan
         // PR 1.2) — human / agent / none / engine. "engine" is live as of
@@ -15459,9 +15460,15 @@ private:
         if (cfg_.https_enabled && cfg_.https_redirect) {
             redirect_server_ = std::make_unique<httplib::Server>();
             // Eager fixed pool, as web_server_ (rationale at its pool: the default dynamic pool
-            // spawns on the accept loop with no handler); size = httplib's default MAXIMUM
-            // (4 x max(8, hw-1)), so capacity is unchanged.
-            const std::size_t redirect_pool = CPPHTTPLIB_THREAD_POOL_MAX_COUNT;
+            // spawns on the accept loop with no handler). Size = httplib's default maximum
+            // (4 x max(8, hw-1)) capped at 64: this port serves 301s and four probes, so the
+            // host's core count must not scale it outside kMaxHttpWorkerThreads and the
+            // --http-worker-threads TasksMax guidance. Up to 17 cores the cap is not reached
+            // (36 at 10); above that the pool is 64 threads, created at boot and resident for
+            // the life of the process. It is not slow-connection resistance: no pool size is
+            // (stop() bounds that wait instead).
+            const std::size_t redirect_pool =
+                std::min<std::size_t>(CPPHTTPLIB_THREAD_POOL_MAX_COUNT, 64);
             redirect_server_->new_task_queue = [redirect_pool] {
                 return new httplib::ThreadPool(redirect_pool, redirect_pool);
             };

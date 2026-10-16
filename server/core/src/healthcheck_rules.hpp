@@ -65,11 +65,21 @@ struct HealthcheckOutcome {
 /// mode anchors the probe on this block only (#5906): a full-chain `--https-cert` file also
 /// carries the issuing intermediate, and trusting that would let any sibling leaf under it pass,
 /// with hostname checking off.
+///
+/// Matches OpenSSL's reader, which the server's own chain loader uses on the same file:
+/// OpenSSL accepts a BEGIN line only at the start of a line (after an optional UTF-8 BOM on the
+/// first), so a marker in mid-line text is not the first certificate and returns empty; and a
+/// block carrying a PEM header (`Proc-Type`, `DEK-Info`) is refused, because OpenSSL would
+/// prompt for a pass phrase. OpenSSL also reads in 254-byte line chunks, a case where this
+/// function fails closed (empty) rather than agree. It may return empty where OpenSSL would
+/// load a certificate, never a different certificate than the one the server presents.
 [[nodiscard]] inline std::string first_pem_certificate(std::string_view pem) {
     constexpr std::string_view kBegin = "-----BEGIN CERTIFICATE-----";
     constexpr std::string_view kEnd = "-----END CERTIFICATE-----";
     const auto b = pem.find(kBegin);
     if (b == std::string_view::npos)
+        return {};
+    if (b != 0 && pem[b - 1] != '\n' && !(b == 3 && pem.starts_with("\xEF\xBB\xBF")))
         return {};
     if (pem.substr(0, b).find("CERTIFICATE-----") != std::string_view::npos)
         return {};
@@ -80,6 +90,9 @@ struct HealthcheckOutcome {
     // One block only: httplib loads every certificate in the text it is handed (stepping over a
     // TRUSTED one), so marker text in a comment or PEM header must not widen what is returned.
     if (block.find("-----BEGIN ", kBegin.size()) != std::string_view::npos)
+        return {};
+    // A base64 body never holds ':'; a PEM header does (`Proc-Type: 4,ENCRYPTED`).
+    if (block.find(':') != std::string_view::npos)
         return {};
     return std::string{block} + '\n';
 }

@@ -499,7 +499,7 @@ boots the `deploy/docker/*.yml` composes** — were:
 - **HTTPS healthcheck** — the compose healthchecks use a bash `/dev/tcp`
   plaintext HTTP GET against `/readyz`, which cannot complete a TLS handshake;
   switch to a TCP-connect liveness check or add `openssl s_client` (a
-  TLS-verifying probe is now possible with `yuzu-server --healthcheck`, #5906;
+  TLS-verifying probe is available with `yuzu-server --healthcheck`, #5906;
   the shipped composes still TCP-connect).
 - **Cert SAN ↔ dial name** — every name a client dials (e.g. the gateway dialing
   `server`, or an agent dialing `gateway`) must be in the dialled server's cert SAN.

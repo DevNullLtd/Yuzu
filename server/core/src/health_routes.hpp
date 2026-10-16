@@ -58,8 +58,8 @@
 ///     The redirect listener's responses carry the five security headers (no
 ///     HSTS) and are counted in `yuzu_http_requests_total` through
 ///     `install_plaintext_post_routing`; the 301s are counted too.
-///   - `/fragments/health/summary` is the one route in this cluster that
-///     genuinely requires a session: `deps.deny_service_scoped_fn` first
+///   - `/fragments/health/summary` is one of the two routes in this cluster that
+///     require a session (with `/fragments/dashboard/health`): `deps.deny_service_scoped_fn` first
 ///     (guardian-confinement-2298 PR3 §3e — service-scoped tokens denied),
 ///     THEN `deps.auth_fn` (blocking `require_auth`, writes 401 on
 ///     failure) — same double-session-resolution shape documented in
@@ -121,9 +121,11 @@
 ///   GET /readyz                     (no gate — draining_, runtime pg_reachable, boot-latched store checks)
 ///   GET /fragments/health/summary   (deny_service_scoped_fn THEN auth_fn)
 ///   GET /fragments/dashboard/health (deny_service_scoped_fn THEN auth_fn; every
-///                                     outcome is a 200 panel note — the Dashboard
-///                                     health panel, which calls the registered
-///                                     `health_handler` in-process)
+///                                     outcome after auth is a 200 panel note —
+///                                     without a session auth_fn answers (401 for
+///                                     HX requests) — the Dashboard health panel,
+///                                     which calls the registered `health_handler`
+///                                     in-process)
 
 #include "authz_gates.hpp" // authz::FleetReadGate (Dashboard health panel)
 #include "security_headers.hpp"

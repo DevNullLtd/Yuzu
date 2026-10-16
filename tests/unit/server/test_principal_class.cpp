@@ -97,9 +97,9 @@ TEST_CASE("resolved classifier falls back to presentation when not an engine ses
 TEST_CASE("http_method_label keeps the methods httplib accepts and collapses the rest",
           "[principal-class][adr1005]") {
     // The ten methods httplib's request-line parser accepts each keep their own label...
-    constexpr std::array<std::string_view, 10> accepted{
+    constexpr std::array<std::string_view, 10> kAccepted{
         "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH", "PRI"};
-    for (const auto m : accepted) CHECK(http_method_label(m) == m);
+    for (const auto m : kAccepted) CHECK(http_method_label(m) == m);
     // ...and anything else, which httplib rejects with a 400 yet still hands to post-routing with
     // the raw token, collapses into the one UNKNOWN series (#5906). Case-sensitive like the parser.
     CHECK(http_method_label("get") == "UNKNOWN");

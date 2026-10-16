@@ -691,7 +691,9 @@ int main(int argc, char* argv[]) {
                    "--max-sse-streams, which is what you want; setting it clamps the stream "
                    "target to what your pool can carry. The whole pool is created at BOOT, so "
                    "size the host's process/thread limit (systemd TasksMax, container pids) at "
-                   "or above this number before starting.")
+                   "or above this number before starting. With HTTPS on, the HTTP->HTTPS "
+                   "redirect listener also creates its own fixed pool at boot (at most 64 "
+                   "threads); count them in the same budget.")
         // Ceiling is the real clamp the server applies (kMaxHttpWorkerThreads), so the
         // flag cannot accept a value the pool will silently refuse to honour.
         ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
@@ -840,7 +842,9 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_HTTPS_CERT");
     app.add_option("--https-key", cfg.https_key_path, "PEM private key for HTTPS")
         ->envname("YUZU_HTTPS_KEY");
-    app.add_flag("--no-https-redirect", "Disable HTTP→HTTPS redirect")
+    app.add_flag("--no-https-redirect",
+                 "Disable the HTTP→HTTPS redirect listener (and with it the cleartext health "
+                 "probes on --web-port)")
         ->each([&cfg](const std::string&) { cfg.https_redirect = false; });
 
     // #5906: in-image health probe. Deliberately NO envname on either option: a
@@ -849,7 +853,7 @@ int main(int argc, char* argv[]) {
     std::string healthcheck_path = "/readyz";
     app.add_flag("--healthcheck", healthcheck,
                  "Probe this server's health endpoint over the configured listener and exit 0 "
-                 "(HTTP 200) or 1; uses the same --no-https/--https-port/--web-port/"
+                 "(HTTP 200) or non-zero; uses the same --no-https/--https-port/--web-port/"
                  "--web-address/--https-cert/--ca-dir flags and env as the server");
     app.add_option("--healthcheck-path", healthcheck_path,
                    "Probe path: /readyz (default) or /livez")
