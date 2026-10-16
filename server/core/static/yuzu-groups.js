@@ -2,12 +2,16 @@
  * All server-derived text goes in with textContent.
  *
  *  - showToast (HX-Trigger from the enrolment routes): a toast. Error toasts stay until closed.
- *  - htmx:responseError / htmx:sendError on a LOAD-triggered fetch of a [data-denied] panel:
- *    401 -> /login, 403 -> the panel's denied note, anything else -> a failbox with Retry.
- *    A mutation's 4xx/5xx never reaches this: the list stays and the toast above reports it.
+ *  - htmx:responseError / htmx:sendError on a panel's OWN load ([data-denied] panel, GET, the
+ *    panel itself as source): 401 -> /login, 403 -> the panel's denied note, anything else ->
+ *    a failbox with Retry. The panel is replaced because its content is now unknown.
+ *  - The same two events on anything else (a mutation button or form in a panel): the list
+ *    stays and a persistent error toast says why. 401 -> /login. A response that already
+ *    carries a toast in HX-Trigger is not toasted a second time.
  *  - [data-copy-token]: copy the sibling <code> to the clipboard.
  *  - [data-token-form]: the "unlimited, never expires" warning follows the two limit fields.
- *  - htmx:confirm on [data-rule-form]: the Add-rule confirm names the match-everything case.
+ *  - htmx:confirm on [data-rule-form]: the server's Add-rule question, plus a sentence when
+ *    the typed rule matches every agent.
  */
 (function () {
   'use strict';
@@ -53,7 +57,7 @@
     var end = el('div', 'end');
     var btn = el('button', 'btn sm', 'Retry');
     btn.type = 'button';
-    btn.dataset.act = 'reload';
+    btn.dataset.gact = 'reload';
     btn.dataset.target = target.id;
     end.appendChild(btn);
     box.appendChild(msg);
@@ -61,11 +65,38 @@
     target.replaceChildren(box);
   }
 
-  // True only for the panel's own GET (load, SSE or refresh trigger), never for a button in it.
+  // True only for the panel's own GET (load, SSE or refresh trigger, or Retry), never for a
+  // button in it: htmx fires these events on the source element, and the panel is its own
+  // source and target only when it asked for itself.
   function ownLoad(e) {
     var t = e.detail && e.detail.target;
     var cfg = e.detail && e.detail.requestConfig;
     return !!t && t === e.target && t.hasAttribute('data-denied') && !!cfg && cfg.verb === 'get';
+  }
+
+  // Source = the panel so a failed Retry is an own load too (a 401 on retry still signs out).
+  function reload(panel) {
+    if (panel && panel.dataset.src) htmx.ajax('GET', panel.dataset.src, { source: panel, target: panel });
+  }
+
+  // A request from inside a panel that the server refused (status) or that never arrived
+  // (status 0), other than the panel's own load. The list is left as it is and a persistent
+  // toast says what went wrong. A 409 means the list was stale, so it is re-read to make
+  // "refreshed" true. Requests from outside the panels (the shell's sign-out) are not ours.
+  var REFUSED = {
+    403: 'Not allowed',
+    409: 'That changed since you loaded it - the list has been refreshed'
+  };
+
+  function mutationFailed(e, status) {
+    if (!e.target.closest || !e.target.closest('[data-denied]')) return;
+    if (status === 401) { location.assign('/login'); return; }
+    var xhr = e.detail.xhr;
+    var trig = xhr && xhr.getResponseHeader ? xhr.getResponseHeader('HX-Trigger') : null;
+    if (trig && trig.indexOf('showToast') !== -1) return;
+    toast(status === 0 ? 'Could not reach the server'
+                       : REFUSED[status] || 'The server could not do that (HTTP ' + status + ')', 'error');
+    if (status === 409) reload(e.target.closest('[data-denied]'));
   }
 
   document.body.addEventListener('showToast', function (e) {
@@ -74,23 +105,19 @@
   });
 
   document.body.addEventListener('htmx:responseError', function (e) {
-    if (!ownLoad(e)) return;
     var s = e.detail.xhr.status;
+    if (!ownLoad(e)) { mutationFailed(e, s); return; }
     if (s === 401) { location.assign('/login'); return; }
     if (s === 403) denied(e.detail.target); else unavailable(e.detail.target);
   });
 
   document.body.addEventListener('htmx:sendError', function (e) {
-    if (ownLoad(e)) unavailable(e.detail.target);
+    if (ownLoad(e)) unavailable(e.detail.target); else mutationFailed(e, 0);
   });
 
   document.addEventListener('click', function (e) {
-    var r = e.target.closest('[data-act="reload"]');
-    if (r) {
-      var t = document.getElementById(r.dataset.target);
-      if (t && t.dataset.src) htmx.ajax('GET', t.dataset.src, { target: '#' + t.id });
-      return;
-    }
+    var r = e.target.closest('[data-gact="reload"]');
+    if (r) { reload(document.getElementById(r.dataset.target)); return; }
     var c = e.target.closest('[data-copy-token]');
     if (!c) return;
     var code = c.parentElement && c.parentElement.querySelector('code');
@@ -129,14 +156,15 @@
     return false;
   }
 
+  // The question is the one the server wrote on the form (e.detail.question); this adds the
+  // one fact only the typed value knows.
   document.body.addEventListener('htmx:confirm', function (e) {
     var f = e.detail.elt;
-    if (!f || !f.matches || !f.matches('[data-rule-form]')) return;
+    if (!f || !f.matches || !f.matches('[data-rule-form]') || !e.detail.question) return;
     e.preventDefault();
     var type = f.querySelector('[name="type"]').value;
     var value = f.querySelector('[name="value"]').value.trim();
-    var q = 'Add this rule? Agents matching it join the fleet without approval.';
-    if (type === 'hostname_glob') q += ' Hostnames are reported by the agent and are not verified.';
+    var q = e.detail.question;
     if (matchesEverything(type, value)) q += ' This matches every agent.';
     if (window.confirm(q)) e.detail.issueRequest(true);
   });
