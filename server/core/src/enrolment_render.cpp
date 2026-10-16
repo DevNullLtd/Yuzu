@@ -88,29 +88,47 @@ const char* rule_suffix(AutoApproveRuleType t) {
 // narrows and disabling or removing widens, with one exception at each end: with ZERO enabled
 // rules the engine matches nobody (auto_approve.cpp evaluate), so enabling the first rule WIDENS
 // admission from nobody to whatever that rule matches, and disabling or removing the LAST
-// enabled rule leaves nobody admitted.
-std::string enable_confirm(bool require_all, std::size_t enabled_count) {
-    if (!require_all || enabled_count == 0)
-        return "Enable this rule? Matching agents will join without approval.";
-    return "Require this rule as well? Fewer agents will join without approval.";
+// enabled rule leaves nobody admitted. Each names the rule's value: the list can change under a
+// stale view, and the operator confirms THIS rule. (attr_confirm escapes the finished text.)
+std::string quoted(const std::string& value) {
+    return "\"" + value + "\"";
 }
-std::string disable_confirm(bool require_all, std::size_t enabled_count) {
+std::string enable_confirm(bool require_all, std::size_t enabled_count, const std::string& value) {
+    if (!require_all || enabled_count == 0)
+        return "Enable rule " + quoted(value) + "? Matching agents will join without approval.";
+    return "Require rule " + quoted(value) + " as well? Fewer agents will join without approval.";
+}
+std::string disable_confirm(bool require_all, std::size_t enabled_count,
+                            const std::string& value) {
     if (!require_all)
         return "";
     if (enabled_count <= 1)
-        return "Disable the last enabled rule? No agent will join without approval until a rule "
-               "is enabled.";
-    return "Stop requiring this rule? More agents may join without approval.";
+        return "Disable the last enabled rule " + quoted(value) +
+               "? No agent will join without approval until a rule is enabled.";
+    return "Stop requiring rule " + quoted(value) + "? More agents may join without approval.";
 }
-std::string remove_confirm(bool require_all, bool enabled, std::size_t enabled_count) {
+std::string remove_confirm(bool require_all, bool enabled, std::size_t enabled_count,
+                           const std::string& value) {
+    const std::string head = "Remove rule " + quoted(value) + "?";
     if (require_all && enabled) {
         if (enabled_count <= 1)
-            return "Remove this auto-approve rule? It is the last enabled rule, so no agent will "
-                   "join without approval until a rule is enabled.";
-        return "Remove this auto-approve rule? It is currently required, so more agents may join "
-               "without approval.";
+            return head + " It is the last enabled rule, so no agent will join without approval "
+                          "until a rule is enabled.";
+        return head + " It is currently required, so more agents may join without approval.";
     }
-    return "Remove this auto-approve rule?";
+    return head;
+}
+
+// hx-vals naming the rule the operator is looking at (htmx 2 sends them as form fields on a
+// POST and as query parameters on a DELETE). The list position alone shifts under a concurrent
+// edit; the routes verify these against the rule now at that index and refuse a mismatch. An
+// `enabled` state is added for a toggle, which flips whatever state it finds.
+std::string attr_rule_vals(const auth::AutoApproveRule& r, bool with_enabled) {
+    std::string json = "{\"type\":\"" + auth::rule_type_to_string(r.type) + "\",\"value\":\"" +
+                       json_escape(r.value) + "\"";
+    if (with_enabled)
+        json += std::string(",\"enabled\":\"") + (r.enabled ? "1" : "0") + "\"";
+    return " hx-vals=\"" + esc(json + "}") + "\"";
 }
 
 std::string attr_confirm(const std::string& question) {
@@ -444,15 +462,18 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
                     (r.enabled ? pill("info", "Enabled") : pill("idle", "Disabled")) +
                     "</td><td class=\"acts\">";
             // Enabling widens (any mode) or narrows (all mode); the copy says which.
-            const std::string q = r.enabled ? disable_confirm(require_all, enabled_count)
-                                            : enable_confirm(require_all, enabled_count);
+            const std::string q = r.enabled ? disable_confirm(require_all, enabled_count, r.value)
+                                            : enable_confirm(require_all, enabled_count, r.value);
             html += "<button class=\"btn link\" type=\"button\" hx-post=\"" + base +
                     "/toggle\" hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\"" +
-                    attr_confirm(q) + ">" + (r.enabled ? "Disable" : "Enable") +
+                    attr_rule_vals(r, /*with_enabled=*/true) + attr_confirm(q) + ">" +
+                    (r.enabled ? "Disable" : "Enable") +
                     "</button>"
                     "<button class=\"btn link danger\" type=\"button\" hx-delete=\"" +
                     base + "\" hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\"" +
-                    attr_confirm(remove_confirm(require_all, r.enabled, enabled_count)) + ">Remove</button>";
+                    attr_rule_vals(r, /*with_enabled=*/false) +
+                    attr_confirm(remove_confirm(require_all, r.enabled, enabled_count, r.value)) +
+                    ">Remove</button>";
             html += "</td></tr>";
         }
         html += "</tbody></table></div>";

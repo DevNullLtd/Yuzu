@@ -5942,6 +5942,40 @@ void SettingsRoutes::register_routes(
         // stoul throws on overflow
         return idx_s.size() <= 9 ? static_cast<size_t>(std::stoul(idx_s)) : std::string::npos;
     };
+    // The rule identity a view states with a toggle or remove (hx-vals): `type` and `value`, and
+    // for a toggle the `enabled` state it saw. The list position alone shifts under a concurrent
+    // edit. Every field is optional - a script that sends none keeps the by-index behaviour - and
+    // the engine checks the stated ones against the rule now at that index under its own lock.
+    // A field that is present but malformed cannot be verified: nullopt, refused like a mismatch.
+    auto aa_expectation = [](const httplib::Request& req,
+                             bool with_enabled) -> std::optional<auth::RuleExpectation> {
+        auth::RuleExpectation expect;
+        if (req.has_param("type")) {
+            expect.type = auth::parse_auto_approve_rule_type(req.get_param_value("type"));
+            if (!expect.type)
+                return std::nullopt;
+        }
+        if (req.has_param("value"))
+            expect.value = req.get_param_value("value");
+        if (with_enabled && req.has_param("enabled")) {
+            const auto v = req.get_param_value("enabled");
+            if (v != "0" && v != "1")
+                return std::nullopt;
+            expect.enabled = (v == "1");
+        }
+        return expect;
+    };
+    // 409: the rule at that position is no longer the one the operator was looking at. Nothing
+    // changed; the toast says so and the refreshed list is the fix.
+    auto aa_stale = [this](const httplib::Request& req, httplib::Response& res,
+                           const char* action, const std::string& idx_s, const std::string& by) {
+        audit_fn_(req, action, "denied", "AutoApproveRule", idx_s, "stale_rule_view by=" + by);
+        res.status = 409;
+        res.set_header(
+            "HX-Trigger",
+            R"({"showToast":{"message":"That rule changed since this list was loaded - nothing was changed. Check the list and try again.","level":"warning"}})");
+        res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
+    };
 
     sink.Post("/api/settings/auto-approve",
               [this, origin_safe, aa_refuse, aa_attempt,
@@ -6017,8 +6051,8 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Post(R"(/api/settings/auto-approve/(\d+)/toggle)",
-              [this, origin_safe, aa_attempt, aa_persist_failed, aa_index](
-                  const httplib::Request& req, httplib::Response& res) {
+              [this, origin_safe, aa_attempt, aa_persist_failed, aa_index, aa_expectation,
+               aa_stale](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto session = auth_fn_(req, res);
@@ -6028,21 +6062,33 @@ void SettingsRoutes::register_routes(
                       return;
                   const auto by = audit_token(session->username);
                   const auto idx_s = req.matches[1].str();
+                  const auto expect = aa_expectation(req, /*with_enabled=*/true);
+                  if (!expect) {
+                      aa_stale(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by);
+                      return;
+                  }
                   if (!aa_attempt(req, res, "enrollment.auto_approve.rule_toggle", idx_s,
                                   "by=" + by))
                       return;
                   // The engine toggles and reports the rule it acted on under ONE lock, so the
-                  // audit row can never name a different rule than the one that changed.
-                  const auto edit = auto_approve_->toggle_rule(aa_index(idx_s));
+                  // audit row can never name a different rule than the one that changed, and
+                  // a stated rule identity is verified under that same lock.
+                  const auto edit = auto_approve_->toggle_rule(aa_index(idx_s), *expect);
                   using Status = auth::RuleEdit::Status;
                   if (edit.status == Status::persist_failed) {
                       aa_persist_failed(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by);
                       return;
                   }
+                  if (edit.status == Status::mismatch) {
+                      aa_stale(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by);
+                      return;
+                  }
                   if (edit.status == Status::ok) {
                       audit_fn_(req, "enrollment.auto_approve.rule_toggle", "success",
                                 "AutoApproveRule", idx_s,
-                                std::string("enabled=") + (edit.rule.enabled ? "1" : "0") +
+                                "type=" + auth::rule_type_to_string(edit.rule.type) +
+                                    " value=" + audit_token(edit.rule.value) +
+                                    " enabled=" + (edit.rule.enabled ? "1" : "0") +
                                     " by=" + by);
                   } else {
                       audit_fn_(req, "enrollment.auto_approve.rule_toggle", "denied",
@@ -6052,8 +6098,8 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Delete(R"(/api/settings/auto-approve/(\d+))",
-                [this, origin_safe, aa_attempt, aa_persist_failed, aa_index](
-                    const httplib::Request& req, httplib::Response& res) {
+                [this, origin_safe, aa_attempt, aa_persist_failed, aa_index, aa_expectation,
+                 aa_stale](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
                     auto session = auth_fn_(req, res);
@@ -6063,14 +6109,23 @@ void SettingsRoutes::register_routes(
                         return;
                     const auto by = audit_token(session->username);
                     const auto idx_s = req.matches[1].str();
+                    const auto expect = aa_expectation(req, /*with_enabled=*/false);
+                    if (!expect) {
+                        aa_stale(req, res, "enrollment.auto_approve.rule_remove", idx_s, by);
+                        return;
+                    }
                     if (!aa_attempt(req, res, "enrollment.auto_approve.rule_remove", idx_s,
                                     "by=" + by))
                         return;
-                    const auto edit = auto_approve_->remove_rule(aa_index(idx_s));
+                    const auto edit = auto_approve_->remove_rule(aa_index(idx_s), *expect);
                     using Status = auth::RuleEdit::Status;
                     if (edit.status == Status::persist_failed) {
                         aa_persist_failed(req, res, "enrollment.auto_approve.rule_remove", idx_s,
                                           by);
+                        return;
+                    }
+                    if (edit.status == Status::mismatch) {
+                        aa_stale(req, res, "enrollment.auto_approve.rule_remove", idx_s, by);
                         return;
                     }
                     if (edit.status == Status::ok) {

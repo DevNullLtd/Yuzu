@@ -902,7 +902,9 @@ TEST_CASE("settings auto-approve: toggle, remove and mode audit rows carry the f
     CHECK(row.result == "success");
     CHECK(row.target_type == "AutoApproveRule");
     CHECK(row.target_id == "0");
-    CHECK(row.detail == "enabled=0 by=admin");
+    // The audit row names the rule, not just its position: a position means a different rule
+    // once the list has been edited.
+    CHECK(row.detail == "type=hostname_glob value=*.corp enabled=0 by=admin");
 
     // Unknown index: denied, state untouched, exactly one row.
     h.audit_calls.clear();
@@ -928,6 +930,142 @@ TEST_CASE("settings auto-approve: toggle, remove and mode audit rows carry the f
     CHECK(row.result == "success");
     CHECK(row.target_id == "0");
     CHECK(row.detail == "value=*.corp label=corp by=admin");
+}
+
+// ── Rule identity (CS-1 / UP-2): toggle and remove are addressed by list position, which shifts
+// under a concurrent edit. The rendered buttons state the rule they were drawn for (type and
+// value, plus the enabled state a toggle saw) and the route verifies it. Absent fields keep the
+// by-index behaviour so scripts do not break.
+
+namespace {
+EnrollRoutesHarness& two_rules(EnrollRoutesHarness& h) {
+    REQUIRE(h.auto_approve.add_rule({auth::AutoApproveRuleType::hostname_glob, "a.corp", "A", true}));
+    REQUIRE(h.auto_approve.add_rule({auth::AutoApproveRuleType::ip_subnet, "10.0.0.0/8", "B", true}));
+    return h;
+}
+constexpr const char* kStaleToast = "That rule changed since this list was loaded";
+} // namespace
+
+TEST_CASE("settings auto-approve: a toggle that states the rule it saw acts on exactly that rule",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    two_rules(h);
+
+    auto r = h.sink.Post("/api/settings/auto-approve/1/toggle",
+                         "type=ip_subnet&value=10.0.0.0%2F8&enabled=1", kForm);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(h.auto_approve.list_rules()[0].enabled);
+    CHECK_FALSE(h.auto_approve.list_rules()[1].enabled);
+    const auto row = h.only("enrollment.auto_approve.rule_toggle");
+    CHECK(row.result == "success");
+    CHECK(row.target_id == "1");
+    CHECK(row.detail == "type=ip_subnet value=10.0.0.0/8 enabled=0 by=admin");
+}
+
+TEST_CASE("settings auto-approve: a toggle for a rule that moved or changed is a 409 and changes nothing",
+          "[settings_routes][enrollment][auto_approve]") {
+    struct Case {
+        const char* name;
+        const char* body;
+    };
+    // Position 0 holds a.corp (enabled). Each body states something that is no longer true there.
+    for (const Case& c : {Case{"another rule's value", "type=hostname_glob&value=b.corp&enabled=1"},
+                          Case{"another rule's type", "type=ip_subnet&value=a.corp&enabled=1"},
+                          Case{"a stale enabled state", "type=hostname_glob&value=a.corp&enabled=0"},
+                          Case{"an unknown type", "type=bogus&value=a.corp&enabled=1"},
+                          Case{"a malformed enabled", "type=hostname_glob&value=a.corp&enabled=yes"},
+                          Case{"the value alone", "value=b.corp"}}) {
+        INFO(c.name);
+        EnrollRoutesHarness h(/*with_store=*/false);
+        two_rules(h);
+        auto r = h.sink.Post("/api/settings/auto-approve/0/toggle", c.body, kForm);
+        REQUIRE(r);
+        CHECK(r->status == 409);
+        CHECK(r->get_header_value("HX-Trigger").find(kStaleToast) != std::string::npos);
+        CHECK(r->get_header_value("HX-Trigger").find("\"level\":\"warning\"") != std::string::npos);
+        // The refreshed list rides the 409 (the dashboard decides what to swap).
+        CHECK(r->body.find("a.corp") != std::string::npos);
+        // Nothing mutated.
+        const auto rules = h.auto_approve.list_rules();
+        REQUIRE(rules.size() == 2);
+        CHECK(rules[0].enabled);
+        CHECK(rules[1].enabled);
+        const auto row = h.only("enrollment.auto_approve.rule_toggle");
+        CHECK(row.result == "denied");
+        CHECK(row.detail == "stale_rule_view by=admin");
+    }
+}
+
+TEST_CASE("settings auto-approve: a remove that states the rule it saw acts on exactly that rule",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    two_rules(h);
+    // htmx 2 sends a DELETE's hx-vals as query parameters.
+    auto r = h.sink.Delete("/api/settings/auto-approve/1?type=ip_subnet&value=10.0.0.0%2F8");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    REQUIRE(h.auto_approve.list_rules().size() == 1);
+    CHECK(h.auto_approve.list_rules()[0].value == "a.corp");
+    const auto row = h.only("enrollment.auto_approve.rule_remove");
+    CHECK(row.result == "success");
+    CHECK(row.detail == "value=10.0.0.0/8 label=B by=admin");
+}
+
+TEST_CASE("settings auto-approve: a remove for a rule that moved is a 409 and removes nothing",
+          "[settings_routes][enrollment][auto_approve]") {
+    for (const char* query : {"?type=hostname_glob&value=b.corp", "?type=ip_subnet&value=a.corp",
+                              "?type=bogus&value=a.corp", "?value=gone.corp"}) {
+        INFO(query);
+        EnrollRoutesHarness h(/*with_store=*/false);
+        two_rules(h);
+        auto r = h.sink.Delete(std::string("/api/settings/auto-approve/0") + query);
+        REQUIRE(r);
+        CHECK(r->status == 409);
+        CHECK(r->get_header_value("HX-Trigger").find(kStaleToast) != std::string::npos);
+        CHECK(h.auto_approve.list_rules().size() == 2);
+        const auto row = h.only("enrollment.auto_approve.rule_remove");
+        CHECK(row.result == "denied");
+        CHECK(row.detail == "stale_rule_view by=admin");
+    }
+}
+
+// The scenario the identity exists for: a view of [A, B] is open, someone deletes A, and the
+// click meant for B (position 1) or the stale click on A (position 0) must not hit B.
+TEST_CASE("settings auto-approve: a stale view after a concurrent delete cannot act on another rule",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    two_rules(h);
+    REQUIRE(h.auto_approve.remove_rule(0).status == auth::RuleEdit::Status::ok); // [B]
+
+    // A's Remove (position 0 in the old view): B is there now. Refused.
+    auto r = h.sink.Delete("/api/settings/auto-approve/0?type=hostname_glob&value=a.corp");
+    REQUIRE(r);
+    CHECK(r->status == 409);
+    // B's Toggle (position 1 in the old view): no such position now. The by-index no-op.
+    h.audit_calls.clear();
+    r = h.sink.Post("/api/settings/auto-approve/1/toggle",
+                    "type=ip_subnet&value=10.0.0.0%2F8&enabled=1", kForm);
+    REQUIRE(r);
+    CHECK(h.only("enrollment.auto_approve.rule_toggle").result == "denied");
+    REQUIRE(h.auto_approve.list_rules().size() == 1);
+    CHECK(h.auto_approve.list_rules()[0].value == "10.0.0.0/8");
+    CHECK(h.auto_approve.list_rules()[0].enabled);
+}
+
+TEST_CASE("settings auto-approve: the rendered buttons round-trip through the routes",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    two_rules(h);
+    // The page asks htmx to send exactly these; a rule value with a '/' must survive the trip.
+    auto frag = h.sink.Get("/fragments/settings/auto-approve");
+    REQUIRE(frag);
+    CHECK(frag->body.find("&quot;value&quot;:&quot;10.0.0.0/8&quot;") != std::string::npos);
+    auto r = h.sink.Post("/api/settings/auto-approve/1/toggle",
+                         "type=ip_subnet&value=10.0.0.0%2F8&enabled=1", kForm);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK_FALSE(h.auto_approve.list_rules()[1].enabled);
 }
 
 TEST_CASE("settings auto-approve: an overlong numeric index is a denied no-op, not an exception",

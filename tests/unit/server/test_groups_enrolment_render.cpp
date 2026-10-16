@@ -465,7 +465,8 @@ TEST_CASE("enrolment rules: a match-everything rule wears a warning", "[groups][
 
 namespace {
 
-// The hx-confirm text of the button whose opening tag contains `anchor` ("" when it has none).
+// The hx-confirm text of the button whose opening tag contains `anchor`, as the browser shows it
+// ("" when it has none).
 std::string confirm_of(const std::string& html, const std::string& anchor) {
     const auto at = html.find(anchor);
     REQUIRE(at != std::string::npos);
@@ -474,7 +475,11 @@ std::string confirm_of(const std::string& html, const std::string& anchor) {
     if (attr == std::string::npos || attr > end)
         return {};
     const auto from = attr + std::string(" hx-confirm=\"").size();
-    return html.substr(from, html.find('"', from) - from);
+    std::string text = html.substr(from, html.find('"', from) - from);
+    // The browser un-escapes the attribute; the fixtures only carry &quot;.
+    for (auto q = text.find("&quot;"); q != std::string::npos; q = text.find("&quot;", q + 1))
+        text.replace(q, 6, "\"");
+    return text;
 }
 
 std::vector<auth::AutoApproveRule> rules_with(std::size_t enabled, std::size_t disabled) {
@@ -493,20 +498,35 @@ std::string remove_confirm_of(const std::string& html, std::size_t index) {
     return confirm_of(html, "hx-delete=\"/api/settings/auto-approve/" + std::to_string(index) + "\"");
 }
 
-constexpr const char* kEnableWidens = "Enable this rule? Matching agents will join without approval.";
-constexpr const char* kEnableNarrows =
-    "Require this rule as well? Fewer agents will join without approval.";
-constexpr const char* kDisableLast =
-    "Disable the last enabled rule? No agent will join without approval until a rule is enabled.";
-constexpr const char* kDisableWidens =
-    "Stop requiring this rule? More agents may join without approval.";
-constexpr const char* kRemoveLast =
-    "Remove this auto-approve rule? It is the last enabled rule, so no agent will join without "
-    "approval until a rule is enabled.";
-constexpr const char* kRemoveWidens =
-    "Remove this auto-approve rule? It is currently required, so more agents may join without "
-    "approval.";
-constexpr const char* kRemovePlain = "Remove this auto-approve rule?";
+// The confirm text names the rule's value, so the operator confirms THIS rule.
+std::string enable_widens(const std::string& v) {
+    return "Enable rule \"" + v + "\"? Matching agents will join without approval.";
+}
+std::string enable_narrows(const std::string& v) {
+    return "Require rule \"" + v + "\" as well? Fewer agents will join without approval.";
+}
+std::string disable_last(const std::string& v) {
+    return "Disable the last enabled rule \"" + v +
+           "\"? No agent will join without approval until a rule is enabled.";
+}
+std::string disable_widens(const std::string& v) {
+    return "Stop requiring rule \"" + v + "\"? More agents may join without approval.";
+}
+std::string remove_last(const std::string& v) {
+    return "Remove rule \"" + v +
+           "\"? It is the last enabled rule, so no agent will join without approval until a rule "
+           "is enabled.";
+}
+std::string remove_widens(const std::string& v) {
+    return "Remove rule \"" + v +
+           "\"? It is currently required, so more agents may join without approval.";
+}
+std::string remove_plain(const std::string& v) {
+    return "Remove rule \"" + v + "\"?";
+}
+// rules_with() names its rules on0.. (enabled) then off0.. (disabled).
+std::string on(std::size_t i) { return "on" + std::to_string(i); }
+std::string off(std::size_t i) { return "off" + std::to_string(i); }
 
 } // namespace
 
@@ -516,14 +536,14 @@ TEST_CASE("enrolment rules: any mode confirm copy ignores the enabled count",
     for (std::size_t enabled : {0u, 1u, 3u}) {
         INFO("enabled=" << enabled);
         const auto html = render_auto_approve(rules_with(enabled, 1), false);
-        CHECK(toggle_confirm(html, enabled) == kEnableWidens); // the disabled rule
-        CHECK(remove_confirm_of(html, enabled) == kRemovePlain);
+        CHECK(toggle_confirm(html, enabled) == enable_widens(off(0))); // the disabled rule
+        CHECK(remove_confirm_of(html, enabled) == remove_plain(off(0)));
         if (enabled > 0) {
             CHECK(toggle_confirm(html, 0).empty()); // disabling narrows: no confirm
-            CHECK(remove_confirm_of(html, 0) == kRemovePlain);
+            CHECK(remove_confirm_of(html, 0) == remove_plain(on(0)));
         }
         CHECK_THAT(html, !ContainsSubstring("Stop requiring"));
-        CHECK_THAT(html, !ContainsSubstring("Require this rule as well?"));
+        CHECK_THAT(html, !ContainsSubstring("Require rule"));
     }
 }
 
@@ -534,30 +554,80 @@ TEST_CASE("enrolment rules: all mode confirm copy follows the number of enabled 
           "[groups][enrolment][render]") {
     SECTION("zero enabled: enabling the first rule widens admission") {
         const auto html = render_auto_approve(rules_with(0, 2), true);
-        CHECK(toggle_confirm(html, 0) == kEnableWidens);
-        CHECK(toggle_confirm(html, 1) == kEnableWidens);
-        CHECK(remove_confirm_of(html, 0) == kRemovePlain); // a disabled rule is not required
-        CHECK_THAT(html, !ContainsSubstring("Require this rule as well?"));
+        CHECK(toggle_confirm(html, 0) == enable_widens(off(0)));
+        CHECK(toggle_confirm(html, 1) == enable_widens(off(1)));
+        CHECK(remove_confirm_of(html, 0) == remove_plain(off(0))); // a disabled rule is not required
+        CHECK_THAT(html, !ContainsSubstring("Require rule"));
     }
     SECTION("one enabled: it is the last, the other enables narrow") {
         const auto html = render_auto_approve(rules_with(1, 1), true);
-        CHECK(toggle_confirm(html, 0) == kDisableLast);
-        CHECK(remove_confirm_of(html, 0) == kRemoveLast);
-        CHECK(toggle_confirm(html, 1) == kEnableNarrows);
-        CHECK(remove_confirm_of(html, 1) == kRemovePlain);
+        CHECK(toggle_confirm(html, 0) == disable_last(on(0)));
+        CHECK(remove_confirm_of(html, 0) == remove_last(on(0)));
+        CHECK(toggle_confirm(html, 1) == enable_narrows(off(0)));
+        CHECK(remove_confirm_of(html, 1) == remove_plain(off(0)));
         CHECK_THAT(html, !ContainsSubstring("Stop requiring"));
         CHECK_THAT(html, !ContainsSubstring("It is currently required"));
     }
     SECTION("several enabled: disabling or removing one widens, enabling another narrows") {
         const auto html = render_auto_approve(rules_with(3, 1), true);
         for (std::size_t i = 0; i < 3; ++i) {
-            CHECK(toggle_confirm(html, i) == kDisableWidens);
-            CHECK(remove_confirm_of(html, i) == kRemoveWidens);
+            CHECK(toggle_confirm(html, i) == disable_widens(on(i)));
+            CHECK(remove_confirm_of(html, i) == remove_widens(on(i)));
         }
-        CHECK(toggle_confirm(html, 3) == kEnableNarrows);
-        CHECK(remove_confirm_of(html, 3) == kRemovePlain);
+        CHECK(toggle_confirm(html, 3) == enable_narrows(off(0)));
+        CHECK(remove_confirm_of(html, 3) == remove_plain(off(0)));
         CHECK_THAT(html, !ContainsSubstring("last enabled rule"));
     }
+}
+
+// The list position alone shifts under a concurrent edit, so each Toggle and Remove carries the
+// rule it was rendered for (type, value, and for a toggle the enabled state it saw) and the
+// route verifies it against the rule now at that index.
+TEST_CASE("enrolment rules: Toggle and Remove carry the rule identity they were rendered for",
+          "[groups][enrolment][render]") {
+    using T = auth::AutoApproveRuleType;
+    const std::vector<auth::AutoApproveRule> v = {
+        {T::hostname_glob, "EDI-*", "edinburgh", true},
+        {T::ip_subnet, "10.0.0.0/8", "lan", false},
+    };
+    const auto html = render_auto_approve(v, false);
+    const auto vals_of = [&](const std::string& anchor) {
+        const auto at = html.find(anchor);
+        REQUIRE(at != std::string::npos);
+        const auto end = html.find("</button>", at);
+        const auto attr = html.find(" hx-vals=\"", at);
+        REQUIRE(attr != std::string::npos);
+        REQUIRE(attr < end);
+        const auto from = attr + std::string(" hx-vals=\"").size();
+        return html.substr(from, html.find('"', from) - from);
+    };
+    CHECK(vals_of("auto-approve/0/toggle\"") ==
+          "{&quot;type&quot;:&quot;hostname_glob&quot;,&quot;value&quot;:&quot;EDI-*&quot;,"
+          "&quot;enabled&quot;:&quot;1&quot;}");
+    CHECK(vals_of("auto-approve/1/toggle\"") ==
+          "{&quot;type&quot;:&quot;ip_subnet&quot;,&quot;value&quot;:&quot;10.0.0.0/8&quot;,"
+          "&quot;enabled&quot;:&quot;0&quot;}");
+    // Remove states the rule but not its enabled state (a remove acts on the rule either way).
+    CHECK(vals_of("hx-delete=\"/api/settings/auto-approve/0\"") ==
+          "{&quot;type&quot;:&quot;hostname_glob&quot;,&quot;value&quot;:&quot;EDI-*&quot;}");
+    CHECK(vals_of("hx-delete=\"/api/settings/auto-approve/1\"") ==
+          "{&quot;type&quot;:&quot;ip_subnet&quot;,&quot;value&quot;:&quot;10.0.0.0/8&quot;}");
+}
+
+// A value is operator text: it is JSON-escaped first and then HTML-escaped, so it can neither
+// close the JSON string and add a key, nor close the attribute.
+TEST_CASE("enrolment rules: a hostile value stays inside its hx-vals string and attribute",
+          "[groups][enrolment][render]") {
+    using T = auth::AutoApproveRuleType;
+    const std::vector<auth::AutoApproveRule> v = {
+        {T::hostname_glob, "a\"b\\c<img src=x onerror=1>&'", "", true}};
+    const auto html = render_auto_approve(v, false);
+    // JSON-escaped first (a\" and \\), then HTML-escaped (" -> &quot; and so on).
+    CHECK_THAT(html, ContainsSubstring("&quot;value&quot;:&quot;a\\&quot;b\\\\c&lt;img src=x "
+                                       "onerror=1&gt;&amp;&#39;&quot;"));
+    CHECK_THAT(html, !ContainsSubstring("<img src=x"));
+    // The attribute count is unchanged: no injected attribute.
+    CHECK(count_of(html, " hx-vals=\"") == 3); // mode switch + Toggle + Remove
 }
 
 TEST_CASE("enrolment rules: add form keeps the field names, blocks colons, no inline handlers",
