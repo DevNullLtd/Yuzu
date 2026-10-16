@@ -148,7 +148,7 @@ Reserved for future implementation. Proto fields exist for `machine_certificate`
 
 Administrators can configure rules that automatically approve agents matching specific criteria, reducing manual toil for large deployments.
 
-**View current auto-approval policies (dashboard):** Navigate to **Estate > Groups and enrolment** (panel **Auto-approve rules**) or **Settings > Auto-Approve Policies**. Each rule is described by what it matches: a hostname rule matches the hostname the agent reports (not verified), an address rule matches the address the server sees (IPv4 only), a cloud provider rule matches the provider the agent reports (not verified), and a CA fingerprint rule never matches at this release. The match mode is two buttons (**Any rule matches (first match)** and **All enabled rules must match**) and each asks for confirmation. A rule that matches every agent is flagged **Matches every agent**.
+**View current auto-approval policies (dashboard):** Navigate to **Estate > Groups and enrolment** (panel **Auto-approve rules**) or **Settings > Auto-Approve Policies**. Each rule is described by what it matches: "Agent-reported hostname matches ..." and "Agent-reported provider ..." are marked "(not verified)" because the agent states the hostname and the attestation provider itself; "Address the server sees matches ..." is the connection's peer address (IPv4 only); and "Agent CA fingerprint ..." is marked "(never matches at this release)" because Register does not yet populate the fingerprint. The match mode is two buttons (**Any rule matches (first match)** and **All enabled rules must match**) and each asks for confirmation. A rule that matches every agent is flagged **Matches every agent**.
 
 **Add an auto-approval rule:**
 
