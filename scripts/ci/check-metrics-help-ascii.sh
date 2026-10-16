@@ -20,11 +20,13 @@
 # future HELP table is a one-line change:
 #
 #   (a) DESCRIBE_GLOB -- every paren-balanced `describe(` call's double-quoted
-#       string-literal arguments, across server/core/src/*.cpp AND
-#       agents/core/src/*.cpp (the agent registers its own metrics at
+#       string-literal arguments, across every *.cpp under server/core/src AND
+#       agents/core/src (the agent registers its own metrics at
 #       agents/core/src/agent.cpp, e.g. around the AgentImpl constructor, and
-#       would otherwise be uncovered), plus every *.hpp in those same
-#       directories. Headers are globbed rather than listed so a new header
+#       would otherwise be uncovered), plus every *.hpp under those same
+#       directories. Both trees are walked recursively (a file in a
+#       subdirectory such as server/core/src/pg/ is scanned too), and headers
+#       are found by that walk rather than listed so a new header
 #       that carries an inline `describe(` call is covered with no edit here;
 #       a header with no `describe(` call contributes nothing, and a
 #       `describe(` mentioned in a comment or a string literal is masked out
@@ -81,7 +83,6 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 
 "$PYTHON_BIN" - "$REPO_ROOT" "$SELFTEST" <<'PYEOF'
-import glob
 import os
 import re
 import shutil
@@ -211,9 +212,13 @@ def scan_describe_surface(root):
                 # silent pass (selftest fixture trees hold only the directories they seed).
                 findings.append((scan_dir, 0, 0, "<missing scan target>"))
             continue
-        found = sorted(glob.glob(os.path.join(base, "*.cpp"))) + sorted(
-            glob.glob(os.path.join(base, "*.hpp"))
-        )
+        # Recursive walk (no `**` glob, no bash-only construct): every .cpp and .hpp at any depth.
+        found = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if name.endswith((".cpp", ".hpp")):
+                    found.append(os.path.join(dirpath, name))
         if not found and root == repo_root:
             findings.append((scan_dir, 0, 0, "<missing scan target>"))
         paths.extend(found)
@@ -394,6 +399,28 @@ def run_selftest():
         if hdr_clean_findings:
             print(f"SELFTEST FAILED: header comment prose false-positived: {hdr_clean_findings}")
             return 1
+
+        # Seeded fixture (a, subdirectory): a describe() call in a header AND in a .cpp placed in
+        # a subdirectory of a scanned directory (as under server/core/src/pg/) is scanned too.
+        sub_dir = os.path.join(tmp, "subdir_seeded", "server", "core", "src", "pg")
+        os.makedirs(sub_dir)
+        with open(os.path.join(sub_dir, "pool_metrics.hpp"), "w", encoding="utf-8") as f:
+            f.write(
+                'inline void seed(Metrics& m) {\n'
+                '    m.describe("yuzu_pg_x_total", "Reintroduced em dash \u2014 in a subdir header", "counter");\n'
+                '}\n'
+            )
+        with open(os.path.join(sub_dir, "pool_metrics.cpp"), "w", encoding="utf-8") as f:
+            f.write(
+                'void f(Metrics& m) {\n'
+                '    m.describe("yuzu_pg_y_total", "Reintroduced em dash \u2014 in a subdir source", "counter");\n'
+                '}\n'
+            )
+        sub_findings = scan_describe_surface(os.path.join(tmp, "subdir_seeded"))
+        for suffix in ("pg/pool_metrics.hpp", "pg/pool_metrics.cpp"):
+            if not any(ord(ch) == 0x2014 and r.endswith(suffix) for r, _l, _b, ch in sub_findings):
+                print(f"SELFTEST FAILED: subdirectory fixture {suffix} was NOT flagged: {sub_findings}")
+                return 1
 
         # Metric NAME / TYPE arguments are never edited by the fix this gate
         # guards, and this gate scans EVERY literal in the call -- a

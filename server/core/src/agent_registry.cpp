@@ -67,9 +67,11 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     // the enrollment status first (get_pending_status) and return on error; AuthDB refuses any
     // id with a control byte or ',' there (agent_id_ok). The agent registry's other log lines
     // that print a session-table id (removal, rollback, session-timeout, sweep and
-    // dispatch-routing lines), and the enrollment store's own log lines (admitted, denied,
-    // consumed and added lines in auth_db.cpp), print it as stored: it carries no control byte,
-    // but space and '=' are not neutralised there, so those lines are not wrapped.
+    // dispatch-routing lines), and the enrollment store's own agent-id log lines in auth_db.cpp
+    // (the admin-denied warnings and the consumed, added-to-pending, approved, denied and
+    // removed-from-queue lines) and the server's command-forward, asset-tag push and quarantine
+    // dispatch-denied lines in server.cpp, print it as stored: it carries no control byte, but
+    // space and '=' are not neutralised there, so those lines are not wrapped.
     const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
     // Ingest filter (#3295): validated and non-service, mirroring TagStore's
     // own sync_agent_tags gate (tag_store.cpp) so a service claim or an

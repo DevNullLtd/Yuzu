@@ -197,7 +197,7 @@ pool's connection-failure text, which can carry libpq text) in custom_properties
 tag_store.cpp. It matches the call name only, with no data flow: a value copied into a local first
 is not seen, which is why pg_pool.cpp's connect-failure line (it prints a local `err` copied from
 PQerrorMessage) is wrapped by hand but not covered here. The same rule keyed on a store `.error()`
-argument covers config_routes.cpp (STORE_ERROR_FILES).
+argument covers config_routes.cpp and custom_properties_routes.cpp (STORE_ERROR_FILES).
 
 CHECK 7 (PKI_SIGNER_FILES, server/core/src/server.cpp only) covers the PKI signer
 legs of the Register / ProxyRegister path: an spdlog:: statement whose format literal starts with
@@ -209,17 +209,20 @@ rule and does not apply to the rest of server.cpp. server.cpp is also NOT in che
 would fail on; it has no `spdlog::log(` or `SPDLOG_*(` use.
 The same check also covers the gateway command-forward lines in server.cpp: an spdlog:: statement
 whose format literal starts with "Gateway SendCommand" must wrap a response frame's `agent_id()`
-(a peer-asserted value read back from the gateway) and the RPC status `error_message()`; the
-expected target `expected_agent_id` comes from the session table and is not matched.
+(a peer-asserted value read back from the gateway), the RPC status `error_message()`, any
+`.command_id()` accessor and any `.cluster_id` member or accessor; the expected target
+`expected_agent_id` comes from the session table and is not matched, and neither is the local
+`cmd_id` (a copy of the command id made before the print).
 
 WHAT CHECKS 2 TO 7 DELIBERATELY DO NOT COVER (session-resolved ids). Log lines that print an
 agent id read back from the session table or the enrollment store print it as stored: the
 Heartbeat / BatchHeartbeat and ReportInventory / ProxyInventory ingest paths and the shared
 ingestion modules they call, the Subscribe stream open and close lines, the agent registry's
 other log lines that print a session-table id (removal, rollback, session-timeout, sweep and
-dispatch-routing lines), and the enrollment store's own log lines (admitted, denied, consumed and
-added lines in auth_db.cpp); in agent_registry.cpp only claimed ids from `info.agent_id()` are
-matched.
+dispatch-routing lines), and the enrollment store's own agent-id log lines in auth_db.cpp (the
+admin-denied warnings and the consumed, added-to-pending, approved, denied and removed-from-queue
+lines) and the server's command-forward, asset-tag push and quarantine dispatch-denied lines in
+server.cpp; in agent_registry.cpp only claimed ids from `info.agent_id()` are matched.
 AuthDB's agent-id check (`agent_id_ok`, auth_db.cpp) has already refused control bytes and ',' for
 such an id, so it cannot add a newline-delimited line (it does accept U+0085, U+2028 and U+2029,
 which a splitlines()-style reader treats as breaks), but an id enrolled or imported before the
@@ -267,6 +270,9 @@ STILL OPEN (stated plainly; every check is lexical, a regression net and not a p
     macros are not recognised at all, in any file;
   - a call whose first argument is not a string literal, including `fmt::format(...)` handed to
     spdlog, is skipped (the SECOND KNOWN LIMITATION above);
+  - guardian_ingest.cpp's ingest-error line wraps the store's `res.error` MEMBER (not a `.error()`
+    call), which no marker matches: that line is wrapped by hand, and the unit test for it only
+    observes the printed text, not the fold;
   - the registry check proves the groups are registered and live, not that REQUIRED_RULE_GROUPS
     and the `*_FILES` constants themselves are complete: a deliberate edit of both still passes.
 
@@ -1192,8 +1198,12 @@ PQ_ERROR_FILES: tuple[str, ...] = (
 
 # Same rule, different marker: in config_routes.cpp the store's `.error()` text (which on the
 # database-failure path carries a kRuntimeConfigDbErrorPrefix plus libpq text) must be wrapped
-# wherever it is an spdlog argument.
-STORE_ERROR_FILES: tuple[str, ...] = ("server/core/src/config_routes.cpp",)
+# wherever it is an spdlog argument. custom_properties_routes.cpp is listed for the same reason:
+# its PUT 503 line and its POST property-schemas line print the store's `.error()` text.
+STORE_ERROR_FILES: tuple[str, ...] = (
+    "server/core/src/config_routes.cpp",
+    "server/core/src/custom_properties_routes.cpp",
+)
 
 # Same rule, third marker: the pool's own connection-failure text (`pool_.last_error()`), which
 # can carry libpq text, in these two stores only: other stores also print `pool_.last_error()` and are
@@ -1378,14 +1388,17 @@ _PKI_STORE_ERROR_RE = re.compile(r"\.\s*error\s*\(\s*\)")
 
 # The gateway command-forward lines in server.cpp ("Gateway SendCommand for {} ..."): a response
 # frame read back from a gateway carries a peer-asserted `agent_id()`, and the RPC status carries a
-# peer-asserted `error_message()`; both are printed only wrapped. The expected target
-# (`expected_agent_id`, taken from the session table) is a session-resolved id and is deliberately
-# not matched. Lexical, like the rest of this check: a literal that does not start with
+# peer-asserted `error_message()`; both are printed only wrapped. The same holds for a
+# `.command_id()` accessor and a `.cluster_id` member or accessor (the DROPPED line prints
+# `gp.cluster_id`). The expected target (`expected_agent_id`, taken from the session table) is a
+# session-resolved id and is deliberately not matched, and neither is the local `cmd_id` copy. Lexical, like the rest of this check: a literal that does not start with
 # "Gateway SendCommand", or a value copied into a local first, is not seen.
 _GATEWAY_FORWARD_LITERAL_PREFIX = "Gateway SendCommand"
 _GATEWAY_FORWARD_RAW_RE = re.compile(
     r"(?:\.|->)\s*agent_id\s*\(\s*\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
     r"|(?:\.|->)\s*error_message\s*\(\s*\)"
+    r"|(?:\.|->)\s*command_id\s*\(\s*\)"
+    r"|(?:\.|->)\s*cluster_id\b"
 )
 
 
@@ -1906,6 +1919,24 @@ def _selfcheck() -> None:
     store_must_not = 'spdlog::error("write failed: {}", ::yuzu::log_key_token(result.error()));'
     if find_pq_error_violations_in_text(store_must_not, (".error()",)):
         raise SystemExit(f"selfcheck: unexpected store .error() violation: {store_must_not!r}")
+    # The two custom_properties_routes.cpp shapes: a raw store `.error()` next to wrapped id and
+    # key arguments, and the single-argument POST line.
+    routes_error_must_match = [
+        'spdlog::error("PUT /api/agents/{}/properties/{}: {}", ::yuzu::log_id_token(agent_id), '
+        '::yuzu::log_key_token(key), result.error());',
+        'spdlog::error("POST /api/property-schemas: {}", result.error());',
+    ]
+    for src in routes_error_must_match:
+        if not find_pq_error_violations_in_text(src, (".error()",)):
+            raise SystemExit(f"selfcheck: expected a routes store .error() violation: {src!r}")
+    routes_error_must_not = [
+        'spdlog::error("PUT /api/agents/{}/properties/{}: {}", ::yuzu::log_id_token(agent_id), '
+        '::yuzu::log_key_token(key), ::yuzu::log_key_token(result.error()));',
+        'spdlog::error("POST /api/property-schemas: {}", ::yuzu::log_key_token(result.error()));',
+    ]
+    for src in routes_error_must_not:
+        if find_pq_error_violations_in_text(src, (".error()",)):
+            raise SystemExit(f"selfcheck: unexpected routes store .error() violation: {src!r}")
     path_key_must_match = 'spdlog::error("PUT /api/config/{}: failed", key);'
     if not find_agent_id_violations_in_text(path_key_must_match, ("key",)):
         raise SystemExit(f"selfcheck: expected a raw path-key violation: {path_key_must_match!r}")
@@ -2076,6 +2107,12 @@ def _selfcheck() -> None:
         'spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id, status.error_message(),'
         " code);",
         'spdlog::warn("Gateway SendCommand for {} unavailable: {}", cmd_id, status . error_message ());',
+        'spdlog::error("Gateway SendCommand for {} DROPPED: cluster_id \'{}\'", cmd_id,'
+        ' gp.cluster_id.value_or("<none>"));',
+        'spdlog::error("Gateway SendCommand for {} DROPPED: cluster_id \'{}\'", cmd_id,'
+        " gp . cluster_id);",
+        'spdlog::error("Gateway SendCommand for {} DROPPED", gp.cmd.command_id());',
+        'spdlog::error("Gateway SendCommand for {} DROPPED", resp . command_id ());',
     ]
     for src in pki_must_match:
         if not find_pki_signer_violations_in_text(src):
@@ -2101,6 +2138,9 @@ def _selfcheck() -> None:
         # The expected target is a session-resolved id, deliberately not matched.
         'spdlog::error("Gateway SendCommand for {} targeted \'{}\'", cmd_id, expected_agent_id);',
         'spdlog::warn("Gateway SendCommand for {} n {}", cmd_id, resp.agent_id().size());',
+        'spdlog::error("Gateway SendCommand for {} DROPPED: cluster_id \'{}\'", cmd_id,'
+        ' ::yuzu::log_id_token(gp.cluster_id.value_or("<none>")));',
+        'spdlog::error("Gateway SendCommand for {} DROPPED", ::yuzu::log_id_token(gp.cmd.command_id()));',
         # Not a PKI line: the broad bare-name rule is deliberately not applied to server.cpp.
         'spdlog::warn("Agent {} did a thing", agent_id);',
     ]

@@ -1432,7 +1432,9 @@ TEST_CASE("Register increment sites only use the closed reason set, and ServerIm
 #endif
     // Wiring pin: the seed function above is only useful while server.cpp still calls it.
     // The pin is the exact call spelling and the line it sits on must not be a comment, so a
-    // commented-out call or a prose mention of it does not satisfy the pin.
+    // commented-out call or a prose mention of it does not satisfy the pin. The limit: a line is
+    // rejected only when its first non-blank characters are `//`, so a mention after code on the
+    // same line, or inside a block comment, is still counted.
     {
         const std::string server_src = read_server_source("server.cpp");
         const std::string call = "seed_register_invalid_agent_id_series(metrics_)";

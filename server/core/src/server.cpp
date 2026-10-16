@@ -13620,14 +13620,16 @@ private:
                             // pr-rev finding (FortitudeEtc/Codex+Kimi, MINOR,
                             // 2026-09-22): the raw status.error_message()
                             // (peer addresses, TLS/HTTP2 transport text) is
-                            // already captured, unfiltered, in the spdlog::warn
-                            // a few lines up — the other four synthesis sites
-                            // all use a curated, static message; match that
-                            // convention here instead of persisting raw
-                            // transport text into error_detail. The numeric
-                            // grpc status code (already logged above too) is
-                            // enough to correlate a stored row back to the
-                            // server log line that has the full text.
+                            // not what the stored row should carry; the other
+                            // four synthesis sites all use a curated, static
+                            // message; match that convention here instead of
+                            // persisting raw transport text into error_detail.
+                            // The spdlog::warn a few lines up prints that text
+                            // control-folded and shortened to
+                            // kGuardianLogIdMaxBytes (log_key_token), so a
+                            // very long message is cut there too. The numeric
+                            // grpc status code (also logged above) is enough
+                            // to correlate a stored row back to that line.
                             apply_gateway_forward_terminal_failure(
                                 svc, expected_agent_id, cmd_id, "gateway_forward_failed",
                                 "Gateway SendCommand RPC failed with grpc status " +

@@ -2166,7 +2166,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                         "claims cluster_id '{}', which differs from this agent's already-bound "
                         "cluster affinity — REFUSING as a likely cross-cluster identity claim "
                         "(#4669), not publishing this placement anywhere",
-                        ::yuzu::log_id_token(agent_id), session_id,
+                        ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(session_id),
                         onbehalf::sanitize_for_log(cluster_id, 64));
                     record_directory_desync(metrics_, "announce_connected",
                                             "cluster_affinity_violation");
@@ -2213,7 +2213,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             spdlog::warn("[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) is "
                         "no longer the currently-installed session — rejecting the publish "
                         "rather than clobbering a newer registration's placement",
-                        session_id, ::yuzu::log_id_token(agent_id));
+                        ::yuzu::log_key_token(session_id), ::yuzu::log_id_token(agent_id));
             record_directory_desync(metrics_, "notify_stream_status", "stale_connected_session");
             response->set_acknowledged(false);
             return grpc::Status::OK;
@@ -2252,7 +2252,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             if (skip_announce) {
                 spdlog::debug("[gateway] NotifyStreamStatus CONNECTED: session {} lost its "
                              "register_fresh epoch race — skipping directory announce_connected",
-                             session_id);
+                             ::yuzu::log_key_token(session_id));
             } else if (auto res = gateway_route_store_->announce_connected(
                            agent_id, session_id, cluster_id, request->gateway_node(),
                            kGatewayRouteLeaseTtlSecs, stream_home_id);
@@ -2298,7 +2298,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                     spdlog::debug(
                         "[gateway] NotifyStreamStatus: cluster_affinity_violation revert "
                         "no-op for agent {} session {} — session already superseded",
-                        ::yuzu::log_id_token(agent_id), session_id);
+                        ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(session_id));
                 }
                 if (audit_store_ && audit_store_->is_open()) {
                     AuditEvent ev;
