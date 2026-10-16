@@ -30,19 +30,21 @@ Pass the encoding the child actually writes:
 
     subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")  # Node; git by default
 
-- A Python child (meson included) writes the locale code page on Windows, not UTF-8: add
-  `PYTHONUTF8=1` to the env the call already passes (`{**base_env, "PYTHONUTF8": "1"}`,
-  where `base_env` is `os.environ` only if the call passed no `env=`; a child run with
-  `-I` or `-E` ignores it) and decode as `utf-8`; decoding with `encoding="utf-8", errors="replace"` instead never raises but
-  turns its non-ASCII into U+FFFD.
+- A Python child (meson included) writes the locale code page on Windows, not UTF-8. Add
+  `PYTHONUTF8=1` to the env the call already passes, `{**base_env, "PYTHONUTF8": "1"}`,
+  and decode as `utf-8`; `base_env` is `os.environ` only if the call passed no `env=`. A
+  child run with `-I` or `-E` ignores the variable. Decoding with
+  `encoding="utf-8", errors="replace"` instead never raises in the parent but turns the
+  child's non-ASCII into U+FFFD, and a character outside the code page still crashes the
+  child itself.
 - For output you only log or scan (a long build, a streamed reader), use
   `encoding="utf-8", errors="replace"` so one stray byte cannot kill the reader (#4839).
 - `encoding=` also encodes `input=`.
 
-Best-effort: this rule sees only the text being written (a Write's whole file, an Edit's
-new text), so silence after an Edit does not mean the file is clean, and a call split
-across an Edit boundary or hidden behind an alias, `functools.partial` or `**kwargs` is
-missed, while a look-alike (a `def run(..., text=True)`, a docstring) can fire it, and
-each hit shows twice (before and after the tool call). It fires on any OS because the
-code it guards runs on the Windows CI leg. It matches `content`, not `new_text`, on
-purpose: `new_text` is empty for a Write.
+Best-effort: the rule sees only the text being written (a Write's whole file, an Edit's
+new text), so silence after an Edit does not mean the file is clean. It misses a call
+split across an Edit boundary or hidden behind an alias, `functools.partial` or
+`**kwargs`, and can fire on a look-alike (a `def run(..., text=True)`, a docstring). Each
+hit appears twice, before and after the tool call. It fires on any OS because the code it
+guards runs on the Windows CI leg. It matches `content`, not `new_text`, on purpose:
+`new_text` is empty for a Write.
