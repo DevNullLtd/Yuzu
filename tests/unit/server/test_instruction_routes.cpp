@@ -810,7 +810,9 @@ TEST_CASE("instruction_routes: instruction-set create/list/delete write an attem
     REQUIRE(list);
     CHECK(list->status == 200);
     bool found = false;
-    for (const auto& s : body(list->body)["sets"])
+    // Named local, not a range-for over a temporary's operator[]: it dangles before P2718R0 (#5924).
+    auto listed = body(list->body);
+    for (const auto& s : listed["sets"])
         found = found || (s["id"] == id);
     CHECK(found);
     CHECK(h.audits.size() == 2); // GET stays unaudited

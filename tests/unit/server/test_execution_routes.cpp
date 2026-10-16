@@ -332,7 +332,9 @@ TEST_CASE("execution_routes: unconfined LIST/detail/summary/agents/children roun
     REQUIRE(list);
     CHECK(list->status == 200);
     bool found = false;
-    for (const auto& e : body(list->body)["executions"])
+    // Named local, not a range-for over a temporary's operator[]: it dangles before P2718R0 (#5924).
+    auto listed = body(list->body);
+    for (const auto& e : listed["executions"])
         found = found || (e["id"] == *id);
     CHECK(found);
 
