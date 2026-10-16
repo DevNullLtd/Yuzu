@@ -5939,11 +5939,18 @@ void SettingsRoutes::register_routes(
         }
         return expect;
     };
-    // 409: the rule at that position is no longer the one the operator was looking at. Nothing
-    // changed; the toast says so and the refreshed list is the fix.
+    // True when the caller stated any part of the rule it meant (a view's button always does).
+    auto aa_identity_sent = [](const auth::RuleExpectation& e) {
+        return e.type.has_value() || e.value.has_value() || e.enabled.has_value();
+    };
+    // 409: the rule at that position is no longer the one the operator was looking at, or there
+    // is no rule at that position any more. Nothing changed; the toast says so and the refreshed
+    // list is the fix. `reason` is the audit detail's lead token.
     auto aa_stale = [this](const httplib::Request& req, httplib::Response& res,
-                           const char* action, const std::string& idx_s, const std::string& by) {
-        audit_fn_(req, action, "denied", "AutoApproveRule", idx_s, "stale_rule_view by=" + by);
+                           const char* action, const std::string& idx_s, const std::string& by,
+                           const char* reason = "stale_rule_view") {
+        audit_fn_(req, action, "denied", "AutoApproveRule", idx_s,
+                  std::string(reason) + " by=" + by);
         res.status = 409;
         res.set_header(
             "HX-Trigger",
@@ -6026,7 +6033,7 @@ void SettingsRoutes::register_routes(
 
     sink.Post(R"(/api/settings/auto-approve/(\d+)/toggle)",
               [this, origin_safe, aa_attempt, aa_persist_failed, aa_index, aa_expectation,
-               aa_stale](const httplib::Request& req, httplib::Response& res) {
+               aa_identity_sent, aa_stale](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto session = auth_fn_(req, res);
@@ -6053,8 +6060,14 @@ void SettingsRoutes::register_routes(
                       aa_persist_failed(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by);
                       return;
                   }
-                  if (edit.status == Status::mismatch) {
-                      aa_stale(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by);
+                  if (edit.status == Status::mismatch ||
+                      (edit.status == Status::not_found && aa_identity_sent(*expect))) {
+                      // A view that named a rule whose position no longer exists is as stale as
+                      // one whose position now holds another rule; a caller that named nothing
+                      // keeps the by-index no-op below.
+                      aa_stale(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by,
+                               edit.status == Status::mismatch ? "stale_rule_view"
+                                                               : "rule_not_found");
                       return;
                   }
                   if (edit.status == Status::ok) {
@@ -6073,7 +6086,7 @@ void SettingsRoutes::register_routes(
 
     sink.Delete(R"(/api/settings/auto-approve/(\d+))",
                 [this, origin_safe, aa_attempt, aa_persist_failed, aa_index, aa_expectation,
-                 aa_stale](const httplib::Request& req, httplib::Response& res) {
+                 aa_identity_sent, aa_stale](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
                     auto session = auth_fn_(req, res);
@@ -6098,14 +6111,18 @@ void SettingsRoutes::register_routes(
                                           by);
                         return;
                     }
-                    if (edit.status == Status::mismatch) {
-                        aa_stale(req, res, "enrollment.auto_approve.rule_remove", idx_s, by);
+                    if (edit.status == Status::mismatch ||
+                        (edit.status == Status::not_found && aa_identity_sent(*expect))) {
+                        aa_stale(req, res, "enrollment.auto_approve.rule_remove", idx_s, by,
+                                 edit.status == Status::mismatch ? "stale_rule_view"
+                                                                 : "rule_not_found");
                         return;
                     }
                     if (edit.status == Status::ok) {
                         audit_fn_(req, "enrollment.auto_approve.rule_remove", "success",
                                   "AutoApproveRule", idx_s,
-                                  "value=" + audit_token(edit.rule.value) +
+                                  "type=" + auth::rule_type_to_string(edit.rule.type) +
+                                      " value=" + audit_token(edit.rule.value) +
                                       " label=" + audit_token(edit.rule.label) + " by=" + by);
                         spdlog::info("Auto-approve rule {} removed by {}", idx_s, by);
                     } else {
