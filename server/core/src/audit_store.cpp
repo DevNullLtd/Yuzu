@@ -548,13 +548,13 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
         sql += " AND target_id = $" + std::to_string(idx++);
         binds.push_back(q.target_id);
     }
-    if (q.since > 0) {
+    if (q.since) {
         sql += " AND timestamp >= $" + std::to_string(idx++) + "::bigint";
-        binds.push_back(std::to_string(q.since));
+        binds.push_back(std::to_string(*q.since));
     }
-    if (q.until > 0) {
+    if (q.until) {
         sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
-        binds.push_back(std::to_string(q.until));
+        binds.push_back(std::to_string(*q.until));
     }
     // Prefix OR-group (auth./mfa./session. for the auth-log sample, #4).
     // Prefixes are code-controlled constants; each binds as `<prefix>%`. Any

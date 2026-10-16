@@ -405,7 +405,7 @@ TEST_CASE("GET /api/responses/:id (catch-all): an engaged scope that drops a res
     REQUIRE(body["responses"].size() == 1);
     CHECK(body["responses"][0]["agent_id"] == "in-scope-agent");
 
-    // Denied scope-drop row, THEN the fail-closed success row (#4644 Gate 7). This used to
+    // Denied scope-drop row, THEN the fail-closed success row (#4644). This used to
     // be the only row (size 1); the success row is new.
     REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "response.read");
@@ -421,7 +421,7 @@ TEST_CASE("GET /api/responses/:id (catch-all): an unconfined caller's genuinely-
     auto res = h.sink.Get("/api/responses/instr-nonexistent");
     REQUIRE(res);
     CHECK(res->status == 200);
-    // Was `audits.empty()` before #4644 Gate 7 made the legacy get fail-closed-audited: an
+    // Was `audits.empty()` before #4644 made the legacy get fail-closed-audited: an
     // admitted read of an empty result is still an access, exactly as on the v1 twin.
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].result == "success");
@@ -1116,7 +1116,36 @@ TEST_CASE("response_routes: wiring -- server.cpp still calls register_response_r
     CHECK(src.find("register_response_routes(") != std::string::npos);
 }
 
-// ── #4644 Gate 7: the legacy export writes a fail-closed success audit row ───
+// ── #4644: the shared strict integer primitive (query_int_parse.hpp) ──
+
+TEST_CASE("query_int_parse: parse_query_int/strict_stoi/strict_stoll accept exactly one base-10 "
+          "integer",
+          "[response_routes][strict_int]") {
+    using yuzu::server::parse_query_int;
+    using yuzu::server::strict_stoi;
+    using yuzu::server::strict_stoll;
+
+    CHECK(parse_query_int<int>("0") == 0);
+    CHECK(parse_query_int<int>("-1") == -1);
+    CHECK(parse_query_int<int>("007") == 7); // zero padding is not malformed
+    CHECK(parse_query_int<long long>("9223372036854775807") == 9223372036854775807LL);
+    CHECK(strict_stoi("2147483647") == 2147483647);
+    CHECK(strict_stoll("-9223372036854775807") == -9223372036854775807LL);
+
+    for (const char* bad : {"", " 1", "1 ", "+1", "1e3", "0x10", "100abc", "abc", "1.5", "--1",
+                            "4294967296", "-2147483649", "99999999999999999999"}) {
+        INFO("[" << bad << "]");
+        CHECK_FALSE(parse_query_int<int>(bad).has_value());
+        CHECK_THROWS_AS(strict_stoi(bad), std::invalid_argument);
+    }
+    CHECK_FALSE(parse_query_int<long long>("9223372036854775808").has_value());
+    CHECK_THROWS_AS(strict_stoll("100abc"), std::invalid_argument);
+    CHECK_THROWS_AS(strict_stoll(""), std::invalid_argument);
+    // std::stoi would have returned the prefix; that is exactly the bug.
+    CHECK(std::stoi("100abc") == 100);
+}
+
+// ── #4644: the legacy export writes a fail-closed success audit row ───
 
 TEST_CASE("GET /api/responses/:id/export: every served export writes ONE response.read success "
           "row CSV and JSON before any body",
@@ -1261,7 +1290,7 @@ TEST_CASE("GET /api/responses/:id/export: an audit row that does not persist or 
     }
 }
 
-// ── #4644 Gate 7: the legacy get and aggregate write fail-closed audit rows ──
+// ── #4644: the legacy get and aggregate write fail-closed audit rows ──
 //
 // The legacy export got the same treatment first (above). These cases run the two remaining
 // legacy reads through one table so a route cannot drift from its sibling.

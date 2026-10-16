@@ -9,6 +9,7 @@
 #include "json_extract.hpp"               // extract_json_string / _array / _map / _int
 #include "mcp_jsonrpc.hpp"                 // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "on_behalf_guard.hpp"            // onbehalf::sanitize_for_log
+#include "query_int_parse.hpp"           // read_json_int_strict (#4644)
 #include "rest_audit.hpp"                 // yuzu::server::detail::emit_behavioral_audit
 
 #include <spdlog/spdlog.h>
@@ -16,7 +17,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <exception>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -521,6 +524,36 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
+        // Stagger/delay (#4644): strict, validated BEFORE anything is minted or sent. The old
+        // `extract_json_int` read 4294967297 as 1 and read a float, string or null as 0, so a
+        // held command dispatched immediately. ABSENT keeps the documented 0 (no stagger / no
+        // delay); a PRESENT key must be one JSON integer in 0..300: the agent caps both at 300 s
+        // (agents/core/src/agent.cpp execute_command_task), so a larger value would run after five
+        // minutes while the caller believed it was held longer. Refuse it instead of lying.
+        // Placed after the destructive block so its 403-before-400 ordering is unchanged.
+        constexpr std::int64_t kMaxWaitSeconds = 300; // mirrors the agent-side cap
+        const auto read_wait = [&](const char* key) -> std::optional<std::int32_t> {
+            const auto v = yuzu::server::read_json_int_strict(body, key, 0);
+            if (v && *v >= 0 && *v <= kMaxWaitSeconds)
+                return static_cast<std::int32_t>(*v);
+            res.status = 400;
+            nlohmann::json err{
+                {"error",
+                 {{"code", 400},
+                  {"message", std::string(key) + " must be a JSON integer between 0 and 300 (the agent caps it at 300 seconds)"}}},
+                {"meta", {{"api_version", "v1"}}}};
+            res.set_content(err.dump(), "application/json");
+            return std::nullopt;
+        };
+        const auto stagger_opt = read_wait("stagger");
+        if (!stagger_opt)
+            return;
+        const auto delay_opt = read_wait("delay");
+        if (!delay_opt)
+            return;
+        const std::int32_t stagger = *stagger_opt;
+        const std::int32_t delay = *delay_opt;
+
         // ── #1788: per-device visibility on EVERY dispatch arm ──────────────
         // Everything above gates a possibly-GLOBAL Execution:Execute (or the
         // destructive-action securable) and, for the destructive list only,
@@ -563,10 +596,6 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
 
         // Parameters: pass-through key-value pairs to the agent plugin.
         auto parameters = extract_json_string_map(body, "params");
-
-        // Stagger/delay: prevent thundering herd on large-fleet dispatch.
-        auto stagger = extract_json_int(body, "stagger", 0);
-        auto delay = extract_json_int(body, "delay", 0);
 
         // Check for scope-based targeting. Reuses the parsed body like the
         // other post-auth reads. Computed here because PR1.9c's builder

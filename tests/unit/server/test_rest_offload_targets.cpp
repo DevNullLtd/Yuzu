@@ -127,6 +127,75 @@ TEST_CASE("REST offload-targets: list empty", "[rest][offload][pg]") {
     CHECK(j["offload_targets"].empty());
 }
 
+TEST_CASE("REST offload-targets: create rejects a batch_size above the ceiling with 400",
+          "[rest][offload][pg]") {
+    OffloadHarness h;
+    for (const int bad : {kMaxOffloadBatchSize + 1, 2147483647}) {
+        INFO("batch_size=" << bad);
+        nlohmann::json body = {{"name", "big-" + std::to_string(bad)},
+                               {"url", "https://siem.example.com/ingest"},
+                               {"batch_size", bad}};
+        auto res = h.sink.Post("/api/v1/offload-targets", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    nlohmann::json ok = {{"name", "at-ceiling"},
+                         {"url", "https://siem.example.com/ingest"},
+                         {"batch_size", kMaxOffloadBatchSize}};
+    auto res = h.sink.Post("/api/v1/offload-targets", ok.dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+}
+
+TEST_CASE("REST offload-targets: create refuses a batch_size that wraps or is not a plain integer",
+          "[rest][offload][pg][numeric_params]") {
+    OffloadHarness h;
+    // 4294967297 wrapped to 1 and 4294977296 to 10000 when narrowed to int; UINT64_MAX is above
+    // INT64_MAX. Each must be a 400 and create NOTHING.
+    for (const char* bad : {"4294967297", "4294977296", "18446744073709551615", "0", "-1", "10001",
+                            "\"5\"", "5.5", "true", "null"}) {
+        INFO("batch_size=" << bad);
+        const std::string body = std::string(R"({"name":"wrap-x","url":"https://siem.example.com/i","batch_size":)") +
+                                 bad + "}";
+        auto res = h.sink.Post("/api/v1/offload-targets", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto list = h.sink.Get("/api/v1/offload-targets");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["offload_targets"].empty());
+
+    for (const int ok_size : {1, 10000}) {
+        INFO("batch_size=" << ok_size);
+        nlohmann::json ok = {{"name", "ok-" + std::to_string(ok_size)},
+                             {"url", "https://siem.example.com/ingest"},
+                             {"batch_size", ok_size}};
+        auto res = h.sink.Post("/api/v1/offload-targets", ok.dump());
+        REQUIRE(res);
+        CHECK(res->status == 201);
+    }
+}
+
+TEST_CASE("REST offload-targets: a denied create row records the submitted name neutralised "
+          "(CWE-117)",
+          "[rest][offload][pg][security]") {
+    OffloadHarness h;
+    // CR/LF would split the audit line, a space or '=' would forge a `k=v` field, ',' separates
+    // fields: each maps to '_' in the recorded target_id (audit_token), on a rejection written
+    // before the store call.
+    nlohmann::json body = {{"name", "evil\r\nresult=success x,y"},
+                           {"url", "https://siem.example.com/ingest"},
+                           {"batch_size", 0}};
+    auto res = h.sink.Post("/api/v1/offload-targets", body.dump());
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "offload_target.create");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail == "validation_failed");
+    CHECK(h.audit_log[0].target_id == "evil__result_success_x_y");
+}
+
 TEST_CASE("REST offload-targets: create returns 201 and id", "[rest][offload][pg]") {
     OffloadHarness h;
     nlohmann::json body = {{"name", "siem-primary"},
@@ -459,6 +528,27 @@ TEST_CASE("REST offload-targets: GET /:id/deliveries 404 on missing target",
     auto res = h.sink.Get("/api/v1/offload-targets/99999/deliveries");
     REQUIRE(res);
     CHECK(res->status == 404);
+}
+
+// #4644: the delivery-list `limit` is ONE base-10 integer or a 400. The documented
+// [1, 1000] clamp still applies to every well-formed integer.
+TEST_CASE("REST offload-targets: GET /:id/deliveries rejects a malformed limit",
+          "[rest][offload][pg][numeric_params]") {
+    OffloadHarness h;
+    auto post = h.sink.Post("/api/v1/offload-targets",
+                            R"({"name":"limit-bad","url":"https://x.example.com/h"})");
+    REQUIRE(post);
+    const auto id = nlohmann::json::parse(post->body)["id"].get<int64_t>();
+    const std::string base = "/api/v1/offload-targets/" + std::to_string(id) + "/deliveries";
+    for (const char* bad : {"50abc", "0x10", "1e2", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto res = h.sink.Get(base + "?limit=" + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto ok = h.sink.Get(base + "?limit=0"); // well-formed but out of range: not rejected
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }
 
 TEST_CASE("REST offload-targets: a lost outcome row keeps the 2xx and marks Sec-Audit-Failed",

@@ -173,9 +173,18 @@ struct FleetExecutionSummary {
 struct ExecutionStatsQuery {
     std::string agent_id;
     std::string definition_id;
-    int64_t since{0};
-    int64_t until{0};
+    /// Epoch-second bounds on `dispatched_at`, PRESENCE-tracked (#4644): unset = no bound on that
+    /// side, a set value is a literal inclusive bound; a literal 0 is not "unbounded". The REST
+    /// and MCP surfaces expose `since` only, reject a negative one, and accept `since=0` as a
+    /// harmless literal bound (every stored dispatched_at is positive).
+    std::optional<int64_t> since;
+    std::optional<int64_t> until;
     int limit{50};
+    /// ADR-0017 admit-then-filter confinement for `get_agent_statistics` (#3526): `nullopt`
+    /// = unconfined (a global grant); present = ONLY these agents' rows, applied in SQL
+    /// BEFORE the GROUP BY and LIMIT, and present-EMPTY = deny-all (never "no filter").
+    /// Ignored by `get_definition_statistics`, whose rows carry no agent identity.
+    std::optional<std::vector<std::string>> visible_agents;
 };
 
 /// HA WS-1(1b), ADR-2002 section 5. Outcome of a `command_execution`
@@ -492,14 +501,28 @@ public:
                                                               const std::string& user);
 
     // Statistics (capability 1.9)
+    //
+    // The `try_get_*` forms are what an operator-facing surface MUST use: `nullopt` means the
+    // read DEGRADED (store not open, pool acquire timed out, or a statement failed), which is
+    // not the same fact as "no executions". The plain `get_*` forms collapse a degrade into
+    // an empty/zeroed value and exist for callers that have no way to report one; a REST or
+    // MCP handler answering a degrade with 200 and `[]` presents a wrong result as correct
+    // (#4644).
+    [[nodiscard]] std::optional<std::vector<AgentExecutionStats>>
+    try_get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
+    [[nodiscard]] std::optional<std::vector<DefinitionExecutionStats>>
+    try_get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
+    [[nodiscard]] std::optional<FleetExecutionSummary> try_get_fleet_summary(std::optional<int64_t> since = std::nullopt) const;
     std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
     std::vector<DefinitionExecutionStats> get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
-    FleetExecutionSummary get_fleet_summary(int64_t since = 0) const;
+    FleetExecutionSummary get_fleet_summary(std::optional<int64_t> since = std::nullopt) const;
     /// Same figures with the store-failure / genuinely-zero distinction: unexpected when the
     /// store is closed, the lease fails or any statement fails (an empty table is a successful
-    /// read of zeros). `include_active_agents = false` skips the DISTINCT agent scan.
+    /// read of zeros). `include_active_agents = false` skips the DISTINCT agent scan. `since` is
+    /// presence-tracked like `ExecutionStatsQuery`: unset = no bound, a literal 0 is a bound.
     [[nodiscard]] std::expected<FleetExecutionSummary, std::string>
-    get_fleet_summary_checked(int64_t since = 0, bool include_active_agents = true) const;
+    get_fleet_summary_checked(std::optional<int64_t> since = std::nullopt,
+                              bool include_active_agents = true) const;
 
     // ── Command <-> execution correlation (HA WS-1(1b), ADR-2002 section 5) ──
     //

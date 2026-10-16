@@ -105,8 +105,13 @@ struct AuditQuery {
     std::string action;
     std::string target_type;
     std::string target_id;
-    int64_t since{0};
-    int64_t until{0};
+    /// Epoch-second bounds, PRESENCE-tracked (#4644): unset = no bound on that side, a set value
+    /// is a literal inclusive bound. A literal 0 is NOT "unbounded" -- the old `int64_t{0}`
+    /// default made an omitted bound and a computed window that collapsed to 0 the same thing,
+    /// so the latter returned the whole log. Every surface rejects `until <= 0` before it gets
+    /// here; `since == 0` is a harmless literal bound (every stored timestamp is positive).
+    std::optional<int64_t> since;
+    std::optional<int64_t> until;
     int limit{100};
     int offset{0};
     // Match any action that starts with one of these prefixes (OR-combined),

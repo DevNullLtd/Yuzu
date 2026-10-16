@@ -357,6 +357,10 @@ too large for its type were already `400`.
   `now - n` that went past the epoch silently returned the whole result. Omit the parameter for
   "no bound on that side". `since=0` stays valid and matches exactly what omitting `since`
   matches; no script that sends `since=0` changes behaviour.
+- Scripts that send a **negative** `since` or `until`, or `until=0`, to other epoch-bounded reads
+  (the execution-statistics, legacy audit, auth-sample and inventory-query routes): it is `400`
+  now too, with the same fix (omit the parameter for no bound). The list is under
+  [Behaviour change: numeric query parameters on other routes](#behaviour-change-numeric-query-parameters-on-other-routes-are-parsed-strictly-too-4644).
 - MCP clients that send `"limit": null` or `"status": null`, or a float or string for either: omit
   the key to get the default. A `status` above `2147483647` and an unsigned value above
   `9223372036854775807` are `-32602` too (the latter used to wrap to `-1`, "any status"; the same
@@ -394,6 +398,184 @@ migration is needed. Two new counters report the effect:
 `yuzu_server_response_param_rejected_total{surface}` and
 `yuzu_server_response_export_truncated_total{surface,cause}`
 ([Metrics](metrics.md#response-store-metrics)).
+
+## Behaviour change: numeric query parameters on other routes are parsed strictly too (#4644)
+
+**Breaking for scripts that relied on a malformed value being silently misread.** The strict
+parsing the response routes got (above) now also covers the routes listed in the REST API
+reference under [Numeric Query Parameters](rest-api.md#numeric-query-parameters-4644): the
+execution-statistics routes, the executions lists, the audit routes, the instruction, product-pack,
+workflow and compliance lists, the patch lists, the software-inventory list, the fleet-topology
+`machines_max` and the app-performance compare `window`. A value that is not one whole base-10
+integer now returns `400` where it used to be read as something else: `limit=100abc` (was `100`),
+`since=junk` on the statistics routes (was `0`, "from the beginning"), `?limit=abc` on
+`/api/analytics/recent` and the patch lists (was ignored), `window=7days` (was `7`).
+
+On MCP, `query_audit_log` answers `-32602` for a `since`, `until` or `limit` that is not a JSON
+integer or does not fit a signed 64-bit value (a string used to mean `0`, unbounded, and
+`18446744073709551615` wrapped to `-1`), and the app-performance compare tool does the same for
+`window`. Other integer arguments that do not fit saturate instead of wrapping, except three tools
+where a saturated value would be harmful and the argument is strict and bounded instead (`-32602`
+otherwise): `create_offload_target` `batch_size` must be 1 to 10000 (the declared schema range, now
+enforced), `mint_upload_grant` `declared_max_size` must be a JSON integer that fits a signed 64-bit
+value, and `create_guardian_rule` `version` must be 1 to 2147483647. `mint_engine_credential`
+`ttl_days` of the wrong JSON type is `-32602` too (nothing is minted; it used to fall back to the
+90-day maximum). Security-gating MCP arguments are strict too: `issue_code_signing_cert` `validity_days` must be a
+JSON integer from 1 to 730 (`4294967297` wrapped to a 1-day certificate; a string, float or `null` took the
+365-day default), `mint_upload_grant` `ttl_secs` must be a JSON integer of at least 1 (a wrong type, `0` or a
+negative value minted the 900 s maximum; larger values still clamp), `create_api_token` `expires_at` must be `0`
+or a future epoch (a negative value minted a token that never expires), and `activate_platform_license`
+`seat_count` and `expires_at` must be integers of at least 0 (a negative `expires_at` was perpetual); each is
+`-32602` and creates nothing. A wrong-typed boolean on `create_guardian_rule`/`update_guardian_rule` `enabled`,
+`push_guardian_rules` `full_sync` and the engine-principal `include_revoked` is `-32602` instead of a bare
+HTTP 500, and `create_offload_target` now neutralises the name it writes to audit rows. The two bounds now hold
+at the REST twins and in the stores, so no writer bypasses them: `POST /api/v1/offload-targets`
+reads `batch_size` as a 64-bit value and answers `400` outside 1 to 10000 (an oversized number is
+rejected, not wrapped) and for a float, string, boolean or `null` (a float such as `5.5` used to be
+truncated), `POST /api/v1/guaranteed-state/rules` answers `400`
+for a `version` outside 1 to 2147483647, and `PUT /api/v1/guaranteed-state/rules/{id}` and MCP
+`update_guardian_rule` refuse a rule whose stored version is already at 2147483647 or above (`409` on REST,
+`-32602` on MCP) instead of overflowing the version bump. The store enforces the range only when a
+write changes the version, so a rule that already holds an out-of-range stored version can still be
+enabled or disabled from the dashboard. The MCP tools `get_execution_statistics_by_agent` and
+`get_execution_statistics_by_definition` answer `-32602` for a `limit` below 1 (the schema minimum;
+it used to be replaced by the default 50), and so do their REST twins, `GET /api/v1/execution-statistics/agents` and `/definitions` (`400` for a `limit` below 1 or malformed). Two more REST inputs are new `400`s: the `limit` in the body of `POST /api/v1/inventory/query` and `POST /api/inventory/query` (below 1 or not an integer; above 1000 still clamps to 1000, and 4294967297 no longer wraps to 1), and the `ttl_days` of `POST /api/v1/engine-principals/{id}/credentials` (present but not a JSON integer from 1 to 90; absent still means 90). That mint route's body is optional only when it is empty or whitespace-only: a truncated document or a body that is not a JSON object (`[]`, `5`, `"x"`, `null`) is now `400` and mints nothing, where it used to mint the default 90-day credential. `{}` and an object without `ttl_days` still mint 90 days.
+
+A negative `since` is refused (`400`, `-32602` on MCP) on the legacy `GET /api/audit` and MCP
+`query_audit_log`, and so is an `until` of `0` or below (a negative `since` or `until`, and an `until`
+of `0`, each used to mean no bound and are new `400`s here). The same holds for a negative `since` on
+`GET /api/v1/execution-statistics/definitions`/`agents` and their MCP twins, for `to=0` on
+`GET /api/v1/audit/auth-sample`, and for an `until` of `0` or below (or a non-integer bound) in the
+body of `POST /api/v1/inventory/query` and `POST /api/inventory/query`; a non-integer `since` or
+`until` in an inventory query body made the body read throw and is a clean `400` now. The bounds are
+presence-tracked now: `-3600` and `until=0` used to mean no bound and returned the whole log,
+statistics set or inventory. Omit the parameter for no bound; `since=0` (`from=0` on the auth sample)
+is accepted and matches the same rows as omitting it. On the auth-sample export a present but empty
+`from` or `to` is accepted as unbounded on that side. `GET /api/v1/audit` follows the same rule: an
+earlier build of this release line read `0` as unbounded there; an `until` of `0` or below (or a
+negative `since`) is now `400`.
+
+The same strictness now covers the dashboard fragments' `page`/`per_page`, the software
+inventory (the three software fragments answer `200` with an `inv-caveat` note for a malformed
+`limit` and ignore a well-formed one, which uses a fixed page size), DEX perf, network quality, hardware and CA-issued lists, the notification, webhook and
+offload delivery lists, the DEX, network and result-set `limit` and the Guaranteed State events `limit`/`offset` (trailing characters are `400`; an integer outside the result-set page range still uses the default page size),
+the pre-flight run list `limit`, the pre-flight run form's `min_gib` and `window` (a malformed value
+or a negative `min_gib` is `400`; an empty field keeps its default; a `window` of zero or below uses 30
+minutes and a larger value is clamped to 1 to 2880 as a 64-bit value, so one beyond a signed 64-bit
+integer is `400`; see [Pre-flight](preflight.md)), the hardware sync poll's `await_since`
+(a malformed freshness bound used to read as "no bound"), the TAR process-tree `node` and the
+`GET /api/v1/events` `?since` cursor (the workflow stream has the header only). A malformed
+`Last-Event-ID` header is served live only (nothing replayed, never the whole buffer) rather than
+a `400`, and `-1` and `5abc` are never accepted as cursors (`5abc` used to replay from 5). On the
+query-parameter routes, a parameter that is present but empty (`?limit=`) is malformed, not
+absent, `GET /api/v1/audit` `limit` included, except `limit` on the software list and catalogue
+routes and fragments, where an empty `limit=` means the default (see
+[the software installs read](#behaviour-change-the-software-installs-read-validates-its-inputs-and-audits-an-out-of-scope-target)).
+The verify fragment's `window`
+is refused with its usual `200` note instead of a `4xx` (the dashboard drops `4xx` bodies).
+
+Four admin forms stop silently saving a different value than the one typed. A malformed
+`min_devices`, `window_seconds` or `cooldown_seconds` on the DEX blast-radius thresholds is a `400`
+and saves nothing (it used to persist the clamped minimum). On the enrollment-token forms and the
+API-token `ttl_hours`, `0x5` used to read as `0`; `max_uses` `0` means unlimited and a TTL of `0`
+means no expiry, so a mistyped limit minted an unlimited or never-expiring credential. Only an
+empty field, or a value that parses to a literal `0` (`0`, `-0`, `00`), means unlimited or no
+expiry now, and a negative `ttl_hours` is refused (it would have computed `0`). The API-token form
+refuses with its usual `200` feedback span and mints nothing; the other forms answer `400` plus an
+error toast. On the batch route an empty `max_uses` defaults to `1`. A malformed `rollout_pct` on an OTA
+package upload or rollout change is a `400` instead of silently becoming `100`. **Behaviour change on
+the rollout change route only:** an empty `rollout_pct` and a value above `100` are now `400` as well
+(an empty value used to mean `100` and a larger one was clamped to `100`); a negative value still
+clamps to `0`; the upload route keeps an empty value as `100`, clamps a larger one to `100` and a negative one to `0`, and refuses only a malformed value. A negative `limit` or `offset` on `GET /api/notifications`, and a negative `limit` on the patch lists
+(`GET /api/patches`, `GET /api/patches/deployments`), is `400` too (the store answered an empty `200`),
+and so is a negative `limit` on the legacy `GET /api/policy-fragments` and `GET /api/policies` (it
+reached Postgres as `LIMIT -1` and answered `503`; the `/api/v1/` policy routes clamp it as before).
+A malformed or out-of-range enrollment-token number now also writes an `enrollment.token_create` or
+`enrollment.bulk_token_create` row with `result=denied` and `detail=invalid_numeric_parameter` (see
+[Audit Log](audit-log.md)).
+
+Security-gating numbers in JSON request bodies are strict too. **Before / after:** `POST /api/v1/tokens` `expires_at` of `-1`, or a value above 9223372036854775807 that wrapped to `-1`, minted a token that never expires, `5.5` or `1e3` minted an already-expired one, and a string, boolean or `null` (or a non-object body) was a bare `500`; now each is `400` and mints nothing (`0` or omitted still means never expires, and a past epoch is refused). `overlap_secs` on `POST /api/v1/tokens/{id}/rotate` and `POST /api/v1/engine-principals/{id}/credentials/rotate` must be a JSON integer, and a non-blank body that is truncated or not an object is `400` instead of rotating with the 7-day default (an empty body still takes the default). `version` on `POST /api/v1/guaranteed-state/rules` must be a JSON integer in range (`5.5` was stored as `5`). `ttl_secs` on `POST /api/v1/upload-grants` must be a JSON integer of at least 1 when present (a wrong type, `0` or a negative value used to mint the 900 s maximum). On `POST /api/settings/enrollment-tokens/batch` a JSON number for `count`, `max_uses` or `ttl_hours` used to be silently ignored, so the documented curl example minted single-use tokens that never expired; numbers and numeric strings are now both honoured, a float, boolean, `null`, overflow or malformed body is `400`, and an empty string still means the default. An `ip_subnet` auto-approve rule with a malformed prefix is refused when added (`400`); a malformed one already stored used to throw out of agent registration and now never matches, so it never auto-approves. `POST /api/schedules` `interval_minutes` (1 to 35791394), `day_of_week` (0 to 6) and `day_of_month` (1 to 28) must be JSON integers in range (`4294967297` minutes became an every-minute schedule); `POST /api/schedules/{id}/enable` `enabled` must be a JSON boolean, the integer `0` or `1`, or the exact string `"true"` or `"false"` (an omitted key or a blank, empty or whitespace-only, body still enables), and any other string, another number, `null` or a malformed body is `400` and changes nothing (`{"enabled":0}` used to arm the schedule). `POST /api/command` `stagger` and `delay` must be integers from 0 to 300 (a float, string or `null` read as 0, so a delayed command ran immediately; a value above 300 was silently capped by the agent at 300 seconds and is now a 400). A result-set matcher `{"kind":"tar_rows_ge","n":N}` needs an integer N from 1 to 2147483647 on `POST /api/v1/result-sets/from-instruction-result` and the MCP `create_result_set_from_instruction_result` (`400` / `-32602`), and a `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too (it used to be dropped, so every responder qualified; omit `matcher` for that default); a malformed `n` or `kind` already stored, or an `n` below 1, now matches no device instead of throwing in the maintenance tick or admitting everyone. The pre-flight form's `app_min`, `app_max` and `os_min` must be empty or a dotted-decimal version with an optional `-beta` / `+build` suffix; `abc`, `v4.2.0` or `4.2.x` is `400` and starts no run (it read as version 0 and passed every device). `POST /api/v1/license` `seat_count` and `expires_at` follow the MCP twin: JSON integers of at least 0, else `400` (the licence surface is dormant until the `LicenseStore` is wired, ADR-0048). Rolling upgrade: replicas on the old and new build answer these inputs differently.
+
+Three more inputs that used to be read as something else are refused (`400` on REST, `-32602` on MCP), and one stored value is repaired:
+a `conditions[].value` on the inventory evaluate and result-set routes that is a JSON number is
+accepted with `==`, `!=`, `>`, `>=`, `<`, `<=` (and a boolean with `==` or `!=`); all six compare it
+as a number against the raw stored value (exact for integers and for integer against a decimal, a stored
+numeric string counting as that number; JSON integers are exact and every JSON float (a number written with a decimal point or exponent, such as `5.0`, `1e3` or `5.5`, or an integer outside `-9223372036854775808` to `18446744073709551615`, which arrives as a float) is refused because its original text is lost once parsed: send the decimal as a JSON string under `>`, `>=`, `<` or `<=`, which is accepted as a whole number within int64/uint64 (digits or an integer-valued exponent form such as `"1e16"`, read exactly) or with at most 15 significant digits, a magnitude below 2^53, a value that is zero or at least the smallest normal double, and a value within the range of a double, and a plain-decimal string such as `"1e400"` is refused instead of ordering lexically; `==` and `!=` with a string stay a text compare, so numeric equality covers JSON integers only; write a whole number as an integer up to `18446744073709551615` or as digits, and a string such as `"9007199254740993.0"` is read as that exact integer; a non-integer at or above 2^53 such as `"9007199254740992.5"` is refused), so **behaviour change:** a stored value that is not a number,
+such as `"5 GB"` or `"N/A"`, no longer satisfies `>`, `>=`, `<` or `<=` against a numeric operand (it was read as `5`
+or compared as text), and any other operand type is refused (a number used to become the empty string, so `{"op":">","value":5}`
+selected every device that had the field); a string operand that is a plain decimal number (`"4"`, `"2e-7"`) is ordered numerically under `>`, `>=`, `<`, `<=`: a stored number or fully numeric string compares exactly (a stored integer within int64/uint64, including an integer-valued exponent spelling that fits (such as `"564141138995e7"`), and a stored decimal with a fraction of at most 15 significant digits and a magnitude below 2^53 compare exactly; any other stored decimal, one of more digits or a non-integer at or above 2^53, or a stored negative integer below `-9223372036854775808`, is compared as the nearest double), a stored string that merely starts with a number (a dotted version `"1.2.3"`, `"5 GB"`) has its leading number read and compared the same way (use `version_gte` / `version_lte` for dotted versions), and any other stored value (`"N/A"`, `""`, a boolean) never matches, where a JSON number operand never matches a stored string that is not a number in full; while `==` / `!=` and a non-numeric string operand such as `"v2"` are unchanged; a result-set matcher whose `column`, `op` or `value` is
+present with the wrong type no longer qualifies every responder; the DEX `window` on
+`GET /api/v1/dex/signals`, `/dex/scope`, `/dex/signals/{obs_type}` and their MCP tools (and `get_dex_device_score`) must be
+`24h`, `7d`, `30d` or `all` (`90d`, a non-string such as `30` or `null`, or an empty `?window=` was answered with 7 days; only an omitted `window` keeps `7d`). Separately, a stored schedule `interval_minutes`
+above 35791394 now advances instead of failing in Postgres on every tick (new schedules are capped at
+that value).
+
+Still lenient, and not an exhaustive list: the `n` retry-attempt counter on the live-snapshot poll
+fragments (the deployment, device, hardware, DEX, pre-flight and TAR process-tree polls), which is
+clamped to a fixed range per poll (1 to 100000 on the deployment and pre-flight polls, at most 50 on
+the others), and values parsed from stored rows, agent output or server configuration rather than
+from a request. Numeric path segments matched by a `(\d+)`
+pattern (notification read/dismiss and the webhook routes) now answer `404` for an id that does
+not fit a signed 64-bit integer; they used to fail with `500`. The auto-approve rule index answers
+`200` with an audited `denied` row (`rule_not_found`) and changes nothing.
+
+**What to do.** Send whole integers, and omit a parameter to get its default. No configuration or
+data migration is needed, but review Settings > Auto-Approve for `ip_subnet` rules with a sign or an odd prefix (they match nothing, so those agents go to the pending queue), and optionally list API tokens with `expires_at=0` and enrollment tokens minted before the upgrade. During a rolling upgrade, replicas on the old and new build answer a
+malformed value differently (`200` versus `400`).
+
+## Changed: a degraded execution-statistics read is a 503, not an empty 200 (#4644)
+
+`GET /api/v1/execution-statistics`, `/agents`, `/definitions`, `GET /api/v1/statistics` and the
+four MCP statistics tools used to answer a store failure (execution store not open, pool timeout,
+failed query) with `200` and an empty list or an all-zero summary, which reads as "no
+executions". They now answer `503` with `retry_after_ms: 2000` on REST and a retryable error with
+`retry_after_ms` on MCP. A filter or confined scope that genuinely matches nothing is still `200`
+with an empty `data` array. Each degraded read also logs a warning on the server
+(`ExecutionTracker::try_get_<reader> degraded: tracker not open`, `pool exhausted` or `query failed`).
+
+**What to do.** Treat a `503` from these routes as retryable. A dashboard or script that read
+`data: []` as "nothing to report" during an outage will now see the error instead.
+
+## Changed: a saturated pre-flight response window is inconclusive (#4644)
+
+Each pre-flight check reads its newest 50,000 responses for a run. On a very large cohort a
+device that had answered could be pushed out of that window and then read as "no response" while
+the runner kept re-dispatching. A device absent from a full window now shows **"inconclusive:
+response cap reached"**, stays Incomplete (never in Deploy's go cohort) and the runner stops
+re-dispatching that run; the run still completes at its deadline. Re-run against a smaller group
+to resolve those devices.
+
+## Behaviour change: per-agent execution statistics are confined to the caller's scope (#3526)
+
+`GET /api/v1/execution-statistics/agents` and the MCP tool `get_execution_statistics_by_agent` used
+to gate on a bare `Execution:Read` check. That check admits only a holder of a global grant, and it
+returned one row per agent across every execution of every operator with no per-agent filter. A
+management-group-scoped-only operator (no global grant) was refused with `403`. Both now go through
+the same admit-then-filter fleet-read gate as `GET /api/v1/executions` (ADR-0017): the visible-agent
+set is applied in the query before the grouping and the row limit, and an empty visible set returns
+no rows, never the fleet. This widens who is admitted and narrows what a confined caller sees:
+nothing a caller could read before is now refused, with one exception: the gate fails closed, so
+when the RBAC or management-group store is not open the route answers a retryable `503`
+(`retry_after_ms` 5000), even to a global admin, where the bare check answered `200`.
+
+- **A group-scoped-only operator** goes from `403` to a `200` that carries only the rows of the
+  agents it can see. A holder of a global grant sees the same rows as before.
+- **A service-scoped API token on the REST route** used to be refused (`403`) by the bare gate. With
+  RBAC enforcement on it is now admitted as a confined view: the token must clear the
+  `ITServiceOwner` authority ceiling (the seeded role holds `Execution:Read`), and the rows are then
+  intersected with the agents tagged for its service. A degraded tag store answers `503`. The MCP
+  tool still denies service-scoped tokens, and widening that is a separate decision, not made here.
+- **Confinement is effective only with RBAC enforcement on.** With RBAC off (the shipped default)
+  the rollup is unfiltered for every authenticated caller other than a service-scoped token or an
+  engine principal (a service-scoped token is refused `403` with RBAC off). Treat the confined view
+  as available once you enable RBAC enforcement, not before.
+- `GET /api/v1/execution-statistics/definitions` and the fleet summary carry no agent identity and
+  keep the plain `Execution:Read` gate (the summary's `active_agents` is a fleet-wide count).
+  `GET /fragments/executions` is not changed by this entry.
+- A negative `since` on `/agents` and `/definitions` is `400` (see the previous section).
+
+During a rolling upgrade, replicas on the old and the new build admit and return different row sets to
+a confined caller.
 
 ## Behaviour change: the software installs read validates its inputs and audits an out-of-scope target
 
@@ -910,8 +1092,9 @@ plus one new prerequisite.**
   whole-registry agent count (tracked in #4753, whose checklist, including `kind=fleet` and
   `get_fleet_posture_fast`, stays open; the executions-list move covers only `kind=execution`). The same
   whole-registry branch is also reached by `kind=execution` or `kind=agent` with an EMPTY id, or
-  when the execution tracker is unavailable (not separately tracked). `GET
-  /api/v1/execution-statistics/agents` has no per-agent filter (#3526).
+  when the execution tracker is unavailable (not separately tracked). (`GET
+  /api/v1/execution-statistics/agents` was listed here and is now confined; see "Behaviour change:
+  per-agent execution statistics are confined to the caller's scope (#3526)".)
 
 **Rollback.** Redeploy the previous binary. The plain `Execution:Read` gate returns, so
 group-scoped-only operators go back to `403` on the fragment. The `visible_agents` filter is a

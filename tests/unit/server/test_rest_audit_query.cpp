@@ -134,8 +134,11 @@ TEST_CASE("v1 audit: since/until are inclusive", "[pg][audit][rest]") {
     CHECK(h.get("?since=2000&until=3000")["data"].size() == 2);
     CHECK(h.get("?since=3001&until=4999")["data"].size() == 0);
     CHECK(h.get("?until=1000")["data"].size() == 1);
-    // 0 means unbounded on that side.
-    CHECK(h.get("?since=0&until=0")["data"].size() == 6);
+    // since=0 is a harmless literal bound (matches what omitting it matches); until=0 would bound
+    // the read at the epoch, so it is refused rather than read as "the whole log" (#4644).
+    CHECK(h.get("?since=0")["data"].size() == 6);
+    h.get("?until=0", 400);
+    h.get("?since=0&until=0", 400);
 }
 
 TEST_CASE("v1 audit: offset pages with real start and page_size and ties are stable",
@@ -173,7 +176,7 @@ TEST_CASE("v1 audit: offset pages with real start and page_size and ties are sta
 TEST_CASE("v1 audit: malformed filters are 400 and never silently dropped", "[audit][rest]") {
     QueryHarness h(/*populated=*/false); // validation precedes the store read
     for (const char* q : {"?since=abc", "?since=-1", "?until=1.5", "?since=2000&until=1000",
-                          "?offset=-1", "?offset=10001", "?offset=x", "?target_id=t1", "?target_type=a%00b",
+                          "?offset=-1", "?offset=10001", "?offset=x", "?offset=", "?target_id=t1", "?target_type=a%00b",
                           "?principal=a%00b", "?action=a%00b", "?target_type=T&target_id=a%00b",
                           "?principal=%C3%28", "?action=%FF", "?target_type=%E2%82", "?target_type=T&target_id=%C0%AF"}) {
         INFO(q);

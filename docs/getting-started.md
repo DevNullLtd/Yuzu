@@ -830,7 +830,7 @@ Expected response:
 curl -s -X POST http://localhost:8080/api/schedules/f6a7b8c9-.../enable \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
-  -d '{"enabled": "false"}'
+  -d '{"enabled": false}'
 ```
 
 Expected response:
@@ -839,13 +839,15 @@ Expected response:
 {"enabled":false}
 ```
 
+`enabled` must be a JSON boolean (or the integer `0` or `1`); a string such as `"false"` is answered `400` and the schedule is left as it was.
+
 ### Re-enable a schedule
 
 ```bash
 curl -s -X POST http://localhost:8080/api/schedules/f6a7b8c9-.../enable \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
-  -d '{"enabled": "true"}'
+  -d '{"enabled": true}'
 ```
 
 ### Delete a schedule
@@ -868,10 +870,10 @@ Expected response:
 | `name` | string | Human-readable name for the schedule |
 | `definition_id` | string | ID of the instruction definition to execute |
 | `frequency_type` | string | `"once"`, `"interval"`, `"daily"`, `"weekly"`, `"monthly"` |
-| `interval_minutes` | int | Minutes between executions (for `interval` type) |
+| `interval_minutes` | int | Minutes between executions (for `interval` type), 1-35791394 |
 | `time_of_day` | string | `"HH:MM"` time for daily/weekly/monthly schedules |
 | `day_of_week` | int | 0-6 (Sunday=0) for weekly schedules |
-| `day_of_month` | int | 1-31 for monthly schedules |
+| `day_of_month` | int | 1-28 for monthly schedules |
 | `scope_expression` | string | Scope expression to target agents |
 | `requires_approval` | bool | Whether each scheduled run needs approval |
 

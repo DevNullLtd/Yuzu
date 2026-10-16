@@ -2,6 +2,7 @@
 
 #include "enrollment_directory_model.hpp" // #4031: shared row builders, REST/MCP parity (Rule 1)
 #include "http_route_sink.hpp"
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "integrations_sync_model.hpp"
 
 #include <nlohmann/json.hpp>
@@ -395,10 +396,19 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                 q.severity = req.get_param_value("severity");
                 q.status = req.get_param_value("status");
                 try {
-                    auto limit_str = req.get_param_value("limit");
-                    if (!limit_str.empty())
-                        q.limit = std::stoi(limit_str);
-                } catch (...) {
+                    if (req.has_param("limit")) {
+                        q.limit = strict_stoi(req.get_param_value("limit"));
+                        // A negative LIMIT is rejected by PG and the store answers an empty
+                        // list: a valid-looking 200 for a malformed request.
+                        if (q.limit < 0)
+                            throw std::invalid_argument("negative limit");
+                    }
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
                 }
 
                 auto status_filter = q.status.empty() ? "missing" : q.status;
@@ -592,10 +602,18 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                 int limit = 50;
                 try {
-                    auto limit_str = req.get_param_value("limit");
-                    if (!limit_str.empty())
-                        limit = std::stoi(limit_str);
-                } catch (...) {
+                    if (req.has_param("limit")) {
+                        limit = strict_stoi(req.get_param_value("limit"));
+                        // Negative: PG rejects `LIMIT -1`; the store would answer an empty 200.
+                        if (limit < 0)
+                            throw std::invalid_argument("negative limit");
+                    }
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
                 }
 
                 auto deployments = patch_manager->list_deployments(limit);
