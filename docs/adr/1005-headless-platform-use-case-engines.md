@@ -336,8 +336,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        #520 is the closed security issue whose fix drew the MCP-tier
        boundary, not a decision record: the decision of record is
        `mcp_policy.hpp`'s `tier_allows`, `docs/mcp-server.md` line 21 and
-       `AuthRoutes::require_admin`'s comment. No open item tracks the
-       2027-04-30 re-confirmation; #5955 covers only its own 13 rows. The
+       `AuthRoutes::require_admin`'s comment. #4031 scoped the per-route
+       decision and its implementing PR #4176 has merged, but the issue is
+       still open and carries no re-confirmation date, so no open item
+       tracks the 2027-04-30 re-confirmation; #5955 covers only its own 13
+       rows. The
        eight #4028 rows keep their undated legacy form.)
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
