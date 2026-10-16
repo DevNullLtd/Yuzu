@@ -2163,8 +2163,10 @@ std::string sqlstate_of(const pg::PgResult& res) {
 
 int to_int(const char* s) { return static_cast<int>(to_i64(s)); }
 
+// Saturating (auth::epoch_ms_to_time_point): a far-future expiry becomes time_point::max(),
+// which renders as the "never" sentinel, instead of wrapping negative.
 std::chrono::system_clock::time_point ms_to_tp(int64_t ms) {
-    return std::chrono::system_clock::time_point{std::chrono::milliseconds{ms}};
+    return auth::epoch_ms_to_time_point(ms);
 }
 
 std::optional<auth::PendingStatus> parse_pending_status(std::string_view s) {

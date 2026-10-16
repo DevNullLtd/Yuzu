@@ -1435,6 +1435,40 @@ TEST_CASE("settings auto-approve: match-everything rules and oversized text are 
 // pushed into the past the way test_auth.cpp does for the consume path. It must list Expired
 // (warn pill), not Active; an exhausted-and-lapsed token keeps Exhausted, and a token that
 // never expires stays Active.
+// The legacy .cfg import allows an expiry in any year up to 9999. Read back through the store's
+// epoch-millisecond conversion that must stay in the future (a wrapped value would list the token
+// Expired while the SQL consume path still accepts it). What the page prints for it depends on
+// the clock's reach (a date where the clock can hold it, "Never" where it saturates), so the
+// assertion is the state, not the text.
+TEST_CASE("settings enrollment: a year-9999 expiry is listed Active and never as Expired",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    auto far = h.auth_mgr.create_enrollment_token("far-future", 0, std::chrono::hours(1), "admin");
+    REQUIRE(far.has_value());
+    {
+        auto lease = h.auth_db->pool().try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        auto upd = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE auth.enrollment_tokens SET expires_at = '9999-12-31 23:59:59+00' "
+            "WHERE token_id = $1",
+            std::vector<std::string>{far->token_id});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+    const auto listed = h.auth_mgr.list_enrollment_tokens().value();
+    REQUIRE(listed.size() == 1);
+    CHECK(listed[0].expires_at > std::chrono::system_clock::now());
+
+    auto res = h.sink.Get("/fragments/settings/tokens");
+    REQUIRE(res);
+    const auto row = res->body.find("<code>" + far->token_id + "</code>");
+    REQUIRE(row != std::string::npos);
+    const auto pill = res->body.find("pill ", row);
+    REQUIRE(pill != std::string::npos);
+    CHECK(res->body.substr(pill, res->body.find("</span>", pill) - pill) == "pill info\">Active");
+    CHECK(res->body.find("pill warn") == std::string::npos);
+}
+
 TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as Active",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;

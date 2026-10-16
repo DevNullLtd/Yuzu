@@ -359,6 +359,28 @@ inline Role effective_role(const Session& s) { return is_elevated(s) ? Role::adm
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
 
+/// Epoch milliseconds read from the store -> a clock value, SATURATING. A bare
+/// `time_point{milliseconds{ms}}` multiplies by the clock's ticks-per-millisecond and wraps for a
+/// large `ms`: on a nanosecond system_clock (libstdc++) anything past about year 2262, so a
+/// far-future expiry carried in by the legacy .cfg import (the epoch may be any year up to 9999)
+/// came back negative and rendered as Expired or as a garbage date, while the SQL consume path
+/// still accepted the token. A value above the clock's range is `time_point::max()`, which every
+/// enrolment-token reader treats as the "never expires" sentinel (the list shows "Never"), and a
+/// value below it is `time_point::min()`. In-range values convert exactly.
+[[nodiscard]] inline std::chrono::system_clock::time_point
+epoch_ms_to_time_point(std::int64_t ms) noexcept {
+    using Clock = std::chrono::system_clock;
+    using std::chrono::duration_cast;
+    using std::chrono::milliseconds;
+    constexpr std::int64_t kMaxMs = duration_cast<milliseconds>((Clock::duration::max)()).count();
+    constexpr std::int64_t kMinMs = duration_cast<milliseconds>((Clock::duration::min)()).count();
+    if (ms > kMaxMs)
+        return (Clock::time_point::max)();
+    if (ms < kMinMs)
+        return (Clock::time_point::min)();
+    return Clock::time_point{duration_cast<Clock::duration>(milliseconds{ms})};
+}
+
 struct EnrollmentToken {
     std::string token_id;   // Short display ID (first 8 hex chars)
     std::string token_hash; // SHA-256 hash of the actual token (stored, never raw)

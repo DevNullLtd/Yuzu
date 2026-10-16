@@ -17,6 +17,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -2016,6 +2017,48 @@ TEST_CASE("pending agent lifecycle", "[auth][pending][pg]") {
     REQUIRE(status->has_value());
     REQUIRE(**status == PendingStatus::approved);
     CHECK(f.mgr.approve_pending_agent("ghost", "alice").value() == PendingTransitionOutcome::not_found);
+}
+
+// The store hands back epoch milliseconds. The legacy .cfg import allows an expiry to year 9999
+// (253402300799000 ms); a bare time_point{milliseconds{ms}} wraps negative for it on a clock that
+// counts nanoseconds in an int64 (libstdc++, limit about year 2262), so the token read back as
+// Expired while the SQL consume path still accepted it. The conversion saturates instead.
+TEST_CASE("epoch_ms_to_time_point saturates instead of wrapping", "[auth][enrollment]") {
+    using Clock = std::chrono::system_clock;
+    using std::chrono::duration_cast;
+    using std::chrono::milliseconds;
+    constexpr auto kMax = (std::numeric_limits<std::int64_t>::max)();
+    constexpr auto kMin = (std::numeric_limits<std::int64_t>::min)();
+
+    // Exact where the clock can hold it.
+    CHECK(epoch_ms_to_time_point(0) == Clock::time_point{});
+    CHECK(duration_cast<milliseconds>(epoch_ms_to_time_point(1'800'000'000'000).time_since_epoch())
+              .count() == 1'800'000'000'000);
+    CHECK(duration_cast<milliseconds>(epoch_ms_to_time_point(-86'400'000).time_since_epoch())
+              .count() == -86'400'000);
+
+    // Far past the range: the max / min sentinel, never a negative or a wrapped value.
+    CHECK(epoch_ms_to_time_point(kMax) == (Clock::time_point::max)());
+    CHECK(epoch_ms_to_time_point(kMin) == (Clock::time_point::min)());
+
+    // Year 9999 (253402300799000 ms) and year 2286 (9999999999000 ms): whatever the clock's tick,
+    // the result is either that exact instant or the max sentinel, and in every case it is
+    // still in the future. It is never a wrapped, past instant.
+    for (const std::int64_t ms : {std::int64_t{253'402'300'799'000}, std::int64_t{9'999'999'999'000}}) {
+        INFO("ms=" << ms);
+        const auto tp = epoch_ms_to_time_point(ms);
+        CHECK(tp > Clock::now());
+        CHECK((tp == (Clock::time_point::max)() ||
+               duration_cast<milliseconds>(tp.time_since_epoch()).count() == ms));
+    }
+    // Monotonic across the saturation edge: a later input is never an earlier instant.
+    std::int64_t prev_ms = 1'000'000'000'000;
+    auto prev = epoch_ms_to_time_point(prev_ms);
+    for (std::int64_t ms = prev_ms; ms <= kMax / 3; ms *= 3) {
+        const auto tp = epoch_ms_to_time_point(ms);
+        CHECK(tp >= prev);
+        prev = tp;
+    }
 }
 
 TEST_CASE("deny pending agent", "[auth][pending][pg]") {
