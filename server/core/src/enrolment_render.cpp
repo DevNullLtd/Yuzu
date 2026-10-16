@@ -5,7 +5,8 @@
 #include "web_utils.hpp"
 
 #include <algorithm>
-#include <ctime>
+#include <cstdint>
+#include <format>
 
 namespace yuzu::server::enrolment {
 
@@ -93,16 +94,22 @@ std::string attr_confirm(const std::string& question) {
 
 
 std::string utc_stamp(std::chrono::system_clock::time_point tp) {
-    const auto tt = std::chrono::system_clock::to_time_t(tp);
-    std::tm tm_buf{};
-#ifdef _WIN32
-    gmtime_s(&tm_buf, &tt);
-#else
-    gmtime_r(&tt, &tm_buf);
-#endif
-    char buf[32]{};
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-    return std::string(buf) + " UTC";
+    using namespace std::chrono;
+    // No CRT gmtime/strftime: past year 3000 MSVC's gmtime_s fails and strftime on the zeroed
+    // result terminates the process via the invalid-parameter handler, and POSIX would print
+    // a 1900-01-00 date. A legacy import can carry an epoch to year 9999, so the range is
+    // stated rather than assumed: four-digit years from 1970 only.
+    constexpr std::int64_t kLastSecond = 253'402'300'799; // 9999-12-31 23:59:59 UTC
+    const std::int64_t secs = floor<seconds>(tp).time_since_epoch().count();
+    if (secs < 0 || secs > kLastSecond)
+        return "out of range";
+    const sys_seconds at{seconds{secs}};
+    const sys_days day = floor<days>(at);
+    const year_month_day cal{day};
+    const hh_mm_ss tod{at - day};
+    return std::format("{:04}-{:02}-{:02} {:02}:{:02} UTC", static_cast<int>(cal.year()),
+                       static_cast<unsigned>(cal.month()), static_cast<unsigned>(cal.day()),
+                       tod.hours().count(), tod.minutes().count());
 }
 
 bool rule_matches_everything(AutoApproveRuleType type, std::string_view value) {

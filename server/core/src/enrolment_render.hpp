@@ -35,7 +35,8 @@ inline constexpr std::size_t kBulkHostnamesListed = 10;
 /// render as "no tokens" / "no agents".
 extern const std::string_view kStoreUnavailableHtml;
 
-/// `YYYY-MM-DD HH:MM UTC`.
+/// `YYYY-MM-DD HH:MM UTC`; the fixed sentence `out of range` for a value before 1970 or after
+/// 9999-12-31 23:59:59 (never a bogus date). Pure std::chrono: no CRT time call.
 std::string utc_stamp(std::chrono::system_clock::time_point tp);
 
 /// True when an auto-approve rule value matches every agent: a `hostname_glob` made only of

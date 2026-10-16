@@ -57,6 +57,31 @@ TEST_CASE("enrolment: utc_stamp is a fixed-width UTC string", "[groups][enrolmen
     CHECK(utc_stamp(Clock::time_point{}) == "1970-01-01 00:00 UTC");
     CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{86'400 + 3'660}}) ==
           "1970-01-02 01:01 UTC");
+    // A normal date; seconds are truncated, not rounded.
+    CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{1'800'000'059}}) ==
+          "2027-01-15 08:00 UTC");
+    // The last second of year 9999 still formats.
+    CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{253'402'300'799}}) ==
+          "9999-12-31 23:59 UTC");
+}
+
+// The legacy enrollment-tokens.cfg import allows an epoch to year 9999 and beyond. The CRT
+// route (gmtime_s then strftime on the zeroed result) terminates the process on MSVC and
+// prints 1900-01-00 on POSIX, so an unrepresentable value is a fixed sentence, never a date.
+TEST_CASE("enrolment: utc_stamp prints out of range instead of a bogus date",
+          "[groups][enrolment][render]") {
+    CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{253'402'300'800}}) == "out of range");
+    CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{4'000'000'000'000}}) == "out of range");
+    CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{-1}}) == "out of range");
+    CHECK(utc_stamp((Clock::time_point::max)()) == "out of range");
+    CHECK(utc_stamp((Clock::time_point::min)()) == "out of range");
+
+    // End to end: such an expiry renders in a row (not "Never", not a date), nothing throws.
+    const std::vector<auth::EnrollmentToken> v = {
+        token("farfuture", "x", 0, 0, false, Clock::time_point{std::chrono::seconds{253'402'300'800}})};
+    const auto html = render_tokens(&v, "", kNow);
+    CHECK_THAT(html, ContainsSubstring("<td>out of range</td>"));
+    CHECK_THAT(html, ContainsSubstring("<span class=\"pill info\">Active</span>"));
 }
 
 TEST_CASE("enrolment: match-everything detection", "[groups][enrolment][render]") {
