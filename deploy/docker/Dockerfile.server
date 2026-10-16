@@ -22,7 +22,7 @@
 #   docker build -t yuzu-server -f deploy/docker/Dockerfile.server .
 
 # ── Stage 1: deps — toolchain + vcpkg packages (cached when vcpkg.json unchanged) ─
-FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS deps
+FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03 AS deps
 
 # TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
 # arm64; the default keeps the historical x64 build behaviour.
@@ -33,21 +33,26 @@ FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3
 # --build-arg sidesteps both pitfalls.)
 ARG TRIPLET=x64-linux
 
-# Base: debian:trixie-slim (Debian 13). gcc-13 13.3.0 ships in main; CDN
-# (deb.debian.org) is reliably reachable when Canonical's archive.ubuntu.com /
-# ports.ubuntu.com are blocked at the network egress (the trigger for this
-# switch — every ubuntu.com mirror was unreachable from the build host).
+# Base: ubuntu:26.04 (Resolute) — the same OS and toolchain as the Big Tam
+# self-hosted Linux CI pool, so the shipped image is built by the compiler CI
+# tests (#5929: "we are what we test for"). GCC 15 is the 26.04 default; the
+# documented compiler floor is GCC 15 (docs/build-guide.md). The image used to
+# build on debian:trixie-slim with gcc-13, chosen when every ubuntu.com mirror
+# was unreachable from the build host; trixie has no gcc-15 (not in main or
+# trixie-backports, checked 2026-10-16), and the chisel images and the release
+# workflow already fetch from the Ubuntu archive on the same hosts.
+# mold is required by meson/native/linux-gcc15.ini (-fuse-ld=mold).
 COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
+    cmake ninja-build gcc-15 g++-15 mold ccache pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
     bison flex \
     autoconf automake libtool \
     python3-pip python3-venv python3-yaml \
-    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
-    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
-    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-13 100 \
-    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 100 \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 100 \
+    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-15 100 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-15 100 \
     && pip3 install --break-system-packages --require-hashes -r /tmp/requirements-meson.txt \
     && rm -rf /var/lib/apt/lists/*
 
@@ -74,14 +79,14 @@ FROM deps AS builder
 # so the compile command omits `-j` entirely when this argument is empty.
 ARG YUZU_BUILD_JOBS=
 
-ENV CC="ccache gcc-13" \
-    CXX="ccache g++-13" \
+ENV CC="ccache gcc-15" \
+    CXX="ccache g++-15" \
     CCACHE_DIR=/root/.cache/ccache
 
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/ccache \
     meson setup builddir \
-        --native-file meson/native/linux-gcc13.ini \
+        --native-file meson/native/linux-gcc15.ini \
         --buildtype=release \
         -Dcmake_prefix_path=/src/vcpkg_installed/${TRIPLET} \
         -Dpkg_config_path=/src/vcpkg_installed/${TRIPLET}/lib/pkgconfig \
@@ -93,11 +98,10 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # ── Stage 3: runtime ─────────────────────────────────────────────────────
 #
 # RUNTIME INVARIANT: bash is required by docker-compose.uat.yml's healthcheck
-# (`bash -c 'exec 3<>/dev/tcp/localhost/8080 && ...'`). debian:trixie-slim DOES
-# ship /bin/bash (5.2.x) — an earlier version of this comment claimed it did not
-# — but the apt line below installs it EXPLICITLY anyway, so the healthcheck's
-# dependency is declared rather than inherited from a base image that could drop
-# it. If you switch this base image to a minimal/distroless variant, also update
+# (`bash -c 'exec 3<>/dev/tcp/localhost/8080 && ...'`). ubuntu:26.04 ships
+# /bin/bash (as debian:trixie-slim, the previous base, did), but the apt line
+# below installs it EXPLICITLY anyway, so the healthcheck's dependency is
+# declared rather than inherited from a base image that could drop it. If you switch this base image to a minimal/distroless variant, also update
 # every compose file's healthcheck block to use a tool the new base provides
 # (busybox wget, nc, etc.). Governance Gate 7, architect SHOULD-2.
 #
@@ -105,7 +109,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # for a WORKING bash + /dev/tcp (not merely a bash binary — a bash built without
 # net redirections is caught too) before release.yml pushes it, and on every PR
 # that touches this file.
-FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03
 
 # /var/log/yuzu uses 0750 (not the default 0755) to align with the deb postinst
 # (deploy/packaging/debian/postinst) and prevent log disclosure to other UIDs
@@ -118,6 +122,18 @@ FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3
 # (The deb/rpm/systemd paths instead make /etc/yuzu itself service-owned, so the
 # server's runtime mkdir of certs/ succeeds there without this eager pre-create;
 # the container needs it because the base image's /etc/yuzu is root-owned.)
+# The runtime base MUST match the builder's OS release (ubuntu:26.04, same
+# digest): yuzu-server links libstdc++/libgcc_s/libc dynamically, and the
+# gcc-15 build needs a libstdc++ carrying the GCC 15 symbol versions. Measured
+# on the arm64 image at #5929: GLIBCXX_3.4.34, CXXABI_1.3.15, GLIBC_2.38.
+# debian:trixie-slim's libstdc++6 is GCC 14 (no GLIBCXX_3.4.34), so the loader
+# would refuse the binary there. Pairing the runtime with the builder's release
+# keeps a later toolchain or glibc bump from reopening the gap. libssl3t64 is
+# the 26.04 (64-bit time_t) name of trixie's libssl3. `useradd -r yuzu` still
+# allocates uid/gid 999 on ubuntu:26.04, as it did on debian:trixie-slim
+# (checked 2026-10-16), so data and cert volumes written by a pre-#5929 image
+# stay owned by the runtime user after an upgrade. Keep it that way: a base
+# swap that moves this uid makes every persisted volume unreadable.
 # libpq5 replaced libsqlite3-0 in #1318 (Postgres substrate, ADR-0006/0008).
 # libsqlite3-0 was vestigial: ldd on the shipped 0.12.0 binary shows SQLite
 # is statically linked from vcpkg (only libstdc++/libm/libgcc_s/libc are
@@ -126,7 +142,7 @@ FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3
 # belt-and-braces, but it keeps the image correct if the Windows static-link
 # canary forces a dynamic-libpq fallback.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 libpq5 ca-certificates bash \
+    libssl3t64 libpq5 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu \
     # Shared cert group (PKI #1289): FIXED gid 2000, identical across the server/

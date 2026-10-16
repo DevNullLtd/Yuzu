@@ -11,7 +11,8 @@
 - **The `yuzu-server` and `yuzu-agent` images, and their chisel variants, are now built with
   GCC 15 on Ubuntu 26.04 instead of GCC 13 on Debian 13** (#5929). The non-chisel
   `Dockerfile.server` and `Dockerfile.agent` runtime stages also move from `debian:trixie-slim`
-  to `ubuntu:26.04`, because a GCC 15 binary needs a newer libstdc++ than Debian 13 provides.
-  The chisel images already ran on Ubuntu 26.04 and keep doing so. Anything that copies the
-  agent out of the `Dockerfile.agent` image onto another base must provide Ubuntu 26.04's
-  libstdc++ and glibc.
+  to `ubuntu:26.04`: the GCC 15 server binary needs GCC 15's libstdc++ (`GLIBCXX_3.4.34`),
+  which Debian 13 does not ship, and both images keep builder and runtime on one release.
+  The chisel images already ran on Ubuntu 26.04 and keep doing so. The data volume owner is
+  unchanged (the runtime user is still uid 999), so an upgraded container reads the volumes
+  the previous image wrote.

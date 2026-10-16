@@ -15,10 +15,15 @@
 # (server/core/scripts/embed_content.py); there is no filesystem content copy.
 
 # ── Stage 1: builder ──────────────────────────────────────────────────────
-# debian:trixie-slim builder (proven + fast); chiselled Ubuntu 26.04 runtime.
-# build-old-glibc / run-new-glibc is the safe direction. Swap BUILDER_IMAGE to
-# ubuntu:26.04 to compile on Ubuntu itself.
-ARG BUILDER_IMAGE=debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b
+# ubuntu:26.04 builder with gcc-15 (the Big Tam CI toolchain, #5929) feeding a
+# chiselled Ubuntu 26.04 runtime. Builder and runtime are the SAME release, so
+# the runtime's libstdc++6_libs / libgcc-s1_libs / libc6_libs slices carry the
+# GCC 15 symbol versions and the glibc the binary was linked against. The
+# builder used to be debian:trixie-slim with gcc-13; trixie has no gcc-15.
+# If you override BUILDER_IMAGE, it must not be NEWER than the 26.04 runtime
+# (build-old / run-new is the only safe direction) and must provide gcc-15 +
+# mold (meson/native/linux-gcc15.ini links with -fuse-ld=mold).
+ARG BUILDER_IMAGE=ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03
 FROM ${BUILDER_IMAGE} AS builder
 
 # TRIPLET may be passed explicitly (--build-arg TRIPLET=arm64-linux, as the
@@ -30,14 +35,14 @@ ARG YUZU_BUILD_JOBS=
 
 COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
+    cmake ninja-build gcc-15 g++-15 mold ccache pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
     bison flex autoconf automake libtool \
     python3-pip python3-venv python3-yaml \
-    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
-    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
-    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-13 100 \
-    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 100 \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 100 \
+    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-15 100 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-15 100 \
     && pip3 install --break-system-packages --require-hashes -r /tmp/requirements-meson.txt \
     && rm -rf /var/lib/apt/lists/*
 
@@ -58,15 +63,15 @@ RUN --mount=type=cache,target=/opt/vcpkg/buildtrees,sharing=locked \
     T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;; *) echo x64-linux;; esac)}"; \
     /opt/vcpkg/vcpkg install --triplet "$T" --x-manifest-root=.
 
-ENV CC="ccache gcc-13" \
-    CXX="ccache g++-13" \
+ENV CC="ccache gcc-15" \
+    CXX="ccache g++-15" \
     CCACHE_DIR=/root/.cache/ccache
 
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/ccache \
     T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;; *) echo x64-linux;; esac)}"; \
     meson setup builddir \
-        --native-file meson/native/linux-gcc13.ini \
+        --native-file meson/native/linux-gcc15.ini \
         --buildtype=release \
         -Dcmake_prefix_path=/src/vcpkg_installed/$T \
         -Dpkg_config_path=/src/vcpkg_installed/$T/lib/pkgconfig \

@@ -304,9 +304,11 @@ services:
   #
   # hostname: is the tier label the viz shows; container_name is yuzu-cv-* to
   # avoid colliding with the plain-agent cedar-vale-local containers above.
-  # All three COPY the trixie-built agent from yuzu-agent-viz-uat:latest, so
-  # the launcher must build that image first (build_images does, before the
-  # mode switch). Tiers run on trixie bases so the agent's glibc matches.
+  # All three COPY the agent from yuzu-agent-viz-uat:latest (Dockerfile.agent,
+  # built on ubuntu:26.04 with gcc-15 since #5929), so the launcher must build
+  # that image first (build_images does, before the mode switch). Tiers run on
+  # trixie bases, which today satisfy the agent's glibc/libstdc++ needs; see
+  # the note in deploy/docker/cedar-vale/Dockerfile.tier-frontend.
   cv-db:
     profiles: ["cedar-vale-app"]
     build:

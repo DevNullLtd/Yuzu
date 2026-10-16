@@ -1,12 +1,20 @@
 # Cedar & Vale demo — db tier: Postgres + co-located yuzu-agent.
 #
-# Base is postgres:17 (Debian trixie, glibc 2.41) so the trixie-built agent
-# binary runs natively. The agent is copied from the already-built
+# Base is postgres:18 (Debian trixie, glibc 2.41), which satisfies the agent's
+# runtime needs. The agent is copied from the already-built
 # yuzu-agent-viz-uat image (the launcher builds it first). The official
 # postgres entrypoint still runs /docker-entrypoint-initdb.d/*.sql on first
 # boot, which seeds the slide content (01-slides.sql).
 #
 # Build context is the repo root (compose sets context: ../..).
+#
+# The agent comes from Dockerfile.agent, which builds on ubuntu:26.04 with
+# gcc-15 since #5929. Its measured needs (GLIBC_2.38, GLIBCXX_3.4.32,
+# CXXABI_1.3.15) are met by trixie's glibc 2.41 and GCC 14 libstdc++; the
+# agent and all 70 plugins were run on debian:trixie-slim (arm64) at #5929. That is a
+# property of today's agent, not a guarantee: yuzu-server, built the same way,
+# already needs GCC 15's GLIBCXX_3.4.34, and if the agent ever does too this
+# tier stops starting with a "GLIBCXX_3.4.34 not found" loader error.
 
 FROM yuzu-agent-viz-uat:latest AS agentsrc
 

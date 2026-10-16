@@ -14,21 +14,25 @@
 #     -f deploy/docker/Dockerfile.agent.chisel .          # arm64 client
 #
 # Three stages:
-#   1. builder  — compiles the agent (debian:trixie-slim, proven + fast with
-#                 the existing vcpkg/ccache cache mounts). The runtime image
+#   1. builder  — compiles the agent (ubuntu:26.04 + gcc-15, the Big Tam CI
+#                 toolchain; vcpkg/ccache cache mounts). The runtime image
 #                 is 100% Ubuntu 26.04; the builder is throwaway scaffolding.
 #   2. chisel   — cuts the Ubuntu 26.04 runtime slices into /rootfs and lays
 #                 the agent binary, core DSO, and plugins on top.
 #   3. final    — FROM scratch + COPY /rootfs. Nothing else.
 
 # ── Stage 1: builder ──────────────────────────────────────────────────────
-# BUILDER_IMAGE defaults to debian:trixie-slim because Canonical's apt mirrors
-# have historically been unreachable from the CI build host (see the comment
-# in Dockerfile.agent). The agent ELF links against the builder's glibc
-# (trixie, 2.41) and runs on the chiselled Ubuntu 26.04 glibc (>= 2.41) —
-# build-old / run-new is the safe direction. Swap to ubuntu:26.04 if you want
-# the compile itself on Ubuntu.
-ARG BUILDER_IMAGE=debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b
+# BUILDER_IMAGE defaults to ubuntu:26.04 — the same release as the chiselled
+# runtime and the Big Tam CI pool — so the agent is compiled by gcc-15, the
+# compiler CI tests (#5929). It used to default to debian:trixie-slim with
+# gcc-13 (Canonical's mirrors were once unreachable from the build host), but
+# trixie has no gcc-15. Same release on both sides means the runtime's
+# libstdc++6_libs / libgcc-s1_libs / libc6_libs slices carry every symbol
+# version the agent, its core DSO and the plugins were linked against. An
+# override must not be NEWER than the 26.04 runtime (build-old / run-new is
+# the only safe direction) and must provide gcc-15 + mold
+# (meson/native/linux-gcc15.ini links with -fuse-ld=mold).
+ARG BUILDER_IMAGE=ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03
 FROM ${BUILDER_IMAGE} AS builder
 
 # TRIPLET may be passed explicitly (--build-arg TRIPLET=arm64-linux, as the
@@ -40,14 +44,14 @@ ARG YUZU_BUILD_JOBS=
 
 COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
+    cmake ninja-build gcc-15 g++-15 mold ccache pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
     bison flex libsystemd-dev libblkid-dev autoconf automake libtool \
     python3-pip python3-venv python3-yaml \
-    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
-    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
-    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-13 100 \
-    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 100 \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 100 \
+    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-15 100 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-15 100 \
     && pip3 install --break-system-packages --require-hashes -r /tmp/requirements-meson.txt \
     && rm -rf /var/lib/apt/lists/*
 
@@ -68,8 +72,8 @@ RUN --mount=type=cache,target=/opt/vcpkg/buildtrees,sharing=locked \
     T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;; *) echo x64-linux;; esac)}"; \
     /opt/vcpkg/vcpkg install --triplet "$T" --x-manifest-root=.
 
-ENV CC="ccache gcc-13" \
-    CXX="ccache g++-13" \
+ENV CC="ccache gcc-15" \
+    CXX="ccache g++-15" \
     CCACHE_DIR=/root/.cache/ccache
 
 COPY . .
@@ -78,7 +82,7 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/ccache \
     T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;; *) echo x64-linux;; esac)}"; \
     meson setup builddir \
-        --native-file meson/native/linux-gcc13.ini \
+        --native-file meson/native/linux-gcc15.ini \
         --buildtype=release \
         -Dcmake_prefix_path=/src/vcpkg_installed/$T \
         -Dpkg_config_path=/src/vcpkg_installed/$T/lib/pkgconfig \

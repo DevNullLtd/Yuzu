@@ -43,7 +43,7 @@
 #     healthcheck later without a silent break.
 #
 # Those dependencies are invisible to the application and to every test we run:
-# a base-image swap (trixie-slim -> a variant without bash), a dropped apt
+# a base-image swap (ubuntu:26.04 -> a variant without bash), a dropped apt
 # package, or a chisel slice change that stops shipping the busybox symlink
 # breaks nothing at build time and nothing at boot. It breaks only the
 # healthcheck -- so Compose parks every container in `unhealthy` forever, and
