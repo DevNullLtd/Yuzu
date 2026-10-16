@@ -23415,6 +23415,206 @@ TEST_CASE("MCP preview_management_group_agent_count: securable/operation registr
     CHECK(it->operation == "Write");
 }
 
+// -- #5623: preview_management_group_agent_count names over-bound filters --
+// A filter value over kMaxFacetValueBytes is not indexed in newly stored responses, so the count
+// can be 0 or an undercount; unindexed_filter_keys says which filters, additively (agent_count
+// and every status are unchanged). REST and MCP call the same builder; the last test pins that.
+
+namespace {
+
+// The REST route beside the MCP tool, over one ResponseStore. `sink` is declared AFTER the route
+// owner it registers (TestRouteSink invariant 1, #1786).
+struct PreviewRestTwin {
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::RestApiV1 api;
+    yuzu::server::test::TestRouteSink sink;
+
+    explicit PreviewRestTwin(yuzu::server::ResponseStore* store) {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<yuzu::server::auth::Session> {
+            yuzu::server::auth::Session session;
+            session.username = "admin";
+            session.role = yuzu::server::auth::Role::admin;
+            return session;
+        };
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> bool { return true; };
+        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                           const std::string&, const std::string&, const std::string&) -> bool {
+            return true;
+        };
+        api.register_routes(sink, auth_fn, perm_fn, audit_fn,
+                            /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
+                            /*token_store=*/nullptr, /*quarantine_store=*/nullptr,
+                            /*response_store=*/store, /*instruction_store=*/nullptr,
+                            /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr,
+                            /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
+                            /*audit_store=*/nullptr, /*service_group_fn=*/{}, /*tag_push_fn=*/{},
+                            /*inventory_store=*/nullptr, /*product_pack_store=*/nullptr,
+                            /*sw_deploy_store=*/nullptr, /*device_token_store=*/nullptr,
+                            /*license_store=*/nullptr, /*guaranteed_state_store=*/nullptr,
+                            /*metrics_registry=*/&metrics, /*session_revoke_fn=*/{},
+                            /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
+                            /*command_dispatch_fn=*/{}, /*step_up_fn=*/{}, /*guardian_push_fn=*/{},
+                            /*dex_perf_fn=*/{}, /*network_api=*/{}, /*lockout_clear_fn=*/{},
+                            /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
+                            /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{});
+    }
+};
+
+void store_preview_response(yuzu::server::ResponseStore& rs, const std::string& command_id,
+                            const std::string& agent, const std::string& output) {
+    yuzu::server::StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = agent;
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = output;
+    r.plugin = "registry"; // default (Agent, Output) layout -> filter key "output"
+    rs.store(r);
+}
+
+} // namespace
+
+TEST_CASE("MCP preview_management_group_agent_count: unindexed_filter_keys is present and empty "
+          "for no filter and for a short filter",
+          "[pg][mcp][devices][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+    store_preview_response(store, "cmd-mcp-preview", "agent-a", "short output");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start();
+
+    auto none = mcp_tool_call(ts, "preview_management_group_agent_count",
+                              R"({"command_id":"cmd-mcp-preview","plugin":"registry"})");
+    INFO(none.dump());
+    REQUIRE(none.contains("result"));
+    const auto& s0 = none["result"]["structuredContent"];
+    CHECK(s0["agent_count"] == 0);
+    REQUIRE(s0.contains("unindexed_filter_keys"));
+    CHECK(s0["unindexed_filter_keys"].is_array());
+    CHECK(s0["unindexed_filter_keys"].empty());
+
+    auto shortf = mcp_tool_call(
+        ts, "preview_management_group_agent_count",
+        R"({"command_id":"cmd-mcp-preview","plugin":"registry","filters":{"output":"short output"}})");
+    REQUIRE(shortf.contains("result"));
+    const auto& s1 = shortf["result"]["structuredContent"];
+    CHECK(s1["agent_count"] == 1);
+    CHECK(s1["unindexed_filter_keys"].empty());
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: a filter value over kMaxFacetValueBytes is "
+          "named; text and structured content agree, the count is unchanged",
+          "[pg][mcp][devices][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+    store_preview_response(store, "cmd-mcp-preview-long", "agent-a", "short output");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start();
+
+    auto call = [&](std::size_t bytes) {
+        const nlohmann::json args = {{"command_id", "cmd-mcp-preview-long"},
+                                     {"plugin", "registry"},
+                                     {"filters", {{"output", std::string(bytes, 'z')}}}};
+        return mcp_tool_call(ts, "preview_management_group_agent_count", args.dump());
+    };
+
+    SECTION("2049 bytes: named, count 0, no value echo, text == structuredContent") {
+        auto body = call(yuzu::server::kMaxFacetValueBytes + 1);
+        INFO(body.dump());
+        REQUIRE(body.contains("result"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(sc["agent_count"] == 0);
+        REQUIRE(sc["unindexed_filter_keys"].is_array());
+        REQUIRE(sc["unindexed_filter_keys"].size() == 1);
+        CHECK(sc["unindexed_filter_keys"][0] == "output");
+        const auto text = body["result"]["content"][0]["text"].get<std::string>();
+        CHECK(nlohmann::json::parse(text) == sc);
+        CHECK(text.find("zzzz") == std::string::npos);
+    }
+
+    SECTION("2048 bytes: not named") {
+        auto body = call(yuzu::server::kMaxFacetValueBytes);
+        REQUIRE(body.contains("result"));
+        CHECK(body["result"]["structuredContent"]["unindexed_filter_keys"].empty());
+    }
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: tools/list documents unindexed_filter_keys "
+          "in the description and the typed output schema (not required)",
+          "[mcp][devices][facets]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":96,"params":{}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("result"));
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : envelope["result"]["tools"])
+        if (t["name"] == "preview_management_group_agent_count")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+    const auto description = (*tool)["description"].get<std::string>();
+    CHECK(description.find("unindexed_filter_keys") != std::string::npos);
+    CHECK(description.find("2048 bytes") != std::string::npos);
+    const auto& out = (*tool)["outputSchema"];
+    REQUIRE(out["properties"].contains("unindexed_filter_keys"));
+    CHECK(out["properties"]["unindexed_filter_keys"]["type"] == "array");
+    CHECK(out["properties"]["unindexed_filter_keys"]["items"]["type"] == "string");
+    for (const auto& req_key : out["required"])
+        CHECK(req_key != "unindexed_filter_keys");
+}
+
+TEST_CASE("preview agent count: REST and MCP report the same count and keys for the same input",
+          "[pg][mcp][rest][devices][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+    const std::string command_id = "cmd-preview-agree";
+    store_preview_response(store, command_id, "agent-a", "short output");
+    store_preview_response(store, command_id, "agent-b", "short output");
+
+    PreviewRestTwin rest{&store};
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start();
+
+    for (const std::size_t bytes :
+         {std::size_t{0}, yuzu::server::kMaxFacetValueBytes, yuzu::server::kMaxFacetValueBytes + 1}) {
+        // bytes == 0 stands for the short matching value (count 2); the others are all-'z'.
+        const std::string value = bytes == 0 ? std::string("short output") : std::string(bytes, 'z');
+        INFO("value bytes: " << value.size());
+
+        auto rest_res = rest.sink.Get("/api/v1/management-groups/agent-count-preview?command_id=" +
+                                      command_id + "&plugin=registry&output=" +
+                                      (bytes == 0 ? std::string("short+output") : value));
+        REQUIRE(rest_res != nullptr);
+        REQUIRE(rest_res->status == 200);
+        const auto rest_data = nlohmann::json::parse(rest_res->body)["data"];
+
+        const nlohmann::json args = {{"command_id", command_id},
+                                     {"plugin", "registry"},
+                                     {"filters", {{"output", value}}}};
+        auto mcp_body = mcp_tool_call(ts, "preview_management_group_agent_count", args.dump());
+        REQUIRE(mcp_body.contains("result"));
+        const auto& mcp_data = mcp_body["result"]["structuredContent"];
+
+        CHECK(rest_data["agent_count"] == mcp_data["agent_count"]);
+        CHECK(rest_data["unindexed_filter_keys"] == mcp_data["unindexed_filter_keys"]);
+        CHECK(rest_data["unindexed_filter_keys"].is_array());
+    }
+}
+
 // ── B4 (#2146 API-parity) — management-group CRUD/membership/role twins ────
 
 namespace {

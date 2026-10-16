@@ -51,6 +51,17 @@ std::string mangle_column_key(std::string_view column_name);
 std::vector<FacetFilter> resolve_group_preview_filters(
     const std::string& plugin, const std::vector<std::pair<std::string, std::string>>& fields);
 
+/// PURE (#5623): the MANGLED column keys (see `mangle_column_key`, resolved
+/// from `columns_for_plugin(plugin)[col_idx + 1]`) of every filter whose value
+/// is longer than `kMaxFacetValueBytes` (response_store.hpp) -- a value that is
+/// not indexed in newly stored responses, so `group_agent_count_preview` can
+/// answer 0 or an undercount for it. In input order, de-duplicated; a filter
+/// whose `col_idx` does not resolve against `plugin`'s columns is skipped. Key
+/// NAMES only, never the values. REST and MCP report this additively as
+/// `unindexed_filter_keys`.
+std::vector<std::string> unindexed_filter_keys(const std::string& plugin,
+                                               const std::vector<FacetFilter>& filters);
+
 /// PURE: the create-group agent-count preview — mirrors
 /// `/fragments/create-group-form`'s own derivation exactly: empty `filters`
 /// is a GENUINE `0` (no scoped count to report — never a store call, matching
@@ -64,11 +75,11 @@ std::vector<FacetFilter> resolve_group_preview_filters(
 /// `agent_scope`: `nullopt` = unfiltered (global grant / elevated / RBAC
 /// off); engaged (including empty) = filter to exactly these agents.
 ///
-/// Known limit (#5623): an exact-match value longer than `kMaxFacetValueBytes`
-/// (response_store.hpp) is not indexed in newly stored responses, so for such a
-/// value this answers a bare count that can be 0 without saying why. The
-/// results page shows a hint for it; this surface does not (a follow-up change
-/// will report it).
+/// Count semantics are unchanged by #5623: an exact-match value longer than
+/// `kMaxFacetValueBytes` (response_store.hpp) is not indexed in newly stored
+/// responses, so for such a value this count can be 0 or an undercount. It does
+/// not say so itself; callers pair it with `unindexed_filter_keys` (above) and
+/// report that additively.
 std::optional<std::int64_t>
 group_agent_count_preview(ResponseStore* store, const std::string& command_id,
                           const std::vector<FacetFilter>& filters,

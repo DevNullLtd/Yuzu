@@ -363,6 +363,55 @@ TEST_CASE("group-from-results: an all-dropped scope falls into the existing "
     CHECK_FALSE(h.mg.find_group_by_name("alldropped-group").has_value());
 }
 
+// -- (2b) #5623: an empty match with a filter over the ingest bound says so --
+
+TEST_CASE("group-from-results: a 422 for an over-bound filter value explains the undercount, "
+          "status and no-group unchanged",
+          "[pg][server][dashboard][group_from_results][facets]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+
+    const std::string plain =
+        "<span class=\"feedback-error\">No agents match the current filters.</span>";
+    const std::string over_bound = "<span class=\"feedback-error\">No agents match the current "
+                                   "filters. A filter value is longer than " +
+                                   std::to_string(kMaxFacetValueBytes) +
+                                   " bytes; values that long are not indexed in newly stored "
+                                   "responses, so this may be an undercount.</span>";
+    auto body_with = [](const std::string& name, const std::string& category) {
+        return "group_name=" + name + "&command_id=" + kCommandId + "&plugin=" + kPlugin +
+               "&f_category=" + category;
+    };
+
+    SECTION("one byte over the bound: 422, the explanatory body, no value echo, no group") {
+        const std::string value(kMaxFacetValueBytes + 1, 'z');
+        auto res = h.post(body_with("overbound-group", value));
+        CHECK(res->status == 422);
+        CHECK(res->body == over_bound);
+        CHECK_FALSE(contains(res->body, "zzzz"));
+        CHECK_FALSE(h.mg.find_group_by_name("overbound-group").has_value());
+    }
+
+    SECTION("exactly the bound: the plain body (nothing changed for a value that is indexed)") {
+        const std::string value(kMaxFacetValueBytes, 'z');
+        auto res = h.post(body_with("atbound-group", value));
+        CHECK(res->status == 422);
+        CHECK(res->body == plain);
+    }
+
+    SECTION("a short filter that matches nothing: the plain body") {
+        auto res = h.post(body_with("nomatch-group", "no-such-category"));
+        CHECK(res->status == 422);
+        CHECK(res->body == plain);
+    }
+
+    SECTION("a short matching filter still creates the group") {
+        auto res = h.post(GroupFromResultsHarness::form_body("match-group"));
+        CHECK(res->status != 422);
+        CHECK(h.mg.find_group_by_name("match-group").has_value());
+    }
+}
+
 // ── (3) Degrade 503 unchanged, before any scope logic ───────────────────────
 
 TEST_CASE("group-from-results: a degraded response store 503s with the "

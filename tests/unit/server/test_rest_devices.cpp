@@ -31,9 +31,13 @@
 //     nullptr -> 503 (degrade posture, never a false 200).
 
 #include "device_routes.hpp"
+#include "pg/pg_pool.hpp"
+#include "response_store.hpp"
 #include "rest_api_v1.hpp"
 #include "authz_gates.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -47,6 +51,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -114,7 +119,10 @@ struct DeviceRestHarness {
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
-    explicit DeviceRestHarness(bool wire_fleet_read_fn = true) {
+    /// @param response_store the store behind agent-count-preview (nullptr = unwired); borrowed,
+    ///        must outlive the harness.
+    explicit DeviceRestHarness(bool wire_fleet_read_fn = true,
+                               ResponseStore* response_store = nullptr) {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
             if (!auth_ok) {
@@ -162,7 +170,7 @@ struct DeviceRestHarness {
         api.register_routes(
             sink, auth_fn, perm_fn, audit_fn,
             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
-            /*quarantine_store=*/nullptr, /*response_store=*/nullptr,
+            /*quarantine_store=*/nullptr, /*response_store=*/response_store,
             /*instruction_store=*/nullptr, /*execution_tracker=*/nullptr,
             /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
             /*audit_store=*/nullptr, /*service_group_fn=*/{}, /*tag_push_fn=*/{},
@@ -407,6 +415,115 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview — no filters is a
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["data"]["agent_count"].get<int64_t>() == 0);
+}
+
+// -- #5623: the additive unindexed_filter_keys field ---------------------------------------
+
+namespace {
+
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
+
+constexpr const char* kPreviewPath = "/api/v1/management-groups/agent-count-preview";
+
+void store_registry_output(ResponseStore& rs, const std::string& command_id,
+                           const std::string& agent, const std::string& output) {
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = agent;
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = output;
+    r.plugin = "registry"; // default (Agent, Output) layout -> filter key "output"
+    rs.store(r);
+}
+
+} // namespace
+
+TEST_CASE("agent-count-preview: unindexed_filter_keys is always present, empty with no filter",
+          "[rest][devices]") {
+    DeviceRestHarness h; // store unwired: the empty-filter branch is a genuine 0
+    auto res = h.sink.Get(std::string(kPreviewPath) + "?command_id=cmd-1&plugin=procfetch");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["agent_count"].get<int64_t>() == 0);
+    REQUIRE(body["data"].contains("unindexed_filter_keys"));
+    CHECK(body["data"]["unindexed_filter_keys"].is_array());
+    CHECK(body["data"]["unindexed_filter_keys"].empty());
+}
+
+TEST_CASE("agent-count-preview: a filter value over kMaxFacetValueBytes is named, the count and "
+          "status are unchanged",
+          "[pg][rest][devices][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-rest-preview-too-long";
+    store_registry_output(rs, command_id, "agent-a", "short output");
+    store_registry_output(rs, command_id, "agent-b", "short output");
+
+    DeviceRestHarness h(/*wire_fleet_read_fn=*/true, &rs);
+    const std::string base = std::string(kPreviewPath) + "?command_id=" + command_id + "&plugin=registry";
+
+    SECTION("a short matching filter: count 2, field present and empty") {
+        auto res = h.sink.Get(base + "&output=short+output");
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["agent_count"].get<int64_t>() == 2);
+        REQUIRE(body["data"].contains("unindexed_filter_keys"));
+        CHECK(body["data"]["unindexed_filter_keys"].empty());
+    }
+
+    SECTION("2049 bytes: the key is named, count 0 as before, no value echo") {
+        const std::string value(kMaxFacetValueBytes + 1, 'z');
+        auto res = h.sink.Get(base + "&output=" + value);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["agent_count"].get<int64_t>() == 0);
+        REQUIRE(body["data"]["unindexed_filter_keys"].is_array());
+        REQUIRE(body["data"]["unindexed_filter_keys"].size() == 1);
+        CHECK(body["data"]["unindexed_filter_keys"][0] == "output");
+        CHECK(res->body.find("zzzz") == std::string::npos);
+    }
+
+    SECTION("2048 bytes: not named (it is indexed), count 0 only because nothing matches") {
+        const std::string value(kMaxFacetValueBytes, 'z');
+        auto res = h.sink.Get(base + "&output=" + value);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["agent_count"].get<int64_t>() == 0);
+        CHECK(body["data"]["unindexed_filter_keys"].empty());
+    }
+
+    SECTION("an unknown filter key is skipped and never named") {
+        const std::string value(kMaxFacetValueBytes + 1, 'z');
+        auto res = h.sink.Get(base + "&not_a_column=" + value);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["agent_count"].get<int64_t>() == 0);
+        CHECK(body["data"]["unindexed_filter_keys"].empty());
+    }
+}
+
+TEST_CASE("agent-count-preview: the 503 degrade is unchanged for an over-bound filter",
+          "[rest][devices][facets]") {
+    DeviceRestHarness h; // store unwired
+    const std::string value(kMaxFacetValueBytes + 1, 'z');
+    auto res = h.sink.Get(std::string(kPreviewPath) +
+                          "?command_id=cmd-1&plugin=registry&output=" + value);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("unindexed_filter_keys") == std::string::npos);
 }
 
 TEST_CASE("GET /api/v1/management-groups/agent-count-preview — a real filter against an "

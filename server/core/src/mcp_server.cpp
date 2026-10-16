@@ -912,13 +912,15 @@ static const ToolDef kTools[] = {
      "an empty filters map returns a genuine 0 (no scoped count to report), never a "
      "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
-     "though this tool itself performs no mutation.",
+     "though this tool itself performs no mutation. When unindexed_filter_keys is "
+     "non-empty, agent_count can be 0 or an undercount because filter values over "
+     "2048 bytes are not indexed in newly stored responses.",
      R"j({"type":"object","properties":{)j"
      R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
      R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
      R"j("filters":{"type":"object","additionalProperties":{"type":"string"},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
      R"j(},"required":["command_id","plugin"]})j",
-     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"}},"required":["agent_count"]})j"},
+     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"},"unindexed_filter_keys":{"type":"array","items":{"type":"string"},"description":"Mangled keys of filters whose value is longer than 2048 bytes (not indexed in newly stored responses); empty when none. When non-empty, agent_count can be 0 or an undercount"}},"required":["agent_count"]})j"},
 
     // B4 (#2146 API-parity Batch B4) — six MCP twins of the remaining
     // /api/v1/management-groups* CRUD/membership/role surface. list_management_groups
@@ -10633,9 +10635,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 mcp_audit("success");
+                // #5623: additive -- key names only (never values); agent_count unchanged.
+                JArr unindexed;
+                for (const auto& key : unindexed_filter_keys(plugin, filters))
+                    unindexed.add(key);
                 res.set_content(
                     success_response(
-                        id, tool_result(JObj().add("agent_count", *count).str(), kObjectOutputSchema)),
+                        id, tool_result(JObj()
+                                            .add("agent_count", *count)
+                                            .raw("unindexed_filter_keys", unindexed.str())
+                                            .str(),
+                                        kObjectOutputSchema)),
                     "application/json");
                 return;
             }

@@ -517,7 +517,8 @@ constexpr std::string_view kTooLongMarker = "data-filter-too-long";
 std::string expected_hint_text() {
     return "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
            " bytes. Newly stored responses do not index values that long, so this filter may "
-           "match nothing. Clear the filter and use the Search box.";
+           "match nothing. Clear the filter (or switch the View to Default) and use the Search "
+           "box.";
 }
 
 // The whole hint element, from its opening `<span` through `</span>`, so an echo check covers
@@ -815,6 +816,26 @@ TEST_CASE("/fragments/results: saved View defaults and the over-bound hint",
         CHECK(res->status == 200);
         CHECK_FALSE(contains(res->body, kTooLongMarker));
         CHECK(contains(res->body, "class=\"result-row\""));
+    }
+
+    SECTION("the hint's advice is true: the Default View (no template_id) plus Search finds the row") {
+        // The saved View's long default filter matches nothing ...
+        auto view = h.get(base + "&definition_id=" + long_eq + "&template_id=vw1");
+        REQUIRE(view);
+        CHECK(contains(view->body, kTooLongMarker));
+        CHECK_FALSE(contains(view->body, "class=\"result-row\""));
+        // ... but the SAME request with the Default View (no template_id) applies no View filter,
+        // and a Search term then returns the row, with no hint.
+        auto dflt = h.get(base + "&definition_id=" + long_eq + "&q=short");
+        REQUIRE(dflt);
+        CHECK(dflt->status == 200);
+        CHECK_FALSE(contains(dflt->body, kTooLongMarker));
+        CHECK(contains(dflt->body, "class=\"result-row\""));
+        CHECK_FALSE(contains(dflt->body, "No results match your filters."));
+        // Negative control: the Search term itself filters (a non-matching term finds no row).
+        auto miss = h.get(base + "&definition_id=" + long_eq + "&q=zzznomatch");
+        REQUIRE(miss);
+        CHECK_FALSE(contains(miss->body, "class=\"result-row\""));
     }
 
     SECTION("an explicit LONG request filter over a short default: hint (the request wins)") {

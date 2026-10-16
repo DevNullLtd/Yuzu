@@ -2,6 +2,7 @@
 
 #include "result_parsing.hpp" // columns_for_plugin
 
+#include <algorithm>
 #include <cctype>
 
 namespace yuzu::server {
@@ -35,6 +36,23 @@ std::vector<FacetFilter> resolve_group_preview_filters(
         }
     }
     return filters;
+}
+
+std::vector<std::string> unindexed_filter_keys(const std::string& plugin,
+                                               const std::vector<FacetFilter>& filters) {
+    std::vector<std::string> keys;
+    const auto& cols = columns_for_plugin(plugin);
+    for (const auto& f : filters) {
+        if (f.value.size() <= kMaxFacetValueBytes)
+            continue;
+        // cols[0] is "Agent"; a FacetFilter's col_idx is 0-based after it.
+        if (f.col_idx < 0 || static_cast<std::size_t>(f.col_idx) + 1 >= cols.size())
+            continue;
+        auto key = mangle_column_key(cols[static_cast<std::size_t>(f.col_idx) + 1]);
+        if (std::find(keys.begin(), keys.end(), key) == keys.end())
+            keys.push_back(std::move(key));
+    }
+    return keys;
 }
 
 std::optional<std::int64_t>

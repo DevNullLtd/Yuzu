@@ -69,3 +69,72 @@ TEST_CASE("group_agent_count_preview: non-empty filters against an unconfigured 
     auto count = group_agent_count_preview(nullptr, "cmd-1", filters, std::nullopt);
     CHECK_FALSE(count.has_value()); // nullopt — never a false 0
 }
+
+// -- unindexed_filter_keys (#5623) ------------------------------------------
+
+TEST_CASE("unindexed_filter_keys: 2048 bytes is indexed, 2049 is not",
+          "[server][devices][facets]") {
+    // procfetch columns: Agent, PID, Name, Path, SHA-1 -> col_idx 0..3 map to pid..sha_1.
+    const std::string at_bound(kMaxFacetValueBytes, 'z');
+    const std::string over(kMaxFacetValueBytes + 1, 'z');
+    REQUIRE(at_bound.size() == 2048);
+    REQUIRE(over.size() == 2049);
+
+    CHECK(unindexed_filter_keys("procfetch", {{2, at_bound}}).empty());
+    const auto keys = unindexed_filter_keys("procfetch", {{2, over}});
+    REQUIRE(keys.size() == 1);
+    CHECK(keys[0] == "path");
+    // Key names only, never the value.
+    CHECK(keys[0].find("zzzz") == std::string::npos);
+}
+
+TEST_CASE("unindexed_filter_keys: no filters, or only short ones, is empty", "[server][devices][facets]") {
+    CHECK(unindexed_filter_keys("procfetch", {}).empty());
+    CHECK(unindexed_filter_keys("procfetch", {{0, "1234"}, {3, "deadbeef"}}).empty());
+}
+
+TEST_CASE("unindexed_filter_keys: mangled keys, input order, de-duplicated",
+          "[server][devices][facets]") {
+    const std::string over(kMaxFacetValueBytes + 1, 'z');
+    // SHA-1 (col_idx 3) mangles to sha_1; listed first, then pid, then sha_1 again.
+    const auto keys =
+        unindexed_filter_keys("procfetch", {{3, over}, {0, over}, {3, over + "y"}, {1, "short"}});
+    REQUIRE(keys.size() == 2);
+    CHECK(keys[0] == "sha_1");
+    CHECK(keys[1] == "pid");
+}
+
+TEST_CASE("unindexed_filter_keys: an unknown plugin or an out-of-range column is skipped",
+          "[server][devices][facets]") {
+    const std::string over(kMaxFacetValueBytes + 1, 'z');
+    // An index past the end of the layout, or a negative one, resolves to no key.
+    CHECK(unindexed_filter_keys("procfetch", {{99, over}}).empty());
+    CHECK(unindexed_filter_keys("procfetch", {{-1, over}}).empty());
+    // An unknown plugin uses columns_for_plugin's default (Agent, Output) layout: column 0 is
+    // "output", and column 1 does not exist.
+    CHECK(unindexed_filter_keys("no_such_plugin", {{0, over}}) ==
+          std::vector<std::string>{"output"});
+    CHECK(unindexed_filter_keys("no_such_plugin", {{1, over}}).empty());
+}
+
+TEST_CASE("unindexed_filter_keys: the bound is bytes, not characters", "[server][devices][facets]") {
+    std::string over; // U+00E9 is two bytes: 1025 of them are 2050 bytes
+    std::string at_bound;
+    for (std::size_t i = 0; i < kMaxFacetValueBytes / 2 + 1; ++i)
+        over += "\xC3\xA9";
+    for (std::size_t i = 0; i < kMaxFacetValueBytes / 2; ++i)
+        at_bound += "\xC3\xA9";
+    REQUIRE(over.size() == kMaxFacetValueBytes + 2);
+    REQUIRE(at_bound.size() == kMaxFacetValueBytes);
+    CHECK(unindexed_filter_keys("procfetch", {{0, at_bound}}).empty());
+    CHECK(unindexed_filter_keys("procfetch", {{0, over}}) == std::vector<std::string>{"pid"});
+}
+
+TEST_CASE("unindexed_filter_keys: composes with resolve_group_preview_filters (an unknown "
+          "key never reaches it)",
+          "[server][devices][facets]") {
+    const std::string over(kMaxFacetValueBytes + 1, 'z');
+    auto filters = resolve_group_preview_filters(
+        "procfetch", {{"not_a_real_column", over}, {"name", over}, {"pid", "1"}});
+    CHECK(unindexed_filter_keys("procfetch", filters) == std::vector<std::string>{"name"});
+}

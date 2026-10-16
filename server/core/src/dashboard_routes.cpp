@@ -684,10 +684,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (agent_ids.empty()) {
                      res.status = 422;
                      res.set_header("HX-Retarget", "#group-form-slot");
-                     res.set_content(
-                         "<span class=\"feedback-error\">"
-                         "No agents match the current filters.</span>",
-                         "text/html; charset=utf-8");
+                     // #5623: when a filter value is over the ingest bound the empty set may be
+                     // an undercount; say so (static text, never the value). Status unchanged.
+                     std::string why = "No agents match the current filters.";
+                     if (any_filter_value_too_long(filters))
+                         why += " A filter value is longer than " +
+                                std::to_string(kMaxFacetValueBytes) +
+                                " bytes; values that long are not indexed in newly stored "
+                                "responses, so this may be an undercount.";
+                     res.set_content("<span class=\"feedback-error\">" + why + "</span>",
+                                     "text/html; charset=utf-8");
                      return;
                  }
 
@@ -2718,7 +2724,8 @@ std::string DashboardRoutes::render_results(
         html += " <span class=\"result-degrade-banner\" data-filter-too-long=\"true\">"
                 "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
                 " bytes. Newly stored responses do not index values that long, so this "
-                "filter may match nothing. Clear the filter and use the Search box.</span>";
+                "filter may match nothing. Clear the filter (or switch the View to Default) "
+                "and use the Search box.</span>";
     }
     html += "</div>";
 
@@ -2933,7 +2940,14 @@ std::string DashboardRoutes::render_create_group_form(
     }
 
     std::string count_hint;
-    if (agent_count.has_value()) {
+    if (agent_count.has_value() && any_filter_value_too_long(filters)) {
+        // #5623: a value over the ingest bound is not indexed in newly stored responses, so the
+        // count can be 0 or an undercount. Say so instead of presenting it as the answer; static
+        // text, never the value.
+        count_hint = "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
+                     " bytes. Newly stored responses do not index values that long, so the "
+                     "agent count may be wrong.";
+    } else if (agent_count.has_value()) {
         count_hint = std::to_string(*agent_count) + " agent" + (*agent_count != 1 ? "s" : "") +
                     " will be added";
     } else {
