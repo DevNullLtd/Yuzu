@@ -335,7 +335,8 @@ operator-visible notes:
     larger). Rows already stored by an older server stay readable until retention removes them.
     Values over 2048 bytes in newly ingested responses are not indexed, so the facet filter, the
     dropdowns and the group-from-results count show nothing or "0 agents" for such a value; this
-    includes values between 2049 bytes and about 2.6 KB that older servers indexed.
+    includes values between 2049 bytes and about 2.6 KB that older servers indexed. The results
+    page shows a hint when a filter value is over 2048 bytes.
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column
     index ascending, then value ascending, so the same output always keeps the same facets. A rare
     value (one line, such as a single package on one host) sorts late and is the first to be cut.
