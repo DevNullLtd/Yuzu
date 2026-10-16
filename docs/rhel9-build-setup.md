@@ -7,6 +7,18 @@ automatically-regression-tested one. Both verified runs were Rocky 9.8 - the re-
 SELinux enforcing (see the verified-run section); the RHEL and Alma branches use the same packages
 but have not been exercised, arm64 is unverified, and the container checks run unconfined.
 
+> **Compiler floor change (#5929, 2026-10-16): use `gcc-toolset-15`, not `gcc-toolset-14`.** The
+> supported floor is now GCC 15 / Clang 21 — exactly what CI builds and tests (`docs/build-guide.md`
+> "Compiler floor"). GCC 14 is below it: it builds Yuzu, but it does not implement P2718R0, and
+> `/test --full` with `gcc-toolset-14` on this platform found six use-after-free sites that no CI leg
+> could see (#5924). `scripts/setup-rhel9.sh` now installs `gcc-toolset-15` (GCC 15.2.1, Rocky 9.8
+> AppStream), and its `--check` fails a box still on `-14` with `g++ is GCC 15+`; re-run the script
+> once to switch, then re-source the env file. Because vcpkg's binary cache keys on the compiler,
+> the first `vcpkg install` after the switch rebuilds every port from source (see the cold timing
+> below). The reference runs recorded at the end of this doc used `gcc-toolset-14` and predate the
+> switch; with `gcc-toolset-15` the provisioning and `--check` steps have been run (Rocky 9.8
+> container, 2026-10-16), but a full build and test run has not.
+
 **One command:**
 
 ```bash
@@ -41,23 +53,24 @@ in confusing ways.
 
 ### 1. The system GCC cannot build this project
 
-RHEL 9's `gcc` is 11. Yuzu is C++23 and the documented floor is **GCC 13+ / Clang 18+**. The fix is
-a **Software Collection**: `gcc-toolset-14` ships GCC 14.2.1 *and its own libstdc++ 14 headers*,
+RHEL 9's `gcc` is 11. Yuzu is C++23 and the documented floor is **GCC 15+ / Clang 21+**. The fix is
+a **Software Collection**: `gcc-toolset-15` ships GCC 15.2.1 *and its own libstdc++ 15 headers*,
 which is the part that matters — `<expected>` and the C++23 `<format>` additions live in libstdc++,
-and the base system's `libstdc++-devel` is 11.5.
+and the base system's `libstdc++-devel` is 11.5. (`gcc-toolset-14`, GCC 14.2.1, is also in
+AppStream but is below the floor — see the note at the top.)
 
 This also rules out the obvious-looking alternative: AppStream carries `clang` 21, but Clang uses
 the *system* libstdc++ headers, so a bare `clang++ -std=c++23` still gets the 11.5 library. Using
-Clang here means installing `gcc-toolset-14` anyway and pointing Clang at it with
+Clang here means installing `gcc-toolset-15` anyway and pointing Clang at it with
 `--gcc-install-dir`. Not worth it unless you specifically want a second-opinion compile.
 
 A Software Collection must be activated **per shell**:
 
 ```bash
-source /opt/rh/gcc-toolset-14/enable
+source /opt/rh/gcc-toolset-15/enable
 ```
 
-Inside the collection the binaries are plain **`gcc` / `g++`** — *not* `gcc-14` / `g++-14`. That
+Inside the collection the binaries are plain **`gcc` / `g++`** — *not* `gcc-15` / `g++-15`. That
 detail drives trap 2. (gcc-toolset links the newer libstdc++ bits statically, so the binaries you
 build still run on the base system without the collection activated.)
 
@@ -67,11 +80,12 @@ The native files are not interchangeable:
 
 | File | Verdict on RHEL 9 |
 |---|---|
-| `linux-gcc13.ini` | ✅ **Use this.** Contains only `cpp_std = 'c++23'` — no hard-coded binaries, no linker override. Compiler selection comes from `CC`/`CXX`. This is what the GHA-hosted ubuntu-24.04 canary uses. |
+| `linux-gcc13.ini` | ✅ **Use this.** Contains only `cpp_std = 'c++23'` — no hard-coded binaries, no linker override. Compiler selection comes from `CC`/`CXX`, so it builds with the toolset's GCC 15. |
 | `linux-gcc14.ini` | ❌ Hard-codes `c = 'gcc-14'` / `cpp = 'g++-14'`. Those names do not exist inside the Software Collection — meson fails to find a compiler. |
 | `linux-gcc15.ini`, `linux-clang21.ini` | ❌ Both force `-fuse-ld=mold`. `mold` is not in BaseOS/AppStream/CRB (EPEL only) and is not installed by this recipe — every link fails. |
 
-The name "gcc13" describes the CI leg it was written for, not a compiler constraint.
+The name "gcc13" is historical: it describes the CI leg the file was written for (since moved to
+GCC 15 and `linux-gcc15.ini`), not a compiler constraint.
 
 ### 3. `postgresql-setup --initdb` leaves host auth on `ident`
 
@@ -175,7 +189,7 @@ where `mold` and Erlang live, if you later want either.
 
 ```bash
 sudo dnf install -y \
-  gcc-toolset-14 \
+  gcc-toolset-15 \
   cmake ninja-build pkgconf-pkg-config make \
   bison flex autoconf automake libtool \
   perl perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html \
@@ -191,7 +205,7 @@ package conflict that aborts `dnf`. The script adds `curl` only when no `curl` b
 
 | Package(s) | Why |
 |---|---|
-| `gcc-toolset-14` | C++23. See trap 1. |
+| `gcc-toolset-15` | C++23 at the GCC 15 floor. See trap 1. |
 | `cmake` | Not a build system here — Meson's `dependency(..., method: 'cmake')` resolution needs it, which is how gRPC/protobuf/SQLite/PostgreSQL/Catch2 are all found. |
 | `ninja-build` | Meson's backend (CRB). |
 | `bison`, `flex` | vcpkg's `libpq` port builds PostgreSQL from source and cannot auto-acquire these on Linux. |
@@ -267,7 +281,7 @@ and `.github/workflows/vcpkg-baseline-update.yml` rewrites every tracked copy wh
 literal SHA in this file would be an untracked copy that silently goes stale, and would fail that
 check. `scripts/setup-rhel9.sh` reads it the same way.
 
-**Activate gcc-toolset before the first `vcpkg install`** so every port is built by GCC 14 rather
+**Activate gcc-toolset before the first `vcpkg install`** so every port is built by GCC 15 rather
 than the system GCC 11. Budget for a cold from-source build of all 22 ports (grpc, protobuf, abseil,
 openssl, libpq, libxml2, xmlsec, sqlite3, zlib, catch2 …) and roughly 15–25 GB of
 `buildtrees`/`packages` churn; see `docs/rhel9-toolchain-manifest.json` for measured timings on the
@@ -283,7 +297,7 @@ behind a guard block, so it is safe on re-run. (To undo, delete the block betwee
 `rm ~/.config/yuzu/toolchain-env.sh`; the cluster, role and `~/vcpkg` are left to you.)
 
 ```bash
-source /opt/rh/gcc-toolset-14/enable   # guarded: no stacked PATH entries
+source /opt/rh/gcc-toolset-15/enable   # guarded: no stacked PATH entries
 PATH="$HOME/.local/bin:$PATH"          # meson
 export VCPKG_ROOT="$HOME/vcpkg"
 export CC="ccache gcc" CXX="ccache g++"
@@ -318,7 +332,7 @@ bash scripts/setup-rhel9.sh --check --with-postgres    # every gate below, scrip
 Manually:
 
 ```bash
-g++ --version                      # 14.2.1
+g++ --version                      # 15.2.1
 meson --version                    # 1.11.2
 python3 -c "import yaml; print(yaml.__version__)"
 bash scripts/setup-rhel9.sh --check     # includes a <expected> compile probe: proves the toolset's libstdc++ is in play
@@ -348,7 +362,8 @@ tests-build-server-linux_x64/yuzu_server_tests "[pg]"
 
 ## Verified reference run
 
-**Re-verified 2026-08-31 (script as of `5bc96ea73`)** in a Rocky 9.8 KVM guest (12 vCPU /
+**Re-verified 2026-08-31 (script as of `5bc96ea73`, `gcc-toolset-14` — before the #5929 floor
+change)** in a Rocky 9.8 KVM guest (12 vCPU /
 23 GB) with SELinux **enforcing** and real systemd - the `postgresql-setup --initdb` + `systemctl`
 path ran genuinely, not shimmed. The recipe (`--with-postgres --manifest`) completed with zero
 failed steps, `--check --with-postgres` passed every check, and the full
@@ -444,7 +459,8 @@ today this is a documented limitation rather than something the setup script can
 - **The UAT rigs.** No container runtime is installed. `podman` + `podman-docker` are available in
   AppStream if you later want `scripts/start-UAT.sh` et al.; `scripts/ci/ensure-postgres.sh` prefers
   a `docker` binary but falls through to the native cluster this recipe provisions.
-- **Sanitizer / coverage builds.** `-Db_sanitize=...` works with gcc-toolset-14; the nightly coverage
+- **Sanitizer / coverage builds.** `-Db_sanitize=...` worked with gcc-toolset-14 and has not been
+  re-checked with `-15`; the nightly coverage
   job additionally needs `gcovr==8.6`.
 
 ## Troubleshooting
@@ -455,7 +471,8 @@ today this is a documented limitation rather than something the setup script can
 | `PyYAML is required to embed shipped InstructionDefinitions but is not importable from ...` at configure time | `python3` resolved to an interpreter without PyYAML. Check `python3 -c 'import yaml'` with the *same* `python3` meson found. |
 | `ERROR: Unknown compiler(s): [['gcc-14']]` | You passed `--native-file meson/native/linux-gcc14.ini`. Use `linux-gcc13.ini`. See trap 2. |
 | `collect2: fatal error: cannot find 'ld'` right after `-fuse-ld=mold` | You passed the gcc15 or clang21 native file and mold is not installed. See trap 2. |
-| `fatal error: expected: No such file or directory` | gcc-toolset not activated — you are on the system GCC 11. `source /opt/rh/gcc-toolset-14/enable`. |
+| `fatal error: expected: No such file or directory` | gcc-toolset not activated — you are on the system GCC 11. `source /opt/rh/gcc-toolset-15/enable`. |
+| `--check` reports `[fail] g++ is GCC 15+` and/or `gcc-toolset-15 present` | The box was provisioned before #5929 with `gcc-toolset-14`. Re-run `bash scripts/setup-rhel9.sh`, then open a new shell or re-source the env file. |
 | `FATAL: Ident authentication failed for user "yuzu"` | `pg_hba.conf` trap 3. |
 | `server pg unit tests shard B` TIMEOUT / SIGKILL at its meson timeout | Missing `pg_signal_backend`, trap 4. Check for leaked `yuzu_test_*` databases. |
 | `permission denied to terminate process` in test output | Same — trap 4. |

@@ -18,7 +18,7 @@
 #   ./scripts/setup.sh                              # debug build, default compiler
 #   ./scripts/setup.sh --buildtype release --lto    # release + LTO
 #   ./scripts/setup.sh --tests                      # enable tests
-#   ./scripts/setup.sh --native-file meson/native/linux-gcc13.ini
+#   ./scripts/setup.sh --native-file meson/native/linux-gcc15.ini   # needs mold
 #   ./scripts/setup.sh --cross-file meson/cross/aarch64-linux-gnu.ini
 #   ./scripts/setup.sh -- -Dbuild_agent=false       # pass extra args to meson
 

@@ -12,9 +12,11 @@ project(
   default_options: [
     # cpp_std is set per-compiler below: '/std:c++latest' for MSVC (meson's
     # cpp_std validation list has no 'vc++23' / 'c++23' entry for MSVC since
-    # toolset 14.40 / meson 1.9), '-std=c++23' for GCC 13+ / Clang 18+ /
-    # Apple Clang 15+. Setting cpp_std here makes `meson setup` fail on
-    # Windows MSVC before per-compiler add_project_arguments runs.
+    # toolset 14.40 / meson 1.9), '-std=c++23' for GCC / Clang / Apple Clang.
+    # Setting cpp_std here makes `meson setup` fail on Windows MSVC before
+    # per-compiler add_project_arguments runs. The supported compiler floor
+    # (GCC 15, Clang 21, MSVC 19.44, Apple Clang 21 — what CI builds and
+    # tests, #5929) is documented in docs/build-guide.md, not enforced here.
     'warning_level=3',
     'werror=false',
     'default_library=shared',
@@ -457,9 +459,10 @@ if host_os == 'darwin'
   # `-std=c++23`/`-fvisibility=hidden` (set above for cpp only) do not reach a
   # .mm TU; every objcpp target must re-pass them via its own `objcpp_args:`.
   # Probe for the C++23 spelling rather than hardcoding it: Apple Clang 15
-  # rejects raw `-std=c++23` and needs `-std=c++2b` (docs/ci-cpp23-
-  # troubleshooting.md); newer Apple Clang accepts the canonical spelling, so
-  # prefer it when available instead of pinning the older alias forever.
+  # (below the Apple Clang 21 floor, but the probe costs nothing) rejects raw
+  # `-std=c++23` and needs `-std=c++2b` (docs/ci-cpp23-troubleshooting.md);
+  # newer Apple Clang accepts the canonical spelling, so prefer it when
+  # available instead of pinning the older alias forever.
   # `-fobjc-arc` is included unconditionally: every objcpp TU in this project
   # keeps Objective-C object lifetimes ARC-managed (see
   # docs/native-objcpp-conventions.md) — there is no manual-retain-count

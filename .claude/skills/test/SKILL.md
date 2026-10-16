@@ -648,7 +648,7 @@ fi
 4. `git add tests/coverage-baseline.json` alongside your feature commit. `git blame` is the audit trail.
 5. Do NOT capture a baseline in the middle of an unrelated change — the commit SHA recorded in the baseline becomes the receipt for "this is the code that earned these numbers."
 
-**Coverage baseline refresh cadence.** Recapture at every `vX.Y.0` release tag on the canonical dev box (any Linux with GCC 13). Commit the updated JSON in the release-prep commit. Coverage drift between release trains is informative trend data.
+**Coverage baseline refresh cadence.** Recapture at every `vX.Y.0` release tag on the canonical dev box (any Linux with GCC 15, the supported floor and the nightly coverage compiler). Commit the updated JSON in the release-prep commit. Coverage drift between release trains is informative trend data.
 
 **Seed sentinel (historical, coverage only).** The `__seed: true` sentinel was the PR2 mechanism that kept the coverage gate from silently green-passing while the baseline was a placeholder. The gate still honors it: `__seed: true` forces WARN regardless of measured numbers. The seed phase has concluded — current `tests/coverage-baseline.json` holds real captured numbers (branch 26.8% / line 51.8% on the 5950X) and the sentinel is absent, so enforcement is live. Do **not** re-add `__seed: true` as a "temporary disable" knob; to adjust thresholds, edit `slack_pp` directly and document why in the commit message.
 
