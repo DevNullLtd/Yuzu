@@ -413,7 +413,8 @@ TEST_CASE("tar routes: /run is denied for a Read-but-no-Execute operator",
 TEST_CASE("tar routes: /run refuses an unparseable custom window and dispatches nothing",
           "[tar][routes][parse]") {
     for (const char* query : {"&from=garbage&to=", "&from=&to=2026-13-01T00:00",
-                              "&from=2026-06-18T12:00&to=2026-06-18T12:00:30xyz"}) {
+                              "&from=2026-06-18T12:00&to=2026-06-18T12:00:30xyz",
+                              "&from=2026-02-31T00:00&to=2026-03-01T00:00"}) {
         TarHarness h;
         auto r = h.sink.Get(std::string("/fragments/tar/process-tree/run?device=dev-A&preset=custom") +
                             query);
