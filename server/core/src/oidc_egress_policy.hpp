@@ -16,7 +16,8 @@
 //   - Refused UNLESS the process operator sets `--oidc-allow-private-networks`: loopback,
 //     RFC 1918, carrier-grade NAT (100.64.0.0/10), IPv6 unique-local (fc00::/7) and every other
 //     non-global unicast block (documentation, benchmarking, IETF protocol assignments, anything
-//     outside 2000::/3 for IPv6).
+//     outside 2000::/3 for IPv6; inside it the non-global parts of 2001::/23, which holds Teredo
+//     and IPv6 benchmarking, except the sub-ranges the IANA registry marks globally reachable).
 // An IPv6 address that embeds an IPv4 address (IPv4-mapped ::ffff:0:0/96, NAT64 64:ff9b::/96, 6to4
 // 2002::/16) is classified by the embedded IPv4 address, so `::ffff:169.254.169.254` is
 // link-local, not "public IPv6". A public embedded address stays public.
@@ -33,7 +34,10 @@
 // `Pref64 + 169.254.169.254` is link-local and not "public IPv6". The caller learns prefixes from
 // the operator (`--oidc-nat64-prefix`) and from RFC 7050 (`discover_prefix_from_ipv4only_answer`);
 // this header stays pure and only decodes. A prefix never relaxes an address that is already in
-// the never-allowed tier.
+// the never-allowed tier. A CONFIGURED prefix is trusted to describe a translator: it is an
+// operator assertion, so it may permit a destination its own address class (say unique-local
+// fc00::/7 for a private-network NAT64) would otherwise gate; only the always-refused tier is
+// immutable.
 //
 // KNOWN LIMIT: the classification is of the address AS THE SERVER SEES IT, plus the prefixes it
 // learned. It cannot know a translator whose prefix is neither discoverable nor configured, nor a
@@ -182,6 +186,23 @@ constexpr AddressClass classify_ipv6(const Ipv6& a) {
         return AddressClass::OtherNonGlobal;
     if (a[0] == 0x3f && a[1] == 0xff && (a[2] & 0xf0) == 0x00)
         return AddressClass::OtherNonGlobal;
+    // 2001::/23 IETF protocol assignments (IANA IPv6 Special-Purpose Address Registry, RFC 6890 /
+    // RFC 8190): not globally reachable as a block - it holds Teredo 2001::/32, benchmarking
+    // 2001:2::/48 and ORCHID 2001:10::/28 - EXCEPT the sub-ranges the registry marks globally
+    // reachable, which stay Public: 2001:1::1, 2001:1::2 and 2001:1::3 (single addresses),
+    // 2001:3::/32 AMT, 2001:4:112::/48 AS112-v6, 2001:20::/28 ORCHIDv2 and 2001:30::/28 drone
+    // remote ID. Every other address in the block (unallocated, Teredo, benchmarking, ORCHID) is
+    // refused: a range the registry does not positively mark globally reachable fails closed.
+    if (a[0] == 0x20 && a[1] == 0x01 && (a[2] & 0xfe) == 0x00) {
+        const bool service_anycast =
+            a[2] == 0x00 && a[3] == 0x01 && zeros(4, 15) && a[15] >= 1 && a[15] <= 3;
+        const bool amt = a[2] == 0x00 && a[3] == 0x03;
+        const bool as112 = a[2] == 0x00 && a[3] == 0x04 && a[4] == 0x01 && a[5] == 0x12;
+        const bool orchid_v2_or_det =
+            a[2] == 0x00 && ((a[3] & 0xf0) == 0x20 || (a[3] & 0xf0) == 0x30);
+        return (service_anycast || amt || as112 || orchid_v2_or_det) ? AddressClass::Public
+                                                                     : AddressClass::OtherNonGlobal;
+    }
     return AddressClass::Public;
 }
 

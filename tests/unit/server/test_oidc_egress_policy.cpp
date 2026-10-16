@@ -7,13 +7,16 @@
  * test_oidc_egress.cpp.
  */
 
+#include "oidc_abandoned_ledger.hpp"
 #include "oidc_egress_policy.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -177,6 +180,39 @@ TEST_CASE("OIDC egress: IPv6 ranges and the embedded IPv4 forms", "[oidc][oidc_e
         {"3fff:0fff:ffff::", AddressClass::OtherNonGlobal},
         {"3fff:1000::", AddressClass::Public},
         {"3ffe::", AddressClass::Public},
+        // 2001::/23 IETF protocol assignments (IANA special-purpose registry): non-global as a
+        // block, edges on both sides (2000:ffff:... and 2001:200::)
+        {"2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff", AddressClass::Public},
+        {"2001::", AddressClass::OtherNonGlobal}, // Teredo 2001::/32, first address
+        {"2001:0:ffff:ffff:ffff:ffff:ffff:ffff", AddressClass::OtherNonGlobal}, // Teredo, last
+        {"2001:1::", AddressClass::OtherNonGlobal},
+        {"2001:2::", AddressClass::OtherNonGlobal}, // benchmarking 2001:2::/48, first
+        {"2001:2:0:ffff:ffff:ffff:ffff:ffff", AddressClass::OtherNonGlobal}, // benchmarking, last
+        {"2001:2:1::", AddressClass::OtherNonGlobal}, // just past benchmarking, still in /23
+        {"2001:10::", AddressClass::OtherNonGlobal},  // ORCHID 2001:10::/28, first
+        {"2001:1f:ffff:ffff:ffff:ffff:ffff:ffff", AddressClass::OtherNonGlobal}, // ORCHID, last
+        {"2001:100::1", AddressClass::OtherNonGlobal}, // unallocated inside the /23
+        {"2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", AddressClass::OtherNonGlobal}, // /23 last
+        {"2001:200::", AddressClass::Public},                                     // /23 + 1
+        // ... except the sub-ranges the registry marks globally reachable
+        {"2001:1::1", AddressClass::Public}, // PCP anycast
+        {"2001:1::2", AddressClass::Public}, // TURN anycast
+        {"2001:1::3", AddressClass::Public}, // DNS-SD SRP anycast
+        {"2001:1::4", AddressClass::OtherNonGlobal},
+        {"2001:1::1:1", AddressClass::OtherNonGlobal},
+        {"2001:1:0:0:0:0:1:2", AddressClass::OtherNonGlobal},
+        {"2001:3::", AddressClass::Public},                             // AMT 2001:3::/32, first
+        {"2001:3:ffff:ffff:ffff:ffff:ffff:ffff", AddressClass::Public}, // AMT, last
+        {"2001:4:111:ffff:ffff:ffff:ffff:ffff", AddressClass::OtherNonGlobal},
+        {"2001:4:112::", AddressClass::Public}, // AS112-v6 2001:4:112::/48, first
+        {"2001:4:112:ffff:ffff:ffff:ffff:ffff", AddressClass::Public}, // AS112-v6, last
+        {"2001:4:113::", AddressClass::OtherNonGlobal},
+        {"2001:1f:ffff::", AddressClass::OtherNonGlobal}, // just below ORCHIDv2
+        {"2001:20::", AddressClass::Public},              // ORCHIDv2 2001:20::/28, first
+        {"2001:2f:ffff:ffff:ffff:ffff:ffff:ffff", AddressClass::Public}, // ORCHIDv2, last
+        {"2001:30::", AddressClass::Public}, // drone remote ID 2001:30::/28, first
+        {"2001:3f:ffff:ffff:ffff:ffff:ffff:ffff", AddressClass::Public}, // drone remote ID, last
+        {"2001:40::", AddressClass::OtherNonGlobal},                     // just past the DET block
         // outside 2000::/3 is not global unicast
         {"1fff:ffff::", AddressClass::OtherNonGlobal},
         {"4000::", AddressClass::OtherNonGlobal},
@@ -616,6 +652,27 @@ TEST_CASE("OIDC egress NAT64: an address inside a prefix is classified by its em
     }
 }
 
+TEST_CASE("OIDC egress NAT64: a configured prefix is trusted to describe a translator",
+          "[oidc][oidc_egress][oidc_nat64][security]") {
+    // By design (a ruling, not an oversight): a CONFIGURED prefix is an operator assertion about a
+    // translator, and a private-network NAT64 may legitimately sit in unique-local space. An
+    // address inside it is therefore classified by the IPv4 address embedded in it, so it may
+    // permit a destination its own address class (here fc00::/7, gated) would otherwise gate. Only
+    // the always-refused tier is immutable: the embedded IPv4 is still classified, and a refused
+    // class stays refused.
+    const std::array<Nat64Prefix, 1> ula{prefix("fd00::/96")};
+    CHECK(classify_ipv6(v6("fd00::808:808")) == AddressClass::UniqueLocal);
+    CHECK(classify_ipv6(v6("fd00::808:808"), ula) == AddressClass::Public); // 8.8.8.8
+    CHECK(decision(classify_ipv6(v6("fd00::808:808"), ula), false, false) == Verdict::Allow);
+    CHECK(classify_ipv6(v6("fd00::a9fe:a9fe"), ula) == AddressClass::LinkLocal); // 169.254.169.254
+    CHECK(classify_ipv6(v6("fd00::"), ula) == AddressClass::Unspecified);        // 0.0.0.0
+    CHECK(classify_ipv6(v6("fd00::e000:1"), ula) == AddressClass::Multicast);    // 224.0.0.1
+    CHECK(classify_ipv6(v6("fd00::a00:5"), ula) == AddressClass::Private);       // 10.0.0.5
+    // The cloud-metadata ULA stays refused: a prefix never relaxes the never-allowed tier.
+    const std::array<Nat64Prefix, 1> aws{prefix("fd00:ec2::/96")};
+    CHECK(classify_ipv6(v6("fd00:ec2::254"), aws) == AddressClass::CloudMetadata);
+}
+
 TEST_CASE("OIDC egress NAT64: what the prefix list does not touch stays as it was",
           "[oidc][oidc_egress][oidc_nat64][security]") {
     const std::array<Nat64Prefix, 2> extra{prefix("2a0e:b107:122:344::/64"),
@@ -798,4 +855,94 @@ TEST_CASE("OIDC egress NAT64: RFC 7050 discovery refuses what is not an unambigu
     // Two lengths fit at once (192.0.0.170 at bytes 4..7 AND at bytes 12..15): ambiguous.
     CHECK_FALSE(
         discover_prefix_from_ipv4only_answer(v6("2a0e:b107:c000:aa:0:0:c000:aa")).has_value());
+}
+
+// ── The bounded owner of abandoned resolver requests (the Windows resolver's reaper) ─────────
+// The ledger is generic so its ownership and bound are exercised here on every platform; the
+// Windows resolver instantiates it with its OVERLAPPED request and an event-signaled test.
+
+namespace {
+
+struct FakeRequest {
+    std::atomic<bool> done{false};
+    std::atomic<int>* destroyed;
+    explicit FakeRequest(std::atomic<int>* counter) : destroyed(counter) {}
+    ~FakeRequest() { destroyed->fetch_add(1); }
+};
+
+using FakeLedger = yuzu::server::oidc::AbandonedRequestLedger<FakeRequest>;
+
+FakeLedger make_ledger(std::size_t max) {
+    return FakeLedger(max, [](const FakeRequest& r) { return r.done.load(); });
+}
+
+} // namespace
+
+TEST_CASE("OIDC egress: an abandoned resolver request is kept until it completes, then freed",
+          "[oidc][oidc_egress][security]") {
+    std::atomic<int> destroyed{0};
+    FakeLedger ledger = make_ledger(2);
+    FakeRequest* first_raw = nullptr;
+    {
+        REQUIRE(ledger.try_reserve());
+        FakeLedger::Slot slot(ledger);
+        auto request = std::make_unique<FakeRequest>(&destroyed);
+        first_raw = request.get();
+        slot.abandon(std::move(request));
+    }
+    // Still pending: owned, not destroyed, however many sweeps run.
+    CHECK(destroyed.load() == 0);
+    CHECK(ledger.abandoned_count() == 1);
+    REQUIRE(ledger.try_reserve()); // sweeps; the request is not complete
+    ledger.finish();
+    CHECK(destroyed.load() == 0);
+    CHECK(ledger.abandoned_count() == 1);
+    // Completion: the next sweep (any reservation) destroys it.
+    first_raw->done.store(true);
+    CHECK(ledger.try_reserve());
+    CHECK(destroyed.load() == 1);
+    CHECK(ledger.abandoned_count() == 0);
+}
+
+TEST_CASE("OIDC egress: stuck resolver requests bound the ledger - a new lookup fails closed",
+          "[oidc][oidc_egress][security]") {
+    std::atomic<int> destroyed{0};
+    FakeLedger ledger = make_ledger(3);
+    std::vector<FakeRequest*> stuck;
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(ledger.try_reserve());
+        FakeLedger::Slot slot(ledger);
+        auto request = std::make_unique<FakeRequest>(&destroyed);
+        stuck.push_back(request.get());
+        slot.abandon(std::move(request));
+    }
+    // Three stuck: nothing is in flight, yet no slot is left, and nothing was freed.
+    CHECK(ledger.abandoned_count() == 3);
+    CHECK_FALSE(ledger.try_reserve());
+    CHECK_FALSE(ledger.try_reserve());
+    CHECK(destroyed.load() == 0);
+    // One completes: exactly that one is freed and exactly one slot opens.
+    stuck[1]->done.store(true);
+    CHECK(ledger.try_reserve());
+    CHECK(destroyed.load() == 1);
+    CHECK(ledger.abandoned_count() == 2);
+    CHECK_FALSE(ledger.try_reserve()); // 2 abandoned + 1 in flight == 3
+}
+
+TEST_CASE("OIDC egress: in-flight resolver lookups count against the ledger and slots come back",
+          "[oidc][oidc_egress][security]") {
+    FakeLedger ledger = make_ledger(2);
+    {
+        REQUIRE(ledger.try_reserve());
+        FakeLedger::Slot a(ledger);
+        REQUIRE(ledger.try_reserve());
+        FakeLedger::Slot b(ledger);
+        // Two lookups in flight fill a ledger of two: a third could not be abandoned, so it
+        // does not start.
+        CHECK_FALSE(ledger.try_reserve());
+    }
+    // Both slots were given back on scope exit (neither lookup was abandoned).
+    CHECK(ledger.try_reserve());
+    CHECK(ledger.try_reserve());
+    CHECK_FALSE(ledger.try_reserve());
 }

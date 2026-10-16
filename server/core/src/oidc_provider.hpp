@@ -186,6 +186,11 @@ public:
     static constexpr const char* kEgressCleartextPublicRefused =
         "plain http is not permitted to a public address";
 
+    /// The fixed reason when the NAT64 prefixes learned from `ipv4only.arpa` would exceed their
+    /// bound: the fetch is refused rather than classified with a partial set. Names no address.
+    static constexpr const char* kEgressNat64Overflow =
+        "the NAT64 prefix discovery answer exceeds the supported number of prefixes";
+
     /// The bounds on every IdP GET (discovery, JWKS, Test Connection), pinned by name in
     /// tests/unit/server/test_oidc_provider.cpp so a silent edit fails a test: the
     /// connect/read/write timeout PER OPERATION, the whole-request bound as a multiple of it
@@ -294,6 +299,18 @@ public:
     /// Test-only seam: forgets the process-wide cache of NAT64 prefixes learned from
     /// `ipv4only.arpa`, so the next eligible fetch looks them up again. Same source-scan pin.
     static void clear_nat64_discovery_cache_for_test();
+    /// Test-only seam: marks the NAT64 discovery cache stale WITHOUT forgetting the prefixes it
+    /// holds, so the next eligible fetch looks `ipv4only.arpa` up again (a refresh) while a test
+    /// can still tell whether what was learned survived it. Same source-scan pin.
+    static void expire_nat64_discovery_cache_for_test();
+    /// Test-only seam: the egress vetting step on its own (no socket): the numeric addresses a
+    /// connect may be pinned to (empty for an IP literal), or the fixed refusal reason.
+    /// `require_all_permitted` is the strict mode the Windows token POST uses (any refused
+    /// address in the answer refuses the target). Same source-scan pin.
+    [[nodiscard]] static std::expected<std::vector<std::string>, std::string>
+    vet_egress_target_for_test(const std::string& host, bool allow_private_networks, bool cleartext,
+                               int timeout_ms, std::span<const egress::Nat64Prefix> nat64_prefixes,
+                               bool require_all_permitted);
     /// Test-only seam: how many authorization flows are pending (a failed start must leave 0
     /// and a refused callback leaves the count unchanged). Same source-scan pin.
     std::size_t pending_flow_count_for_test() const;
@@ -374,10 +391,13 @@ public:
     ///
     /// NAT64. An IPv6 address the policy would otherwise permit is also decoded under
     /// `nat64_prefixes` (the operator's `--oidc-nat64-prefix`) and under the prefixes the server
-    /// learns from RFC 7050 by resolving `ipv4only.arpa` (cached 10 minutes, a failed or empty
-    /// answer 1 minute); an address inside one is classified by the IPv4 address embedded in it.
-    /// The lookup runs only for such an address, never for an IPv4-only fetch, and a lookup that
-    /// fails means "none discovered", not a refusal. A translator whose prefix is neither
+    /// learns from RFC 7050 by resolving `ipv4only.arpa`; an address inside one is classified by
+    /// the IPv4 address embedded in it. The lookup runs only for such an address, never for an
+    /// IPv4-only fetch, and a lookup that fails means "none discovered", not a refusal. Learned
+    /// prefixes are only ever ADDED (process lifetime, union across answers; the lookup repeats
+    /// after 10 minutes when it found something, else after 1 minute, and only to learn more), up
+    /// to 64: an answer that would exceed that is never installed partially, the fetch is refused
+    /// with the fixed `kEgressNat64Overflow` text. A translator whose prefix is neither
     /// discoverable nor configured stays invisible (see `oidc_egress_policy.hpp`).
     [[nodiscard]] static std::expected<std::string, std::string>
     http_get_bounded(const std::string& url, bool skip_tls_verify, bool allow_private_networks,

@@ -2712,9 +2712,9 @@ TEST_CASE("OIDC: token-endpoint answers carrying line breaks reach the log and t
             m.token_body = "boom\nFAKELINE [error] injected\r" + breaks;
         });
 #ifdef _WIN32
-        // winhttp_post hands back the body whatever the status, so the (non-JSON) body reaches the
-        // parser instead of the status line.
-        expect_in_log = "OIDC token exchange: parse error";
+        // winhttp_post refuses any status but 200 itself (before reading the body), so the log
+        // line is its own, not the exchange's.
+        expect_in_log = "WinHTTP: token endpoint returned HTTP status 500";
 #else
         expect_in_log = "OIDC token exchange: status=500";
 #endif
@@ -3432,7 +3432,8 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
           "add_test_pending_flow - set_http_timeouts_for_test - "
           "set_discovery_negative_cache_for_test - set_resolver_for_test - "
           "set_jwks_key_age_for_test - age_jwks_keys_for_test - "
-          "clear_nat64_discovery_cache_for_test or pending_flow_count_for_test "
+          "clear_nat64_discovery_cache_for_test - expire_nat64_discovery_cache_for_test - "
+          "vet_egress_target_for_test or pending_flow_count_for_test "
           "(source pin)",
           "[oidc][oidc_binding][source_pin]") {
     // The seams are public members of the production class and the first makes the binding
@@ -3447,6 +3448,8 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
                                              "set_jwks_key_age_for_test",
                                              "age_jwks_keys_for_test",
                                              "clear_nat64_discovery_cache_for_test",
+                                             "expire_nat64_discovery_cache_for_test",
+                                             "vet_egress_target_for_test",
                                              "pending_flow_count_for_test"};
     std::size_t scanned = 0;
     const fs::path src_dir = fs::path(YUZU_SERVER_SRC_DIR);

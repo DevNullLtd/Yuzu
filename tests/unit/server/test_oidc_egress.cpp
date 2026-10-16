@@ -21,9 +21,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <format>
 #include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 // A real httplib acceptor thread crashes the ThreadSanitizer build (#438); see the MockIdp banner.
@@ -754,6 +758,263 @@ TEST_CASE("OIDC egress NAT64: the lookup is only made for an IPv6 address that w
         (void)OidcProvider::fetch_discovery_document(issuer, false, true, 500);
         (void)OidcProvider::fetch_discovery_document(issuer, false, true, 500);
         CHECK(probes.load() == 1);
+    }
+}
+
+// ── Learned NAT64 prefixes: they only grow, and a set that does not fit is a refusal ─────────
+
+namespace {
+
+/// The ipv4only.arpa AAAA answer that teaches `2001:db8:<n>::/96` (documentation space: the base
+/// class is non-global, so `allow_private` lets the lookup happen and nothing leaves the host).
+std::string learn_answer(int n) {
+    return std::format("2001:db8:{:x}::c000:aa", n);
+}
+/// 169.254.169.254 inside the prefix learned from `learn_answer(n)`.
+std::string metadata_under(int n) {
+    return std::format("2001:db8:{:x}::a9fe:a9fe", n);
+}
+
+/// A resolver whose ipv4only.arpa answer changes between lookups; other names resolve through
+/// `targets` (host -> address), or to a documentation-space address no prefix covers.
+struct ScriptedDns {
+    std::mutex mu;
+    std::vector<std::string> answer;
+    std::vector<std::pair<std::string, std::string>> targets;
+    int probes{0};
+
+    void set_answer(std::vector<std::string> a) {
+        std::lock_guard lock(mu);
+        answer = std::move(a);
+    }
+    int probe_count() {
+        std::lock_guard lock(mu);
+        return probes;
+    }
+    OidcProvider::ResolverForTest resolver() {
+        return [this](const std::string& host) -> std::vector<std::string> {
+            std::lock_guard lock(mu);
+            if (host == "ipv4only.arpa") {
+                ++probes;
+                return answer;
+            }
+            for (const auto& [name, address] : targets)
+                if (name == host)
+                    return {address};
+            return {"2001:db8:ffff::1"};
+        };
+    }
+};
+
+/// True when a fetch of `host` (http, switch on) is refused by the egress policy.
+bool refused_by_policy(const std::string& host) {
+    auto doc = OidcProvider::fetch_discovery_document("http://" + host, false, true, 500);
+    return !doc.has_value() && doc.error().find(kRefused) != std::string::npos;
+}
+
+std::string error_of(const std::string& host) {
+    auto doc = OidcProvider::fetch_discovery_document("http://" + host, false, true, 500);
+    return doc.has_value() ? std::string{} : doc.error();
+}
+
+} // namespace
+
+TEST_CASE("OIDC egress NAT64: more than eight learned prefixes are ALL honored",
+          "[oidc][oidc_egress][oidc_nat64][security]") {
+    Nat64CacheReset cache;
+    ScriptedDns dns;
+    std::vector<std::string> answers;
+    for (int n = 1; n <= 9; ++n)
+        answers.push_back(learn_answer(n));
+    dns.set_answer(answers);
+    for (int n : {1, 8, 9}) // the first, the old cap's last, and the one past it
+        dns.targets.emplace_back(std::format("t{}.test", n), metadata_under(n));
+    ResolverGuard resolver(dns.resolver());
+
+    // The ninth prefix is the one the old cap of eight dropped: its metadata address was then
+    // plain documentation space, allowed with the switch on.
+    for (int n : {1, 8, 9}) {
+        CAPTURE(n);
+        CHECK(refused_by_policy(std::format("t{}.test", n)));
+    }
+    CHECK(dns.probe_count() == 1);
+}
+
+TEST_CASE("OIDC egress NAT64: 64 learned prefixes fit, 65 refuse the fetch - never a partial set",
+          "[oidc][oidc_egress][oidc_nat64][security]") {
+    Nat64CacheReset cache;
+    ScriptedDns dns;
+    dns.targets.emplace_back("t64.test", metadata_under(64));
+    dns.targets.emplace_back("t65.test", metadata_under(65));
+    ResolverGuard resolver(dns.resolver());
+    const auto answers_up_to = [](int count) {
+        std::vector<std::string> a;
+        for (int n = 1; n <= count; ++n)
+            a.push_back(learn_answer(n));
+        return a;
+    };
+
+    SECTION("64 is the bound and fits") {
+        dns.set_answer(answers_up_to(64));
+        CHECK(refused_by_policy("t64.test"));
+        CHECK(error_of("t64.test").find(OidcProvider::kEgressNat64Overflow) == std::string::npos);
+    }
+    SECTION("65 distinct prefixes: the fetch fails closed with its own fixed reason") {
+        dns.set_answer(answers_up_to(65));
+        const auto logs = warnings_of([&] {
+            const auto err = error_of("t65.test");
+            CHECK(err.find(OidcProvider::kEgressNat64Overflow) != std::string::npos);
+            CHECK(names_no_address(err));
+            CHECK(err.find("2001:db8") == std::string::npos);
+        });
+        CHECK(logs.find("would exceed 64 learned prefixes") != std::string::npos);
+        // Even a target no prefix covers is refused (the decision needs a complete set), and the
+        // overflow is remembered while the cache is fresh (no second lookup).
+        CHECK(error_of("unrelated.test").find(OidcProvider::kEgressNat64Overflow) !=
+              std::string::npos);
+        CHECK(dns.probe_count() == 1);
+
+        // It heals: once an answer fits again the fetch is classified normally.
+        OidcProvider::expire_nat64_discovery_cache_for_test();
+        dns.set_answer(answers_up_to(3));
+        CHECK(error_of("unrelated.test").find(OidcProvider::kEgressNat64Overflow) ==
+              std::string::npos);
+        CHECK(dns.probe_count() == 2);
+    }
+    SECTION("the union counts: 64 known plus one new prefix overflows, and the 64 are kept") {
+        dns.set_answer(answers_up_to(64));
+        REQUIRE(refused_by_policy("t64.test"));
+        OidcProvider::expire_nat64_discovery_cache_for_test();
+        auto more = answers_up_to(64);
+        more.push_back(learn_answer(65));
+        dns.set_answer(more);
+        CHECK(error_of("t65.test").find(OidcProvider::kEgressNat64Overflow) != std::string::npos);
+        OidcProvider::expire_nat64_discovery_cache_for_test();
+        dns.set_answer(answers_up_to(64)); // back to a fitting answer: the earlier set is intact
+        CHECK(refused_by_policy("t64.test"));
+        CHECK(dns.probe_count() == 3);
+    }
+}
+
+TEST_CASE("OIDC egress NAT64: a learned prefix is never forgotten by a later answer",
+          "[oidc][oidc_egress][oidc_nat64][security]") {
+    Nat64CacheReset cache;
+    ScriptedDns dns;
+    dns.targets.emplace_back("p1.test", metadata_under(1));
+    dns.targets.emplace_back("p2.test", metadata_under(2));
+    ResolverGuard resolver(dns.resolver());
+
+    dns.set_answer({learn_answer(1)});
+    REQUIRE(refused_by_policy("p1.test"));
+    CHECK_FALSE(refused_by_policy("p2.test")); // not learned yet (a connect to doc space fails)
+    CHECK(dns.probe_count() == 1);
+
+    SECTION("an empty answer") {
+        OidcProvider::expire_nat64_discovery_cache_for_test();
+        dns.set_answer({});
+        CHECK(refused_by_policy("p1.test"));
+        CHECK(dns.probe_count() == 2); // it really did look again
+    }
+    SECTION("an answer with only A records") {
+        OidcProvider::expire_nat64_discovery_cache_for_test();
+        dns.set_answer({"192.0.0.170", "192.0.0.171"});
+        CHECK(refused_by_policy("p1.test"));
+        CHECK(dns.probe_count() == 2);
+    }
+    SECTION("a different prefix adds to the set and removes nothing") {
+        OidcProvider::expire_nat64_discovery_cache_for_test();
+        dns.set_answer({learn_answer(2)});
+        CHECK(refused_by_policy("p2.test"));
+        CHECK(refused_by_policy("p1.test"));
+        CHECK(dns.probe_count() == 2);
+        // ... and an empty answer after that still keeps both.
+        OidcProvider::expire_nat64_discovery_cache_for_test();
+        dns.set_answer({});
+        CHECK(refused_by_policy("p1.test"));
+        CHECK(refused_by_policy("p2.test"));
+        CHECK(dns.probe_count() == 3);
+    }
+}
+
+TEST_CASE("OIDC egress NAT64: two concurrent refreshes cannot lose an entry",
+          "[oidc][oidc_egress][oidc_nat64][security]") {
+    Nat64CacheReset cache;
+    std::mutex mu;
+    std::condition_variable cv;
+    int arrived = 0;
+    // Both ipv4only.arpa lookups are held until BOTH are in flight, so each refresh computes its
+    // answer without knowing the other's; then each writes. A last-writer-wins cache keeps one.
+    ResolverGuard resolver([&](const std::string& host) -> std::vector<std::string> {
+        if (host == "p1.test")
+            return {metadata_under(1)};
+        if (host == "p2.test")
+            return {metadata_under(2)};
+        if (host != "ipv4only.arpa")
+            return {"2001:db8:ffff::1"};
+        std::unique_lock lock(mu);
+        const int me = arrived++;
+        cv.notify_all();
+        cv.wait_for(lock, std::chrono::seconds(10), [&] { return arrived >= 2; });
+        if (me == 0)
+            return {learn_answer(1)};
+        if (me == 1)
+            return {learn_answer(2)};
+        return {};
+    });
+
+    std::thread a(
+        [] { (void)OidcProvider::fetch_discovery_document("http://idp.test", false, true, 500); });
+    std::thread b(
+        [] { (void)OidcProvider::fetch_discovery_document("http://idp.test", false, true, 500); });
+    a.join();
+    b.join();
+    {
+        std::lock_guard lock(mu);
+        REQUIRE(arrived == 2); // both really refreshed concurrently
+    }
+    CHECK(refused_by_policy("p1.test"));
+    CHECK(refused_by_policy("p2.test"));
+}
+
+TEST_CASE("OIDC egress: the strict vet mode refuses a mixed answer the pinning mode pins",
+          "[oidc][oidc_egress][security]") {
+    Nat64CacheReset cache;
+    const std::string refused_text = OidcProvider::kEgressRefused;
+    const auto vet = [](std::vector<std::string> answer, bool allow_private, bool strict,
+                        const std::string& host = "mixed.test") {
+        ResolverGuard resolver([answer = std::move(answer)](const std::string&) { return answer; });
+        return OidcProvider::vet_egress_target_for_test(host, allow_private, false, 1000, {},
+                                                        strict);
+    };
+
+    SECTION("link-local plus a public address") {
+        const auto pinned = vet({"169.254.169.254", "8.8.8.8"}, false, false);
+        REQUIRE(pinned.has_value());
+        CHECK(*pinned == std::vector<std::string>{"8.8.8.8"}); // the refused one is dropped
+        const auto strict = vet({"169.254.169.254", "8.8.8.8"}, false, true);
+        REQUIRE_FALSE(strict.has_value());
+        CHECK(strict.error() == refused_text);
+        // Order does not matter.
+        CHECK_FALSE(vet({"8.8.8.8", "169.254.169.254"}, false, true).has_value());
+    }
+    SECTION("private plus public is a refusal only without the operator switch") {
+        CHECK_FALSE(vet({"10.0.0.5", "8.8.8.8"}, false, true).has_value());
+        const auto allowed = vet({"10.0.0.5", "8.8.8.8"}, true, true);
+        REQUIRE(allowed.has_value());
+        CHECK(allowed->size() == 2);
+    }
+    SECTION("an IPv6 refused member refuses too") {
+        CHECK_FALSE(vet({"fe80::1", "1.1.1.1"}, false, true).has_value());
+        CHECK(vet({"fe80::1", "1.1.1.1"}, false, false).has_value());
+    }
+    SECTION("an all-permitted answer, a literal and an empty answer behave as before") {
+        const auto all = vet({"8.8.8.8", "1.1.1.1"}, false, true);
+        REQUIRE(all.has_value());
+        CHECK(all->size() == 2);
+        const auto literal = vet({"169.254.169.254"}, false, true, "8.8.8.8");
+        REQUIRE(literal.has_value()); // the host is the literal; the resolver is never asked
+        CHECK(literal->empty());
+        CHECK_FALSE(vet({}, false, true).has_value());
     }
 }
 

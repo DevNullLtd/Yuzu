@@ -1,6 +1,7 @@
 #include "oidc_provider.hpp"
 
 #include "evp_raii.hpp"
+#include "oidc_abandoned_ledger.hpp"
 #include "oidc_egress_policy.hpp"
 #include "sha256_steps.hpp"
 
@@ -671,8 +672,8 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
 
     // Never follow a redirect. The token endpoint was vetted against the egress policy before
     // this call; WinHTTP's default policy would follow a 3xx to a host that was never vetted
-    // (including an internal one). A 3xx now comes back as a (non-JSON) body that the caller
-    // fails to parse, so the sign-in fails closed. If the policy cannot be set, fail too.
+    // (including an internal one). A 3xx is then refused by the status check after the response
+    // arrives, so the sign-in fails closed. If the policy cannot be set, fail too.
     DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     if (!WinHttpSetOption(h.request, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy,
                           sizeof(redirect_policy))) {
@@ -702,6 +703,23 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
         return {};
     }
 
+    // Only a 200 carries a token response (RFC 6749 section 5.1), as on the POSIX path. WinHTTP
+    // hands the body of any status to the caller, so a 3xx (redirects are off) or an error status
+    // with a well-formed body would otherwise be parsed as one. The status is a number, safe to
+    // log.
+    DWORD status_code = 0;
+    DWORD status_size = sizeof(status_code);
+    if (!WinHttpQueryHeaders(h.request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size,
+                             WINHTTP_NO_HEADER_INDEX)) {
+        spdlog::error("WinHTTP: WinHttpQueryHeaders (status) failed: {}", GetLastError());
+        return {};
+    }
+    if (status_code != 200) {
+        spdlog::error("WinHTTP: token endpoint returned HTTP status {}", status_code);
+        return {};
+    }
+
     std::string response;
     for (;;) {
         // Reset every pass: a failed query must not leave the previous count behind and spin.
@@ -712,6 +730,12 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
         }
         if (bytes_available == 0)
             break;
+        // Bound the allocation BEFORE it is made: response.size() <= kHttpMaxBody holds here (the
+        // cap below fails the call as soon as it is exceeded), so the subtraction cannot wrap.
+        if (bytes_available > kHttpMaxBody - response.size()) {
+            spdlog::error("WinHTTP: response exceeds {} bytes, aborting", kHttpMaxBody);
+            return {};
+        }
         std::vector<char> buf(bytes_available);
         DWORD bytes_read = 0;
         if (!WinHttpReadData(h.request, buf.data(), bytes_available, &bytes_read)) {
@@ -923,29 +947,57 @@ struct ResolvedAddress {
 // FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it with freeaddrinfo
 // is the wrong deleter.
 #ifdef _WIN32
+// One GetAddrInfoExW lookup. It owns a HANDLE and a resolver-allocated list, and the OS references
+// it while the lookup is pending, so it may be destroyed only once the lookup has completed.
+struct ResolverRequest {
+    OVERLAPPED overlapped{};
+    PADDRINFOEXW result{};
+    HANDLE cancel{};
+    std::wstring name;
+    ResolverRequest() = default;
+    ResolverRequest(const ResolverRequest&) = delete;
+    ResolverRequest& operator=(const ResolverRequest&) = delete;
+    ~ResolverRequest() {
+        if (result != nullptr)
+            ::FreeAddrInfoExW(result);
+        if (overlapped.hEvent != nullptr)
+            ::CloseHandle(overlapped.hEvent);
+    }
+};
+
+// Process-wide owner of the lookups whose cancellation the resolver did not acknowledge in time
+// (oidc_abandoned_ledger.hpp): such a request cannot be freed (the OS may still write into it) and
+// must not be lost, so it moves here and is destroyed by a later sweep once its event is signaled.
+// A slot is reserved before each lookup, so abandoned plus in-flight lookups never exceed
+// kMaxAbandonedResolverRequests; when that many are stuck a new lookup fails closed ("did not
+// resolve") instead of growing the set. The instance is never destroyed: exiting with a lookup
+// still pending must not free memory the resolver may write to, and the OS reclaims it with the
+// process.
+constexpr std::size_t kMaxAbandonedResolverRequests = 16;
+
+using ResolverLedger = ::yuzu::server::oidc::AbandonedRequestLedger<ResolverRequest>;
+
+ResolverLedger& resolver_request_ledger() {
+    static ResolverLedger& ledger =
+        *new ResolverLedger(kMaxAbandonedResolverRequests, [](const ResolverRequest& r) {
+            return ::WaitForSingleObject(r.overlapped.hEvent, 0) == WAIT_OBJECT_0;
+        });
+    return ledger;
+}
+
 bool resolve_host_addresses(const std::string& host, int timeout_sec,
                             std::vector<ResolvedAddress>& out) {
-    struct Request {
-        OVERLAPPED overlapped{};
-        PADDRINFOEXW result{};
-        HANDLE cancel{};
-        std::wstring name;
-        Request() = default;
-        // Owns a HANDLE and a resolver-allocated list, and is referenced by the OS while pending.
-        Request(const Request&) = delete;
-        Request& operator=(const Request&) = delete;
-        ~Request() {
-            if (result != nullptr)
-                ::FreeAddrInfoExW(result);
-            if (overlapped.hEvent != nullptr)
-                ::CloseHandle(overlapped.hEvent);
-        }
-    };
+    auto& ledger = resolver_request_ledger();
+    if (!ledger.try_reserve()) {
+        spdlog::warn("OIDC egress: too many resolver lookups are stuck; refusing a new lookup");
+        return false;
+    }
+    ResolverLedger::Slot slot(ledger);
     const int wide_len =
         ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host.c_str(), -1, nullptr, 0);
     if (wide_len <= 1)
         return false;
-    auto request = std::make_unique<Request>();
+    auto request = std::make_unique<ResolverRequest>();
     request->name.assign(static_cast<std::size_t>(wide_len), L'\0');
     if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host.c_str(), -1, request->name.data(),
                               wide_len) <= 0)
@@ -966,12 +1018,13 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
             ::GetAddrInfoExCancel(&request->cancel);
             // The canceled lookup still completes into `overlapped` and `result`; they must
             // outlive that completion. It follows a cancel promptly, so wait for it briefly; if it
-            // does not arrive, LEAK the request (one small allocation) rather than free memory the
-            // resolver may still write to.
+            // does not arrive, hand the request to the ledger, which frees it once the lookup
+            // completes (a later lookup sweeps it), rather than free memory the resolver may still
+            // write to.
             if (::WaitForSingleObject(request->overlapped.hEvent, 5000) != WAIT_OBJECT_0) {
                 spdlog::warn("OIDC egress: the resolver did not acknowledge a canceled lookup; "
-                             "leaking one request");
-                (void)request.release();
+                             "the request is kept until it completes");
+                slot.abandon(std::move(request));
             }
             return false;
         }
@@ -1048,14 +1101,30 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 // server sits on and not to one provider. A failed or empty lookup is "none discovered", not a
 // refusal: DNS64 is absent on most networks and a transient resolver error must not break every
 // IPv6 destination.
+//
+// LEARNED PREFIXES NEVER SHRINK. The cache is a set that only grows: an answered refresh MERGES
+// (set union, under the cache mutex) into it, so an empty, A-only or different answer adds nothing
+// and removes nothing, and two concurrent refreshes cannot lose each other's entries. The TTLs
+// below control only WHEN the name is looked up again, never what is retained: a prefix, once
+// learned, is kept for the life of the process (a restart clears it). A resolver the attacker can
+// influence therefore cannot make the server forget a translator it already saw.
+//
+// The set is bounded (kMaxDiscoveredNat64Prefixes). An answer that would take it past the bound is
+// never installed partially: the fetch is REFUSED (kEgressNat64OverflowReason) until a later
+// answer fits. A partial set would be a silent hole: the prefix that was cut off is the one the
+// attacker wants unclassified.
 constexpr const char* kNat64ProbeName = "ipv4only.arpa";
 constexpr std::chrono::minutes kNat64PositiveTtl{10};
 constexpr std::chrono::minutes kNat64NegativeTtl{1};
-constexpr std::size_t kMaxDiscoveredNat64Prefixes = 8;
+constexpr std::size_t kMaxDiscoveredNat64Prefixes = 64;
+constexpr const char* kEgressNat64OverflowReason = OidcProvider::kEgressNat64Overflow;
 
 struct Nat64DiscoveryCache {
     std::mutex mu;
     bool filled{false};
+    // The latest answer would not fit under kMaxDiscoveredNat64Prefixes: fetches that need the
+    // learned prefixes are refused until an answer fits.
+    bool overflowed{false};
     std::chrono::steady_clock::time_point expires{};
     std::vector<::yuzu::server::oidc::egress::Nat64Prefix> prefixes;
 };
@@ -1094,54 +1163,81 @@ bool lookup_ipv4only_answers(int dns_timeout_ms,
     return true;
 }
 
-// The prefixes learned from `ipv4only.arpa`, from the cache while it is fresh. The cache mutex
-// is never held across the lookup (two concurrent lookups are harmless).
-std::vector<::yuzu::server::oidc::egress::Nat64Prefix>
+// The prefixes learned from `ipv4only.arpa`, from the cache while it is fresh. nullopt = the
+// learned set overflowed (see above): the caller must refuse. The cache mutex is never held across
+// the lookup (two concurrent lookups are harmless: their answers are merged).
+std::optional<std::vector<::yuzu::server::oidc::egress::Nat64Prefix>>
 discovered_nat64_prefixes(int dns_timeout_ms) {
     namespace egress = ::yuzu::server::oidc::egress;
     auto& cache = nat64_discovery_cache();
     {
         std::lock_guard lock(cache.mu);
-        if (cache.filled && std::chrono::steady_clock::now() < cache.expires)
+        if (cache.filled && std::chrono::steady_clock::now() < cache.expires) {
+            if (cache.overflowed)
+                return std::nullopt;
             return cache.prefixes;
+        }
     }
     std::vector<egress::Ipv6> answers;
     const bool answered = lookup_ipv4only_answers(dns_timeout_ms, answers);
     std::vector<egress::Nat64Prefix> found;
     for (const auto& answer : answers)
         if (const auto prefix = egress::discover_prefix_from_ipv4only_answer(answer))
-            if (found.size() < kMaxDiscoveredNat64Prefixes &&
-                std::find(found.begin(), found.end(), *prefix) == found.end())
+            if (std::find(found.begin(), found.end(), *prefix) == found.end())
                 found.push_back(*prefix);
     if (!answered)
         spdlog::warn("OIDC egress: the NAT64 prefix lookup (ipv4only.arpa) failed; IPv6 "
                      "destinations are classified without it until the lookup is retried");
     bool learned = false;
-    std::vector<egress::Nat64Prefix> result;
+    bool overflow_now = false;
+    std::optional<std::vector<egress::Nat64Prefix>> result;
     {
         std::lock_guard lock(cache.mu);
-        // A failed lookup keeps what was learned before (a transient resolver error must not
-        // forget a prefix); an answer, even an empty one, replaces it.
         if (answered) {
-            learned = !found.empty() && (!cache.filled || cache.prefixes != found);
-            cache.prefixes = std::move(found);
+            // Union into what is already known; nothing is ever removed.
+            std::vector<egress::Nat64Prefix> merged = cache.prefixes;
+            for (const auto& prefix : found)
+                if (std::find(merged.begin(), merged.end(), prefix) == merged.end())
+                    merged.push_back(prefix);
+            if (merged.size() > kMaxDiscoveredNat64Prefixes) {
+                // Never a partial set: keep what was known, remember the overflow.
+                overflow_now = !cache.overflowed;
+                cache.overflowed = true;
+            } else {
+                learned = merged.size() > cache.prefixes.size();
+                cache.prefixes = std::move(merged);
+                cache.overflowed = false;
+            }
         }
+        // A failed lookup changes nothing (an earlier overflow stays in force).
         cache.filled = true;
         cache.expires =
             std::chrono::steady_clock::now() +
-            (answered && !cache.prefixes.empty() ? kNat64PositiveTtl : kNat64NegativeTtl);
-        result = cache.prefixes;
+            (answered && !cache.overflowed && !cache.prefixes.empty() ? kNat64PositiveTtl
+                                                                      : kNat64NegativeTtl);
+        if (!cache.overflowed)
+            result = cache.prefixes;
     }
+    if (overflow_now)
+        spdlog::warn("OIDC egress: the NAT64 prefix answer for ipv4only.arpa would exceed {} "
+                     "learned prefixes; fetches to IPv6 destinations are refused until an answer "
+                     "fits",
+                     kMaxDiscoveredNat64Prefixes);
     if (learned)
         spdlog::info("OIDC egress: learned {} NAT64 prefix(es) from ipv4only.arpa (RFC 7050); "
                      "IPv6 destinations inside them are classified by the IPv4 address they embed",
-                     result.size());
+                     result ? result->size() : std::size_t{0});
     return result;
 }
 
+// `require_all_permitted` is for a caller that CANNOT pin the connect (the Windows token POST:
+// WinHTTP does its own second lookup and may pick any member of the answer): ANY refused address
+// in the answer then refuses the whole target, not only an answer with no permitted address. The
+// default (false) keeps the pin-the-permitted semantics of the callers that do pin.
 std::expected<std::vector<std::string>, const char*>
 vet_egress_target(const std::string& host, bool allow_private, bool cleartext, int dns_timeout_ms,
-                  std::span<const ::yuzu::server::oidc::egress::Nat64Prefix> nat64_prefixes) {
+                  std::span<const ::yuzu::server::oidc::egress::Nat64Prefix> nat64_prefixes,
+                  bool require_all_permitted = false) {
     namespace egress = ::yuzu::server::oidc::egress;
     const auto refuse = [&](egress::AddressClass cls) -> std::unexpected<const char*> {
         // Plain http to a public address is refused whatever the switch says (a distinct reason).
@@ -1162,19 +1258,32 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
     // The class of an IPv6 address: the configured NAT64 prefixes always apply; the learned ones
     // (RFC 7050) are looked up only for an address that would otherwise be permitted, because only
     // then can a hidden translation change the answer. An IPv4-only fetch never reaches this.
+    // When the learned set overflowed (discovered_nat64_prefixes), the address is classed as
+    // refused and the whole target fails with the distinct overflow reason below.
     std::optional<std::vector<egress::Nat64Prefix>> active_prefixes;
+    bool nat64_overflow = false;
     const auto classify_v6 = [&](const egress::Ipv6& bytes) {
         const auto cls = egress::classify_ipv6(bytes, nat64_prefixes);
         if (egress::decision(cls, allow_private, cleartext) != egress::Verdict::Allow)
             return cls;
         if (!active_prefixes) {
+            const auto learned_set = discovered_nat64_prefixes(dns_timeout_ms);
+            if (!learned_set) {
+                nat64_overflow = true;
+                return egress::AddressClass::Reserved;
+            }
             active_prefixes.emplace(nat64_prefixes.begin(), nat64_prefixes.end());
-            for (const auto& learned : discovered_nat64_prefixes(dns_timeout_ms))
+            for (const auto& learned : *learned_set)
                 if (std::find(active_prefixes->begin(), active_prefixes->end(), learned) ==
                     active_prefixes->end())
                     active_prefixes->push_back(learned);
         }
         return egress::classify_ipv6(bytes, *active_prefixes);
+    };
+    const auto refuse_overflow = [&]() -> std::unexpected<const char*> {
+        spdlog::warn("OIDC egress: refused host '{}': the learned NAT64 prefix set overflowed",
+                     ::yuzu::log_key_token(host));
+        return std::unexpected(kEgressNat64OverflowReason);
     };
     const auto classify_text = [&](const std::string& text) -> std::optional<egress::AddressClass> {
         if (text.find(':') != std::string::npos) {
@@ -1186,6 +1295,8 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
     };
 
     if (const auto literal = classify_text(host)) {
+        if (nat64_overflow)
+            return refuse_overflow();
         if (egress::decision(*literal, allow_private, cleartext) != egress::Verdict::Allow)
             return refuse(*literal);
         return std::vector<std::string>{};
@@ -1235,6 +1346,10 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
             // any other address family is never connected to
         }
     }
+    if (nat64_overflow)
+        return refuse_overflow();
+    if (require_all_permitted && first_refused)
+        return refuse(*first_refused);
     if (!pins.empty())
         return pins;
     if (first_refused)
@@ -1278,15 +1393,18 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
 #ifdef _WIN32
     // Egress policy. WinHTTP resolves and connects on its own and offers no way to pin the
     // address, so this is a PRE-RESOLVE check only: the name is resolved and classified here,
-    // then WinHTTP resolves it again. A DNS answer that changes between the two lookups (DNS
-    // rebinding) is NOT covered on this path; the httplib paths (discovery, JWKS, and the token
-    // POST on Linux/macOS) pin the vetted address and have no such window.
+    // then WinHTTP resolves it again and may pick ANY address of its answer. So the check is
+    // STRICT: one refused address in the answer refuses the whole target (a mixed answer is not
+    // pinned to its permitted member, as the httplib paths do). A DNS answer that changes between
+    // the two lookups (DNS rebinding) is still NOT covered on this path; the httplib paths
+    // (discovery, JWKS, and the token POST on Linux/macOS) pin the vetted address and have no such
+    // window.
     const auto egress_target = split_http_url(*token_endpoint);
     if (!egress_target)
         return std::unexpected("invalid token endpoint URL");
     if (const auto vet = vet_egress_target(egress_target->host, config_.allow_private_networks,
                                            egress_target->cleartext, kHttpOperationTimeoutMs,
-                                           config_.nat64_prefixes);
+                                           config_.nat64_prefixes, /*require_all_permitted=*/true);
         !vet) {
         spdlog::error("OIDC token exchange: request refused: {}", vet.error());
         return std::unexpected(std::string("token endpoint request failed: ") + vet.error());
@@ -2382,7 +2500,24 @@ void OidcProvider::clear_nat64_discovery_cache_for_test() {
     auto& cache = nat64_discovery_cache();
     std::lock_guard lock(cache.mu);
     cache.filled = false;
+    cache.overflowed = false;
     cache.prefixes.clear();
+}
+
+void OidcProvider::expire_nat64_discovery_cache_for_test() {
+    auto& cache = nat64_discovery_cache();
+    std::lock_guard lock(cache.mu);
+    cache.expires = {}; // the learned prefixes stay; only the next lookup is due
+}
+
+std::expected<std::vector<std::string>, std::string> OidcProvider::vet_egress_target_for_test(
+    const std::string& host, bool allow_private_networks, bool cleartext, int timeout_ms,
+    std::span<const egress::Nat64Prefix> nat64_prefixes, bool require_all_permitted) {
+    auto vet = vet_egress_target(host, allow_private_networks, cleartext, timeout_ms,
+                                 nat64_prefixes, require_all_permitted);
+    if (!vet)
+        return std::unexpected(std::string(vet.error()));
+    return std::move(*vet);
 }
 
 void OidcProvider::set_http_timeouts_for_test(int ms) {
