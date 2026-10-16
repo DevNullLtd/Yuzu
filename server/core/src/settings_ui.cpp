@@ -649,28 +649,6 @@ const char* const kSettingsPageTemplate =
       if (w) w.hidden = !(zero('max_uses') && zero('ttl_hours'));
     });
 
-    /* ── Two-click confirm for bulk destructive operations ── */
-    function twoClickConfirm(btn, action) {
-      if (btn.dataset.confirming === 'true') {
-        action();
-        btn.dataset.confirming = 'false';
-        btn.textContent = btn.dataset.originalText;
-        btn.classList.remove('btn-confirming');
-        return;
-      }
-      btn.dataset.originalText = btn.textContent;
-      btn.dataset.confirming = 'true';
-      btn.textContent = 'Confirm: ' + btn.dataset.originalText + '?';
-      btn.classList.add('btn-confirming');
-      setTimeout(function() {
-        if (btn.dataset.confirming === 'true') {
-          btn.dataset.confirming = 'false';
-          btn.textContent = btn.dataset.originalText;
-          btn.classList.remove('btn-confirming');
-        }
-      }, 3000);
-    }
-
 )HTM"
     // Split here purely to keep each raw-string literal under MSVC's 16 KB
     // C2026 cap (adjacent literals concatenate byte-for-byte; the engine-
