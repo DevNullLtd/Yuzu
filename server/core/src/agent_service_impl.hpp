@@ -3,6 +3,7 @@
 /// @file agent_service_impl.hpp
 /// gRPC AgentService implementation: Register, Heartbeat, Subscribe, OTA updates.
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -36,6 +37,13 @@
 
 // Forward declarations to avoid pulling in full store headers
 namespace yuzu::server {
+
+/// The closed `reason` label set of `yuzu_register_invalid_agent_id_total`. Register and
+/// ProxyRegister emit exactly these four (the latter with an extra `source="gateway_proxy"`
+/// label); ServerImpl pre-seeds every combination to 0 from this one list.
+inline constexpr std::array<const char*, 4> kRegisterInvalidAgentIdReasons = {
+    "length", "nul", "control", "charset"};
+
 class ResponseStore;
 class TagStore;
 class AnalyticsEventStore;

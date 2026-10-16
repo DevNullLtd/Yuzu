@@ -20,6 +20,7 @@
 #endif
 #endif
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 #include "response_export_metrics.hpp"
 #include <yuzu/secure_zero.hpp>
@@ -732,6 +733,20 @@ public:
                          {{"surface", "http"}, {"event", "security"}});
         metrics_.counter("yuzu_onbehalf_rejected_total",
                          {{"surface", "grpc"}, {"event", "security"}});
+
+        // Register / ProxyRegister agent_id shape refusals (#5513). Pre-seeded to 0 for every
+        // closed-set combination per docs/observability-conventions.md: the direct Register series
+        // carries only `reason`, the gateway path adds source="gateway_proxy".
+        metrics_.describe("yuzu_register_invalid_agent_id_total",
+                          "Register/ProxyRegister requests refused because of the shape of "
+                          "the agent id (reason: length/nul/control/charset; source "
+                          "gateway_proxy for the gateway path)",
+                          "counter");
+        for (auto reason : kRegisterInvalidAgentIdReasons) {
+            metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", reason}});
+            metrics_.counter("yuzu_register_invalid_agent_id_total",
+                             {{"reason", reason}, {"source", "gateway_proxy"}});
+        }
 
         // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
         // per docs/observability-conventions.md so absent() alerts stay
@@ -8312,12 +8327,13 @@ public:
                     try {
                         return sign_agent_csr(csr_pem, agent_id, src);
                     } catch (const std::exception& e) {
-                        spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
-                                      agent_id);
+                        spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal",
+                                      ::yuzu::log_key_token(e.what()),
+                                      ::yuzu::log_id_token(agent_id));
                         return std::nullopt;
                     } catch (...) {
                         spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
-                                      agent_id);
+                                      ::yuzu::log_id_token(agent_id));
                         return std::nullopt;
                     }
                 };
@@ -11349,7 +11365,7 @@ private:
         constexpr std::size_t kMaxCsrPemBytes = 16 * 1024;
         if (csr_pem.size() > kMaxCsrPemBytes) {
             spdlog::warn("PKI: rejecting oversize CSR ({} bytes > {}) for agent {}",
-                         csr_pem.size(), kMaxCsrPemBytes, agent_id);
+                         csr_pem.size(), kMaxCsrPemBytes, ::yuzu::log_id_token(agent_id));
             return std::nullopt;
         }
 
@@ -11402,7 +11418,7 @@ private:
                     spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
                                  "non-expired cert (serial {}) exists; an operator must clear "
                                  "the revocation before this agent can re-provision",
-                                 agent_id, rev.serial_hex);
+                                 ::yuzu::log_id_token(agent_id), rev.serial_hex);
                     metrics_
                         .counter("yuzu_server_ca_reissue_blocked_total",
                                  {{"reason", "revoked_identity"}})
@@ -11449,8 +11465,8 @@ private:
             }
             auto it = csr_issue_last_.find(agent_id);
             if (it != csr_issue_last_.end() && now_s - it->second < kCsrIssueMinInterval) {
-                spdlog::warn("PKI: throttling agent CSR for {} (one issuance per {}s)", agent_id,
-                             kCsrIssueMinInterval.count());
+                spdlog::warn("PKI: throttling agent CSR for {} (one issuance per {}s)",
+                             ::yuzu::log_id_token(agent_id), kCsrIssueMinInterval.count());
                 return std::nullopt;
             }
         }
@@ -11494,7 +11510,7 @@ private:
 
         auto issued = pki::sign_csr(csr_pem, root->cert_pem, *ca_key, lp);
         if (!issued) {
-            spdlog::warn("PKI: sign_csr failed for agent {}", agent_id);
+            spdlog::warn("PKI: sign_csr failed for agent {}", ::yuzu::log_id_token(agent_id));
             return std::nullopt;
         }
 
@@ -11526,7 +11542,8 @@ private:
             // Fail closed: an unrecorded cert can't be revoked, so don't hand it
             // out — the agent stays on the bootstrap posture and retries.
             spdlog::error("PKI: failed to record issued agent cert for {} — not issuing: {}",
-                          agent_id, rec_result.error());
+                          ::yuzu::log_id_token(agent_id),
+                          ::yuzu::log_key_token(rec_result.error()));
             return std::nullopt;
         }
 

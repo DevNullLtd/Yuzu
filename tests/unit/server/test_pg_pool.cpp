@@ -31,6 +31,25 @@ bool select_1_works(PGconn* conn) {
     return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1;
 }
 
+// A conninfo that can never connect and uses no port: a libpq host that is an absolute path
+// names a Unix-socket DIRECTORY, and this one is a salted per-call path (unique_temp_path,
+// "yuzu_test_" prefix) that is never created, so the connect fails at once with "No such file or
+// directory" on POSIX. No TCP port is involved, so two concurrent jobs on a shared runner cannot
+// collide (CLAUDE.md, shared-identity runners). libpq connect-failure text ends in a newline. On
+// Windows the same value is a drive path, expected to fail the same way (any refusal by that libpq
+// build is still a failed connect); this has not been run on Windows from this tree. The path is single-quoted and `\` and `'` are escaped,
+// so a temp directory with a space or a backslash cannot split the conninfo.
+std::string unconnectable_conninfo() {
+    std::string path = yuzu::test::unique_temp_path("yuzu_test_pg_").generic_string();
+    std::string quoted;
+    for (const char c : path) {
+        if (c == '\\' || c == '\'')
+            quoted.push_back('\\');
+        quoted.push_back(c);
+    }
+    return "host='" + quoted + "' dbname=nope user=nobody connect_timeout=2";
+}
+
 } // namespace
 
 TEST_CASE("PgPool acquire and release", "[pg][pool]") {
@@ -214,10 +233,8 @@ TEST_CASE("PgPool failed construction", "[pg][pool]") {
     }
 
     SECTION("unreachable host: valid conninfo, acquire fails with error") {
-        // Port 9 (discard) on loopback — nothing listens there in CI or dev.
-        PgPool pool{{.conninfo = "host=127.0.0.1 port=9 dbname=nope "
-                                 "user=nobody connect_timeout=2",
-                     .size = 2}};
+        // A Unix-socket directory that does not exist: a deterministic failure with no port.
+        PgPool pool{{.conninfo = unconnectable_conninfo(), .size = 2}};
         CHECK(pool.valid());
         auto lease = pool.acquire();
         CHECK_FALSE(static_cast<bool>(lease));
@@ -231,12 +248,12 @@ TEST_CASE("PgPool logs a connect failure's libpq text on one line",
           "[pool][log_injection][5513]") {
     // libpq's connect error text spans several lines (a "connection to server ... failed"
     // sentence, then a tab-indented hint) and ends in a newline. The pool wraps it in
-    // log_key_token, so one failed attempt is exactly one physical log line. Nothing listens on
-    // loopback port 9. The transaction-start failure line (BEGIN) shares the wrapper but cannot
+    // log_key_token, so one failed attempt is exactly one physical log line. The connection
+    // targets a Unix-socket directory that does not exist (no port). The transaction-start
+    // failure line (BEGIN) shares the wrapper but cannot
     // be provoked without a connection that fails on its first statement, so it has no test
     // here; the tripwire (tests/test_guardian_spark_log_injection_tripwire.py) covers it.
-    PgPool pool{{.conninfo = "host=127.0.0.1 port=9 dbname=nope user=nobody connect_timeout=2",
-                 .size = 1}};
+    PgPool pool{{.conninfo = unconnectable_conninfo(), .size = 1}};
     REQUIRE(pool.valid());
     yuzu::test::LogCapture cap;
     auto lease = pool.acquire();

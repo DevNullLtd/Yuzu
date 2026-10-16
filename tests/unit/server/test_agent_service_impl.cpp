@@ -72,6 +72,7 @@
 #include <vector>
 
 using yuzu::server::AuditStore;
+using yuzu::server::kRegisterInvalidAgentIdReasons;
 using yuzu::server::NotificationStore;
 using yuzu::server::OffloadAuthType;
 using yuzu::server::OffloadTargetStore;
@@ -1294,6 +1295,33 @@ double invalid_id_count(yuzu::MetricsRegistry& m, const char* reason, bool gatew
 }
 
 } // namespace
+
+TEST_CASE("kRegisterInvalidAgentIdReasons is exactly the closed reason set the Register paths emit",
+          "[agent_service][register][metrics]") {
+    // ServerImpl pre-seeds yuzu_register_invalid_agent_id_total from this list. The four reasons
+    // are the literals at the increment sites in agent_service_impl.cpp (length, nul, control,
+    // charset) and gateway_service_impl.cpp (same four, source="gateway_proxy"); a reason added
+    // there without being added here would be absent from a healthy scrape.
+    const std::vector<std::string> expected{"length", "nul", "control", "charset"};
+    const std::vector<std::string> actual(kRegisterInvalidAgentIdReasons.begin(),
+                                          kRegisterInvalidAgentIdReasons.end());
+    CHECK(actual == expected);
+
+    // A pre-seeded series reads 0 and is the same series a later rejection increments.
+    yuzu::MetricsRegistry m;
+    for (const auto* reason : kRegisterInvalidAgentIdReasons) {
+        m.counter("yuzu_register_invalid_agent_id_total", yuzu::Labels{{"reason", reason}});
+        m.counter("yuzu_register_invalid_agent_id_total",
+                  yuzu::Labels{{"reason", reason}, {"source", "gateway_proxy"}});
+    }
+    const auto text = m.serialize();
+    for (const auto& reason : expected) {
+        CHECK(text.find("yuzu_register_invalid_agent_id_total{reason=\"" + reason + "\"} 0") !=
+              std::string::npos);
+        CHECK(text.find("yuzu_register_invalid_agent_id_total{reason=\"" + reason +
+                        "\",source=\"gateway_proxy\"} 0") != std::string::npos);
+    }
+}
 
 TEST_CASE("Register: an agent_id with a control byte the door lets through is counted as "
           "reason=control and logged at warn, not as a store outage",

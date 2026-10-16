@@ -180,6 +180,22 @@ connect-failure line (it prints a local `err` copied from PQerrorMessage) is wra
 not covered here. The same rule keyed on a store `.error()` argument covers config_routes.cpp
 (STORE_ERROR_FILES).
 
+A seventh, narrower rule (PKI_SIGNER_FILES, server/core/src/server.cpp only) covers the PKI signer
+legs of the Register / ProxyRegister path: an spdlog:: statement whose format literal starts with
+"PKI:" must wrap a bare `agent_id` argument and any `.what()` argument. It is not the broad
+bare-name rule and does not apply to the rest of server.cpp.
+
+WHAT THE SECOND CHECK DELIBERATELY DOES NOT COVER (session-resolved ids). Log lines that print an
+agent id read back from the session table or the enrollment store print it as stored: the
+Heartbeat / BatchHeartbeat and ReportInventory / ProxyInventory ingest paths and the shared
+ingestion modules they call, the Subscribe stream open and close lines, and the registry's removal
+and sweep lines (in agent_registry.cpp only claimed ids from `info.agent_id()` are matched).
+AuthDB's agent-id check (`agent_id_ok`, auth_db.cpp) has already refused control bytes and ',' for
+such an id, so it cannot add a physical log line, but an id enrolled before the new-id charset gate
+(`auth::is_valid_new_agent_id`) may still contain a space, '=' or a non-ASCII byte, and so can add
+same-line key=value tokens. The `ex.what()` of the ingest catch-alls on those paths is likewise
+printed as-is. This is a stated limit of the check, not a claim that those lines are neutralised.
+
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml,
 same precedent shape as test_no_connless_pq_escape.py and
 test_split_interlock_tripwire.py. Zero third-party dependencies (stdlib only).
@@ -1133,6 +1149,34 @@ def find_command_text_violations_in_text(text: str) -> list[tuple[int, str]]:
     return out
 
 
+# Seventh, narrower rule: the PKI signer legs in server.cpp. The Register / ProxyRegister signer
+# (the `cert_signer` lambda and `sign_agent_csr`) prints the claimed `agent_id` and, on a throw,
+# `e.what()`. In server.cpp, an spdlog statement whose format literal starts with "PKI:" must not
+# print a bare `agent_id` or an `e.what()` argument: each must be wholly one wrap call. This is
+# deliberately NOT the broad bare-name rule of AGENT_ID_FILES (server.cpp is a very large file in
+# which `agent_id` is a common name outside the PKI lines). Lexical: it reads the literal's prefix
+# and the argument text, so a PKI line whose literal does not start with "PKI:", or an id copied
+# into another local first, is not seen.
+PKI_SIGNER_FILES: tuple[str, ...] = ("server/core/src/server.cpp",)
+
+_PKI_BARE_AGENT_ID_RE = re.compile(r"(?<![\w.>:])agent_id\b(?!\s*[(.])")
+_PKI_WHAT_RE = re.compile(r"\.what\(\)")
+
+
+def find_pki_signer_violations_in_text(text: str) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for pos, stmt in find_spdlog_statements_with_pos(text):
+        parsed = parse_call(stmt)
+        if parsed is None or not parsed[0].lstrip().startswith("PKI:"):
+            continue
+        for arg in split_top_level_args(parsed[1]):
+            raw = _PKI_BARE_AGENT_ID_RE.search(arg) is not None or _PKI_WHAT_RE.search(arg) is not None
+            if raw and not argument_is_wrapped(arg):
+                out.append((text.count("\n", 0, pos) + 1, stmt))
+                break
+    return out
+
+
 # Sixth guard: logging forms the scanner above does not parse. find_spdlog_statements only
 # understands `spdlog::<level>(` and `<logger>-><level>(`; any other form in the files of
 # the second check would print its arguments unexamined. They are absent today, so the guard
@@ -1633,6 +1677,35 @@ def _selfcheck() -> None:
         if find_unscanned_logging_forms_in_text(src):
             raise SystemExit(f"selfcheck: unexpected unscanned-logging-form hit: {src!r}")
 
+    # 13. The PKI signer rule (find_pki_signer_violations_in_text).
+    pki_must_match = [
+        'spdlog::warn("PKI: sign_csr failed for agent {}", agent_id);',
+        'spdlog::warn("PKI: throttling agent CSR for {} (one issuance per {}s)", agent_id, 30);',
+        'spdlog::error("PKI: agent CSR signing threw ({}) for {} - non-fatal", e.what(),'
+        " ::yuzu::log_id_token(agent_id));",
+        'spdlog::error("PKI: agent CSR signing threw ({}) for {}", ::yuzu::log_key_token(e.what()),'
+        " agent_id);",
+        'spdlog::warn("PKI: x {}", "a=" + agent_id);',
+        'spdlog::warn("PKI: x {}", ::yuzu::log_id_token(a) + agent_id);',
+    ]
+    for src in pki_must_match:
+        if not find_pki_signer_violations_in_text(src):
+            raise SystemExit(f"selfcheck: expected a PKI signer violation: {src!r}")
+    pki_must_not = [
+        'spdlog::warn("PKI: sign_csr failed for agent {}", ::yuzu::log_id_token(agent_id));',
+        'spdlog::error("PKI: x ({}) for {}", ::yuzu::log_key_token(e.what()),'
+        " ::yuzu::log_id_token(agent_id));",
+        'spdlog::warn("PKI: n {}", agent_id.size());',
+        'spdlog::warn("PKI: x {}", rev.agent_id);',
+        'spdlog::warn("PKI: x {}", my_agent_id);',
+        'spdlog::warn("PKI: initial CRL publish failed: {}", err);',
+        # Not a PKI line: the broad bare-name rule is deliberately not applied to server.cpp.
+        'spdlog::warn("Agent {} did a thing", agent_id);',
+    ]
+    for src in pki_must_not:
+        if find_pki_signer_violations_in_text(src):
+            raise SystemExit(f"selfcheck: unexpected PKI signer violation: {src!r}")
+
 
 # ---------------------------------------------------------------------------
 # main
@@ -1708,6 +1781,15 @@ def main() -> int:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for line_no, stmt in find_command_text_violations_in_text(text):
+            snippet = " ".join(stmt.split())[:160]
+            agent_hits.append(f"{rel}:{line_no}: {snippet}")
+    for rel in PKI_SIGNER_FILES:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            agent_hits.append(f"{rel}: file listed in PKI_SIGNER_FILES does not exist")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for line_no, stmt in find_pki_signer_violations_in_text(text):
             snippet = " ".join(stmt.split())[:160]
             agent_hits.append(f"{rel}:{line_no}: {snippet}")
     for rel in UNSCANNED_LOGGING_FILES:
