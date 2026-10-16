@@ -221,10 +221,12 @@ TEST_CASE("healthcheck: first_pem_certificate reads a block the way OpenSSL does
     // A marker after a newline is a line start (CRLF files included).
     CHECK(first_pem_certificate("prose\r\n" + a) == a);
     // OpenSSL starts a BEGIN line only after a newline (or a leading UTF-8 BOM): three bytes of
-    // other text, or a lone CR, ahead of a block make it a mid-line marker, so the second
-    // certificate must not be returned.
+    // other text, or a lone CR, ahead of a block make it a mid-line marker, so the first
+    // block must not be returned.
     CHECK(first_pem_certificate("abc" + a + b).empty());
     CHECK(first_pem_certificate("x\r" + a + b).empty());
+    // Only the full three-byte UTF-8 BOM counts: two of its bytes plus another are mid-line text.
+    CHECK(first_pem_certificate("\xEF\xBB\xBE" + a + b).empty());
     // A block carrying a PEM header is refused: OpenSSL would prompt for a pass phrase on
     // stderr, a second line against the one-line contract (a base64 body never holds ':').
     CHECK(first_pem_certificate("-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n"

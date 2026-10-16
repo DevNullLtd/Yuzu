@@ -73,7 +73,9 @@ struct HealthcheckOutcome {
 /// prompt for a pass phrase. OpenSSL also reads in 254-byte line chunks, and its file reader
 /// (`fgets` + `strlen`, what the server's chain loader uses) cuts a chunk at a NUL while the
 /// memory reader httplib uses counts bytes, so a block holding a NUL is refused: the two
-/// readers would decode different text from it. It may return empty where OpenSSL would
+/// readers would decode different text from it. The BOM this block drops moves where a
+/// 251-254 byte first line is chunked, so the readers can still disagree on whether such a
+/// block loads, never on which certificate. It may return empty where OpenSSL would
 /// load a certificate, never a different certificate than the one the server presents.
 [[nodiscard]] inline std::string first_pem_certificate(std::string_view pem) {
     constexpr std::string_view kBegin = "-----BEGIN CERTIFICATE-----";
