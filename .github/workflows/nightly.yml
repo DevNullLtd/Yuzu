@@ -743,8 +743,18 @@ jobs:
   # ── Coverage (gcov + gcovr) ────────────────────────────────────────────
   coverage:
     name: "Coverage (GCC 15)"
-    needs: [preflight]
-    if: needs.preflight.outputs.bigtam_pool_healthy == 'true' && inputs.jobs != 'windows-asan'
+    # #4019: Coverage runs AFTER both Linux sanitizer legs, never alongside them. All
+    # three are pinned to Big Tam (4 runner agents, ONE box), and running together
+    # oversubscribed it, which made timing-sensitive sanitizer tests fail far more
+    # often (the tests that assumed an ordering were also fixed, #4019). The needs: is
+    # for ORDERING only - Coverage must still run, and still report, when a sanitizer
+    # leg fails - so the if: leads with `!cancelled()`. A bare expression gets an
+    # implicit success() ANDed on, which would skip Coverage on every red sanitizer
+    # night (the #1038 failure-path trap; CLAUDE.md "CI architecture"). Because
+    # !cancelled() drops that implicit success(), preflight success is re-asserted
+    # explicitly. Re-running a failed sanitizer leg re-runs Coverage too.
+    needs: [preflight, sanitize-asan, sanitize-tsan]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.preflight.outputs.bigtam_pool_healthy == 'true' && inputs.jobs != 'windows-asan' }}
     # Pinned to the Big Tam pool. Was the generic [self-hosted, Linux, X64]
     # pool, but that spans both Shulgi (24.04/gcc-13) and Big Tam
     # (26.04/gcc-15); a gcc-15 coverage build can only run on Big Tam, so
@@ -927,8 +937,9 @@ jobs:
         run: ccache -s
 
   # ── Alert on nightly failure ───────────────────────────────────────────
-  # Opens or comments on the `nightly-broken` issue if any of the four
-  # jobs above failed. The discipline rule is "no merge to main while
+  # Opens or comments on the `nightly-broken` issue if any job it needs
+  # failed, or ended cancelled (a timeout, or a lost runner) while the run
+  # itself was not cancelled. The discipline rule is "no merge to main while
   # `nightly-broken` is open." Mirrors runner-inventory-sentinel.yml's
   # issue-creation pattern.
   alert:
@@ -936,7 +947,12 @@ jobs:
     needs: [preflight, sanitize-asan, sanitize-tsan, windows-asan, coverage]
     # `always()` alone also runs after cancellation, which must not create a
     # repository-wide merge block. Retain failure handling for preflight.
-    if: ${{ !cancelled() && inputs.jobs != 'windows-asan' && (failure() || needs.preflight.result == 'failure') }}
+    # A leg that hits its timeout-minutes ends `cancelled`, not `failure` (see the
+    # upload steps above), so failure() alone misses it and a hung sanitizer night
+    # would open nothing. The per-job `cancelled` term sits INSIDE !cancelled(): a
+    # whole-run cancel by an operator still opens nothing; only a job that ended
+    # cancelled while the run went on (a timeout, or its runner going away) does.
+    if: ${{ !cancelled() && inputs.jobs != 'windows-asan' && (failure() || contains(needs.*.result, 'cancelled') || needs.preflight.result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -956,6 +972,7 @@ jobs:
             const ctx = JSON.parse(process.env.NEEDS_JSON);
             for (const [name, job] of Object.entries(ctx)) {
               if (job.result === 'failure') failedJobs.push(name);
+              else if (job.result === 'cancelled') failedJobs.push(`${name} (timed out/cancelled)`);
             }
             const summary = failedJobs.length
               ? failedJobs.join(', ')
