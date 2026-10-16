@@ -260,20 +260,32 @@ default 90); nothing new is added.
 including values between 2049 bytes and about 2.6 KB that older servers could index, and compressible
 values far larger than that. The facet filter, the dropdowns and the group-from-results and create-group
 counts therefore show nothing or "0 agents" for such a value, and a direct group-from-results submit
-answers `422` "No agents match" and creates no group when no agent matches. The results page now gives
-an indication: when an active exact-value filter (typed, or applied by a saved view's default) is longer
-than 2048 bytes, it shows a static hint, "A filter value is longer than 2048 bytes. Newly stored responses do
-not index values that long, so this filter may match nothing. Clear the filter and use the Search
-box.", in the results summary. The hint never repeats the value, and the results, counts, Create
-Group button and the `422` are unchanged.
+answers `422` "No agents match" and creates no group when no agent matches. Every one of these surfaces
+now says so when an active exact-value filter (typed, or applied by a saved View's default) is longer
+than 2048 bytes:
 
-The other surfaces give no such indication for an over-long filter value. The REST agent-count
-preview and the MCP preview tool (`preview_management_group_agent_count`) answer 0, the create-group
-form says "0 agents will be added", and a direct group-from-results submit answers `422`, all with no
-reason. For a value in the 2049 bytes to about 2.6 KB band the answer 0 can be wrong: agents whose
-newly ingested output contains the value are not counted, because the value is not indexed (rows
-ingested before the upgrade, when older servers indexed it, are still counted). A follow-up change
-will report it.
+- **Results page.** A static hint in the results summary, "A filter value is longer than 2048 bytes.
+  Newly stored responses do not index values that long, so this filter may match nothing. Clear the
+  filter (or switch the View to Default) and use the Search box." The hint never repeats the value, and
+  the results, counts, Create Group button and the `422` are unchanged.
+- **REST agent-count preview and MCP preview tool.** `GET /api/v1/management-groups/agent-count-preview`
+  and `preview_management_group_agent_count` add `unindexed_filter_keys` to the result: the filter keys
+  (for example `output`, never the values) whose value is longer than 2048 bytes. It is always present
+  and is empty when no filter is over the bound. When it is not empty, `agent_count` can be 0 or an
+  undercount. `agent_count`, the status codes and the `503` degrade are unchanged, so a client that
+  ignores the new field behaves as before.
+- **Create-group form.** In place of "N agents will be added" it shows a static sentence, "A filter value
+  is longer than 2048 bytes. Newly stored responses do not index values that long, so the agent count
+  may be wrong." The submit button works as before.
+- **Direct group-from-results submit.** It still answers `422` and creates no group. When the `422` is
+  for an empty selection while a filter value is over the bound, the message adds "A filter value is
+  longer than 2048 bytes; values that long are not indexed in newly stored responses, so this may be an
+  undercount."
+
+For a value in the 2049 bytes to about 2.6 KB band the answer 0 can be wrong: agents whose newly
+ingested output contains the value are not counted, because the value is not indexed. Rows ingested
+before the upgrade, when older servers indexed it, are still counted, so the count from older rows can
+still match.
 
 **5,000-facet cap.** Above 5,000 distinct facets in one response, the facets kept are now chosen in a
 fixed order: most lines first, then column index ascending, then value ascending. Before, they were

@@ -992,10 +992,16 @@ to report, and no store read is made.
 
 ```json
 {
-  "data": { "agent_count": 42 },
+  "data": { "agent_count": 42, "unindexed_filter_keys": [] },
   "meta": { "api_version": "v1" }
 }
 ```
+
+`unindexed_filter_keys` is always present (additive, #5623): the mangled keys, in request order and
+without duplicates, of any filter whose value is longer than 2048 bytes, and an empty array when
+none is. Such a value is not indexed in newly stored responses, so when the array is not empty
+`agent_count` can be 0 or an undercount. The array names keys only, never the values. `agent_count`
+and every status code are unchanged, including the `503` when the response store is degraded.
 
 ---
 
