@@ -504,7 +504,7 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
 - **The re-announce/"known-session" check is PER-REPLICA in-memory** (`gateway_sessions_`) on the
   `ProxyRegister` replay branch (#4246 #3). *Update 2026-10-11: the `BatchHeartbeat` /
   `ProxyInventory` / `NotifyStreamStatus` session resolution is now directory-authoritative — see §7f
-  (implemented on branch `feat/ha-ws5-session-lookup`, no PR yet); the `ProxyRegister` known-session
+  (merged as PR #5694, 2026-10-12); the `ProxyRegister` known-session
   check itself is unchanged.* Under active-active a replay routed to a non-owning replica still takes
   the fresh branch until the safe-to-scale gate work lands.
 - **Re-announce refreshes LIVENESS (lease), not PLACEMENT** — `cluster_id`/`gateway_node` are not
@@ -1125,7 +1125,8 @@ so a wrong disposition is never edited in place, only superseded by a later row 
 "remaining 4.4 scope" in §7b's `#4555` decision text) is judged OUT of WS-4 4.4's actual scope: the
 WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix.md`), and gossip-based
 peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
-not a WS-4 gate item.
+not a WS-4 gate item: as of 2026-10-13 that tracker is **WS-15** in `docs/ha-delivery-matrix.md`
+(roadmap 7.1.1, #5759), paired with WS-13's agent-side failover (roadmap 14.2, #291).
 
 **Update (2026-10-01, #1197 - server-side unknown-session verdict; INERT until the gateway consumes it).**
 `BatchHeartbeatResponse` gained `repeated string unknown_session_ids = 2` and
@@ -1566,6 +1567,60 @@ one core replica a server-only restart now recovers through the replay described
   are planned follow-ups with no issue numbers yet. Rig pass 6 (`c518edd93`, simulated agents, loopback) registered 1000, 2000 and 5000 agents in 1.89 s, 4.16 s and 12.08 s with the shipped setting. Detail:
   `docs/user-manual/gateway.md`, "Registration rate per gateway".
 
+**Update (2026-10-06, #4632 - the gateway holds stream-status notifications instead of dropping them).**
+`yuzu_gw_upstream` no longer drops a `CONNECTED` or `DISCONNECTED` notification when 10 are already in
+flight or the circuit breaker is not closed. It holds it in a bounded, memory-only store keyed by
+`{agent, session, stream home}` (a newer event for a held key replaces the held one and keeps its place, except that a newer event for the
+half open probe's own key is held at the tail and supersedes the probe's older event if the probe fails;
+`notify_pending_max`, default 10000, caps the keys) and sends the held entries first in first out, at most 10 at a time. The
+earlier text of this section is left as written; the points below say what it no longer describes.
+- **Emission is at most once per session; delivery is not.** The "AT MOST ONE `CONNECTED(S)` and one
+  `DISCONNECTED(S)` per session" statement in the 4.4 status paragraph above describes what
+  `yuzu_gw_agent` emits. While the breaker is half open exactly one held notification is sent as the probe
+  and a probe that times out may already have reached the server, so it is sent again after it goes back to
+  the head: probe delivery is at least once (OBSERVED on a rig: one `DISCONNECTED` reached the server 3 times
+  after two timed-out probes and 6 times after five; one `CONNECTED` used as the probe, twice; the server
+  handled every copy without error).
+- **Retired clause.** "a `DISCONNECTED(S)` that `yuzu_gw_upstream` drops (circuit-open, or the
+  `MAX_NOTIFY_INFLIGHT` inflight cap) leaves it to lease-expiry + the stale-lease reaper", and the #1197
+  update's statement that an open breaker "drops stream-status notifications", no longer hold: such a
+  notification is held and delivered when the probe succeeds. What is still lost is a notification for a
+  new key when the store is full (counted as `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`),
+  one whose worker failed after taking it (not counted, not retried), a held probe that is evicted because it cannot
+  be encoded or is retired by a server status that means the request itself was wrong (a WARN is logged; see
+  the Known limits in `docs/user-manual/gateway.md`), and everything held when the upstream client process or the
+  gateway stops (the store is volatile). A lost `DISCONNECTED` still leaves the agent
+  listed as online in the server's registry and its route row routable until the lease expires, as before.
+- **Superseded pointer.** "The in-flight notification limit behind it is tracked in #4632" (the "What it does
+  not promise" bullet above) is closed by this change; the series still has no agent label and an agent
+  whose `CONNECTED` was lost at the cap still stays acknowledged but unreachable until its next reconnect.
+- **New invariant.** The head held notification is the breaker probe, so a notification that fails
+  deterministically on its own payload would block the queue and keep the breaker cycling against a healthy
+  server. Fields that an agent controls are therefore sanitised at admission; the agent-supplied peer address
+  is the only one today (found in review: a value that is not valid UTF-8 cannot be encoded).
+- **Narrowed by the Gate 8 re-review (same update).** The invariant above is now enforced at one more layer:
+  a failure of the gateway's own request encoder (the request never left the gateway) is a local error that
+  feeds the breaker neither as a success nor as a failure, and a held notification whose probe ends that way is
+  evicted with a warning and the next head is probed at once, so such a notification no longer blocks the queue.
+  A server answer, a transport error and a killed probe worker still count as before. `cluster_id` is converted
+  with the unicode conversion and the gateway refuses to start when it cannot be represented. The peer address
+  stays sanitised so its notification is sent instead of evicted. Details: Known limits in
+  `docs/user-manual/gateway.md` and the evidence record.
+- **Narrowed again by the second re-review (2026-10-06, fix round 3).** The invariant now also covers a
+  server status that means the request itself was wrong. The gateway refuses an agent id outside 1 to
+  256 bytes at the edge (the same bound the server applies) before any upstream call, and server statuses
+  such as `INVALID_ARGUMENT` no longer count as breaker failures, so a registration the server refuses cannot
+  move the breaker; statuses that mean an unhealthy or unusable upstream still count. The `cluster_id`
+  environment text is interpreted in the VM's native name encoding (latin1 in the shipped images), because
+  the round above had assumed Unicode code points; the refusal to start for an unrepresentable value is
+  unchanged. Details: Known limits in `docs/user-manual/gateway.md` and the evidence record.
+- **Residuals** are the ones listed under Known limits in `docs/user-manual/gateway.md`, among them: a probe
+  success proves only the notification path, not registration; the synchronous RPCs still run inside the one
+  upstream process, so casts queue in its mailbox while one runs; retry or breaker feedback for an ordinary
+  notification worker that fails is a follow-up.
+The measured evidence (rig runs against the previous build and with TLS, the governance run and the
+adversarial review) is `docs/security-reviews/gateway-notify-pending-store-2026-10-05.md`.
+
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 
 **Status: CLOSED.** The last named WS-4 4.3 gap: 4.3a (§ above) built INTRA-cluster routing (agent on a
@@ -1850,7 +1905,7 @@ every branch this PR's own scope covers, not that one.
 
 ### 7f. Durable cross-replica gateway session resolution (WS-5 slice 2, `#4246` item #3, 2026-10-11)
 
-**Status: implemented on branch `feat/ha-ws5-session-lookup`, no PR yet. THE SAFE-TO-SCALE GATE IS NOT
+**Status: merged as PR #5694 (`eabc2b639`, 2026-10-12). THE SAFE-TO-SCALE GATE IS NOT
 LIFTED** — this closes one more `#4246` gap; it does not make a second replica safe (WS-6 6.1b/6.3, WS-13
 for gateway-fronted fleets, WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
 `docs/ha-delivery-matrix.md`). Run exactly ONE server replica (§7c).
@@ -1898,23 +1953,36 @@ is counted under route-store failure op `session_lookup`.
   directory verified at `ProxyRegister`, which is sound only for a single replica; see "Deferred, not
   silent"); otherwise it is refused and counted
   `notify_stream_status/connected_unverified`. DISCONNECTED proceeds on the local-map check when the
-  directory read fails (it is a teardown, not an admission), and its presence-row delete is gated on
+  directory read fails (it is a teardown, not an admission), and its presence-row delete (#5678: now
+  a session clear; the row is kept for the roster) is gated on
   `removed_current_session || store_removed`. A CONNECTED on a replica with a directory row but no
   local `AgentSession` skips the registry `set_gateway_route`/unpublish (nothing local to update) and
   still announces.
 - **Presence correctness (§7a).** `OfflineEndpointStore::upsert` blank-preserves `hostname`
-  (newly; `os` has been blank-preserved since #5294, as were `agent_version`/`arch`): a blank incoming
-  value never overwrites a known non-blank one. Consequence: a presence row's `hostname` is never
-  cleared by an upsert — it is reset only by deleting the row (`remove_if_session`). Recorded gap
-  (pre-existing, not introduced here): `OfflineEndpointStore` has no `delete_agent` and is not a
-  member of the decommission cascade (`AgentDecommissionStores`), so a decommissioned agent's
-  `endpoint_state.endpoints` row (including its `hostname`) persists indefinitely: there is no
-  age-out pass for that table (the only delete is the session-guarded `remove_if_session`, reached
-  from a DISCONNECTED the decommissioned agent never sends). Reads filter by TTL or stale window, so
-  the row is invisible to scope evaluation and `/viz` once stale, but it is not deleted; deletion
-  needs the decommission-cascade item (#5682). `HeartbeatIngestion::ingest`
-  takes the resolved session id, so a heartbeat on a non-owning replica (no local `AgentSession`)
-  cannot blank the presence row's `session_id`.
+  (newly; `os` has been blank-preserved since #5294, as were `agent_version`/`arch`) and, since
+  #5678 (2026-10-12), `session_id`: a blank incoming value never overwrites a known non-blank one.
+  A graceful disconnect (`remove_if_session`) clears ONLY the row's `session_id` (session-guarded
+  `UPDATE`, #5678); `hostname` and the other fields survive so the offline-inclusive `/hardware`
+  roster keeps listing the device with its real last-seen time. Rows are aged out by a clock-guarded
+  hourly per-replica prune (`pg::run_clock_guarded_prune` on `preflight_runner_thread_`, keyed on the
+  PG-authored `last_seen_at`: 37 d = the 30 d roster window + a 7 d margin, advisory-locked, up to 12
+  passes of 1000 rows per hourly tick) (#5678, 2026-10-12), and the decommission cascade below deletes
+  a decommissioned agent's row explicitly, so a presence row's `hostname` is never cleared by an
+  upsert and goes away only when one of those two deletes removes the row. Gap recorded when this
+  bullet was written (pre-existing, not introduced by WS-5): `OfflineEndpointStore` had no
+  `delete_agent` and was not a member of the decommission cascade (`AgentDecommissionStores`), so a
+  decommissioned agent's `endpoint_state.endpoints` row (including its `hostname`) persisted
+  indefinitely, because the only delete was the session-guarded `remove_if_session`, reached from a
+  DISCONNECTED the decommissioned agent never sends. **Closed by #5682:**
+  `OfflineEndpointStore::delete_agent` deletes the row whatever its `session_id`, and it is the
+  cascade's seventh member (`offline_endpoint`), so `DELETE /api/v1/sle/agents/{id}` erases it on the
+  shared Postgres, visible to every replica's next presence read (the registry's 3 s
+  `kPresenceCacheTtl` read cache aside). A still-enrolled agent that heartbeats again re-creates the
+  row, the same "erasure does not unenroll" posture as every other cascade store. A device that is
+  never decommissioned ages out through the prune above (#5678). Reads filter by TTL or stale window,
+  so a departed row is flagged stale on `/viz` for 7 days and is invisible to scope evaluation.
+  `HeartbeatIngestion::ingest` takes the resolved session id, so a heartbeat on a non-owning replica
+  (no local `AgentSession`) cannot blank the presence row's `session_id`.
 
 **Local hydration (server-only restart).** The directory rows survive a server restart but the local
 registry and `gateway_sessions_` do not, and the gateway only replays `ProxyRegister` for ids the

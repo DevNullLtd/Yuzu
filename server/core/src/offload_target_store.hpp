@@ -119,11 +119,17 @@ struct OffloadDelivery {
     std::string error;
 };
 
+/// Largest accepted `batch_size`. The per-target buffer flushes only when it reaches
+/// `batch_size` and has no other cap, so an unbounded value is unbounded memory growth.
+/// Enforced in `OffloadTargetStore::create_target`, the one writer every surface (REST,
+/// MCP) goes through; the MCP schema's `maximum` and the docs name this same number.
+inline constexpr int kMaxOffloadBatchSize = 10000;
+
 /// Typed mutator failure (#3097 lesson — 400 vs 503 classification at the
 /// REST seam, mirrors `WebhookWriteError`). `invalid_input` is a CALLER
 /// error (400); the other two are store/infra degradation (503).
 enum class OffloadWriteError {
-    invalid_input,     ///< empty name/url, bad url scheme, batch_size < 1, duplicate name,
+    invalid_input,     ///< empty name/url, bad url scheme, batch_size outside 1..kMaxOffloadBatchSize, duplicate name,
                        ///< or a control byte in a free-text field — caller error, 400
     store_unavailable, ///< not open / pool exhausted / codec unavailable — 503
     db_error,          ///< a query against an open store failed — 503
@@ -224,6 +230,12 @@ public:
     /// convenience, not itself a decision surface.
     [[nodiscard]] std::vector<OffloadDelivery> get_deliveries(int64_t target_id,
                                                               int limit = 50) const;
+
+    /// Same read, but `nullopt` = the read FAILED (closed store, lease
+    /// timeout, query error) so a caller that renders history can tell a
+    /// failed read from a genuinely empty log. `get_deliveries` delegates here.
+    [[nodiscard]] std::optional<std::vector<OffloadDelivery>>
+    get_deliveries_checked(int64_t target_id, int limit = 50) const;
 
     /// Fire an event to all enabled, matching targets. Honours batching:
     /// when a target has `batch_size > 1`, the event is appended to an

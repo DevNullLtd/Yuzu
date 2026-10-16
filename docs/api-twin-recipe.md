@@ -186,6 +186,9 @@ Use `ok_json` for a single object/scalar result, `list_json` for anything return
 total count. Both wrap the shared builder's output (§1) — they never build the `data` payload
 themselves.
 
+A checked list reader that caps its page reads one row past the cap and exposes `truncated`;
+it never reports the page size as a `total` (see `GET /api/v1/deployments`).
+
 ### OpenAPI entry
 
 `openapi_spec()` (`rest_api_v1.cpp:516`) is a hand-maintained raw-string literal (split into

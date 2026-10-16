@@ -68,6 +68,14 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/settings/analytics-events",
+    "capability_id": "get.fragments-settings-analytics-events",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-analytics-recent"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/settings/data-retention",
     "capability_id": "get.fragments-settings-data-retention",
     "rest_v1_twin": {
@@ -79,6 +87,61 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/settings/developer/api",
+    "capability_id": "get.fragments-settings-developer-api",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/routes"
+    },
+    "mcp_twin": "discover_routes",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/permissions",
+    "capability_id": "get.fragments-settings-developer-permissions",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/permissions"
+    },
+    "mcp_twin": "discover_permissions",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/plugins",
+    "capability_id": "get.fragments-settings-developer-plugins",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/plugin-docs"
+    },
+    "mcp_twin": null,
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/plugins/observed",
+    "capability_id": "get.fragments-settings-developer-plugins-observed",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/plugins"
+    },
+    "mcp_twin": "discover_plugins",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/routes",
+    "capability_id": "get.fragments-settings-developer-routes",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/routes"
+    },
+    "mcp_twin": "discover_routes",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/settings/gateway",
     "capability_id": "get.fragments-settings-gateway",
     "rest_v1_twin": {
@@ -87,6 +150,14 @@
     },
     "mcp_twin": null,
     "status": "exception:#520"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/general-runtime",
+    "capability_id": "get.fragments-settings-general-runtime",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-config"
   },
   {
     "method": "GET",
@@ -142,5 +213,43 @@
     },
     "mcp_twin": null,
     "status": "exception:#520"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/webhooks",
+    "capability_id": "get.fragments-settings-webhooks",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-webhooks"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/webhooks/{param}/deliveries",
+    "capability_id": "get.fragments-settings-webhooks-param-deliveries",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-webhooks-param-deliveries"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/offload-targets",
+    "capability_id": "get.fragments-settings-offload-targets",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/offload-targets"
+    },
+    "mcp_twin": "list_offload_targets",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/offload-targets/{param}/deliveries",
+    "capability_id": "get.fragments-settings-offload-targets-param-deliveries",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/offload-targets/{id}/deliveries"
+    },
+    "mcp_twin": "list_offload_target_deliveries",
+    "status": "twinned"
   }
 ]

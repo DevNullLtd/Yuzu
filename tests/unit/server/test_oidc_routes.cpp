@@ -516,7 +516,7 @@ TEST_CASE("OIDC binding route: a bound flow completes, clears the cookie and a r
 
     auto ok = rig.callback(a, flow);
     CHECK(ok->status == 302);
-    CHECK(ok->get_header_value("Location") == "/");
+    CHECK(ok->get_header_value("Location") == "/home");
     CHECK(has_cookie_named(*ok, "yuzu_session="));
     // The binding cookie is single-use: cleared on the success exit.
     CHECK(binding_cookie_cleared(*ok));
@@ -552,7 +552,7 @@ TEST_CASE("OIDC binding route: a callback URL opened in a browser without the co
 
     // The refusal did not consume the pending flow: the initiating browser finishes inside TTL.
     auto ok = rig.callback(a, flow);
-    CHECK(ok->get_header_value("Location") == "/");
+    CHECK(ok->get_header_value("Location") == "/home");
     CHECK(has_cookie_named(*ok, "yuzu_session="));
     CHECK(rig.idp.token_calls.load() == 1);
 }
@@ -579,8 +579,8 @@ TEST_CASE("OIDC binding route: a browser holding its own cookie is refused on an
     CHECK(b.jar["__Host-yuzu_oidc_bind"] == b_cookie);
 
     // Neither flow was consumed: B finishes its own, and A finishes A's.
-    CHECK(rig.callback(b, b_flow)->get_header_value("Location") == "/");
-    CHECK(rig.callback(a, a_flow)->get_header_value("Location") == "/");
+    CHECK(rig.callback(b, b_flow)->get_header_value("Location") == "/home");
+    CHECK(rig.callback(a, a_flow)->get_header_value("Location") == "/home");
     CHECK(rig.idp.token_calls.load() == 2);
 }
 
@@ -603,7 +603,7 @@ TEST_CASE("OIDC binding route: only the exact cookie name counts",
     CHECK(rig.callback(sess, flow)->get_header_value("Location") == "/login?error=sso_failed");
     CHECK(rig.idp.token_calls.load() == 0);
     // The genuine browser still completes (neither request consumed the flow).
-    CHECK(rig.callback(a, flow)->get_header_value("Location") == "/");
+    CHECK(rig.callback(a, flow)->get_header_value("Location") == "/home");
 }
 
 TEST_CASE("OIDC binding route: a callback that matches no pending flow leaves the binding cookie alone",
@@ -626,7 +626,7 @@ TEST_CASE("OIDC binding route: a callback that matches no pending flow leaves th
     (void)rig.get(a, "/auth/callback?error=access_denied");
     (void)rig.get(a, "/auth/callback?code=c&state=zzz");
     REQUIRE(a.jar.count("__Host-yuzu_oidc_bind") == 1);
-    CHECK(rig.callback(a, flow)->get_header_value("Location") == "/");
+    CHECK(rig.callback(a, flow)->get_header_value("Location") == "/home");
 }
 
 TEST_CASE("OIDC binding route: a failure after the binding matched still clears the cookie",
@@ -656,7 +656,7 @@ TEST_CASE("OIDC binding route: the IdP's GET callback is not subject to a same-o
     auto r = rig.fix.sink.dispatch("GET", "/auth/callback?code=c&state=" + flow.state, {},
                                    "application/json", h);
     REQUIRE(r != nullptr);
-    CHECK(r->get_header_value("Location") == "/");
+    CHECK(r->get_header_value("Location") == "/home");
 }
 
 // ---------------------------------------------------------------------------

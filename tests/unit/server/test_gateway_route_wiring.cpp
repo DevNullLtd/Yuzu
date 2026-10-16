@@ -39,6 +39,7 @@
 #include "agent_service_impl.hpp"
 #include "audit_store.hpp"
 #include "event_bus.hpp"
+#include "fleet_topology_store.hpp"
 #include "gateway_route_store.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "offline_endpoint_store.hpp"
@@ -84,6 +85,16 @@ yuzu::test::PgTestTemplate gwroutewiring_tpl{"gwroutewiring", [](const std::stri
     GatewayRouteStore store{pool};
     if (!store.is_open())
         throw std::runtime_error("gwroutewiring template: store failed to migrate");
+}};
+
+// #5678: both GatewayRouteStore and OfflineEndpointStore migrated ONCE in the
+// template (no per-test DDL) for the DISCONNECTED -> presence-clear cases.
+yuzu::test::PgTestTemplate gwpresence_tpl{"gwpresence", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    GatewayRouteStore route_store{pool};
+    yuzu::server::OfflineEndpointStore offline_store{pool};
+    if (!route_store.is_open() || !offline_store.is_open())
+        throw std::runtime_error("gwpresence template: a store failed to migrate");
 }};
 
 /// An AuthManager wired to a PG-backed AuthDB (WS-6 6.2: enrollment/pending state
@@ -2889,8 +2900,21 @@ gw::BatchHeartbeatResponse batch_hb(GatewayUpstreamServiceImpl& svc,
 }
 
 bool offline_row_present(yuzu::server::OfflineEndpointStore& s, const std::string& agent_id) {
-    for (const auto& e : s.query_stale_within(std::chrono::hours(1)))
+    const auto roster = s.query_stale_within(std::chrono::hours(1));
+    REQUIRE(roster.has_value()); // #5531: the read is typed; a store fault is not "absent"
+    for (const auto& e : *roster)
         if (e.agent_id == agent_id)
+            return true;
+    return false;
+}
+
+// Cross-replica PRESENCE (query_live_ids), distinct from the roster row above:
+// a graceful disconnect clears this while the roster row stays (#5678).
+bool live_present(yuzu::server::OfflineEndpointStore& s, const std::string& agent_id) {
+    auto r = s.query_live_ids(std::chrono::hours(1));
+    REQUIRE(r.has_value());
+    for (const auto& p : *r)
+        if (p.agent_id == agent_id)
             return true;
     return false;
 }
@@ -2977,7 +3001,7 @@ TEST_CASE("WS-5 BatchHeartbeat: a non-owning replica threads the directory-resol
     auto resp = batch_hb(other.svc, {sid});
     CHECK(resp.acknowledged_count() == 1);
     // The presence row exists (this replica has no local session) and carries
-    // the resolved session id, so the session-guarded delete matches it.
+    // the resolved session id, so the session-guarded clear matches it.
     CHECK(offline_row_present(offline, agent));
     CHECK(offline.remove_if_session(agent, sid));
 }
@@ -3265,7 +3289,7 @@ TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read still acknowledges
 }
 
 TEST_CASE("WS-5 NotifyStreamStatus: DISCONNECTED on a non-owning replica tombstones the "
-          "directory row and removes the presence row on the directory's proof alone",
+          "directory row and clears presence (row kept for the roster) on the directory's proof alone",
           "[pg][gateway_route_wiring][ws5]") {
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     BatchHbFixture owner(db.dsn());
@@ -3296,7 +3320,8 @@ TEST_CASE("WS-5 NotifyStreamStatus: DISCONNECTED on a non-owning replica tombsto
     REQUIRE(row.has_value());
     REQUIRE(row->has_value()); // tombstone, not gone
     CHECK_FALSE((*row)->session_id.has_value());
-    CHECK_FALSE(offline_row_present(offline, agent));
+    CHECK(offline_row_present(offline, agent));
+    CHECK_FALSE(live_present(offline, agent));
 }
 
 namespace {
@@ -3323,7 +3348,9 @@ std::int64_t now_ms() {
 }
 
 std::string presence_hostname(yuzu::server::OfflineEndpointStore& s, const std::string& agent_id) {
-    for (const auto& e : s.query_stale_within(std::chrono::hours(1)))
+    const auto roster = s.query_stale_within(std::chrono::hours(1));
+    REQUIRE(roster.has_value()); // #5531: the read is typed; a store fault is not "absent"
+    for (const auto& e : *roster)
         if (e.agent_id == agent_id)
             return e.hostname;
     return {};
@@ -3365,10 +3392,11 @@ TEST_CASE("WS-5 NotifyStreamStatus: a superseded session is refused CONNECTED an
     REQUIRE(after_disc->has_value());
     CHECK((*after_disc)->session_id == winner);
     CHECK(offline_row_present(offline, agent));
+    CHECK(live_present(offline, agent)); // the stale DISCONNECTED must not clear the winner's presence
     CHECK_FALSE(owner.registry.get_session(agent));
 }
 
-TEST_CASE("WS-5 NotifyStreamStatus: the presence delete gate honours each half separately",
+TEST_CASE("WS-5 NotifyStreamStatus: the presence clear gate honours each half separately",
           "[pg][gateway_route_wiring][ws5]") {
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     BatchHbFixture owner(db.dsn());
@@ -3378,7 +3406,7 @@ TEST_CASE("WS-5 NotifyStreamStatus: the presence delete gate honours each half s
                                                &offline};
     owner.svc.set_heartbeat_ingestion(&ingestion);
 
-    SECTION("local half: the registry held the session so its presence row is removed") {
+    SECTION("local half: the registry held the session so its presence is cleared (row kept)") {
         const std::string agent = "yuzu_test_ws5_gate_local";
         const std::string sid = owner.register_live(agent);
         auto row = owner.store.lookup_route(agent);
@@ -3389,7 +3417,8 @@ TEST_CASE("WS-5 NotifyStreamStatus: the presence delete gate honours each half s
 
         CHECK(notify(owner.svc, agent, sid, gw::StreamStatusNotification::DISCONNECTED));
         CHECK(owner.desync("deregister", "session_mismatch") == 1);
-        CHECK_FALSE(offline_row_present(offline, agent));
+        CHECK(offline_row_present(offline, agent));
+        CHECK_FALSE(live_present(offline, agent));
     }
 
     SECTION("neither half: no local session and a directory mismatch leaves the presence row") {
@@ -3405,6 +3434,7 @@ TEST_CASE("WS-5 NotifyStreamStatus: the presence delete gate honours each half s
         CHECK(notify(owner.svc, agent, sid, gw::StreamStatusNotification::DISCONNECTED));
         CHECK(owner.desync("deregister", "session_mismatch") == 1);
         CHECK(offline_row_present(offline, agent));
+        CHECK(live_present(offline, agent)); // neither half fired: presence is untouched
     }
 }
 
@@ -3635,4 +3665,301 @@ TEST_CASE("WS-5 BatchHeartbeat: a non-owning replica keeps the last-known hostna
         CHECK(resp2.acknowledged_count() == 1);
         CHECK(listed_unknown(resp2) == std::vector<std::string>{sid});
     }
+}
+
+// ── #5678: DISCONNECTED drives the shared presence-clear helper ─────────────
+
+TEST_CASE("NotifyStreamStatus DISCONNECTED for the CURRENT session clears presence but keeps the "
+          "endpoint row (#5678)",
+          "[pg][gateway_route_wiring][presence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwpresence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore route_store{pool};
+    yuzu::server::OfflineEndpointStore offline_store{pool};
+    REQUIRE(route_store.is_open());
+    REQUIRE(offline_store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    yuzu::server::HeartbeatIngestion hi{registry, nullptr, nullptr, &metrics, &offline_store};
+    gateway_svc.set_gateway_route_store(&route_store);
+    gateway_svc.set_heartbeat_ingestion(&hi);
+    // #5678 gateway evict_pushed parity: a real store so the evict is observable.
+    yuzu::server::FleetTopologyStore topo{[](std::chrono::milliseconds) {
+        return std::vector<yuzu::server::RawAgentSnapshot>{};
+    }};
+    gateway_svc.set_fleet_topology_store(&topo);
+
+    auto req = make_gw_register(auth_mgr, "agent-presence-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session = resp.session_id();
+
+    gw::StreamStatusNotification conn;
+    conn.set_agent_id("agent-presence-1");
+    conn.set_session_id(session);
+    conn.set_event(gw::StreamStatusNotification::CONNECTED);
+    conn.set_stream_home_id("home-1");
+    gw::StreamStatusAck conn_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &conn, &conn_ack).ok());
+    REQUIRE(conn_ack.acknowledged());
+
+    const auto t = now_ms();
+    REQUIRE(offline_store.upsert("agent-presence-1", "host-presence", "linux", t, 0, "1.0.0",
+                                 "x86_64", session));
+    REQUIRE(live_present(offline_store, "agent-presence-1"));
+    {
+        yuzu::server::RawAgentSnapshot snap;
+        snap.agent_id = "agent-presence-1";
+        snap.hostname = "host-presence";
+        snap.os = "linux";
+        snap.local_ips = {"10.5.0.1"};
+        topo.push_snapshot(std::move(snap));
+    }
+    REQUIRE(topo.pushed_map_size() == 1);
+
+    gw::StreamStatusNotification disc;
+    disc.set_agent_id("agent-presence-1");
+    disc.set_session_id(session);
+    disc.set_event(gw::StreamStatusNotification::DISCONNECTED);
+    disc.set_stream_home_id("home-1");
+    gw::StreamStatusAck disc_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &disc, &disc_ack).ok());
+    REQUIRE(disc_ack.acknowledged());
+
+    CHECK_FALSE(live_present(offline_store, "agent-presence-1"));
+    // The CURRENT-session DISCONNECTED also evicts the pushed viz snapshot.
+    CHECK(topo.pushed_map_size() == 0);
+    const auto roster = offline_store.query_stale_within(std::chrono::hours(1));
+    REQUIRE(roster.has_value()); // #5531: the roster read is typed; a store fault is not "absent"
+    const yuzu::server::OfflineEndpoint* row = nullptr;
+    for (const auto& e : *roster)
+        if (e.agent_id == "agent-presence-1")
+            row = &e;
+    REQUIRE(row != nullptr);
+    CHECK(row->hostname == "host-presence");
+    CHECK(row->last_heartbeat_ms == t);
+}
+
+TEST_CASE("NotifyStreamStatus: a STALE DISCONNECTED (superseded session) leaves the live "
+          "presence row untouched (#5678)",
+          "[pg][gateway_route_wiring][presence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwpresence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore route_store{pool};
+    yuzu::server::OfflineEndpointStore offline_store{pool};
+    REQUIRE(route_store.is_open());
+    REQUIRE(offline_store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    yuzu::server::HeartbeatIngestion hi{registry, nullptr, nullptr, &metrics, &offline_store};
+    gateway_svc.set_gateway_route_store(&route_store);
+    gateway_svc.set_heartbeat_ingestion(&hi);
+    // #5678 gateway evict_pushed parity: a real store so the evict is observable.
+    yuzu::server::FleetTopologyStore topo{[](std::chrono::milliseconds) {
+        return std::vector<yuzu::server::RawAgentSnapshot>{};
+    }};
+    gateway_svc.set_fleet_topology_store(&topo);
+
+    auto req1 = make_gw_register(auth_mgr, "agent-presence-2");
+    apb::RegisterResponse resp1;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req1, &resp1).ok());
+    const std::string session1 = resp1.session_id();
+    auto req2 = make_gw_register(auth_mgr, "agent-presence-2");
+    apb::RegisterResponse resp2;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req2, &resp2).ok());
+    const std::string session2 = resp2.session_id();
+    REQUIRE(session2 != session1);
+
+    gw::StreamStatusNotification conn;
+    conn.set_agent_id("agent-presence-2");
+    conn.set_session_id(session2);
+    conn.set_event(gw::StreamStatusNotification::CONNECTED);
+    conn.set_stream_home_id("home-2");
+    gw::StreamStatusAck conn_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &conn, &conn_ack).ok());
+
+    REQUIRE(offline_store.upsert("agent-presence-2", "h", "linux", now_ms(), 0, "", "", session2));
+    REQUIRE(live_present(offline_store, "agent-presence-2"));
+    {
+        yuzu::server::RawAgentSnapshot snap;
+        snap.agent_id = "agent-presence-2";
+        snap.hostname = "h";
+        snap.os = "linux";
+        snap.local_ips = {"10.5.0.2"};
+        topo.push_snapshot(std::move(snap));
+    }
+    REQUIRE(topo.pushed_map_size() == 1);
+
+    gw::StreamStatusNotification stale;
+    stale.set_agent_id("agent-presence-2");
+    stale.set_session_id(session1);
+    stale.set_event(gw::StreamStatusNotification::DISCONNECTED);
+    gw::StreamStatusAck stale_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &stale, &stale_ack).ok());
+
+    // removed_current_session was false: presence untouched, and the stored
+    // session_id is still session2 (a clear with session2 would now succeed).
+    CHECK(live_present(offline_store, "agent-presence-2"));
+    // A stale DISCONNECTED must not evict a live re-registered agent's pushed slot.
+    CHECK(topo.pushed_map_size() == 1);
+    CHECK(offline_store.remove_if_session("agent-presence-2", session2));
+}
+
+// #5686: a saturated presence pool costs a handful of bounded acquire waits per
+// batch (at most floor(log2 N)+1), not one per heartbeat. The presence store has
+// its own one-connection pool whose only lease is held, so every upsert would
+// time out; the route store's pool is untouched, so acks and lease renewal
+// must be unaffected.
+//
+// Probe schedule for the 4 sessions with the store failing throughout: entry 1
+// is attempted and fails; entry 2 (right after the first failure) is the
+// half-open probe and fails; entry 3 is skipped; entry 4 is the next probe and
+// fails (the one after would be entry 8). So failed==3, skipped==1.
+TEST_CASE("BatchHeartbeat: after a presence upsert fails the batch skips theirs except "
+          "spaced probes while every entry is still acked and renewed (#5686)",
+          "[pg][gateway_route_wiring][ws5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    PgPool presence_pool{{.conninfo = db.dsn(), .size = 1}};
+    yuzu::server::OfflineEndpointStore offline{presence_pool};
+    REQUIRE(offline.is_open());
+    offline.set_metrics(&f.metrics);
+    yuzu::server::HeartbeatIngestion ingestion{f.registry, nullptr, nullptr, &f.metrics, &offline};
+    f.svc.set_heartbeat_ingestion(&ingestion);
+
+    std::vector<std::string> agents;
+    std::vector<std::string> sids;
+    for (int i = 0; i < 4; ++i) {
+        agents.push_back("yuzu_test_5686_agent_" + std::to_string(i));
+        sids.push_back(f.register_live(agents.back()));
+        REQUIRE(
+            f.store.announce_connected(agents.back(), sids.back(), "zone", "node", 90).has_value());
+    }
+    // Expire every lease so a renewal is visible without waiting on the clock.
+    raw_exec(db.dsn(), "UPDATE gateway_route_store.agent_routes SET lease_until = now() - "
+                       "interval '1 hour' WHERE agent_id LIKE 'yuzu_test_5686_agent_%'");
+    auto lease_of = [&](const std::string& agent) {
+        auto r = f.store.lookup_route(agent);
+        REQUIRE(r.has_value());
+        REQUIRE(r->has_value());
+        REQUIRE((*r)->lease_until_ms.has_value());
+        return *(*r)->lease_until_ms;
+    };
+    std::vector<std::int64_t> expired;
+    for (const auto& a : agents)
+        expired.push_back(lease_of(a));
+
+    auto presence_failed = [&] {
+        return f.metrics
+            .counter("yuzu_server_agent_presence_store_failed_total",
+                     {{"op", "upsert"}, {"reason", "store_unavailable"}})
+            .value();
+    };
+    auto skipped = [&] {
+        return f.metrics.counter("yuzu_server_agent_presence_upsert_skipped_total").value();
+    };
+    auto batches = [&](const char* outcome) {
+        return f.metrics
+            .histogram("yuzu_server_gateway_batch_heartbeat_duration_seconds",
+                       {{"outcome", outcome}})
+            .snapshot()
+            .count;
+    };
+
+    {
+        auto held = presence_pool.acquire();
+        REQUIRE(held);
+        auto resp = batch_hb(f.svc, sids);
+        CHECK(resp.acknowledged_count() == 4);
+        CHECK(listed_unknown(resp).empty());
+        CHECK(presence_failed() == 3);
+        CHECK(skipped() == 1);
+        CHECK(f.metrics.counter("yuzu_heartbeats_received_total", {{"via", "gateway"}}).value() ==
+              4);
+        CHECK(batches("degraded") == 1);
+        CHECK(batches("ok") == 0);
+    }
+    for (std::size_t i = 0; i < agents.size(); ++i) {
+        CHECK(lease_of(agents[i]) > expired[i]);
+        CHECK_FALSE(offline_row_present(offline, agents[i]));
+    }
+
+    // Per batch, not sticky: the next batch on a healthy pool writes every row.
+    auto resp = batch_hb(f.svc, sids);
+    CHECK(resp.acknowledged_count() == 4);
+    for (const auto& a : agents)
+        CHECK(offline_row_present(offline, a));
+    CHECK(presence_failed() == 3);
+    CHECK(skipped() == 1);
+    CHECK(batches("ok") == 1);
+    CHECK(batches("degraded") == 1);
+}
+
+// #5686 governance G-1: a presence failure on the LAST entry of a batch leaves
+// nothing to skip (and a probe is not even reached), but the batch is still
+// labelled degraded and counts the failed attempt.
+TEST_CASE("BatchHeartbeat: a presence failure on the last entry still labels the batch "
+          "degraded (#5686)",
+          "[pg][gateway_route_wiring][ws5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    PgPool presence_pool{{.conninfo = db.dsn(), .size = 1}};
+    yuzu::server::OfflineEndpointStore offline{presence_pool};
+    REQUIRE(offline.is_open());
+    offline.set_metrics(&f.metrics);
+    yuzu::server::HeartbeatIngestion ingestion{f.registry, nullptr, nullptr, &f.metrics, &offline};
+    f.svc.set_heartbeat_ingestion(&ingestion);
+
+    // One-entry batch: the only (= last) upsert fails.
+    const std::string agent = "yuzu_test_5686_last_agent";
+    const std::string sid = f.register_live(agent);
+    REQUIRE(f.store.announce_connected(agent, sid, "zone", "node", 90).has_value());
+
+    auto histo = [&](const char* outcome) {
+        return f.metrics
+            .histogram("yuzu_server_gateway_batch_heartbeat_duration_seconds",
+                       {{"outcome", outcome}})
+            .snapshot()
+            .count;
+    };
+    {
+        auto held = presence_pool.acquire();
+        REQUIRE(held);
+        auto resp = batch_hb(f.svc, {sid});
+        CHECK(resp.acknowledged_count() == 1);
+    }
+    CHECK(f.metrics
+              .counter("yuzu_server_agent_presence_store_failed_total",
+                       {{"op", "upsert"}, {"reason", "store_unavailable"}})
+              .value() == 1);
+    CHECK(f.metrics.counter("yuzu_server_agent_presence_upsert_skipped_total").value() == 0);
+    CHECK(histo("degraded") == 1);
+    CHECK(histo("ok") == 0);
+}
+
+// #5686: the new series are pre-seeded at construction (a rate() over a series
+// that does not exist yet is silent) and carry the corrected HELP text.
+TEST_CASE("GatewayUpstreamServiceImpl: the #5686 series and HELP lines exist before any batch",
+          "[pg][gateway_route_wiring][ws5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    const std::string text = f.metrics.serialize();
+    auto has = [&](std::string_view needle) { return text.find(needle) != std::string::npos; };
+    CHECK(has("# HELP yuzu_server_gateway_batch_heartbeat_duration_seconds "));
+    CHECK(has("# HELP yuzu_server_agent_presence_upsert_skipped_total "));
+    CHECK(has("the spacing doubles on each further consecutive failure"));
+    CHECK(has("yuzu_server_gateway_batch_heartbeat_duration_seconds_count{outcome=\"ok\"} 0"));
+    CHECK(has("yuzu_server_gateway_batch_heartbeat_duration_seconds_count{outcome=\"degraded\"} "
+              "0"));
+    CHECK(has("\nyuzu_server_agent_presence_upsert_skipped_total 0\n"));
 }

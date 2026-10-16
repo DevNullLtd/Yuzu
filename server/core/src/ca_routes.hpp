@@ -139,6 +139,16 @@ using IssueCodeSigningFn = std::function<std::expected<CodeSigningIssuance, std:
     const std::string& csr_pem, const std::string& label, std::optional<int> validity_days,
     const std::string& issued_by)>;
 
+/// The dashboard panel's "showing the first N certificates" note. A free function so the wording is
+/// testable without seeding `panel_limit` certificates. The paging hint must NOT be copy-pasteable as
+/// a present-but-empty `offset=` (a 400 since #4644): it shows the placeholder escaped as `&lt;n&gt;`.
+inline std::string ca_issued_paging_hint(int panel_limit) {
+    return "<p class=\"section-note warn\">Showing the first " +
+           std::to_string(panel_limit) +
+           " certificates. Use <code>GET /api/v1/ca/issued?offset=&lt;n&gt;</code> to page through "
+           "the full inventory.</p>";
+}
+
 class CaRoutes {
 public:
     using AuthFn =

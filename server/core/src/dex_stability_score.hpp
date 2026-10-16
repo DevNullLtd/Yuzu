@@ -47,18 +47,24 @@
  *   uncertainty. Every +infinity upper bound the sibling produces is labelled
  *   unreliable, so suppressing unreliable intervals would make the open upper
  *   bound unreachable.
- * - Bands: excellent >= 90, good >= 75, fair >= 60, else poor. These are the
- *   edges and labels of the fleet health-score band (build_dex_health_model,
- *   dex_read_model.cpp); the per-device buckets there (great / fair / poor at
- *   90 / 75) are a different scale. The rule differs: the health page bands
- *   the RAW double and prints it at zero decimals, while this module bands the
- *   one-decimal DISPLAY value, so 89.96 reads "good" there and "excellent"
- *   here. A page must not share one band expression across the two.
+ * - Bands: excellent >= 90, good >= 75, fair >= 60, else poor. These defaults
+ *   are the edges and labels of the fleet health-score band
+ *   (build_dex_health_model, dex_read_model.cpp); the per-device buckets there
+ *   (great / fair / poor at 90 / 75) are a different scale. The rule differs:
+ *   the health page bands the RAW double and prints it at zero decimals,
+ *   while this module bands the one-decimal DISPLAY value, so 89.96 reads
+ *   "good" there and "excellent" here. A page must not share one band
+ *   expression across the two. The edges are a parameter (StabilityBandEdges,
+ *   defaulting to 90 / 75 / 60), applied to the displayed value exactly as the
+ *   defaults are. The scorer refuses edges that are non-finite, outside (0, 100)
+ *   or not strictly descending as invalid_edges (stability_edges_valid); the
+ *   finer policy rules live in dex_score_policy.hpp.
  * - Display and banding. The returned `score` is UNROUNDED. The display
  *   precision is one decimal (kStabilityScoreScale) and the rounding rule is
  *   stability_display_score(): round half away from zero at one decimal on
  *   the computed double (an IEEE multiply by 10, then std::round; it can differ
- *   from printf of the raw double on near-ties). Consumers display and
+ *   from printf of the raw double on near-ties). Round-to-nearest
+ *   floating-point mode is assumed. Consumers display and
  *   serialise stability_display_score(*score) formatted at one decimal, never
  *   printf of the raw double, and never the raw score beside the band (JSON
  *   carrying 89.96 with band "excellent" would contradict itself). The band is
@@ -69,10 +75,18 @@
  *   computed double lands on either side of the tie; band and display always
  *   agree with each other, and two such apps can display one tenth apart.
  * - `floor` is the reporting-device minimum: fewer devices withholds the score
- *   as below_floor, so that no small cohort reads as an individual device's
- *   behaviour. Callers pass kDexCohortFloor literally; the module enforces
- *   whatever floor it is handed. `reporting_devices` is the distinct devices
- *   that reported THIS application/version in the window, never fleet size.
+ *   as below_floor. Callers pass kDexCohortFloor literally; the module enforces
+ *   whatever floor it is handed. kDexCohortFloor is one device (maintainer
+ *   ruling, 2026-10-14), and no_population is checked first, so a caller
+ *   passing it never sees below_floor: the token stays in the vocabulary for a
+ *   caller handing in a larger floor. `reporting_devices` is the distinct
+ *   devices that reported THIS application/version in the window; the Apps list
+ *   read (DexApi::apps) is the one caller for which it is the fleet reporting
+ *   population (Windows devices online now), since a per-application reporting
+ *   count is not available there. That caller draws `devices_affected` and the
+ *   event sums from the same online ids, so the numerator is a subset of this
+ *   population by construction. That caller withholds the score as
+ *   "offline_affected" (not a core reason) when an affected device is not in it.
  * - Missing or contradictory population data is withheld (score and band
  *   empty, `withheld` names why), never shown as 0 or 100. A missing or
  *   unusable rate_ratio is NOT withheld: the result is scored with an
@@ -81,22 +95,23 @@
  * - "no_population" is the ordinary no-data state (N <= 0, including a
  *   negative N). "inconsistent" covers: a negative A, crash or hang count;
  *   A > N; crash or hang above A * cap; crash + hang below A (every affected
- *   device has an event). "inconsistent" and "invalid_weights" are fault
- *   states.
+ *   device has an event). "inconsistent", "invalid_weights" and
+ *   "invalid_edges" are fault states.
  * - In every result of compute_stability_score, score, band and the four
  *   deductions are present together exactly when `withheld` is empty. No
  *   withheld result carries N, A or any count, whatever the reason. A page
  *   that shows a count from its own input may show N, and only N, for
- *   below_floor (a count under the floor identifies nobody); never A, crash or
- *   hang counts, which are the individual behaviour the floor withholds, and
- *   never any count for no_population, inconsistent or invalid_weights.
+ *   below_floor; never A, crash or hang counts, which are the individual
+ *   behaviour the floor withholds, and never any count for no_population,
+ *   inconsistent, invalid_weights or invalid_edges.
  * - The string vocabulary is closed and wire-stable: withheld reasons
- *   (no_population, invalid_weights, inconsistent, below_floor), deduction
- *   names (breadth, crashes, hangs, regression) and band labels (excellent,
- *   good, fair, poor). Renaming one is a contract break. `name` and
- *   `withheld` are always string literals (static storage), never owned,
- *   never freed; compare them by content (std::string_view(x) == "...",
- *   strcmp), never by applying == to the raw pointer, which compares addresses.
+ *   (no_population, invalid_weights, invalid_edges, inconsistent,
+ *   below_floor; the Apps list adds offline_affected outside this module), deduction names (breadth, crashes, hangs, regression) and
+ *   band labels (excellent, good, fair, poor). Renaming one is a contract
+ *   break. `name` and `withheld` are always string literals (static storage),
+ *   never owned, never freed; compare them by content (std::string_view(x) ==
+ *   "...", strcmp), never by applying == to the raw pointer, which compares
+ *   addresses.
  * - Identity: 100 - sum(points) equals score, to within a few ulp in floating
  *   point, while the weights sum to at most 100 (each term lies in [0, 1] of
  *   its weight for N below 2^53; above that a term can exceed its weight by one
@@ -139,6 +154,17 @@ inline constexpr double kStabilityRegressionFullRatio = 3.0;
 inline constexpr double kStabilityBandExcellent = 90.0;
 inline constexpr double kStabilityBandGood = 75.0;
 inline constexpr double kStabilityBandFair = 60.0;
+
+/// Lower edges of the top three bands (poor is everything below `fair`).
+/// compute_stability_score refuses unusable edges (stability_edges_valid);
+/// the finer policy rules are in dex_score_policy.hpp.
+struct StabilityBandEdges {
+    double excellent{kStabilityBandExcellent};
+    double good{kStabilityBandGood};
+    double fair{kStabilityBandFair};
+};
+
+inline constexpr StabilityBandEdges kStabilityBandEdges{};
 /// Display resolution: scores are shown at one decimal (10 steps per point).
 inline constexpr double kStabilityScoreScale = 10.0;
 
@@ -147,6 +173,14 @@ inline constexpr double kStabilityScoreScale = 10.0;
     return std::isfinite(w.breadth) && std::isfinite(w.crashes) && std::isfinite(w.hangs) &&
            std::isfinite(w.regression) && w.breadth >= 0.0 && w.crashes >= 0.0 && w.hangs >= 0.0 &&
            w.regression >= 0.0;
+}
+
+/// Edges must lie strictly descending inside (0, 100): 100 > excellent > good >
+/// fair > 0. The chain is false for NaN and +-infinity, so no separate finite
+/// check. The loose structural check only; display exactness and the minimum gap
+/// are the policy validator's (dex_score_policy.hpp).
+[[nodiscard]] inline bool stability_edges_valid(const StabilityBandEdges& e) {
+    return 100.0 > e.excellent && e.excellent > e.good && e.good > e.fair && e.fair > 0.0;
 }
 
 /// The score as displayed: rounded half away from zero at one decimal.
@@ -160,14 +194,17 @@ enum class StabilityBand { Excellent, Good, Fair, Poor };
 
 /// Band of the DISPLAYED score (see stability_display_score). Domain: s in
 /// [0, 100], as returned by compute_stability_score; NaN bands poor and +inf
-/// bands excellent.
-[[nodiscard]] inline StabilityBand stability_band(double score) {
+/// bands excellent. `e` is NOT checked here (this stays a plain band function):
+/// compute_stability_score refuses unusable edges, a direct caller checks
+/// stability_edges_valid first.
+[[nodiscard]] inline StabilityBand stability_band(
+    double score, const StabilityBandEdges& e = kStabilityBandEdges) {
     const double shown = stability_display_score(score);
-    if (shown >= kStabilityBandExcellent)
+    if (shown >= e.excellent)
         return StabilityBand::Excellent;
-    if (shown >= kStabilityBandGood)
+    if (shown >= e.good)
         return StabilityBand::Good;
-    if (shown >= kStabilityBandFair)
+    if (shown >= e.fair)
         return StabilityBand::Fair;
     return StabilityBand::Poor;
 }
@@ -228,10 +265,11 @@ namespace stability_detail {
 } // namespace stability_detail
 
 /// Withheld reasons, checked in this order: no_population, invalid_weights,
-/// inconsistent, below_floor.
+/// invalid_edges, inconsistent, below_floor.
 [[nodiscard]] inline StabilityScore
 compute_stability_score(const StabilityInputs& in, std::int64_t floor,
-                        const StabilityWeights& w = kStabilityWeights) {
+                        const StabilityWeights& w = kStabilityWeights,
+                        const StabilityBandEdges& edges = kStabilityBandEdges) {
     const std::int64_t reporting = in.reporting_devices;
     const std::int64_t affected = in.devices_affected;
     const std::int64_t crash = in.crash_events;
@@ -241,6 +279,8 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
         return stability_detail::withheld_result("no_population");
     if (!stability_weights_valid(w))
         return stability_detail::withheld_result("invalid_weights");
+    if (!stability_edges_valid(edges))
+        return stability_detail::withheld_result("invalid_edges");
     // Overflow-safe: above INT64_MAX / cap every representable count is under
     // affected * cap, so skipping the multiply is exact. After the non-negative
     // checks affected - crash cannot overflow.
@@ -282,7 +322,7 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
         total += d.points;
     const double s = std::clamp(100.0 - total, 0.0, 100.0);
     r.score = s;
-    r.band = stability_band(s);
+    r.band = stability_band(s, edges);
     return r;
 }
 

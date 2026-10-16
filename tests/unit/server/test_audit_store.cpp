@@ -293,6 +293,14 @@ TEST_CASE("AuditStore: open against a fresh template clone", "[pg][audit_store][
     CHECK(store.last_pass_unixtime() == 0);
 }
 
+TEST_CASE("AuditStore: retention_days() reports the constructor-time window",
+          "[pg][audit_store][db][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool, 366);
+    REQUIRE(store.is_open());
+    CHECK(store.retention_days() == 366);
+}
 TEST_CASE("AuditStore: bad-path constructor (unroutable DSN) is closed and fails hard/degrades",
           "[audit_store]") {
     PgPool bad{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
@@ -499,6 +507,43 @@ TEST_CASE("AuditStore: time range filter", "[pg][audit_store]") {
     auto r = store.query(q);
     REQUIRE(r.has_value());
     REQUIRE(r->size() == 3);
+}
+
+TEST_CASE("AuditStore: AuditQuery since and until are presence-tracked and a literal 0 is not the "
+          "unbounded sentinel (#4644)",
+          "[pg][audit_store][since_until]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    for (int64_t ts : {100, 200, 300}) {
+        AuditEvent e = mk("admin", "test");
+        e.timestamp = ts;
+        CHECK(store.log(e));
+    }
+    const auto rows = [&](const AuditQuery& q) {
+        auto r = store.query(q);
+        REQUIRE(r.has_value());
+        return r->size();
+    };
+    AuditQuery none;
+    CHECK_FALSE(none.since.has_value());
+    CHECK_FALSE(none.until.has_value());
+    CHECK(rows(none) == 3);
+    AuditQuery since_zero;
+    since_zero.since = 0; // literal bound at the epoch: every stored timestamp is positive
+    CHECK(rows(since_zero) == 3);
+    AuditQuery until_set;
+    until_set.until = 200; // inclusive upper bound
+    CHECK(rows(until_set) == 2);
+    AuditQuery window;
+    window.since = 200;
+    window.until = 200;
+    CHECK(rows(window) == 1);
+    // Presence, not a sentinel: a literal `until = 0` matches nothing. The REST/MCP edges refuse
+    // it before it can get here; the store must not turn it back into "the whole log".
+    AuditQuery until_zero;
+    until_zero.until = 0;
+    CHECK(rows(until_zero) == 0);
 }
 
 TEST_CASE("AuditStore: non-UTF-8 / embedded-NUL free text is defanged, the write still lands",

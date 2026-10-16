@@ -170,6 +170,18 @@ public:
     [[nodiscard]] virtual std::optional<std::vector<AppPerfTrendPoint>>
     app_fleet_trend(const std::string& app, const std::string& version) const = 0;
 
+    /// GET /api/v1/dex/perf/app and MCP `get_dex_app_perf`: the same trend points
+    /// as `app_fleet_trend` (one shared B2 read and transform, so the two can
+    /// never disagree) PLUS the per-version crash and hang join (`versions`).
+    /// `app_fleet_trend` stays for the dashboard; this is the REST/MCP projection
+    /// of the same resource. TWO bounded reads in sequence (the B2 series, then
+    /// the cross-schema failure read), no lease held across the other. EITHER
+    /// read degrading makes the whole report `nullopt` (the authoritative
+    /// degrade above) — never a 200 with a silently empty `versions`. A request
+    /// for one exact `version` yields a one-row `versions` with no previous.
+    [[nodiscard]] virtual std::optional<AppPerfFleetReport>
+    app_fleet_report(const std::string& app, const std::string& version) const = 0;
+
     /// GET /api/v1/dex/perf/app/devices?app=&version= — the version-row "which
     /// devices" drill. FLOOR-FREE (every row already names an agent_id — see
     /// the routed-concern doc's DEX row): returns the relocated pure
@@ -185,9 +197,8 @@ public:
 
     /// GET /api/v1/dex/perf/group?group_id=&app=&version= — the management-group
     /// trend: the on-the-fly B1 aggregate over the group's members, with
-    /// `kDexCohortFloor` suppression APPLIED INSIDE the impl (a named group is a
-    /// set of specific devices, so a small-N aggregate is de-facto individual
-    /// behaviour — works-council). `nullopt` = the aggregate read failed OR the
+    /// `kDexCohortFloor` suppression APPLIED INSIDE the impl (the one floor
+    /// constant, one device since the 2026-10-14 ruling). `nullopt` = the aggregate read failed OR the
     /// B1 `group_reader_` is unwired OR the group/tag store is unwired OR the
     /// member-resolution read degraded (`ManagementGroupStore::get_members_checked`
     /// returned `nullopt` — store-not-open / pool-acquire-timeout / query-error,

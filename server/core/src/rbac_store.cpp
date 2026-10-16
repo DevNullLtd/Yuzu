@@ -1643,19 +1643,35 @@ bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
 // ── Roles CRUD ───────────────────────────────────────────────────────────────
 
 std::vector<RbacRole> RbacStore::list_roles() const {
-    std::vector<RbacRole> result;
+    return list_roles_checked().value_or(std::vector<RbacRole>{});
+}
+
+std::expected<std::vector<RbacRole>, std::string> RbacStore::list_roles_checked() const {
     if (!open_)
-        return result;
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return result;
+    if (!lease) {
+        // Same degrade observability as list_all_principal_roles_checked: the
+        // fail-soft `list_roles()` callers (the no-admin auditors, the
+        // discover_permissions catalog) now show up in
+        // yuzu_server_rbac_read_degrade_total instead of reading as "no roles".
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("RbacStore::list_roles_checked: pool acquire timed out");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
+    }
     pg::PgResult r = pg::exec_params(
         lease.get(),
         "SELECT name, description, is_system, created_at FROM rbac_store.roles "
         "ORDER BY is_system DESC, name",
         std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK)
-        return result;
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("RbacStore::list_roles_checked: query failed");
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    }
+    std::vector<RbacRole> result;
     for (int i = 0; i < PQntuples(r.get()); ++i) {
         RbacRole role;
         role.name = text_col(r.get(), i, 0);

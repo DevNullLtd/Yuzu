@@ -7,16 +7,19 @@
       "method": "GET",
       "path": "/api/v1/inventory/software/catalogue"
     },
-    "mcp_twin": null,
+    "mcp_twin": "query_software_catalogue",
     "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/fragments/inventory/software/devices",
     "capability_id": "get.fragments-inventory-software-devices",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/inventory/software"
+    },
+    "mcp_twin": "query_installed_software",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -26,7 +29,18 @@
       "method": "GET",
       "path": "/api/v1/inventory/software/catalogue/versions"
     },
-    "mcp_twin": null,
+    "mcp_twin": "get_software_versions",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/inventory/sources",
+    "capability_id": "get.fragments-inventory-sources",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/inventory/tables"
+    },
+    "mcp_twin": "list_inventory_tables",
     "status": "twinned"
   }
 ]

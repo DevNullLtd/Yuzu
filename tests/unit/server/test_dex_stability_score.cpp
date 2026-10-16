@@ -153,7 +153,10 @@ TEST_CASE("stability: rare widespread-mild and half-fleet cases", "[dex][stabili
 
 TEST_CASE("stability: withheld ladder", "[dex][stability]") {
     require_withheld(compute_stability_score(mk(0, -4, 99), kFloor), "no_population");
-    require_withheld(compute_stability_score(mk(9, 1, 1), kFloor), "below_floor");
+    // The module enforces whatever floor it is handed (a literal 10 here); with
+    // kDexCohortFloor at one device a one-device population is scored.
+    require_withheld(compute_stability_score(mk(9, 1, 1), 10), "below_floor");
+    CHECK(compute_stability_score(mk(1, 1, 1), kFloor).score.has_value());
     CHECK(compute_stability_score(mk(10, 1, 1), kFloor).score.has_value());
     require_withheld(compute_stability_score(mk(1000, 1001, 1001), kFloor), "inconsistent");
     require_withheld(compute_stability_score(mk(1000, 0, -1), kFloor), "inconsistent");
@@ -221,6 +224,62 @@ TEST_CASE("stability: weight contract", "[dex][stability]") {
     CHECK(*over.band == StabilityBand::Poor);
     CHECK(over.deductions[0].points == Approx(200.0));
     CHECK(over.deductions[1].points == Approx(20.0));
+}
+
+TEST_CASE("stability: edge contract", "[dex][stability]") {
+    const StabilityInputs ok = mk(1000, 300, 300); // scores 80.8
+    const auto under = [&](const StabilityBandEdges& e,
+                           const StabilityInputs& in = mk(1000, 300, 300),
+                           const StabilityWeights& w = kStabilityWeights) {
+        return compute_stability_score(in, kFloor, w, e);
+    };
+
+    // The default edges are the one-argument path, bit for bit.
+    require_scored(under(kStabilityBandEdges), 80.8, StabilityBand::Good);
+    CHECK(under(kStabilityBandEdges).score == compute_stability_score(ok, kFloor).score);
+    // Unusual but structurally valid edges are scored, never withheld.
+    require_scored(under({99.9, 0.2, 0.1}), 80.8, StabilityBand::Good);
+
+    // Unusable edges are withheld as invalid_edges, never banded.
+    const struct {
+        const char* name;
+        double StabilityBandEdges::*slot;
+    } slots[] = {{"excellent", &StabilityBandEdges::excellent},
+                 {"good", &StabilityBandEdges::good},
+                 {"fair", &StabilityBandEdges::fair}};
+    for (const auto& [name, slot] : slots) {
+        for (const double bad : {kNaN, kInf, -kInf, -1.0}) {
+            INFO(name << " = " << bad);
+            StabilityBandEdges e = kStabilityBandEdges;
+            e.*slot = bad;
+            require_withheld(under(e), "invalid_edges");
+        }
+    }
+    // A failing app (12.0) must not band "excellent" under all-negative edges.
+    require_withheld(under({-5.0, -10.0, -20.0}, mk(1000, 1000, 5000, 5000)), "invalid_edges");
+    // Equal neighbours, unordered, and the ends of the open interval (0, 100).
+    const StabilityBandEdges shapes[] = {{90, 90, 60},  {90, 75, 75},  {75, 75, 75}, {60, 75, 90},
+                                         {100, 75, 60}, {101, 75, 60}, {90, 75, 0}};
+    for (const auto& e : shapes) {
+        INFO("edges " << e.excellent << " / " << e.good << " / " << e.fair);
+        require_withheld(under(e), "invalid_edges");
+    }
+
+    // The public predicate, asserted directly.
+    CHECK(stability_edges_valid(kStabilityBandEdges));
+    CHECK(stability_edges_valid({99.9, 0.2, 0.1}));
+    CHECK_FALSE(stability_edges_valid({100, 75, 60}));
+    CHECK_FALSE(stability_edges_valid({90, 90, 60}));
+    CHECK_FALSE(stability_edges_valid({90, 75, 0}));
+    CHECK_FALSE(stability_edges_valid({90, kNaN, 60}));
+    CHECK_FALSE(stability_edges_valid({60, 75, 90}));
+
+    // Precedence: after no_population and invalid_weights, before inconsistent and below_floor.
+    const StabilityBandEdges bad{60, 75, 90};
+    require_withheld(under(bad, mk(0, 0, 0)), "no_population");
+    require_withheld(under(bad, ok, {kNaN, 20, 8, 12}), "invalid_weights");
+    require_withheld(under(bad, mk(1000, 1001, 1001)), "invalid_edges");
+    require_withheld(under(bad, mk(5, 1, 1)), "invalid_edges");
 }
 
 TEST_CASE("stability: near-maximum finite weights give finite rows at ordinary cohort size",
@@ -446,10 +505,16 @@ TEST_CASE("stability: rank flip under perturbed weights", "[dex][stability]") {
     REQUIRE(s5.has_value());
     CHECK(s5->first == 0);
     CHECK(s5->second == 1);
+    // At kDexCohortFloor (one device) the 5-device app is comparable too, so the
+    // flip is the same pair as at floor 5 (it was (1, 2) at the old floor of 10).
     auto sf = stability_rank_flip({small, x, y}, kFloor, pert);
     REQUIRE(sf.has_value());
-    CHECK(sf->first == 1);
-    CHECK(sf->second == 2);
+    CHECK(sf->first == 0);
+    CHECK(sf->second == 1);
+    auto s10 = stability_rank_flip({small, x, y}, 10, pert); // a handed-in floor still applies
+    REQUIRE(s10.has_value());
+    CHECK(s10->first == 1);
+    CHECK(s10->second == 2);
 
     CHECK_FALSE(stability_rank_flip({x, y}, kFloor, {kNaN, 70, 8, 12}).has_value());
 

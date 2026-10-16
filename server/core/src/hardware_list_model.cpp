@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <limits>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -285,9 +287,66 @@ bool hw_row_matches(const InventoryDeviceRow& row, const std::vector<std::string
     return true;
 }
 
+std::optional<double> median_ram_gb(const std::vector<InventoryDeviceRow>& rows,
+                                    std::size_t* count) {
+    std::vector<double> gb;
+    for (const auto& r : rows) {
+        const std::string& s = r.ci_ram_bytes;
+        if (is_blank_sentinel(s) || s.size() > 18 ||
+            !std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+            continue;
+        const double bytes = std::stod(s);
+        if (bytes > 0)
+            gb.push_back(bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+    if (count)
+        *count = gb.size();
+    if (gb.empty())
+        return std::nullopt;
+    std::sort(gb.begin(), gb.end());
+    const std::size_t mid = gb.size() / 2;
+    return gb.size() % 2 ? gb[mid] : (gb[mid - 1] + gb[mid]) / 2.0;
+}
+
+std::vector<std::pair<std::string, std::size_t>>
+count_by_manufacturer(const std::vector<InventoryDeviceRow>& rows, std::size_t top_n) {
+    std::vector<std::pair<std::string, std::size_t>> counts; // folded key -> count; first spelling kept
+    std::vector<std::string> keys;
+    for (const auto& r : rows) {
+        std::string m = r.ci_manufacturer;
+        const auto b = m.find_first_not_of(" \t");
+        if (b == std::string::npos)
+            continue;
+        m = m.substr(b, m.find_last_not_of(" \t") - b + 1);
+        if (is_blank_sentinel(m))
+            continue;
+        const std::string key = to_lower_ascii(m);
+        const auto it = std::find(keys.begin(), keys.end(), key);
+        if (it == keys.end()) {
+            keys.push_back(key);
+            counts.emplace_back(m, 1);
+        } else {
+            ++counts[static_cast<std::size_t>(it - keys.begin())].second;
+        }
+    }
+    std::stable_sort(counts.begin(), counts.end(), [](const auto& a, const auto& b) {
+        return a.second != b.second ? a.second > b.second : a.first < b.first;
+    });
+    if (counts.size() > top_n) {
+        std::size_t other = 0;
+        for (std::size_t i = top_n; i < counts.size(); ++i)
+            other += counts[i].second;
+        counts.resize(top_n);
+        counts.emplace_back("Other", other);
+    }
+    return counts;
+}
+
 HardwareKpis hardware_kpis(const std::vector<InventoryDeviceRow>& roster) {
     HardwareKpis k;
     k.total = roster.size();
+    k.median_ram_gb = median_ram_gb(roster, &k.ram_devices);
+    k.by_manufacturer = count_by_manufacturer(roster);
     for (const auto& row : roster) {
         if (row.online)
             ++k.online;
@@ -527,6 +586,8 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
         out["last_seen"] = nullptr;
     }
 
+    out["identity_state"] = detail.identity ? "found" : detail.identity_degraded ? "degraded" : "absent";
+
     if (!detail.ci.has_value()) {
         out["ci"] = nullptr;
         out["ci_state"] = "degraded";
@@ -577,6 +638,64 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
     out["software_last_seen"] =
         detail.software_last_seen ? nlohmann::json(*detail.software_last_seen) : nullptr;
     return out;
+}
+
+bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps) {
+    if (eps)
+        return true;
+    result.roster_degraded = true; // unread, not empty
+    result.ci_degraded = true;
+    result.tags_degraded = true;
+    return false;
+}
+
+void apply_tag_read(InventoryDevicesResult& result,
+                    const std::expected<std::vector<std::string>, TagReadError>& keys,
+                    const TagValuesReader& read_values) {
+    if (!keys) {
+        result.tags_degraded = true; // unread keys, not "no keys"
+        return;
+    }
+    const auto values = read_values(*keys);
+    if (!values) {
+        result.tags_degraded = true;
+        return;
+    }
+    for (auto& r : result.rows)
+        if (const auto it = values->find(r.agent_id); it != values->end())
+            r.tags.assign(it->second.begin(), it->second.end());
+}
+
+std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
+offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, std::int64_t now_ms,
+                     std::string (*human_age)(std::int64_t)) {
+    if (!eps)
+        return std::unexpected(eps.error());
+    for (const auto& e : *eps) {
+        if (e.agent_id != agent_id)
+            continue;
+        InventoryDeviceRow r;
+        r.agent_id = e.agent_id;
+        r.hostname = e.hostname;
+        r.os = e.os;
+        r.agent_version = e.agent_version;
+        r.arch = e.arch;
+        r.online = false;
+        const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
+        r.stale = age_ms > kHardwareStaleAfterMs;
+        r.last_seen = human_age(age_ms);
+        r.last_seen_ms = e.last_heartbeat_ms;
+        return std::optional<InventoryDeviceRow>{std::move(r)};
+    }
+    return std::optional<InventoryDeviceRow>{};
+}
+
+void apply_identity_read(HardwareCiDetail& detail,
+                         std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> ident) {
+    if (ident)
+        detail.identity = std::move(*ident);
+    else
+        detail.identity_degraded = true;
 }
 
 } // namespace yuzu::server

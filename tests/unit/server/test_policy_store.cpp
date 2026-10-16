@@ -1007,6 +1007,144 @@ TEST_CASE("PolicyStore: fleet compliance cache is invalidated on the store's "
     CHECK(fc2->non_compliant == 1);
 }
 
+TEST_CASE("PolicyStore: compliance_by_policy_checked groups per policy, agrees with "
+          "get_compliance_summary, and is cached until a store write",
+          "[policy_store][pg][compliance]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto p1 = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(p1.has_value());
+    auto p2 = store.create_policy(make_policy_yaml(frag.value(), "second-policy"));
+    REQUIRE(p2.has_value());
+
+    REQUIRE(store.update_agent_status(p1.value(), "a1", "compliant").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a2", "non_compliant").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a3", "compliant").has_value());
+    REQUIRE(store.update_agent_status(p2.value(), "a1", "error").has_value());
+
+    auto by = store.compliance_by_policy_checked();
+    REQUIRE(by.has_value());
+    REQUIRE(by->size() == 2);
+    for (const auto& row : *by) {
+        auto one = store.get_compliance_summary(row.policy_id);
+        REQUIRE(one.has_value());
+        CHECK(row.compliant == one->compliant);
+        CHECK(row.non_compliant == one->non_compliant);
+        CHECK(row.error == one->error);
+        CHECK(row.total == one->total);
+    }
+    const auto& first = (*by)[0].policy_id == p1.value() ? (*by)[0] : (*by)[1];
+    CHECK(first.compliant == 2);
+    CHECK(first.non_compliant == 1);
+    CHECK(first.total == 3);
+
+    // Cached: a write that bypasses the store (no invalidation hook) is not seen.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(static_cast<bool>(lease));
+        PgResult r{PQexec(lease.get(),
+                          "UPDATE policy_store.policy_status SET status = 'non_compliant' "
+                          "WHERE agent_id = 'a1' AND status = 'compliant'")};
+        REQUIRE(r.ok());
+    }
+    auto cached = store.compliance_by_policy_checked();
+    REQUIRE(cached.has_value());
+    for (const auto& row : *cached)
+        if (row.policy_id == p1.value())
+            CHECK(row.compliant == 2);
+
+    // The store's own write drops the cache.
+    REQUIRE(store.update_agent_status(p2.value(), "a9", "compliant").has_value());
+    auto fresh = store.compliance_by_policy_checked();
+    REQUIRE(fresh.has_value());
+    for (const auto& row : *fresh)
+        if (row.policy_id == p1.value())
+            CHECK(row.compliant == 1);
+}
+
+TEST_CASE("PolicyStore: compliance_by_policy_checked shape, all five statuses, and 60 s expiry",
+          "[policy_store][pg][compliance]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+
+    // No status rows at all: an empty success, not an error.
+    auto none = store.compliance_by_policy_checked();
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto p1 = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(p1.has_value());
+    auto p2 = store.create_policy(make_policy_yaml(frag.value(), "second-policy"));
+    REQUIRE(p2.has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a1", "compliant").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a2", "non_compliant").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a3", "unknown").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a4", "fixing").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a5", "error").has_value());
+    REQUIRE(store.update_agent_status(p2.value(), "a1", "compliant").has_value());
+
+    auto fake_now = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    store.set_cache_clock_for_test([&fake_now] { return fake_now; });
+
+    auto by = store.compliance_by_policy_checked();
+    REQUIRE(by.has_value());
+    REQUIRE(by->size() == 2);
+    CHECK((*by)[0].policy_id < (*by)[1].policy_id); // ordered by policy_id
+    for (const auto& row : *by) {
+        if (row.policy_id != p1.value())
+            continue;
+        CHECK(row.compliant == 1);
+        CHECK(row.non_compliant == 1);
+        CHECK(row.unknown == 1);
+        CHECK(row.fixing == 1);
+        CHECK(row.error == 1);
+        CHECK(row.total == 5);
+    }
+
+    // Bypass the store's own write hook, then step the injected clock.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(static_cast<bool>(lease));
+        PgResult r{PQexec(lease.get(),
+                          "UPDATE policy_store.policy_status SET status = 'non_compliant' "
+                          "WHERE agent_id = 'a1' AND status = 'compliant'")};
+        REQUIRE(r.ok());
+    }
+    auto count_compliant = [&](const std::vector<yuzu::server::ComplianceSummary>& v) {
+        std::int64_t n = 0;
+        for (const auto& row : v)
+            n += row.compliant;
+        return n;
+    };
+    fake_now += std::chrono::seconds(59);
+    auto at59 = store.compliance_by_policy_checked();
+    REQUIRE(at59.has_value());
+    CHECK(count_compliant(*at59) == 2); // still the cached value
+    fake_now += std::chrono::seconds(1);
+    auto at60 = store.compliance_by_policy_checked();
+    REQUIRE(at60.has_value());
+    CHECK(count_compliant(*at60) == 0); // expired: recomputed
+}
+
+TEST_CASE("PolicyStore: compliance_by_policy_checked is kDegraded on a closed store, "
+          "never an empty list",
+          "[policy_store]") {
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    PolicyStore store{pool};
+    auto by = store.compliance_by_policy_checked();
+    REQUIRE_FALSE(by.has_value());
+    CHECK(by.error() == yuzu::server::PolicyReadError::kDegraded);
+}
+
 TEST_CASE("PolicyStore: get policy agent statuses", "[policy_store][pg][compliance]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1757,4 +1895,45 @@ TEST_CASE("update_agent_status with expected_gen is a fenced write: the owning g
     REQUIRE(s3.has_value());
     REQUIRE(s3->has_value());
     CHECK((*s3)->status == "compliant");
+}
+
+// ============================================================================
+// Explicit ids at creation: [A-Za-z0-9._-]{1,128}, not dot-only (new records only)
+// ============================================================================
+
+namespace {
+std::string with_id_line(const std::string& yaml, const std::string& id) {
+    // Insert `id: <id>` after the `kind:` line (extract_yaml_value reads the first `id:`).
+    const auto kind_end = yaml.find('\n', yaml.find("kind:"));
+    return yaml.substr(0, kind_end + 1) + "id: " + id + "\n" + yaml.substr(kind_end + 1);
+}
+} // namespace
+
+TEST_CASE("PolicyStore: an explicit policy or fragment id must be a safe path segment",
+          "[policy_store][pg][policy][fragment][url_path_segment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+
+    const std::vector<std::string> bad = {"..", ".", "a/b", "../x", "a?b", "a b",
+                                          "a%2Fb", "x\"y", std::string(129, 'a')};
+    for (const auto& id : bad) {
+        INFO("id=" << id);
+        auto p = store.create_policy(with_id_line(make_policy_yaml(frag.value()), id));
+        CHECK_FALSE(p.has_value());
+        auto f = store.create_fragment(with_id_line(kCheckOnlyFragment, id));
+        CHECK_FALSE(f.has_value());
+    }
+
+    // Generated ids and ordinary explicit ids still work, including dots/underscores/dashes.
+    const std::vector<std::string> good = {"pol-1", "my.policy_v2", "a..b", std::string(128, 'a')};
+    for (const auto& id : good) {
+        INFO("id=" << id);
+        auto p = store.create_policy(with_id_line(make_policy_yaml(frag.value()), id));
+        REQUIRE(p.has_value());
+        CHECK(p.value() == id);
+    }
+    CHECK(store.create_policy(make_policy_yaml(frag.value())).has_value());
 }

@@ -1,15 +1,18 @@
 #include "dex_read_builders.hpp" // the store-reaching build_dex_*_model_* (defined here); dex_device_app_perf_json has since moved to dex_app_perf_model.cpp
 #include "dex_read_model.hpp"
 
+#include "dex_json_detail.hpp"
 #include "dex_window.hpp" // dex_normalize_os_filter (PURE) -- replaces the dropped dex_routes.hpp
 #include "guaranteed_state_store.hpp" // GuaranteedStateStore methods -- no longer transitive via dex_read_model.hpp
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <cstdint>
+#include <map>
 
 namespace yuzu::server {
 
@@ -174,25 +177,185 @@ std::string dex_app_json(const DexAppModel& model, bool audit_persisted) {
 
 // ── New twin #2: app-centric stability list ──────────────────────────────────
 
-DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string& window,
-                                  const std::string& since) {
+namespace {
+
+DexStabilityFigures apps_figures(const DexAppStabilityRow& r, std::optional<int64_t> population,
+                                 const DexEffectivePolicy& eff) {
+    // Counts are window-wide; share, rate and score use the online-device
+    // figures only, so numerator and denominator are one population.
+    const int64_t affected = r.affected_online;
+    const int64_t events = r.crashes_online + r.hangs_online;
+    DexStabilityFigures f;
+    f.crashes = r.crashes;
+    f.hangs = r.hangs;
+    f.distinct_devices = r.affected_devices;
+    if (population)
+        f.distinct_devices_online = affected;
+    f.last_seen = r.last_seen;
+    // An unknown or zero population nulls both share and rate. affected >
+    // population cannot happen when the numerator is drawn from the
+    // population's own ids; if a caller breaks that, the share is withheld
+    // and the score reads `inconsistent`. A refusal, not a failure.
+    if (population && *population > 0 && affected >= 0 && affected <= *population) {
+        f.share_affected = dex_proportion(affected, *population);
+        if (events >= 0)
+            f.rate_per_1000 = dex_rate(events, static_cast<double>(*population) / 1000.0);
+    }
+    StabilityInputs in;
+    in.reporting_devices = population.value_or(0);
+    in.devices_affected = affected;
+    in.crash_events = r.capped_crashes;
+    in.hang_events = r.capped_hangs;
+    // The one cohort floor (one device, maintainer ruling 2026-10-14): every
+    // figure is published at any device count; reporting <= 0 withholds
+    // no_population. The regression term is not assessed here (no sampled
+    // exposure per version). kDexCohortFloor rather than 0 on purpose: at one
+    // device below_floor is unreachable here (no_population is checked first),
+    // and any later floor change reaches this read through the one constant.
+    f.score = dex_score_under_policy(in, kDexCohortFloor, eff);
+    // The score is built from the online devices only. When any affected device
+    // is not online the evidence is incomplete: an application that crashes and
+    // takes its devices offline would read 100. Withhold rather than publish a
+    // healthy-looking score; the share and rate stay (they state their
+    // population) and `distinct_devices` vs `distinct_devices_online` show the gap.
+    if (f.score.score && r.affected_devices > affected)
+        f.score = stability_detail::withheld_result("offline_affected");
+    return f;
+}
+
+json interval_or_null(const std::optional<DexInterval>& i) {
+    return i ? dex_json_detail::interval_json(*i, false) : json(nullptr);
+}
+
+json figures_json(const DexStabilityFigures& f) {
+    json deductions = json::array();
+    for (const auto& d : f.score.deductions)
+        deductions.push_back({{"name", d.name}, {"points", d.points}, {"assessed", d.assessed}});
+    json score{{"score", f.score.score ? json(stability_display_score(*f.score.score)) : json(nullptr)},
+               {"band", f.score.band ? json(stability_band_label(*f.score.band)) : json(nullptr)},
+               {"withheld", f.score.withheld[0] ? json(f.score.withheld) : json(nullptr)},
+               {"deductions", std::move(deductions)}};
+    return {{"crashes", f.crashes},
+            {"hangs", f.hangs},
+            {"distinct_devices", f.distinct_devices},
+            {"distinct_devices_online",
+             f.distinct_devices_online ? json(*f.distinct_devices_online) : json(nullptr)},
+            {"last_seen", f.last_seen},
+            {"share_affected", interval_or_null(f.share_affected)},
+            {"rate_per_1000", interval_or_null(f.rate_per_1000)},
+            {"score", std::move(score)}};
+}
+
+} // namespace
+
+DexAppsModel dex_apps_model_from_rows(const std::string& window,
+                                      const std::vector<DexAppStabilityRow>& rows,
+                                      std::optional<int64_t> population, const DexScorePolicy& policy) {
     DexAppsModel m;
     m.window = window;
-    if (store)
-        m.apps = store->dex_top_apps(since, 100);
+    m.population = population;
+    std::map<std::string, std::size_t> index; // subject -> position in m.apps
+    // Totals first, so a version row seen before its total still finds its app.
+    for (const auto& r : rows) {
+        if (r.version)
+            continue;
+        const DexEffectivePolicy eff = resolve_dex_score_policy(policy, r.subject);
+        DexAppStability a;
+        a.subject = r.subject;
+        a.figures = apps_figures(r, population, eff);
+        a.version_count = r.version_count;
+        m.apps_total = std::max(m.apps_total, r.apps_total);
+        a.versions_truncated = r.version_count > kDexAppsVersionCap;
+        index[a.subject] = m.apps.size();
+        m.apps.push_back(std::move(a));
+    }
+    for (const auto& r : rows) {
+        if (!r.version)
+            continue;
+        const auto it = index.find(r.subject);
+        if (it == index.end())
+            continue;
+        const DexEffectivePolicy eff = resolve_dex_score_policy(policy, r.subject);
+        DexAppVersionStability v;
+        v.version = *r.version;
+        v.figures = apps_figures(r, population, eff);
+        m.apps[it->second].versions.push_back(std::move(v));
+    }
+    m.apps_truncated = m.apps_total > static_cast<int64_t>(m.apps.size());
+    std::stable_sort(m.apps.begin(), m.apps.end(), [](const DexAppStability& x, const DexAppStability& y) {
+        const int64_t ax = x.figures.crashes + x.figures.hangs;
+        const int64_t ay = y.figures.crashes + y.figures.hangs;
+        if (ax != ay)
+            return ax > ay;
+        return x.subject < y.subject;
+    });
+    for (auto& a : m.apps)
+        std::stable_sort(a.versions.begin(), a.versions.end(),
+                         [](const DexAppVersionStability& x, const DexAppVersionStability& y) {
+                             if (x.figures.distinct_devices != y.figures.distinct_devices)
+                                 return x.figures.distinct_devices > y.figures.distinct_devices;
+                             return x.version < y.version;
+                         });
     return m;
 }
 
+DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string& window,
+                                  const std::string& since,
+                                  const std::optional<std::vector<std::string>>& online_windows,
+                                  const DexScorePolicy& policy) {
+    DexAppsModel m;
+    m.window = window;
+    // A score under an invalid policy is never published: the resolver requires
+    // a policy that passed dex_score_policy_fault.
+    if (const auto f = dex_score_policy_fault(policy)) {
+        spdlog::warn("build_dex_apps_model: score policy rejected: {}", dex_policy_fault_label(f->fault));
+        m.degraded = true;
+        return m;
+    }
+    if (!store) {
+        m.degraded = true;
+        return m;
+    }
+    // Windows-scoped, and the share numerators drawn from the same online ids
+    // whose count is the population.
+    static const std::vector<std::string> kNoIds;
+    const auto rows = store->dex_app_stability_checked(since, "windows", kDexAppsLimit, kDexAppsVersionCap,
+                                                       kStabilityPerDeviceEventCap,
+                                                       online_windows ? *online_windows : kNoIds);
+    if (!rows) {
+        m.degraded = true;
+        return m;
+    }
+    return dex_apps_model_from_rows(
+        window, *rows,
+        online_windows ? std::optional<int64_t>{static_cast<int64_t>(online_windows->size())}
+                       : std::nullopt,
+        policy);
+}
+
 std::string dex_apps_json(const DexAppsModel& model) {
+    assert(!model.degraded && "a degraded Apps model must be refused by the caller, never serialised");
     json arr = json::array();
-    for (const auto& a : model.apps)
-        arr.push_back({{"subject", a.subject},
-                       {"crashes", a.crashes},
-                       {"hangs", a.hangs},
-                       {"distinct_devices", a.distinct_devices},
-                       {"last_seen", a.last_seen}});
+    for (const auto& a : model.apps) {
+        json o = figures_json(a.figures);
+        json versions = json::array();
+        for (const auto& v : a.versions) {
+            json vo = figures_json(v.figures);
+            vo["version"] = v.version;
+            versions.push_back(std::move(vo));
+        }
+        o["subject"] = a.subject;
+        o["versions"] = std::move(versions);
+        o["version_count"] = a.version_count;
+        o["versions_truncated"] = a.versions_truncated;
+        arr.push_back(std::move(o));
+    }
     json out{{"window", model.window}};
     out["apps"] = std::move(arr);
+    out["apps_total"] = model.apps_total;
+    out["apps_truncated"] = model.apps_truncated;
+    out["population"] = model.population ? json(*model.population) : json(nullptr);
+    out["population_basis"] = kDexAppsPopulationBasis;
     return out.dump();
 }
 

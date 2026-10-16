@@ -43,7 +43,7 @@
 /// is likewise called from its existing free-function home in
 /// `web_utils.hpp`, unchanged.
 ///
-/// Routes (2) — gate in parens:
+/// Routes (3) — gate in parens:
 ///   GET  /fragments/instructions               (deny_service_scoped_fn
 ///                                                 "instructions.fragment.access_denied",
 ///                                                 THEN auth_fn — the role
@@ -51,6 +51,11 @@
 ///                                                 body gates only the
 ///                                                 New/Edit buttons, not the
 ///                                                 list itself)
+///   GET  /fragments/instructions/templates     (probe_perm_fn
+///                                                 InstructionDefinition:Read,
+///                                                 a denial answers HTTP 200
+///                                                 with a data-denied note;
+///                                                 perm_fn when no probe is wired)
 ///   POST /fragments/instructions/yaml-preview   (perm_fn
 ///                                                 InstructionDefinition:Read)
 ///
@@ -95,8 +100,15 @@ struct Deps {
                            const std::string& message, const std::string& target_type,
                            const std::string& target_id)>;
 
+    /// Render-time capability probe: true when the caller holds
+    /// `securable:op`. Unwired means "cannot decide" -- the list fragment then
+    /// renders neither the approval column nor the sets panel.
+    using ProbePermFn =
+        std::function<bool(const httplib::Request&, const std::string&, const std::string&)>;
+
     AuthFn auth_fn;
     PermFn perm_fn;
+    ProbePermFn probe_perm_fn;
     DenyServiceScopedFn deny_service_scoped_fn;
     /// `ServerImpl::instruction_store_`. Null, or a genuine DB error on
     /// `query_definitions()`, both degrade the list fragment to "Not

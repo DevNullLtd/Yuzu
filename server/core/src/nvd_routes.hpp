@@ -9,12 +9,15 @@
 /// `deps.perm_fn`), and member accesses (`nvd_db_.` -> `deps.nvd_db->`,
 /// `nvd_sync_.` -> `deps.nvd_sync->`).
 ///
-/// Routes (3) — gate in parens, no route here uses auth_fn:
-///   GET  /api/nvd/status   (perm_fn Infrastructure:Read)
-///   POST /api/nvd/sync     (perm_fn Infrastructure:Execute)
-///   POST /api/nvd/match    (perm_fn Infrastructure:Read)
+/// Routes (4) — gate in parens, no route here uses auth_fn:
+///   GET  /api/nvd/status         (perm_fn Infrastructure:Read)
+///   POST /api/nvd/sync           (perm_fn Infrastructure:Execute; audited nvd.sync.request)
+///   POST /api/nvd/match          (perm_fn Infrastructure:Read)
+///   GET  /fragments/auto/nvd     (perm_fn Infrastructure:Read; status card over the SAME
+///                                 status JSON as /api/nvd/status, so they cannot disagree)
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <string>
@@ -33,12 +36,26 @@ struct Deps {
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                        const std::string&, const std::string&)>;
 
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
+                                       const std::string& result, const std::string& target_type,
+                                       const std::string& target_id, const std::string& detail)>;
+
     PermFn perm_fn; // no route in this group uses auth_fn
+    AuditFn audit_fn; // server.cpp's hoisted audit closure; null = audit-off (tests)
     NvdDatabase* nvd_db{nullptr};
     NvdSyncManager* nvd_sync{nullptr};
 };
 
-/// Register all 3 NVD CVE-feed routes against `sink`.
+/// The status object `GET /api/nvd/status` serves: `{"enabled":false}` when the catalog DB
+/// is closed, otherwise enabled / total_cves and (when sync exists) the sync fields. Shared
+/// with the status fragment so the two surfaces cannot drift.
+nlohmann::json status_json(const NvdDatabase* db, const NvdSyncManager* sync);
+
+/// PURE: the status card over `status_json`. Every dynamic string is escaped and the sync
+/// error is length-capped.
+std::string render_nvd_status(const nlohmann::json& status);
+
+/// Register all 4 NVD CVE-feed routes against `sink`.
 void register_nvd_routes(HttpRouteSink& sink, Deps deps);
 
 } // namespace yuzu::server::nvd

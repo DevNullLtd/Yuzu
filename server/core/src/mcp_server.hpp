@@ -26,6 +26,8 @@
 // fully defined, so no separate include is needed for that.
 #include "file_retrieval_routes.hpp"
 #include "dex_perf_model.hpp"
+#include "discovered_devices_model.hpp" // list_discovered_devices read seam (DiscoveredDevicesReadFn)
+#include "software_sync_runner.hpp"      // sync_hardware_software: the shared fleet-run (Runner)
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
@@ -114,6 +116,10 @@ class PluginConfigStore;
 // handler, which is the same shape). Forward-declared (pointer-only in the
 // setter below); the .cpp includes preflight_run_store.hpp for the definition.
 class PreflightRunStore;
+// Read-only deployment list/detail (list_deployments / get_deployment). Forward-declared
+// (pointer-only in the setter below); the .cpp includes deployment_routes.hpp, which pulls in
+// the store definition and the shared JSON builders.
+class DeploymentRunStore;
 // #2146 Batch B1 — backs get_guardian_device_compliance (the SAME BaselineStore
 // GET /guaranteed-state/device-compliance already reads). Forward-declared
 // (pointer-only in the setter below); the .cpp includes baseline_store.hpp for
@@ -520,6 +526,19 @@ public:
     /// both tools answer "unavailable" rather than crashing.
     void set_preflight_run_store(PreflightRunStore* store) { preflight_run_store_ = store; }
 
+    /// The deployment run store, backing `list_deployments` and `get_deployment`
+    /// (mirror GET /api/v1/deployments[/{id}], owner-scoped, read-only). Unset
+    /// (`nullptr`, the default) => both tools answer "unavailable". This is the live
+    /// `/auto` engine's store, NOT the dormant `SoftwareDeploymentStore`.
+    void set_deployment_run_store(DeploymentRunStore* store) { deployment_run_store_ = store; }
+    /// Network discovery read seam, backing `list_discovered_devices` (mirrors
+    /// GET /api/v1/network/discovered-devices; same shared builders). A
+    /// function rather than a store so tests inject fixtures. Unset (empty,
+    /// the default) => the tool answers "unavailable" rather than crashing.
+    void set_discovered_devices_reader(DiscoveredDevicesReadFn reader) {
+        discovered_devices_reader_ = std::move(reader);
+    }
+
     /// #2146 Batch B2 — the scope-walking result-set store, backing the 12
     /// result-set MCP tools (`list_result_sets` through `delete_result_set`).
     /// Same setter idiom as `set_preflight_run_store` above. Unset
@@ -544,19 +563,19 @@ public:
     /// #2146 Batch B3 — the fleet-visualization store trio backing
     /// `get_fleet_topology`/`get_host_topology` (mirrors GET
     /// /api/v1/viz/fleet/topology and GET /api/v1/viz/host/{id}/topology).
-    /// Same setter idiom as `set_preflight_run_store` above. `offline_store`
-    /// may be null (offline hosts are then not stale-flagged, matching
-    /// `VizRoutes`' own null-offline-store legacy behavior); `kill_switch`
+    /// Same setter idiom as `set_preflight_run_store` above. `offline_roster_fn`
+    /// may be empty (an unwired roster: offline hosts are then not
+    /// merged and the topology is live-only, with no degraded flag); `kill_switch`
     /// may be null (then the viz kill switch is never consulted on the MCP
     /// path — production MUST wire the same `--viz-disable` /
     /// `yuzu_viz_disabled` atomic the REST `VizRoutes` registration uses, or
     /// disabling the feature would silently leave the MCP twins reachable).
     /// Unset `fleet_topology_store` (`nullptr`, the default) ⇒ both tools
     /// answer "unavailable" rather than crashing.
-    void set_viz_deps(FleetTopologyStore* fleet_topology_store, OfflineEndpointStore* offline_store,
+    void set_viz_deps(FleetTopologyStore* fleet_topology_store, OfflineRosterFn offline_roster_fn,
                       const std::atomic<bool>* kill_switch) {
         fleet_topology_store_ = fleet_topology_store;
-        offline_endpoint_store_ = offline_store;
+        offline_roster_fn_ = std::move(offline_roster_fn);
         viz_kill_switch_ = kill_switch;
     }
 
@@ -635,6 +654,13 @@ public:
     /// always wires this; the unwired path is a test-only affordance).
     using GuardianPushFn = std::function<int(const std::string& scope, bool full_sync)>;
     void set_guardian_push_fn(GuardianPushFn fn) { guardian_push_fn_ = std::move(fn); }
+
+    /// The fleet "Sync now" run behind `sync_hardware_software` - the SAME instance
+    /// `POST /api/v1/hardware/sync` uses, so the per-operator cooldown and the single in-flight
+    /// slot bind both surfaces. Wired once before register_routes (permanent when unset).
+    void set_software_sync_runner(std::shared_ptr<software_sync::Runner> runner) {
+        software_sync_runner_ = std::move(runner);
+    }
 
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
     /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_tar_process_
@@ -739,12 +765,13 @@ public:
 
     /// ADR-0031 WS-A4 (eighth family): the SAME in-process workflow-read API
     /// seam the REST `GET /api/v1/workflows[/{id}]` and
-    /// `GET /api/v1/workflow-executions/{id}` handlers use — server.cpp
+    /// `GET /api/v1/workflow-executions[/{id}]` handlers use — server.cpp
     /// wires the IDENTICAL instance so `list_workflows`/`get_workflow`/
-    /// `get_workflow_execution` can never disagree with REST v1.
+    /// `get_workflow_execution`/`list_workflow_executions` can never
+    /// disagree with REST v1.
     /// A SETTER, not a `build_handler` parameter — mirrors `set_schedule_api`
     /// above: `build_handler`'s own `WorkflowEngine* workflow_engine`
-    /// parameter is now unused inside these three tool bodies (superseded by
+    /// parameter is now unused inside these tool bodies (superseded by
     /// this seam) but is kept, unremoved, for constructor-signature
     /// stability — a bounded, disclosed, deferred follow-up, not an
     /// oversight (matrix doc, `workflow` family row). Unset (default-
@@ -1202,6 +1229,8 @@ private:
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
     PreflightRunStore* preflight_run_store_{nullptr};
+    DeploymentRunStore* deployment_run_store_{nullptr};
+    DiscoveredDevicesReadFn discovered_devices_reader_;
     // #2146 Batch B2 — see set_result_set_store above.
     ResultSetStore* result_set_store_{nullptr};
     // #4981 PR-2 — see set_scope_evaluate_fn above.
@@ -1210,9 +1239,10 @@ private:
     BaselineStore* baseline_store_{nullptr};
     // #2146 Batch B1 — see set_guardian_push_fn above.
     GuardianPushFn guardian_push_fn_;
+    std::shared_ptr<software_sync::Runner> software_sync_runner_;
     // #2146 Batch B3 — see set_viz_deps above.
     FleetTopologyStore* fleet_topology_store_{nullptr};
-    OfflineEndpointStore* offline_endpoint_store_{nullptr};
+    yuzu::server::OfflineRosterFn offline_roster_fn_;
     const std::atomic<bool>* viz_kill_switch_{nullptr};
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;

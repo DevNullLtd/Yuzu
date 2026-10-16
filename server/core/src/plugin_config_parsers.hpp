@@ -3,7 +3,8 @@
 /// @file plugin_config_parsers.hpp
 /// PURE parsing/validation for the plugin config/secret plane + kill switch
 /// (PR1.5b). Zero includes of any store, httplib, or pg header — this file
-/// depends on nothing but the standard library, so `plugin_config_store.cpp`
+/// depends on nothing but the standard library and the pure
+/// `yuzu/protective_actions.hpp` list, so `plugin_config_store.cpp`
 /// and `plugin_config_routes.cpp` share exactly ONE grammar/validation
 /// definition instead of two drifting copies (the class of bug #1647 exists
 /// to prevent for audit helpers; the same reasoning applies to key grammar).
@@ -32,6 +33,8 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+
+#include <yuzu/protective_actions.hpp>
 
 namespace yuzu::server::plugin_config {
 
@@ -192,10 +195,12 @@ struct KillSwitchScope {
 /// never a dotted key — it names one REST/MCP action, not a nested config
 /// path). The reserved-namespace allowance is scoped to the kill-switch
 /// grammar only: it lets a `system_reserved` dispatch capability such as
-/// `__guard__.push_rules` be explicitly kill-switched (or left alone, which
-/// must mean "not killed" — see `PluginConfigStore::action_allowed`'s
-/// no-row default), and does NOT extend to `is_valid_identifier`/
-/// `parse_plugin_key`, which continue to gate ordinary config/secret rows.
+/// `__guard__.push_rules` have a kill-switch row addressed and stored (or left
+/// alone, which must mean "not killed" — see `PluginConfigStore::action_allowed`'s
+/// no-row default). That pair is PROTECTIVE (`yuzu/protective_actions.hpp`): a
+/// stored row is accepted and displayed but never refuses the push. It does NOT
+/// extend to `is_valid_identifier`/`parse_plugin_key`, which continue to gate
+/// ordinary config/secret rows.
 [[nodiscard]] inline std::optional<KillSwitchScope>
 parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw,
                         std::string_view os_raw = "") {
@@ -218,6 +223,33 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
     if (!scope.os.empty())
         key += "@" + scope.os;
     return key;
+}
+
+/// True iff a kill-switch row at `scope` (any OS layer) covers a protective
+/// action (`yuzu/protective_actions.hpp`): an action-level row for a protective
+/// pair, or a plugin-level row for a plugin that owns protective actions. Such
+/// a row never stops the protective actions and still gates any non-protective
+/// action the plugin declares (none today: `quarantine` declares exactly the
+/// four protective actions and `__guard__` dispatches only `push_rules`). The
+/// write surfaces use it to label the audit evidence so a stored OFF row is
+/// never read as proof of a stop. One list: both predicates come from the
+/// shared header.
+[[nodiscard]] inline bool kill_switch_row_covers_protective(const KillSwitchScope& scope) {
+    if (scope.action.empty())
+        return yuzu::protective::plugin_owns_protective_actions(scope.plugin);
+    return yuzu::protective::is_protective_action(scope.plugin, scope.action);
+}
+
+/// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
+/// `, protective_exempt=true` when the row covers a protective action (stored
+/// but never gating dispatch). One definition for the REST and MCP write
+/// surfaces so the documented evidence format cannot drift between them.
+[[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope,
+                                                        bool enabled) {
+    std::string detail = enabled ? "enabled=true" : "enabled=false";
+    if (kill_switch_row_covers_protective(scope))
+        detail += ", protective_exempt=true";
+    return detail;
 }
 
 /// One stored kill-switch row of a single plugin, as the resolver sees it.

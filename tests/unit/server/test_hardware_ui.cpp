@@ -33,6 +33,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <utility>
@@ -245,6 +246,55 @@ TEST_CASE("hardware row: DEX badge for a scored row; honest dash for the -1 sent
     CHECK(nth_td(first_row(render_row(unscored)), 5) == "<span class=\"hw-grey\">&mdash;</span>");
 }
 
+// Kills: swapping or dropping the DEX tone classes, or moving a threshold (>=90 ok, >=75 warn,
+// else bad). The score text alone survives all of those.
+TEST_CASE("hardware row: DEX badge tone — ok from 90 and warn from 75 and bad below",
+          "[hardware][ui]") {
+    const std::pair<int, const char*> cases[] = {
+        {95, "ok"}, {90, "ok"}, {82, "warn"}, {75, "warn"}, {74, "bad"}, {60, "bad"}};
+    for (const auto& [score, tone] : cases) {
+        InventoryDeviceRow row;
+        row.agent_id = "a1";
+        row.hostname = "WS-1";
+        row.dex_score = score;
+        CHECK(nth_td(first_row(render_row(row)), 5) ==
+              std::string("<span class=\"pill ") + tone + "\">" + std::to_string(score) + "</span>");
+    }
+}
+
+// ── Status pill ────────────────────────────────────────────────────────────────
+
+// The Status cell is the pill followed by the row's Containment link (es-1); these pins are
+// about the pill, so compare only what precedes the link.
+std::string status_pill_only(const std::string& cell) {
+    const auto link = cell.find(" <a class=\"hw-lab\" data-act=\"row-containment\"");
+    return link == std::string::npos ? cell : cell.substr(0, link);
+}
+
+// Kills: dropping or swapping the status pill tone, or collapsing the stale branch into offline.
+// Online wins over stale; offline (not stale) is the neutral pill with no tone class.
+TEST_CASE("hardware row: status pill — online ok and stale warn and offline neutral",
+          "[hardware][ui]") {
+    InventoryDeviceRow row;
+    row.agent_id = "a1";
+    row.hostname = "WS-1";
+
+    row.online = true;
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill ok\">online</span>");
+
+    row.online = true;
+    row.stale = true; // a live stream outranks a stale heartbeat
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill ok\">online</span>");
+
+    row.online = false;
+    row.stale = true;
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill warn\">stale</span>");
+
+    row.online = false;
+    row.stale = false;
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill idle\">offline</span>");
+}
+
 // ── IP cell ────────────────────────────────────────────────────────────────────
 
 TEST_CASE("hardware row: IP cell — single IP, +N suffix for multiple, honest empty",
@@ -350,8 +400,8 @@ TEST_CASE("hardware CI overview lens: CPU cores/threads and RAM humanised; unkno
     HwCiAffordances aff;
 
     const auto html = render_hardware_lens_body("a1", detail, /*lens=*/"", /*now_secs=*/0, aff);
-    CHECK(html.find("Cores / threads: </span>8c/16t") != std::string::npos);
-    CHECK(html.find("Memory: </span>16.0 GB") != std::string::npos);
+    CHECK(html.find("Cores / threads</span>8c/16t") != std::string::npos);
+    CHECK(html.find("Memory</span>16.0 GB") != std::string::npos);
 
     DeviceCiRecord unk;
     unk.cpu_cores = "unknown";
@@ -362,9 +412,9 @@ TEST_CASE("hardware CI overview lens: CPU cores/threads and RAM humanised; unkno
     const auto unk_html = render_hardware_lens_body("a1", unk_detail, "", 0, aff);
     CHECK(unk_html.find("8c/16t") == std::string::npos);
     CHECK(unk_html.find(" GB") == std::string::npos);
-    CHECK(unk_html.find("Cores / threads: </span><span class=\"inv-grey\">&mdash;</span>") !=
+    CHECK(unk_html.find("Cores / threads</span><span class=\"inv-grey\">&mdash;</span>") !=
           std::string::npos);
-    CHECK(unk_html.find("Memory: </span><span class=\"inv-grey\">&mdash;</span>") !=
+    CHECK(unk_html.find("Memory</span><span class=\"inv-grey\">&mdash;</span>") !=
           std::string::npos);
 }
 
@@ -408,11 +458,11 @@ TEST_CASE("hardware CI record: store degrade, not-yet-synced and found render di
 TEST_CASE("hardware lens bar: id, fixed 7-tab order, active class, oob gated on the parameter",
           "[hardware][ui]") {
     const auto html = render_hardware_lens_bar("a1", "dex", /*oob=*/false);
-    REQUIRE(html.find("<div class=\"hw-lens\" id=\"hw-lens-bar\">") != std::string::npos);
+    REQUIRE(html.find("<div class=\"gp-subnav\" id=\"hw-lens-bar\">") != std::string::npos);
     CHECK(html.find("hx-swap-oob") == std::string::npos);
 
     // Fixed order + exact labels.
-    const std::vector<std::string> labels = {"Overview", "Installed software", "Tags",
+    const std::vector<std::string> labels = {"Overview", "Installed software", "Tags and properties",
                                               "DEX",      "Guardian",           "Live",
                                               "Actions"};
     std::size_t pos = 0;
@@ -475,8 +525,141 @@ TEST_CASE("hardware lens body (overview): General block renders agent identity f
 
     const auto html = render_hardware_lens_body("agent-42", detail, /*lens=*/"", 0, aff);
     CHECK(html.find("<h4>General</h4>") != std::string::npos);
-    CHECK(html.find("Agent id: </span>agent-42") != std::string::npos);
-    CHECK(html.find("OS: </span>Linux") != std::string::npos); // os_label("linux")
-    CHECK(html.find("Agent version: </span>0.14.2") != std::string::npos);
-    CHECK(html.find("Architecture: </span>x86_64") != std::string::npos);
+    CHECK(html.find("Agent id</span>agent-42") != std::string::npos);
+    CHECK(html.find("OS</span>Linux") != std::string::npos); // os_label("linux")
+    CHECK(html.find("Agent version</span>0.14.2") != std::string::npos);
+    CHECK(html.find("Architecture</span>x86_64") != std::string::npos);
+}
+
+// Kills: dropping the stored_data_placeholder() call from the Overview lens (the feature's
+// only entry point) or rendering it on a non-Overview lens.
+TEST_CASE("hardware lens body: Stored data placeholder is on Overview only, click-triggered",
+          "[hardware][ui][estate]") {
+    InventoryDeviceRow identity;
+    identity.os = "linux";
+    HardwareCiDetail detail;
+    detail.identity = identity;
+    HwCiAffordances aff;
+
+    const auto overview = render_hardware_lens_body("agent-42", detail, "", 0, aff);
+    CHECK(overview.find("hx-get=\"/fragments/hardware/ci/stored-data?id=agent-42\"") !=
+          std::string::npos);
+    CHECK(overview.find("hx-trigger=\"click\"") != std::string::npos);
+    CHECK(render_hardware_lens_body("agent-42", detail, "tags", 0, aff).find("hw-stored-data") ==
+          std::string::npos);
+}
+
+// ── #5531: failed roster read is never an empty fleet / "not found" ───────────
+
+// Kills: collapsing the CI fragment's not-found arms without the identity_degraded split.
+TEST_CASE("hardware CI fragment: identity_degraded + no record -> roster unreadable; "
+          "+ record -> record with identity note; not degraded -> not found",
+          "[hardware][ui]") {
+    HwCiAffordances aff;
+    HardwareCiDetail d;
+    d.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(std::optional<DeviceCiRecord>{});
+
+    SECTION("degraded, no record") {
+        d.identity_degraded = true;
+        const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+        CHECK(html.find("roster unreadable") != std::string::npos);
+        CHECK(html.find("Device not found") == std::string::npos);
+    }
+    SECTION("degraded, readable record") {
+        d.identity_degraded = true;
+        DeviceCiRecord rec;
+        rec.model = "CI-MODEL-5531";
+        d.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+            std::optional<DeviceCiRecord>(rec));
+        const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+        CHECK(html.find("Device identity unavailable") != std::string::npos);
+        CHECK(html.find("CI-MODEL-5531") != std::string::npos);
+        CHECK(html.find("style=\"margin:0\">agent-x") != std::string::npos);
+    }
+    SECTION("not degraded, no record") {
+        const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+        CHECK(html.find("Device not found") != std::string::npos);
+        CHECK(html.find("last 30 days") != std::string::npos);
+    }
+}
+
+// Kills: dropping the CI header's online/offline text pill (status must never be colour alone), or
+// inverting its tone. The header has no stale state: anything not online reads "offline".
+TEST_CASE("hardware CI fragment: header status pill — online ok and otherwise neutral offline",
+          "[hardware][ui]") {
+    HwCiAffordances aff;
+    InventoryDeviceRow identity;
+    identity.hostname = "WS-1";
+    HardwareCiDetail d;
+
+    identity.online = true;
+    d.identity = identity;
+    const auto on = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+    CHECK(on.find("<span class=\"pill ok\">online</span>") != std::string::npos);
+    CHECK(on.find("<span class=\"pill idle\">offline</span>") == std::string::npos);
+
+    identity.online = false;
+    d.identity = identity;
+    const auto off = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+    CHECK(off.find("<span class=\"pill idle\">offline</span>") != std::string::npos);
+    CHECK(off.find("<span class=\"pill ok\">online</span>") == std::string::npos);
+}
+
+// Kills: rendering the KPI strip (all zeros) above the roster-unavailable banner. The marker is
+// the class-use `<div class="gp-tiles">`.
+TEST_CASE("hardware list fragment: a degraded full-form list renders no KPI strip",
+          "[hardware][ui]") {
+    const std::string marker = "<div class=\"gp-tiles\">";
+    const auto degraded = render_hardware_list_fragment(HardwareListPage{}, false, true, false);
+    CHECK(degraded.find("Hardware roster unavailable") != std::string::npos);
+    CHECK(degraded.find(marker) == std::string::npos);
+    // Control: the marker is present on a healthy render, so the negative above is not vacuous.
+    const auto healthy = render_hardware_list_fragment(HardwareListPage{}, false, false, false);
+    CHECK(healthy.find(marker) != std::string::npos);
+}
+
+// Kills: leaving the CI / Tags degrade banners in the page shell (outside #hw-results), where a
+// results_only htmx swap drops them; passing a hardcoded false for tags_degraded on either path;
+// emitting a banner in both the shell and the region (the exactly-once check).
+TEST_CASE("hardware list fragment: degrade banners live inside #hw-results, once, on every path",
+          "[hardware][ui]") {
+    const std::string ci_banner = "CI columns unavailable";
+    const std::string tags_banner = "Tags unavailable";
+    const std::string region = "id=\"hw-results\"";
+
+    SECTION("full render: each banner exactly once, after the region opens") {
+        const auto html = render_hardware_list_fragment(HardwareListPage{}, /*ci_degraded=*/true,
+                                                        /*roster_unavailable=*/false,
+                                                        /*results_only=*/false,
+                                                        /*tags_degraded=*/true);
+        const auto open = html.find(region);
+        REQUIRE(open != std::string::npos);
+        CHECK(count_occurrences(html, ci_banner) == 1);
+        CHECK(count_occurrences(html, tags_banner) == 1);
+        CHECK(html.find(ci_banner) > open);
+        CHECK(html.find(tags_banner) > open);
+    }
+    SECTION("results_only: Tags banner survives the refresh") {
+        const auto html = render_hardware_list_fragment(HardwareListPage{}, false, false,
+                                                        /*results_only=*/true,
+                                                        /*tags_degraded=*/true);
+        CHECK(html.starts_with("<div id=\"hw-results\""));
+        CHECK(count_occurrences(html, tags_banner) == 1);
+        CHECK(html.find(ci_banner) == std::string::npos);
+    }
+    SECTION("results_only: CI banner survives the refresh") {
+        const auto html = render_hardware_list_fragment(HardwareListPage{}, /*ci_degraded=*/true,
+                                                        false, /*results_only=*/true, false);
+        CHECK(html.starts_with("<div id=\"hw-results\""));
+        CHECK(count_occurrences(html, ci_banner) == 1);
+        CHECK(html.find(tags_banner) == std::string::npos);
+    }
+    SECTION("healthy: no banner on either form") {
+        for (const bool results_only : {false, true}) {
+            const auto html = render_hardware_list_fragment(HardwareListPage{}, false, false,
+                                                            results_only, false);
+            CHECK(html.find(ci_banner) == std::string::npos);
+            CHECK(html.find(tags_banner) == std::string::npos);
+        }
+    }
 }

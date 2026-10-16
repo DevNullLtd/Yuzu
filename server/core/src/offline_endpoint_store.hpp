@@ -30,9 +30,9 @@
 /// fail-closed posture `member_set_owned` already holds for result-set
 /// membership. `evaluate_scope_local` never calls into presence at all and so
 /// can never fail this way (see its own doc comment). `query_stale_within`
-/// (the viz-only read) is UNCHANGED — it stays fail-soft (empty on error),
-/// since a stale-cube viz render has no dispatch/enforce/target decision
-/// downstream of it.
+/// (the roster read: Hardware list/record, viz, MCP, and the Software page's
+/// hostname map) is typed the same way (#5531) — a failed read is
+/// `std::unexpected`, never an empty roster.
 ///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned lease,
@@ -41,8 +41,11 @@
 /// `RETURNING` (the #1033-banning idiom), never `sqlite3_changes()`.
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <expected>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -92,7 +95,8 @@ struct PresenceIdentity {
     std::string arch;
 };
 
-/// `query_live_ids`'s typed failure surface (#4981 PR-1, Finding B).
+/// `query_live_ids`'s and `query_stale_within`'s typed failure surface (#4981 PR-1, Finding B;
+/// #5531). `query_stale_within` never produces `Truncated`.
 /// `StoreUnavailable`/`DbError` mirror `record_presence_store_failure`'s
 /// existing `reason` label vocabulary (`store_unavailable`/`db_error`,
 /// offline_endpoint_store.cpp) exactly — do not introduce a third spelling.
@@ -102,6 +106,80 @@ struct PresenceIdentity {
 /// genuine DB error guards against).
 enum class PresenceReadError { StoreUnavailable, DbError, Truncated };
 
+/// One offline-roster read, as `OfflineEndpointStore::query_stale_within` returns it (#5531).
+using OfflineRosterRead = std::expected<std::vector<OfflineEndpoint>, PresenceReadError>;
+
+/// Fleet-wide roster tallies from one SQL statement (no row materialised, no
+/// `kQueryRowCap`). `total` is every endpoint inside the roster window; the
+/// platform buckets partition it exactly (`windows + linux + macos + other ==
+/// total`). `stale` counts rows whose last HEARTBEAT is older than the stale
+/// threshold, so it overlaps rows the registry reports online — combine with
+/// the online count through `partition_fleet_state`, never subtract blindly.
+struct FleetStateCounts {
+    std::int64_t total{0};
+    std::int64_t stale{0};
+    /// Rows `query_live_ids(live_ttl)` would return (non-blank session, DB-clock
+    /// `last_seen_at` inside the TTL) AND inside the roster window — counted in
+    /// SQL, so it stays exact past `kQueryRowCap` where `known_agent_count()`
+    /// is unavailable. Durable-presence only: it does not add local sessions
+    /// the store has not yet persisted.
+    std::int64_t live{0};
+    std::int64_t windows{0};
+    std::int64_t linux_os{0};
+    std::int64_t macos{0};
+    std::int64_t other{0};
+};
+
+enum class FleetPlatform { Windows, Linux, MacOs, Other };
+
+/// Maps a stored `os` string onto exactly one platform bucket, using the same
+/// spellings the Hardware list filters accept (`windows|win`, `linux|lin`,
+/// `darwin|macos|mac`, case-insensitive). Anything else, blank included, is
+/// `Other`, so the buckets always partition.
+[[nodiscard]] FleetPlatform fleet_platform_of(std::string_view os);
+
+/// Three disjoint segments that always sum to the (clamped) total.
+struct FleetStatePartition {
+    std::int64_t online{0};
+    std::int64_t not_seen{0}; ///< Not online and heartbeat older than the stale threshold.
+    std::int64_t offline{0};  ///< Not online, heartbeat inside the stale threshold.
+};
+
+/// `online` is the registry's count, `stale` the SQL heartbeat-age count; the
+/// two overlap on online-and-stale rows. Online wins, `not_seen` is capped at
+/// the rows left over, `offline` takes the remainder; nothing is negative and
+/// the sum is always `max(total, 0)`. Over-states `not_seen` by the number of
+/// online-and-stale rows (a connected agent whose heartbeat row lags). An
+/// `online` above `total` is clamped, which hides agents the store holds no
+/// row for (failed presence upserts, or rows outside the roster window); a page that
+/// states a figure uses `reconcile_fleet_estate` below instead.
+[[nodiscard]] FleetStatePartition partition_fleet_state(std::int64_t total, std::int64_t online,
+                                                        std::int64_t stale) noexcept;
+
+/// The Estate figure a page may state. `partition_fleet_state` clamps an `online` above `total`,
+/// which silently drops connected agents the store holds no row for (a failed presence upsert,
+/// or a row outside the roster window); with an empty table that clamp turned a live fleet into
+/// {0,0,0,0} and the page said "No devices have reported". Here an `online` above `total`
+/// WIDENS the total to `online` and sets `lower_bound`, so the figure never understates what the
+/// registry already proves is connected.
+struct FleetEstateReading {
+    std::int64_t total{0};
+    std::int64_t online{0};
+    std::int64_t not_seen{0};
+    std::int64_t offline{0};
+    bool lower_bound{false}; ///< the store is behind the registry; every figure is "at least"
+};
+[[nodiscard]] FleetEstateReading reconcile_fleet_estate(std::int64_t total, std::int64_t online,
+                                                        std::int64_t stale) noexcept;
+
+/// The production counts-to-figure adapter behind the Dashboard's unrestricted Estate figure:
+/// `online` is the registry's union count when it can answer, else the SQL durable-live count,
+/// and the result goes through `reconcile_fleet_estate`; it is also a lower bound whenever the
+/// registry's count exceeds the store's live count (connected agents with no row). A free function (not a lambda in
+/// server.cpp) so the registry-ahead-of-store case is a unit test on the real wiring input.
+[[nodiscard]] FleetEstateReading fleet_estate_reading(const FleetStateCounts& counts,
+                                                      std::optional<std::size_t> registry_known) noexcept;
+
 class OfflineEndpointStore {
 public:
     /// Hard cap on rows materialised by `query_stale_within`/`query_live_ids`
@@ -110,6 +188,16 @@ public:
     /// has grown large. Public so tests can size a truncation fixture against
     /// the real value rather than a hardcoded duplicate.
     static constexpr int kQueryRowCap = 100000;
+
+    /// #5678 / #1545 UP-4 endpoint prune: rows are deleted only once unseen for
+    /// the roster read window PLUS this margin. The prune keys on the PG-authored
+    /// `last_seen_at`; the roster still reads the replica-authored
+    /// `last_heartbeat_ms`, so a cutoff can reach a roster-visible row only under
+    /// >7 d replica/PG clock disagreement.
+    static constexpr std::chrono::hours kPruneMargin{24 * 7};
+    /// Per-replica, per-pass delete cap (must stay > 0 or every pass is a no-op).
+    static constexpr int kPruneCapPerPass = 1000;
+    static_assert(kPruneCapPerPass > 0, "a zero cap makes every prune pass a silent no-op");
 
     /// Borrows the shared pool and runs the `endpoint_state` schema migration
     /// on a pinned lease. `is_open()` is false if the lease was empty or the
@@ -150,22 +238,68 @@ public:
     /// blank out what this store already learned from the owning replica. A
     /// non-blank value still overwrites, so a genuine hostname/OS change
     /// lands on the next session-hit heartbeat.
+    ///
+    /// `session_id` (#5678) blank-preserves the same way: a raced-lookup
+    /// heartbeat on a LIVE agent keeps its stored session and stays present. A
+    /// blank session on a NEW or just-departed row leaves it blank, so the
+    /// agent is not present (see query_live_ids) until a session-carrying
+    /// heartbeat arrives — including a departed gateway agent that reconnects
+    /// through a replica with a degraded session-directory lookup, for the
+    /// duration of the degradation.
     bool upsert(std::string_view agent_id, std::string_view hostname, std::string_view os,
                 std::int64_t last_heartbeat_ms, std::int64_t agent_ts,
                 std::string_view agent_version = {}, std::string_view arch = {},
                 std::string_view session_id = {});
 
     /// Every endpoint whose last heartbeat is within `window` of now, newest
-    /// first. The viz handler renders those NOT currently online as stale
-    /// cubes; rows older than `window` are withheld so a long-departed host
-    /// eventually stops cluttering the view. Empty on error (fail-soft: the
-    /// page still renders the live fleet).
-    [[nodiscard]] std::vector<OfflineEndpoint> query_stale_within(std::chrono::seconds window);
+    /// first. Its consumers (Hardware list/record, viz, MCP, and the Software
+    /// page's display-only hostname map) render those NOT currently online as
+    /// offline rows / stale cubes; rows older than `window` are withheld so a
+    /// long-departed host eventually stops cluttering the view. #5531: typed —
+    /// `std::unexpected` (`StoreUnavailable`: no connection in time; `DbError`:
+    /// the query failed) on a failed read, never an empty vector; an empty success
+    /// means "no rows". `Truncated` is never produced: the read keeps
+    /// `LIMIT kQueryRowCap` newest-first and serves the capped set. A failure
+    /// is counted on `yuzu_server_agent_presence_store_failed_total`
+    /// (`op=query_stale_within`) and logged at warn once per failed call (a
+    /// store that never opened — boot-time migration failure — answers
+    /// `StoreUnavailable` without a count or warn, as `query_live_ids` does).
+    [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window);
+
+    /// Fleet tallies over the same roster window `query_stale_within` serves,
+    /// computed in ONE `COUNT(*) [FILTER ...] ... GROUP BY lower(os)` statement.
+    /// `now_ms` is injected (the caller's clock); `stale_after` is the "not seen"
+    /// threshold; `live_ttl` is the presence TTL for `FleetStateCounts::live`
+    /// (judged on the DATABASE clock, unlike `total`/`stale`, which use `now_ms`).
+    ///
+    /// UNCACHED, and it costs seconds at fleet scale (a parallel seq scan holding
+    /// one pool lease; 1-3 s measured at 2M rows on one noisy host): the consumer
+    /// MUST cache it (~60 s) rather than call it per view. Typed like
+    /// `query_stale_within`: a failed read is `std::unexpected`
+    /// (`StoreUnavailable` / `DbError`, counted on
+    /// `yuzu_server_agent_presence_store_failed_total{op=fleet_state_counts}`),
+    /// never a zero struct. `Truncated` is never produced: there is no row cap.
+    ///
+    /// NOT CONFINED: this is a fleet-wide aggregate that knows nothing about
+    /// the caller's management-group scope. Callers must gate (fleet read, and
+    /// `scope == nullopt`); a scope-engaged caller keeps the roster +
+    /// `authz::in_scope` path.
+    [[nodiscard]] std::expected<FleetStateCounts, PresenceReadError>
+    fleet_state_counts(std::int64_t now_ms, std::chrono::seconds window,
+                       std::chrono::milliseconds stale_after, std::chrono::seconds live_ttl);
 
     /// HA WS-5: every agent whose `last_seen_at` is within `ttl` of the
     /// DATABASE clock (`now()` in-SQL, never the replica's own
     /// `system_clock` — the #3715 precedent), for cross-replica
-    /// scope-evaluation visibility.
+    /// scope-evaluation visibility, and whose `session_id` is non-blank — a
+    /// gracefully departed agent (session cleared by remove_if_session) is
+    /// absent from THIS read. AgentRegistry::live_presence() caches the result
+    /// for kPresenceCacheTtl (3 s) and disconnect does not invalidate that
+    /// cache, so a replica's scope evaluation can still see a departed agent
+    /// for up to 3 s — unchanged from the pre-#5678 DELETE, which left the
+    /// deleted row cached the same 3 s. The same cache feeds /hardware's
+    /// `online` flag (AgentRegistry::all_ids() = local sessions UNION cached
+    /// durable presence), so the same <= 3 s applies there.
     ///
     /// #4981 PR-1 (Finding B): type-distinguishable — `std::unexpected` on a
     /// genuine read failure (`StoreUnavailable`: no connection in time;
@@ -181,30 +315,50 @@ public:
     /// "confirmed zero presence-only agents" and, under a NOT combinator
     /// elsewhere in the scope expression, would otherwise invert to a
     /// fleet-wide match built on a degraded read the caller never even
-    /// noticed. `query_stale_within` above is UNCHANGED (still fail-soft,
-    /// empty on error) — a stale-cube viz render has no
-    /// dispatch/enforce/target decision downstream of it, unlike this method.
+    /// noticed. `query_stale_within` above is typed the same way (#5531) but
+    /// its consumers are display surfaces, not dispatch decisions.
     [[nodiscard]] std::expected<std::vector<PresenceIdentity>, PresenceReadError>
     query_live_ids(std::chrono::seconds ttl);
 
-    /// Session-guarded delete (HA WS-5): removes the row ONLY when its
-    /// stored `session_id` matches — mirrors
+    /// Session-guarded presence CLEAR (HA WS-5, #5678): blanks the row's
+    /// `session_id` ONLY when the stored value matches — mirrors
     /// `AgentRegistry::remove_agent_if_session`, so a stale/superseded
-    /// session's disconnect can never delete a NEWER session's presence
-    /// row. Called on graceful disconnect so a departed agent's row does
-    /// not linger for the full liveness window — needed to keep the
-    /// single-replica monolith's `evaluate_scope` outcome unchanged from
-    /// pre-WS-5 behavior (an agent gone from the local registry must also
-    /// be gone from presence, not just eventually-stale). Best-effort like
-    /// `upsert()`: a failure here just means the row lingers until TTL
-    /// expiry, which is always safe (over-inclusion never grants dispatch
-    /// authority).
+    /// session's disconnect can never clear a NEWER session's presence. The row
+    /// itself is KEPT so /hardware and the viz keep listing the device offline
+    /// with its real last heartbeat; query_live_ids no longer reports it, which
+    /// keeps the single-replica monolith's `evaluate_scope` outcome unchanged
+    /// from pre-WS-5 behaviour. Returns true when the current session was
+    /// cleared. Best-effort like `upsert()`: a failure just means the agent is
+    /// counted present until last_seen_at ages past the TTL, which is always
+    /// safe (over-inclusion never grants dispatch authority). Residual: an
+    /// in-flight heartbeat that resolved the OLD session before the disconnect
+    /// but upserts after the clear re-sets `session_id`, so the agent reads
+    /// present again until last_seen_at ages past the TTL — same as the old
+    /// DELETE + reinsert, bounded by the TTL, and grants no dispatch authority.
     bool remove_if_session(std::string_view agent_id, std::string_view session_id);
+
+    /// #5678 / #1545 UP-4: clock-guarded, capped delete of rows unseen for
+    /// `roster_window + kPruneMargin`. Returns rows deleted; 0 on
+    /// decline / lock-skip / nothing to do; -1 on error or a store that is not
+    /// open (the preflight_run_store contract).
+    int run_retention_prune(std::chrono::seconds roster_window);
+    /// Decommission erasure (#5682, `AgentDecommissionStores::offline_endpoint`):
+    /// deletes the agent's row whatever its `session_id`, unlike
+    /// `remove_if_session`. Returns true iff the DELETE ran (zero rows
+    /// included, so a re-issued decommission stays idempotent); false on an
+    /// empty id, a closed store, no lease in time, or a SQL error, so the
+    /// cascade records `Failed`, never a false erasure.
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
 private:
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
 };
+
+/// Injected roster read (#5531): lets VizRoutes / McpServer take the typed
+/// `query_stale_within` as a boundary without holding the store. An empty
+/// function means "no durable roster wired" (live-only, legacy behaviour).
+using OfflineRosterFn = std::function<OfflineRosterRead(std::chrono::seconds)>;
 
 } // namespace yuzu::server

@@ -176,9 +176,15 @@ Recommended order for a fresh install:
 > with no per-agent filter. Dashboard `/fragments/results/filter-bar`,
 > `/fragments/create-group-form`, and `POST /api/dashboard/group-from-results`
 > (tracked #3489; #3525 tracked the same finding and was closed as its
-> duplicate); REST `GET /api/v1/execution-statistics/agents` (tracked #3526);
-> `summarize_working_set` `kind=fleet`/`result_set` (an unscoped whole-registry
-> agent count, tracked #4753). So
+> duplicate); `summarize_working_set` `kind=fleet`/`result_set` (an unscoped
+> whole-registry agent count, tracked #4753). (REST
+> `GET /api/v1/execution-statistics/agents` and the MCP
+> `get_execution_statistics_by_agent` twin, formerly listed here under #3526, now gate on the
+> fleet-read chokepoint and are confined, effective only with RBAC enforcement on (a
+> management-group-scoped-only operator, refused before, is now admitted as a confined view;
+> with RBAC off the rollup is unfiltered for every authenticated non-service, non-engine
+> caller); the `/definitions` and fleet-summary
+> statistics carry no agent identity and keep the plain `Execution:Read` gate.) So
 > a degraded store looks like "no agents in scope" / "no responses" / `503`
 > across every reader on this page now — check the server startup log for
 > `RbacStore` errors, the `/health` store status, and
@@ -287,8 +293,8 @@ Recommended order for a fresh install:
 
 ## The authorization topology floor (#2376)
 
-Ten reads are treated as **authorization topology** rather than ordinary
-operational data. Wherever the legacy RBAC-off fallback is the branch in
+Eleven reads are treated as **authorization topology or audit evidence**
+rather than ordinary operational data. Wherever the legacy RBAC-off fallback is the branch in
 effect, they require the `admin` session role — the generic “any Read is
 allowed” rule does not reach them. (With RBAC **enabled** they are ordinary
 permission checks, so a seeded `Reviewer` holding `AccessReview:Read` is
@@ -306,14 +312,18 @@ admitted; the floor never overrides a live RBAC grant.)
 | `ServerConfig:Read` (#4028) | Server runtime-configuration read-twins — `GET /api/v1/settings/server-config`, `/settings/gateway`, `/settings/mcp` and `/settings/data-retention` |
 | `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
 | `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2) |
+| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
-that includes these ten. On a default install (RBAC ships disabled) that
+that includes these eleven. On a default install (RBAC ships disabled) that
 handed a plain `user` session read access to the authorization topology
 itself: who holds what role, and the complete access-review grant
 population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
-access. The floor closes that gap by denying these ten reads to a
+access — and, until #5771, the full audit trail (who did what, to which
+target, with what outcome, plus the free-text detail and, on the legacy
+`GET /api/audit` route, each actor's role and source IP). The floor closes
+that gap by denying these eleven reads to a
 non-admin whenever the legacy fallback is the branch in effect — never by
 changing behavior under a live RBAC grant.
 
@@ -324,7 +334,7 @@ particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
 + `AccessReview:Attest`) continues to reach the access-review export exactly
 as before — the floor never overrides that grant.
 
-**If you are relying on a non-admin reaching one of these ten reads on an
+**If you are relying on a non-admin reaching one of these eleven reads on an
 RBAC-disabled install,** that access is now denied. The supported remedy is
 to enable RBAC and grant the appropriate role rather than to expect a
 non-admin session to reach authorization topology while RBAC is off:
@@ -347,6 +357,11 @@ non-admin session to reach authorization topology while RBAC is off:
   (the authority ceiling); use an Administrator-minted non-service token.
 - For the OIDC SSO config status read: enable RBAC and grant
   `OidcConfig:Read` — `Administrator`-only for the same reason.
+- For the audit trail (#5771): enable RBAC and assign a role that holds
+  `AuditLog:Read` — the built-in `Operator`, `PlatformEngineer`,
+  `ITServiceOwner` and `Viewer` roles already hold it, or grant it to a
+  custom role. The `Reviewer` role does not hold it. Under RBAC, `AuditLog:Read`
+  is not confined to a management group: a holder reads every row.
 
 The floor is deliberately **not configurable** — there is no setting that
 widens it back open. It is keyed on `(securable, operation)`, not on route
@@ -364,7 +379,10 @@ counted in `yuzu_auth_topology_floor_denied_total{permission}`, separate
 > auditing permission gate. An ordinary non-admin call therefore increments this counter and writes
 > an `auth.permission_required` `denied` row for a permission the caller never asked for. Until
 > #2829 lands, do **not** alert on this counter alone as evidence of someone probing the
-> authorization topology — correlate with the route in the audit row first.
+> authorization topology — correlate with the route in the audit row first. The Access
+> principals fragments (`/fragments/access/principals/*`) are a further source: they probe
+> `EnginePrincipal:Read` on every page view, a floored refusal moves this counter, and for a
+> browser session no audit row accompanies the increment.
 from an ordinary legacy-fallback denial, so a spike in floored denials is
 visible without grepping audit-log text.
 
@@ -411,6 +429,26 @@ purely that an auditor reading the export or a closed campaign draws the
 wrong conclusion about what state RBAC was in — not that access control
 itself misbehaves.
 
+## Viewing accounts from the dashboard
+
+The **Users** page (`/access/users`, in the **Access** section of the sidebar) lists the
+accounts that can sign in to this server and shows one account's details beside the list.
+It is read-only: it shows each account's name, where it comes from (local, OIDC, SAML, AD or
+SCIM) and its account role. Adding, removing and changing accounts is done in **Settings**.
+
+- **Who can see it.** Any signed-in user can open the page. The two panels need the
+  Administrator account role; for anyone else each panel says it is not available to their
+  account. A refused browser session writes no audit row (the panels load automatically, so
+  a row per page view would fill the log with denials); a refused API or MCP token that
+  reaches the panel URL is recorded as an administrator-required denial.
+- **Account role versus RBAC role.** The account role (`admin` or `user`) is the legacy role:
+  it decides who can open Settings and what applies while RBAC enforcement is off. RBAC roles
+  apply once enforcement is on, and are managed through the RBAC API.
+- **Unreadable store.** If the account store does not answer, the Users panel shows a red
+  message with a Retry button. It never shows an empty list in that case, so a degraded store
+  cannot be mistaken for "nobody is here".
+- **Your own account.** Your row is marked "Current user" and has no Manage link.
+
 ## Concepts
 
 | Concept | Description |
@@ -452,7 +490,7 @@ Seven roles are created automatically and cannot be deleted:
 | `UserManagement` | User accounts and role assignments |
 | `Security` | Security settings (TLS, enrollment, quarantine, CA and KEK reads, and privilege-posture reads such as the local_security_policy `sudoers` content) |
 | `ApiToken` | API token lifecycle |
-| `AuditLog` | Audit event records |
+| `AuditLog` | Audit event records. `AuditLog:Read` is in the topology floor (#5771): admin-only while RBAC is off. |
 | `Policy` | Guaranteed State policy fragments and composed policies |
 | `DeviceToken` | Agent device-token issuance and revocation |
 | `SoftwareDeployment` | Software deployment campaigns |
@@ -462,7 +500,7 @@ Seven roles are created automatically and cannot be deleted:
 | `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
 | `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection; per-app privacy-permission grants). Administrator-only by default (absent from the Viewer read-list; the stored results follow `Response:Read`); every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
-| `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (five per-agent stores spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`; a companion package adds a sixth, `Forensics`-governed store) in one grant, replacing a hand-maintained per-store conjunction. |
+| `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (seven per-agent stores: five spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`, a sixth `Forensics`-governed store, and the `endpoint_state` presence row read on `/hardware` and `/viz/fleet`) in one grant, replacing a hand-maintained per-store conjunction. |
 | `SoftwareLicensing` | Discovered software-licence facts synced from endpoints (ADR-0024) |
 | `AccessReview` | Periodic access-review campaigns and attestations (SOC 2 CC6.2). Seeded to Administrator and `Reviewer` only — deliberately NOT `AuditLog`, see "The authorization topology floor" above |
 | `Workflow` | Multi-step workflow definitions and executions |
@@ -490,7 +528,7 @@ The 8 routes/tools in this family authorize purely on `owner_principal == sessio
 | `GET /api/v1/result-sets` | `list_result_sets` | `GET /fragments/result-sets/sidebar` |
 | `POST /api/v1/result-sets` | `create_result_set` | `POST /fragments/result-sets/create` |
 | `GET /api/v1/result-sets/{id}` | `get_result_set` | `GET /fragments/result-sets/{id}/detail` |
-| `GET /api/v1/result-sets/{id}/members` | `get_result_set_members` | *(no fragment equivalent — the detail fragment shows only a device COUNT, not the member list)* |
+| `GET /api/v1/result-sets/{id}/members` | `get_result_set_members` | `GET /fragments/result-sets/{id}/members` (same `Infrastructure:Read` scope, applied before the page limit) |
 | `GET /api/v1/result-sets/{id}/lineage` | `get_result_set_lineage` | *(shown as the breadcrumb on the detail fragment)* |
 | `POST /api/v1/result-sets/{id}/pin` | `pin_result_set` | `POST /fragments/result-sets/{id}/pin` |
 | `POST /api/v1/result-sets/{id}/unpin` | `unpin_result_set` | `POST /fragments/result-sets/{id}/unpin` |
@@ -694,6 +732,8 @@ Custom roles can be created programmatically via `RbacStore::create_role()` and 
 
 An Administrator can grant or revoke one of the 6 non-`ITServiceOwner` built-in roles (`Administrator`, `PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a human (`principal_type="user"`) user, fleet-wide, through a dedicated pair of routes — **not** the general RBAC-securable `perm_fn`/`require_permission` gate every other route in this document uses. Granting (and especially revoking) standing Administrator authority is a stronger security decision than an ordinary permission check, so the caller must hold a **durable** Administrator role themselves, re-read fresh from the store rather than trusted from a cached session role or a JIT (`POST /api/v1/elevate`) elevation — an elevated session does **not** satisfy this gate.
 
+Changing the sign-in provider settings (`POST /api/settings/oidc`, and `PUT /api/config/{key}` for the `oidc_*` keys) needs the caller's own administrator role: a session that is administrator only through a temporary elevation is refused, because the provider decides who becomes an administrator at the next SSO login.
+
 ```bash
 # Grant the Operator role to a user, fleet-wide
 curl -s -b cookies.txt -X POST \
@@ -786,7 +826,7 @@ If a later step of a create fails, the undo of the just-created account goes thr
 
 **A refused deprovision leaves the person live.** When the guard refuses a SCIM deactivation or delete, the identity provider has terminated the person but this server has not: the account stays active. After an early refusal nothing was revoked, so the person's API tokens and sessions are also still live. After a late refusal the tokens and sessions were revoked, but the account remains active in Yuzu, so any credential the identity provider still accepts for it works. Either way the refusal is audited as `scim.user.last_administrator_refused` (always written; the critical analytics event of the same name is a no-op under `--no-analytics`, so key any notification on the audit action) and an operator has to act: have another account hold the `Administrator` grant (`assign_rbac_role`, or `POST /api/v1/rbac/roles/Administrator/assignments`; SCIM only deprovisions `role=user` accounts, so this refusal is always on the grant population and an account whose `role` column is `admin` does not unlock it) and let the identity provider retry (or repeat the delete), or revoke the person's API tokens and sessions by hand. The audit row records what the refusal left in place (`live_api_tokens_slug=<n>`, which counts the username's own tokens and not those of linked SSO identities, with `linked_principals_not_walked=true` beside it so a `0` is not read as "nothing live"; and `sessions_not_revoked=true` on an early refusal).
 
-**If the guard refuses an action you intend.** There is one in-band route: make another local account an administrator first and repeat the operation. The second administrator has to be an ACTIVE LOCAL account whose `role` is `admin`: the column population is what a demotion or a deactivation of a local admin account is refused on, so a grant alone, or an administrator who signs in only through SSO, does not unlock it. Create the account in Settings > User Management > Add User (the create call ignores `role`), then set the role with `POST /api/settings/users/{username}/role` and `{"role":"admin"}`. Granting a second account `Administrator` under RBAC enforcement helps only when the refusal was on the grant population (a refusal on the column population is unaffected by it); a refused SCIM deactivation or delete is always on the grant population, so for it a second ACTIVE LOCAL account must hold `Administrator` instead of a local `role=admin` account. Grant it BEFORE the identity provider removes the member, while some account already holds the grant (`assign_rbac_role`, or `POST /api/v1/rbac/roles/Administrator/assignments`). The route needs a caller who holds an Administrator grant and is a counted account, so when the member being removed is the only counted holder nobody else can make the grant, and after the refusal the exit is direct SQL, which bypasses the audit log like the other break-glass SQL here: `INSERT INTO rbac_store.principal_roles (principal_type, principal_id, role_name) VALUES ('user', '<active local username>', 'Administrator');`, then retry. An inactive or unknown principal does not unlock the retry (granting one through the API is accepted but is not counted). An SSO-only principal cannot be granted through the API; an active SSO-provisioned `auth.users` row granted by SQL is counted. To demote the member afterwards, call the same route with `{"role":"user"}` while signed in as the newly created second administrator, not as the member: a self-target answers `403` `self_role_change_blocked`. The dashboard has no role button; the call needs a cookie session (an account with MFA enrolled also needs a fresh step-up: a proof older than `--mfa-step-up-window-secs`, default 300 s, answers `401` with `meta.mfa_step_up_required`, and a fresh password plus TOTP login counts; an account with no MFA enrolled is not challenged under the default `--mfa-enforcement=optional`; a SAML session gets `403` at step-up, an OIDC session instead needs a fresh IdP MFA assertion by signing in through SSO again, and Add User itself has no step-up, so a sole administrator who signs in only through SAML cannot start this chain) or an administrator API token (`Authorization: Bearer` or `X-Yuzu-Token`), which is never challenged for step-up (see [`server-admin.md`](server-admin.md#changing-a-users-role)). If no administrator session can pass step-up, promote the break-glass account with the SQL in the "SSO-only fleets" note under "Enabling RBAC", arm it (run `yuzu-server --break-glass-user <name> --break-glass-arm` on the server host; the account is armed for `--break-glass-window-secs`, default 24 h, and the command exits without starting the server; see [`server-admin.md`](server-admin.md)), sign in as it and continue. Afterwards revert the break-glass account to its previous role and record the change in your change record. Under `--auth-mode=sso-only` only the armed break-glass account can sign in locally (a newly created administrator's `/login` answers `401`), so make the calls as the break-glass account itself, with its cookie session or an administrator API token it mints, instead of as a new account. When `--break-glass-user` is set, the server refuses to start under `sso-only` unless that account exists, is active and has MFA enrolled, even before it is armed (with no break-glass user configured it starts and no local account can sign in). The Settings MFA page is admin-only, so enroll the break-glass account while it is an administrator, before switching to `sso-only`. Under `--mfa-enforcement admin-only` or `required` a sole administrator who has not enrolled cannot sign in until they enroll (enrolling counts as a fresh proof, so the chain can continue at once); sessions and API tokens that already exist are not affected, only new logins. Afterwards demote or remove the temporary local administrator, so that it does not remain as a standing credential. It cannot demote or delete itself (`403`, audited as `self_role_change_blocked` for a demotion and `self_delete_blocked` for a delete), so a permanent administrator account has to do it once one exists. If the member's role is already `user` and only the session wipe failed, the role call answers "Role unchanged" and does nothing else: revoke the sessions separately (Settings > User Management > Revoke sessions, or `DELETE /api/v1/sessions?username=<name>`, which also needs a fresh MFA step-up for a cookie session; under RBAC enforcement it additionally needs `UserManagement:Write`, held through an Administrator grant, so a `role=admin` account with no grant answers `403` `permission denied: UserManagement:Write` so the revoke must come from an account that holds an Administrator grant, while the role call needs the `admin` role). Administrators who sign in only through SSO are not recognized as members of a population until [#5182](https://github.com/Tr3kkR/Yuzu/issues/5182) lands, so an `sso-only` fleet whose only administrators are SSO identities is protected by its local break-glass account alone. Direct SQL against `auth.users` is break-glass and outside the rule. A guarded operation that keeps answering `503` is usually waiting on a lock holder that never finished. Run this in the Yuzu database (it lists only sessions of the current database that block others and are not themselves blocked, i.e. the root of the queue). Confirm the holder is stuck first (for example `idle in transaction` for far longer than the 2000 ms bound, an old `xact_age`; the 15 s idle bound releases an orphaned deactivation or local role change on its own, but NOT an orphaned role unassignment or enforcement toggle, which need this step) and that it is not a backup or migration session you want to keep, then end that one backend (a lock held by a prepared transaction has no backend: it is listed in `pg_prepared_xacts` and is ended with `ROLLBACK PREPARED '<gid>'` once you have confirmed it is not a two-phase commit you want):
+**If the guard refuses an action you intend.** There is one in-band route: make another local account an administrator first and repeat the operation. (The role change itself needs the calling account's own `admin` role: a session that is administrator only through a temporary elevation is refused with `403`.) The second administrator has to be an ACTIVE LOCAL account whose `role` is `admin`: the column population is what a demotion or a deactivation of a local admin account is refused on, so a grant alone, or an administrator who signs in only through SSO, does not unlock it. Create the account in Settings > User Management > Add User (the create call ignores `role`), then set the role with `POST /api/settings/users/{username}/role` and `{"role":"admin"}`. Granting a second account `Administrator` under RBAC enforcement helps only when the refusal was on the grant population (a refusal on the column population is unaffected by it); a refused SCIM deactivation or delete is always on the grant population, so for it a second ACTIVE LOCAL account must hold `Administrator` instead of a local `role=admin` account. Grant it BEFORE the identity provider removes the member, while some account already holds the grant (`assign_rbac_role`, or `POST /api/v1/rbac/roles/Administrator/assignments`). The route needs a caller who holds an Administrator grant and is a counted account, so when the member being removed is the only counted holder nobody else can make the grant, and after the refusal the exit is direct SQL, which bypasses the audit log like the other break-glass SQL here: `INSERT INTO rbac_store.principal_roles (principal_type, principal_id, role_name) VALUES ('user', '<active local username>', 'Administrator');`, then retry. An inactive or unknown principal does not unlock the retry (granting one through the API is accepted but is not counted). An SSO-only principal cannot be granted through the API; an active SSO-provisioned `auth.users` row granted by SQL is counted. To demote the member afterwards, call the same route with `{"role":"user"}` while signed in as the newly created second administrator, not as the member: a self-target answers `403` `self_role_change_blocked`. The dashboard has no role button; the call needs a cookie session (an account with MFA enrolled also needs a fresh step-up: a proof older than `--mfa-step-up-window-secs`, default 300 s, answers `401` with `meta.mfa_step_up_required`, and a fresh password plus TOTP login counts; an account with no MFA enrolled is not challenged under the default `--mfa-enforcement=optional`; a SAML session gets `403` at step-up, an OIDC session instead needs a fresh IdP MFA assertion by signing in through SSO again, and Add User itself has no step-up, so a sole administrator who signs in only through SAML cannot start this chain) or an administrator API token (`Authorization: Bearer` or `X-Yuzu-Token`), which is never challenged for step-up (see [`server-admin.md`](server-admin.md#changing-a-users-role)). If no administrator session can pass step-up, promote the break-glass account with the SQL in the "SSO-only fleets" note under "Enabling RBAC", arm it (run `yuzu-server --break-glass-user <name> --break-glass-arm` on the server host; the account is armed for `--break-glass-window-secs`, default 24 h, and the command exits without starting the server; see [`server-admin.md`](server-admin.md)), sign in as it and continue. Afterwards revert the break-glass account to its previous role and record the change in your change record. Under `--auth-mode=sso-only` only the armed break-glass account can sign in locally (a newly created administrator's `/login` answers `401`), so make the calls as the break-glass account itself, with its cookie session or an administrator API token it mints, instead of as a new account. When `--break-glass-user` is set, the server refuses to start under `sso-only` unless that account exists, is active and has MFA enrolled, even before it is armed (with no break-glass user configured it starts and no local account can sign in). The Settings MFA page is admin-only, so enroll the break-glass account while it is an administrator, before switching to `sso-only`. Under `--mfa-enforcement admin-only` or `required` a sole administrator who has not enrolled cannot sign in until they enroll (enrolling counts as a fresh proof, so the chain can continue at once); sessions and API tokens that already exist are not affected, only new logins. Afterwards demote or remove the temporary local administrator, so that it does not remain as a standing credential. It cannot demote or delete itself (`403`, audited as `self_role_change_blocked` for a demotion and `self_delete_blocked` for a delete), so a permanent administrator account has to do it once one exists. If the member's role is already `user` and only the session wipe failed, the role call answers "Role unchanged" and does nothing else: revoke the sessions separately (Settings > User Management > Revoke sessions, or `DELETE /api/v1/sessions?username=<name>`, which also needs a fresh MFA step-up for a cookie session; under RBAC enforcement it additionally needs `UserManagement:Write`, held through an Administrator grant, so a `role=admin` account with no grant answers `403` `permission denied: UserManagement:Write` so the revoke must come from an account that holds an Administrator grant, while the role call needs the `admin` role). Administrators who sign in only through SSO are not recognized as members of a population until [#5182](https://github.com/Tr3kkR/Yuzu/issues/5182) lands, so an `sso-only` fleet whose only administrators are SSO identities is protected by its local break-glass account alone. Direct SQL against `auth.users` is break-glass and outside the rule. A guarded operation that keeps answering `503` is usually waiting on a lock holder that never finished. Run this in the Yuzu database (it lists only sessions of the current database that block others and are not themselves blocked, i.e. the root of the queue). Confirm the holder is stuck first (for example `idle in transaction` for far longer than the 2000 ms bound, an old `xact_age`; the 15 s idle bound releases an orphaned deactivation or local role change on its own, but NOT an orphaned role unassignment or enforcement toggle, which need this step) and that it is not a backup or migration session you want to keep, then end that one backend (a lock held by a prepared transaction has no backend: it is listed in `pg_prepared_xacts` and is ended with `ROLLBACK PREPARED '<gid>'` once you have confirmed it is not a two-phase commit you want):
 
 ```sql
 SELECT a.pid, a.state, now() - a.xact_start AS xact_age, left(a.query, 120) AS query
@@ -817,6 +857,10 @@ curl -s -b cookies.txt -X POST \
     "role_name": "Operator"
   }'
 ```
+
+## Tokens and principals page
+
+The read-only `/access/tokens` page shows API tokens and engine principals. Its token list uses `ApiToken:Read` and is scoped to the caller's own tokens unless the caller is an administrator on a cookie session; an administrator's API, MCP or service-scoped token gets its own tokens only. The principal list and detail use `EnginePrincipal:Read`, the same permission as `GET /api/v1/engine-principals` (administrators only while RBAC is disabled; an ordinary grant once it is enabled): with RBAC on, an account administrator without that grant is refused and a non-administrator who holds it is admitted. Engine and MCP-tier credentials are refused whatever they hold. A refused browser session writes no audit row, because the panels load automatically. A revoked principal's free-text revocation detail comes from the audit trail and is shown only to callers who also hold `AuditLog:Read`; others see it marked withheld. The no-administrator check above the list also needs `AuditLog:Read` and is skipped, with a note, without it. Role assignment for engine principals is shown here; assigning is not.
 
 ## Examples
 

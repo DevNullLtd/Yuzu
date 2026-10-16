@@ -116,7 +116,7 @@ securable — see [Access control](#access-control)):
 | Surface | Returns | Scope |
 |---|---|---|
 | `GET /api/v1/sle/agents/{agent_id}` | one device's discovered licences, **including any `user_ref` rows** | **per-device scoped** (403 outside your management-group scope) |
-| `DELETE /api/v1/sle/agents/{agent_id}` | erases a device's stored rows (the audited decommission trigger — see [Erasure](#erasure-and-opt-out)) | **per-device scoped** `SoftwareLicensing:Delete` **and** `Inventory:Delete` **and** `GuaranteedState:Delete` (see below) |
+| `DELETE /api/v1/sle/agents/{agent_id}` | erases a device's stored rows (the audited decommission trigger — see [Erasure](#erasure-and-opt-out)) | **per-device scoped** `Decommission:Delete` (see below) |
 | MCP `query_software_licenses` | one device's discovered-licence **facts** (machine-scope; **no `user_ref`**) | **per-device scoped** `SoftwareLicensing:Read` (the drill's confinement + #1717 fail-closed guard) |
 
 The **single-agent drill** (`GET /sle/agents/{id}`) takes a real per-device scoped gate
@@ -180,14 +180,19 @@ enabling the SLE sources — deny-override wins).
   Because each sync **full-replaces** the device's rows, the identifier is purged
   **within one 24 h cycle** for a syncing agent (an offline agent purges on reconnect).
   This knob-flip full-replace is the erasure path available today.
+- **Stored data panel on the Hardware record.** The bottom of a device's Overview tab has a
+  **Stored data** control (loaded on click) that drives the same route. It needs
+  `Decommission:Delete` for the device, asks you to type the hostname (the agent id when none is
+  known) exactly, then confirms. It does not unenrol the device and does not remove tags,
+  custom properties, quarantine records or property schemas. A partial failure lists each
+  store's outcome and can be re-issued; a failed audit write refuses the erase.
 - **Decommission cascade — live via `DELETE /api/v1/sle/agents/{id}`.** This release wires
-  the agent-decommission cascade to an audited REST route that clears **all five** of a
-  removed device's per-agent stores (inventory, installed-software, device-CI, app-perf
-  and detected-licence rows). Because it erases well beyond licences, it is gated on a
-  **conjunction over every securable it destroys through** — the caller needs all of
-  `SoftwareLicensing:Delete`, `Inventory:Delete` and `GuaranteedState:Delete`, each scoped
-  to the device. (Administrator and ITServiceOwner hold all three by default; a custom role
-  holding only some of them is refused, so nobody can destroy data they cannot read.) It is
+  the agent-decommission cascade to an audited REST route that clears the seven stores in
+  the cascade for a removed device (inventory, installed-software, device-CI, app-perf,
+  detected-licence, app-usage and presence rows). Because it erases well beyond licences, it is gated on a
+  single dedicated securable, **`Decommission:Delete`**, scoped to the device (ADR-0024 Decision 9,
+  amended Wave 7 PR7.2; see [RBAC](rbac.md)). Administrator and ITServiceOwner hold it by default; a custom
+  role that only holds the old per-store `Delete` grants is refused. It is
   **audit-before-erase, fail-closed**: it records a durable
   `sle.agent.decommission|attempt` and refuses to erase if that evidence row cannot persist,
   then reports the per-store outcome. Because each store's delete now returns its committed

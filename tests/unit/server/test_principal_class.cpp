@@ -7,13 +7,16 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <httplib.h>
 
 #include "principal_class.hpp"
 
+using yuzu::server::http_method_label;
 using yuzu::server::principal_class_of;
 using yuzu::server::principal_class_resolved;
 
@@ -89,4 +92,19 @@ TEST_CASE("resolved classifier falls back to presentation when not an engine ses
     CHECK(principal_class_resolved(req_with({{"Authorization", "Bearer abc"}})) == "agent");
     CHECK(principal_class_resolved(req_with({{"Cookie", "yuzu_session=s1"}})) == "human");
     CHECK(principal_class_resolved(req_with({})) == "none");
+}
+
+TEST_CASE("http_method_label keeps the methods httplib accepts and collapses the rest",
+          "[principal-class][adr1005]") {
+    // The ten methods httplib's request-line parser accepts each keep their own label...
+    constexpr std::array<std::string_view, 10> kAccepted{
+        "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH", "PRI"};
+    for (const auto m : kAccepted) CHECK(http_method_label(m) == m);
+    // ...and anything else, which httplib rejects with a 400 yet still hands to post-routing with
+    // the raw token, collapses into the one UNKNOWN series (#5906). Case-sensitive like the parser.
+    CHECK(http_method_label("get") == "UNKNOWN");
+    CHECK(http_method_label("") == "UNKNOWN");
+    CHECK(http_method_label(std::string(1024, 'A')) == "UNKNOWN");
+    CHECK(http_method_label(std::string_view{"GE\x01T"}) == "UNKNOWN");
+    CHECK(http_method_label("GET ") == "UNKNOWN");
 }

@@ -20,6 +20,8 @@
 /// Spark / Assertion); the RBAC securable stays "GuaranteedState" and the REST
 /// surface stays /api/v1/guaranteed-state/* until the dedicated rename PR.
 
+#include "mfa_step_up.hpp" // StepUpFn
+
 #include <yuzu/server/auth.hpp>
 #include <yuzu/metrics.hpp>
 
@@ -29,6 +31,8 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -45,7 +49,10 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
-    using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
+    /// Returns whether the audit row was persisted (production wires `audit_log`'s
+    /// bool). A mutation that must fail closed on audit failure (ADR-0033 §9) reads it
+    /// through `detail::emit_behavioral_audit` and refuses to apply the change.
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
     using EmitEventFn = std::function<void(const std::string& event_type,
@@ -65,6 +72,13 @@ public:
     /// "saved, not deployed").
     using PushFn = std::function<int(const std::string& scope, bool full_sync)>;
 
+    /// Boot-time CSRF allowlist (cfg.csrf_trusted_origins) for the same-site gate
+    /// on every cookie-authorized Guardian mutation (Guard create/enable/update/delete
+    /// and every Baseline mutation); empty = same-host only (fail closed).
+    void set_csrf_trusted_origins(std::vector<std::string> origins) {
+        csrf_trusted_origins_ = std::move(origins);
+    }
+
     /// Register all Guardian routes on the given server.
     /// `store` may be null (degrades to fully-mock rendering). `baseline_store`
     /// may also be null (Baseline fragments degrade to the mock/empty state).
@@ -81,7 +95,8 @@ public:
                          BaselineStore* baseline_store,
                          AgentsJsonFn agents_json_fn,
                          PushFn push_fn,
-                         yuzu::MetricsRegistry* metrics = nullptr);
+                         yuzu::MetricsRegistry* metrics = nullptr,
+                         StepUpFn step_up_fn = {});
 
     /// HttpRouteSink overload — same registration, against the polymorphic
     /// route-sink seam so the handlers can be dispatched in-process by an
@@ -96,7 +111,8 @@ public:
                          BaselineStore* baseline_store,
                          AgentsJsonFn agents_json_fn,
                          PushFn push_fn,
-                         yuzu::MetricsRegistry* metrics = nullptr);
+                         yuzu::MetricsRegistry* metrics = nullptr,
+                         StepUpFn step_up_fn = {});
 
 private:
     /// Reject a service-scoped API token on a fleet-wide/identity-bearing
@@ -145,7 +161,7 @@ private:
 
     // -- Fragment renderers (called by route handlers) -------------------------
     std::string render_status_fragment(const std::string& view) const;
-    std::string render_guards_fragment(const std::string& status_filter) const;
+    std::string render_guards_fragment() const;
     std::string render_events_fragment(const std::string& type_filter,
                                        const std::string& severity_filter) const;
     std::string render_baselines_fragment() const;
@@ -156,7 +172,11 @@ private:
     /// hero + tiles + filterable member/device table). Served into the shared
     /// page shell (guardian_page_ui.cpp) via an hx-get on load.
     std::string render_baseline_page_fragment(const std::string& baseline_id) const;
-    std::string render_guard_page_fragment(const std::string& guard_id) const;
+    /// `can_write` / `can_delete` come from ONE render-time permission probe in the
+    /// page-fragment route (never from the polled fragments); they only decide
+    /// whether the Edit / Delete buttons are drawn. The mutators re-check.
+    std::string render_guard_page_fragment(const std::string& guard_id, bool can_write = false,
+                                           bool can_delete = false) const;
 
     /// True iff a DEPLOYED Baseline's current member set differs from the set
     /// captured at its last deploy (`deployed_snapshot`) — i.e. members were
@@ -173,6 +193,24 @@ private:
     /// with the re-rendered guards list. No push — the change propagates on the
     /// next Baseline deploy/reconcile. Mode (Watch/Enforce) is immutable, so there
     /// is no mode toggle. Backs `POST /guard/<id>/enabled`.
+    /// Guard edit / delete twins of REST PUT / DELETE
+    /// /api/v1/guaranteed-state/rules/{id} (same derive_rule_spec, same
+    /// immutable Mode, same audit verbs). Called AFTER the route's service-scope
+    /// deny, same-site gate and RBAC check; they run the step-up themselves and
+    /// answer JSON (the caller is YuzuDialog.request, not htmx), so a failure
+    /// carries its real status and the 401 step-up envelope reaches the dialog.
+    /// Back `POST /fragments/guardian/guard/<id>/update` and `/delete`.
+    void update_guard_action(const httplib::Request& req, httplib::Response& res,
+                             const std::string& rule_id);
+    void delete_guard_action(const httplib::Request& req, httplib::Response& res,
+                             const std::string& rule_id);
+
+    /// Cross-origin gate for the two step-up'd Guard mutators: 403 + a
+    /// `csrf_denied` denied audit row when the request is not same-site.
+    [[nodiscard]] bool deny_cross_origin_(const httplib::Request& req, httplib::Response& res,
+                                          const std::string& audit_action,
+                                          const std::string& target_id) const;
+
     void apply_guard_change(const httplib::Request& req, httplib::Response& res,
                             const std::string& rule_id, bool enabled);
 
@@ -227,6 +265,8 @@ private:
     AgentsJsonFn agents_json_fn_;
     PushFn push_fn_{};
     yuzu::MetricsRegistry* metrics_{};
+    StepUpFn step_up_fn_{};
+    std::vector<std::string> csrf_trusted_origins_;
 };
 
 } // namespace yuzu::server

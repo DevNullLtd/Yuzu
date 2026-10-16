@@ -43,13 +43,25 @@ std::vector<std::pair<std::string, std::string>> applicable_checks(const Preflig
 std::unordered_map<std::string, std::string> dispatch_params(std::string_view key,
                                                              const PreflightConfig& cfg);
 
+/// Per-check fetch cap. MUST exceed the run's cohort cap (PreflightRunStore kRowCap=20000)
+/// with headroom for the multiple rows/agent that re-dispatch accrues: the read is a sliding
+/// window, so an undersized cap evicts already-answered agents' rows. A hit is surfaced as
+/// `PreflightCheckResponses::truncated`.
+inline constexpr int kResponseFetchCap = 50000;
+
 /// Collect each applicable check's per-agent best response via the ResponseStore
 /// (query_by_execution on the per-check execution_id + latest_per_agent). MUST
 /// NOT be called while holding a PreflightRunStore lease (ADR-0012). Feeds
 /// compute_device_results.
 std::vector<PreflightCheckResponses>
 collect_check_responses(ResponseStore& store, const std::string& run_id,
-                        const std::vector<std::pair<std::string, std::string>>& applicable);
+                        const std::vector<std::pair<std::string, std::string>>& applicable,
+                        int fetch_cap = kResponseFetchCap);
+
+/// True iff any check's fetch hit its row cap (#4644): absent agents are then
+/// inconclusive, and a caller MUST NOT keep re-dispatching to them (every reply adds a row
+/// and evicts another agent's, so more dispatch cannot resolve the ambiguity).
+bool any_check_truncated(const std::vector<PreflightCheckResponses>& checks);
 
 /// True iff any check's read degraded (#2691 finding 10). Every caller that
 /// would build a grid from `checks` and persist it (the runner tick, the live

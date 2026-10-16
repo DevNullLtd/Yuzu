@@ -17,6 +17,8 @@
  *   3. a real secret persists and is reported saved
  *   4. a NULL store reports NOT SAVED (defensive; unreachable in the shipped server)
  *   5. a non-admin is refused and nothing persists
+ *   6. a session that is administrator only through a temporary elevation is refused,
+ *      audited, and changes nothing; a durable and an IdP-mapped administrator still save
  *
  * KNOWN GAP: the production-reachable degraded state is a NON-NULL store whose
  * is_open() is false (unwritable db_dir, failed migration). Nothing covers it -- the
@@ -112,6 +114,11 @@ struct OidcHarness {
     yuzu::server::test::TestRouteSink sink;
 
     bool is_admin{true};
+    // The session's OWN role. `is_admin` models the admin gate (which admits a JIT-elevated
+    // session through effective_role); setting session_role to `user` with is_admin true is an
+    // administrator-only-by-elevation session.
+    auth::Role session_role{auth::Role::admin};
+    std::string session_user{"admin"};
     int apply_calls{0};
     std::vector<std::string> audited; // "action|result|target_id|detail"
 
@@ -133,11 +140,11 @@ struct OidcHarness {
             auto init_res = secret_codec->init(conn.get());
             REQUIRE(init_res.has_value());
         }
-        auto auth_fn = [](const httplib::Request&,
-                          httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
-            s.username = "admin";
-            s.role = auth::Role::admin;
+            s.username = session_user;
+            s.role = session_role;
             return s;
         };
         auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
@@ -616,3 +623,76 @@ TEST_CASE("Settings OIDC: Test Connection decodes the server's NAT64 declaration
     CHECK(h.oidc_provider == nullptr);
 }
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+// ── An elevated-only session cannot change the sign-in provider ──────────────
+//
+// admin_fn_ admits a JIT-elevated session (effective_role), and this handler decides who
+// becomes a STANDING administrator at the next SSO login (admin_group, issuer, client). The
+// handler therefore requires the caller's OWN role: the harness models an elevated `user` as
+// is_admin=true (gate admits) with session_role=user (own role).
+
+TEST_CASE("Settings OIDC: an elevated-only session is refused and audited; nothing changes",
+          "[settings][oidc][elevation]") {
+    OidcHarness h{"", /*open_store=*/false};
+    h.session_user = "mallory";
+    h.session_role = auth::Role::user; // durable role; admitted only through the elevation
+    h.cfg.oidc_admin_group = "orig-group";
+    h.cfg.oidc_issuer = "https://orig.example";
+
+    auto res = h.sink.Post("/api/settings/oidc",
+                           "issuer=https://evil.example&client_id=cid&client_secret=s&redirect_uri="
+                           "&admin_group=evil-group&skip_tls_verify=false",
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+    CHECK(res->body.find("own administrator role") != std::string::npos);
+    REQUIRE(h.audited.size() == 1);
+    CHECK(h.audited[0] == "oidc.configure|denied||elevated_session_oidc_change_blocked");
+    CHECK(h.cfg.oidc_admin_group == "orig-group");
+    CHECK(h.cfg.oidc_issuer == "https://orig.example");
+    CHECK(h.oidc_provider == nullptr); // no provider was built or swapped in
+}
+
+TEST_CASE("Settings OIDC: an elevated-only session leaves the stored settings untouched; "
+          "a durable administrator and an IdP-mapped administrator still save",
+          "[pg][settings][oidc][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, oidc_settings_tpl);
+    OidcHarness h(db.dsn());
+    REQUIRE(h.runtime_config->set("oidc_admin_group", "orig-group", "seed").has_value());
+
+    h.session_user = "mallory";
+    h.session_role = auth::Role::user;
+    auto res = h.sink.Post("/api/settings/oidc",
+                           "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri="
+                           "&admin_group=evil-group&skip_tls_verify=false",
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.runtime_config->get_value("oidc_admin_group") == "orig-group");
+    CHECK(h.cfg.oidc_admin_group.empty());
+    CHECK(h.oidc_provider == nullptr);
+
+    // A local account whose own role is admin saves as before.
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+    res = h.sink.Post("/api/settings/oidc",
+                      "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri="
+                      "&admin_group=group-1&skip_tls_verify=false",
+                      "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.cfg.oidc_admin_group == "group-1");
+    CHECK(h.runtime_config->get_value("oidc_admin_group") == "group-1");
+
+    // An SSO session whose role the IdP mapped to admin (Session::role == admin) saves too.
+    h.session_user = "oidc:https://idp.example|u-123";
+    h.session_role = auth::Role::admin;
+    res = h.sink.Post("/api/settings/oidc",
+                      "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri="
+                      "&admin_group=group-2&skip_tls_verify=false",
+                      "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.runtime_config->get_value("oidc_admin_group") == "group-2");
+}

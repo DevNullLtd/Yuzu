@@ -27,6 +27,7 @@ namespace yuzu::server {
 // in dex_routes.cpp (same yuzu::server scope) — forward-declared here, the same
 // cross-TU pattern the Performance tab uses (dex_perf_ui.cpp).
 std::string dex_subnav(const std::string& active, int window_days);
+std::string dex_fragment_style();
 
 namespace {
 
@@ -106,7 +107,7 @@ std::string cell(const std::optional<double>& v, Unit u) {
 
 std::string render_network_overview_fragment(const NetPerfFleetNow& now) {
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     // The DEX sub-nav with "network" active (Network sits under DEX). This is a
     // now-view with no window of its own, so the threaded window is the DEX
     // default (7 = "7d") — it only governs which window a sibling signal tab opens.
@@ -221,7 +222,7 @@ std::string render_network_devices_fragment(const std::vector<NetPerfDeviceRow>&
         title = std::string("Worst devices by ") + m;
     }
 
-    std::string h;
+    std::string h = dex_fragment_style();
     h += "<a class=\"gp-back\" hx-get=\"/fragments/network/overview\" hx-target=\"#guardian-detail\" "
          "hx-swap=\"innerHTML\" style=\"cursor:pointer;\">&larr; Network quality</a>";
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + title +
@@ -240,8 +241,7 @@ std::string render_network_devices_fragment(const std::vector<NetPerfDeviceRow>&
              "hx-get=\"/fragments/network/devices?metric=" +
              std::string(metric_token) +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
-             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-             "border-radius:.35rem;padding:.15rem .4rem;\">";
+             "class=\"dx-ctl\">";
         h += "<option value=\"\"" + std::string(cohort_key.empty() ? " selected" : "") +
              ">(none)</option>";
         bool key_listed = false;
@@ -269,10 +269,10 @@ std::string render_network_devices_fragment(const std::vector<NetPerfDeviceRow>&
     int i = 1;
     for (const auto& r : rows) {
         const std::string flag_dev =
-            r.under_pressure ? "<b style=\"color:var(--yellow,#ffcc00)\">device &#9679;</b>"
+            r.under_pressure ? "<b class=\"gp-drift\">device &#9679;</b>"
                              : "<span class=\"gp-mute\">&mdash;</span>";
         const std::string flag_app =
-            r.app_unstable ? "<b style=\"color:#c98bff\">app &#9679;</b>"
+            r.app_unstable ? "<b class=\"gp-drift\">app &#9679;</b>"
                            : "<span class=\"gp-mute\">&mdash;</span>";
         // Cohort cell: "—" until a key is chosen (the dimension is undefined),
         // then the resolved value as a drill that filters to that cohort_value.
