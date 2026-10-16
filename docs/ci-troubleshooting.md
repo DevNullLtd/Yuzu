@@ -32,6 +32,8 @@ Companion docs:
 - Nightly preflight reports `Required runner pool unavailable: bigtam` or
   `weetam`.
 - The nightly workflow opens or updates a `nightly-broken` issue.
+- The issue lists a leg as `(timed out/cancelled)`: that leg hit its
+  `timeout-minutes` or lost its runner while the run went on.
 
 **Triage:**
 
@@ -40,6 +42,11 @@ gh api repos/Tr3kkR/Yuzu/actions/runners \
   --jq '.runners[] | [.name, .status, (.labels | map(.name) | join(","))] | @tsv'
 gh run view <run-id> --log-failed
 ```
+
+For a `(timed out/cancelled)` leg, read that job's log for the step running
+at the end. If it shows "runner lost communication", or the step was not a
+test step, check Big Tam / Wee Tam health first. Close the issue only after a
+genuine green nightly, not after a "Re-run failed jobs" pass.
 
 The runner-control query retries transient transport/API failures three times
 with bounded backoff. Authentication failures, rate limits, malformed JSON,
