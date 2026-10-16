@@ -2222,13 +2222,16 @@ def _store_error_member_hits(text: str, rel: str) -> list[str]:
 
     The rule matches the name `res` only, so a rename or a removal of the wrapped site would
     leave it matching nothing and the group would pass silently. The file therefore has to
-    contain at least one spdlog statement that uses `res.error` (a comment mention does not
-    count); if it does not, that is reported as a hit so
-    the rule gets re-pointed at the new name instead of going quiet.
+    contain at least one spdlog statement that uses `res.error` (a prose mention does not
+    count, but this scan is lexical: spdlog-shaped text inside a comment or a string literal
+    still does); if it does not, that is reported as a hit so the rule gets re-pointed at the
+    new name instead of going quiet. The anchor is per file, so a second file added to
+    STORE_ERROR_MEMBER_FILES must itself contain a spdlog statement using `res.error`, or
+    gets its own rule.
     """
     hits = _fmt_stmt_hits(rel, find_pq_error_violations_in_text(text, STORE_ERROR_MEMBER_MARKERS))
     if not any(STORE_ERROR_MEMBER_RE.search(stmt) for _, stmt in find_spdlog_statements_with_pos(text)):
-        hits.append(f"{rel}: no spdlog statement uses `res.error` any more; update STORE_ERROR_MEMBER_RE")
+        hits.append(f"{rel}: ANCHOR: no spdlog statement uses `res.error` any more; re-point STORE_ERROR_MEMBER_RE (this is not a wrap violation)")
     return hits
 
 
