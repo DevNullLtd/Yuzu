@@ -150,14 +150,14 @@ std::string attr_confirm(const std::string& question) {
 } // namespace
 
 
-std::string utc_stamp(std::chrono::system_clock::time_point tp) {
+std::string utc_stamp_epoch_secs(std::int64_t secs) {
     using namespace std::chrono;
     // No CRT gmtime/strftime: past year 3000 MSVC's gmtime_s fails and strftime on the zeroed
     // result terminates the process via the invalid-parameter handler, and POSIX would print
     // a 1900-01-00 date. A legacy import can carry an epoch to year 9999, so the range is
-    // stated rather than assumed: four-digit years from 1970 only.
+    // stated rather than assumed: four-digit years from 1970 only. The check comes BEFORE any
+    // chrono value is built, so no input (INT64_MIN included) can overflow a conversion.
     constexpr std::int64_t kLastSecond = 253'402'300'799; // 9999-12-31 23:59:59 UTC
-    const std::int64_t secs = floor<seconds>(tp).time_since_epoch().count();
     if (secs < 0 || secs > kLastSecond)
         return "out of range";
     const sys_seconds at{seconds{secs}};
@@ -167,6 +167,13 @@ std::string utc_stamp(std::chrono::system_clock::time_point tp) {
     return std::format("{:04}-{:02}-{:02} {:02}:{:02} UTC", static_cast<int>(cal.year()),
                        static_cast<unsigned>(cal.month()), static_cast<unsigned>(cal.day()),
                        tod.hours().count(), tod.minutes().count());
+}
+
+std::string utc_stamp(std::chrono::system_clock::time_point tp) {
+    // floor<seconds> of any representable time_point divides by the tick ratio, so it cannot
+    // overflow whatever the clock's tick (nanoseconds on libstdc++, microseconds on libc++).
+    return utc_stamp_epoch_secs(
+        std::chrono::floor<std::chrono::seconds>(tp).time_since_epoch().count());
 }
 
 bool rule_matches_everything(AutoApproveRuleType type, std::string_view value) {

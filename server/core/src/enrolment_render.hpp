@@ -20,6 +20,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,8 +32,14 @@ inline constexpr std::size_t kRenderCap = 200;
 /// Hostnames named in a bulk confirm.
 inline constexpr std::size_t kBulkHostnamesListed = 10;
 
-/// `YYYY-MM-DD HH:MM UTC`; the fixed sentence `out of range` for a value before 1970 or after
-/// 9999-12-31 23:59:59 (never a bogus date). Pure std::chrono: no CRT time call.
+/// `YYYY-MM-DD HH:MM UTC` for a count of seconds since the Unix epoch; the fixed sentence
+/// `out of range` for a value before 1970 or after 9999-12-31 23:59:59 (never a bogus date).
+/// Pure std::chrono: no CRT time call, and the range is checked before any chrono value is
+/// built, so every int64 is safe. Callers holding an epoch (the API-token and engine-principal
+/// tables, the access-review table) use this directly.
+std::string utc_stamp_epoch_secs(std::int64_t secs);
+
+/// The same for a clock value. Cannot overflow: it floors to seconds, which divides.
 std::string utc_stamp(std::chrono::system_clock::time_point tp);
 
 /// True when an auto-approve rule value matches every agent: a `hostname_glob` made only of

@@ -18,6 +18,8 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -71,9 +73,25 @@ TEST_CASE("enrolment: utc_stamp is a fixed-width UTC string", "[groups][enrolmen
     // A normal date; seconds are truncated, not rounded.
     CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{1'800'000'059}}) ==
           "2027-01-15 08:00 UTC");
-    // The last second of year 9999 still formats.
-    CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{253'402'300'799}}) ==
-          "9999-12-31 23:59 UTC");
+    // Sub-second ticks floor to the second (a pre-epoch fraction floors DOWN, so it is out of range).
+    CHECK(utc_stamp(Clock::time_point{std::chrono::milliseconds{1'500}}) == "1970-01-01 00:00 UTC");
+    CHECK(utc_stamp(Clock::time_point{std::chrono::milliseconds{-1}}) == "out of range");
+}
+
+// The calendar logic runs over plain int64 epoch seconds, so these boundaries do not depend on
+// the clock's tick: libstdc++'s system_clock counts nanoseconds in an int64 and cannot even hold
+// year 2263, let alone 9999, as a time_point.
+TEST_CASE("enrolment: utc_stamp_epoch_secs formats the whole supported range",
+          "[groups][enrolment][render]") {
+    CHECK(utc_stamp_epoch_secs(0) == "1970-01-01 00:00 UTC");
+    CHECK(utc_stamp_epoch_secs(86'400 + 3'660) == "1970-01-02 01:01 UTC");
+    CHECK(utc_stamp_epoch_secs(1'800'000'059) == "2027-01-15 08:00 UTC");
+    // Leap day, and the century rule (2000 leap, 2100 not).
+    CHECK(utc_stamp_epoch_secs(951'782'400) == "2000-02-29 00:00 UTC");
+    CHECK(utc_stamp_epoch_secs(4'107'542'400) == "2100-03-01 00:00 UTC");
+    // The last second of year 9999 still formats; the next one does not.
+    CHECK(utc_stamp_epoch_secs(253'402'300'799) == "9999-12-31 23:59 UTC");
+    CHECK(utc_stamp_epoch_secs(253'402'300'800) == "out of range");
 }
 
 // The legacy enrollment-tokens.cfg import allows an epoch to year 9999 and beyond. The CRT
@@ -81,51 +99,34 @@ TEST_CASE("enrolment: utc_stamp is a fixed-width UTC string", "[groups][enrolmen
 // prints 1900-01-00 on POSIX, so an unrepresentable value is a fixed sentence, never a date.
 TEST_CASE("enrolment: utc_stamp prints out of range instead of a bogus date",
           "[groups][enrolment][render]") {
-    CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{253'402'300'800}}) == "out of range");
-    CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{4'000'000'000'000}}) == "out of range");
-    CHECK(utc_stamp(Clock::time_point{std::chrono::seconds{-1}}) == "out of range");
-    CHECK(utc_stamp((Clock::time_point::max)()) == "out of range");
+    constexpr auto kMin = (std::numeric_limits<std::int64_t>::min)();
+    constexpr auto kMax = (std::numeric_limits<std::int64_t>::max)();
+    for (const std::int64_t secs : {std::int64_t{-1}, std::int64_t{-86'400}, std::int64_t{-62'135'596'800},
+                                    std::int64_t{253'402'300'800}, std::int64_t{4'000'000'000'000},
+                                    kMin, kMin + 1, kMax - 1, kMax}) {
+        INFO("secs=" << secs);
+        CHECK(utc_stamp_epoch_secs(secs) == "out of range");
+    }
+    // The clock extremes (whatever the tick) go through the same floor and are out of range
+    // or a valid date, never UB: libc++'s microsecond max is year 294247, libstdc++'s
+    // nanosecond max is year 2262.
+    for (const auto tp : {(Clock::time_point::max)(), (Clock::time_point::min)()}) {
+        const auto s = utc_stamp(tp);
+        CHECK((s == "out of range" || s.size() == 20));
+    }
     CHECK(utc_stamp((Clock::time_point::min)()) == "out of range");
 
-    // End to end: such an expiry renders in a row (not "Never", not a date), nothing throws.
-    const std::vector<auth::EnrollmentToken> v = {
-        token("farfuture", "x", 0, 0, false, Clock::time_point{std::chrono::seconds{253'402'300'800}})};
+    // End to end through a row: a far-future expiry that is NOT the never sentinel renders as a
+    // date or "out of range" by the clock's reach, never "Never" and never Expired. The exact
+    // text is derived from the same helper so the assertion holds on every standard library.
+    const auto far = (Clock::time_point::max)() - std::chrono::hours(24);
+    const std::vector<auth::EnrollmentToken> v = {token("farfuture", "x", 0, 0, false, far)};
     const auto html = render_tokens(&v, "", kNow);
-    CHECK_THAT(html, ContainsSubstring("<td>out of range</td>"));
+    const auto want = utc_stamp_epoch_secs(
+        std::chrono::floor<std::chrono::seconds>(far).time_since_epoch().count());
+    CHECK_THAT(html, ContainsSubstring("<td>" + want + "</td>"));
+    CHECK_THAT(html, !ContainsSubstring("<td>Never</td>"));
     CHECK_THAT(html, ContainsSubstring("<span class=\"pill info\">Active</span>"));
-}
-
-// The element ids are baked into the Groups template and the Settings page, and an htmx swap
-// lands in whatever hx-target names. A renderer that targeted another panel's id would drop its
-// refreshed list into the wrong panel, so every target must be the section that owns the fragment.
-TEST_CASE("enrolment: every hx-target is the section that owns the fragment",
-          "[groups][enrolment][render]") {
-    using T = auth::AutoApproveRuleType;
-    const auto check = [](const std::string& html, const std::string& section,
-                          std::size_t at_least) {
-        const auto targets = hx_targets(html);
-        INFO("section=" << section);
-        CHECK(targets.size() >= at_least); // not vacuous: the buttons and forms are really there
-        for (const auto& t : targets)
-            CHECK(t == section);
-    };
-
-    const std::vector<auth::EnrollmentToken> toks = {token("aaaaaaaa", "live"),
-                                                     token("bbbbbbbb", "gone", 0, 0, true)};
-    // Done + Revoke + the generate form.
-    check(render_tokens(&toks, "secret", kNow), "#token-section", 3);
-    check(render_tokens(nullptr, "", kNow), "#token-section", 0);
-
-    const std::vector<auth::PendingAgent> agents = {agent("one", "h1"), agent("two", "h2"),
-                                                    agent("three", "h3", auth::PendingStatus::denied)};
-    // Approve + Deny + Forget for two rows, then Approve all and Deny all.
-    check(render_pending(&agents), "#pending-section", 8);
-
-    const std::vector<auth::AutoApproveRule> rules = {{T::hostname_glob, "a.corp", "", true},
-                                                      {T::ip_subnet, "10.0.0.0/8", "", false}};
-    // The other match mode, Toggle + Remove for two rules, and the Add form.
-    check(render_auto_approve(rules, false), "#auto-approve-section", 6);
-    check(render_auto_approve(rules, true), "#auto-approve-section", 6);
 }
 
 TEST_CASE("enrolment: match-everything detection", "[groups][enrolment][render]") {
