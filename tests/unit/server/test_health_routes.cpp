@@ -23,6 +23,7 @@
 #include "health_routes.hpp"
 #include "http_route_sink.hpp"
 #include "pg_reachability_probe.hpp"
+#include "principal_class.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -694,11 +695,17 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // injected-callback live test green, so the production wiring is pinned here instead.
     expect(R"(auto count_http_request = [this](const httplib::Request& req,
                                          const httplib::Response& res) {
-            metrics_.counter("yuzu_http_requests_total", {{"method", req.method},
+            metrics_.counter("yuzu_http_requests_total",
+                {{"method", std::string(http_method_label(req.method))},
                 {"status", std::to_string(res.status)},
                 {"principal_class", std::string(principal_class_resolved(req))}}).increment();
         };)",
            1, "the shared counter lambda carries the metric name and all three labels");
+    // The method label is normalised: a rejected request's raw request-line token is
+    // attacker-controlled on the plain port, so a revert to req.method must redden on its own,
+    // by name, not only via the exact-spelling check above (#5906 CODEX-R3-1).
+    expect("http_method_label(req.method)", 1,
+           "the request counter's method label is bounded, never the raw request-line token");
     expect("count_http_request(req, res);", 1,
            "the main post-routing handler counts through the shared lambda");
     expect("redirect_thread_done_ = true;", 1,
@@ -1226,10 +1233,35 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
     CHECK(ctrl->status == 400);
     counted(6, "GET", 400);
 
+    // Two distinct request-line methods httplib REJECTS (400) are still handed to post-routing
+    // with the raw token; the counter must collapse them into one label (#5906 CODEX-R3-1).
+    // The client writes req.method verbatim and no body byte is sent (no #2757 RST hazard).
+    // This case injects its own callback, so it cannot observe the production lambda: it proves
+    // the parser hands rejected tokens to post-routing and that http_method_label collapses
+    // them; the production wiring is pinned by the server.cpp tripwire below.
+    for (const char* bad : {"BAD000001", "BAD000002"}) {
+        httplib::Request r;
+        r.method = bad;
+        r.path = "/";
+        auto rejected = cli.send(r);
+        REQUIRE(rejected);
+        CHECK(rejected->status == 400);
+    }
+    {
+        std::lock_guard<std::mutex> lk(seen_mu);
+        REQUIRE(seen.size() == 8);
+        CHECK(seen[6].first == "BAD000001");
+        CHECK(seen[7].first == "BAD000002");
+        CHECK(seen[6].second == 400);
+        CHECK(seen[7].second == 400);
+        CHECK(http_method_label(seen[6].first) == "UNKNOWN");
+        CHECK(http_method_label(seen[7].first) == "UNKNOWN");
+    }
+
     auto query = cli.Get("/login?x=1");
     REQUIRE(query);
     CHECK(query->status == 301);
-    counted(7, "GET", 301);
+    counted(9, "GET", 301);
     const auto loc = query->get_header_value("Location");
     CHECK(loc.size() >= 4);
     CHECK(loc.substr(loc.size() - 4) == "?x=1");
@@ -1240,6 +1272,6 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
     CHECK(down->status == 503);
     CHECK(json::parse(down->body)["reason"] == "https_listener_not_serving");
     expect_security_headers(down);
-    counted(8, "GET", 503);
+    counted(10, "GET", 503);
 }
 #endif // !YUZU_HEALTH_ROUTES_LIVE_TSAN

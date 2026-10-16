@@ -711,9 +711,10 @@ public:
                           "counter");
         // Pre-seed the closed principal_class dimension (docs/observability-
         // conventions.md — every value of a closed-set label is initialised at
-        // startup, matching yuzu_onbehalf_rejected_total below). method/status
-        // are NOT closed sets, so a single representative GET/200 point per
-        // class is the seed — not a cross-product, which would be unbounded.
+        // startup, matching yuzu_onbehalf_rejected_total below). method is
+        // bounded by http_method_label (accepted methods + UNKNOWN) but, like
+        // status, is not pre-seeded as a cross-product with it, so a single
+        // representative GET/200 point per class is the seed.
         // "engine" is now included (PR 4.5 — principal_class_resolved makes it
         // live, emitted for a resolved engine-principal session): the closed
         // set is human/agent/none/engine and every value gets its 0-point.
@@ -15368,6 +15369,9 @@ private:
         // The ONE spelling of the request counter and its label set (an observability contract):
         // the main post-routing handler below calls it, and the plain-HTTP redirect listener is
         // handed the same callable, so a label change reaches both listeners' series (#5906).
+        // The method is normalised through http_method_label: httplib counts requests it rejects
+        // (400) with the raw request-line token, which an unauthenticated peer on the plain port
+        // controls, so the raw value would mint an unbounded series set (#5906 CODEX-R3-1).
         //
         // principal_class: bounded actor class (ADR-1005, execution-plan
         // PR 1.2) — human / agent / none / engine. "engine" is live as of
@@ -15379,7 +15383,7 @@ private:
                                          const httplib::Response& res) {
             metrics_
                 .counter("yuzu_http_requests_total",
-                         {{"method", req.method},
+                         {{"method", std::string(http_method_label(req.method))},
                           {"status", std::to_string(res.status)},
                           {"principal_class", std::string(principal_class_resolved(req))}})
                 .increment();

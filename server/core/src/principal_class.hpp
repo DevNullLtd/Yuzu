@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include <array>
 #include <string_view>
 
 #include <httplib.h>
@@ -72,6 +73,23 @@ namespace detail {
         return "human";
     }
     return "none";
+}
+
+// Bounded `method` label for yuzu_http_requests_total (#5906). httplib hands a
+// request it REJECTS (400) to post-routing with req.method still holding the raw
+// request-line token, so the raw value is attacker-controlled on the
+// unauthenticated plain port and would mint one retained series per distinct
+// token. The set mirrors the allowlist in httplib.h's request-line parser
+// (detail::parse_request_line) and must be kept in step; `method` is therefore
+// a closed 11-value set. Case-sensitive on purpose, as the parser is: a
+// lowercase `get` is rejected by httplib, so it must not read as an accepted GET.
+[[nodiscard]] constexpr std::string_view http_method_label(std::string_view m) {
+    constexpr std::array<std::string_view, 10> kAccepted{
+        "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH", "PRI"};
+    for (const auto a : kAccepted) {
+        if (m == a) return a;
+    }
+    return "UNKNOWN";
 }
 
 // principal_class for the metric: "engine" when the RESOLVED session is an

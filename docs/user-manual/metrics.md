@@ -51,7 +51,7 @@ yuzu_command_duration_seconds_count 1542
 yuzu_agents_connected 47
 ```
 
-`yuzu_http_requests_total` also counts the responses served on the plain-HTTP redirect port (`--web-port`, when HTTPS is on): its `301`s, `400`s and the four health-probe answers. A plain-port `503` (`https_listener_not_serving`) while the HTTPS listener is down therefore counts toward `YuzuHighErrorRate`.
+`yuzu_http_requests_total` also counts the responses served on the plain-HTTP redirect port (`--web-port`, when HTTPS is on): its `301`s, `400`s and the four health-probe answers. A plain-port `503` (`https_listener_not_serving`) while the HTTPS listener is down therefore counts toward `YuzuHighErrorRate`. The `method` label is limited to the HTTP methods the server accepts (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH`, `PRI`); any other request-line token is reported as `UNKNOWN`, so a malformed request cannot create new series. Accepted methods keep their exact label, so existing dashboards and `YuzuHighErrorRate` (which uses `status` only) are unchanged.
 
 ## Naming conventions
 
