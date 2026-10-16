@@ -340,6 +340,18 @@ TEST_CASE("tar parse_ts_param_strict: refuses what the lenient parser reads as u
     CHECK_FALSE(parse_ts_param_strict("-5"));
 }
 
+TEST_CASE("tar parse_ts_param_strict: refuses a calendar-impossible date", "[tar][tree][parse]") {
+    // The lenient parser rolls these into the next month; the strict one must refuse them.
+    CHECK_FALSE(parse_ts_param_strict("2026-02-31T00:00"));
+    CHECK_FALSE(parse_ts_param_strict("2026-02-29T00:00")); // 2026 is not a leap year
+    CHECK_FALSE(parse_ts_param_strict("2026-04-31T00:00:00"));
+    CHECK_FALSE(parse_ts_param_strict("1900-02-29T00:00")); // divisible by 100, not by 400
+    CHECK(parse_ts_param_strict("2028-02-29T00:00").has_value()); // leap year
+    CHECK(parse_ts_param_strict("2000-02-29T00:00").has_value()); // divisible by 400
+    CHECK(parse_ts_param_strict("2026-04-30T23:59:59").has_value());
+    CHECK(parse_ts_param_strict("2026-01-31T00:00").has_value());
+}
+
 TEST_CASE("tar anchors: non-positive ts cannot poison observed_since", "[tar][tree][anchor]") {
     std::vector<TarProcEvent> e{ev(0, "started", 9, 0, "garbage"),     // ts<=0 ignored
                                 ev(-5, "started", 8, 0, "garbage"),    // negative ignored
