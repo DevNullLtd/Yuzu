@@ -612,23 +612,25 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
    - **2026-10-15 - temporary UI-only fragment exceptions (Dashboard,
      Integrations webhooks, General, Access).** The ADR owner (Dave Rae)
-     is reported to have accepted these server-rendered fragments, which have
-     no REST v1 or MCP twin yet, as temporary exceptions to Decisions 1 and 4
-     on 2026-10-15 (#5859, #5872, #5873, #5880). The recorded ground, for
-     #5859, is that the Dashboard rework should not wait on building its
-     twins; the same ruling was extended to the other three. That acceptance
-     is attributed to a retrospective quotation in the body of #5955 (opened
-     2026-10-16); there is no contemporaneous ruling on the four pull
-     requests that this entry can cite, and no independent approving review
-     of the entry yet, so it is recorded on that basis until a colleague's
-     review of the change that carries it endorses the bounded exception. It
-     covers only the missing REST v1 and MCP twins of 13 rows in this change
-     and changes no authentication, authorization or audit behaviour. The
-     exceptions are to be revisited by **2026-11-30**. This is not a general
-     waiver: a new UI-only capability, or any extension, needs its own
-     recorded ruling. The list of record is issue #5955 plus the rows
-     carrying `exception:#5955 revisit:2026-11-30` in
-     `scripts/ci/api-parity/*.json`.
+     accepted these server-rendered fragments, which have no REST v1 or MCP
+     twin yet, as temporary exceptions to Decision 4 and Grandfathered
+     surface 1 (#5859, #5872, #5873, #5880). The acceptance is recorded in
+     review text edited into the owner's own reviews of those four pull
+     requests, dated 2026-10-15 ("Decision recorded (owner, 2026-10-15)" on
+     #5859, #5872 and #5873; "Owner decision (recorded: accepted)" in the
+     approving review of #5880), and restated in the body of #5955 (opened
+     2026-10-16). The ground recorded is that the exception is accepted for
+     now. These are review edits by the owner's account, not a signed
+     decision, and no independent approving review of this entry exists yet.
+     The exception waives only the requirement of a REST v1 and MCP twin for
+     13 read fragments in this change. It does not waive, and this entry
+     does not assess, the authentication, authorization, audit or
+     confinement requirements on the fragments themselves, which were
+     reviewed in the four pull requests. The exceptions are to be revisited
+     by **2026-11-30**. This is not a general waiver: a new UI-only
+     capability, or any extension, needs its own recorded ruling. The list
+     of record is issue #5955 plus the rows carrying
+     `exception:#5955 revisit:2026-11-30` in `scripts/ci/api-parity/*.json`.
      The gate requires the dated shape for any new exception but does not yet
      cap how many there are. Growth is review-enforced for now, as is
      re-dating, re-pointing or relabelling an existing exception row. A
