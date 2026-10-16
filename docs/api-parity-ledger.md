@@ -26,13 +26,21 @@ churns the ledger. Each row records:
   one exists.
 - `mcp_twin` - the MCP tool name that serves the same capability, if one
   exists.
-- `status` - one of `twinned` (a twin exists and is verified against the
-  current source), `planned:#N` (tracked, not yet built - `#2146` is the
-  generic placeholder used when no more specific tracking issue exists
-  yet), `composed-of:<capability-ids>` (this row's capability is covered by
-  the union of other ledgered capabilities, not a 1:1 twin),
-  `exception:<note>` (a deliberate, reviewed reason this row will never get
-  a twin - an ADR-1005 ledger entry, not a free pass), or `retire` (the
+- `status` - one of `twinned` (BOTH a REST v1 and an MCP twin exist and are
+  verified against the current source; the `mcp_twin` is a tool name, or
+  `resource:<uri>` for a fixed `kResources[]` entry; the gate cannot verify a
+  resource template yet, so ledger such a row `twinned-rest-only` and cite
+  ADR-1005's 2026-09-07 / 2026-09-14 class entry), `twinned-rest-only` /
+  `twinned-mcp-only` (exactly one machine twin exists; counts as untwinned,
+  because ADR-1005 expects both), `planned:#N` (tracked, not yet built -
+  `#2146` is the generic placeholder used when no more specific tracking
+  issue exists yet, and its row count may only shrink),
+  `composed-of:<capability-ids>` (this row's capability is covered by the
+  union of other ledgered capabilities, not a 1:1 twin),
+  `exception:#<issue> revisit:<YYYY-MM-DD> <reason>` (a deliberate, reviewed
+  exception with a tracking issue and a revisit date - an ADR-1005 ledger
+  entry, not a free pass; a closed, shrink-only set of older rows predates
+  the shape and is grandfathered by `capability_id` in the script), or `retire` (the
   fragment route no longer exists; kept for history until the ledger row
   itself is deleted).
 
@@ -98,14 +106,28 @@ the served surface - it does not compete with that work.
 preflight step (no build required - pure source-tree lexical analysis) and
 fails on: an extracted `/fragments/*` or legacy `/api/*` route with no
 ledger row; a ledger row still claiming a route that no longer exists
-(other than `status: "retire"`); a `twinned` row whose claimed REST or MCP
-twin does not actually exist in the current extraction; a registered
+(other than `status: "retire"`); a `twinned` row that lacks either twin, or a
+`twinned*` row whose claimed REST or MCP twin does not actually exist in the
+current extraction (a `resource:<uri>` twin must be a registered MCP
+resource); a duplicate `capability_id`; an `exception:` row without an issue,
+a real revisit date and a reason (outside the grandfathered set); a
+grandfathered set whose size is not its pinned maximum, or that holds a stale
+entry (a row gone, converted, or already in the strict shape - a swap of one
+id for another keeps the size and is caught only in review); a registered
 `/api/v1/*` route missing from OpenAPI and not in the allowlist; the total
-untwinned-row count growing past the baseline recorded in the script (the
-baseline shrinks as F2+ wires real twins, and rises only when a change
-raises it with a stated reviewed reason - a newly-discovered fragment route,
-or extraction-completeness catching up to a route that already existed); and this
-document's generated block going stale relative to a fresh render. See
+untwinned-row count, or the generic `planned:#2146` row count, moving off its
+own baseline recorded in the script (the generic count never rises; the
+untwinned baseline shrinks as F2+ wires real twins, and rises only when a
+change raises it with a stated reviewed reason - a newly-discovered fragment
+route, or extraction-completeness catching up to a route that already
+existed); and this document's generated block going stale relative to a
+fresh render. Adding a NEW exception row is not mechanically capped by this
+gate: it needs a maintainer ruling and shows in review. Twelve single-twin
+rows were examined when the gate began requiring both twins on plain
+`twinned`: eleven were reclassified (eight `twinned-rest-only`, three
+`exception:#520`) and one, satisfied by an MCP resource twin, stays
+`twinned`, moving the untwinned baseline from 216 to 227 without changing any
+capability. See
 `tests/unit/server/test_openapi_spec_completeness.cpp` for the in-process
 unit-test half (RestApiV1's own `register_routes()` vs `openapi_spec()`,
 plus `$ref` validity) - the #842 companion to this whole-tree script.
@@ -139,20 +161,20 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 21 | 12 | 9 |
+| devices | 21 | 8 | 13 |
 | inventory | 4 | 4 | 0 |
 | dex | 27 | 18 | 9 |
 | guardian | 18 | 8 | 10 |
-| tar | 12 | 4 | 8 |
+| tar | 12 | 3 | 9 |
 | auto-preflight | 4 | 1 | 3 |
 | auto-deploy | 6 | 3 | 3 |
 | auto-verify | 3 | 0 | 3 |
 | network | 3 | 2 | 1 |
 | viz | 2 | 2 | 0 |
-| executions | 6 | 1 | 5 |
+| executions | 6 | 0 | 6 |
 | scope-result-sets | 1 | 0 | 1 |
 | instructions | 27 | 14 | 13 |
-| compliance-policy | 22 | 6 | 16 |
+| compliance-policy | 22 | 5 | 17 |
 | settings | 26 | 7 | 19 |
 | rbac | 13 | 0 | 13 |
 | auth-mfa | 7 | 0 | 7 |
@@ -160,13 +182,13 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | access-reviews | 2 | 0 | 2 |
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 1 | 14 |
-| enrollment | 21 | 7 | 14 |
-| other | 79 | 17 | 62 |
-| **Total** | **325** | **109** | **216** |
+| enrollment | 21 | 4 | 17 |
+| other | 79 | 16 | 63 |
+| **Total** | **325** | **98** | **227** |
 
 Registered `/api/vN/*` routes: 251. OpenAPI `paths` entries: 250. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 191.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 216.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 227. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 176.
 
 <!-- END GENERATED -->
 

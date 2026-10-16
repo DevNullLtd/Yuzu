@@ -172,7 +172,7 @@
     "capability_id": "get.fragments-dashboard-policies",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.api-compliance,get.api-policies"
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-compliance,get.api-policies; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
   },
   {
     "method": "GET",
@@ -191,6 +191,6 @@
       "path": "/api/v1/tag-compliance"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
   }
 ]

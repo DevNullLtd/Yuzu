@@ -45,10 +45,17 @@ WHAT IT CHECKS
      recorded here rather than left implicit). A v1-keyed row with any other
      status is an error - v1 routes are otherwise tracked by check 3, not
      the ledger.
-  2. Every ledger row whose status is "twinned" names a `rest_v1_twin`
-     and/or `mcp_twin` that actually exists in the CURRENT extraction (a
-     twin claim referencing a renamed/removed route or tool is a lie, and
-     this catches it going stale).
+  2. Every ledger row whose status is "twinned" names BOTH a `rest_v1_twin`
+     and an `mcp_twin`; a row with only one uses "twinned-rest-only" /
+     "twinned-mcp-only". An `mcp_twin` is a tool name, or `resource:<uri>`
+     for a fixed kResources[] entry. Every named twin must actually exist in
+     the CURRENT extraction (a twin claim referencing a renamed/removed
+     route, tool or resource is a lie, and this catches it going stale).
+  2c. An `exception:` status must read `exception:#<issue> revisit:<YYYY-MM-DD>
+     <reason>`, except the closed grandfather set
+     GRANDFATHERED_LEGACY_EXCEPTIONS (size pinned by GRANDFATHERED_MAX; it may
+     only shrink). capability_ids are unique, and a malformed ledger is
+     reported alone.
   3. Every registered `/api/v1/*` route either appears in the OpenAPI
      `paths` table (openapi_spec() in rest_api_v1.cpp) or is named in this
      script's ALLOWLIST_OPENAPI_MISSING with a reason. F2's job is to
@@ -58,7 +65,8 @@ WHAT IT CHECKS
      check-capability-matrix.sh's ratchet, this is BIDIRECTIONAL - an
      improvement (count decreases) must lower the constant in the same
      change, or a later regression back up to the old baseline would pass
-     silently.
+     silently. The count of rows carrying exactly the generic `planned:#2146`
+     status has its own bidirectional baseline, BASELINE_GENERIC_PLANNED.
 
 USAGE
   check-api-parity.py                    # run the full gate (CI mode)
@@ -66,16 +74,21 @@ USAGE
   check-api-parity.py --bootstrap        # add default rows for any
                                           # unledgered fragment/legacy route
                                           # (planned:#2146, both twins null)
-                                          # to the right domain file
+                                          # to the right domain file. The gate
+                                          # no longer lets planned:#2146 grow:
+                                          # retag each new row with a specific
+                                          # planned:#N or a strict exception
   check-api-parity.py --baseline-inventory
                                           # print current vs baseline counts
                                           # without failing - use when
                                           # preparing to lower a baseline
 """
 import argparse
+import datetime
 import json
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -289,9 +302,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # principal fragments share GET /api/v1/engine-principals' EnginePrincipal:Read gate but add the
 # page's roles/credentials composition and an audit-gated revocation detail, so they are not
 # ledgered as twins here. Merged with the 207 above, the two Access pages make 212 (207 + 2 + 3),
-# the value the checker reports on the merged tree, not hand-picked. The ADR-1005 exception
-# recorded for the four Dashboard fragments does not cover these rows; whether to extend it is
-# the owner's decision on #5880.
+# the value the checker reports on the merged tree, not hand-picked. The maintainer accepted
+# these rows as a TEMPORARY UI-only exception on 2026-10-15 (see the #5955 note below).
 #
 # Access pages merged onto the Estate changes: the count is the value the checker reports on the
 # merged tree, set from its output.
@@ -299,16 +311,64 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # System General and Data pages (#5873): re-surfaces the untwinned General runtime and analytics
 # events settings as GET /fragments/settings/general-runtime and /fragments/settings/analytics-events,
 # +2. Merged with the Access pages (212 above), the count is 214, the value the checker reports on the
-# merged tree, not hand-picked. Whether the ADR-1005 exception extends to these rows is the owner's decision on #5873.
+# merged tree, not hand-picked. The maintainer accepted these rows as a TEMPORARY UI-only exception
+# on 2026-10-15 (see the #5955 note below).
 #
 # Integrations page, webhook panel (System pages SYS-5, #5872): the two webhook fragments
 # (GET /fragments/settings/webhooks and .../{id}/deliveries) are `composed-of:` the legacy /api/webhooks
 # routes, which are themselves `planned:#2146` with no REST v1 or MCP twin yet, so they cannot be
 # `twinned`: +2. Merged with the General and Access rows above (214), the count is 216, the value the
-# checker reports on the merged tree, not hand-picked. OWNER DECISION PENDING: this raise is not covered by
-# the ADR-1005 exception recorded for the four Dashboard fragments of PR #5859. The twins that would remove
-# it are tracked in #5885.
-BASELINE_UNTWINNED = 216
+# checker reports on the merged tree, not hand-picked. The maintainer accepted these rows as a TEMPORARY
+# UI-only exception on 2026-10-15 (see the #5955 note below). The twins that would remove it are tracked
+# in #5885.
+#
+# #5955: the maintainer accepted the UI-only fragment rows of the Dashboard, Integrations webhooks,
+# General and Access pages (PRs #5859, #5872, #5873, #5880) on 2026-10-15 as TEMPORARY exceptions,
+# not a general waiver (a new UI-only capability needs its own ruling); those 13 rows now carry
+# `exception:#5955 revisit:...`. Rows with exactly one machine twin are no longer plain `twinned`:
+# they carry `twinned-rest-only` / `twinned-mcp-only` (or, for the deliberate #520 no-MCP
+# decisions, `exception:#520 revisit:...`), which count untwinned. 11 rows were reclassified that
+# way, so 216 -> 227, with no change in capability; a 12th (settings developer plugins) is
+# satisfied by the `resource:yuzu://plugin-docs` MCP resource twin and stays `twinned`.
+BASELINE_UNTWINNED = 227
+
+# The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
+# SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
+# issue. Bidirectional like BASELINE_UNTWINNED: lower it in the same change that removes rows.
+GENERIC_PLANNED_STATUS = "planned:#2146"
+GENERIC_PLANNED_ISSUE = 2146
+BASELINE_GENERIC_PLANNED = 176
+
+# A revisit date outside this window is a typo (9999-12-31), a shape error.
+REVISIT_MIN = datetime.date(2026, 1, 1)
+REVISIT_MAX = datetime.date(2028, 12, 31)
+
+# `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named
+# here predate that shape and are grandfathered by capability_id. The set is size-pinned
+# (len == GRANDFATHERED_MAX) and every id must still be a free-form `exception:` row; converting
+# or removing a row means deleting its id AND lowering GRANDFATHERED_MAX in the same change. A swap
+# (remove one id, add another) keeps the size and is caught only by review of the diff: that part
+# is REVIEW-ENFORCED, not machine-enforced. Never extend this set to unblock a new exception.
+GRANDFATHERED_MAX = 17
+GRANDFATHERED_LEGACY_EXCEPTIONS = frozenset({
+    "get.fragments-auto-nvd",
+    "get.fragments-settings-nvd",
+    "get.fragments-hardware-ci-stored-data",
+    "post.api-settings-api-tokens",
+    "delete.api-settings-api-tokens-param",
+    "post.api-v1-users-me-password",
+    "post.api-v1-users-param-password",
+    "get.fragments-settings-analytics",
+    "get.fragments-settings-data-retention",
+    "get.fragments-settings-gateway",
+    "get.fragments-settings-https",
+    "get.fragments-settings-mcp",
+    "get.fragments-settings-plugin-signing",
+    "get.fragments-settings-server-config",
+    "get.fragments-settings-tls",
+    "get.fragments-tar-process-tree-detail",
+    "get.fragments-tar-process-tree-result",
+})
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
@@ -692,13 +752,50 @@ def extract_openapi_paths():
 _TOOLDEF_ENTRY = re.compile(r'^\s{4}\{"([A-Za-z0-9_]+)"', re.MULTILINE)
 
 
+class AnchorError(RuntimeError):
+    """A lexical anchor in mcp_server.cpp is gone (renamed or reformatted):
+    reported as a named error, never a traceback."""
+
+
 def extract_mcp_tools():
     text = MCP_SERVER_CPP.read_text(encoding="utf-8")
-    start = text.index("static const ToolDef kTools[] = {")
+    start = text.find("static const ToolDef kTools[] = {")
     # Matching closing "};" at column 0, mirroring the array's own style.
-    end = text.index("\n};", start)
-    body = text[start:end]
-    return set(_TOOLDEF_ENTRY.findall(body))
+    end = text.find("\n};", start) if start >= 0 else -1
+    if end < 0:
+        raise AnchorError("kTools[] was not found in mcp_server.cpp - the "
+                          "array declaration (the lexical anchor) changed")
+    return set(_TOOLDEF_ENTRY.findall(text[start:end]))
+
+
+_RESOURCE_ENTRY = re.compile(r'\{\s*"(yuzu://[^"]+)"')
+_CPP_TOKEN = re.compile(
+    r'"(?:\\.|[^"\\\n])*"|//[^\n]*|/\*.*?\*/', re.DOTALL)
+
+
+def parse_mcp_resources(text):
+    """URIs of the fixed `static const ResourceDef kResources[] = {...};`
+    entries (resource templates are not included). Block and `//` comments are
+    blanked first, string literals untouched ("yuzu://x" holds a `//`);
+    extract_mcp_tools() has the same pre-existing comment weakness. Raises
+    AnchorError when the array or its entries cannot be found."""
+    start = text.find("static const ResourceDef kResources[] = {")
+    end = text.find("\n};", start) if start >= 0 else -1
+    if end < 0:
+        raise AnchorError("kResources[] was not found in mcp_server.cpp - the "
+                          "array declaration (the lexical anchor) changed")
+    body = _CPP_TOKEN.sub(lambda m: m.group(0) if m.group(0)[0] == '"' else " ",
+                          text[start:end])
+    found = set(_RESOURCE_ENTRY.findall(body))
+    if not found:
+        raise AnchorError("kResources[] in mcp_server.cpp yielded zero "
+                          "entries - the entry layout (the lexical anchor) "
+                          "changed")
+    return found
+
+
+def extract_mcp_resources():
+    return parse_mcp_resources(MCP_SERVER_CPP.read_text(encoding="utf-8"))
 
 
 def all_ref_targets(node, out):
@@ -730,21 +827,94 @@ def resolve_ref(spec, ref):
 # ── Ledger I/O ────────────────────────────────────────────────────────────
 
 STATUS_RE = re.compile(
-    r"^(twinned|retire|planned:#\d+|composed-of:[A-Za-z0-9_.:,\-]+|exception:.+)$"
-)
+    r"(twinned|twinned-rest-only|twinned-mcp-only|retire|planned:#[1-9][0-9]*"
+    r"|composed-of:[A-Za-z0-9_.:,\-]+|exception:.+)", re.ASCII)
+EXCEPTION_RE = re.compile(
+    r"exception:#([1-9][0-9]*) revisit:([0-9]{4}-[0-9]{2}-[0-9]{2}) (.+)", re.ASCII)
+TWINNED_STATUSES = ("twinned", "twinned-rest-only", "twinned-mcp-only")
+RESOURCE_TWIN_PREFIX = "resource:"
+# A reason needs one character outside these categories (control, format, surrogate,
+# private-use, unassigned, spaces/separators, combining marks) and not NUL.
+_NON_CONTENT = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zs", "Zl", "Zp", "Mn", "Me"})
+
+
+def parse_exception(status):
+    """(issue, date_str, reason) for a strict-shaped exception, else None."""
+    m = EXCEPTION_RE.fullmatch(status)
+    if not m or not any(c != "\0" and unicodedata.category(c) not in _NON_CONTENT
+                        for c in m.group(3)):
+        return None
+    return int(m.group(1)), m.group(2), m.group(3)
+
+
+def status_errors(status, capability_id, grandfathered):
+    """Status-shape validation as a pure function (selftested): a list of
+    error strings (empty = clean). An `exception:` status must be strict
+    unless its capability_id is in the closed `grandfathered` set."""
+    if not isinstance(status, str):
+        return [f"status must be a string, got {type(status).__name__}"]
+    if not STATUS_RE.fullmatch(status):
+        return [f"invalid status {status!r}"]
+    if not status.startswith("exception:"):
+        return []
+    parsed = parse_exception(status)
+    if parsed:
+        if parsed[0] == GENERIC_PLANNED_ISSUE:
+            return [f"exception issue #{GENERIC_PLANNED_ISSUE} is the generic "
+                    f"{GENERIC_PLANNED_STATUS} umbrella, not a ruling: {status!r}"]
+        try:
+            d = datetime.date.fromisoformat(parsed[1])
+        except ValueError:
+            return [f"exception revisit date {parsed[1]!r} is not a real date: {status!r}"]
+        if not REVISIT_MIN <= d <= REVISIT_MAX:
+            return [f"exception revisit date {parsed[1]!r} is outside "
+                    f"{REVISIT_MIN}..{REVISIT_MAX}: {status!r}"]
+        return []
+    if capability_id in grandfathered:
+        return []
+    return [f"exception status must be 'exception:#<issue> revisit:<YYYY-MM-DD> "
+            f"<reason>': convert the row to that shape; do NOT extend "
+            f"GRANDFATHERED_LEGACY_EXCEPTIONS (closed, shrink-only), "
+            f"got {status!r}"]
+
+
+def stale_grandfather_errors(rows, grandfathered):
+    """The grandfather set's size must equal GRANDFATHERED_MAX and every id
+    must still name a NON-strict `exception:` row, so it only ever shrinks."""
+    n = len(grandfathered)
+    errors = []
+    if n != GRANDFATHERED_MAX:
+        errors.append(f"GRANDFATHERED_LEGACY_EXCEPTIONS has {n} ids but "
+                      f"GRANDFATHERED_MAX is {GRANDFATHERED_MAX} - the set may "
+                      f"only shrink; lower GRANDFATHERED_MAX to {n} in THIS "
+                      f"change if you removed an id")
+    by_id = {r["capability_id"]: r for r in rows.values()}
+    for cid in sorted(grandfathered):
+        row = by_id.get(cid)
+        if row is None or not row["status"].startswith("exception:"):
+            errors.append(f"GRANDFATHERED_LEGACY_EXCEPTIONS id {cid!r} no longer "
+                          f"names an exception row - remove it from the set and "
+                          f"lower GRANDFATHERED_MAX in THIS change")
+        elif parse_exception(row["status"]):
+            errors.append(f"GRANDFATHERED_LEGACY_EXCEPTIONS id {cid!r} already "
+                          f"uses the strict shape - remove it from the set and "
+                          f"lower GRANDFATHERED_MAX in THIS change")
+    return errors
 
 
 def ledger_files():
     return sorted(LEDGER_DIR.glob("*.json"))
 
 
-def load_ledger():
+def load_ledger(ledger_dir=None):
     """Returns (rows, errors): rows is {(method, canonical_path): row_dict
     with '_domain' and '_file' added}; errors is a list of strings for
     malformed ledger content (duplicate key, bad status, etc.)."""
     rows = {}
     errors = []
-    for f in ledger_files():
+    ids = {}
+    ledger_dir = Path(ledger_dir) if ledger_dir is not None else LEDGER_DIR
+    for f in sorted(ledger_dir.glob("*.json")):
         domain = f.stem
         if domain not in DOMAINS:
             errors.append(f"{f}: filename '{domain}.json' is not one of the "
@@ -758,14 +928,31 @@ def load_ledger():
             errors.append(f"{f}: top level must be a JSON array of rows")
             continue
         for idx, row in enumerate(data):
+            if not isinstance(row, dict):
+                errors.append(f"{f}[{idx}]: row must be a JSON object")
+                continue
             missing = {"method", "path", "capability_id", "rest_v1_twin",
                        "mcp_twin", "status"} - row.keys()
             if missing:
                 errors.append(f"{f}[{idx}]: missing field(s) {sorted(missing)}")
                 continue
-            if not STATUS_RE.match(row["status"]):
-                errors.append(f"{f}[{idx}] ({row['method']} {row['path']}): "
-                               f"invalid status {row['status']!r}")
+            if not all(isinstance(row[k], str) for k in ("method", "path", "capability_id")):
+                errors.append(f"{f}[{idx}]: method, path and capability_id must be strings")
+                continue
+            # A bare-string rest_v1_twin is documentary prose on a non-twinned row.
+            if not (row["rest_v1_twin"] is None or isinstance(row["rest_v1_twin"], (dict, str))) \
+                    or not (row["mcp_twin"] is None or isinstance(row["mcp_twin"], str)):
+                errors.append(f"{f}[{idx}]: rest_v1_twin must be null, a string or an "
+                              f"object, mcp_twin null or a string")
+                continue
+            for msg in status_errors(row["status"], row["capability_id"],
+                                     GRANDFATHERED_LEGACY_EXCEPTIONS):
+                errors.append(f"{f}[{idx}] ({row['method']} {row['path']}): {msg}")
+            if row["capability_id"] in ids:
+                errors.append(f"{f}[{idx}]: duplicate capability_id "
+                               f"{row['capability_id']!r} (already used at "
+                               f"{ids[row['capability_id']]})")
+            ids.setdefault(row["capability_id"], f"{f}[{idx}]")
             key = (row["method"], row["path"])
             if key in rows:
                 errors.append(f"{f}[{idx}]: duplicate ledger key {key} "
@@ -815,6 +1002,13 @@ def bootstrap(bucket_a):
                      encoding="utf-8")
         print(f"check-api-parity --bootstrap: {f}: +{len(new_rows)} row(s)")
     print(f"check-api-parity --bootstrap: {added} row(s) added total")
+    if added:
+        print(f"check-api-parity --bootstrap: NOTE the new rows are "
+              f"{GENERIC_PLANNED_STATUS}, which the gate no longer lets grow - "
+              f"retag each with a specific planned:#N or a strict "
+              f"exception:#N revisit:YYYY-MM-DD <reason>, and raise "
+              f"BASELINE_UNTWINNED for each row that is not born twinned",
+              file=sys.stderr)
     return 0
 
 
@@ -857,7 +1051,10 @@ def render_doc_block(ledger_rows, bucket_b, openapi_paths, allowlist_set, mcp_to
     lines.append("")
     lines.append(f"Ratchet baseline (untwinned rows; shrinks as routes are "
                  f"twinned, or rises only with a reviewed reason stated in "
-                 f"the change that raises it): {BASELINE_UNTWINNED}.")
+                 f"the change that raises it): {BASELINE_UNTWINNED}. Generic "
+                 f"`{GENERIC_PLANNED_STATUS}` placeholder baseline (shrinks "
+                 f"only; a new row names a specific issue): "
+                 f"{BASELINE_GENERIC_PLANNED}.")
     lines.append("")
     lines.append(DOC_END)
     return "\n".join(lines) + "\n"
@@ -899,8 +1096,10 @@ def unmatched_ledger_row_errors(ledger_rows, bucket_a, bucket_b):
             if not status.startswith("exception:"):
                 errors.append(f"{row['_file']}: ledger row {key[0]} {key[1]} is "
                               f"keyed on a REST v1 route - the only legal status "
-                              f"for a v1-keyed row is \"exception:<reason>\" (a "
-                              f"deliberate no-MCP-twin record); v1 routes are "
+                              f"for a v1-keyed row is \"exception:#<issue> "
+                              f"revisit:<YYYY-MM-DD> <reason>\" (a deliberate "
+                              f"no-MCP-twin record; only the closed grandfather "
+                              f"set may omit the issue and date); v1 routes are "
                               f"otherwise covered by the OpenAPI check, not the "
                               f"ledger")
             continue
@@ -911,15 +1110,102 @@ def unmatched_ledger_row_errors(ledger_rows, bucket_a, bucket_b):
     return errors
 
 
-def run_check():
-    bucket_a, bucket_b = extract_all_routes()
-    openapi_paths, _spec = extract_openapi_paths()
-    mcp_tools = extract_mcp_tools()
-    ledger_rows, ledger_errors = load_ledger()
+def twin_errors(ledger_rows, all_extracted, mcp_tools, mcp_resources):
+    """Check 2 as a pure function (selftested). `twinned` needs BOTH twins;
+    `twinned-rest-only` a rest twin and no mcp twin; `twinned-mcp-only` the
+    reverse. An mcp_twin is a tool name or `resource:<uri>` (a fixed
+    kResources[] entry). Every named twin must exist in the extraction."""
+    errors = []
+    for key, row in ledger_rows.items():
+        status = row["status"]
+        if status not in TWINNED_STATUSES:
+            continue
+        where = f"{row['_file']}: {key[0]} {key[1]}"
+        rest, mcp = row["rest_v1_twin"], row["mcp_twin"]
+        need_rest = status != "twinned-mcp-only"
+        need_mcp = status != "twinned-rest-only"
+        if bool(rest) != need_rest or bool(mcp) != need_mcp:
+            errors.append(f"{where} is status={status} but rest_v1_twin is "
+                          f"{'set' if rest else 'null'} and mcp_twin is "
+                          f"{'set' if mcp else 'null'} - a one-sided twin must "
+                          f"be twinned-rest-only / twinned-mcp-only, plain "
+                          f"twinned needs both")
+            continue
+        if rest:
+            twin_key = ((rest.get("method"), canonicalize(rest.get("path", "")))
+                        if isinstance(rest, dict) else rest)
+            if twin_key not in all_extracted:
+                errors.append(f"{where} claims rest_v1_twin {twin_key} which is "
+                              f"not currently registered")
+        if mcp and mcp.startswith(RESOURCE_TWIN_PREFIX):
+            if mcp[len(RESOURCE_TWIN_PREFIX):] not in mcp_resources:
+                errors.append(f"{where} claims mcp_twin {mcp!r} which is not in "
+                              f"mcp_server.cpp's kResources[]")
+        elif mcp and mcp not in mcp_tools:
+            errors.append(f"{where} claims mcp_twin {mcp!r} which is not in "
+                          f"mcp_server.cpp's kTools[]")
+    return errors
+
+
+def ratchet_errors(untwinned, generic_planned):
+    """Check 4 as a pure function (selftested): both counts are pinned
+    BIDIRECTIONALLY. A rise may also mean the baseline was over-lowered."""
+    errors = []
+    for label, const, actual, baseline, advice in (
+            ("untwinned-row count", "BASELINE_UNTWINNED", untwinned,
+             BASELINE_UNTWINNED,
+             "RATCHET mode forbids this. Wire a real REST/MCP twin, or if this "
+             "growth is a deliberate reviewed decision (a newly-discovered "
+             "fragment route with no twin yet), raise BASELINE_UNTWINNED in "
+             "THIS change"),
+            (f"generic {GENERIC_PLANNED_STATUS} row count",
+             "BASELINE_GENERIC_PLANNED", generic_planned,
+             BASELINE_GENERIC_PLANNED,
+             f"do not add {GENERIC_PLANNED_STATUS} rows, name a specific issue "
+             f"(or a twin / exception) instead")):
+        if actual > baseline:
+            errors.append(f"{label} grew ({baseline} -> {actual}) - {advice}. "
+                          f"If you added no rows, {const} was over-lowered "
+                          f"earlier: set it to {actual}.")
+        elif actual < baseline:
+            errors.append(f"{label} improved ({baseline} -> {actual}) but "
+                          f"{const} was not lowered to match - the ratchet "
+                          f"would not be sticky (a later regression back to "
+                          f"{baseline} would pass). Lower {const} to {actual} "
+                          f"in THIS change.")
+    return errors
+
+
+def run_check(ledger_dir=None, doc_path=None, extracted=None):
+    """The CI gate. The keyword arguments let the selftest drive the real
+    wiring over a temporary ledger with synthetic extraction; CI passes none.
+    `extracted` is (bucket_a, bucket_b, openapi_paths, mcp_tools, mcp_resources)."""
+    ledger_rows, ledger_errors = load_ledger(ledger_dir)
+    if ledger_errors:
+        # Reported alone: every later check, above all the ratchet advice, is
+        # only meaningful over a well-formed ledger.
+        for e in ledger_errors:
+            gh("error", f"check-api-parity: {e}")
+        gh("error", "check-api-parity: ledger is malformed - the remaining "
+                    "checks were skipped; fix the errors above first")
+        return 1
+    ledger_doc = Path(doc_path) if doc_path is not None else LEDGER_DOC
+    if extracted is None:
+        try:
+            mcp_resources = extract_mcp_resources()
+            mcp_tools = extract_mcp_tools()
+        except AnchorError as e:
+            gh("error", f"check-api-parity: {e}")
+            return 1
+        bucket_a, bucket_b = extract_all_routes()
+        openapi_paths, _spec = extract_openapi_paths()
+    else:
+        bucket_a, bucket_b, openapi_paths, mcp_tools, mcp_resources = extracted
 
     ok = True
-    for e in ledger_errors:
-        gh("error", f"check-api-parity: {e}")
+    # 0. the legacy-exception grandfather set may only shrink.
+    for err in stale_grandfather_errors(ledger_rows, GRANDFATHERED_LEGACY_EXCEPTIONS):
+        gh("error", f"check-api-parity: {err}")
         ok = False
 
     # 1. every extracted fragment/legacy route must be ledgered.
@@ -928,7 +1214,11 @@ def run_check():
         sources = bucket_a[(method, canon)]
         gh("error", f"check-api-parity: unledgered route {method} {canon} "
                     f"(registered in {sources[0][0]}) - add a row to "
-                    f"scripts/ci/api-parity/<domain>.json")
+                    f"scripts/ci/api-parity/<domain>.json. `--bootstrap` writes "
+                    f"`planned:#2146`, which the gate no longer lets grow: "
+                    f"retag the row with a specific `planned:#N` or a strict "
+                    f"`exception:#N revisit:YYYY-MM-DD <reason>` and raise "
+                    f"BASELINE_UNTWINNED unless the row is born twinned")
         ok = False
 
     # 1b. stale ledger rows (route no longer registered) must be marked
@@ -938,31 +1228,12 @@ def run_check():
         gh("error", f"check-api-parity: {err}")
         ok = False
 
-    # 2. twinned rows must reference twins that actually exist.
+    # 2. twinned rows must reference twins that actually exist, and a
+    #    one-sided twin must use its own status, never plain `twinned`.
     all_extracted = set(bucket_a) | set(bucket_b)
-    for key, row in ledger_rows.items():
-        if row["status"] != "twinned":
-            continue
-        rest_twin = row.get("rest_v1_twin")
-        mcp_twin = row.get("mcp_twin")
-        if not rest_twin and not mcp_twin:
-            gh("error", f"check-api-parity: {row['_file']}: {key[0]} {key[1]} "
-                        f"is status=twinned but names neither rest_v1_twin "
-                        f"nor mcp_twin")
-            ok = False
-            continue
-        if rest_twin:
-            twin_key = (rest_twin.get("method"), canonicalize(rest_twin.get("path", "")))
-            if twin_key not in all_extracted:
-                gh("error", f"check-api-parity: {row['_file']}: {key[0]} {key[1]} "
-                            f"claims rest_v1_twin {twin_key} which is not "
-                            f"currently registered")
-                ok = False
-        if mcp_twin and mcp_twin not in mcp_tools:
-            gh("error", f"check-api-parity: {row['_file']}: {key[0]} {key[1]} "
-                        f"claims mcp_twin {mcp_twin!r} which is not in "
-                        f"mcp_server.cpp's kTools[]")
-            ok = False
+    for err in twin_errors(ledger_rows, all_extracted, mcp_tools, mcp_resources):
+        gh("error", f"check-api-parity: {err}")
+        ok = False
 
     # 2b. composed-of rows must reference real capability ids in the ledger.
     all_capability_ids = {r["capability_id"] for r in ledger_rows.values()}
@@ -996,23 +1267,12 @@ def run_check():
                     f"it from the allowlist")
         ok = False
 
-    # 4. ratchet on the untwinned-row count (bidirectional).
+    # 4. ratchets on the untwinned-row count and the generic placeholder count.
     untwinned = sum(1 for r in ledger_rows.values() if r["status"] != "twinned")
-    if untwinned > BASELINE_UNTWINNED:
-        gh("error", f"check-api-parity: untwinned-row count grew "
-                    f"({BASELINE_UNTWINNED} -> {untwinned}) - RATCHET mode "
-                    f"forbids this. Wire a real REST/MCP twin, or if this "
-                    f"growth is a deliberate reviewed decision (a newly-"
-                    f"discovered fragment route with no twin yet), raise "
-                    f"BASELINE_UNTWINNED in THIS change.")
-        ok = False
-    elif untwinned < BASELINE_UNTWINNED:
-        gh("error", f"check-api-parity: untwinned-row count improved "
-                    f"({BASELINE_UNTWINNED} -> {untwinned}) but "
-                    f"BASELINE_UNTWINNED was not lowered to match - the "
-                    f"ratchet would not be sticky (a later regression back "
-                    f"to {BASELINE_UNTWINNED} would pass). Lower "
-                    f"BASELINE_UNTWINNED to {untwinned} in THIS change.")
+    generic_planned = sum(1 for r in ledger_rows.values()
+                          if r["status"] == GENERIC_PLANNED_STATUS)
+    for err in ratchet_errors(untwinned, generic_planned):
+        gh("error", f"check-api-parity: {err}")
         ok = False
 
     # 5. docs/api-parity-ledger.md's generated block must match a fresh
@@ -1020,14 +1280,14 @@ def run_check():
     #    docs/os-capability-matrix.md). Reuses `allowlist_set` from check 3.
     expected_block = render_doc_block(ledger_rows, bucket_b, openapi_paths,
                                        allowlist_set, mcp_tools)
-    doc_text = LEDGER_DOC.read_text(encoding="utf-8") if LEDGER_DOC.exists() else ""
+    doc_text = ledger_doc.read_text(encoding="utf-8") if ledger_doc.exists() else ""
     actual_block = extract_doc_block(doc_text)
     if actual_block is None:
-        gh("error", f"check-api-parity: {LEDGER_DOC} has no "
+        gh("error", f"check-api-parity: {ledger_doc} has no "
                     f"'{DOC_BEGIN[:40]}...' / '{DOC_END}' generated block")
         ok = False
     elif actual_block != expected_block:
-        gh("error", f"check-api-parity: {LEDGER_DOC}'s generated block is "
+        gh("error", f"check-api-parity: {ledger_doc}'s generated block is "
                     f"stale - regenerate with `python3 scripts/ci/"
                     f"check-api-parity.py --render-doc` and splice it "
                     f"between the BEGIN/END GENERATED markers")
@@ -1035,10 +1295,12 @@ def run_check():
 
     if ok:
         print(f"check-api-parity: OK ({len(ledger_rows)} ledger rows, "
-              f"{untwinned} untwinned == baseline {BASELINE_UNTWINNED}; "
+              f"{untwinned} untwinned == baseline {BASELINE_UNTWINNED}, "
+              f"{generic_planned} generic {GENERIC_PLANNED_STATUS} == baseline "
+              f"{BASELINE_GENERIC_PLANNED}; "
               f"{len(bucket_b)} v1 routes, {len(openapi_paths)} OpenAPI "
               f"entries, {len(allowlist_set)} allowlisted; {len(mcp_tools)} "
-              f"MCP tools)")
+              f"MCP tools, {len(mcp_resources)} MCP resources)")
     return 0 if ok else 1
 
 
@@ -1076,6 +1338,9 @@ def baseline_inventory():
     print(f"ledger rows                       : {len(ledger_rows)}")
     print(f"untwinned rows                     : {untwinned} "
           f"(baseline {BASELINE_UNTWINNED})")
+    print(f"generic {GENERIC_PLANNED_STATUS} rows           : "
+          f"{sum(1 for r in ledger_rows.values() if r['status'] == GENERIC_PLANNED_STATUS)} "
+          f"(baseline {BASELINE_GENERIC_PLANNED})")
     print(f"api/v1 routes extracted            : {len(bucket_b)}")
     print(f"openapi paths                      : {len(openapi_paths)}")
     print(f"api/v1 missing from openapi        : {len(missing)} "
@@ -1098,11 +1363,26 @@ def _selftest():
     to prevent in the PRODUCT, and neither would be caught by running the
     script against the real tree, since the real tree doesn't (yet) contain
     either shape. Runs no filesystem I/O against the real source tree."""
+    import contextlib
+    import io
+    import tempfile
+
     failures = []
 
     def check(cond, label):
         if not cond:
             failures.append(label)
+
+    @contextlib.contextmanager
+    def _patched(**kv):
+        """Temporarily rebinds module globals so a fixture isolates one defect."""
+        g = globals()
+        saved = {k: g[k] for k in kv}
+        g.update(kv)
+        try:
+            yield
+        finally:
+            g.update(saved)
 
     # -- parse_literal_at: the two literal forms it must recognise --------
     lit, end = parse_literal_at('"/api/v1/foo"', 0)
@@ -1185,6 +1465,165 @@ def _selftest():
     check(len(errs) == 1 and "retire" in errs[0],
           f"1b: an exception row on an UNREGISTERED route must still be stale, got {errs}")
 
+    # -- status_errors: strict exception shape + grandfather set (#5955) ----
+    span = REVISIT_MAX - REVISIT_MIN
+    day_a = REVISIT_MIN + span // 3  # every fixture date derives from the window
+    one_day = datetime.timedelta(days=1)
+    gf = frozenset({"legacy.id"})
+    strict = f"exception:#5955 revisit:{day_a} UI-only fragment"
+    for ok_status in (strict, "twinned", "twinned-rest-only", "twinned-mcp-only",
+                      "retire", "planned:#2146", "composed-of:a.b,c-d",
+                      f"exception:#7 revisit:{REVISIT_MIN} r", f"exception:#7 revisit:{REVISIT_MAX} r"):
+        check(status_errors(ok_status, "new.id", gf) == [], f"status: {ok_status!r} must be accepted")
+    for bad in ("exception:no issue or date", f"exception:#5955 revisit:{day_a}",
+                f"exception:#5955 revisit:{day_a}   ", "exception:#5955 revisit:2026-13-45 r",
+                "exception:#5955 revisit:9999-12-31 r", "exception:#5955 revisit:20261130 r",
+                "exception:#5955 revisit:soon r", f"exception:#7 revisit:{REVISIT_MAX + one_day} r",
+                f"exception:#7 revisit:{REVISIT_MIN - one_day} r", f"exception:# revisit:{day_a} r",
+                f"exception:#0 revisit:{day_a} r", f"exception:#٥ revisit:{day_a} r",
+                f"exception:#5955 revisit:{day_a} ​​", f"exception:#2146 revisit:{day_a} r",
+                "twinned\n", "planned:#2146\n", strict + "\n",
+                "planned:#0", "twinned-both"):
+        check(len(status_errors(bad, "new.id", gf)) == 1, f"status: {bad!r} must be rejected")
+    check(status_errors("exception:#520", "legacy.id", gf) == [], "status: a grandfathered legacy exception is accepted")
+    errs = status_errors("exception:#520", "other.id", gf)
+    check(len(errs) == 1 and "do NOT extend" in errs[0], f"status: a legacy-shaped exception outside the set, got {errs}")
+    check(len(status_errors(None, "x", gf)) == 1, "status: a non-string status must be rejected without raising")
+
+    def _lrow(cid, status):
+        return {"capability_id": cid, "status": status, "_file": "x.json"}
+    with _patched(GRANDFATHERED_MAX=1):
+        check(stale_grandfather_errors({("GET", "/a"): _lrow("legacy.id", "exception:#520")}, gf) == [],
+              "grandfather: a live legacy row is clean")
+        for label, rows_g in (("gone", {}), ("converted", {("GET", "/a"): _lrow("legacy.id", "twinned")}),
+                              ("already strict", {("GET", "/a"): _lrow("legacy.id", strict)})):
+            check(len(stale_grandfather_errors(rows_g, gf)) == 1, f"grandfather: a {label} id must be stale")
+    check(len(stale_grandfather_errors({}, frozenset())) == 1, "grandfather: size must equal GRANDFATHERED_MAX")
+    check(len(GRANDFATHERED_LEGACY_EXCEPTIONS) == GRANDFATHERED_MAX, "constants: the real set matches its pinned size")
+
+    # -- parse_mcp_resources: fixed entries only, comments ignored ----------
+    res = parse_mcp_resources(
+        'static const ResourceDef kResources[] = {\n    {"yuzu://a", "A", "d", "m"},\n'
+        '    /* {"yuzu://hidden", "H", "d", "m"}, */\n    // {"yuzu://hidden2", "H", "d", "m"},\n'
+        '    {\n        "yuzu://b", "B", "see http://x // not a comment", "m"},\n};\n'
+        'static const ResourceTemplateDef kResourceTemplates[] = {\n    {"yuzu://t/{n}", "T", "d", "m"},\n};\n')
+    check(res == {"yuzu://a", "yuzu://b"}, f"resources: comments and templates are excluded, got {res}")
+    for bad_cpp, why in (("int x;\n", "was not found"),
+                         ("static const ResourceDef kResources[] = {\n};\n", "zero entries")):
+        try:
+            parse_mcp_resources(bad_cpp)
+            check(False, "resources: an anchor miss must raise AnchorError")
+        except AnchorError as e:
+            check("kResources[]" in str(e) and why in str(e),
+                  f"resources: the error must name the symbol and say {why!r}, got {e}")
+
+    # -- twin_errors: one-sided twins need their own status -----------------
+    def _trow(status, rest, mcp):
+        return {"status": status, "_file": "x.json", "rest_v1_twin": rest, "mcp_twin": mcp}
+    rest_tw = {"method": "GET", "path": "/api/v1/a"}
+    routes, tools, resources = {("GET", "/api/v1/a")}, {"a_tool"}, {"yuzu://r"}
+    k = ("GET", "/fragments/a")
+    for status, rest, mcp, want in (
+            ("twinned", rest_tw, "a_tool", 0), ("twinned", rest_tw, "resource:yuzu://r", 0),
+            ("twinned-rest-only", rest_tw, None, 0), ("twinned-mcp-only", None, "a_tool", 0),
+            ("twinned", rest_tw, None, 1), ("twinned", None, "a_tool", 1),
+            ("twinned-rest-only", rest_tw, "a_tool", 1), ("twinned-mcp-only", rest_tw, "a_tool", 1),
+            ("twinned", rest_tw, "resource:yuzu://gone", 1), ("twinned", rest_tw, "gone_tool", 1),
+            ("twinned", rest_tw, "yuzu://r", 1),
+            ("twinned-rest-only", {"method": "GET", "path": "/api/v1/gone"}, None, 1)):
+        errs = twin_errors({k: _trow(status, rest, mcp)}, routes, tools, resources)
+        check(len(errs) == want, f"twin: {status} rest={bool(rest)} mcp={mcp!r}: want {want} error(s), got {errs}")
+    errs = twin_errors({k: _trow("twinned", rest_tw, "resource:yuzu://gone")}, routes, tools, resources)
+    check(len(errs) == 1 and "kResources" in errs[0], f"twin: an unregistered resource names kResources, got {errs}")
+
+    # -- ratchet_errors: both pins are bidirectional ------------------------
+    with _patched(BASELINE_UNTWINNED=10, BASELINE_GENERIC_PLANNED=4):
+        check(ratchet_errors(10, 4) == [], "ratchet: equal counts are clean")
+        for u, g, text in ((11, 4, "BASELINE_UNTWINNED"), (9, 4, "Lower BASELINE_UNTWINNED to 9"),
+                           (10, 5, "name a specific issue"), (10, 3, "Lower BASELINE_GENERIC_PLANNED to 3")):
+            errs = ratchet_errors(u, g)
+            check(len(errs) == 1 and text in errs[0], f"ratchet: ({u},{g}) want {text!r}, got {errs}")
+        check("over-lowered" in ratchet_errors(10, 5)[0], "ratchet: a rise also mentions over-lowering")
+
+    # -- run_check wiring over a temporary ledger (positive control) --------
+    def _mk(name, status, **kw):
+        path = f"/fragments/{name}"
+        row = {"method": "GET", "path": path, "capability_id": capability_id_for("GET", path),
+               "rest_v1_twin": None, "mcp_twin": None, "status": status}
+        row.update(kw)
+        return row
+
+    def _drive(rows, patch=None, doc=True, synthetic=True):
+        """Writes a ledger dir, tunes the baselines and grandfather set to the
+        synthetic ledger (then applies `patch`, the one defect under test),
+        renders the matching generated doc, and runs the REAL run_check."""
+        legacy = frozenset(r["capability_id"] for r in rows if isinstance(r, dict)
+                           and isinstance(r.get("status"), str)
+                           and r["status"].startswith("exception:") and not parse_exception(r["status"]))
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as d:
+            for dom in DOMAINS:
+                (Path(d) / f"{dom}.json").write_text(json.dumps(rows if dom == "other" else []), encoding="utf-8")
+            with _patched(GRANDFATHERED_LEGACY_EXCEPTIONS=legacy, GRANDFATHERED_MAX=len(legacy)):
+                loaded, load_errs = load_ledger(d)
+            tuned, extracted = {}, None
+            if not load_errs:
+                tuned = {"BASELINE_UNTWINNED": sum(1 for r in loaded.values() if r["status"] != "twinned"),
+                         "BASELINE_GENERIC_PLANNED": sum(1 for r in loaded.values()
+                                                         if r["status"] == GENERIC_PLANNED_STATUS),
+                         "GRANDFATHERED_LEGACY_EXCEPTIONS": legacy, "GRANDFATHERED_MAX": len(legacy)}
+                opt = ("OPTIONS", canonicalize("/api/v1/{param}"))
+                extracted = ({k_: [("s.cpp", k_[1])] for k_, r in loaded.items() if r["status"] != "retire"},
+                             {("GET", "/api/v1/a"): [], opt: []}, {("GET", "/api/v1/a")}, tools, resources)
+            tuned.update(patch or {})
+            doc_path = Path(d) / "ledger.md"
+            err = io.StringIO()
+            with _patched(**tuned):
+                if extracted and doc:
+                    allow = {(m, canonicalize(p)) for m, p, _r in ALLOWLIST_OPENAPI_MISSING}
+                    doc_path.write_text(render_doc_block(loaded, extracted[1], extracted[2], allow, tools),
+                                        encoding="utf-8")
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = run_check(ledger_dir=d, doc_path=doc_path, extracted=extracted if synthetic else None)
+            return rc, err.getvalue()
+
+    def expect(label, result, rc, *needles, absent=()):
+        got, out = result
+        check(got == rc and all(n in out for n in needles) and not any(a in out for a in absent)
+              and "Traceback" not in out, f"drive({label}): want rc={rc} with {needles}, got rc={got}: {out[:300]}")
+
+    pl = _mk("pl", GENERIC_PLANNED_STATUS)
+    base_rows = [_mk("tw", "twinned", rest_v1_twin=rest_tw, mcp_twin="a_tool"),
+                 _mk("twr", "twinned", rest_v1_twin=rest_tw, mcp_twin="resource:yuzu://r"),
+                 _mk("ro", "twinned-rest-only", rest_v1_twin=rest_tw), pl,
+                 _mk("co", "composed-of:" + pl["capability_id"]),
+                 _mk("leg", "exception:#520 free-form legacy text"),
+                 _mk("s1", f"exception:#5955 revisit:{day_a} ui-only"), _mk("gone", "retire")]
+    rc0, out0 = _drive(base_rows)
+    check(rc0 == 0 and "::error::" not in out0, f"drive(control): the clean ledger must pass, got {rc0}: {out0[:300]}")
+    expect("stale-doc", _drive(base_rows, doc=False), 1, "generated block")
+    expect("bad-status", _drive(base_rows + [_mk("bad", "planned:#2146\n")]), 1, "invalid status", absent=("BASELINE",))
+    expect("dup-id", _drive(base_rows + [_mk("a-b", "retire"), _mk("a/b", "retire")]), 1, "duplicate capability_id")
+    expect("malformed", _drive(["not an object", _mk("n", None), dict(_mk("p", "retire"), path=None)]), 1,
+           "must be a JSON object", "status must be a string", "must be strings")
+    expect("composed-of", _drive(base_rows + [_mk("c2", "composed-of:no.such.id")]), 1, "unknown capability id")
+    expect("plain-twinned", _drive(base_rows + [_mk("t2", "twinned", rest_v1_twin=rest_tw)]), 1, "twinned-rest-only")
+    expect("bad-resource", _drive(base_rows + [_mk("t3", "twinned", rest_v1_twin=rest_tw,
+                                                   mcp_twin="resource:yuzu://gone")]), 1, "kResources")
+    expect("new-free-form", _drive(base_rows + [_mk("e2", "exception:#520 legacy two")],
+                                   patch={"GRANDFATHERED_LEGACY_EXCEPTIONS": frozenset({"get.fragments-leg"}),
+                                          "GRANDFATHERED_MAX": 1}), 1, "do NOT extend")
+    expect("stale-grandfather", _drive(base_rows, patch={"GRANDFATHERED_LEGACY_EXCEPTIONS": frozenset({"ghost.id", "get.fragments-leg"}),
+                                                         "GRANDFATHERED_MAX": 2}), 1, "no longer names an exception row")
+    expect("grandfather-size", _drive(base_rows, patch={"GRANDFATHERED_MAX": 5}), 1, "lower GRANDFATHERED_MAX to 1")
+    expect("planned-rise", _drive(base_rows, patch={"BASELINE_GENERIC_PLANNED": 0}), 1, "do not add planned:#2146 rows")
+    expect("planned-fall", _drive(base_rows, patch={"BASELINE_GENERIC_PLANNED": 2}), 1, "Lower BASELINE_GENERIC_PLANNED to 1")
+    expect("untwinned-rise", _drive(base_rows, patch={"BASELINE_UNTWINNED": 1}), 1, "RATCHET")
+    expect("untwinned-fall", _drive(base_rows, patch={"BASELINE_UNTWINNED": 99}), 1, "Lower BASELINE_UNTWINNED")
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dc:
+        cpp = Path(dc) / "mcp_server.cpp"
+        cpp.write_text("int nothing_here;\n", encoding="utf-8")
+        expect("anchor-miss", _drive(base_rows, patch={"MCP_SERVER_CPP": cpp}, synthetic=False), 1, "kResources[]")
+
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")
         return 1
@@ -1199,7 +1638,9 @@ def main():
                      help="dump raw extraction as JSON and exit")
     ap.add_argument("--bootstrap", action="store_true",
                      help="add default (planned:#2146) rows for any "
-                          "currently-unledgered fragment/legacy route")
+                          "currently-unledgered fragment/legacy route; the gate "
+                          "does not let planned:#2146 grow, so retag each new row "
+                          "with a specific planned:#N or a strict exception")
     ap.add_argument("--baseline-inventory", action="store_true",
                      help="print current vs baseline counts without failing")
     ap.add_argument("--render-doc", action="store_true",
@@ -1213,16 +1654,20 @@ def main():
 
     if args.selftest:
         return _selftest()
-    if args.dump_json:
-        return dump_json()
-    if args.baseline_inventory:
-        return baseline_inventory()
-    if args.render_doc:
-        return render_doc()
-    if args.bootstrap:
-        bucket_a, _bucket_b = extract_all_routes()
-        return bootstrap(bucket_a)
-    return run_check()
+    try:
+        if args.dump_json:
+            return dump_json()
+        if args.baseline_inventory:
+            return baseline_inventory()
+        if args.render_doc:
+            return render_doc()
+        if args.bootstrap:
+            bucket_a, _bucket_b = extract_all_routes()
+            return bootstrap(bucket_a)
+        return run_check()
+    except AnchorError as e:
+        gh("error", f"check-api-parity: {e}")
+        return 1
 
 
 if __name__ == "__main__":

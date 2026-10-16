@@ -326,7 +326,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/mcp-server.md:21` already states explicitly requires "its own
        security-guardian-reviewed amendment... not a side effect of a
        routine REST-twin PR." This stands as a standing exception until
-       that amendment happens, not a numbered issue with a revisit date.
+       that amendment happens, not a numbered issue with a revisit date. (The
+       2026-10-15 entry below dates the three #4031 enrollment/OIDC rows for
+       re-confirmation; the eight #4028 rows keep their undated legacy form.)
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -594,6 +596,23 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        admits them, confined), audits every
        served page or file, and answers a degraded read with `503`, never an
        empty `200`; wire reference: `docs/user-manual/rest-api.md`.
+
+   - **2026-10-15 - temporary UI-only fragment exceptions (Dashboard,
+     Integrations webhooks, General, Access).** The maintainer accepted these
+     server-rendered fragments, which have no REST v1 or MCP twin yet, as
+     exceptions to Decision 4 (#5859, #5872, #5873, #5880). The acceptance is
+     quoted, with its 2026-10-15 date, in the body of #5955 (opened
+     2026-10-16); the approving review of the change that carries this entry
+     is the evidence artefact. The exceptions are temporary, 13 rows at
+     acceptance, and are to be revisited by **2026-11-30**. This is not a
+     general waiver: a new UI-only capability needs its own ruling. The list
+     of record is issue #5955 plus the rows carrying
+     `exception:#5955 revisit:2026-11-30` in `scripts/ci/api-parity/*.json`.
+     The gate requires the dated shape for any new exception but does not yet
+     cap how many there are, so growth beyond these rows is review-enforced
+     for now. The #520 no-MCP rows (the three #4031 enrollment/OIDC read
+     twins) carry a re-confirmation date in the same shape, which re-confirms
+     that standing decision and does not retire it.
 
 ## Interim rules (until the named follow-ups ship)
 
