@@ -228,10 +228,9 @@ a `*_FILES` constant without registering it, or replacing a finder with a no-op 
 the selfcheck. main() additionally records, per group, the files it listed and the files whose
 finder it actually ran, and fails unless the groups it evaluated are exactly
 REQUIRED_RULE_GROUPS and every listed file was read and scanned, so a loop that is emptied, a
-finder result that is dropped or a group sliced off the registry cannot print OK. The
-selfcheck (`_selfcheck_registry_detects_removal`) exercises two of the three registry edits, a
-removed group and a no-op finder; an unregistered `*_FILES` constant is exercised there too, by
-the third case below.
+finder result that is dropped inside the loop or a group sliced off the registry cannot print
+OK. The selfcheck (`_selfcheck_registry_detects_removal`) exercises all three registry edits: a
+removed group, a no-op finder and an unregistered `*_FILES` constant.
 
 WHITESPACE AND LOGGING FORMS CLOSED. A marker or accessor call is matched with whitespace allowed
 before its parenthesis (`last_error ()`, `PQerrorMessage (c)`, `.error ()`, `.agent_id ()`), a
@@ -242,9 +241,12 @@ brace/parenthesis init) as well as `auto` / `std::string`.
 STILL OPEN (stated plainly; every check is lexical, a regression net and not a proof):
   - the scan-completeness ledger in main() fails a loop that did less than the registry lists,
     but deleting the selfcheck calls or the ledger's verify() call themselves, or editing
-    RULE_GROUPS, REQUIRED_RULE_GROUPS and the `*_FILES` constants together, is not self-detected;
-  - a hostname alias declared as `T const& h = ...` or `auto const& h = ...` (const after the type
-    name) is not tracked, and neither is a hostname logged through `spdlog::get(std::string("x"))->`
+    RULE_GROUPS, REQUIRED_RULE_GROUPS and the `*_FILES` constants together, is not self-detected,
+    and neither is replacing the ledger's collected hits (`ledger.hits(...)`) with an empty list
+    after the loop, or a ledger that records a file as evaluated while discarding the finder's
+    hit lines;
+  - a hostname alias declared as `T const& h = ...` or `auto const& h = ...` (const before the
+    reference) is not tracked, and neither is a hostname logged through `spdlog::get(std::string("x"))->`
     (a non-literal registry lookup argument) or `logger->log(level, ...)` (the explicit-level
     form); `spdlog::log(level, ...)` is refused outright by check 5 in its files only;
   - a value copied into a local, a renamed local or a function parameter before it is printed is
@@ -2177,12 +2179,15 @@ def _selfcheck_registry_detects_removal() -> None:
 class _ScanLedger:
     """What main() actually did, so a loop that silently did less than the registry says fails.
 
-    `begin(group, files)` records the files a group listed; `scan(group, rel, text)` runs the
-    finder and is the ONLY way a result reaches the hit lists; it notes that `rel` was evaluated. `verify`
-    fails unless the groups begun are exactly REQUIRED_RULE_GROUPS, each listed at least one
-    file, and every listed file was evaluated once. Not self-detected: deleting the
-    selfcheck calls or the `verify` call itself, or editing REQUIRED_RULE_GROUPS together with
-    RULE_GROUPS (the module docstring's STILL OPEN list).
+    `begin(group, files)` records the files the caller says a group listed; `scan(group, rel,
+    text)` runs the finder and is the ONLY way a result reaches the hit lists; it notes that
+    `rel` was evaluated. `verify` fails unless the groups begun are exactly REQUIRED_RULE_GROUPS
+    and, for every group in the registry, the files evaluated equal the registry's OWN file list
+    (`group.files()` recomputed here, not the list the caller handed to `begin`), so a caller that
+    slices or empties its list before or after `begin` is detected. Not self-detected: deleting
+    the selfcheck calls or the `verify` call itself, editing REQUIRED_RULE_GROUPS together with
+    RULE_GROUPS, or a ledger that records a file as evaluated but discards the finder's hit lines
+    (the module docstring's STILL OPEN list).
     """
 
     def __init__(self) -> None:
@@ -2216,12 +2221,14 @@ class _ScanLedger:
             problems.append(
                 f"evaluated rule groups {sorted(self.listed)} != required {sorted(REQUIRED_RULE_GROUPS)}"
             )
-        for name, files in self.listed.items():
-            if not files:
-                problems.append(f"{name}: the group listed no files")
-            elif sorted(self.evaluated(name)) != sorted(files):
+        for group in RULE_GROUPS:
+            expected = group.files()  # the registry's own list, not what main() passed to begin()
+            if not expected:
+                problems.append(f"{group.name}: the group lists no files")
+            elif sorted(self.evaluated(group.name)) != sorted(expected):
                 problems.append(
-                    f"{name}: listed {len(files)} file(s) but evaluated {len(self.evaluated(name))}"
+                    f"{group.name}: lists {len(expected)} file(s) but evaluated "
+                    f"{len(self.evaluated(group.name))}"
                 )
         return problems
 
