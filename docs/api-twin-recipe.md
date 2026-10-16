@@ -588,7 +588,8 @@ see §5 for which chokepoints apply.
 12. **F1 ledger row flip.** The parity ledger (`docs/api-parity-ledger.md` plus the per-domain
     files at `scripts/ci/api-parity/<domain>.json`, gated by `scripts/ci/check-api-parity.py`) has
     one row per capability with a `status` of `twinned` (BOTH a REST v1 and an MCP twin; the
-    `mcp_twin` may be `resource:<uri>` for a fixed `kResources[]` entry) / `twinned-rest-only` /
+    `mcp_twin` may be `resource:<uri>` for a fixed `kResources[]` entry) / `twinned-rest-only` (for
+    a NEW one, name the tracker for the missing side in an issue or an ADR-1005 entry) /
     `twinned-mcp-only` / `planned:#N` / `composed-of:<ids>` /
     `exception:#<issue> revisit:<YYYY-MM-DD> <reason>` / `retire`. A twin PR's last step is
     flipping its row to `twinned`, then lowering the baselines in the script to the values the
@@ -605,8 +606,9 @@ see §5 for which chokepoints apply.
     amount merge cleanly yet fail the ratchet on the merged tree, and two PRs that each remove a
     different grandfathered id and lower the max merge clean and leave the set at 15 with the max
     at 16. The fix is to set the constants to the values the checker prints, then re-run
-    `--render-doc` and splice the block again. Name the tracker for a `twinned-rest-only` row's
-    missing side in an issue or an ADR-1005 entry.
+    `--render-doc` and splice the block again. A route rename changes its derived
+    `capability_id`: rename the id in the JSON (a grandfathered row that is renamed must be
+    converted to the strict shape, since the set is keyed by id).
 
 ---
 

@@ -48,7 +48,8 @@ WHAT IT CHECKS
   2. Every ledger row whose status is "twinned" names BOTH a `rest_v1_twin`
      and an `mcp_twin`; a row with only one uses "twinned-rest-only" /
      "twinned-mcp-only". An `mcp_twin` is a tool name, or `resource:<uri>`
-     for a fixed kResources[] entry. Every named twin must actually exist in
+     for a fixed kResources[] entry. Every named twin, and an object-form
+     `rest_v1_twin` on a row of ANY status, must actually exist in
      the CURRENT extraction (a twin claim referencing a renamed/removed
      route, tool or resource is a lie, and this catches it going stale).
   2b. Every `composed-of:` row names capability ids that exist in the ledger.
@@ -904,16 +905,16 @@ def stale_grandfather_errors(rows, grandfathered):
                       f"GRANDFATHERED_MAX {GRANDFATHERED_MAX}: lower "
                       f"GRANDFATHERED_MAX to {n} in THIS change")
     by_id = {r["capability_id"]: r for r in rows.values()}
+    fix = ("remove this id and leave GRANDFATHERED_MAX alone" if n > GRANDFATHERED_MAX
+           else f"remove it from the set and lower GRANDFATHERED_MAX to {n - 1} in THIS change")
     for cid in sorted(grandfathered):
         row = by_id.get(cid)
         if row is None or not row["status"].startswith("exception:"):
             errors.append(f"GRANDFATHERED_LEGACY_EXCEPTIONS id {cid!r} no longer "
-                          f"names an exception row - remove it from the set and "
-                          f"lower GRANDFATHERED_MAX in THIS change")
+                          f"names an exception row - {fix}")
         elif parse_exception(row["status"]):
             errors.append(f"GRANDFATHERED_LEGACY_EXCEPTIONS id {cid!r} already "
-                          f"uses the strict shape - remove it from the set and "
-                          f"lower GRANDFATHERED_MAX in THIS change")
+                          f"uses the strict shape - {fix}")
     return errors
 
 
@@ -957,7 +958,7 @@ def load_ledger(ledger_dir=None):
                            f"declared domains {DOMAINS}")
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError, RecursionError) as e:
+        except (ValueError, OSError, RecursionError) as e:  # ValueError: bad JSON/UTF-8, >4300-digit ints
             errors.append(f"{f}: invalid JSON ({str(e)[:120]})")
             continue
         if not isinstance(data, list):
@@ -1126,8 +1127,9 @@ def unmatched_ledger_row_errors(ledger_rows, bucket_a, bucket_b):
                               f"keyed on a REST v1 route - the only legal status "
                               f"for a v1-keyed row is \"exception:#<issue> "
                               f"revisit:<YYYY-MM-DD> <reason>\" (a deliberate "
-                              f"no-MCP-twin record; only the closed grandfather "
-                              f"set may omit the issue and date); v1 routes are "
+                              f"no-MCP-twin record; only the size-pinned "
+                              f"grandfather set may omit the issue and date, "
+                              f"and extending it is review-enforced); v1 routes are "
                               f"otherwise covered by the OpenAPI check, not the "
                               f"ledger")
             continue
@@ -1198,8 +1200,9 @@ def ratchet_errors(untwinned, generic_planned):
             (f"generic {GENERIC_PLANNED_STATUS} row count",
              "BASELINE_GENERIC_PLANNED", generic_planned,
              BASELINE_GENERIC_PLANNED,
-             f"do not add {GENERIC_PLANNED_STATUS} rows, name a specific issue "
-             f"(or a twin / exception) instead")):
+             f"this count should never rise: investigate (a merge race, an "
+             f"over-lowered constant, or a newly added {GENERIC_PLANNED_STATUS} "
+             f"row - name a specific issue, a twin or an exception instead)")):
         if actual > baseline:
             errors.append(f"{label} grew ({baseline} -> {actual}) - {advice}. "
                           f"If you added no rows, {const} was over-lowered "
@@ -1242,7 +1245,8 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None):
         bucket_a, bucket_b, openapi_paths, mcp_tools, mcp_resources = extracted
 
     ok = True
-    # 0. the legacy-exception grandfather set may only shrink.
+    # 0. the grandfather set is size-pinned to GRANDFATHERED_MAX (growth and
+    #    shrinkage both fail); extend+bump, swap and rebind are review-only.
     for err in stale_grandfather_errors(ledger_rows, GRANDFATHERED_LEGACY_EXCEPTIONS):
         gh("error", f"check-api-parity: {err}")
         ok = False
@@ -1549,6 +1553,17 @@ def _selftest():
                                         frozenset({"legacy.id", "legacy.two"}))
         check(errs == ["GRANDFATHERED_LEGACY_EXCEPTIONS grew (2 ids, GRANDFATHERED_MAX 1): remove the added "
                        "id(s); GRANDFATHERED_MAX is never raised"], f"grandfather: growth text, got {errs}")
+    with _patched(GRANDFATHERED_MAX=1):
+        # n > MAX with a strict id: never advise raising/lowering the max.
+        errs = stale_grandfather_errors({("GET", "/a"): _lrow("legacy.id", strict),
+                                         ("GET", "/b"): _lrow("legacy.two", "exception:#520")},
+                                        frozenset({"legacy.id", "legacy.two"}))
+        check(len(errs) == 2 and "leave GRANDFATHERED_MAX alone" in errs[1]
+              and "lower GRANDFATHERED_MAX" not in " ".join(errs), f"grandfather: grow + strict id text, got {errs}")
+        for rows_g in ({}, {("GET", "/a"): _lrow("legacy.id", strict)}):
+            errs = stale_grandfather_errors(rows_g, gf)
+            check(len(errs) == 1 and "lower GRANDFATHERED_MAX to 0 in THIS change" in errs[0],
+                  f"grandfather: stale-id advice at n <= MAX, got {errs}")
     with _patched(GRANDFATHERED_MAX=3):
         errs = stale_grandfather_errors({("GET", "/a"): _lrow("legacy.id", "exception:#520")}, gf)
         check(len(errs) == 1 and "lower GRANDFATHERED_MAX to 1 in THIS change" in errs[0],
@@ -1624,7 +1639,7 @@ def _selftest():
     with _patched(BASELINE_UNTWINNED=10, BASELINE_GENERIC_PLANNED=4):
         check(ratchet_errors(10, 4) == [], "ratchet: equal counts are clean")
         for u, g, text in ((11, 4, "BASELINE_UNTWINNED"), (9, 4, "Lower BASELINE_UNTWINNED to 9"),
-                           (10, 5, "name a specific issue"), (10, 3, "Lower BASELINE_GENERIC_PLANNED to 3")):
+                           (10, 5, "should never rise"), (10, 3, "Lower BASELINE_GENERIC_PLANNED to 3")):
             errs = ratchet_errors(u, g)
             check(len(errs) == 1 and text in errs[0] and "re-run --render-doc" in errs[0],
                   f"ratchet: ({u},{g}) want {text!r} and the splice hint, got {errs}")
@@ -1713,7 +1728,7 @@ def _selftest():
     v1_row = _mk("v1x", "planned:#5", path="/api/v1/a", capability_id="get.api-v1-a")
     cases = (  # label, rows, kwargs, needles (each failing case differs from the control by ONE defect)
         ("missing-doc", base_rows, {"doc": "missing"}, ("has no",)),
-        ("stale-doc", base_rows, {"doc": "stale"}, ("generated block is stale",)),
+        ("stale-doc", base_rows, {"doc": "stale"}, ("generated block is stale", "--render-doc")),
         ("bad-status", base_rows + [_mk("bad", "planned:#2146\n")], {}, ("invalid status",)),
         ("dup-id", base_rows + [_mk("a-b", "retire"), _mk("a/b", "retire")], {}, ("duplicate capability_id",)),
         ("dup-key", base_rows + [_mk("tw", "retire")], {}, ("duplicate ledger key",)),
@@ -1725,6 +1740,8 @@ def _selftest():
         ("domain-guard", base_rows, {"extra_files": {"foo.json": "[]"}}, ("not one of the declared domains",)),
         ("top-level", base_rows, {"extra_files": {"tar.json": "5"}}, ("top level must be a JSON array",)),
         ("bad-bytes", base_rows, {"extra_files": {"tar.json": b"\xff\xfe\x00["}}, ("invalid JSON",)),
+        ("bad-syntax", base_rows, {"extra_files": {"tar.json": "{bad"}}, ("invalid JSON",)),
+        ("huge-int", base_rows, {"extra_files": {"tar.json": "1" * 5000}}, ("invalid JSON",)),
         ("too-deep", base_rows, {"extra_files": {"tar.json": "[" * 200000}}, ("invalid JSON",)),
         ("composed-of", base_rows + [_mk("c2", "composed-of:no.such.id")], {}, ("unknown capability id",)),
         ("plain-twinned", base_rows + [_mk("t2", "twinned", rest_v1_twin=rest_tw)], {}, ("plain twinned needs BOTH",)),
@@ -1738,15 +1755,16 @@ def _selftest():
                                                     "GRANDFATHERED_MAX": 2}}, ("no longer names an exception row",)),
         ("grandfather-shrink", base_rows, {"patch": {"GRANDFATHERED_MAX": 5}}, ("lower GRANDFATHERED_MAX to 1",)),
         ("grandfather-grew", base_rows, {"patch": {"GRANDFATHERED_MAX": 0}}, ("is never raised",)),
-        ("planned-rise", base_rows, {"patch": {"BASELINE_GENERIC_PLANNED": 0}}, ("do not add planned:#2146 rows",)),
+        ("planned-rise", base_rows, {"patch": {"BASELINE_GENERIC_PLANNED": 0}}, ("this count should never rise",)),
         ("planned-fall", base_rows, {"patch": {"BASELINE_GENERIC_PLANNED": 2}}, ("Lower BASELINE_GENERIC_PLANNED to 1",)),
         ("untwinned-rise", base_rows, {"patch": {"BASELINE_UNTWINNED": 1}}, ("RATCHET",)),
         ("untwinned-fall", base_rows, {"patch": {"BASELINE_UNTWINNED": 99}}, ("Lower BASELINE_UNTWINNED",)),
         ("unledgered", base_rows, {"tweak": _extra_route}, ("unledgered route GET /fragments/not-in-ledger",)),
-        ("v1-keyed", base_rows + [v1_row], {"tweak": _no_a}, ("keyed on a REST v1 route",)),
+        ("v1-keyed", base_rows + [v1_row], {"tweak": _no_a}, ("keyed on a REST v1 route", "size-pinned")),
         ("openapi-missing", base_rows, {"tweak": _unlisted}, ("registered but missing from openapi_spec()",)),
         ("stale-allowlist", base_rows, {"tweak": _no_options}, ("ALLOWLIST_OPENAPI_MISSING entry OPTIONS", "is stale")),
     )
+    expect("planned-lookalike", _drive(base_rows + [_mk("p21460", "planned:#21460")]), 0)
     for label, rows_c, kw, needles in cases:
         expect(label, _drive(rows_c, **kw), 1, *needles,
                absent=("BASELINE",) if label in ("bad-status", "malformed", "top-level") else ())
@@ -1761,6 +1779,14 @@ def _selftest():
                 cpp.write_bytes(body if isinstance(body, bytes) else body.encode("utf-8"))
             target = cpp if body is not None else Path(dc) / "absent.cpp"
             expect("cpp-" + label, _drive(base_rows, patch={"MCP_SERVER_CPP": target}, synthetic=False), 1, needle)
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dm:
+        for mode in ("--render-doc", "--dump-json"):
+            err = io.StringIO()
+            with _patched(MCP_SERVER_CPP=Path(dm) / "absent.cpp", SERVER_SRC=Path(dm)), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc_m = main([mode])
+            check(rc_m == 1 and "::error::" in err.getvalue() and "cannot read" in err.getvalue()
+                  and "Traceback" not in err.getvalue(), f"main({mode}): a lost source is a named error, got {rc_m}: {err.getvalue()[:200]}")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dd:
         (Path(dd) / "x.json").mkdir()
         _rows, errs = load_ledger(dd)
@@ -1774,7 +1800,7 @@ def _selftest():
     return 0
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dump-json", action="store_true",
@@ -1793,7 +1819,7 @@ def main():
                      help="run internal extraction/parsing logic checks "
                           "against synthetic fixtures and exit (no real-tree "
                           "I/O)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.selftest:
         return _selftest()

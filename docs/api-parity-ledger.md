@@ -21,7 +21,8 @@ under `server/core/src/*.cpp`, keyed by `(method, canonical path)` - never
 #2542/#2557 `HttpRouteSink` migration campaign is doing exactly that) never
 churns the ledger. Each row records:
 
-- `capability_id` - a stable slug for the underlying capability.
+- `capability_id` - an id DERIVED from the method and path (it changes if a
+  route is renamed, and the gate requires it to match).
 - `rest_v1_twin` - the `/api/v1/*` route that serves the same capability, if
   one exists.
 - `mcp_twin` - the MCP tool name that serves the same capability, if one
@@ -33,8 +34,9 @@ churns the ledger. Each row records:
   which overstates the gap relative to ADR-1005's 2026-09-14 addendum until
   the gate can verify templates - a temporary limitation, not a rule),
   `twinned-rest-only` / `twinned-mcp-only` (exactly one machine twin exists;
-  counts as untwinned, because ADR-1005 expects both; name the tracker for
-  the missing side in an issue or an ADR-1005 entry), `planned:#N` (tracked, not yet built -
+  counts as untwinned, because ADR-1005 expects both; for a NEW one-sided
+  row, name the tracker for the missing side in an issue or an ADR-1005
+  entry - the eight existing ones are untracked by the maintainer's call), `planned:#N` (tracked, not yet built -
   `#2146` is the generic placeholder used when no more specific tracking
   issue exists yet, and its row count may only shrink),
   `composed-of:<capability-ids>` (this row's capability is covered by the
@@ -112,7 +114,7 @@ ledger row; a ledger row still claiming a route that no longer exists
 (other than `status: "retire"`); a `twinned` row that lacks either twin, or a
 `twinned*` row whose claimed REST or MCP twin does not actually exist in the
 current extraction (a `resource:<uri>` twin must be a registered MCP
-resource); a duplicate `capability_id`; an `exception:` row without an issue,
+resource; an object-form `rest_v1_twin` is verified on a row of any status); a duplicate `capability_id`; an `exception:` row without an issue,
 a real revisit date and a reason (outside the grandfathered set); a
 `capability_id` that is not the one derived from the row's method and path; a
 grandfathered set whose size is not its pinned maximum, or that holds a stale
@@ -126,8 +128,13 @@ untwinned baseline shrinks as F2+ wires real twins, and rises only when a
 change raises it with a stated reviewed reason - a newly-discovered fragment
 route, or extraction-completeness catching up to a route that already
 existed); and this document's generated block going stale relative to a
-fresh render. Adding a NEW exception row is not mechanically capped by this
-gate: it needs a maintainer ruling and shows in review. Twelve single-twin
+fresh render. Review-only, never checked by the gate: an issue's existence,
+state or content; a revisit date having passed (dates are shape- and
+window-checked, 2026-01-01..2028-12-31, but never lapse-checked); a
+`twinned-rest-only` row silently becoming a dated exception; extending the
+grandfather set together with its maximum, swapping an id, or rebinding an id
+to a row with the same slug. Adding a NEW exception row is not mechanically
+capped: it needs a maintainer ruling and shows in review. Twelve single-twin
 rows were examined when the gate began requiring both twins on plain
 `twinned`: eleven were reclassified (eight `twinned-rest-only`, three
 `exception:#520`) and one, satisfied by an MCP resource twin, stays

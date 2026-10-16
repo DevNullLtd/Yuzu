@@ -327,14 +327,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        security-guardian-reviewed amendment... not a side effect of a
        routine REST-twin PR." This stands as a standing exception until
        that amendment happens, not a numbered issue with a revisit date. (#4031
-       made the identical call for the three REST-only enrollment/OIDC reads:
-       `GET /api/v1/enrollment/auto-approve-rules`, `.../pending-agents` and
-       `GET /api/v1/settings/oidc`, ledgered as `get.fragments-settings-
-       auto-approve`, `-pending` and `-directory`. They were previously
-       ledgered `twinned`; they are now `exception:#520 revisit:2027-04-30`,
-       a re-confirmation date set by the 2026-10-15 ledger change. #520 is a
-       closed decision issue used as the record. The eight #4028 rows keep
-       their undated legacy form.)
+       made the identical call for three REST-only reads: enrollment
+       auto-approve-rules, enrollment pending-agents and settings/oidc,
+       ledgered as `get.fragments-settings-auto-approve`,
+       `get.fragments-settings-pending` and
+       `get.fragments-settings-directory`. They were previously ledgered
+       `twinned`; this change makes them `exception:#520 revisit:2027-04-30`.
+       #520 is the closed security issue whose fix drew the MCP-tier
+       boundary, not a decision record: the decision of record is
+       `mcp_policy.hpp`'s `tier_allows`, `docs/mcp-server.md` line 21 and
+       `AuthRoutes::require_admin`'s comment. No open item tracks the
+       2027-04-30 re-confirmation; #5955 covers only its own 13 rows. The
+       eight #4028 rows keep their undated legacy form.)
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -604,25 +608,28 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        empty `200`; wire reference: `docs/user-manual/rest-api.md`.
 
    - **2026-10-15 - temporary UI-only fragment exceptions (Dashboard,
-     Integrations webhooks, General, Access).** The maintainer accepted these
-     server-rendered fragments, which have no REST v1 or MCP twin yet, as
-     exceptions to Decision 4 (#5859, #5872, #5873, #5880). The acceptance is
-     quoted, with its 2026-10-15 date, in the body of #5955 (opened
-     2026-10-16); the approving review of the change that carries this entry
-     is the evidence artefact. The exceptions are temporary, 13 rows at
+     Integrations webhooks, General, Access).** The ADR owner (Dave Rae)
+     accepted these server-rendered fragments, which have no REST v1 or MCP
+     twin yet, as exceptions to Decision 4 (#5859, #5872, #5873, #5880). The
+     acceptance is quoted, with its 2026-10-15 date, in the body of #5955
+     (opened 2026-10-16); the evidence artefact is the approving review of
+     this change by a reviewer other than its author. The exceptions are temporary, 13 rows at
      acceptance, and are to be revisited by **2026-11-30**. This is not a
      general waiver: a new UI-only capability needs its own ruling. The list
      of record is issue #5955 plus the rows carrying
      `exception:#5955 revisit:2026-11-30` in `scripts/ci/api-parity/*.json`.
      The gate requires the dated shape for any new exception but does not yet
-     cap how many there are, so growth beyond these rows is review-enforced
-     for now: so is re-dating, re-pointing to another issue or relabelling an
-     existing exception row, and a revisit date that has passed is not
-     machine-checked (#5955 is the reminder). The #520 dating of the #4031
-     rows (see the #4028 entry) is not part of the 2026-10-15 acceptance. The
-     17 older `exception:` rows are undated legacy rows (a size-pinned set;
-     keeping it from growing or being swapped is review-enforced) and are a
-     disclosed residual not covered by #5955.
+     cap how many there are. Growth is review-enforced for now, as is
+     re-dating, re-pointing or relabelling an existing exception row. A
+     revisit date that has passed is not machine-checked (#5955 is the
+     reminder). The #520 dating of the #4031 rows (see the #4028 entry) is not
+     part of the 2026-10-15 acceptance. The 17 (when written) older
+     `exception:` rows are undated legacy rows in a size-pinned set: plain
+     growth is machine-caught, while growth paired with a raise of the pin, a
+     swap or a rebind to a row with the same slug is review-only. They are a
+     disclosed residual not covered by #5955. The eight `twinned-rest-only`
+     rows are open gaps counted only by the ratchet; only the hardware rows
+     (#4456) and the management-groups rows are mentioned in this ADR.
 
 ## Interim rules (until the named follow-ups ship)
 
