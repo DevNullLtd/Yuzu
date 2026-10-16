@@ -1467,14 +1467,3 @@ TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as
     CHECK(pill_of(never->token_id) == "pill info\">Active");
     CHECK(res->body.find("pill ok") == std::string::npos);
 }
-
-// The pure decision behind that pill, with the clock injected: no Postgres, no TTL wait.
-TEST_CASE("settings enrollment: enrollment_token_expired compares expiry with the injected now",
-          "[settings_routes][enrollment]") {
-    using clock = std::chrono::system_clock;
-    const auto now = clock::time_point{std::chrono::seconds(1'800'000'000)};
-    CHECK_FALSE(enrollment_token_expired((clock::time_point::max)(), now)); // never expires
-    CHECK(enrollment_token_expired(now - std::chrono::hours(1), now));
-    CHECK(enrollment_token_expired(now, now)); // the consume path needs expires_at > now()
-    CHECK_FALSE(enrollment_token_expired(now + std::chrono::seconds(1), now));
-}

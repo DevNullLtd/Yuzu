@@ -860,11 +860,6 @@ std::string bulk_audit_detail(const std::vector<std::string>& ids) {
 }
 } // namespace
 
-bool enrollment_token_expired(std::chrono::system_clock::time_point expires_at,
-                              std::chrono::system_clock::time_point now) noexcept {
-    return expires_at != (std::chrono::system_clock::time_point::max)() && expires_at <= now;
-}
-
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
     // Markup is a pure function (enrolment_render.cpp). A freshly minted raw token is shown
     // ONCE, so it is passed through even when the list read failed.

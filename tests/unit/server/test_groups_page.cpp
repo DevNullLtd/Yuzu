@@ -178,8 +178,11 @@ TEST_CASE("groups page: the Groups entry is first in Estate and lights up on /gr
     CHECK(estate->items[0].href == "/groups");
     CHECK(estate->items[0].label == "Groups and enrolment");
     CHECK_FALSE(estate->items[0].admin_only);
-    // No new nav group was added for it.
-    CHECK(groups_nav.size() >= 4);
+    // No new nav group was added for it: the five groups the shell already had.
+    std::vector<std::string> titles;
+    for (const auto& g : groups_nav)
+        titles.emplace_back(g.title);
+    CHECK(titles == std::vector<std::string>{"Operate", "Posture", "Estate", "Access", "System"});
     const std::string baked = kGroupsHtml;
     CHECK_THAT(baked, ContainsSubstring("<a class=\"shell-nav on\" href=\"/groups\""));
 }

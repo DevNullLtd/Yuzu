@@ -14,13 +14,25 @@ namespace {
 
 using auth::AutoApproveRuleType;
 
-std::string esc(const std::string& s) {
-    return html_escape(s);
-}
-
 constexpr std::string_view kFailboxSv =
     "<div class=\"failbox\" role=\"alert\"><div><b>Enrolment store unavailable.</b> "
     "State unknown. This is not an empty list. Retry shortly.</div></div>";
+
+// What an enrolment token can still do, decided against an injected clock. Revoked beats
+// exhausted beats expired; an expiry exactly at `now` is already expired (the consume path
+// needs expires_at > now() to enrol, so a token the server refuses is never listed Active).
+enum class TokenState { active, expired, exhausted, revoked };
+
+TokenState token_state(const auth::EnrollmentToken& t,
+                       std::chrono::system_clock::time_point now) {
+    if (t.revoked)
+        return TokenState::revoked;
+    if (t.max_uses > 0 && t.use_count >= t.max_uses)
+        return TokenState::exhausted;
+    if (t.expires_at != (std::chrono::system_clock::time_point::max)() && t.expires_at <= now)
+        return TokenState::expired;
+    return TokenState::active;
+}
 
 // "Active" is mild information, never the green OK pill: a lapsed credential is not "healthy".
 std::string pill(const char* cls, const char* text) {
@@ -128,11 +140,11 @@ std::string attr_rule_vals(const auth::AutoApproveRule& r, bool with_enabled) {
                        json_escape(r.value) + "\"";
     if (with_enabled)
         json += std::string(",\"enabled\":\"") + (r.enabled ? "1" : "0") + "\"";
-    return " hx-vals=\"" + esc(json + "}") + "\"";
+    return " hx-vals=\"" + html_escape(json + "}") + "\"";
 }
 
 std::string attr_confirm(const std::string& question) {
-    return question.empty() ? std::string() : " hx-confirm=\"" + esc(question) + "\"";
+    return question.empty() ? std::string() : " hx-confirm=\"" + html_escape(question) + "\"";
 }
 
 } // namespace
@@ -193,7 +205,7 @@ std::string render_tokens(const std::vector<auth::EnrollmentToken>* tokens,
         html += "<div class=\"note warn\" role=\"region\" aria-label=\"New enrolment token\">"
                 "<b>Copy this token now. It will not be shown again.</b>"
                 "<div class=\"revealrow\"><code class=\"mono\">" +
-                esc(std::string(new_raw_token)) +
+                html_escape(std::string(new_raw_token)) +
                 "</code>"
                 "<button class=\"btn sm\" type=\"button\" data-copy-token>Copy to Clipboard</button>"
                 "<button class=\"btn sm primary\" type=\"button\" "
@@ -208,23 +220,15 @@ std::string render_tokens(const std::vector<auth::EnrollmentToken>* tokens,
 
     struct Row {
         const auth::EnrollmentToken* t;
-        int state; // 0 active, 1 expired, 2 exhausted, 3 revoked
+        TokenState state;
     };
     std::vector<Row> rows;
     rows.reserve(tokens->size());
-    for (const auto& t : *tokens) {
-        int st = 0;
-        if (t.revoked)
-            st = 3;
-        else if (t.max_uses > 0 && t.use_count >= t.max_uses)
-            st = 2;
-        else if (t.expires_at != (std::chrono::system_clock::time_point::max)() &&
-                 t.expires_at <= now)
-            st = 1;
-        rows.push_back({&t, st});
-    }
+    for (const auto& t : *tokens)
+        rows.push_back({&t, token_state(t, now)});
     // Active first, otherwise the store's newest-first order is kept.
-    std::stable_partition(rows.begin(), rows.end(), [](const Row& r) { return r.state == 0; });
+    std::stable_partition(rows.begin(), rows.end(),
+                          [](const Row& r) { return r.state == TokenState::active; });
 
     if (rows.empty()) {
         html += "<div class=\"empty\"><b>No tokens yet.</b>"
@@ -245,28 +249,29 @@ std::string render_tokens(const std::vector<auth::EnrollmentToken>* tokens,
                     : utc_stamp(t.expires_at);
             std::string status;
             switch (rows[i].state) {
-            case 0:
+            case TokenState::active:
                 status = pill("info", "Active");
                 break;
-            case 1:
+            case TokenState::expired:
                 status = pill("warn", "Expired");
                 break;
-            case 2:
+            case TokenState::exhausted:
                 status = pill("idle", "Exhausted");
                 break;
-            default:
+            case TokenState::revoked:
                 status = pill("idle", "Revoked");
+                break;
             }
-            html += "<tr><td><code>" + esc(t.token_id) + "</code></td><td class=\"long\">" +
-                    esc(t.label) + "</td><td>" + uses + "</td><td>" + exp + "</td><td>" + status +
-                    "</td><td class=\"acts\">";
+            html += "<tr><td><code>" + html_escape(t.token_id) + "</code></td><td class=\"long\">" +
+                    html_escape(t.label) + "</td><td>" + uses + "</td><td>" + exp + "</td><td>" +
+                    status + "</td><td class=\"acts\">";
             if (!t.revoked) {
                 html += "<button class=\"btn link danger\" type=\"button\" "
                         "hx-delete=\"/api/settings/enrollment-tokens/" +
                         url_path_segment(t.token_id) +
                         "\" hx-target=\"#token-section\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Revoke token &quot;" +
-                        esc(t.token_id) +
+                        html_escape(t.token_id) +
                         "&quot;? Agents using this token will no longer be able to enroll. "
                         "Agents already enrolled stay enrolled.\">Revoke</button>";
             }
@@ -279,11 +284,15 @@ std::string render_tokens(const std::vector<auth::EnrollmentToken>* tokens,
         }
     }
 
+    // hx-disabled-elt (htmx core, not hx-on) disables the submit button while the request is in
+    // flight, so a double click cannot mint two tokens.
     html += "<form class=\"form\" hx-post=\"/api/settings/enrollment-tokens\" "
-            "hx-target=\"#token-section\" hx-swap=\"innerHTML\" data-token-form>"
+            "hx-target=\"#token-section\" hx-swap=\"innerHTML\" "
+            "hx-disabled-elt=\"find button[type=submit]\" data-token-form>"
             "<div class=\"fld\"><label for=\"tok-label\">Label</label>"
-            "<input class=\"in\" id=\"tok-label\" type=\"text\" name=\"label\" maxlength=\"256\" "
-            "placeholder=\"e.g. Edinburgh rollout\"></div>"
+            "<input class=\"in\" id=\"tok-label\" type=\"text\" name=\"label\" maxlength=\"" +
+            std::to_string(auth::kMaxEnrollmentTextLength) +
+            "\" placeholder=\"e.g. Edinburgh rollout\"></div>"
             "<div class=\"row2\">"
             "<div class=\"fld\"><label for=\"tok-uses\">Max uses</label>"
             "<input class=\"in\" id=\"tok-uses\" type=\"text\" inputmode=\"numeric\" "
@@ -335,9 +344,10 @@ std::string render_pending(const std::vector<auth::PendingAgent>* agents) {
         const std::string short_id =
             a.agent_id.size() > 12 ? a.agent_id.substr(0, 12) + "..." : a.agent_id;
         const bool is_pending = a.status == auth::PendingStatus::pending;
-        html += "<tr><td><code title=\"" + esc(a.agent_id) + "\">" + esc(short_id) +
-                "</code></td><td class=\"long\">" + esc(a.hostname) + "</td><td>" + esc(a.os) +
-                " " + esc(a.arch) + "</td><td>" + esc(a.agent_version) + "</td><td>" +
+        html += "<tr><td><code title=\"" + html_escape(a.agent_id) + "\">" +
+                html_escape(short_id) + "</code></td><td class=\"long\">" +
+                html_escape(a.hostname) + "</td><td>" + html_escape(a.os) + " " +
+                html_escape(a.arch) + "</td><td>" + html_escape(a.agent_version) + "</td><td>" +
                 utc_stamp(a.requested_at) + "</td><td>" +
                 (is_pending ? pill("warn", "Pending") : pill("bad", "Denied")) +
                 "</td><td class=\"acts\">";
@@ -394,13 +404,13 @@ std::string render_pending(const std::vector<auth::PendingAgent>* agents) {
                 std::string(off) +
                 " hx-post=\"/api/settings/pending-agents/bulk-approve\" "
                 "hx-target=\"#pending-section\" hx-swap=\"innerHTML\" hx-confirm=\"" +
-                esc(approve_q) + "\">Approve all (" + count +
+                html_escape(approve_q) + "\">Approve all (" + count +
                 ")</button>"
                 "<button class=\"btn danger\" type=\"button\"" +
                 std::string(off) +
                 " hx-post=\"/api/settings/pending-agents/bulk-deny\" "
                 "hx-target=\"#pending-section\" hx-swap=\"innerHTML\" hx-confirm=\"" +
-                esc(deny_q) + "\">Deny all (" + count + ")</button></div>";
+                html_escape(deny_q) + "\">Deny all (" + count + ")</button></div>";
         if (!whole) {
             html += "<p class=\"hint pad\">Showing " + std::to_string(kRenderCap) + " of " +
                     count + ". Approve or deny these individually; the bulk actions act on every "
@@ -455,10 +465,10 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
             const std::string idx = std::to_string(i);
             const std::string base = "/api/settings/auto-approve/" + idx;
             html += "<tr><td class=\"long\">" + std::string(rule_phrase(r.type)) + "<code>" +
-                    esc(r.value) + "</code>" + rule_suffix(r.type);
+                    html_escape(r.value) + "</code>" + rule_suffix(r.type);
             if (rule_matches_everything(r.type, r.value))
                 html += " " + pill("warn", "Matches every agent");
-            html += "</td><td class=\"long\">" + esc(r.label) + "</td><td>" +
+            html += "</td><td class=\"long\">" + html_escape(r.label) + "</td><td>" +
                     (r.enabled ? pill("info", "Enabled") : pill("idle", "Disabled")) +
                     "</td><td class=\"acts\">";
             // Enabling widens (any mode) or narrows (all mode); the copy says which.
@@ -483,8 +493,9 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
             "reported by the agent and are not verified. A CA fingerprint rule never matches at "
             "this release.</p>";
 
-    // The Add confirm is built client-side (yuzu-groups.js) because it depends on the value
-    // typed; the static text here is the floor if the script did not load.
+    // The Add confirm is this static hx-confirm text and the only copy of the question:
+    // yuzu-groups.js appends "This matches every agent." to the confirm event's
+    // detail.question when the typed value would match every agent, and adds nothing else.
     html += "<form class=\"form\" hx-post=\"/api/settings/auto-approve\" "
             "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" data-rule-form "
             "hx-confirm=\"Add this rule? Agents matching it join the fleet without approval. "
@@ -498,11 +509,13 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
             "<option value=\"cloud_provider\">Cloud provider</option></select></div>"
             "<div class=\"fld\"><label for=\"rule-value\">Value</label>"
             "<input class=\"in mono\" id=\"rule-value\" type=\"text\" name=\"value\" required "
-            "maxlength=\"256\" pattern=\"[^:]*\" title=\"A colon is not allowed.\" "
+            "maxlength=\"" + std::to_string(auth::kMaxRuleValueLen) +
+            "\" pattern=\"[^:]*\" title=\"A colon is not allowed.\" "
             "placeholder=\"*.prod.example.com\"></div></div>"
             "<div class=\"fld\"><label for=\"rule-label\">Label</label>"
-            "<input class=\"in\" id=\"rule-label\" type=\"text\" name=\"label\" maxlength=\"256\" "
-            "pattern=\"[^:]*\" title=\"A colon is not allowed.\" "
+            "<input class=\"in\" id=\"rule-label\" type=\"text\" name=\"label\" maxlength=\"" +
+            std::to_string(auth::kMaxRuleLabelLen) +
+            "\" pattern=\"[^:]*\" title=\"A colon is not allowed.\" "
             "placeholder=\"Production servers\"></div>"
             "<div><button class=\"btn primary\" type=\"submit\">Add rule</button></div>"
             "</form>";

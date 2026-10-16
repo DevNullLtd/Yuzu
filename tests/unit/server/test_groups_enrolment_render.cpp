@@ -207,6 +207,8 @@ TEST_CASE("enrolment tokens: empty list says so and keeps the generate form",
     // Form field names are the existing route's contract.
     for (const char* n : {"name=\"label\"", "name=\"max_uses\"", "name=\"ttl_hours\""})
         CHECK_THAT(html, ContainsSubstring(n));
+    CHECK_THAT(html, ContainsSubstring("name=\"label\" maxlength=\"" +
+                                       std::to_string(auth::kMaxEnrollmentTextLength) + "\""));
     // Both limits empty: the unlimited warning is on screen by default.
     CHECK_THAT(html, ContainsSubstring("data-token-unlimited"));
     CHECK_THAT(html, ContainsSubstring("Anyone holding this token can enrol agents indefinitely"));
@@ -237,6 +239,64 @@ TEST_CASE("enrolment tokens: Active; Expired; Exhausted and Revoked are distinct
     CHECK_THAT(html, ContainsSubstring("hx-delete=\"/api/settings/enrollment-tokens/aaaaaaaa\""));
     CHECK_THAT(html, ContainsSubstring("1 / 5"));
     CHECK_THAT(html, ContainsSubstring("0 / \xe2\x88\x9e"));
+}
+
+namespace {
+// The pill that follows a token row's id cell.
+std::string pill_after(const std::string& html, const std::string& token_id) {
+    const auto row = html.find("<code>" + token_id + "</code>");
+    REQUIRE(row != std::string::npos);
+    const auto pill = html.find("<span class=\"pill ", row);
+    REQUIRE(pill != std::string::npos);
+    return html.substr(pill, html.find("</span>", pill) + 7 - pill);
+}
+} // namespace
+
+// The decision behind the pill, with the clock injected. The consume path needs
+// `expires_at > now()` to enrol, so a token expiring exactly now is already Expired.
+TEST_CASE("enrolment tokens: an expiry exactly at now is Expired and one second later is Active",
+          "[groups][enrolment][render]") {
+    const std::vector<auth::EnrollmentToken> v = {
+        token("atnowxxx", "x", 0, 0, false, kNow),
+        token("latersec", "x", 0, 0, false, kNow + std::chrono::seconds(1)),
+        token("earlier1", "x", 0, 0, false, kNow - std::chrono::seconds(1)),
+        token("neverexp", "x"),
+    };
+    const auto html = render_tokens(&v, "", kNow);
+    CHECK(pill_after(html, "atnowxxx") == "<span class=\"pill warn\">Expired</span>");
+    CHECK(pill_after(html, "latersec") == "<span class=\"pill info\">Active</span>");
+    CHECK(pill_after(html, "earlier1") == "<span class=\"pill warn\">Expired</span>");
+    CHECK(pill_after(html, "neverexp") == "<span class=\"pill info\">Active</span>");
+}
+
+// Revoked beats exhausted beats expired, whatever the clock says.
+TEST_CASE("enrolment tokens: revoked beats exhausted beats expired",
+          "[groups][enrolment][render]") {
+    const auto lapsed = kNow - std::chrono::hours(1);
+    const std::vector<auth::EnrollmentToken> v = {
+        token("revokedx", "x", 2, 2, true, lapsed),
+        token("spentand", "x", 2, 2, false, lapsed),
+        token("lapsedxx", "x", 2, 1, false, lapsed),
+    };
+    const auto html = render_tokens(&v, "", kNow);
+    CHECK(pill_after(html, "revokedx") == "<span class=\"pill idle\">Revoked</span>");
+    CHECK(pill_after(html, "spentand") == "<span class=\"pill idle\">Exhausted</span>");
+    CHECK(pill_after(html, "lapsedxx") == "<span class=\"pill warn\">Expired</span>");
+}
+
+// A double submit of the generate form must not mint two tokens: htmx's own hx-disabled-elt
+// (not hx-on, which the dashboard CSP blocks) disables the submit button while in flight.
+TEST_CASE("enrolment tokens: the generate form disables its submit button while in flight",
+          "[groups][enrolment][render]") {
+    const std::vector<auth::EnrollmentToken> none;
+    const auto html = render_tokens(&none, "", kNow);
+    const auto form = html.find("<form class=\"form\" hx-post=\"/api/settings/enrollment-tokens\"");
+    REQUIRE(form != std::string::npos);
+    const auto tag_end = html.find('>', form);
+    CHECK_THAT(html.substr(form, tag_end - form),
+               ContainsSubstring("hx-disabled-elt=\"find button[type=submit]\""));
+    CHECK_THAT(html.substr(form), ContainsSubstring("<button class=\"btn primary\" type=\"submit\">Generate token"));
+    CHECK_THAT(html, !ContainsSubstring("hx-on"));
 }
 
 TEST_CASE("enrolment tokens: expiry is a UTC date; never raw epoch seconds",
@@ -691,6 +751,18 @@ TEST_CASE("enrolment rules: add form keeps the field names; blocks colons; no in
                                        "and are not verified."));
     CHECK_THAT(html, ContainsSubstring("A CA fingerprint rule never matches at this release."));
     CHECK_THAT(html, ContainsSubstring("pattern=\"[^:]*\""));
+    // The advertised maxlength is the validator's own bound, not a hand-copied 256.
+    const auto in_input = [&](const std::string& id) {
+        const auto at = html.find("id=\"" + id + "\"");
+        REQUIRE(at != std::string::npos);
+        return html.substr(at, html.find('>', at) - at);
+    };
+    CHECK_THAT(in_input("rule-value"),
+               ContainsSubstring("maxlength=\"" + std::to_string(auth::kMaxRuleValueLen) + "\""));
+    CHECK_THAT(in_input("rule-label"),
+               ContainsSubstring("maxlength=\"" + std::to_string(auth::kMaxRuleLabelLen) + "\""));
+    CHECK(auth::kMaxRuleValueLen == 253);
+    CHECK(auth::kMaxRuleLabelLen == 128);
     for (const char* bad : {"onclick", "onchange", "hx-on", "style=\"", "feedback-error",
                             "user-table", "mini-field"})
         CHECK_THAT(html, !ContainsSubstring(bad));
