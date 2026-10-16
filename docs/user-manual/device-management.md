@@ -22,11 +22,13 @@ yuzu-agent --server server.example.com:50051
 
 The agent will attempt registration, receive a "pending" status, and retry periodically until approved.
 
-**Server side (dashboard):** Navigate to **Estate > Groups and enrolment** (or **Settings > Pending Agents**; both show the same queue). Each entry shows the agent's hostname, OS, architecture, version and the time it first asked to join (UTC). Click **Approve**, **Deny**, or **Forget** (removes a waiting request; the agent is queued again the next time it asks to join). **Approve all** and **Deny all** act on every waiting agent, including any that arrive after the page loaded, and are disabled when the list shows only part of the queue.
+**Server side (dashboard):** Navigate to **Estate > Groups and enrolment** (panel **Agents waiting for approval**) or **Settings > Pending Agent Approvals**; both show the same queue. The page is named "Groups and enrolment" (UK spelling); the Settings panels keep their existing US-spelling names. Each entry shows the agent's hostname, OS, architecture, version and the time it first asked to join (UTC). Click **Approve**, **Deny**, or **Forget** (removes a waiting request; the agent is queued again the next time it asks to join). A denied agent stays listed as **Denied** ("denial recorded") with no button: the page cannot reverse a denial, and the **Deny all** confirmation says so. **Approve all** and **Deny all** act on every waiting agent, including any that arrive after the page loaded, and their confirmation gives the total and the first ten hostnames. At most 200 rows are listed (waiting agents first, then denied); when more than 200 agents are waiting, the panel says "Showing 200 of N" and the two bulk buttons are disabled, because they would also act on the agents not shown.
+
+The page opens for any signed-in user, but the three panels need the Administrator account role; other users see "Not available to your account" in each panel.
 
 **Server side (API):**
 
-There is no dedicated JSON API endpoint to list pending agents. Use the HTMX fragment to retrieve the rendered HTML list:
+To list the queue as JSON, use `GET /api/v1/enrollment/pending-agents` (pending and denied requests; permission `Enrollment:Read`; `503` when the enrollment store is degraded; REST only, there is no MCP tool for it). See [REST API](rest-api.md#get-apiv1enrollmentpending-agents). Approve, deny and remove have no JSON endpoint; they are the dashboard routes below. The dashboard's own list is an HTMX fragment:
 
 ```bash
 # List pending agents (returns HTML fragment)
@@ -77,7 +79,9 @@ curl -s -X POST http://localhost:8080/api/settings/enrollment-tokens \
   -d "label=datacenter-rollout-q1&max_uses=100&ttl_hours=72"
 ```
 
-The response is an HTML fragment (the updated tokens table). The raw token value is displayed once in the fragment and cannot be retrieved again.
+The response is an HTML fragment (the updated tokens table) sent with `Cache-Control: no-store, private`. The raw token value is displayed once in the fragment and cannot be retrieved again.
+
+On the dashboard (**Estate > Groups and enrolment**, panel **Enrolment tokens**, or **Settings > Enrollment Tokens**) the token is shown once above the list, with **Copy to Clipboard** and **Done**. It lives inside the token panel: navigating away, **Done**, revoking a token, generating another or anything else that reloads the panel removes it for good, and the only recovery is to revoke that token and generate a new one. **Copy to Clipboard** needs HTTPS or `localhost`; otherwise it says "Copy failed. Select the text." and you copy the token by hand. The list shows each token's expiry in UTC and its status (**Active**, **Expired**, **Exhausted** or **Revoked**, active first) and lists at most 200 tokens; the form shows "Unlimited uses and no expiry" while both limit fields are empty or zero.
 
 **Generate tokens in batch (JSON API for scripting):**
 
@@ -142,7 +146,7 @@ Reserved for future implementation. Proto fields exist for `machine_certificate`
 
 Administrators can configure rules that automatically approve agents matching specific criteria, reducing manual toil for large deployments.
 
-**View current auto-approval policies (dashboard):** Navigate to **Estate > Groups and enrolment** (or **Settings > Auto-Approve**). Each rule is described by what it matches: a hostname rule matches the hostname the agent reports (not verified), an address rule matches the address the server sees (IPv4 only). A rule that matches every agent is flagged.
+**View current auto-approval policies (dashboard):** Navigate to **Estate > Groups and enrolment** (panel **Auto-approve rules**) or **Settings > Auto-Approve Policies**. Each rule is described by what it matches: a hostname rule matches the hostname the agent reports (not verified), an address rule matches the address the server sees (IPv4 only), a cloud provider rule matches the provider the agent reports (not verified), and a CA fingerprint rule never matches at this release. The match mode is two buttons (**Any rule matches (first match)** and **All enabled rules must match**) and each asks for confirmation. A rule that matches every agent is flagged **Matches every agent**.
 
 **Add an auto-approval rule:**
 
@@ -158,7 +162,7 @@ curl -s -X POST http://localhost:8080/api/settings/auto-approve \
 
 This rule automatically approves any agent whose hostname matches the glob pattern `web-*.example.com`.
 
-Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. A value is at most 253 characters and a label at most 128. A rule that would match every machine (a hostname glob of only `*`, or an `ip_subnet` of `/0`) is refused.
+Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. A value is at most 253 characters and a label at most 128. The server refuses two shapes outright: a hostname glob made only of `*` characters, and an `ip_subnet` with a `/0` prefix (for example `0.0.0.0/0`). It accepts other rules that are just as broad, for example a hostname glob of only `*` and `?` characters such as `?*`. The dashboard flags every existing rule that matches every agent (**Matches every agent**). On **Groups and enrolment** the **Add rule** confirmation also says "This matches every agent." when the value you typed has that shape (for a `*`-only glob or a `/0` range the server then refuses the rule); the Settings panel asks the same fixed confirmation for every value.
 
 **These rules are not a strong admission control.** `hostname_glob` and `cloud_provider` match strings the registering agent states about itself (its hostname and attestation provider); any client that can reach the Register endpoint can claim a matching value, which makes such a rule no stronger than `*`. `ip_subnet` matches the connection's peer address. `trusted_ca` can never match today because Register does not yet populate the CA fingerprint. Verified proof for the first two is reserved for a later tier. Treat `any`-mode `hostname_glob`/`cloud_provider` rules as a convenience for a trusted network, not as a security boundary.
 

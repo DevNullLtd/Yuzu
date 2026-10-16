@@ -2938,8 +2938,8 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. The accounts are also listed, read-only, on the **Users** page (`/access/users`) in the Access section of the sidebar. |
 | Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. Also shown on the **Groups and enrolment** page (`/groups`, **Estate** group), from the same fragment. |
-| Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. Also shown on **Groups and enrolment**. |
-| Auto-Approval Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). Also shown on **Groups and enrolment**. |
+| Pending Agent Approvals | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. Also shown on **Groups and enrolment**. |
+| Auto-Approve Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). Also shown on **Groups and enrolment**. |
 | API Tokens | `/fragments/settings/api-tokens` | Create and revoke bearer tokens for REST API automation. |
 | Plugin Code Signing | `/fragments/settings/plugin-signing` | Upload a PEM trust bundle for agent plugin CMS signature verification, toggle the require-signed-plugins flag, and remove the bundle. The trust bundle persists at `<cert-dir>/plugin-trust-bundle.pem`; the require flag persists in `runtime_config` under key `plugin_signing_required`. Distribution to agents is operator-driven today (curl into a local file referenced by `--plugin-trust-bundle`); automatic agent-side fetch is a forthcoming change. See the user-manual *Agent Plugins → Plugin Code Signing* section. |
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. The upload form also takes an optional detached CMS **Signature** (`.sig`, max 64 KB), stored as a sidecar beside the binary and served to agents on `CheckForUpdate` — see *Signing update binaries*. The server stores but never verifies it. |
@@ -3599,28 +3599,32 @@ and the response clears the session cookie via `Set-Cookie: Max-Age=0`.
 
 Yuzu uses a tiered enrollment model. Each tier provides a different balance of security and convenience.
 
+Enrollment is managed on the **Groups and enrolment** page (**Estate** group, `/groups`; see [Groups and enrolment page](#groups-and-enrolment-page)) or, equivalently, in the **Settings** panels **Pending Agent Approvals**, **Enrollment Tokens** and **Auto-Approve Policies**. Both places show the same lists and use the same routes. The page and its navigation entry use the UK spelling "enrolment"; the existing Settings panel names keep the US spelling "enrollment".
+
 ### Tier 1: Manual Approval
 
 The default enrollment method. No pre-shared token is required.
 
 1. The agent starts and sends a `RegisterRequest` to the server.
 2. The server places the agent in the **pending queue**.
-3. An admin reviews pending agents in **Estate > Groups and enrolment** (or **Settings > Pending Agents**; both show the same queue).
+3. An admin reviews pending agents in **Estate > Groups and enrolment** (panel **Agents waiting for approval**) or in **Settings > Pending Agent Approvals**; both show the same queue.
 4. The admin approves or denies each agent.
 5. Approved agents complete registration on their next heartbeat.
-6. Denied agents are removed from the queue. They can re-register if restarted.
+6. A denied agent stays in the queue as **Denied** ("denial recorded") as a durable record; the page offers no way to reverse a denial. If the agent registers again, the server answers `enrollment_status` `denied` (reason "enrollment denied by administrator") and it is not enrolled.
 
 ### Tier 2: Pre-Shared Token
 
 For automated or bulk deployment. Agents present a token at startup for instant enrollment.
 
 **Server side:**
-1. Navigate to **Estate > Groups and enrolment** (or **Settings > Enrollment Tokens**; both show the same tokens).
+1. Navigate to **Estate > Groups and enrolment** (panel **Enrolment tokens**) or **Settings > Enrollment Tokens**; both show the same tokens.
 2. Fill in the **Generate token** form:
    - **Label** -- free text shown in the list.
-   - **Max uses** -- how many agents can use this token (`0` = unlimited). The default `0` with no expiry makes a token that never stops working; the form warns while both limits are empty or zero. Leave the field empty or enter `0` for unlimited. Any other value must be one whole number: a typo such as `0x5` or `5abc` is refused with `400` and no token is minted (it used to be read as `0`, which means unlimited). The same rule applies to the token lifetime (`ttl_hours`, empty or `0` for no expiry); a negative `ttl_hours` is refused with `400` too, because it used to compute to "never expires".
+   - **Max uses** -- how many agents can use this token (`0` = unlimited). Empty or `0` in both limit fields makes a token that never stops working, and the form shows "Unlimited uses and no expiry" until one of them is a real limit. Leave the field empty or enter `0` for unlimited. Any other value must be one whole number: a typo such as `0x5` or `5abc` is refused with `400` and no token is minted (it used to be read as `0`, which means unlimited). The same rule applies to the token lifetime (`ttl_hours`, empty or `0` for no expiry); a negative `ttl_hours` is refused with `400` too, because it used to compute to "never expires".
    - **Expires after (hours)** -- time limit (`0` = never).
-3. Click **Generate token** and copy the string shown. It is displayed once, stays on screen until you click **Done** or leave the page, and is sent with `Cache-Control: no-store, private`.
+3. Click **Generate token** and copy the string shown. It is shown once. The reveal sits inside the token panel, so navigating away, clicking **Done**, revoking a token, generating another or anything else that reloads the panel removes it for good; if you did not copy it, revoke that token and generate a new one. **Copy to Clipboard** needs HTTPS or `localhost`; over plain HTTP, or if the browser refuses, the button says "Copy failed. Select the text." and you copy the token by hand. The response is sent with `Cache-Control: no-store, private`.
+
+The list shows each token's ID, label, uses, expiry (UTC) and status: **Active**, **Expired**, **Exhausted** or **Revoked**, with active tokens first. Only a token that is not revoked has a **Revoke** button.
 
 **Agent side:**
 ```bash
@@ -3640,8 +3644,8 @@ Reserved protocol fields (`machine_certificate`, `attestation_signature`, `attes
 
 For environments that need something between manual approval and pre-shared tokens, auto-approval policies can automatically approve agents that match defined criteria:
 
-1. Navigate to **Settings > Auto-Approval Policies**.
-2. Create a rule with conditions (e.g., hostname matches `prod-web-*`, source IP in `10.0.0.0/8`).
+1. Navigate to **Estate > Groups and enrolment** (panel **Auto-approve rules**) or **Settings > Auto-Approve Policies**.
+2. Create a rule with conditions (e.g., hostname matches `prod-web-*`, source IP in `10.0.0.0/8`). The Add rule confirmation asks before it saves; see [Auto-Approval Policies](device-management.md#auto-approval-policies) for what each rule type matches, what the server refuses and which rules the page flags.
 3. Agents matching any active policy are approved automatically at registration time.
 
 ---
@@ -5145,7 +5149,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/fragments/settings/tokens` | Render the enrollment tokens fragment (HTMX). |
+| `GET` | `/fragments/settings/tokens` | Render the enrollment tokens fragment (HTMX); also the **Enrolment tokens** panel of `/groups`. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`. |
 | `POST` | `/api/settings/enrollment-tokens` | Generate a new enrollment token. Form fields: `label`, `max_uses` (empty or `0` = unlimited), `ttl_hours` (empty or `0` = never). A malformed or negative number is a `400` and nothing is minted. The response is the token-list fragment with the raw token shown once; it carries `Cache-Control: no-store, private`. |
 | `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. Defaults when a field is empty or omitted: `count` 10 (allowed 1 to 10000), `max_uses` 1, `ttl_hours` 0 (no expiry). Each number may be a JSON integer or a numeric string. A malformed, fractional, boolean, `null` or negative number, one outside the 32-bit range, a `count` outside 1 to 10000, or a body that is not one JSON object, is a `400` and nothing is minted. The response carries `Cache-Control: no-store, private`. |
 | `DELETE` | `/api/settings/enrollment-tokens/{id}` | Revoke a token by ID. |
@@ -5154,7 +5158,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/fragments/settings/pending` | Render the pending agents fragment (HTMX). |
+| `GET` | `/fragments/settings/pending` | Render the pending agents fragment (HTMX); also the **Agents waiting for approval** panel of `/groups`. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`. |
 | `POST` | `/api/settings/pending-agents/{id}/approve` | Approve a pending agent. |
 | `POST` | `/api/settings/pending-agents/{id}/deny` | Deny a pending agent. |
 | `DELETE` | `/api/settings/pending-agents/{id}` | Remove a pending agent from the queue. `409` if the row is no longer `pending` (already `approved`/`denied`) — removal only succeeds against a genuinely pending row, by design (WS-6 6.2). |
@@ -5167,11 +5171,29 @@ An agent id seen for the first time must also use only letters, digits, `.`, `_`
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/fragments/settings/auto-approve` | Render the auto-approval policies fragment (HTMX). |
+| `GET` | `/fragments/settings/auto-approve` | Render the auto-approval policies fragment (HTMX); also the **Auto-approve rules** panel of `/groups`. |
 | `POST` | `/api/settings/auto-approve` | Create a new auto-approval rule. Returns `400` and saves nothing for an unknown type, an empty value, a value over 253 or a label over 128 characters, a `:` or control character in value or label, a malformed `ip_subnet`, a `trusted_ca` that is not 64 hex characters, or a match-everything rule (`*`, `/0`). The four rule writes are refused with `403` when `Origin`/`Referer` names another site, and are refused with `503` if their audit row cannot be stored. |
 | `POST` | `/api/settings/auto-approve/mode` | Set the match mode (`any` or `all`); any other value returns `400`. |
 | `POST` | `/api/settings/auto-approve/{index}/toggle` | Toggle an auto-approval rule on or off. |
 | `DELETE` | `/api/settings/auto-approve/{index}` | Delete an auto-approval rule. |
+
+### Groups and enrolment page
+
+`/groups` (first entry of the **Estate** group in the navigation) puts the three enrolment panels on one page: **Agents waiting for approval**, **Auto-approve rules** and **Enrolment tokens**. A fourth panel, **Management groups**, only points to Settings, where management groups are still managed. The panels are the Settings fragments below, served by the same routes; the page adds no endpoint of its own beyond the page and its script.
+
+The page opens for every signed-in user and redirects to `/login` without a session. Each panel needs the Administrator account role, so a user without it sees "Not available to your account" and the reason in each panel instead of a list.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/groups` | The page. Redirects to `/login` without a session. Sent with `Cache-Control: no-store`. |
+| `GET` | `/static/yuzu-groups.js` | The page's script (clipboard copy, the unlimited-token warning, failure toasts, the Add rule confirmation). Sent with `Cache-Control: no-cache, no-store, must-revalidate`. |
+| `GET` | `/fragments/settings/tokens` | **Enrolment tokens** panel, also the Settings **Enrollment Tokens** panel. Administrator only. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`. |
+| `GET` | `/fragments/settings/pending` | **Agents waiting for approval** panel, also the Settings **Pending Agent Approvals** panel. Administrator only. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`; the page refreshes it when an agent arrives. |
+| `GET` | `/fragments/settings/auto-approve` | **Auto-approve rules** panel, also the Settings **Auto-Approve Policies** panel. Administrator only. |
+
+Each list shows at most 200 rows. Tokens are listed active first, then in the store's newest-first order; waiting agents are listed first, then denied ones. Rows past the limit are not listed. The tokens panel says "Showing 200 of N tokens", and the waiting-agents panel says "Showing 200 of N" when more than 200 agents are waiting; denied rows past the limit are dropped without a note. **Approve all** and **Deny all** act on every waiting agent, including the ones not shown and any that arrive after the page loaded, so they are disabled while more than 200 agents are waiting; approve or deny the listed agents one at a time. Their confirmation gives the total and the first ten hostnames.
+
+A store that does not answer is shown as an unavailable panel, never as an empty list. If a panel cannot load, the page says so and offers **Retry**. A click that fails afterwards (refused, a server error, or lost on the network) leaves the list as it was and shows an error message that stays until closed.
 
 ### API Tokens
 

@@ -132,6 +132,17 @@ customer-distribution lane. Before switching lanes, read the
 - **Colour schemes.** Settings > General > Appearance now offers six schemes (Slate stays
   the default). The choice is stored in the browser, not on the server.
 
+## Behaviour change: the Groups and enrolment page; the Settings enrolment panels look and act differently
+
+- **New page: Estate > Groups and enrolment** (`/groups`). It hosts the agent approval queue, the auto-approve rules and the enrolment tokens on one page. Management groups stay in Settings. The page opens for every signed-in user; the three panels need the Administrator account role, as they did in Settings.
+- **The Settings panels use the same renderers**, so they change too (**Enrollment Tokens**, **Pending Agent Approvals**, **Auto-Approve Policies**). Routes, element ids, form fields and the Administrator gate are unchanged, so scripts keep working. What you will see:
+  - Token **Expires** is shown in UTC (it was raw epoch seconds). Status is a pill and gains **Expired**; active tokens are listed first. The token reveal has a **Done** button.
+  - The approval queue shows when each agent asked to join (UTC) and gains **Forget**, which removes a waiting request (the agent is queued again the next time it asks to join). **Approve all** and **Deny all** replace the two-click buttons with a confirmation that gives the total and the first ten hostnames, and are disabled while the list shows only part of the queue.
+  - Auto-approve rules are described by what they match (hostname and cloud provider are agent-reported and not verified; address rules are IPv4 only). The match mode is two buttons that each ask for confirmation, where it was a drop-down that applied at once. Enable, Remove and Add rule ask for confirmation (Disable asks only in "all" mode, where it widens admission), and a rule that matches every agent is flagged **Matches every agent**.
+  - Each list shows at most 200 rows; the token and waiting-agent panels say how many are not shown.
+  - The token and pending fragments, and the responses that mint tokens, carry `Cache-Control: no-store, private` and `Vary: Cookie`, so a proxy or the browser cache no longer keeps them.
+- No setting, migration or action is needed. Rolling back restores the earlier panels.
+
 ## Behaviour change: new agent, policy and fragment identifiers are restricted; page links encode identifiers
 
 - A `Register` (direct or through the gateway) with an agent id the server has not seen before is now refused with `INVALID_ARGUMENT` unless the id uses only letters, digits, `.`, `_`, `:` and `-` and is not only dots (counted in `yuzu_register_invalid_agent_id_total{reason="charset"}`). Agents that are already enrolled, pending or denied are not affected, and the agent's own generated UUID always passes. If you set `--agent-id` or `YUZU_AGENT_ID` to a value with other characters (for example `DOMAIN\HOST`, `user@host` or a space), change it before the agent first registers. An agent whose enrollment row no longer exists is treated as new again: a pending row an administrator removed, or an enrollment store restored from an older backup, reset or rebuilt. Such an agent, if its id has other characters, gets the refusal on every attempt (retrying with backoff up to 300 seconds) until you change its `--agent-id` / `YUZU_AGENT_ID` to a conforming value. Through the gateway the agent sees the server message wrapped in an `INTERNAL` status. Before upgrading, check any explicit agent ids you set against the rule.
