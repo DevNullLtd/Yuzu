@@ -111,3 +111,16 @@ TEST_CASE("Settings page hides the unlimited-token hint once a limit is typed",
     CHECK(count_of(html, "querySelector('[data-token-unlimited]')") == 1);
     CHECK(count_of(html, "zero('max_uses') && zero('ttl_hours')") == 1);
 }
+
+TEST_CASE("Settings page shows the refreshed list a stale enrolment action returns with a 409",
+          "[settings][settings_page]") {
+    // htmx drops every 4xx body by default; the enrolment routes answer a stale click with a
+    // 409 whose body is the refreshed panel. Same rule as the Groups glue.
+    const std::string html = kSettingsHtml;
+    CHECK(count_of(html, "'htmx:beforeSwap'") == 1);
+    CHECK(count_of(html, "d.xhr.status === 409") == 1);
+    CHECK(count_of(html, "'#token-section, #pending-section, #auto-approve-section'") == 1);
+    CHECK(count_of(html, "indexOf('text/html') !== -1") == 1);
+    CHECK(count_of(html, "d.shouldSwap = true;") == 1);
+    CHECK(count_of(html, "d.isError = false;") == 1);
+}

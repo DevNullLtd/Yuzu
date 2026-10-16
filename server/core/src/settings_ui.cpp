@@ -649,6 +649,19 @@ const char* const kSettingsPageTemplate =
       if (w) w.hidden = !(zero('max_uses') && zero('ttl_hours'));
     });
 
+    /* A stale enrolment action answers 409 with the refreshed list as its body (and a
+       toast). htmx drops every 4xx body by default; show this one. The Groups page does
+       the same in yuzu-groups.js. */
+    document.body.addEventListener('htmx:beforeSwap', function(e) {
+      var d = e.detail;
+      if (d.xhr.status === 409 && d.target &&
+          d.target.matches('#token-section, #pending-section, #auto-approve-section') &&
+          (d.xhr.getResponseHeader('Content-Type') || '').indexOf('text/html') !== -1) {
+        d.shouldSwap = true;
+        d.isError = false;
+      }
+    });
+
 )HTM"
     // Split here purely to keep each raw-string literal under MSVC's 16 KB
     // C2026 cap (adjacent literals concatenate byte-for-byte; the engine-

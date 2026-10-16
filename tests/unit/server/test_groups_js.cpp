@@ -56,9 +56,22 @@ TEST_CASE("groups glue: a failed mutation gets a status-specific persistent toas
     CHECK_THAT(js, ContainsSubstring("'error')"));
     // A response that already carries a toast is not toasted twice.
     CHECK_THAT(js, ContainsSubstring("getResponseHeader('HX-Trigger')"));
-    CHECK_THAT(js, ContainsSubstring("trig.indexOf('showToast') !== -1"));
-    // A stale-list 409 re-reads the panel it came from.
+    CHECK_THAT(js, ContainsSubstring("h.indexOf('showToast') !== -1"));
+    // A 409 without a refreshed-list body re-reads the panel it came from.
     CHECK_THAT(js, ContainsSubstring("if (status === 409) reload(e.target.closest('[data-denied]'));"));
+}
+
+TEST_CASE("groups glue: a 409 with an HTML body swaps in the refreshed list", "[groups][js]") {
+    const std::string& js = yuzu::server::kYuzuGroupsJs;
+    // htmx drops every 4xx body by default; a stale row's 409 carries the refreshed list.
+    CHECK_THAT(js, ContainsSubstring("'htmx:beforeSwap'"));
+    CHECK_THAT(js, ContainsSubstring("d.xhr.status !== 409"));
+    CHECK_THAT(js, ContainsSubstring("indexOf('text/html') === -1"));
+    CHECK_THAT(js, ContainsSubstring("d.shouldSwap = true;"));
+    CHECK_THAT(js, ContainsSubstring("d.isError = false;"));
+    // Only inside a panel, and a response that already toasted is not toasted again.
+    CHECK_THAT(js, ContainsSubstring("d.target.closest('[data-denied]')"));
+    CHECK_THAT(js, ContainsSubstring("if (!serverToasted(d.xhr)) toast(STALE, 'error');"));
 }
 
 TEST_CASE("groups glue: Retry reloads with the panel as the request source", "[groups][js]") {

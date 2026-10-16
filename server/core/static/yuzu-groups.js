@@ -8,6 +8,8 @@
  *  - The same two events on anything else (a mutation button or form in a panel): the list
  *    stays and a persistent error toast says why. 401 -> /login. A response that already
  *    carries a toast in HX-Trigger is not toasted a second time.
+ *  - htmx:beforeSwap on a 409 with an HTML body (a stale row; the body is the refreshed list):
+ *    the body is swapped in, which htmx does not do for any 4xx by default.
  *  - [data-copy-token]: copy the sibling <code> to the clipboard.
  *  - [data-token-form]: the "unlimited, never expires" warning follows the two limit fields.
  *  - htmx:confirm on [data-rule-form]: the server's Add-rule question, plus a sentence when
@@ -79,25 +81,39 @@
     if (panel && panel.dataset.src) htmx.ajax('GET', panel.dataset.src, { source: panel, target: panel });
   }
 
+  // True when the response already carries a toast in HX-Trigger: the user has been told.
+  function serverToasted(xhr) {
+    var h = xhr && xhr.getResponseHeader ? xhr.getResponseHeader('HX-Trigger') : null;
+    return !!h && h.indexOf('showToast') !== -1;
+  }
+
+  var STALE = 'That changed since you loaded it - the list has been refreshed';
+  var REFUSED = { 403: 'Not allowed', 409: STALE };
+
   // A request from inside a panel that the server refused (status) or that never arrived
   // (status 0), other than the panel's own load. The list is left as it is and a persistent
-  // toast says what went wrong. A 409 means the list was stale, so it is re-read to make
-  // "refreshed" true. Requests from outside the panels (the shell's sign-out) are not ours.
-  var REFUSED = {
-    403: 'Not allowed',
-    409: 'That changed since you loaded it - the list has been refreshed'
-  };
-
+  // toast says what went wrong. Requests from outside the panels (the shell's sign-out) are
+  // not ours.
   function mutationFailed(e, status) {
     if (!e.target.closest || !e.target.closest('[data-denied]')) return;
     if (status === 401) { location.assign('/login'); return; }
-    var xhr = e.detail.xhr;
-    var trig = xhr && xhr.getResponseHeader ? xhr.getResponseHeader('HX-Trigger') : null;
-    if (trig && trig.indexOf('showToast') !== -1) return;
+    if (serverToasted(e.detail.xhr)) return;
     toast(status === 0 ? 'Could not reach the server'
                        : REFUSED[status] || 'The server could not do that (HTTP ' + status + ')', 'error');
     if (status === 409) reload(e.target.closest('[data-denied]'));
   }
+
+  // A 409 on an enrolment action means the row had already changed, and its body is the
+  // refreshed list. htmx drops every 4xx body by default; this one is shown, so the stale
+  // row goes away (the toast comes from the response, or from here if it carried none).
+  document.body.addEventListener('htmx:beforeSwap', function (e) {
+    var d = e.detail;
+    if (d.xhr.status !== 409 || !d.target || !d.target.closest || !d.target.closest('[data-denied]')) return;
+    if ((d.xhr.getResponseHeader('Content-Type') || '').indexOf('text/html') === -1) return;
+    d.shouldSwap = true;
+    d.isError = false;
+    if (!serverToasted(d.xhr)) toast(STALE, 'error');
+  });
 
   document.body.addEventListener('showToast', function (e) {
     var d = e.detail || {};
