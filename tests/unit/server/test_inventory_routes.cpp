@@ -963,3 +963,62 @@ TEST_CASE("software routes: the shell carries the page script and /inventory red
     REQUIRE(redirect);
     REQUIRE(redirect->status == 302);
 }
+
+// #4644 (carried across the M.9 catalogue rewrite): `limit` is ONE base-10 integer. The
+// software fragments no longer clamp it themselves (the page size is fixed), but a malformed
+// value must still be refused by the shared model parser, not silently read as the default.
+// The fragments answer 200 + caveat (htmx does not swap 4xx), with no store read.
+TEST_CASE("software routes: a malformed limit is refused, not read as the default",
+          "[inventory][route][numeric_params]") {
+    InvHarness h;
+    for (const char* bad : {"50abc", "0x10", "1e2", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto cat = h.sink.Get(std::string(kSoftware) + "?limit=" + bad);
+        REQUIRE(cat);
+        CHECK(cat->status == 200);
+        CHECK(contains(cat->body, "inv-caveat"));
+        CHECK(contains(cat->body, "invalid limit")); // the style block alone names inv-caveat
+        auto dev = h.sink.Get(std::string(kDevices) + "?name=Chrome&limit=" + bad);
+        REQUIRE(dev);
+        CHECK(dev->status == 200);
+        CHECK(contains(dev->body, "inv-caveat"));
+        CHECK(contains(dev->body, "invalid limit")); // the style block alone names inv-caveat
+        auto ver = h.sink.Get(std::string(kVersions) + "?name=Chrome&limit=" + bad);
+        REQUIRE(ver);
+        CHECK(ver->status == 200);
+        CHECK(contains(ver->body, "inv-caveat"));
+        CHECK(contains(ver->body, "invalid limit")); // the style block alone names inv-caveat
+    }
+    CHECK_FALSE(h.last_catalog_query.has_value());
+    CHECK_FALSE(h.last_versions_query.has_value());
+    CHECK_FALSE(h.last_fleet_query.has_value());
+}
+
+// Positive control for the refusal above: a well-formed `limit` is validated, then ignored (the
+// fragments use a fixed page size), and an EMPTY `limit=` means the default, not a refusal. Both
+// reach the store and render without the caveat, so the malformed case is not refused merely
+// because every `limit` is.
+TEST_CASE("software routes: a well-formed or empty limit reads the store without a caveat",
+          "[inventory][route][numeric_params]") {
+    for (const char* lim : {"50", ""}) {
+        INFO("limit=" << lim);
+        InvHarness h;
+        auto cat = h.sink.Get(std::string(kSoftware) + "?limit=" + lim);
+        REQUIRE(cat);
+        CHECK(cat->status == 200);
+        CHECK_FALSE(contains(cat->body, "invalid limit"));
+        REQUIRE(h.last_catalog_query);
+        CHECK(h.last_catalog_query->limit == 100); // fixed page size, whatever was asked
+        auto ver = h.sink.Get(std::string(kVersions) + "?name=Chrome&limit=" + lim);
+        REQUIRE(ver);
+        CHECK(ver->status == 200);
+        CHECK_FALSE(contains(ver->body, "invalid limit"));
+        REQUIRE(h.last_versions_query);
+        CHECK(h.last_versions_query->limit == 200);
+        auto dev = h.sink.Get(std::string(kDevices) + "?name=Chrome&limit=" + lim);
+        REQUIRE(dev);
+        CHECK(dev->status == 200);
+        CHECK_FALSE(contains(dev->body, "invalid limit"));
+        CHECK(h.last_fleet_query.has_value());
+    }
+}

@@ -375,8 +375,9 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
         spdlog::warn("OffloadTargetStore: rejected target with invalid URL scheme");
         return std::unexpected(OffloadWriteError::invalid_input);
     }
-    if (batch_size < 1) {
-        spdlog::warn("OffloadTargetStore: batch_size must be >= 1, got {}", batch_size);
+    if (batch_size < 1 || batch_size > kMaxOffloadBatchSize) {
+        spdlog::warn("OffloadTargetStore: batch_size must be 1..{}, got {}", kMaxOffloadBatchSize,
+                     batch_size);
         return std::unexpected(OffloadWriteError::invalid_input);
     }
     // Reject control characters in operator-supplied free-text fields.

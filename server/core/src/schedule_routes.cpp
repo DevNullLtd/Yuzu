@@ -2,12 +2,44 @@
 
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "query_int_parse.hpp"
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <optional>
+#include <string>
+
 namespace yuzu::server::schedule {
+
+namespace {
+
+/// Upper bound of `interval_minutes`: the engine's own create-time ceiling
+/// (`kMaxScheduleIntervalMinutes`, floor(INT32_MAX / 60)), so the route 400s before the engine
+/// would refuse the same value.
+constexpr std::int64_t kMaxIntervalMinutes = kMaxScheduleIntervalMinutes;
+
+/// Strict schedule integer (#4644): ABSENT keeps `def`; a PRESENT key must be one JSON integer
+/// inside [lo, hi]. `body.value(k, int)` is a plain static_cast, so 4294967297 became 1 (an
+/// every-minute interval) and 5.5 became 5; a string or null threw and leaked nlohmann's text.
+/// Returns the 400 message, or nullopt when accepted (`out` then holds the value).
+std::optional<std::string> read_schedule_int(const nlohmann::json& j, const char* key, int def,
+                                             std::int64_t lo, std::int64_t hi, int& out) {
+    const auto v = read_json_int_strict(j, key, def);
+    if (!v)
+        return std::string(key) + " must be a JSON integer";
+    if (*v < lo || *v > hi)
+        return std::string(key) + " must be between " + std::to_string(lo) + " and " +
+               std::to_string(hi);
+    out = static_cast<int>(*v);
+    return std::nullopt;
+}
+
+} // namespace
 
 void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
     // -- Schedule API -----------------------------------------------------
@@ -103,12 +135,22 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
             sched.name = j.value("name", "");
             sched.definition_id = j.value("definition_id", "");
             sched.frequency_type = j.value("frequency_type", "once");
-            sched.interval_minutes = j.value("interval_minutes", 60);
             sched.time_of_day = j.value("time_of_day", "00:00");
-            sched.day_of_week = j.value("day_of_week", 0);
-            sched.day_of_month = j.value("day_of_month", 1);
             sched.scope_expression = j.value("scope_expression", "");
             sched.requires_approval = j.value("requires_approval", false);
+            // Strict integers with the documented ranges (#4644): a wrapped or fractional value
+            // used to become a different, valid-looking schedule, and nothing is created on a 400.
+            for (const auto& err :
+                 {read_schedule_int(j, "interval_minutes", 60, 1, kMaxIntervalMinutes,
+                                    sched.interval_minutes),
+                  read_schedule_int(j, "day_of_week", 0, 0, 6, sched.day_of_week),
+                  read_schedule_int(j, "day_of_month", 1, 1, 28, sched.day_of_month)}) {
+                if (err) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", *err}}).dump(), "application/json");
+                    return;
+                }
+            }
 
             // Typed schedule parameters (PR1.5a). `parameters` is OPTIONAL —
             // an omitted field dumps to the empty string, which the
@@ -223,7 +265,17 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
         // JSON boolean {"enabled":false} used to silently fall through
         // to the "absent" default (true), inverting the request and
         // defeating the disable-always-reachable kill switch (H-01).
-        bool enabled = parse_schedule_enabled(req.body);
+        const auto parsed_enabled = parse_schedule_enabled(req.body);
+        if (!parsed_enabled) {
+            // #4644: nothing is armed or changed on a value that is not an unambiguous boolean.
+            res.status = 400;
+            res.set_content(
+                nlohmann::json({{"error", "enabled must be a JSON boolean, the integer 0 or 1, or the string \"true\" or \"false\""}})
+                    .dump(),
+                "application/json");
+            return;
+        }
+        const bool enabled = *parsed_enabled;
         // H-01 (#1806): re-enabling arms the schedule to fire unattended
         // through ScheduleRunner — the same fleet-wide-dispatch concern
         // as create, so it needs the same Execution:Execute gate.
@@ -259,18 +311,40 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
     });
 }
 
-bool parse_schedule_enabled(const std::string& body) {
-    try {
-        auto j = nlohmann::json::parse(body);
-        if (j.contains("enabled")) {
-            if (j["enabled"].is_boolean())
-                return j["enabled"].get<bool>();
-            if (j["enabled"].is_string())
-                return j["enabled"].get<std::string>() != "false";
-        }
-    } catch (...) {
+std::optional<bool> parse_schedule_enabled(const std::string& body) {
+    // A blank (empty or whitespace-only) body is "no body" -- the same rule as the credential-
+    // rotate and enrollment-batch readers.
+    if (std::all_of(body.begin(), body.end(),
+                    [](unsigned char c) { return std::isspace(c) != 0; }))
+        return true; // no body -- pre-existing default: enabling is the bare action
+    const auto j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.is_object())
+        return std::nullopt; // truncated or non-object body: never inferred as "arm"
+    if (!j.contains("enabled"))
+        return true; // missing key -- pre-existing default (disable is an explicit opt-in)
+    const auto& v = j["enabled"];
+    if (v.is_boolean())
+        return v.get<bool>();
+    // 0 and 1 are the only integers with an unambiguous boolean meaning; `{"enabled":0}` used to
+    // ARM the schedule (only the exact string "false" disarmed). Floats, strings, null, arrays
+    // and objects are refused.
+    if (v.is_number_integer()) {
+        if (v == 0)
+            return false;
+        if (v == 1)
+            return true;
     }
-    return true; // missing key / malformed body — pre-existing default
+    // The exact strings "true" and "false" keep the documented kill switch reachable for older
+    // clients that send the value as text: `{"enabled":"false"}` must still disable a runaway
+    // schedule. Case variants and every other string stay refused.
+    if (v.is_string()) {
+        const auto& t = v.get_ref<const std::string&>();
+        if (t == "false")
+            return false;
+        if (t == "true")
+            return true;
+    }
+    return std::nullopt;
 }
 
 } // namespace yuzu::server::schedule

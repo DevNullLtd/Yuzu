@@ -84,8 +84,11 @@ struct InventoryTable {
 struct InventoryQuery {
     std::string agent_id;   // Filter by agent (empty = all)
     std::string plugin;     // Filter by plugin (empty = all)
-    int64_t since{0};       // epoch seconds, 0 = no lower bound
-    int64_t until{0};       // epoch seconds, 0 = no upper bound
+    /// Epoch-second bounds on `collected_at`, PRESENCE-tracked (#4644): unset = no bound on that
+    /// side, a set value is a literal inclusive bound; a literal 0 is not "unbounded". The REST
+    /// routes reject `until <= 0` and a negative `since`; `since == 0` is a harmless literal bound.
+    std::optional<int64_t> since;
+    std::optional<int64_t> until;
     int limit{100};
     int offset{0};
 };

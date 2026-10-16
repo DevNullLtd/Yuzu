@@ -5,6 +5,7 @@
 /// degrades to an honest "unavailable" placeholder (the slice-2 state).
 
 #include "network_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
 #include "http_route_sink.hpp"
@@ -168,9 +169,14 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             key.clear();
         int limit = 50;
         if (req.has_param("limit")) {
-            try {
-                limit = std::clamp(std::stoi(req.get_param_value("limit")), 1, 500);
-            } catch (...) {}
+            const auto parsed = yuzu::server::parse_query_int<int>(req.get_param_value("limit"));
+            if (!parsed) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter: limit"),
+                                "application/json");
+                return;
+            }
+            limit = std::clamp(*parsed, 1, 500);
         }
         // Behavioral-PII access audit — same verb/target as the REST sibling
         // GET /api/v1/network/devices. Set-and-proceed (HTML dashboard
