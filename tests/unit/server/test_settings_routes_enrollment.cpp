@@ -78,6 +78,7 @@ struct EnrollRoutesHarness {
     yuzu::server::test::TestRouteSink sink;
 
     std::string session_user{"admin"};
+    bool admin_allowed{true}; ///< false: both admin gates refuse (403), as for a non-administrator
     std::vector<AuditCall> audit_calls;   ///< AuditFn (void): outcome / denied rows
     std::vector<AuditCall> attempt_calls; ///< AuditReadFn (bool): the fail-closed `attempt` rows
     bool audit_persists{true};            ///< false: the bool hook reports a persist failure
@@ -96,7 +97,23 @@ struct EnrollRoutesHarness {
             s.role = auth::Role::admin;
             return s;
         };
-        auto admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
+        // The loud gate (require_admin) writes a denial row when it refuses; the quiet probe
+        // (probe_admin, what server.cpp binds for the auto-loading GET fragments) makes the same
+        // decision without the row. The rows land in audit_calls so a test can see which gate a
+        // route used.
+        auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
+            if (admin_allowed)
+                return true;
+            res.status = 403;
+            audit_calls.push_back({"auth.admin_required", "denied", "", "", "loud gate"});
+            return false;
+        };
+        auto probe_admin_fn = [this](const httplib::Request&, httplib::Response& res) {
+            if (admin_allowed)
+                return true;
+            res.status = 403;
+            return false;
+        };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) { return true; };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
@@ -120,6 +137,7 @@ struct EnrollRoutesHarness {
                                /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
                                oidc_mu, oidc_provider, /*metrics_registry=*/nullptr,
                                /*step_up_fn=*/{}, audit_read_fn);
+        routes.set_read_admin_fn(probe_admin_fn); // as server.cpp does
         // A browser sends these on every same-origin post; the cross-origin tests clear them.
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
     }
@@ -401,6 +419,96 @@ TEST_CASE("settings enrollment: revoking an unknown token warns and never reads 
     auto ok = h.sink.Delete("/api/settings/enrollment-tokens/" + created->token_id);
     REQUIRE(ok);
     CHECK(ok->get_header_value("HX-Trigger").find("Enrollment token revoked") != std::string::npos);
+}
+
+// ── Admin gates (SG-1 / FV-2) ──────────────────────────────────────────────────────────────
+// The three GET fragments auto-load (and the pending panel reloads on every SSE arrival), so for
+// a non-administrator they must refuse WITHOUT a denial audit row per panel per view (the Users
+// page was fixed for exactly this). Every mutating route keeps the loud gate: it refuses, writes
+// its denial row, and touches no store.
+
+TEST_CASE("settings enrollment: a non-admin GET of an auto-loading fragment is 403 with no denial row",
+          "[pg][settings_routes][enrollment][admin_gate]") {
+    EnrollRoutesHarness h;
+    h.queue("p1");
+    REQUIRE(h.auth_mgr.create_enrollment_token("secret-label", 1, std::chrono::hours(1), "admin"));
+    h.auto_approve.add_rule({auth::AutoApproveRuleType::hostname_glob, "secret.corp", "", true});
+    h.admin_allowed = false;
+
+    for (const char* path : {"/fragments/settings/tokens", "/fragments/settings/pending",
+                             "/fragments/settings/auto-approve"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        // Nothing of the store or the policy was rendered.
+        for (const char* leak : {"secret-label", "host-p1", "secret.corp", "<table"})
+            CHECK(res->body.find(leak) == std::string::npos);
+    }
+    // A page view writes no denial rows: not one per panel, not one per SSE reload.
+    CHECK(h.audit_calls.empty());
+}
+
+TEST_CASE("settings enrollment: an unwired read probe falls back to the loud gate, never to none",
+          "[pg][settings_routes][enrollment][admin_gate]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    h.routes.set_read_admin_fn({});
+    h.admin_allowed = false;
+    auto res = h.sink.Get("/fragments/settings/auto-approve");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.only("auth.admin_required").result == "denied");
+}
+
+TEST_CASE("settings enrollment: every mutating enrolment route refuses a non-admin loudly and changes nothing",
+          "[pg][settings_routes][enrollment][admin_gate]") {
+    EnrollRoutesHarness h;
+    h.queue("p1");
+    REQUIRE(h.auth_mgr.create_enrollment_token("t", 1, std::chrono::hours(1), "admin"));
+    const auto token_id = h.auth_mgr.list_enrollment_tokens().value()[0].token_id;
+    h.auto_approve.add_rule({auth::AutoApproveRuleType::hostname_glob, "a.corp", "A", true});
+    h.admin_allowed = false;
+
+    struct Call {
+        const char* verb;
+        std::string path;
+        std::string body;
+    };
+    const std::vector<Call> calls = {
+        {"POST", "/api/settings/enrollment-tokens", "label=x&max_uses=1"},
+        {"DELETE", "/api/settings/enrollment-tokens/" + token_id, ""},
+        {"POST", "/api/settings/enrollment-tokens/batch", R"({"count":2})"},
+        {"POST", "/api/settings/pending-agents/bulk-approve", ""},
+        {"POST", "/api/settings/pending-agents/bulk-deny", ""},
+        {"POST", "/api/settings/pending-agents/p1/approve", ""},
+        {"POST", "/api/settings/pending-agents/p1/deny", ""},
+        {"DELETE", "/api/settings/pending-agents/p1", ""},
+        {"POST", "/api/settings/auto-approve", "type=hostname_glob&value=b.corp&label=B"},
+        {"POST", "/api/settings/auto-approve/mode", "mode=all"},
+        {"POST", "/api/settings/auto-approve/0/toggle", ""},
+        {"DELETE", "/api/settings/auto-approve/0", ""},
+    };
+    for (const auto& c : calls) {
+        INFO(c.verb << " " << c.path);
+        h.audit_calls.clear();
+        const auto res = std::string(c.verb) == "POST" ? h.sink.Post(c.path, c.body, kForm)
+                                                       : h.sink.Delete(c.path);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        // The loud gate's row, and nothing else: no outcome row, no attempt row.
+        REQUIRE(h.audit_calls.size() == 1);
+        CHECK(h.audit_calls[0].action == "auth.admin_required");
+        CHECK(h.attempt_calls.empty());
+    }
+    // No store call got through: all of it is as it was.
+    CHECK(h.status_of("p1") == auth::PendingStatus::pending);
+    const auto tokens = h.auth_mgr.list_enrollment_tokens().value();
+    REQUIRE(tokens.size() == 1);
+    CHECK_FALSE(tokens[0].revoked);
+    const auto rules = h.auto_approve.list_rules();
+    REQUIRE(rules.size() == 1);
+    CHECK(rules[0].enabled);
+    CHECK_FALSE(h.auto_approve.require_all());
 }
 
 TEST_CASE("settings enrollment: remove REFUSES a denied/approved row — 409, denied audit, row "

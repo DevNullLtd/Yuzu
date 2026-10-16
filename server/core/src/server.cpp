@@ -16406,6 +16406,14 @@ private:
                    const std::string& target_id, const std::string& detail) -> bool {
                 return audit_log(req, action, result, target_type, target_id, detail);
             });
+        // The three auto-loading enrolment GET fragments (Settings panels and the Groups page)
+        // use the quiet admin probe, as the Users page does: a non-administrator's page view
+        // must not write an auth.admin_required row per panel. Mutating routes keep the loud
+        // require_admin bound above. Wired before the listener starts.
+        settings_routes_->set_read_admin_fn(
+            [this](const httplib::Request& req, httplib::Response& res) {
+                return auth_routes_->probe_admin(req, res);
+            });
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).
         settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });

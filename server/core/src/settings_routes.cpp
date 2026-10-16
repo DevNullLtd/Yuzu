@@ -3084,7 +3084,7 @@ void SettingsRoutes::register_routes(
 
     sink.Get("/fragments/settings/tokens",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_admin(req, res))
                      return;
                  no_store_private(res);
                  res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
@@ -3092,7 +3092,7 @@ void SettingsRoutes::register_routes(
 
     sink.Get("/fragments/settings/pending",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_admin(req, res))
                      return;
                  no_store_private(res);
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
@@ -3100,7 +3100,7 @@ void SettingsRoutes::register_routes(
 
     sink.Get("/fragments/settings/auto-approve",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_admin(req, res))
                      return;
                  res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
              });
