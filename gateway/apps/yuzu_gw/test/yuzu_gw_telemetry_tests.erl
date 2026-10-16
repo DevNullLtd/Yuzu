@@ -764,3 +764,42 @@ register_refused_families_test_() ->
                               <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"batch_heartbeat\",code=\"exception\"} ">>])
        end}
      ]}.
+
+%% S3: the breaker transition counter is pre-seeded for its three states. A
+%% series born at 1 is invisible to increase(), so without the seed the first
+%% open of a fresh gateway process (a crash-looping gateway opens only once per
+%% life) never raised YuzuGatewayUpstreamCircuitOpened. The series are removed
+%% before setup() so "exists at 0" proves the seed, not an earlier increment.
+circuit_transitions_seeded_test_() ->
+    States = [<<"closed">>, <<"open">>, <<"half_open">>],
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        [catch prometheus_counter:remove(yuzu_gw_upstream_circuit_transitions_total, [S])
+         || S <- States],
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"closed, open and half_open exist at 0 straight after setup",
+       fun() ->
+           [?assertEqual({S, 0},
+                         {S, prometheus_counter:value(yuzu_gw_upstream_circuit_transitions_total,
+                                                      [S])})
+            || S <- States]
+       end},
+      {"the first open of the process moves the seeded series 0 -> 1",
+       fun() ->
+           telemetry:execute([yuzu, gw, upstream, circuit_state], #{count => 1},
+                             #{state => <<"open">>}),
+           ?assertEqual(1, prometheus_counter:value(yuzu_gw_upstream_circuit_transitions_total,
+                                                    [<<"open">>])),
+           assert_scrape_has(
+             [<<"yuzu_gw_upstream_circuit_transitions_total{state=\"closed\"} 0">>,
+              <<"yuzu_gw_upstream_circuit_transitions_total{state=\"half_open\"} 0">>,
+              <<"yuzu_gw_upstream_circuit_transitions_total{state=\"open\"} 1">>])
+       end}
+     ]}.

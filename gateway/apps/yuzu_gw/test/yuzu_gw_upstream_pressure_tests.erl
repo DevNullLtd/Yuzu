@@ -197,6 +197,8 @@ process_test_() ->
        {timeout, 30, fun busy_alone_is_not_saturated/0}},
       {"every notify slot held saturates the notify lane, and the next notification is held",
        {timeout, 30, fun notify_lane_saturates/0}},
+      {"during a registration replay the notify lane saturates at the reserved budget",
+       {timeout, 30, fun notify_lane_saturates_at_the_replay_budget/0}},
       {"there is no snapshot when the process is not running",
        {timeout, 30, fun no_snapshot_without_a_process/0}},
       {"a restarted process does not inherit a busy lane from the one that died mid-RPC",
@@ -287,6 +289,55 @@ notify_lane_saturates() ->
     Last ! go,
     await_snapshot(fun(#{notify_inflight := N}) -> N =:= 0 end),
     ?assertEqual(none(), ?P:saturated(yuzu_gw_upstream:lane_snapshot())).
+
+%% While a registration replay is queued drain/1 holds one notify slot back
+%% (notify_budget/1: 9 of 10), so nine workers in flight already means the next
+%% notification is held: the lane is saturated at 9, not at 10.
+notify_lane_saturates_at_the_replay_budget() ->
+    %% Three entries with no stored request: each replay step skips its entry
+    %% without an RPC, and a minute between steps keeps the queue non-empty
+    %% until the test advances it by hand.
+    Prev = application:get_env(yuzu_gw, registration_replay_spacing_ms),
+    application:set_env(yuzu_gw, registration_replay_spacing_ms, 60000),
+    catch meck:unload(yuzu_gw_registry),
+    ok = meck:new(yuzu_gw_registry, [passthrough, no_link]),
+    ok = meck:expect(yuzu_gw_registry, all_register_reqs,
+                     fun() -> [{<<"r1">>, <<"s1">>, #{}}, {<<"r2">>, <<"s2">>, #{}},
+                               {<<"r3">>, <<"s3">>, #{}}] end),
+    try
+        Up = start_upstream(),
+        ?assertMatch(#{notify_limit := 10}, yuzu_gw_upstream:lane_snapshot()),
+        gen_server:cast(yuzu_gw_upstream, replay_registrations),
+        %% the first step ran (r1 skipped); r2 and r3 wait a minute
+        await_snapshot(fun(#{notify_limit := L}) -> L =:= 9 end),
+        Notify = fun(Id) ->
+                     yuzu_gw_upstream:notify_stream_status(Id, <<"s">>, connected,
+                                                           <<"127.0.0.1">>, <<"h">>)
+                 end,
+        [Notify(<<"n", (integer_to_binary(I))/binary>>) || I <- lists:seq(1, 10)],
+        Workers = [receive {rpc, _, none, W} -> W after ?WAIT_MS -> error(no_notify_rpc) end
+                   || _ <- lists:seq(1, 9)],
+        %% the tenth is held: one slot is reserved for the replay
+        receive {rpc, _, none, _} -> error(reserved_slot_used) after 100 -> ok end,
+        await_snapshot(fun(#{notify_inflight := N}) -> N =:= 9 end),
+        ?assertMatch(#{notify_limit := 9}, yuzu_gw_upstream:lane_snapshot()),
+        ?assertEqual(sat([notify]), ?P:saturated(yuzu_gw_upstream:lane_snapshot())),
+        %% the replay ends (r2, r3 stepped by hand): the budget is ten again
+        %% and the held notification takes the slot that was reserved
+        Up ! replay_next,
+        Up ! replay_next,
+        await_snapshot(fun(#{notify_limit := L}) -> L =:= 10 end),
+        Tenth = receive {rpc, _, none, W10} -> W10 after ?WAIT_MS -> error(held_not_sent) end,
+        [W ! go || W <- [Tenth | Workers]],
+        await_snapshot(fun(#{notify_inflight := N}) -> N =:= 0 end),
+        ?assertEqual(none(), ?P:saturated(yuzu_gw_upstream:lane_snapshot()))
+    after
+        catch meck:unload(yuzu_gw_registry),
+        case Prev of
+            {ok, V}   -> application:set_env(yuzu_gw, registration_replay_spacing_ms, V);
+            undefined -> application:unset_env(yuzu_gw, registration_replay_spacing_ms)
+        end
+    end.
 
 no_snapshot_without_a_process() ->
     ?assertEqual(undefined, yuzu_gw_upstream:lane_snapshot()).

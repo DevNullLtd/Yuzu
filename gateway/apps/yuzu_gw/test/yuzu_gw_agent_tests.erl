@@ -64,6 +64,10 @@ agent_test_() ->
       {"streaming removes pending on terminal response", fun streaming_clears_pending/0},
       {"streaming keeps pending on RUNNING response", fun streaming_keeps_running/0},
       {"streaming handles orphaned response", fun streaming_orphaned_response/0},
+      {"completed duration carries the dispatched plugin, not the response's",
+       fun completed_carries_dispatched_plugin/0},
+      {"code_change upgrades a pending entry kept without its plugin",
+       fun code_change_upgrades_legacy_pending/0},
       {"agent stops on stream_closed", fun stops_on_close/0},
       {"stream_home_id is identical on CONNECTED and DISCONNECTED (#4324)", fun stream_home_id_identical_on_connect_and_disconnect/0},
       {"agent stops on stream_error", fun stops_on_error/0},
@@ -200,6 +204,66 @@ streaming_keeps_running() ->
     timer:sleep(20),
     {ok, Info} = yuzu_gw_agent:get_info(Pid),
     ?assertEqual(1, maps:get(pending_cmds, Info)),
+    stop_agent(Pid).
+
+%% A CommandResponse carries `plugin' only on the Guardian side channel; a
+%% reply to a dispatched command decodes it as the proto3 default <<>>. The
+%% duration histogram must be labelled with the plugin the command was
+%% DISPATCHED for (what yuzu_gw_commands_dispatched_total uses), so the two
+%% series join; reading the response's field labelled every reply plugin="".
+completed_carries_dispatched_plugin() ->
+    {Pid, _} = start_agent(<<"ccp-1">>, self()),
+    FanoutRef = make_ref(),
+    meck:reset(telemetry),
+    yuzu_gw_agent:dispatch(Pid, #{command_id => <<"cmd-cp1">>, plugin => <<"svc">>},
+                           {self(), FanoutRef}),
+    receive {send_command, _} -> ok after 1000 -> ok end,
+    Pid ! {stream_data, #{command_id => <<"cmd-cp1">>, status => 'SUCCESS',
+                          plugin => <<>>, action => <<>>}},
+    receive {command_response, FanoutRef, _, _} -> ok
+    after 1000 -> ?assert(false, "Expected command_response")
+    end,
+    _ = sys:get_state(Pid),
+    Events = [{E, Meta} || {_, {telemetry, execute, [E, _, Meta]}, _}
+                               <- meck:history(telemetry),
+                           E =:= [yuzu, gw, command, dispatched]
+                               orelse E =:= [yuzu, gw, command, completed]],
+    ?assertMatch([{[yuzu, gw, command, dispatched], #{plugin := <<"svc">>}},
+                  {[yuzu, gw, command, completed],
+                   #{plugin := <<"svc">>, status := 'SUCCESS'}}], Events),
+    stop_agent(Pid).
+
+%% A pending entry written by a version that did not keep the plugin is a
+%% 3-tuple; after code_change/4 it completes (labelled unknown) instead of
+%% crashing the agent process on the 4-tuple match.
+code_change_upgrades_legacy_pending() ->
+    {Pid, _} = start_agent(<<"ccl-1">>, self()),
+    FanoutRef = make_ref(),
+    yuzu_gw_agent:dispatch(Pid, #{command_id => <<"cmd-l1">>, plugin => <<"svc">>},
+                           {self(), FanoutRef}),
+    receive {send_command, _} -> ok after 1000 -> ok end,
+    %% Rewrite the entry to the old 3-tuple shape: the pending map is the
+    %% only field of the data record holding the key <<"cmd-l1">>.
+    Downgrade = fun(#{<<"cmd-l1">> := {R, F, T, _Plugin}} = M) -> M#{<<"cmd-l1">> := {R, F, T}};
+                   (Other) -> Other
+                end,
+    _ = sys:replace_state(Pid, fun({St, Data}) ->
+                                       Fields = [Downgrade(E) || E <- tuple_to_list(Data)],
+                                       {St, list_to_tuple(Fields)}
+                               end),
+    ok = sys:suspend(Pid),
+    ok = sys:change_code(Pid, yuzu_gw_agent, old_vsn, []),
+    ok = sys:resume(Pid),
+    meck:reset(telemetry),
+    Pid ! {stream_data, #{command_id => <<"cmd-l1">>, status => 'SUCCESS'}},
+    receive {command_response, FanoutRef, _, _} -> ok
+    after 1000 -> ?assert(false, "Expected command_response")
+    end,
+    _ = sys:get_state(Pid),
+    ?assert(is_process_alive(Pid)),
+    ?assertMatch([#{plugin := <<"unknown">>}],
+                 [Meta || {_, {telemetry, execute, [[yuzu, gw, command, completed], _, Meta]}, _}
+                              <- meck:history(telemetry)]),
     stop_agent(Pid).
 
 streaming_orphaned_response() ->

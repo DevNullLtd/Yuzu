@@ -35,7 +35,7 @@ init_includes_cluster_discovery_child_spec_test() ->
 -define(CORE, [yuzu_gw_registry, yuzu_gw_upstream, yuzu_gw_upstream_pressure,
                yuzu_gw_heartbeat_buffer, yuzu_gw_router,
                yuzu_gw_gauge, yuzu_gw_cluster_discovery, yuzu_gw_health,
-               yuzu_gw_memory_shedder, yuzu_gw_agent_sup]).
+               yuzu_gw_memory_shedder, yuzu_gw_agent_sup, yuzu_gw_mgmt_pins]).
 
 entry(Name) ->
     #{name => Name, service_protos => [agent_pb],
@@ -69,6 +69,17 @@ listeners_are_the_last_children_test() ->
         {ok, {_, Specs}} = yuzu_gw_sup:init([]),
         [?assertMatch(#{start := {yuzu_grpc_listener, start_link, [_]}, restart := permanent},
                       S) || S <- Specs, is_tuple(maps:get(id, S))]
+    end).
+
+%% #5696: the management-pin watcher publishes the pins in its init/1, so it
+%% must start before any listener can take a management stream.
+mgmt_pin_watcher_precedes_the_listeners_test() ->
+    with_listeners([(entry(mgmt))#{service_protos := [management_pb]}], fun() ->
+        Ids = child_ids(),
+        Watcher = length(lists:takewhile(fun(I) -> I =/= yuzu_gw_mgmt_pins end, Ids)),
+        Listener = length(lists:takewhile(fun(I) -> I =/= {yuzu_grpc_listener, mgmt} end, Ids)),
+        ?assert(Watcher < length(Ids)),
+        ?assert(Watcher < Listener)
     end).
 
 pg_scope_is_the_first_child_test() ->
@@ -127,7 +138,7 @@ channel_children_precede_their_callers_test() ->
                       {yuzu_grpc_client_channel, second_channel},
                       yuzu_gw_upstream, yuzu_gw_upstream_pressure, yuzu_gw_heartbeat_buffer,
                       yuzu_gw_router, yuzu_gw_gauge, yuzu_gw_cluster_discovery, yuzu_gw_health,
-                      yuzu_gw_memory_shedder, yuzu_gw_agent_sup],
+                      yuzu_gw_memory_shedder, yuzu_gw_agent_sup, yuzu_gw_mgmt_pins],
                      child_ids())
     end) end).
 

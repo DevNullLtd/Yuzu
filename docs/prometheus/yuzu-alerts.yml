@@ -155,6 +155,11 @@ groups:
             plus failing command forwarding means the server leaf and
             mgmt_peer_pins diverged (rotation?); other reasons indicate a
             CA-cert holder that is not the server probing the command plane.
+            A few pin_mismatch rejections that stop within
+            mgmt_pin_refresh_ms (default 5 s) of the server rotating its leaf
+            are the pin watcher's refresh window (#5696): the gateway refuses
+            the new leaf until its next refresh, and the server's retry
+            succeeds. Rejections that continue past it are not.
 
       - alert: YuzuGatewayMgmtPinUnresolved
         expr: |
@@ -768,11 +773,10 @@ groups:
         # alerts above name two specific causes; this one also covers a server
         # that is down, slow or refusing for another reason.
         #
-        # Not pre-seeded (yuzu_gw_telemetry.erl declares the counter without
-        # initial series), so the FIRST open of a gateway process is a series that
-        # appears at 1, which increase() cannot see; a fault that persists
-        # re-opens the circuit (every failed probe is another `open`) and fires,
-        # but one isolated open that then recovers can be missed.
+        # Pre-seeded: yuzu_gw_telemetry.erl creates the closed, open and
+        # half_open series at 0 when the gateway starts, so the FIRST open of a
+        # gateway process is a 0 -> 1 step that increase() sees (a crash-looping
+        # gateway, which opens its breaker once per life, alerts too).
         # INITIAL threshold, to be tuned on a real deployment.
         expr: |
           sum by (instance) (increase(yuzu_gw_upstream_circuit_transitions_total{state="open"}[15m])) > 0

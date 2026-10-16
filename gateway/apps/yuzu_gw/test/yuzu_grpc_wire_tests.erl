@@ -504,6 +504,9 @@ tls_setup() ->
             start_apps(),
             yuzu_grpc_stub_svc:init_state(),
             application:set_env(yuzu_gw, mgmt_peer_pins, [{cert_file, SrvPem}]),
+            %% What the running gateway's yuzu_gw_mgmt_pins does at boot: the
+            %% auth_fun reads the published pin, never the file.
+            ok = yuzu_gw_mgmt_pins:refresh(),
             Tls = #{certfile => filename:join(Dir, "gw.pem"), keyfile => filename:join(Dir, "gw.key"),
                     cacertfile => Ca},
             Base = #{service_protos => [agent_pb], services => #{?SVC => yuzu_grpc_stub_svc}},

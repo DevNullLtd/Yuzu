@@ -22,7 +22,8 @@
 -export([check_legacy_grpcbox_servers/0, check_legacy_grpcbox_client/0,
          legacy_grpcbox_in_files/2, check_grpc_listeners/0,
          check_upstream_client_config/0,
-         check_mgmt_listener_posture/0, check_memory_shedding/0]).         %% for testing
+         check_mgmt_listener_posture/0, check_memory_shedding/0,
+         check_mgmt_pin_refresh/0]).                                      %% for testing
 -export([evaluate_cluster_id/2, evaluate_cluster_id/3]).                  %% for testing
 -export([apply_env_overrides/1]).                                          %% for testing
 
@@ -86,6 +87,7 @@ do_start_guarded() ->
                 fun check_upstream_tls_posture/0,
                 fun check_upstream_tls_files/0,
                 fun check_mgmt_listener_posture/0,
+                fun check_mgmt_pin_refresh/0,
                 fun check_memory_shedding/0],
                fun do_start_services/0).
 
@@ -1066,6 +1068,24 @@ check_memory_shedding() ->
                         "See docs/user-manual/gateway.md for the shape.", [Reason]),
                     {error, bad_memory_shedding}
             end
+    end.
+
+%% @doc Fail-closed guard: refuse to boot on a {yuzu_gw, mgmt_pin_refresh_ms}
+%% that is set but is not an integer from 100 to 3600000 (ms). It is how often
+%% yuzu_gw_mgmt_pins re-stats the {cert_file, Path} management pins, so it bounds
+%% how long a rotated server leaf is refused (#5696). Unset is valid (5000).
+-spec check_mgmt_pin_refresh() -> ok | {error, bad_mgmt_pin_refresh_ms}.
+check_mgmt_pin_refresh() ->
+    case yuzu_gw_mgmt_pins:validate_refresh_ms(
+           application:get_env(yuzu_gw, mgmt_pin_refresh_ms, undefined)) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            logger:critical(
+              "Refusing to start: invalid {yuzu_gw, mgmt_pin_refresh_ms}: ~p. It must be "
+              "an integer number of milliseconds from 100 to 3600000, or unset (5000). "
+              "See docs/user-manual/gateway.md.", [Reason]),
+            {error, bad_mgmt_pin_refresh_ms}
     end.
 
 %% @doc Pure listener-configuration decision -- exported for testing. A defect

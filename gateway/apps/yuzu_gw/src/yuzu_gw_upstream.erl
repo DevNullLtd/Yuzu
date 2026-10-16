@@ -253,12 +253,18 @@
 %%             publish_breaker/1 wherever cb_state is assigned: init/1, the
 %%             circuit_half_open timer, on_success/1 from half_open and
 %%             trip_circuit/1. A new assignment of cb_state must publish too.
+%%   NOTIFY_LIMIT  the notify slots drain/1 may fill now, notify_budget/1 of the
+%%             replay queue: MAX_NOTIFY_INFLIGHT, one fewer while a registration
+%%             replay is queued. Published by set_replay_queue/2, the one place
+%%             replay_queue is assigned after init/1 (init_cell/0 publishes the
+%%             empty queue's budget). A new assignment must go through it.
 -define(CELL, {?MODULE, cell}).
--define(CELL_SLOTS, 4).
+-define(CELL_SLOTS, 5).
 -define(CELL_IN_RPC, 1).
 -define(CELL_NOTIFY, 2).
 -define(CELL_GUARDIAN, 3).
 -define(CELL_CB, 4).
+-define(CELL_NOTIFY_LIMIT, 5).
 -define(CB_CLOSED, 0).
 -define(CB_OPEN, 1).
 -define(CB_HALF_OPEN, 2).
@@ -460,7 +466,7 @@ lane_snapshot() ->
                     #{in_rpc            => atomics:get(Cell, ?CELL_IN_RPC) =:= 1,
                       mailbox_len       => Len,
                       notify_inflight   => atomics:get(Cell, ?CELL_NOTIFY),
-                      notify_limit      => ?MAX_NOTIFY_INFLIGHT,
+                      notify_limit      => notify_limit(Cell),
                       guardian_inflight => atomics:get(Cell, ?CELL_GUARDIAN),
                       guardian_limit    => ?MAX_GUARDIAN_INFLIGHT};
                 undefined ->
@@ -487,7 +493,24 @@ init_cell() ->
                    end
            end,
     [atomics:put(Cell, Slot, 0) || Slot <- [?CELL_IN_RPC, ?CELL_NOTIFY, ?CELL_GUARDIAN]],
+    atomics:put(Cell, ?CELL_NOTIFY_LIMIT, notify_budget([])),
     ok.
+
+grow_cell() ->
+    case persistent_term:get(?CELL, undefined) of
+        undefined ->
+            ok;
+        Old ->
+            case atomics:info(Old) of
+                #{size := Size} when Size >= ?CELL_SLOTS ->
+                    ok;
+                #{size := Size} ->
+                    New = atomics:new(?CELL_SLOTS, [{signed, false}]),
+                    [atomics:put(New, I, atomics:get(Old, I)) || I <- lists:seq(1, Size)],
+                    persistent_term:put(?CELL, New),
+                    ok
+            end
+    end.
 
 new_cell() ->
     Cell = atomics:new(?CELL_SLOTS, [{signed, false}]),
@@ -499,6 +522,29 @@ cell_put(Slot, Value) ->
         undefined -> ok;
         Cell      -> atomics:put(Cell, Slot, Value)
     end.
+
+%% The notify budget the pressure sampler compares the in-flight count with: the
+%% one drain/1 applies, so "every slot drain/1 may fill is held" is what
+%% saturates the lane (one slot is reserved while a replay is queued). A cell
+%% that has not been written (0) reads as the full budget.
+%% A cell put by an older version of this module (fewer slots) has no limit to
+%% read until code_change/3 or the next start replaces it: also the full budget.
+notify_limit(Cell) ->
+    case atomics:info(Cell) of
+        #{size := Size} when Size >= ?CELL_NOTIFY_LIMIT ->
+            case atomics:get(Cell, ?CELL_NOTIFY_LIMIT) of
+                0     -> ?MAX_NOTIFY_INFLIGHT;
+                Limit -> Limit
+            end;
+        _ ->
+            ?MAX_NOTIFY_INFLIGHT
+    end.
+
+%% Assign replay_queue and publish the notify budget it implies.
+-spec set_replay_queue(#state{}, list()) -> #state{}.
+set_replay_queue(State, Queue) ->
+    cell_put(?CELL_NOTIFY_LIMIT, notify_budget(Queue)),
+    State#state{replay_queue = Queue}.
 
 publish_breaker(closed)    -> cell_put(?CELL_CB, ?CB_CLOSED);
 publish_breaker(open)      -> cell_put(?CELL_CB, ?CB_OPEN);
@@ -692,9 +738,13 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamH
             #state{notify_pending = Pending, notify_probe = Probe,
                    cluster_id = ClusterId} = State) ->
     Before = notify_counts(State),
-    %% The peer address is agent supplied: make it encodable and bounded before
-    %% anything is built from it, so the held notification can never fail the
-    %% same way on every send (see the standing invariant in the module header).
+    %% The peer address is the one the gateway decided when the agent registered
+    %% (yuzu_gw_agent_service:register_checked/2: the TCP peer, or the address a
+    %% trusted proxy vouched for, formatted by yuzu_grpc_origin; `unknown' when
+    %% there is none), never a value the agent sent. It is still made encodable
+    %% and bounded here, whoever the caller, before anything is built from it, so
+    %% the held notification can never fail the same way on every send (see the
+    %% standing invariant in the module header).
     PeerAddr = sanitize_peer_addr(AgentId, PeerAddr0),
     Notification = #{
         agent_id     => AgentId,
@@ -847,14 +897,14 @@ handle_cast(replay_registrations, State) ->
     case Agents of
         [] ->
             logger:info("Registration replay: no agents to re-proxy"),
-            {noreply, State#state{replay_queue = []}};
+            {noreply, set_replay_queue(State, [])};
         _ ->
             logger:info("Registration replay: re-proxying ~b agent(s) upstream",
                         [length(Agents)]),
             telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
                               #{count => 1}, #{trigger => breaker}),
             self() ! replay_next,
-            {noreply, State#state{replay_queue = Agents}}
+            {noreply, set_replay_queue(State, Agents)}
     end;
 
 handle_cast(_Msg, State) ->
@@ -880,7 +930,7 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                 logger:warning("Registration replay aborted: circuit open "
                                "(~b agent(s) not yet re-proxied)", [length(Rest) + 1]),
                 emit_queue_depth(0),
-                prune_recent_replays(State1#state{replay_queue = []});
+                prune_recent_replays(set_replay_queue(State1, []));
             {allow, #state{notify_pids = Pids} = State1}
                     when map_size(Pids) >= ?MAX_NOTIFY_INFLIGHT ->
                 %% Back-pressure, not drop avoidance (#4632). A replay-ADOPTED
@@ -974,7 +1024,7 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                         schedule_replay_next(Rest, Spacing),
                         advance_queue(NextState, Rest);
                     abort ->
-                        prune_recent_replays(State1#state{replay_queue = []})
+                        prune_recent_replays(set_replay_queue(State1, []))
                 end
         end,
     %% The reserved slot is spent again as soon as the replay is over, and the
@@ -1184,8 +1234,11 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
 terminate(_Reason, _State) ->
     ok.
 
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+code_change(_OldVsn, #state{replay_queue = Queue} = State, _Extra) ->
+    %% A cell put by an older version has fewer slots than this one writes:
+    %% replace it with one that keeps the old slots, then publish the budget.
+    ok = grow_cell(),
+    {ok, set_replay_queue(State, Queue)}.
 
 %% @doc What a crash report and sys:get_status/1 show of this process.
 %%
@@ -1772,7 +1825,7 @@ enqueue_sessions(SessionIds, State0) ->
                 [] -> self() ! replay_next;
                 _  -> ok
             end,
-            State#state{replay_queue = Queue ++ lists:reverse(RevAppended)}
+            set_replay_queue(State, Queue ++ lists:reverse(RevAppended))
     end.
 
 %% @doc The head entry is finished: keep the rest of the queue. When that
@@ -1780,9 +1833,9 @@ enqueue_sessions(SessionIds, State0) ->
 %% here (the `replay_next' clause for an empty queue is not reached after the
 %% last pop).
 advance_queue(State, []) ->
-    prune_recent_replays(State#state{replay_queue = []});
+    prune_recent_replays(set_replay_queue(State, []));
 advance_queue(State, Rest) ->
-    State#state{replay_queue = Rest}.
+    set_replay_queue(State, Rest).
 
 %% @doc Record that SessionId is being replayed now. An entry seeded with no
 %% session (the register_agent/5 back-compat path) has nothing a verdict could

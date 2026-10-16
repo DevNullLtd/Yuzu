@@ -29,12 +29,15 @@
 %%% peer address, a failed upstream call): at most one line per second per kind,
 %%% and the line that follows a quiet interval carries the number of lines that
 %%% were suppressed since the previous one. The first occurrence always logs.
+%%% A kind is an atom, or `{mgmt_peer_rejected, Reason}' for a management-plane
+%%% peer the SPKI pin refused (yuzu_gw_authz): any holder of an install-CA
+%%% certificate can provoke that once per stream, so it is limited per reason.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_safe_call).
 
 -export([call/4, guard/3, warn_limited/3]).
--export([init_limits/0, init_limits/1]).
+-export([init_limits/0, init_limits/1, init_kinds/1]).
 -export([exit_class/1, reset_limits/0, expire_limit/1, hold_limit/1]).  %% for testing
 
 -define(WARN_INTERVAL_MS, 1000).
@@ -46,6 +49,9 @@
 %% the gateway write once per request.
 -define(KINDS, [register_refused, register_peer_addr, register_failed, inventory_failed,
                 rpc_raised, rpc_answered_error]).
+
+-type kind() :: atom() | {mgmt_peer_rejected, atom()}.
+-export_type([kind/0]).
 
 %% @doc gen_server:call(Server, Request, Timeout), with an exit turned into
 %% {error, Error}. A reply is returned as is.
@@ -79,7 +85,7 @@ exit_class(_)            -> other.
 %% how many were counted since the previous one. A Kind without a stamp (a caller
 %% before init_limits/0 ran) gets one on its first use: that costs at most an
 %% extra line when the first uses race, never a missed first line.
--spec warn_limited(atom(), string(), [term()]) -> ok.
+-spec warn_limited(kind(), string(), [term()]) -> ok.
 warn_limited(Kind, Format, Args) ->
     Ref = kind_stamp(Kind),
     Now = erlang:monotonic_time(millisecond),
@@ -101,13 +107,13 @@ warn_limited(Kind, Format, Args) ->
 
 %% @doc Make the next warn_limited/3 of the Kind log (a test's way of letting the
 %% interval pass without waiting for it). The count of suppressed lines is kept.
--spec expire_limit(atom()) -> ok.
+-spec expire_limit(kind()) -> ok.
 expire_limit(Kind) ->
     atomics:put(kind_stamp(Kind), 1, never_warned()).
 
 %% @doc Keep the Kind quiet for an hour (a test's way of making sure the interval
 %% cannot pass in the middle of a burst). expire_limit/1 or reset_limits/0 lifts it.
--spec hold_limit(atom()) -> ok.
+-spec hold_limit(kind()) -> ok.
 hold_limit(Kind) ->
     atomics:put(kind_stamp(Kind), 1, erlang:monotonic_time(millisecond) + 3600000).
 
@@ -120,7 +126,14 @@ hold_limit(Kind) ->
 -spec init_limits() -> ok.
 init_limits() ->
     init_limits(?SERVERS),
-    lists:foreach(fun init_kind_stamp/1, ?KINDS).
+    init_kinds(?KINDS).
+
+%% @doc Create (or reset) the stamp of each named warning kind, for a caller
+%% whose kinds are its own closed set (yuzu_gw_authz's rejection reasons):
+%% created once before the first use, for the reason init_limits/0 gives.
+-spec init_kinds([kind()]) -> ok.
+init_kinds(Kinds) ->
+    lists:foreach(fun init_kind_stamp/1, Kinds).
 
 %% @doc init_limits/0 for the named servers (a test's own fake).
 -spec init_limits([atom()]) -> ok.

@@ -15,7 +15,10 @@
 %%%   8. yuzu_gw_memory_shedder    — node-wide memory load shedder (suspends the
 %%%      agent listener(s) under memory pressure, never the management listener)
 %%%   9. yuzu_gw_agent_sup         — simple_one_for_one for agent processes
-%%%  10. one yuzu_grpc_listener per {yuzu_gw, grpc_listeners} entry — LAST, so
+%%%  10. yuzu_gw_mgmt_pins         — the management-pin watcher (#5696): resolves the
+%%%      {cert_file, Path} pins in init, so the first management stream finds them,
+%%%      and re-stats them on its own timer; the per-stream check does no file I/O
+%%%  11. one yuzu_grpc_listener per {yuzu_gw, grpc_listeners} entry — LAST, so
 %%%      nothing is served before the registry, router and agent supervisor a
 %%%      handler calls exist, and a listener that cannot bind stops the tree
 %%%      rather than leaving a gateway that looks up and serves nothing. The
@@ -144,7 +147,16 @@ init([]) ->
           start    => {yuzu_gw_agent_sup, start_link, []},
           restart  => permanent,
           shutdown => infinity,
-          type     => supervisor}
+          type     => supervisor},
+
+        %% Directly ahead of the listeners: its init/1 publishes the management
+        %% pins before the management listener can take a stream. A restart
+        %% leaves the published pins in place (they are a persistent_term).
+        #{id       => yuzu_gw_mgmt_pins,
+          start    => {yuzu_gw_mgmt_pins, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker}
     ] ++ listener_children(),
 
     {ok, {SupFlags, Children}}.

@@ -43,7 +43,11 @@
     agent_info  :: map(),
     register_req :: map(),                %% verbatim RegisterRequest (for upstream-reconnect replay)
     plugins     :: [binary()],
-    pending     :: #{binary() => {pid(), reference(), integer()}},  %% command_id => {reply_to, fanout_ref, dispatched_at}
+    %% command_id => {reply_to, fanout_ref, dispatched_at, plugin}. The plugin
+    %% is the one the command was dispatched for: a CommandResponse carries
+    %% `plugin' only on the Guardian side channel, so a reply cannot label the
+    %% duration histogram itself (it decodes as <<>>).
+    pending     :: #{binary() => {pid(), reference(), integer(), term()}},
     connected_at :: integer() | undefined,
     peer_addr   :: binary(),
     %% Opaque random id minted ONCE per process instance (HA WS-4, #4324) —
@@ -275,7 +279,8 @@ streaming(cast, {dispatch, CommandReq, {ReplyTo, FanoutRef}}, Data) ->
                       #{agent_id => AgentId, plugin => Plugin,
                         command_id => CmdId}),
 
-    Pending2 = Pending#{CmdId => {ReplyTo, FanoutRef, erlang:monotonic_time(millisecond)}},
+    Pending2 = Pending#{CmdId => {ReplyTo, FanoutRef, erlang:monotonic_time(millisecond),
+                                  Plugin}},
     {keep_state, Data#data{pending = Pending2}};
 
 streaming(info, {stream_data, ResponseFrame}, #data{agent_id = AgentId} = Data) ->
@@ -367,8 +372,15 @@ terminate(_Reason, _State, Data) ->
     do_cleanup(Data),
     ok.
 
-code_change(_OldVsn, State, Data, _Extra) ->
-    {ok, State, Data}.
+code_change(_OldVsn, State, #data{pending = Pending} = Data, _Extra) ->
+    %% A pending entry from a version that did not keep the dispatched plugin
+    %% is a 3-tuple; it completes with the plugin unknown.
+    Pending2 = maps:map(fun(_CmdId, {ReplyTo, FanoutRef, DispatchedAt}) ->
+                                {ReplyTo, FanoutRef, DispatchedAt, <<"unknown">>};
+                           (_CmdId, Entry) ->
+                                Entry
+                        end, Pending),
+    {ok, State, Data#data{pending = Pending2}}.
 
 %% What OTP prints for this process in a terminate or crash report and in
 %% sys:get_status/1: the data without the stored RegisterRequest, which holds
@@ -426,7 +438,7 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
                       maps:get(status, ResponseFrame, undefined)),
 
     case maps:find(CmdId, Pending) of
-        {ok, {ReplyTo, FanoutRef, DispatchedAt}} ->
+        {ok, {ReplyTo, FanoutRef, DispatchedAt, Plugin}} ->
             ReplyTo ! {command_response, FanoutRef, AgentId, ResponseFrame},
 
             Pending2 = case Status of
@@ -435,8 +447,8 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
                 0                  -> Pending;  %% proto enum value
                 _FinalStatus       ->
                     Duration = erlang:monotonic_time(millisecond) - DispatchedAt,
-                    Plugin = maps:get(<<"plugin">>, ResponseFrame,
-                                      maps:get(plugin, ResponseFrame, <<"unknown">>)),
+                    %% The dispatched plugin, the label commands_dispatched_total
+                    %% carries, never the response's own (empty) field.
                     telemetry:execute([yuzu, gw, command, completed],
                                       #{duration_ms => Duration},
                                       #{agent_id => AgentId, plugin => Plugin, status => Status}),
@@ -481,7 +493,7 @@ do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
 
     %% Notify pending command waiters that the agent disconnected,
     %% and notify router so it can complete fanout tracking.
-    maps:foreach(fun(_CmdId, {ReplyTo, FanoutRef, _DispatchedAt}) ->
+    maps:foreach(fun(_CmdId, {ReplyTo, FanoutRef, _DispatchedAt, _Plugin}) ->
         ReplyTo ! {command_error, FanoutRef, AgentId, agent_disconnected},
         %% HA WS-4 4.3a fix: route to the DISPATCHING node's router, same
         %% reasoning as handle_stream_response/2 above.

@@ -11,9 +11,11 @@
 %%%             or Inventory, a registration-replay step) AND at least one
 %%%             message waits in its mailbox. The process runs one RPC at a time,
 %%%             so everything that arrives during one waits behind it.
-%%%   notify    all of the stream-status notification slots are held (10): the
-%%%             next notification is held until a slot frees (and is dropped
-%%%             only when the held store itself is full).
+%%%   notify    all of the stream-status notification slots the upstream may
+%%%             fill now are held: 10, or 9 while a registration replay is
+%%%             queued (one is kept back for the replay drip). The next
+%%%             notification is held until a slot frees (and is dropped only
+%%%             when the held store itself is full).
 %%%   guardian  all of the Guardian forward slots are held (50): the next one
 %%%             would be dropped.
 %%%

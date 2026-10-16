@@ -594,6 +594,14 @@ declare_metrics() ->
         {name, yuzu_gw_upstream_circuit_transitions_total},
         {labels, [state]},
         {help, "Circuit breaker state transitions (closed, open, half_open)"}]),
+    %% A series that first appears already at 1 is invisible to increase(), so
+    %% without these the FIRST open of a gateway process never raised
+    %% YuzuGatewayUpstreamCircuitOpened -- and a crash-looping gateway opens
+    %% its breaker once per life, so it never alerted at all. The states are
+    %% the closed set yuzu_gw_upstream emits (trip_circuit/1, the
+    %% circuit_half_open timer, on_success/1 from half_open).
+    [prometheus_counter:inc(yuzu_gw_upstream_circuit_transitions_total, [S], 0)
+     || S <- [<<"closed">>, <<"open">>, <<"half_open">>]],
     prometheus_counter:declare([
         {name, yuzu_gw_cluster_events_total},
         {labels, [event, node]},
@@ -783,8 +791,9 @@ declare_metrics() ->
         {labels, []},
         {help, "Seconds during which the path to the server was backed up: at "
                "least one lane saturated (the serial upstream process inside an "
-               "RPC with a message waiting, all 10 stream-status notification "
-               "slots held, or all 50 Guardian forward slots held). rate() of "
+               "RPC with a message waiting, every usable stream-status "
+               "notification slot held (10, or 9 during a registration "
+               "replay), or all 50 Guardian forward slots held). rate() of "
                "this is the backpressure duty cycle, 0 to 1. Sampled every "
                "100 ms"}]),
     prometheus_counter:declare([
