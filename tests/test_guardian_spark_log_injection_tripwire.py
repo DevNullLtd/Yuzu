@@ -1050,7 +1050,8 @@ PQ_ERROR_FILES: tuple[str, ...] = (
 STORE_ERROR_FILES: tuple[str, ...] = ("server/core/src/config_routes.cpp",)
 
 # Same rule, third marker: the pool's own connection-failure text (`pool_.last_error()`), which
-# can carry libpq text, in the two stores that print it. Name-only, like the rules above: the
+# can carry libpq text, in these two stores only: other stores also print `pool_.last_error()` and are
+# not scanned, so a new store file that logs it must be added to POOL_ERROR_FILES. Name-only, like the rules above: the
 # marker is matched inside the argument text, so an error string copied into a local first is
 # not seen.
 POOL_ERROR_FILES: tuple[str, ...] = (

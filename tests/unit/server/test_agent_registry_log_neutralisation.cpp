@@ -162,13 +162,23 @@ TEST_CASE("AgentRegistry::send_to: the gateway-capability refusal logs the gatew
     CHECK(count_char(text, '\n') == 1);
 }
 
-TEST_CASE("stray_control_bytes: accepts both line endings, counts every other control byte",
+TEST_CASE("stray_control_bytes: accepts the platform line ending, counts every other control byte",
           "[log_injection][5513]") {
     CHECK(stray_control_bytes("line one\nline two\n") == 0);
+    // "\r\n" is the spdlog line ending on Windows only; elsewhere the '\r' is a stray byte.
+#ifdef _WIN32
     CHECK(stray_control_bytes("line one\r\nline two\r\n") == 0);
+#else
+    CHECK(stray_control_bytes("line one\r\nline two\r\n") == 2);
+#endif
     CHECK(stray_control_bytes("") == 0);
-    // A '\r' that does not end a line is an injected control byte.
+    // A '\r' that does not end a line is an injected control byte on every platform.
+    CHECK(stray_control_bytes("line one\rforged\n") == 1);
+#ifdef _WIN32
     CHECK(stray_control_bytes("line one\rforged\r\n") == 1);
+#else
+    CHECK(stray_control_bytes("line one\rforged\r\n") == 2);
+#endif
     CHECK(stray_control_bytes("trailing\r") == 1);
     CHECK(stray_control_bytes(std::string("del\x7f\n")) == 1);
     CHECK(stray_control_bytes(std::string("esc\x1b[0m\n")) == 1);

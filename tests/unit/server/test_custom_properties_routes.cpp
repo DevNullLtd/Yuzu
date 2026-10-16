@@ -502,9 +502,11 @@ TEST_CASE("custom_properties_routes: GET properties degrades to 503 (never a fal
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// The only degenerate agent-id shape the `[^/]+` capture can carry over HTTP is an over-length
-// one (an empty segment does not match and a NUL cannot be sent in a path), so a 257-byte id
-// stands in for all of them. The store refuses it on writes and answers empty on reads, as the
+// An over-length id is the one degenerate shape this harness can send (an empty segment does
+// not match the `[^/]+` capture and the sink does not percent-decode a NUL), so a 257-byte id
+// stands in for all of them. Only the PUT assertions observe the guard itself; DELETE and GET
+// would answer the same without it, so they pin the response contract. The store tests cover
+// the guard directly. The store refuses the id on writes and answers empty on reads, as the
 // tag store does.
 TEST_CASE("custom_properties_routes: a 257-byte agent id is refused on writes (400/404, audited) "
           "and reads answer empty",

@@ -95,7 +95,10 @@ selftest_flag = sys.argv[2] == "1"
 SCAN_TARGETS = {
     "describe_dirs": ["server/core/src", "agents/core/src"],
     # Headers with an inline describe(...) call, scanned like the .cpp files above.
-    "describe_files": ["server/core/src/agent_service_impl.hpp"],
+    "describe_files": [
+        "server/core/src/agent_service_impl.hpp",
+        "server/core/src/response_export_metrics.hpp",
+    ],
     "help_tables": [
         "server/core/src/guardian_journal_fleet_tags.hpp",
         "server/core/src/guardian_health_fleet_tags.hpp",
