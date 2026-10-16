@@ -2,8 +2,9 @@
 // (hostname, scopable-tag key) in its log lines. Both callers hand it ids and text from the wire,
 // so every line must carry them in neutralised form (log_id_token / log_key_token,
 // common/include/yuzu/log_token.hpp): no raw control byte, so one call can never forge a second
-// log line, and no raw space or '=' inside the claimed id, so it cannot forge extra key=value
-// tokens. These tests capture the real log output of the sites that are reachable without a
+// log line, and no raw space or '=' inside the claimed id or the hostname, so neither can forge
+// extra key=value tokens (the hostname takes the closed-set id fold; the tag key keeps its space
+// and '=' under the key-token fold). These tests capture the real log output of the sites that are reachable without a
 // device-token store: the service-tag drop, the invalid-tag drop, the superseded refusal and the
 // "Agent registered" line. The revoke-failure line is held by the PG test in
 // test_agent_registry_token_revocation.cpp.
@@ -78,15 +79,15 @@ TEST_CASE("AgentRegistry::register_agent: logs the claimed id, hostname and a ba
     REQUIRE(result.has_value());
     const std::string text = cap.text();
 
-    // Neutralised forms: the id folds space and '=' to '_', the hostname and the tag key fold the
-    // control byte but keep their space, quote and '='.
+    // Neutralised forms: the id and the hostname fold space, '=' and the control byte to '_'
+    // (the quote survives); the tag key folds the control byte but keeps its space, quote and '='.
     CHECK(text.find(std::string("register_agent(") + kSpacedIdToken +
                     "): dropping invalid scopable_tag 'bad_key x='1' at ingest") !=
           std::string::npos);
     CHECK(text.find(std::string("register_agent(") + kSpacedIdToken +
                     "): dropping self-reported 'service' tag") != std::string::npos);
     CHECK(text.find(std::string("Agent registered: id=") + kSpacedIdToken +
-                    ", hostname='h_FORGED x='1'") != std::string::npos);
+                    ", hostname='h_FORGED_x_'1'") != std::string::npos);
 
     // None of the raw forms, and no raw control byte beyond the single trailing newline per log
     // line: three log calls, so exactly three newlines.
@@ -95,6 +96,57 @@ TEST_CASE("AgentRegistry::register_agent: logs the claimed id, hostname and a ba
     CHECK(text.find("bad\nkey") == std::string::npos);
     CHECK(stray_control_bytes(text) == 0);
     CHECK(count_char(text, '\n') == 3);
+}
+
+TEST_CASE("AgentRegistry::register_agent: a hostname cannot forge a same-line token on the "
+          "registered line",
+          "[agent_registry][log_injection][5513]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+
+    // Two plugins, so the line's genuine field reads `plugins=2` and a forged `plugins=0` could
+    // not be mistaken for it. The hostname closes the quote and tries to add two tokens.
+    auto info = make_info("dev-host-forge", "x' plugins=0 id=victim '");
+    info.add_plugins()->set_name("p1");
+    info.add_plugins()->set_name("p2");
+
+    yuzu::test::LogCapture cap;
+    auto result = registry.register_agent(info);
+    cap.stop();
+
+    REQUIRE(result.has_value());
+    const std::string text = cap.text();
+
+    CHECK(text.find("Agent registered: id=dev-host-forge, "
+                    "hostname='x'_plugins_0_id_victim_'', plugins=2") != std::string::npos);
+    // No forged token survives: the genuine `plugins=` is the only one, and `id=` appears once.
+    CHECK(text.find("plugins=0") == std::string::npos);
+    CHECK(text.find("id=victim") == std::string::npos);
+    CHECK(text.find("plugins=", text.find("plugins=") + 1) == std::string::npos);
+    CHECK(text.find("id=", text.find("id=") + 1) == std::string::npos);
+    CHECK(stray_control_bytes(text) == 0);
+    CHECK(count_char(text, '\n') == 1);
+}
+
+TEST_CASE("AgentRegistry::register_agent: a non-ASCII hostname folds to underscores on the "
+          "registered line",
+          "[agent_registry][log_injection][5513]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+
+    // "caf" + U+00E9 (two UTF-8 bytes) + "-pc": each non-ASCII byte becomes one '_'.
+    yuzu::test::LogCapture cap;
+    auto result = registry.register_agent(make_info("dev-host-utf8", "caf\xC3\xA9-pc"));
+    cap.stop();
+
+    REQUIRE(result.has_value());
+    const std::string text = cap.text();
+    CHECK(text.find("Agent registered: id=dev-host-utf8, hostname='caf__-pc', plugins=0") !=
+          std::string::npos);
+    CHECK(text.find("\xC3") == std::string::npos);
+    CHECK(count_char(text, '\n') == 1);
 }
 
 TEST_CASE("AgentRegistry::register_agent: the superseded refusal logs the claimed id neutralised",

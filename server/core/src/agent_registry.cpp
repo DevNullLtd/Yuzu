@@ -61,7 +61,8 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     session->arch = info.platform().arch();
     session->agent_version = info.agent_version();
     // Every spdlog call in THIS function prints the claimed id (via safe_agent_id) and any
-    // agent-supplied free text (tag key, hostname) or store error text neutralised (CWE-117);
+    // agent-supplied free text (tag key, hostname) or store error text neutralised (CWE-117; the
+    // hostname takes the closed-set id fold, the tag key and store error text the key-token fold);
     // the gateway path reaches here without the direct path's token checks. Both callers read
     // the enrollment status first (get_pending_status) and return on error; AuthDB refuses any
     // id with a control byte or ',' there (agent_id_ok). The agent registry's other log lines
@@ -209,8 +210,11 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     metrics_.counter("yuzu_agents_registered_total").increment();
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
     bus_.publish("agent-online", info.agent_id());
+    // The hostname is agent-supplied and sits between two genuine `key=value` tokens, so it takes
+    // the closed-set id fold (space, '=', ',' and every non-ASCII byte become '_'): a hostname such
+    // as `x' plugins=0 id=victim '` cannot close the quote and add a same-line token.
     spdlog::info("Agent registered: id={}, hostname='{}', plugins={}", safe_agent_id,
-                 ::yuzu::log_key_token(info.hostname()), info.plugins_size());
+                 ::yuzu::log_id_token(info.hostname()), info.plugins_size());
     return session;
 }
 

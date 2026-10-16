@@ -154,10 +154,14 @@ In agent_registry.cpp only the claimed ids from `info.agent_id()` (and the local
 `safe_agent_id` built from it) are in scope; the many other spdlog calls in that file print
 ids taken from the session table and are deliberately not matched.
 
-CHECK 3 (REGISTRY_FREE_TEXT_FILES, agent_registry.cpp only) requires an
+CHECK 3 (REGISTRY_FREE_TEXT_FILES, run on the three files below) requires an
 spdlog:: argument that is an agent-supplied hostname (`info.hostname()` or a local alias bound
-from it) or the `.error()` of a `revoke_by_device(` or `register_agent(` result (a store error
-string that can quote the device id) to be wholly one wrap call. The `register_agent(` half
+from it) to be wholly one log_id_token call, and the `.error()` of a `revoke_by_device(` or
+`register_agent(` result (a store error string that can quote the device id) to be wholly one
+wrap call. A hostname takes log_id_token ONLY: it sits between genuine key=value tokens, and
+log_key_token / audit_token keep spaces and '=' (a hostname such as `x' plugins=0 id=victim '`
+would close the quote and forge a same-line token), while log_id_token folds space, '=', ',',
+control bytes and every non-ASCII byte to '_' and caps the length. The `register_agent(` half
 also runs on agent_service_impl.cpp and gateway_service_impl.cpp (REGISTRY_FREE_TEXT_FILES).
 
 CHECK 4 (COMMAND_TEXT_FILES, agent_service_impl.cpp, gateway_service_impl.cpp and
@@ -176,8 +180,9 @@ CHECK 5 (UNSCANNED_LOGGING_FILES, the check 2 files except config_routes.cpp, wh
 reads the default logger's level without logging through it, plus server/core/src/pg/pg_pool.cpp)
 fails on any
 logging FORM the scanner does not parse: an `SPDLOG_TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL(`
-macro, `spdlog::log(` or `default_logger`. The checks above only understand `spdlog::<level>(`
-and `<logger>-><level>(` calls, so a different form would otherwise escape them silently;
+macro, `spdlog::log(` or `default_logger`. The checks above only understand `spdlog::<level>(`,
+`spdlog::get(<name>)-><level>(` and `<logger>-><level>(` calls, so a different form would otherwise
+escape them silently;
 this makes it fail loudly instead. A new file added to check 2 is covered by
 extending that tuple, not by this note.
 
@@ -214,6 +219,33 @@ enrollment_cfg_import.cpp does not apply it) may still contain a space, '=' or a
 and so can add same-line key=value tokens. The `ex.what()` of the ingest catch-alls on those paths is likewise
 printed as-is. This is a stated limit of the checks, not a claim that those lines are neutralised.
 
+REGISTRY. main() runs every rule group from the single module-level RULE_GROUPS list (file
+constant, finder, known-bad sample), and the selfcheck requires that list to hold every group
+named in REQUIRED_RULE_GROUPS and every `*_FILES` constant in this module, to scan exactly the
+constant's files, and to flag its own known-bad sample. Removing a group from RULE_GROUPS, adding
+a `*_FILES` constant without registering it, or replacing a finder with a no-op therefore fails
+the selfcheck, which itself checks that each of those three edits is detected.
+
+WHITESPACE AND LOGGING FORMS CLOSED. A marker or accessor call is matched with whitespace allowed
+before its parenthesis (`last_error ()`, `PQerrorMessage (c)`, `.error ()`, `.agent_id ()`), a
+wrap call likewise (`log_id_token (x)`), `spdlog::get("name")->warn(...)` is parsed as a logging
+call like any other, and an agent-id alias may be a `std::string_view` (const, reference, or
+brace/parenthesis init) as well as `auto` / `std::string`.
+
+STILL OPEN (stated plainly; every check is lexical, a regression net and not a proof):
+  - a value copied into a local, a renamed local or a function parameter before it is printed is
+    not traced (only the accessor-bound aliases named above, for agent ids and hostnames);
+    a later plain assignment to an alias is not tracked either;
+  - logging through a helper lambda or wrapper function, or a chained logger lookup other than
+    `spdlog::get(...)->` (for example `get_logger()->info(...)`), is not scanned;
+  - `spdlog::log(`, `spdlog::default_logger()` and the `SPDLOG_TRACE|DEBUG|INFO|WARN|ERROR|
+    CRITICAL(` macros are refused outright by check 5 in its files only; the `SPDLOG_LOGGER_*`
+    macros are not recognised at all, in any file;
+  - a call whose first argument is not a string literal, including `fmt::format(...)` handed to
+    spdlog, is skipped (the SECOND KNOWN LIMITATION above);
+  - the registry check proves the groups are registered and live, not that REQUIRED_RULE_GROUPS
+    and the `*_FILES` constants themselves are complete: a deliberate edit of both still passes.
+
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml,
 same precedent shape as test_no_connless_pq_escape.py and
 test_split_interlock_tripwire.py. Zero third-party dependencies (stdlib only).
@@ -224,6 +256,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable, NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SELF = Path(__file__).resolve()
@@ -254,7 +287,15 @@ FILE_BASENAME_RE = re.compile(r"^(guardian_|guard_|spark_|guaranteed_state)[A-Za
 # parse_call() already returns None for it, the same graceful skip every
 # non-spdlog statement this scanner cannot analyse gets -- see parse_call()'s
 # own docstring).
-SPDLOG_CALL_RE = re.compile(r"\b(?:spdlog::|\w+->)(?:trace|debug|info|warn|error|critical)\s*\(")
+#
+# A call through the registry lookup, `spdlog::get("name")->warn(...)` (the argument is any
+# text without a parenthesis, so a string literal or a plain identifier), is the one chained form
+# that IS matched: it is tried first, and parse_call() finds the LEVEL call's parenthesis, not the
+# `get(`'s. Any other chained form (`get_logger()->info(...)`) is still not matched.
+SPDLOG_CALL_RE = re.compile(
+    r"\b(?:spdlog::get\s*\([^()]*\)\s*->\s*|spdlog::|\w+->)"
+    r"(?:trace|debug|info|warn|error|critical)\s*\("
+)
 
 # Recognised wrappers that fully neutralise a rule-id/Spark-key-shaped argument.
 # Checked as a substring WITHIN the specific argument's own text slot -- see the
@@ -606,7 +647,10 @@ def parse_call(stmt: str) -> tuple[str, str] | None:
     (concatenated_format_literal, argument_list_text) or None if the first
     argument is not a string literal (nothing this scanner can analyse --
     a documented limitation, not an error)."""
-    open_paren = stmt.index("(")
+    # The level call's own parenthesis: for `spdlog::get("x")->warn(...)` the first "(" in the
+    # statement belongs to `get(`, so it is located through the same pattern that opened it.
+    call = SPDLOG_CALL_RE.match(stmt)
+    open_paren = call.end() - 1 if call is not None else stmt.index("(")
     i = _skip_ws_and_comments(stmt, open_paren + 1)
     if i >= len(stmt) or stmt[i] != '"':
         return None
@@ -705,7 +749,7 @@ def sensitive_placeholder_indices(literal: str) -> dict[int, list[str]]:
 _SAFE_CALL_NAME_RE = re.compile(
     r"^(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*("
     + "|".join(re.escape(c.rstrip("(")) for c in ALL_SAFE_CALLS)
-    + r")\("
+    + r")\s*\("
 )
 
 
@@ -905,14 +949,15 @@ def find_violations_in_text(text: str) -> list[tuple[int, str, list[str]]]:
 # session table), any other claimed field, and any new spelling nobody
 # has added here. An accessor passed as a sub-expression of a larger call (for
 # example `fmt::format("{}", request->agent_id())`) IS flagged, conservatively,
-# unless the whole argument is a wrap call. Known lexical limits: alias forms such
-# as `string_view x = ...` and `auto&& x = ...`, brace-init aliases and a later
-# plain assignment to an alias are not tracked; the `safe_agent_id` evasions listed above
+# unless the whole argument is a wrap call. Aliases of the accessor declared as `auto`,
+# `std::string` or `std::string_view` (const, `&` or `&&`; `=`, brace or parenthesis init) are
+# tracked. Known lexical limits: a later plain assignment to an alias is not tracked, nor is an
+# alias of any other type; the `safe_agent_id` evasions listed above
 # (rename, parameter, `+=`) are not seen; `SPDLOG_*` macros, `spdlog::log(level, ...)` calls,
 # calls through `spdlog::default_logger()->` and logging through a helper lambda or wrapper
 # function are not scanned, because the statement finder only recognises
-# `spdlog::LEVEL(` and `<name>->LEVEL(`. It is a regression net for the
-# sites fixed under #5513, not proof that no claimed id is ever logged raw.
+# `spdlog::LEVEL(`, `spdlog::get(<name>)->LEVEL(` and `<name>->LEVEL(`. It is a regression net
+# for the sites fixed under #5513, not proof that no claimed id is ever logged raw.
 # ---------------------------------------------------------------------------
 
 AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
@@ -937,15 +982,23 @@ AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
 # Any receiver, including a chained one such as `request->info().agent_id()`: the match starts at
 # the member access itself, not at a word character before it.
 _RAW_AGENT_ID_ACCESSOR_RE = re.compile(
-    r"(?:\.|->)\s*agent_id\(\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
+    r"(?:\.|->)\s*agent_id\s*\(\s*\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
 )
+# A local alias bound from an agent-id accessor: `auto`, `std::string` or `std::string_view`
+# (optionally const, a reference or a forwarding reference), initialised with `=`, braces or
+# parentheses. `std::string_view` is a borrowed view of the same bytes, so printing it is printing
+# the raw id.
+_AGENT_ID_ACCESSOR_TAIL = r"(?:\.|->)\s*agent_id\s*\(\s*\)\s*"
 _AGENT_ID_ALIAS_DECL_RE = re.compile(
-    r"\b(?:const\s+)?(?:auto|std::string)\s*&?\s*(\w+)\s*=\s*[^;=]*?(?:\.|->)\s*agent_id\(\)\s*;"
+    r"\b(?:const\s+)?(?:auto|(?:std::)?string_view|std::string)\s*&{0,2}\s*(?:const\s+)?(\w+)\s*"
+    r"(?:=\s*[^;=]*?" + _AGENT_ID_ACCESSOR_TAIL + r";"
+    r"|\{[^;{}]*?" + _AGENT_ID_ACCESSOR_TAIL + r"\}"
+    r"|\([^;]*?" + _AGENT_ID_ACCESSOR_TAIL + r"\)\s*;)"
 )
-_SANITIZE_CALL_NAME_RE = re.compile(r"^(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*sanitize_for_log\(")
+_SANITIZE_CALL_NAME_RE = re.compile(r"^(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*sanitize_for_log\s*\(")
 
 
-_LOG_ID_TOKEN_CALL_NAME_RE = re.compile(r"^(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*log_id_token\(")
+_LOG_ID_TOKEN_CALL_NAME_RE = re.compile(r"^(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*log_id_token\s*\(")
 _SAFE_AGENT_ID_DEF_RE = re.compile(r"\bsafe_agent_id\s*(=(?!=)|[({])")
 _SAFE_AGENT_ID_USE_RE = re.compile(r"(?<![\w.>:])safe_agent_id\b(?!\s*[=({])")
 
@@ -1061,18 +1114,39 @@ POOL_ERROR_FILES: tuple[str, ...] = (
 POOL_ERROR_MARKERS: tuple[str, ...] = ("last_error()",)
 
 
+def _marker_regex(marker: str) -> "re.Pattern[str]":
+    """A marker such as `PQerrorMessage(`, `last_error()` or `.error()` as a regex that also
+    accepts whitespace between the name and its parenthesis, between the parentheses, and after
+    a leading `.` (`last_error ()`, `PQerrorMessage (c)`, `. error ()`)."""
+    parts: list[str] = []
+    for ch in marker:
+        if ch == "(":
+            parts.append(r"\s*\(\s*")
+        elif ch == ")":
+            parts.append(r"\s*\)")
+        elif ch == ".":
+            parts.append(r"\.\s*")
+        else:
+            parts.append(re.escape(ch))
+    return re.compile("".join(parts))
+
+
 # Name-only: the rule matches the call NAME inside the argument text. A value copied into a
 # local first (`const char* e = PQerrorMessage(c); spdlog::warn("{}", e)`) is not caught.
+PQ_ERROR_MARKERS: tuple[str, ...] = ("PQerrorMessage(", "PQresultErrorMessage(")
+
+
 def find_pq_error_violations_in_text(
-    text: str, markers: tuple[str, ...] = ("PQerrorMessage(", "PQresultErrorMessage(")
+    text: str, markers: tuple[str, ...] = PQ_ERROR_MARKERS
 ) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
+    marker_res = [_marker_regex(m) for m in markers]
     for pos, stmt in find_spdlog_statements_with_pos(text):
         parsed = parse_call(stmt)
         if parsed is None:
             continue
         for arg in split_top_level_args(parsed[1]):
-            if any(m in arg for m in markers) and not argument_is_wrapped(arg):
+            if any(r.search(arg) for r in marker_res) and not argument_is_wrapped(arg):
                 out.append((text.count("\n", 0, pos) + 1, stmt))
                 break
     return out
@@ -1085,7 +1159,9 @@ def find_pq_error_violations_in_text(
 #   - `X.error()` where `X` is a local bound earlier in the same function from a
 #     `revoke_by_device(` or `register_agent(` call (a store error string that can quote the
 #     claimed device id; the latter can carry raw libpq text)
-# must be wholly one wrap call (log_key_token / log_id_token / audit_token). Lexical, like the
+# must be wholly one wrap call: a hostname specifically must be wholly one log_id_token call
+# (the closed-set fold, so it cannot add a same-line token), a store error text any of
+# log_key_token / log_id_token / audit_token. Lexical, like the
 # checks above: a hostname reaching the log through a variable it cannot trace to the accessor,
 # another store call's error, and `session->hostname` (a member, not an accessor call) are not
 # seen. The function boundary is the last `\n}` before the call, as for the agent-id check.
@@ -1096,10 +1172,11 @@ REGISTRY_FREE_TEXT_FILES: tuple[str, ...] = (
 )
 
 _RAW_HOSTNAME_ACCESSOR_RE = re.compile(
-    r"\b\w+(?:\.|->)hostname\(\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
+    r"(?:\.|->)\s*hostname\s*\(\s*\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
 )
 _HOSTNAME_ALIAS_DECL_RE = re.compile(
-    r"\b(?:const\s+)?(?:auto|std::string)\s*&?\s*(\w+)\s*=\s*\w+(?:\.|->)hostname\(\)\s*;"
+    r"\b(?:const\s+)?(?:auto|(?:std::)?string_view|std::string)\s*&{0,2}\s*(?:const\s+)?(\w+)\s*="
+    r"\s*[^;=]*?(?:\.|->)\s*hostname\s*\(\s*\)\s*;"
 )
 _REVOKE_RESULT_DECL_RE = re.compile(
     r"\b(?:const\s+)?auto\s*&?\s*(\w+)\s*=\s*[\w.>:-]*(?:revoke_by_device|register_agent)\s*\("
@@ -1117,12 +1194,20 @@ def find_registry_free_text_violations_in_text(text: str) -> list[tuple[int, str
         host_names = {m.group(1) for m in _HOSTNAME_ALIAS_DECL_RE.finditer(scope)}
         revoke_names = {m.group(1) for m in _REVOKE_RESULT_DECL_RE.finditer(scope)}
         for arg in split_top_level_args(parsed[1]):
-            raw = (
-                _RAW_HOSTNAME_ACCESSOR_RE.search(arg) is not None
-                or any(re.search(r"(?<![\w.>:])" + re.escape(n) + r"\b(?!\s*\()", arg) for n in host_names)
-                or any(re.search(r"(?<![\w.>:])" + re.escape(n) + r"\.error\(\)", arg) for n in revoke_names)
+            raw_host = _RAW_HOSTNAME_ACCESSOR_RE.search(arg) is not None or any(
+                re.search(r"(?<![\w.>:])" + re.escape(n) + r"\b(?!\s*\()", arg) for n in host_names
             )
-            if raw and not argument_is_wrapped(arg):
+            raw_error = any(
+                re.search(r"(?<![\w.>:])" + re.escape(n) + r"\s*\.\s*error\s*\(\s*\)", arg)
+                for n in revoke_names
+            )
+            # A hostname sits between genuine key=value tokens, so it must take the closed-set id
+            # fold (log_id_token: space, '=', ',' and every non-ASCII byte become '_'). The
+            # key-token fold keeps spaces and '=' and lets a hostname forge a same-line token, so
+            # it is NOT accepted for a hostname; the store error text keeps the wider set.
+            if (raw_host and not _is_whole_call_wrapped(arg, _LOG_ID_TOKEN_CALL_NAME_RE)) or (
+                raw_error and not argument_is_wrapped(arg)
+            ):
                 out.append((text.count("\n", 0, pos) + 1, stmt))
                 break
     return out
@@ -1143,7 +1228,7 @@ COMMAND_TEXT_FILES: tuple[str, ...] = (
 )
 
 _RAW_COMMAND_TEXT_ACCESSOR_RE = re.compile(
-    r"(?:\.|->)\s*(?:command_id|plugin|gateway_node|cluster_id)\(\)"
+    r"(?:\.|->)\s*(?:command_id|plugin|gateway_node|cluster_id)\s*\(\s*\)"
     r"(?!\s*\.\s*(?:size|empty|length)\s*\()"
 )
 # The member form `.gateway_node` / `->gateway_node` (no parentheses): the session table keeps the
@@ -1194,10 +1279,10 @@ PKI_SIGNER_FILES: tuple[str, ...] = ("server/core/src/server.cpp",)
 _PKI_BARE_AGENT_ID_RE = re.compile(
     r"(?<![\w.>:])agent_id\b(?!\s*\.\s*(?:size|empty|length)\s*\()"
 )
-_PKI_WHAT_RE = re.compile(r"\.what\(\)")
+_PKI_WHAT_RE = re.compile(r"\.\s*what\s*\(\s*\)")
 # A store / ca_store `std::expected` error string (`root_or_err.error()`): not agent data, but it
 # can quote the stored row, so it is wrapped like the other free-text store errors.
-_PKI_STORE_ERROR_RE = re.compile(r"\.error\(\)")
+_PKI_STORE_ERROR_RE = re.compile(r"\.\s*error\s*\(\s*\)")
 
 
 def find_pki_signer_violations_in_text(text: str) -> list[tuple[int, str]]:
@@ -1219,7 +1304,7 @@ def find_pki_signer_violations_in_text(text: str) -> list[tuple[int, str]]:
 
 
 # Check 5: logging forms the scanner above does not parse. find_spdlog_statements only
-# understands `spdlog::<level>(` and `<logger>-><level>(`; any other form in the files of
+# understands `spdlog::<level>(`, `spdlog::get(<name>)-><level>(` and `<logger>-><level>(`; any other form in the files of
 # the second check would print its arguments unexamined. They are absent today, so the guard
 # fails on any occurrence (a mention in a comment too: reword it) rather than trying to scan them.
 # config_routes.cpp is the one AGENT_ID_FILES member left out: it reads the default logger's LEVEL
@@ -1539,6 +1624,38 @@ def _selfcheck() -> None:
             '  spdlog::info("peer {}", aid);\n}\n',
             (),
         ),
+        # A std::string_view alias of the accessor is a borrowed view of the same raw bytes.
+        (
+            "void F() {\n  std::string_view x = info.agent_id();\n"
+            '  spdlog::info("peer {}", x);\n}\n',
+            (),
+        ),
+        (
+            "void F() {\n  const std::string_view& x = request->agent_id();\n"
+            '  spdlog::info("peer {}", x);\n}\n',
+            (),
+        ),
+        (
+            "void F() {\n  const std::string_view id{info.agent_id()};\n"
+            '  spdlog::info("peer {}", id);\n}\n',
+            (),
+        ),
+        (
+            "void F() {\n  const std::string_view id(info.agent_id());\n"
+            '  spdlog::info("peer {}", id);\n}\n',
+            (),
+        ),
+        (
+            "void F() {\n  std::string_view id = info.agent_id();\n"
+            '  spdlog::get("agent")->warn("peer {}", id);\n}\n',
+            (),
+        ),
+        # Whitespace before the accessor's parenthesis.
+        ('spdlog::info("peer {}", info.agent_id ());', ()),
+        # The registry-lookup logging form is parsed like any other.
+        ('spdlog::get("agent")->warn("{}", info.agent_id());', ()),
+        ('spdlog::get(name)->error("peer {}", request->agent_id());', ()),
+        ('spdlog::get ( "agent" ) -> debug ("peer {}", req->agent_id());', ()),
     ]
     for src, always in agent_must_match:
         if not aflagged(src, always):
@@ -1577,6 +1694,20 @@ def _selfcheck() -> None:
             (),
         ),
         ('spdlog::info("n {}", n);', ()),
+        # Wrapped string_view aliases and the wrapped registry-lookup form.
+        (
+            "void F() {\n  const std::string_view id{info.agent_id()};\n"
+            '  spdlog::info("peer {}", ::yuzu::log_id_token(id));\n}\n',
+            (),
+        ),
+        ('spdlog::get("agent")->warn("{}", ::yuzu::log_id_token(info.agent_id()));', ()),
+        ('spdlog::get("agent")->warn("n {}", info.agent_id().size());', ()),
+        # An alias bound in an earlier function does not leak into the next, string_view too.
+        (
+            "void F() {\n  std::string_view x = info.agent_id();\n}\n"
+            'void G() {\n  std::string_view x = other;\n  spdlog::info("hb {}", x);\n}\n',
+            (),
+        ),
     ]
     for src, always in agent_must_not:
         if aflagged(src, always):
@@ -1608,6 +1739,29 @@ def _selfcheck() -> None:
     if find_pq_error_violations_in_text(pool_must_not, POOL_ERROR_MARKERS):
         raise SystemExit(f"selfcheck: unexpected last_error() violation: {pool_must_not!r}")
 
+    # 9a'. Whitespace between a marker's name and its parenthesis does not hide the call.
+    spaced_must_match = [
+        ('spdlog::warn("no connection ({})", pool_.last_error ());', POOL_ERROR_MARKERS),
+        ('spdlog::warn("no connection ({})", pool_.last_error( ));', POOL_ERROR_MARKERS),
+        ('spdlog::warn("query failed: {}", PQerrorMessage (lease.get()));', PQ_ERROR_MARKERS),
+        ('spdlog::warn("query failed: {}", PQresultErrorMessage (res.get()));', PQ_ERROR_MARKERS),
+        ('spdlog::error("write failed: {}", result.error ());', (".error()",)),
+        ('spdlog::error("write failed: {}", result . error());', (".error()",)),
+        ('spdlog::get("pool")->warn("no connection ({})", pool_.last_error ());', POOL_ERROR_MARKERS),
+    ]
+    for src, markers in spaced_must_match:
+        if not find_pq_error_violations_in_text(src, markers):
+            raise SystemExit(f"selfcheck: expected a spaced-marker violation: {src!r}")
+    spaced_must_not = [
+        ('spdlog::warn("no connection ({})", ::yuzu::log_key_token(pool_.last_error ()));', POOL_ERROR_MARKERS),
+        ('spdlog::warn("query failed: {}", ::yuzu::log_key_token (PQerrorMessage (lease.get())));', PQ_ERROR_MARKERS),
+        ('spdlog::error("write failed: {}", ::yuzu::log_key_token(result.error ()));', (".error()",)),
+        ('spdlog::warn("no connection ({})", pool_.last_errors ());', POOL_ERROR_MARKERS),
+    ]
+    for src, markers in spaced_must_not:
+        if find_pq_error_violations_in_text(src, markers):
+            raise SystemExit(f"selfcheck: unexpected spaced-marker violation: {src!r}")
+
     # 9b. The same rule keyed on a store `.error()` (config_routes.cpp).
     store_must_match = 'spdlog::error("write failed: {}", result.error());'
     if not find_pq_error_violations_in_text(store_must_match, (".error()",)):
@@ -1626,6 +1780,21 @@ def _selfcheck() -> None:
     free_must_match = [
         'spdlog::info("Agent registered: hostname=\'{}\'", info.hostname());',
         'spdlog::info("Agent registered: hostname=\'{}\'", req->hostname());',
+        # The key-token fold keeps spaces and '=' and so cannot neutralise a hostname on a
+        # key=value line: a hostname must take log_id_token. audit_token is not enough either
+        # (no non-ASCII fold, no length cap).
+        'spdlog::info("Agent registered: hostname=\'{}\'", ::yuzu::log_key_token(info.hostname()));',
+        'spdlog::info("Agent registered: hostname=\'{}\'", audit_token(info.hostname()));',
+        'spdlog::info("Agent registered: hostname=\'{}\'", ::yuzu::log_id_token(a) + info.hostname());',
+        # Whitespace before the accessor's parenthesis, and a chained receiver.
+        'spdlog::info("Agent registered: hostname=\'{}\'", info.hostname ());',
+        'spdlog::info("Agent registered: hostname=\'{}\'", req.info().hostname());',
+        "void F() {\n  const auto& host = info.hostname();\n"
+        '  spdlog::info("registered \'{}\'", ::yuzu::log_key_token(host));\n}\n',
+        "void F() {\n  const std::string_view host = info.hostname();\n"
+        '  spdlog::info("registered \'{}\'", host);\n}\n',
+        # Through the registry lookup instead of a bound handle.
+        'spdlog::get("agent")->info("Agent registered: hostname=\'{}\'", info.hostname());',
         "void F() {\n  const auto& host = info.hostname();\n"
         '  spdlog::info("registered \'{}\'", host);\n}\n',
         "void F() {\n  auto revoked = store->revoke_by_device(info.agent_id());\n"
@@ -1641,10 +1810,14 @@ def _selfcheck() -> None:
         if not find_registry_free_text_violations_in_text(src):
             raise SystemExit(f"selfcheck: expected a register-path free-text violation: {src!r}")
     free_must_not = [
-        'spdlog::info("Agent registered: hostname=\'{}\'", ::yuzu::log_key_token(info.hostname()));',
+        'spdlog::info("Agent registered: hostname=\'{}\'", ::yuzu::log_id_token(info.hostname()));',
+        'spdlog::info("Agent registered: hostname=\'{}\'", ::yuzu::log_id_token (info.hostname ()));',
         'spdlog::info("host empty? {}", info.hostname().empty());',
         "void F() {\n  const auto& host = info.hostname();\n"
-        '  spdlog::info("registered \'{}\'", ::yuzu::log_key_token(host));\n}\n',
+        '  spdlog::info("registered \'{}\'", ::yuzu::log_id_token(host));\n}\n',
+        "void F() {\n  const std::string_view host = info.hostname();\n"
+        '  spdlog::info("registered \'{}\'", ::yuzu::log_id_token(host));\n}\n',
+        'spdlog::get("agent")->info("Agent registered: hostname=\'{}\'", ::yuzu::log_id_token(info.hostname()));',
         "void F() {\n  auto revoked = store->revoke_by_device(info.agent_id());\n"
         '  spdlog::error("revoke failed for \'{}\': {}", safe_agent_id,'
         " ::yuzu::log_key_token(revoked.error()));\n}\n",
@@ -1678,6 +1851,8 @@ def _selfcheck() -> None:
         'spdlog::warn("node \'{}\'", session.gateway_node);',
         'spdlog::warn("node \'{}\'", sess->gateway_node);',
         'spdlog::warn("x {} \'{}\'", agent_id, session.gateway_node, cap);',
+        'spdlog::info("Command {} completed", resp.command_id ());',
+        'spdlog::get("agent")->info("Command {} completed", resp.command_id());',
     ]
     for src in cmd_must_match:
         if not find_command_text_violations_in_text(src):
@@ -1744,6 +1919,9 @@ def _selfcheck() -> None:
         'spdlog::error("PKI: read failed: {}", ca_store_->get_root().error());',
         'spdlog::error("PKI: list failed ({}) for {}", ::yuzu::log_key_token(r.error()) + "x",'
         " e.error());",
+        'spdlog::error("PKI: read failed: {}", root_or_err.error ());',
+        'spdlog::error("PKI: signing threw ({})", e.what ());',
+        'spdlog::get("pki")->error("PKI: read failed: {}", root_or_err.error());',
     ]
     for src in pki_must_match:
         if not find_pki_signer_violations_in_text(src):
@@ -1789,91 +1967,194 @@ def _scanned_files() -> list[Path]:
     return files
 
 
+def _snippet(stmt: str) -> str:
+    return " ".join(stmt.split())[:160]
+
+
+class RuleGroup(NamedTuple):
+    """One rule group of the scan, as main() runs it.
+
+    `name` is the module-level constant naming the group's files (AGENT_ID_FILES, ...); the
+    selfcheck requires a registry entry for every such constant and for every name in
+    REQUIRED_RULE_GROUPS, so a group removed from RULE_GROUPS (or a new `*_FILES` constant never
+    added to it) fails the selfcheck instead of silently shrinking the scan. `files` returns the
+    repo-relative paths scanned. `find(text, rel)` returns the hit lines for one file (already
+    formatted). `kind` picks the failure banner. `bad_sample` is a source snippet the finder MUST
+    flag, run by the selfcheck, so a finder replaced by a no-op fails too.
+    """
+
+    name: str
+    files: Callable[[], tuple[str, ...]]
+    find: Callable[[str, str], list[str]]
+    kind: str  # "rule" (check 1) or "agent" (checks 2 to 7)
+    bad_sample: str
+    # False for check 1, whose file set is the Guardian/Spark basename family found by walking
+    # the tree, not a constant: the selfcheck then skips the file-constant comparison.
+    constant_backed: bool = True
+
+
+def _fmt_stmt_hits(rel: str, hits: list[tuple[int, str]]) -> list[str]:
+    return [f"{rel}:{line_no}: {_snippet(stmt)}" for line_no, stmt in hits]
+
+
+def _find_check1(text: str, rel: str) -> list[str]:
+    return [
+        f"{rel}:{line_no}: [{names}] {_snippet(stmt)}"
+        for line_no, names, stmt in find_violations_in_text(text)
+    ]
+
+
+def _find_unscanned(text: str, rel: str) -> list[str]:
+    return [
+        f"{rel}:{line_no}: logging form the scanner does not parse "
+        f"(use spdlog::<level>(...)): {line[:160]}"
+        for line_no, line in find_unscanned_logging_forms_in_text(text)
+    ]
+
+
+# The single registry of rule groups. main() iterates ONLY this list, so a group's loop cannot be
+# deleted from main() without removing its entry here, and the selfcheck compares the entries
+# against REQUIRED_RULE_GROUPS (and every `*_FILES` constant) below.
+RULE_GROUPS: tuple[RuleGroup, ...] = (
+    RuleGroup(
+        "FILE_BASENAME_RE",
+        lambda: tuple(str(p.relative_to(REPO_ROOT)) for p in _scanned_files()),
+        _find_check1,
+        "rule",
+        'spdlog::warn("Guardian FileGuard[{}]: no watch armed for {}", cfg_.rule_id, cfg_.path);',
+        constant_backed=False,
+    ),
+    RuleGroup(
+        "AGENT_ID_FILES",
+        lambda: tuple(AGENT_ID_FILES),
+        lambda text, rel: _fmt_stmt_hits(rel, find_agent_id_violations_in_text(text, AGENT_ID_FILES[rel])),
+        "agent",
+        'spdlog::info("peer {}", info.agent_id());',
+    ),
+    RuleGroup(
+        "PQ_ERROR_FILES",
+        lambda: PQ_ERROR_FILES,
+        lambda text, rel: _fmt_stmt_hits(rel, find_pq_error_violations_in_text(text)),
+        "agent",
+        'spdlog::warn("query failed: {}", PQerrorMessage(lease.get()));',
+    ),
+    RuleGroup(
+        "STORE_ERROR_FILES",
+        lambda: STORE_ERROR_FILES,
+        lambda text, rel: _fmt_stmt_hits(rel, find_pq_error_violations_in_text(text, (".error()",))),
+        "agent",
+        'spdlog::error("write failed: {}", result.error());',
+    ),
+    RuleGroup(
+        "POOL_ERROR_FILES",
+        lambda: POOL_ERROR_FILES,
+        lambda text, rel: _fmt_stmt_hits(rel, find_pq_error_violations_in_text(text, POOL_ERROR_MARKERS)),
+        "agent",
+        'spdlog::warn("no connection ({})", pool_.last_error());',
+    ),
+    RuleGroup(
+        "REGISTRY_FREE_TEXT_FILES",
+        lambda: REGISTRY_FREE_TEXT_FILES,
+        lambda text, rel: _fmt_stmt_hits(rel, find_registry_free_text_violations_in_text(text)),
+        "agent",
+        'spdlog::info("Agent registered: hostname=\'{}\'", info.hostname());',
+    ),
+    RuleGroup(
+        "COMMAND_TEXT_FILES",
+        lambda: COMMAND_TEXT_FILES,
+        lambda text, rel: _fmt_stmt_hits(rel, find_command_text_violations_in_text(text)),
+        "agent",
+        'spdlog::info("Command {} completed", resp.command_id());',
+    ),
+    RuleGroup(
+        "PKI_SIGNER_FILES",
+        lambda: PKI_SIGNER_FILES,
+        lambda text, rel: _fmt_stmt_hits(rel, find_pki_signer_violations_in_text(text)),
+        "agent",
+        'spdlog::warn("PKI: sign_csr failed for agent {}", agent_id);',
+    ),
+    RuleGroup(
+        "UNSCANNED_LOGGING_FILES",
+        lambda: UNSCANNED_LOGGING_FILES,
+        _find_unscanned,
+        "agent",
+        'SPDLOG_INFO("x {}", agent_id);',
+    ),
+)
+
+# The groups the scan must run, spelled out here a second time on purpose: deleting an entry from
+# RULE_GROUPS then fails the registry selfcheck unless this tuple is edited as well.
+REQUIRED_RULE_GROUPS: tuple[str, ...] = (
+    "FILE_BASENAME_RE",
+    "AGENT_ID_FILES",
+    "PQ_ERROR_FILES",
+    "STORE_ERROR_FILES",
+    "POOL_ERROR_FILES",
+    "REGISTRY_FREE_TEXT_FILES",
+    "COMMAND_TEXT_FILES",
+    "PKI_SIGNER_FILES",
+    "UNSCANNED_LOGGING_FILES",
+)
+
+
+def _selfcheck_registry(groups: tuple[RuleGroup, ...] = RULE_GROUPS) -> None:
+    """The registry holds every named group, each backed by its constant and each finder live."""
+    names = [g.name for g in groups]
+    if len(names) != len(set(names)):
+        raise SystemExit(f"selfcheck: RULE_GROUPS has a duplicate group name: {names}")
+    declared = {n for n, v in globals().items() if n.endswith("_FILES") and n.isupper() and isinstance(v, (tuple, dict))}
+    missing = [n for n in REQUIRED_RULE_GROUPS if n not in names]
+    unregistered = sorted(declared - set(names))
+    if missing or unregistered:
+        raise SystemExit(
+            "selfcheck: RULE_GROUPS does not match the declared rule groups "
+            f"(missing from the registry: {missing}; *_FILES constants with no registry entry: {unregistered})"
+        )
+    for g in groups:
+        if g.constant_backed:
+            const = globals().get(g.name)
+            if const is None or tuple(const) != tuple(g.files()):
+                raise SystemExit(f"selfcheck: RULE_GROUPS entry {g.name} does not scan the {g.name} constant")
+        files = g.files()
+        if not files:
+            raise SystemExit(f"selfcheck: RULE_GROUPS entry {g.name} scans no files")
+        if not g.find(g.bad_sample, files[0]):
+            raise SystemExit(f"selfcheck: RULE_GROUPS entry {g.name} did not flag its known-bad sample")
+
+
+def _selfcheck_registry_detects_removal() -> None:
+    """The registry check itself must fail on a removed group and on a no-op finder."""
+
+    def fails(groups: tuple[RuleGroup, ...]) -> bool:
+        try:
+            _selfcheck_registry(groups)
+        except SystemExit:
+            return True
+        return False
+
+    for i, g in enumerate(RULE_GROUPS):
+        if not fails(RULE_GROUPS[:i] + RULE_GROUPS[i + 1 :]):
+            raise SystemExit(f"selfcheck: removing the {g.name} group from RULE_GROUPS was not detected")
+        if not fails(RULE_GROUPS[:i] + (g._replace(find=lambda text, rel: []),) + RULE_GROUPS[i + 1 :]):
+            raise SystemExit(f"selfcheck: a no-op finder for the {g.name} group was not detected")
+
+
 def main() -> int:
     _selfcheck()
+    _selfcheck_registry()
+    _selfcheck_registry_detects_removal()
     hits: list[str] = []
-    for path in _scanned_files():
-        text = path.read_text(encoding="utf-8", errors="replace")
-        rel = path.relative_to(REPO_ROOT)
-        for line_no, pattern_names, stmt in find_violations_in_text(text):
-            snippet = " ".join(stmt.split())[:160]
-            hits.append(f"{rel}:{line_no}: [{pattern_names}] {snippet}")
     agent_hits: list[str] = []
-    for rel, always_bare in AGENT_ID_FILES.items():
-        path = REPO_ROOT / rel
-        if not path.is_file():
-            # A rename would otherwise silently shrink this check to nothing.
-            agent_hits.append(f"{rel}: file listed in AGENT_ID_FILES does not exist")
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line_no, stmt in find_agent_id_violations_in_text(text, always_bare):
-            snippet = " ".join(stmt.split())[:160]
-            agent_hits.append(f"{rel}:{line_no}: {snippet}")
-    for rel in PQ_ERROR_FILES:
-        path = REPO_ROOT / rel
-        if not path.is_file():
-            agent_hits.append(f"{rel}: file listed in PQ_ERROR_FILES does not exist")
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line_no, stmt in find_pq_error_violations_in_text(text):
-            snippet = " ".join(stmt.split())[:160]
-            agent_hits.append(f"{rel}:{line_no}: {snippet}")
-    for rel in STORE_ERROR_FILES:
-        path = REPO_ROOT / rel
-        if not path.is_file():
-            agent_hits.append(f"{rel}: file listed in STORE_ERROR_FILES does not exist")
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line_no, stmt in find_pq_error_violations_in_text(text, (".error()",)):
-            snippet = " ".join(stmt.split())[:160]
-            agent_hits.append(f"{rel}:{line_no}: {snippet}")
-    for rel in POOL_ERROR_FILES:
-        path = REPO_ROOT / rel
-        if not path.is_file():
-            agent_hits.append(f"{rel}: file listed in POOL_ERROR_FILES does not exist")
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line_no, stmt in find_pq_error_violations_in_text(text, POOL_ERROR_MARKERS):
-            snippet = " ".join(stmt.split())[:160]
-            agent_hits.append(f"{rel}:{line_no}: {snippet}")
-    for rel in REGISTRY_FREE_TEXT_FILES:
-        path = REPO_ROOT / rel
-        if not path.is_file():
-            agent_hits.append(f"{rel}: file listed in REGISTRY_FREE_TEXT_FILES does not exist")
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line_no, stmt in find_registry_free_text_violations_in_text(text):
-            snippet = " ".join(stmt.split())[:160]
-            agent_hits.append(f"{rel}:{line_no}: {snippet}")
-    for rel in COMMAND_TEXT_FILES:
-        path = REPO_ROOT / rel
-        if not path.is_file():
-            agent_hits.append(f"{rel}: file listed in COMMAND_TEXT_FILES does not exist")
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line_no, stmt in find_command_text_violations_in_text(text):
-            snippet = " ".join(stmt.split())[:160]
-            agent_hits.append(f"{rel}:{line_no}: {snippet}")
-    for rel in PKI_SIGNER_FILES:
-        path = REPO_ROOT / rel
-        if not path.is_file():
-            agent_hits.append(f"{rel}: file listed in PKI_SIGNER_FILES does not exist")
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line_no, stmt in find_pki_signer_violations_in_text(text):
-            snippet = " ".join(stmt.split())[:160]
-            agent_hits.append(f"{rel}:{line_no}: {snippet}")
-    for rel in UNSCANNED_LOGGING_FILES:
-        path = REPO_ROOT / rel
-        if not path.is_file():
-            agent_hits.append(f"{rel}: file listed in UNSCANNED_LOGGING_FILES does not exist")
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line_no, line in find_unscanned_logging_forms_in_text(text):
-            agent_hits.append(
-                f"{rel}:{line_no}: logging form the scanner does not parse "
-                f"(use spdlog::<level>(...)): {line[:160]}"
-            )
+    for group in RULE_GROUPS:
+        sink = hits if group.kind == "rule" else agent_hits
+        for rel in group.files():
+            path = REPO_ROOT / rel
+            if not path.is_file():
+                # A rename would otherwise silently shrink the check to nothing.
+                sink.append(f"{rel}: file listed in {group.name} does not exist")
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            sink.extend(group.find(text, rel))
     rc = 0
     if hits:
         print(
@@ -1888,7 +2169,7 @@ def main() -> int:
             "FAIL: spdlog:: call prints a request-derived agent id, agent-supplied hostname or "
             "command id / plugin name, or raw store/libpq error text unwrapped (#5513 CWE-117 log-injection tripwire). Wrap with ::yuzu::log_id_token(...) "
             "/ ::yuzu::log_key_token(...) "
-            "(common/include/yuzu/log_token.hpp):"
+            "(common/include/yuzu/log_token.hpp); a hostname takes log_id_token only:"
         )
         print("\n".join(agent_hits))
         rc = 1
