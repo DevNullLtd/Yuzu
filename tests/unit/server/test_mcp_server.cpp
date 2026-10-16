@@ -35143,8 +35143,11 @@ TEST_CASE("MCP B5: create_offload_target audits a refused batch_size as a denied
     ts.offload_target_store_for_test = store.get();
     ts.start();
     int rpc_id = 0;
-    auto create = [&](const std::string& name, const std::string& batch_json) {
-        nlohmann::json args = {{"url", "https://example.com/hook"}};
+    auto create = [&](const std::string& name, const std::string& batch_json,
+                      bool with_url = true) {
+        nlohmann::json args = nlohmann::json::object();
+        if (with_url)
+            args["url"] = "https://example.com/hook";
         if (!name.empty())
             args["name"] = name;
         const std::string body =
@@ -35160,7 +35163,10 @@ TEST_CASE("MCP B5: create_offload_target audits a refused batch_size as a denied
         const char* batch;
         const char* detail;
     };
+    // 18446744073709551615 is refused as not-an-integer by the strict reader (REST saturates it
+    // and records validation_failed), so MCP records invalid_field_type for it.
     for (const Case c : {Case{"\"10\"", "invalid_field_type"}, Case{"1.5", "invalid_field_type"},
+                         Case{"18446744073709551615", "invalid_field_type"},
                          Case{"0", "validation_failed"}, Case{"10001", "validation_failed"}}) {
         INFO("batch_size=" << c.batch);
         const auto before = ts.audit_log.size();
@@ -35171,11 +35177,21 @@ TEST_CASE("MCP B5: create_offload_target audits a refused batch_size as a denied
         CHECK(ts.audit_target_ids.back() == "audited-target");
         CHECK(ts.audit_details.back() == c.detail);
     }
-    // No empty-target row for a range reject with no name.
+    // No empty-target row for a range reject with no name, or with a name and no url.
     const auto before = ts.audit_log.size();
     auto noname = create("", "0");
     REQUIRE(noname.contains("error"));
     CHECK(ts.audit_log.size() == before);
+    auto nourl = create("audited-target", "0", /*with_url=*/false);
+    REQUIRE(nourl.contains("error"));
+    CHECK(ts.audit_log.size() == before);
+    // A wrong-typed batch_size is audited even with no name (REST parity), with an empty target.
+    auto typed = create("", "\"10\"");
+    REQUIRE(typed.contains("error"));
+    REQUIRE(ts.audit_log.size() == before + 1);
+    CHECK(ts.audit_log.back() == "offload_target.create|denied");
+    CHECK(ts.audit_target_ids.back().empty());
+    CHECK(ts.audit_details.back() == "invalid_field_type");
     // Nothing was created.
     auto listed = store->list();
     REQUIRE(listed.has_value());
