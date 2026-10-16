@@ -621,7 +621,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      approving review of #5880), and restated in the body of #5955 (opened
      2026-10-16). The ground recorded is that the exception is accepted for
      now. These are review edits by the owner's account, not a signed
-     decision, and no independent approving review of this entry exists yet.
+     decision. The ADR owner has stated that the decision is final and that
+     no independent review of this entry is required.
      The exception waives only the requirement of a REST v1 and MCP twin for
      13 read fragments in this change. It does not waive, and this entry
      does not assess, the authentication, authorization, audit or
