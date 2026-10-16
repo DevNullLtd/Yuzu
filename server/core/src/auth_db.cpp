@@ -2236,8 +2236,10 @@ bool principal_ok(const std::string& p) {
 /// only move on a real transition into `approved`. Column 1 (`inserted`) is true
 /// only when this statement CREATED the row (`xmax = 0` on the returned tuple; an
 /// `ON CONFLICT DO UPDATE` result carries a non-zero `xmax`); a caller enforcing
-/// the new-id charset reads it to refuse a creation. Callers that do not need it
-/// read column 0 only.
+/// the new-id charset reads it to refuse a creation. Both callers
+/// (`consume_and_enroll` and `ensure_enrolled`) test the row count (zero rows is
+/// the denied case) and read column 1 only when `enforce_new_id_charset` is set;
+/// neither reads column 0.
 constexpr const char* kEnrollUpsertSql =
     "INSERT INTO auth.pending_agents AS pa "
     "(agent_id, hostname, os, arch, agent_version, status, status_changed_at, status_changed_by) "

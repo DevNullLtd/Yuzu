@@ -527,8 +527,11 @@ TEST_CASE("guardian ingest: #4606 the server's other id-printing log lines neutr
         cap.stop();
         CHECK(cap.text().find("event ingest error (agent=agent_x_1, rule=rule-err)") !=
               std::string::npos);
-        // The store error text is wrapped too (log_key_token): control bytes are folded, spaces
-        // are kept so the message stays readable.
+        // The store error text is printed after the id fields, with its spaces kept so the
+        // message stays readable. This only observes that readable text: the store's own message
+        // here holds no control byte, so the case does not show the control-byte fold of the
+        // wrap (log_key_token), and a hostile store message cannot be driven cheaply because the
+        // store's Error texts are fixed strings or quote the pool's last connection error.
         CHECK(cap.text().find("): event field contains an embedded NUL byte") != std::string::npos);
     }
     { // an action other than "event" is ignored (debug): the action name and the agent id are

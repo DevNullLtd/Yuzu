@@ -10,8 +10,6 @@
 #include <algorithm>
 #include <string_view>
 
-#include <yuzu/log_token.hpp>
-
 #include <grpc/grpc_security_constants.h>
 
 #include <chrono>
@@ -54,6 +52,8 @@
 
 // compare_versions is declared in nvd_db.hpp
 #include "nvd_db.hpp"
+
+#include <yuzu/log_token.hpp>
 
 namespace yuzu::server::detail {
 

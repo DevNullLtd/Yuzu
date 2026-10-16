@@ -136,7 +136,7 @@ void register_custom_properties_routes(HttpRouteSink& sink, Deps deps) {
             if (is_custom_properties_db_error(result.error())) {
                 spdlog::error("PUT /api/agents/{}/properties/{}: {}",
                               ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(key),
-                              result.error());
+                              ::yuzu::log_key_token(result.error()));
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
@@ -265,7 +265,7 @@ void register_custom_properties_routes(HttpRouteSink& sink, Deps deps) {
         auto result = deps.store->upsert_schema(schema);
         if (!result) {
             if (is_custom_properties_db_error(result.error())) {
-                spdlog::error("POST /api/property-schemas: {}", result.error());
+                spdlog::error("POST /api/property-schemas: {}", ::yuzu::log_key_token(result.error()));
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",

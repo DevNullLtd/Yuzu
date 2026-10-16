@@ -360,6 +360,27 @@ TEST_CASE("CustomPropertiesStore: reads answer empty for an invalid agent_id",
     }
 }
 
+TEST_CASE("CustomPropertiesStore: an agent_id of exactly 256 bytes is accepted",
+          "[pg][custom_props][crud][failclosed]") {
+    // The upper bound of the guard is inclusive: 256 bytes is the longest id the REST and gRPC
+    // doors admit, so it must round-trip, while 257 is refused (pinned by the neighbouring cases).
+    PROPS_SHARED(store, pool);
+    const std::string edge_id(256, 'e');
+    require_ok(store.set_property(edge_id, "owner", "alice"));
+
+    auto v = store.get_value(edge_id, "owner");
+    REQUIRE(v.has_value());
+    REQUIRE(v->has_value());
+    CHECK(**v == "alice");
+    const auto props = require_ok(store.get_properties(edge_id));
+    REQUIRE(props.size() == 1);
+    CHECK(props[0].agent_id == edge_id);
+    CHECK(require_ok(store.get_property(edge_id, "owner")).has_value());
+    CHECK(require_ok(store.get_property_map(edge_id)).size() == 1);
+    CHECK(store.delete_property(edge_id, "owner"));
+    CHECK(require_ok(store.get_properties(edge_id)).empty());
+}
+
 TEST_CASE("CustomPropertiesStore: get_properties lists all for agent",
           "[pg][custom_props][crud]") {
     PROPS_SHARED(store, pool);

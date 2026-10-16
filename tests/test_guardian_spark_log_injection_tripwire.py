@@ -85,8 +85,9 @@ does NOT flag it and documents why that is expected.
 
 SECOND KNOWN LIMITATION (Phase-3 governance quality-engineer finding,
 2026-09-25, empirically confirmed and left open rather than closed here):
-`parse_call()` requires the statement's first token after `(` to be a `"`
-string literal, so `spdlog::warn(fmt::format("Guardian: rule '{}' failed",
+`parse_call()` requires the statement's first token after `(` to be a string
+literal (a plain one, or one with a u8/u/U/L prefix or a raw `R"delim(...)delim"`
+form), so `spdlog::warn(fmt::format("Guardian: rule '{}' failed",
 rule_id));` -- a raw, wholly unwrapped rule_id, zero token wrapping anywhere
 in the statement -- makes `parse_call` return `None` and the whole statement
 is silently skipped. No current call site in this tree uses this idiom
@@ -142,7 +143,8 @@ spdlog:: argument that is a request-derived agent id
 (`info.agent_id()`, `request->agent_id()`, `req->agent_id()`, a local alias bound from
 one of those in the same function, or the bare `agent_id` in the custom-properties
 files and tag_store.cpp, where the bare caller-supplied tag `key` is also matched; the bare `key`
-and `validation_regex` in custom_properties_store.cpp and the bare path parameter `key` in
+and `validation_regex` in custom_properties_store.cpp, the bare path parameter `key` in
+custom_properties_routes.cpp (the PUT 503 line) and the bare path parameter `key` in
 config_routes.cpp are matched the same way) and is
 not wholly a log_id_token / log_key_token / audit_token /
 onbehalf::sanitize_for_log call or the local `safe_agent_id`. It is LEXICAL: it reads
@@ -205,13 +207,19 @@ rule and does not apply to the rest of server.cpp. server.cpp is also NOT in che
 (UNSCANNED_LOGGING_FILES): it makes one legitimate non-logging use of the default logger
 (`spdlog::default_logger()->level()` in the log-level report), which the guard
 would fail on; it has no `spdlog::log(` or `SPDLOG_*(` use.
+The same check also covers the gateway command-forward lines in server.cpp: an spdlog:: statement
+whose format literal starts with "Gateway SendCommand" must wrap a response frame's `agent_id()`
+(a peer-asserted value read back from the gateway) and the RPC status `error_message()`; the
+expected target `expected_agent_id` comes from the session table and is not matched.
 
 WHAT CHECKS 2 TO 7 DELIBERATELY DO NOT COVER (session-resolved ids). Log lines that print an
 agent id read back from the session table or the enrollment store print it as stored: the
 Heartbeat / BatchHeartbeat and ReportInventory / ProxyInventory ingest paths and the shared
-ingestion modules they call, the Subscribe stream open and close lines, and the agent registry's
+ingestion modules they call, the Subscribe stream open and close lines, the agent registry's
 other log lines that print a session-table id (removal, rollback, session-timeout, sweep and
-dispatch-routing lines); in agent_registry.cpp only claimed ids from `info.agent_id()` are matched.
+dispatch-routing lines), and the enrollment store's own log lines (admitted, denied, consumed and
+added lines in auth_db.cpp); in agent_registry.cpp only claimed ids from `info.agent_id()` are
+matched.
 AuthDB's agent-id check (`agent_id_ok`, auth_db.cpp) has already refused control bytes and ',' for
 such an id, so it cannot add a newline-delimited line (it does accept U+0085, U+2028 and U+2029,
 which a splitlines()-style reader treats as breaks), but an id enrolled or imported before the
@@ -591,9 +599,62 @@ def _skip_ws_and_comments(s: str, i: int) -> int:
     return i
 
 
-def _skip_string_literal(s: str, i: int) -> int:
-    """s[i] == '"'. Return the index just past the closing quote."""
+def _raw_string_prefix_before(s: str, i: int) -> bool:
+    """s[i] == '"'. True when the quote opens a raw string literal: an `R` immediately before it,
+    itself either standalone or following an encoding prefix (`u8`, `u`, `U`, `L`), and not the
+    tail of a longer identifier."""
+    k = i - 1
+    if k < 0 or s[k] != "R":
+        return False
+    if k >= 2 and s[k - 2 : k] == "u8":
+        k -= 2
+    elif k >= 1 and s[k - 1] in "uUL":
+        k -= 1
+    return k == 0 or not (s[k - 1].isalnum() or s[k - 1] == "_")
+
+
+def _raw_string_end(s: str, i: int) -> tuple[int, int, int] | None:
+    """s[i] == '"' opening a raw string. Return (content_start, content_end, end) where `end` is
+    the index just past the closing quote, or None when the delimiter is malformed or the literal
+    is unterminated (the caller then treats the rest of the text as consumed)."""
     n = len(s)
+    j = i + 1
+    while j < n and j - i - 1 <= 16 and s[j] not in '()\\" \t\r\n':
+        j += 1
+    if j >= n or s[j] != "(":
+        return None
+    delim = s[i + 1 : j]
+    close = ")" + delim + '"'
+    k = s.find(close, j + 1)
+    if k == -1:
+        return None
+    return j + 1, k, k + len(close)
+
+
+def _string_literal_quote_at(s: str, i: int) -> int | None:
+    """If a string literal begins at s[i], with an optional encoding prefix (`u8`, `u`, `U`, `L`)
+    and an optional raw marker `R`, return the index of its opening quote; else None."""
+    n = len(s)
+    j = i
+    if s.startswith("u8", j):
+        j += 2
+    elif j < n and s[j] in "uUL":
+        j += 1
+    if j < n and s[j] == "R":
+        j += 1
+    if j < n and s[j] == '"':
+        return j
+    return None
+
+
+def _skip_string_literal(s: str, i: int) -> int:
+    """s[i] == '"'. Return the index just past the closing quote. A raw string literal
+    (`R"delim(...)delim"`, any encoding prefix) is skipped as a whole: its body has no escapes and
+    may contain quotes and parentheses."""
+    n = len(s)
+    if _raw_string_prefix_before(s, i):
+        span = _raw_string_end(s, i)
+        return n if span is None else span[2]
     i += 1
     while i < n:
         if s[i] == "\\":
@@ -668,12 +729,21 @@ def parse_call(stmt: str) -> tuple[str, str] | None:
     call = SPDLOG_CALL_RE.match(stmt)
     open_paren = call.end() - 1 if call is not None else stmt.index("(")
     i = _skip_ws_and_comments(stmt, open_paren + 1)
-    if i >= len(stmt) or stmt[i] != '"':
+    if i >= len(stmt) or _string_literal_quote_at(stmt, i) is None:
         return None
     parts: list[str] = []
-    while i < len(stmt) and stmt[i] == '"':
-        end = _skip_string_literal(stmt, i)
-        parts.append(stmt[i + 1 : end - 1])
+    while i < len(stmt):
+        # A literal may carry an encoding prefix (u8, u, U, L) and/or be a raw string
+        # (R"delim(...)delim"); the body is what the format string says either way.
+        quote = _string_literal_quote_at(stmt, i)
+        if quote is None:
+            break
+        end = _skip_string_literal(stmt, quote)
+        raw_span = _raw_string_end(stmt, quote) if _raw_string_prefix_before(stmt, quote) else None
+        if raw_span is not None:
+            parts.append(stmt[raw_span[0] : raw_span[1]])
+        else:
+            parts.append(stmt[quote + 1 : end - 1])
         i = _skip_ws_and_comments(stmt, end)
     literal = "".join(parts)
     # i now points just past the format string's last literal token. The
@@ -989,7 +1059,9 @@ AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
     # `key` is the caller-supplied tag key (get_values_for_key prints it); the file has no
     # other local of that name in a log argument.
     "server/core/src/tag_store.cpp": ("agent_id", "key"),
-    "server/core/src/custom_properties_routes.cpp": ("agent_id",),
+    # `key` is the URL path parameter of PUT /api/agents/{id}/properties/{key}, printed by the 503
+    # log line; the file has no other bare local of that name in a log argument.
+    "server/core/src/custom_properties_routes.cpp": ("agent_id", "key"),
     # `key` is the URL path parameter of PUT /api/config/{key}. The store `.error()` text this
     # file also logs is covered by STORE_ERROR_FILES below, not by this entry.
     "server/core/src/config_routes.cpp": ("key",),
@@ -1106,10 +1178,10 @@ def find_agent_id_violations_in_text(
     return out
 
 
-# Check 6: libpq error text (`PQerrorMessage`) can quote the statement
-# parameters, i.e. the claimed agent id, so in the custom-properties store every spdlog
-# argument that contains a `PQerrorMessage(` call must be wholly one wrap call. Lexical,
-# like the check above; it covers only this one file.
+# Check 6: libpq error text (`PQerrorMessage`, `PQresultErrorMessage`) can quote the statement
+# parameters, i.e. the claimed agent id, so in the files below every spdlog argument that
+# contains one of the PQ_ERROR_MARKERS calls must be wholly one wrap call. Lexical, like the
+# check above; it covers only the files listed here.
 PQ_ERROR_FILES: tuple[str, ...] = (
     "server/core/src/custom_properties_store.cpp",
     "server/core/src/tag_store.cpp",
@@ -1304,18 +1376,34 @@ _PKI_WHAT_RE = re.compile(r"\.\s*what\s*\(\s*\)")
 _PKI_STORE_ERROR_RE = re.compile(r"\.\s*error\s*\(\s*\)")
 
 
+# The gateway command-forward lines in server.cpp ("Gateway SendCommand for {} ..."): a response
+# frame read back from a gateway carries a peer-asserted `agent_id()`, and the RPC status carries a
+# peer-asserted `error_message()`; both are printed only wrapped. The expected target
+# (`expected_agent_id`, taken from the session table) is a session-resolved id and is deliberately
+# not matched. Lexical, like the rest of this check: a literal that does not start with
+# "Gateway SendCommand", or a value copied into a local first, is not seen.
+_GATEWAY_FORWARD_LITERAL_PREFIX = "Gateway SendCommand"
+_GATEWAY_FORWARD_RAW_RE = re.compile(
+    r"(?:\.|->)\s*agent_id\s*\(\s*\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
+    r"|(?:\.|->)\s*error_message\s*\(\s*\)"
+)
+
+
 def find_pki_signer_violations_in_text(text: str) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
     for pos, stmt in find_spdlog_statements_with_pos(text):
         parsed = parse_call(stmt)
-        if parsed is None or not parsed[0].lstrip().startswith("PKI:"):
+        if parsed is None:
+            continue
+        literal = parsed[0].lstrip()
+        if literal.startswith("PKI:"):
+            raw_res = (_PKI_BARE_AGENT_ID_RE, _PKI_WHAT_RE, _PKI_STORE_ERROR_RE)
+        elif literal.startswith(_GATEWAY_FORWARD_LITERAL_PREFIX):
+            raw_res = (_GATEWAY_FORWARD_RAW_RE,)
+        else:
             continue
         for arg in split_top_level_args(parsed[1]):
-            raw = (
-                _PKI_BARE_AGENT_ID_RE.search(arg) is not None
-                or _PKI_WHAT_RE.search(arg) is not None
-                or _PKI_STORE_ERROR_RE.search(arg) is not None
-            )
+            raw = any(r.search(arg) is not None for r in raw_res)
             if raw and not argument_is_wrapped(arg):
                 out.append((text.count("\n", 0, pos) + 1, stmt))
                 break
@@ -1598,6 +1686,25 @@ def _selfcheck() -> None:
 
     agent_must_match = [
         ('spdlog::info("peer {} seen", info.agent_id());', ()),
+        # A raw or encoding-prefixed format literal is still parsed, so its arguments are checked
+        # (a prefix used to make the statement skip silently).
+        ('spdlog::warn(R"(x {})", info.agent_id());', ()),
+        ('spdlog::warn(R"d(x ) {})d", info.agent_id());', ()),
+        ('spdlog::warn(u8"x {}", info.agent_id());', ()),
+        ('spdlog::warn(L"x {}", info.agent_id());', ()),
+        ('spdlog::warn(u"x {}", info.agent_id());', ()),
+        ('spdlog::warn(U"x {}", info.agent_id());', ()),
+        ('spdlog::warn(u8R"(x {})", info.agent_id());', ()),
+        ('spdlog::warn(R"(x {})" R"( and {})", log_id_token(a), info.agent_id());', ()),
+        # A raw literal whose body holds quotes and an unbalanced parenthesis must not derail the
+        # statement scan: the raw agent id after it is still seen.
+        ('spdlog::warn(R"x(say "hi" ) here {})x", info.agent_id());', ()),
+        # The path-parameter `key` of PUT /api/agents/{id}/properties/{key}, bare in a file that
+        # lists it.
+        (
+            'spdlog::error("PUT /api/agents/{}/properties/{}: failed", ::yuzu::log_id_token(agent_id), key);',
+            ("agent_id", "key"),
+        ),
         ('spdlog::warn("update check: agent {} v{}", request->agent_id(), v);', ()),
         ('spdlog::info("sent {} bytes to {}", n, req->agent_id());', ()),
         # A chained receiver (a call result before the member access) is "any receiver" too.
@@ -1694,6 +1801,17 @@ def _selfcheck() -> None:
         ('spdlog::info("peer {}", ::yuzu::log_id_token(request->info().agent_id()));', ()),
         ('spdlog::warn("delete failed for agent={}", ::yuzu::log_id_token(agent_id));', ("agent_id",)),
         ('spdlog::warn("tag sync failed ({})", err);', ("agent_id",)),
+        # The wrapped counterparts of the raw and prefixed literals above.
+        ('spdlog::warn(R"(x {})", ::yuzu::log_id_token(info.agent_id()));', ()),
+        ('spdlog::warn(R"d(x ) {})d", ::yuzu::log_id_token(info.agent_id()));', ()),
+        ('spdlog::warn(u8"x {}", ::yuzu::log_id_token(info.agent_id()));', ()),
+        ('spdlog::warn(L"x {}", ::yuzu::log_id_token(info.agent_id()));', ()),
+        ('spdlog::warn(u8R"(x {})", ::yuzu::log_id_token(info.agent_id()));', ()),
+        ('spdlog::warn(R"x(say "hi" ) here {})x", ::yuzu::log_id_token(info.agent_id()));', ()),
+        (
+            'spdlog::error("PUT /api/agents/{}/properties/{}: failed", ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(key));',
+            ("agent_id", "key"),
+        ),
         ('spdlog::warn("values_for_key(\'{}\') failed", ::yuzu::log_key_token(key));', ("agent_id", "key")),
         # `key` is only a bare name in a file that lists it; a method call named key() is not it.
         ('spdlog::warn("failed", row.key());', ("agent_id", "key")),
@@ -1950,6 +2068,14 @@ def _selfcheck() -> None:
         'spdlog::error("PKI: read failed: {}", root_or_err.error ());',
         'spdlog::error("PKI: signing threw ({})", e.what ());',
         'spdlog::get("pki")->error("PKI: read failed: {}", root_or_err.error());',
+        # The gateway command-forward lines: a peer-asserted response agent id or RPC status text.
+        'spdlog::error("Gateway SendCommand for {} received a response for agent \'{}\'", cmd_id,'
+        " resp.agent_id());",
+        'spdlog::error("Gateway SendCommand for {} received a response for agent \'{}\'", cmd_id,'
+        " resp . agent_id ());",
+        'spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id, status.error_message(),'
+        " code);",
+        'spdlog::warn("Gateway SendCommand for {} unavailable: {}", cmd_id, status . error_message ());',
     ]
     for src in pki_must_match:
         if not find_pki_signer_violations_in_text(src):
@@ -1967,6 +2093,14 @@ def _selfcheck() -> None:
         'spdlog::warn("PKI: x {}", rev.agent_id);',
         'spdlog::warn("PKI: x {}", my_agent_id);',
         'spdlog::warn("PKI: initial CRL publish failed: {}", err);',
+        'spdlog::error("Gateway SendCommand for {} received a response for agent \'{}\'", cmd_id,'
+        " ::yuzu::log_id_token(resp.agent_id()));",
+        'spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,'
+        " ::yuzu::log_key_token(status.error_message()), code);",
+        'spdlog::debug("Gateway SendCommand for {} completed: {} response(s)", cmd_id, resp_count);',
+        # The expected target is a session-resolved id, deliberately not matched.
+        'spdlog::error("Gateway SendCommand for {} targeted \'{}\'", cmd_id, expected_agent_id);',
+        'spdlog::warn("Gateway SendCommand for {} n {}", cmd_id, resp.agent_id().size());',
         # Not a PKI line: the broad bare-name rule is deliberately not applied to server.cpp.
         'spdlog::warn("Agent {} did a thing", agent_id);',
     ]

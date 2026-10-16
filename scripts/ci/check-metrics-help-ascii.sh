@@ -23,9 +23,12 @@
 #       string-literal arguments, across server/core/src/*.cpp AND
 #       agents/core/src/*.cpp (the agent registers its own metrics at
 #       agents/core/src/agent.cpp, e.g. around the AgentImpl constructor, and
-#       would otherwise be uncovered), plus the few headers listed in
-#       "describe_files" that carry an inline `describe(` call of their own
-#       (a header is not globbed: most headers hold no HELP text).
+#       would otherwise be uncovered), plus every *.hpp in those same
+#       directories. Headers are globbed rather than listed so a new header
+#       that carries an inline `describe(` call is covered with no edit here;
+#       a header with no `describe(` call contributes nothing, and a
+#       `describe(` mentioned in a comment or a string literal is masked out
+#       exactly as it is in the .cpp files.
 #
 #   (b) HELP_TABLE_FILES -- every double-quoted string literal in the two
 #       Guardian HELP-table headers (guardian_journal_fleet_tags.hpp,
@@ -94,11 +97,7 @@ selftest_flag = sys.argv[2] == "1"
 # Kept in one constant so adding a future HELP table is a one-line change.
 SCAN_TARGETS = {
     "describe_dirs": ["server/core/src", "agents/core/src"],
-    # Headers with an inline describe(...) call, scanned like the .cpp files above.
-    "describe_files": [
-        "server/core/src/agent_service_impl.hpp",
-        "server/core/src/response_export_metrics.hpp",
-    ],
+    # Every *.hpp in "describe_dirs" is scanned like the .cpp files (see scan_describe_surface).
     "help_tables": [
         "server/core/src/guardian_journal_fleet_tags.hpp",
         "server/core/src/guardian_health_fleet_tags.hpp",
@@ -207,16 +206,17 @@ def scan_describe_surface(root):
     for scan_dir in SCAN_TARGETS["describe_dirs"]:
         base = os.path.join(root, scan_dir)
         if not os.path.isdir(base):
+            if root == repo_root:
+                # A listed directory that vanished from the real tree is a config error, not a
+                # silent pass (selftest fixture trees hold only the directories they seed).
+                findings.append((scan_dir, 0, 0, "<missing scan target>"))
             continue
-        paths.extend(sorted(glob.glob(os.path.join(base, "*.cpp"))))
-    for rel_file in SCAN_TARGETS["describe_files"]:
-        full = os.path.join(root, rel_file)
-        if os.path.isfile(full):
-            paths.append(full)
-        elif root == repo_root:
-            # A listed header that vanished from the real tree is a config error, not a silent
-            # pass (selftest fixture trees hold only the files they seed).
-            findings.append((rel_file, 0, 0, "<missing scan target>"))
+        found = sorted(glob.glob(os.path.join(base, "*.cpp"))) + sorted(
+            glob.glob(os.path.join(base, "*.hpp"))
+        )
+        if not found and root == repo_root:
+            findings.append((scan_dir, 0, 0, "<missing scan target>"))
+        paths.extend(found)
     for full in paths:
         rel = os.path.relpath(full, root).replace(os.sep, "/")
         try:
@@ -366,18 +366,33 @@ def run_selftest():
             print(f"SELFTEST FAILED: HELP-table fixture was NOT flagged: {table_findings}")
             return 1
 
-        # Seeded fixture (a, header): a describe() call inline in a listed header is scanned too.
+        # Seeded fixture (a, header): a describe() call inline in ANY header under a scanned
+        # directory is scanned too. The file name is deliberately one no list could name.
         hdr_dir = os.path.join(tmp, "header_seeded", "server", "core", "src")
         os.makedirs(hdr_dir)
-        with open(os.path.join(hdr_dir, "agent_service_impl.hpp"), "w", encoding="utf-8") as f:
+        with open(os.path.join(hdr_dir, "some_new_metrics.hpp"), "w", encoding="utf-8") as f:
             f.write(
                 'inline void seed(Metrics& m) {\n'
                 '    m.describe("yuzu_x_total", "Reintroduced em dash — in a header", "counter");\n'
                 '}\n'
             )
         hdr_findings = scan_describe_surface(os.path.join(tmp, "header_seeded"))
-        if not any(ch == "—" for _r, _l, _b, ch in hdr_findings):
+        if not any(ch == "—" and r.endswith("some_new_metrics.hpp") for r, _l, _b, ch in hdr_findings):
             print(f"SELFTEST FAILED: header describe() fixture was NOT flagged: {hdr_findings}")
+            return 1
+
+        # A header that only MENTIONS describe( in a comment, or holds non-ASCII prose outside
+        # any describe() call, must not be flagged (same masking as the .cpp files).
+        hdr_clean_dir = os.path.join(tmp, "header_clean", "server", "core", "src")
+        os.makedirs(hdr_clean_dir)
+        with open(os.path.join(hdr_clean_dir, "prose.hpp"), "w", encoding="utf-8") as f:
+            f.write(
+                '// See describe("x — y") in the registry; an em dash — here is prose.\n'
+                'inline int g() { return 1; } // section sign §\n'
+            )
+        hdr_clean_findings = scan_describe_surface(os.path.join(tmp, "header_clean"))
+        if hdr_clean_findings:
+            print(f"SELFTEST FAILED: header comment prose false-positived: {hdr_clean_findings}")
             return 1
 
         # Metric NAME / TYPE arguments are never edited by the fix this gate

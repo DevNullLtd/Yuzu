@@ -1431,8 +1431,22 @@ TEST_CASE("Register increment sites only use the closed reason set, and ServerIm
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
     // Wiring pin: the seed function above is only useful while server.cpp still calls it.
-    CHECK(read_server_source("server.cpp").find("seed_register_invalid_agent_id_series(") !=
-          std::string::npos);
+    // The pin is the exact call spelling and the line it sits on must not be a comment, so a
+    // commented-out call or a prose mention of it does not satisfy the pin.
+    {
+        const std::string server_src = read_server_source("server.cpp");
+        const std::string call = "seed_register_invalid_agent_id_series(metrics_)";
+        std::size_t live_calls = 0;
+        for (auto pos = server_src.find(call); pos != std::string::npos;
+             pos = server_src.find(call, pos + 1)) {
+            const auto line_start = server_src.rfind('\n', pos);
+            const auto from = line_start == std::string::npos ? 0 : line_start + 1;
+            const auto first = server_src.find_first_not_of(" \t", from);
+            if (first != std::string::npos && server_src.compare(first, 2, "//") != 0)
+                ++live_calls;
+        }
+        CHECK(live_calls == 1);
+    }
 
     // A reason literal added at an increment site without being added to
     // kRegisterInvalidAgentIdReasons would be absent from a healthy scrape.
@@ -1478,6 +1492,8 @@ TEST_CASE("Register and ProxyRegister pass enforce_new_id_charset=true at every 
         CHECK(count_occurrences(src, "auth_mgr_.consume_and_enroll(") == 1);
         CHECK(count_occurrences(src, "auth_mgr_.ensure_enrolled(") == 1);
         CHECK(count_occurrences(src, "auth_mgr_.add_pending_agent(") == 1);
+        // The store's own spelling of the pending-queue write: a handler never calls it directly.
+        CHECK(count_occurrences(src, "add_pending(") == 0);
         CHECK(count_charset_flag_true(src) == 3);
     }
 
@@ -1509,6 +1525,9 @@ TEST_CASE("Register and ProxyRegister pass enforce_new_id_charset=true at every 
         CHECK(count_occurrences(src, "consume_and_enroll(") == 0);
         CHECK(count_occurrences(src, "ensure_enrolled(") == 0);
         CHECK(count_occurrences(src, "add_pending_agent(") == 0);
+        // The AuthDB method spelling of the same write (the only definition and the only call are
+        // in the two excluded files; no other file under server/core/src mentions it).
+        CHECK(count_occurrences(src, "add_pending(") == 0);
         ++scanned;
         if (rel.find('/') != std::string::npos)
             ++scanned_in_subdir;

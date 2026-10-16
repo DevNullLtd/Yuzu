@@ -13446,7 +13446,8 @@ private:
                                 "Gateway SendCommand for {} received a response for agent "
                                 "'{}' but this request targeted '{}' — REFUSING to apply it "
                                 "(possible cross-cluster response forgery)",
-                                cmd_id, resp.agent_id(), expected_agent_id);
+                                cmd_id, ::yuzu::log_id_token(resp.agent_id()),
+                                expected_agent_id);
                             metrics
                                 ->counter("yuzu_server_gateway_forward_total",
                                          {{"cluster_id", cluster_label},
@@ -13589,7 +13590,7 @@ private:
                     // Only retry on UNAVAILABLE (connection refused / not ready)
                     if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
                         spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
-                                     status.error_message(),
+                                     ::yuzu::log_key_token(status.error_message()),
                                      static_cast<int>(status.error_code()));
                         // #4672: same "resolve now, don't leave the
                         // command_id stuck" posture as every other terminal
@@ -13636,7 +13637,8 @@ private:
                         return; // non-transient error — don't retry
                     }
                     spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
-                                 cmd_id, attempt + 1, status.error_message());
+                                 cmd_id, attempt + 1,
+                                 ::yuzu::log_key_token(status.error_message()));
                 }
                 spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
                 // #4672: retries exhausted (3 attempts, exponential backoff)

@@ -6,8 +6,6 @@
 #include <chrono>
 #include <string_view>
 
-#include <yuzu/log_token.hpp>
-
 #include <nlohmann/json.hpp>
 
 #include "agent_service_impl.hpp"
@@ -38,6 +36,8 @@
 #include "app_usage_ingestion.hpp"
 #include "app_usage_store.hpp"
 #include "peer_ip.hpp"
+
+#include <yuzu/log_token.hpp>
 
 namespace yuzu::server::detail {
 
