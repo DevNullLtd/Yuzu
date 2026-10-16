@@ -209,20 +209,49 @@ TEST_CASE("OTA rollout on a package that does not exist records not_found, not s
     CHECK(pkgs.front().rollout_pct == 50);
 }
 
-TEST_CASE("OTA rollout percentage is clamped, and the row reports the CLAMPED value",
-          "[ota][audit][settings_routes][pg]") {
-    // The handler clamps to 0..100. The audit row must report what was actually
-    // stored, not what was requested, or the evidence disagrees with the state.
+TEST_CASE("OTA rollout change refuses an empty or above-100 percentage and changes nothing",
+          "[ota][audit][settings_routes][pg][numeric_params]") {
+    // Both used to become 100 (the empty default, and the clamp), i.e. a blank or typo'd
+    // field flipped an existing package to a FULL-FLEET rollout. Now a 400 with the stored
+    // percentage untouched; 0, 50 and 100 are still accepted.
     YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
     OtaAuditHarness h{db.dsn()};
     h.seed(/*rollout_pct=*/10, /*mandatory=*/false);
 
-    h.post_rollout("1.2.3", "500");
+    // "%205" is a form-encoded leading space (" 5"): whitespace is not part of a base-10 integer,
+    // so it is refused rather than trimmed.
+    for (const char* bad : {"", "101", "500", "%205"}) {
+        INFO("rollout_pct='" << bad << "'");
+        auto res = h.post_rollout("1.2.3", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.registry->list_packages().front().rollout_pct == 10);
+    }
+    CHECK(h.audited.empty());
 
-    REQUIRE(h.audited.size() == 1);
-    CHECK(h.audited.front().detail.find("from=10%") != std::string::npos);
-    CHECK(h.audited.front().detail.find("to=100%") != std::string::npos);
-    CHECK(h.registry->list_packages().front().rollout_pct == 100);
+    for (const int ok : {0, 50, 100}) {
+        INFO("rollout_pct=" << ok);
+        auto res = h.post_rollout("1.2.3", std::to_string(ok));
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.registry->list_packages().front().rollout_pct == ok);
+    }
+
+    // A negative value keeps its documented clamp to 0 (the least exposure, never a full-fleet
+    // value), and a percent-encoded digit is decoded before the parse.
+    h.seed(/*rollout_pct=*/60, /*mandatory=*/false);
+    auto neg = h.post_rollout("1.2.3", "-5");
+    REQUIRE(neg);
+    CHECK(neg->status == 200);
+    CHECK(h.registry->list_packages().front().rollout_pct == 0);
+    // The audit row reports the stored value, never the raw -5 the caller sent.
+    REQUIRE_FALSE(h.audited.empty());
+    CHECK(h.audited.back().detail.find("to=0%") != std::string::npos);
+    CHECK(h.audited.back().detail.find("-5") == std::string::npos);
+    auto encoded = h.post_rollout("1.2.3", "%37");
+    REQUIRE(encoded);
+    CHECK(encoded->status == 200);
+    CHECK(h.registry->list_packages().front().rollout_pct == 7);
 }
 
 TEST_CASE("a rollout whose registry write does not commit is audited as failure, not success",
@@ -437,6 +466,27 @@ TEST_CASE("a rollout write does not clobber a concurrent change to another colum
     CHECK(pkgs.front().mandatory == true);
     REQUIRE(h.audited.size() == 1);
     CHECK(h.audited.front().detail.find("mandatory=true") != std::string::npos);
+}
+
+// #4644: a malformed rollout percentage must NOT fall back to 100 (a full-fleet rollout
+// nobody asked for): 400, nothing stored, no audit row claiming a change happened.
+TEST_CASE("OTA rollout with a malformed percentage is a 400 and changes nothing",
+          "[ota][audit][settings_routes][pg][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    h.seed(/*rollout_pct=*/25, /*mandatory=*/false);
+    for (const char* bad : {"50abc", "0x32", "1e1", "99999999999999999999"}) {
+        INFO("rollout_pct=" << bad);
+        auto res = h.post_rollout("1.2.3", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        // The dashboard drops 4xx bodies, so the operator only learns of the refusal from the toast.
+        CHECK(res->get_header_value("HX-Trigger").find("nothing was changed") != std::string::npos);
+    }
+    CHECK(h.audited.empty());
+    auto pkgs = h.registry->list_packages();
+    REQUIRE(pkgs.size() == 1);
+    CHECK(pkgs.front().rollout_pct == 25); // untouched, NOT 100
 }
 
 // ── Update-package row URLs: platform/arch/version are encoded segments ──────

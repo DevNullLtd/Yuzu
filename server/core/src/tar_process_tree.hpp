@@ -23,6 +23,7 @@
 ///     rows, never in SQL.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -213,6 +214,12 @@ TarWindow resolve_tar_window(const std::string& preset, std::int64_t custom_from
 /// an oversized digit string or an absurd year yields 0, never signed-overflow UB.
 /// Pure + free so it is unit-testable without the HTTP layer.
 std::int64_t parse_ts_param(const std::string& s);
+
+/// Strict twin of `parse_ts_param` for the operator-supplied `from`/`to` window (#4644). Empty is
+/// absent (0). Anything else must be all digits (at most 18) or exactly `YYYY-MM-DDTHH:MM[:SS]`
+/// with every field in range; otherwise `std::nullopt`, so a caller can refuse the request
+/// instead of silently rendering an unbounded or shifted window. Never throws.
+std::optional<std::int64_t> parse_ts_param_strict(const std::string& s);
 
 /// Reconstruct the per-host tree: build per-pid alive intervals from the event
 /// stream, keep incarnations whose lifetime overlaps `[from, to]`, link each to the

@@ -7,6 +7,7 @@
 /// filter/paginate/JSON logic in hardware_list_model.{hpp,cpp}.
 
 #include "hardware_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
 #include "authz_model.hpp"          // authz::in_scope
@@ -109,7 +110,9 @@ std::int64_t now_secs() {
         .count();
 }
 
-HardwareListQuery query_from_request(const httplib::Request& req) {
+// nullopt when `offset`/`limit` is present but not ONE base-10 integer: the caller
+// answers 400 rather than serving a page the operator did not ask for (#4644).
+std::optional<HardwareListQuery> query_from_request(const httplib::Request& req) {
     HardwareListQuery q;
     if (req.has_param("q")) q.q = req.get_param_value("q");
     if (req.has_param("os")) q.os = req.get_param_value("os");
@@ -117,15 +120,20 @@ HardwareListQuery query_from_request(const httplib::Request& req) {
     if (req.has_param("sort")) q.sort = req.get_param_value("sort");
     if (req.has_param("dir")) q.desc = req.get_param_value("dir") == "desc";
     if (req.has_param("tag")) q.tag = req.get_param_value("tag");
+    bool malformed = false;
     auto parse_u = [&](const char* name, std::size_t dflt) -> std::size_t {
         if (!req.has_param(name)) return dflt;
-        try {
-            long long v = std::stoll(req.get_param_value(name));
-            return v < 0 ? 0 : static_cast<std::size_t>(v);
-        } catch (...) { return dflt; }
+        const auto v = yuzu::server::parse_query_int<long long>(req.get_param_value(name));
+        if (!v) { malformed = true; return dflt; }
+        // A negative offset/limit is malformed (the other converted sites reject it too),
+        // not a request for page 0.
+        if (*v < 0) { malformed = true; return dflt; }
+        return static_cast<std::size_t>(*v);
     };
     q.offset = parse_u("offset", 0);
     q.limit = parse_u("limit", 50);
+    if (malformed)
+        return std::nullopt;
     return q;
 }
 
@@ -229,7 +237,14 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const InventoryDevicesResult all = deps_.roster_fn();
         auto [scoped, omitted] = scoped_roster(all, gate.scope);
 
-        auto raw = query_from_request(req);
+        const auto raw_opt = query_from_request(req);
+        if (!raw_opt) {
+            res.status = 400;
+            send_html(res, "<div class=\"gp-placeholder\"><b>Bad request.</b> offset and limit "
+                           "must be whole numbers.</div>");
+            return;
+        }
+        auto raw = *raw_opt;
         auto normalised = normalise_hardware_query(raw);
         if (!normalised) {
             res.status = 400;
@@ -332,7 +347,16 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         int attempt = 1;
         std::string command_id;
         if (req.has_param("await_since")) {
-            try { await_since = std::stoll(req.get_param_value("await_since")); } catch (...) {}
+            // await_since is the freshness bound the poll waits past: a malformed value
+            // must not read as "no bound" (the poll would then serve the STALE snapshot as
+            // fresh), so it is a 400, not a silent default.
+            await_since = yuzu::server::parse_query_int<long long>(req.get_param_value("await_since"));
+            if (!await_since) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
             if (req.has_param("n")) {
                 try { attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 30); } catch (...) {}
             }
@@ -643,7 +667,14 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const InventoryDevicesResult all = deps_.roster_fn();
         auto [scoped, omitted] = scoped_roster(all, gate.scope);
 
-        auto raw = query_from_request(req);
+        const auto raw_opt = query_from_request(req);
+        if (!raw_opt) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                            "application/json");
+            return;
+        }
+        auto raw = *raw_opt;
         auto normalised = normalise_hardware_query(raw);
         if (!normalised) {
             res.status = 400;

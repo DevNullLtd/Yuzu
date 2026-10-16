@@ -655,11 +655,11 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -H "Content-Type: application/json" \
   -d '{
     "name": "ci-pipeline",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 
-The `expires_at` field is a Unix epoch timestamp in seconds. Pass `0` or omit it for a non-expiring token.
+The `expires_at` field is a Unix epoch timestamp in seconds and must be in the future (the example value is 1 January 2030; use your own). Pass `0` or omit it for a non-expiring token. A negative, past or non-integer value is `400`.
 
 ```json
 {
@@ -754,7 +754,7 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -d '{
     "name": "finance-svc-token",
     "scope_service": "finance",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 
@@ -1149,13 +1149,18 @@ The `supervised` tier marks destructive operations as approval-gated, and the be
 MCP tokens are created via the same `POST /api/v1/tokens` endpoint as regular API tokens, with the addition of the `mcp_tier` field. MCP tokens **require** an expiration date, with a maximum lifetime of 90 days.
 
 ```bash
+# expires_at: unix epoch seconds, in the future and at most 90 days out (here, 30 days).
+# macOS: EXPIRES_AT=$(date -v+30d +%s)
+EXPIRES_AT=$(date -d '+30 days' +%s)
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "claude-desktop-readonly",
-    "mcp_tier": "readonly",
-    "expires_at": 1750185000
-  }'
+  -d @- <<EOF
+{
+  "name": "claude-desktop-readonly",
+  "mcp_tier": "readonly",
+  "expires_at": $EXPIRES_AT
+}
+EOF
 ```
 
 ```json
@@ -1180,7 +1185,7 @@ MCP tokens have the following restrictions:
 }
 ```
 
-The `mcp_tier` field accepts `"readonly"`, `"operator"`, or `"supervised"`. If `expires_at` is omitted or set to `0` for an MCP token, the server rejects the request. Maximum expiration is 90 days from creation.
+The `mcp_tier` field accepts `"readonly"`, `"operator"`, or `"supervised"`. If `expires_at` is omitted or set to `0` for an MCP token, the server rejects the request, and so does a past or negative value. Maximum expiration is 90 days from creation.
 
 MCP tokens can also be created via the Settings UI under the API Tokens section, which provides an MCP tier dropdown when creating a new token.
 
