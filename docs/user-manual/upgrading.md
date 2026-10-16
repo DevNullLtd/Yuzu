@@ -5297,8 +5297,9 @@ in the audit log**: an older gateway still forwards the `gateway_observed_peer` 
 sent, so a forged address passes through it.
 
 **Rolling back.** Restore the old image **and** the old config together, then verify as
-above. Restoring only the config is the old-image-plus-new-config pairing, which serves
-nothing and reports healthy.
+above. Restoring only the image leaves the old-image-plus-new-config pairing, which serves
+nothing and reports healthy. Restoring only the config leaves the new-image-plus-old-config
+pairing, which refuses to start.
 
 **Symptoms of a wrong pairing.**
 
