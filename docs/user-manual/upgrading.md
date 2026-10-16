@@ -61,6 +61,8 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 - A monitor that expected `301` on the plain port, or followed it to the TLS listener, now sees a probe answer. Point it at `https://<host>:8443/readyz`, or run `yuzu-server --healthcheck` in the container.
 - A Kubernetes `httpGet` probe on the plain port needs no change. The kubelet follows a redirect to the same host name (it ignores the port), so it was already reading the TLS listener's answer with the certificate unverified; it now reads the plain port's own answer, where a stopped HTTPS listener is a `503` instead of a refused connection.
 - Port 8080 now serves health data without encryption or authentication. Publish it only to the orchestrator network, bind it to loopback with `--web-address 127.0.0.1`, or set `--no-https-redirect`.
+- Responses on the plain port (the `301`s, `400`s and probe answers) now count in `yuzu_http_requests_total` with their own method and status labels, so request-rate totals and the 5xx error ratio include them; a plain-port `503` while the HTTPS listener is down counts toward the `YuzuHighErrorRate` alert.
+- That port's responses now carry the same security headers as the HTTPS port, minus HSTS. Its worker pool is fixed-size, and shutdown waits at most 15 s for its thread.
 - Images built before this change are unchanged: they redirect, and have no `--healthcheck`.
 
 ## Behaviour change: new agent, policy and fragment identifiers are restricted; page links encode identifiers

@@ -19,6 +19,7 @@
 #include "gateway_peer_test_pki.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -33,6 +34,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 
 #ifndef _WIN32
@@ -55,6 +57,7 @@
 
 using namespace yuzu::server;
 using namespace yuzu::server::healthcheck;
+using Catch::Matchers::ContainsSubstring;
 namespace fs = std::filesystem;
 
 // ── Pure cases ──────────────────────────────────────────────────────────────
@@ -170,6 +173,33 @@ TEST_CASE("healthcheck: first_pem_certificate returns only the first certificate
     CHECK(first_pem_certificate("-----BEGIN CERTIFICATE-----\nAAAA\n").empty());
 }
 
+TEST_CASE("healthcheck: first_pem_certificate refuses a certificate under another label",
+          "[server][healthcheck]") {
+    // OpenSSL's PEM reader loads `X509 CERTIFICATE` and `TRUSTED CERTIFICATE` blocks as
+    // certificates, so a file whose first certificate carries one is a real server certificate
+    // that this function must not step over: the next plain block is typically the issuing CA,
+    // and anchoring on it would trust every sibling leaf under it.
+    const std::string a = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    const std::string x509 =
+        "-----BEGIN X509 CERTIFICATE-----\nXXXX\n-----END X509 CERTIFICATE-----\n";
+    const std::string trusted =
+        "-----BEGIN TRUSTED CERTIFICATE-----\nTTTT\n-----END TRUSTED CERTIFICATE-----\n";
+    CHECK(first_pem_certificate(x509).empty());
+    CHECK(first_pem_certificate(trusted).empty());
+    CHECK(first_pem_certificate(x509 + a).empty());
+    CHECK(first_pem_certificate(trusted + a + a).empty());
+    // Marker text in a comment ahead of an alias-labelled leaf must not widen the result: the
+    // returned text would carry the leaf AND the CA behind it, and httplib loads every
+    // certificate in the text it is handed.
+    const std::string prose = "# paste after -----BEGIN CERTIFICATE----- below\n";
+    CHECK(first_pem_certificate(prose + x509 + a).empty());
+    CHECK(first_pem_certificate(prose + trusted + a).empty());
+    // A certificate request is not a certificate: skipped like a key, never a refusal.
+    CHECK(first_pem_certificate("-----BEGIN CERTIFICATE REQUEST-----\nRRRR\n"
+                                "-----END CERTIFICATE REQUEST-----\n" +
+                                a) == a);
+}
+
 TEST_CASE("healthcheck: only HTTP 200 is healthy", "[server][healthcheck]") {
     CHECK(healthcheck_exit_code({200, {}}) == 0);
     CHECK(healthcheck_exit_code({301, {}}) == 1);
@@ -179,7 +209,7 @@ TEST_CASE("healthcheck: only HTTP 200 is healthy", "[server][healthcheck]") {
           1);
 }
 
-TEST_CASE("healthcheck: the diagnostic is one line, names target and anchor - never the key path",
+TEST_CASE("healthcheck: the diagnostic is one line naming target and anchor - never the key path",
           "[server][healthcheck]") {
     Config cfg{};
     cfg.https_cert_path = "/op/server.pem";
@@ -402,6 +432,20 @@ TEST_CASE("healthcheck: run_healthcheck turns an exception from the probe into e
         run([](const HealthcheckTarget&) -> HealthcheckOutcome { throw NotStd{}; },
             "unknown exception");
     }
+    SECTION("std::system_error, as std::thread's constructor throws it") {
+        // Runtime evidence for the real spawn path (pthread_create forced to EAGAIN with an
+        // LD_PRELOAD shim against `--healthcheck --no-https`): exit 1, empty stdout, exactly one
+        // `exception: Resource temporarily unavailable` line. A unit test cannot fail the real
+        // spawn, so this pins the arm that line comes from: a system_error is a std::exception
+        // and must not fall through to the `unknown exception` arm. Mutation: delete the
+        // `catch (const std::exception&)` arm in run_healthcheck and this section reads
+        // `unknown exception`.
+        const std::system_error err{
+            std::make_error_code(std::errc::resource_unavailable_try_again)};
+        // what() is implementation-defined, so the expectation is built from the object.
+        run([err](const HealthcheckTarget&) -> HealthcheckOutcome { throw err; },
+            std::string{"exception: "} + err.what());
+    }
 }
 
 #ifndef _WIN32
@@ -520,6 +564,26 @@ HealthcheckTarget tls_target(int port, const fs::path& anchor, bool partial_chai
     return t;
 }
 
+/// The whole `--healthcheck` path (target resolution, exception translation, diagnostic) in
+/// operator mode: 127.0.0.1:`port`, `anchor` as `--https-cert`. Returns the one stderr line of a
+/// failing probe.
+std::string operator_mode_diagnostic(int port, const fs::path& anchor) {
+    Config cfg{};
+    cfg.https_port = port;
+    cfg.https_cert_path = anchor;
+    g_recorded_exit = -1;
+    std::ostringstream diag;
+    const int code = run_healthcheck(
+        cfg, "/readyz", diag, [](const HealthcheckTarget& t) { return probe_once(t); },
+        kProbeDeadline, &record_exit);
+    const std::string line = diag.str();
+    CHECK(code == 1);
+    CHECK(g_recorded_exit.load() == -1); // the probe answered, so no hard_exit
+    CHECK(std::count(line.begin(), line.end(), '\n') == 1);
+    CHECK(line.find("(trust anchor: " + anchor.string() + ")") != std::string::npos);
+    return line;
+}
+
 /// An SSLServer answering 200 on /readyz and /livez, serving `leaf`. `readyz`, when given,
 /// replaces the /readyz handler.
 std::unique_ptr<LoopbackServer> tls_server(const fs::path& dir, const gwt::TestLeaf& leaf,
@@ -624,7 +688,7 @@ TEST_CASE("healthcheck: operator mode anchors on the server certificate itself (
 
 TEST_CASE("healthcheck: operator mode with a full-chain file trusts only its first certificate",
           "[server][healthcheck][live]") {
-    // D4: the anchor file is the server certificate followed by its issuing CA, as an operator's
+    // The anchor file is the server certificate followed by its issuing CA, as an operator's
     // fullchain.pem is. Handing httplib the whole file would trust the CA too, and with the
     // partial-chain flag and hostname checking off, any sibling leaf under that CA would pass.
     // Mutation: load the file with set_ca_cert_path in operator mode and the sibling case below
@@ -674,9 +738,10 @@ TEST_CASE("healthcheck: operator mode loads exactly one certificate from a two-c
 
 TEST_CASE("healthcheck: an anchor that cannot be loaded fails as a loading error naming the anchor",
           "[server][healthcheck][live]") {
-    // Operator mode falls back to set_ca_cert_path when the file is missing or holds no
-    // certificate, so the diagnostic stays httplib's own `SSL certificate loading failed`
-    // rather than a misleading verification failure.
+    // Default-CA mode hands the file to httplib (set_ca_cert_path), whose own `SSL certificate
+    // loading failed` is the reason. Operator mode never loads a whole file, so it throws the
+    // same words itself and run_healthcheck turns that into the one diagnostic line. Either way
+    // the reason is a loading error, never a misleading verification failure.
     yuzu::test::TempDir tmp{"yuzu_test_healthcheck-"};
     fs::create_directories(tmp.path);
     const auto ca = gwt::make_ca("hc-ca");
@@ -684,15 +749,57 @@ TEST_CASE("healthcheck: an anchor that cannot be loaded fails as a loading error
     write_file(tmp.path / "garbage.pem", "this is not a certificate\n");
     auto srv = tls_server(tmp.path, leaf);
 
-    for (const bool operator_mode : {true, false}) {
-        for (const char* name : {"missing.pem", "garbage.pem"}) {
-            INFO("operator_mode: " << operator_mode << ", anchor: " << name);
-            const auto t = tls_target(srv->port, tmp.path / name, operator_mode);
-            const auto out = probe_once(t);
-            CHECK(out.status == 0);
-            CHECK(out.error.find("loading") != std::string::npos);
-            CHECK(healthcheck_diagnostic(t, out).find(name) != std::string::npos);
+    for (const char* name : {"missing.pem", "garbage.pem"}) {
+        INFO("anchor: " << name);
+
+        const auto t = tls_target(srv->port, tmp.path / name, false);
+        const auto out = probe_once(t);
+        CHECK(out.status == 0);
+        CHECK(out.error.find("loading") != std::string::npos);
+        CHECK(healthcheck_diagnostic(t, out).find(name) != std::string::npos);
+
+        const auto op = tls_target(srv->port, tmp.path / name, true);
+        CHECK_THROWS_WITH(probe_once(op), ContainsSubstring("SSL certificate loading failed"));
+        CHECK(operator_mode_diagnostic(srv->port, op.trust_anchor).find(name) !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("healthcheck: operator mode refuses a first certificate under an alias label - never "
+          "the CA behind it",
+          "[server][healthcheck][live]") {
+    // `openssl x509 -trustout` writes TRUSTED CERTIFICATE, and some tools write X509 CERTIFICATE;
+    // the server's own chain loader reads both. Here the leaf carries the alias label and the
+    // plain CA follows it. Skipping the leaf would anchor the probe on the CA, and with
+    // PARTIAL_CHAIN set and hostname checking off a SIBLING leaf under that CA would pass.
+    // Mutation: make first_pem_certificate step over the alias block (or fall back to
+    // set_ca_cert_path in operator mode) and the sibling answers 200.
+    yuzu::test::TempDir tmp{"yuzu_test_healthcheck-"};
+    fs::create_directories(tmp.path);
+    const auto ca = gwt::make_ca("hc-ca");
+    const auto sibling = gwt::make_leaf(ca, "hc-sibling", true, false);
+    const auto leaf = gwt::make_leaf(ca, "hc-server", true, false);
+    auto srv_sibling = tls_server(tmp.path, sibling);
+
+    const auto relabel = [](std::string pem, const std::string& label) {
+        for (const char* edge : {"BEGIN", "END"}) {
+            const std::string from = std::string{"-----"} + edge + " CERTIFICATE-----";
+            const std::string to = std::string{"-----"} + edge + " " + label + "-----";
+            for (auto pos = pem.find(from); pos != std::string::npos; pos = pem.find(from, pos))
+                pem.replace(pos, from.size(), to);
         }
+        return pem;
+    };
+    for (const char* label : {"X509 CERTIFICATE", "TRUSTED CERTIFICATE"}) {
+        INFO("label: " << label);
+        const auto anchor = tmp.path / "alias-anchor.pem";
+        write_file(anchor, relabel(leaf.cert_pem, label) + ca.cert_pem);
+
+        const auto t = tls_target(srv_sibling->port, anchor, true);
+        CHECK_THROWS_WITH(probe_once(t), ContainsSubstring("SSL certificate loading failed"));
+        const auto line = operator_mode_diagnostic(srv_sibling->port, anchor);
+        CHECK(line.find("exception: SSL certificate loading failed") != std::string::npos);
+        CHECK(line.find("alias-anchor.pem") != std::string::npos);
     }
 }
 

@@ -686,12 +686,39 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
            "base == max: the dynamic-growth branch stays dead");
     expect("install_plaintext_post_routing(*redirect_server_", 1,
            "the redirect listener installs the shared post-routing handler");
-    expect("HeaderBundle::make(cfg_.csp_extra_sources, /*https_enabled=*/false)", 1,
-           "the redirect listener's headers carry no HSTS");
+    expect("HeaderBundle::make(cfg_.csp_extra_sources, /*https_enabled=*/false), "
+           "count_http_request);",
+           1, "the redirect listener's headers carry no HSTS, and it is handed the shared counter");
+    // The request counter has ONE spelling (name + all three labels), and the main
+    // post-routing handler calls it: dropping the increment, a label, or either call leaves the
+    // injected-callback live test green, so the production wiring is pinned here instead.
+    expect(R"(auto count_http_request = [this](const httplib::Request& req,
+                                         const httplib::Response& res) {
+            metrics_.counter("yuzu_http_requests_total", {{"method", req.method},
+                {"status", std::to_string(res.status)},
+                {"principal_class", std::string(principal_class_resolved(req))}}).increment();
+        };)",
+           1, "the shared counter lambda carries the metric name and all three labels");
+    expect("count_http_request(req, res);", 1,
+           "the main post-routing handler counts through the shared lambda");
     expect("redirect_thread_done_ = true;", 1,
            "the redirect thread signals stop()'s bounded wait");
     expect("(redirect_thread_done_ || !redirect_thread_.joinable())", 1,
            "stop() waits for the redirect thread inside the one 15s bound");
+    // The bound and the force-exit line are what an operator sees on a wedged shutdown. The
+    // behaviour itself is proven by a real-process shutdown run (the redirect-trickle probe),
+    // which the unit suite cannot host (ServerImpl needs Postgres), so these are source-text
+    // pins: weaker evidence than a lifecycle test, but they redden on a changed bound, a lost
+    // thread name, or a force-exit that no longer follows the message.
+    expect("web_thread_done_cv_.wait_for(lk, std::chrono::seconds(15), [this] {", 1,
+           "one 15s bound covers both listener threads");
+    expect(R"("web and redirect listener threads")", 1, "the both-wedged name is reported");
+    expect(R"("web listener thread")", 1, "the web-only-wedged name is reported");
+    expect(R"("redirect listener thread")", 1, "the redirect-only-wedged name is reported");
+    expect("(#2703 Gate 7 item 2, #5906) - force-exiting.", 1,
+           "the force-exit message keeps its text");
+    expect("emit(kPrefix); emit(who); emit(kSuffix); std::_Exit(1);", 1,
+           "the message is written, whole and immediately, before the force-exit");
     expect("no plausible hang scenario", 0,
            "the false 'cannot hang' comment (and its bare join) stays gone");
     expect("listener failed to bind or exited with an error", 2,
@@ -966,7 +993,7 @@ TEST_CASE("health_routes: a plaintext sink without main_listener_serving_fn is a
     CHECK_THROWS_AS(health::register_health_routes(sink, deps), std::invalid_argument);
 }
 
-TEST_CASE("health_routes: plaintext /health never resolves a session, even with a valid cookie",
+TEST_CASE("health_routes: plaintext /health never resolves a session - even with a valid cookie",
           "[server][routes][health_routes][plaintext]") {
     Harness h;
     h.plain_wired = true;

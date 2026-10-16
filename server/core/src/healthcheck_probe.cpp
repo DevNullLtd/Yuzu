@@ -32,20 +32,26 @@ std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) 
     // decision (the server's own install CA, or the operator's --https-cert). The [live]
     // containment test counts the store after a connect.
     auto* ctx = static_cast<SSL_CTX*>(c->tls_context());
-    std::string pem;
     if (t.partial_chain) {
-        // Operator mode (D4): the anchor is the FIRST certificate of the file only (see
-        // first_pem_certificate); PARTIAL_CHAIN because it may be non-self-signed. An unreadable
-        // or certificate-less file falls back to set_ca_cert_path, so the failure is httplib's own
-        // `SSL certificate loading failed` naming the anchor. Both loaders add to the ctx's
-        // existing store, so the flag order is irrelevant.
+        // Operator mode: the anchor is the FIRST certificate of the file only (see
+        // first_pem_certificate); PARTIAL_CHAIN because it may be non-self-signed. There is no
+        // whole-file fallback: set_ca_cert_path loads every block OpenSSL's PEM reader accepts
+        // (`CERTIFICATE`, `X509 CERTIFICATE`, `TRUSTED CERTIFICATE`), so a file this function
+        // cannot read as "plain certificate first" would trust the issuing CA behind the leaf and,
+        // with hostname checking off, any sibling leaf under it. An unreadable or
+        // certificate-less file is a loading error naming the anchor instead.
+        const auto pem = first_pem_certificate(detail::read_file_contents(t.trust_anchor));
+        if (pem.empty())
+            throw std::runtime_error(
+                "SSL certificate loading failed: the anchor file has no usable "
+                "-----BEGIN CERTIFICATE----- block (the first certificate in it must be a plain "
+                "CERTIFICATE block holding the server certificate)");
         X509_STORE_set_flags(SSL_CTX_get_cert_store(ctx), X509_V_FLAG_PARTIAL_CHAIN);
-        pem = first_pem_certificate(detail::read_file_contents(t.trust_anchor));
-    }
-    if (pem.empty())
-        c->set_ca_cert_path(t.trust_anchor.string());
-    else
         c->load_ca_cert_store(pem.data(), pem.size());
+    } else {
+        // Default-CA mode: the one-CA default-ca.pem the server itself writes, loaded whole.
+        c->set_ca_cert_path(t.trust_anchor.string());
+    }
     c->enable_server_certificate_verification(true);
     c->enable_server_hostname_verification(false);
     c->set_follow_location(false);

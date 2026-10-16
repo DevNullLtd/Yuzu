@@ -51,6 +51,8 @@ yuzu_command_duration_seconds_count 1542
 yuzu_agents_connected 47
 ```
 
+`yuzu_http_requests_total` also counts the responses served on the plain-HTTP redirect port (`--web-port`, when HTTPS is on): its `301`s, `400`s and the four health-probe answers. A plain-port `503` (`https_listener_not_serving`) while the HTTPS listener is down therefore counts toward `YuzuHighErrorRate`.
+
 ## Naming conventions
 
 All Yuzu metrics follow a consistent naming scheme.

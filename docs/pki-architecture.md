@@ -498,8 +498,9 @@ boots the `deploy/docker/*.yml` composes** — were:
   `0700` volume) or first-boot cert generation fails.
 - **HTTPS healthcheck** — the compose healthchecks use a bash `/dev/tcp`
   plaintext HTTP GET against `/readyz`, which cannot complete a TLS handshake;
-  switch to a TCP-connect liveness check or add `openssl s_client` (resolved by
-  `yuzu-server --healthcheck`, #5906).
+  switch to a TCP-connect liveness check or add `openssl s_client` (a
+  TLS-verifying probe is now possible with `yuzu-server --healthcheck`, #5906;
+  the shipped composes still TCP-connect).
 - **Cert SAN ↔ dial name** — every name a client dials (e.g. the gateway dialing
   `server`, or an agent dialing `gateway`) must be in the dialled server's cert SAN.
   The default SAN is `localhost`/loopback/`gethostname()`; set the service `hostname:`

@@ -5467,7 +5467,7 @@ The shipped images contain no `curl` (the chiselled image ships a static busybox
 | Aspect | Behaviour |
 |---|---|
 | Target | `https://<web-address>:<https-port>/readyz` (a wildcard bind, `0.0.0.0` or `::`, is dialled over loopback); with `--no-https`, `http://<web-address>:<web-port>/readyz`. `--healthcheck-path /livez` selects liveness. |
-| Trust | The certificate chain is verified against **only** a trust anchor, never the system trust store. Default-certs mode: `<ca-dir>/default-ca.pem` (the install CA). Operator certificate (`--https-cert`): the first certificate in that file (the server certificate itself); certificates after it are not trusted. The host name is not checked. |
+| Trust | The certificate chain is verified against **only** a trust anchor, never the system trust store. Default-certs mode: `<ca-dir>/default-ca.pem` (the install CA). Operator certificate (`--https-cert`): the first certificate in that file (the server certificate itself); certificates after it are not trusted, and a first certificate that is not a `-----BEGIN CERTIFICATE-----` block (for example `X509 CERTIFICATE` or `TRUSTED CERTIFICATE`) is refused with an `SSL certificate loading failed` error, never the whole file. The host name is not checked. |
 | Redirects | Not followed. A `301` is a failure. |
 | Time | Each phase is bounded: TCP connect 1 s, each TLS handshake step 1 s, the request as a whole 3 s; and the whole probe, name resolution and handshake included, is cut at 4 s with the reason `timed out after 4000 ms`. A plain or post-handshake server that accepts but never answers is reported in about 2 s, a TLS peer that accepts and never starts the handshake in about 1 s, one that trickles a response in about 3 s, one that trickles its TLS handshake at 4 s. |
 | Output | Nothing on success. Exit status `0` is healthy, non-zero otherwise (`1` is a failed probe; a bad flag exits with CLI11's own code). On failure one stderr line naming the target, the HTTP status or TLS reason (for example `certificate has expired`), and the trust anchor used. It never prints a key path or a response body. `docker inspect --format '{{json .State.Health}}' <container>` shows the last lines; for a `503`, the server's `docker logs` carry the `[readyz]` line that says why. |
@@ -5484,7 +5484,7 @@ healthcheck:
   start_period: 30s
 ```
 
-Operator certificate (the same `--https-cert` the server uses; the probe trusts the first certificate in that file as its anchor):
+Operator certificate (the same `--https-cert` the server uses; the probe trusts the first certificate in that file as its anchor, which must be a `-----BEGIN CERTIFICATE-----` block, and refuses anything else rather than trusting the whole file):
 
 ```yaml
 healthcheck:

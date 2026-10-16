@@ -57,20 +57,31 @@ struct HealthcheckOutcome {
 }
 
 /// The first `BEGIN CERTIFICATE`..`END CERTIFICATE` block of a PEM bundle, markers and a
-/// closing newline included; empty when there is none (or the block is unterminated).
-/// Operator mode anchors the probe on this block only (#5906, D4): a full-chain
-/// `--https-cert` file also carries the issuing intermediate, and trusting that would let any
-/// sibling leaf under it pass, with hostname checking off.
+/// closing newline included; empty when there is none (or the block is unterminated), when
+/// a certificate block under another label (`X509 CERTIFICATE`, `TRUSTED CERTIFICATE`) comes
+/// ahead of it, or when the text between the markers holds another `BEGIN`: skipping an alias
+/// block would anchor the probe on a LATER certificate, the issuing CA behind the leaf, and
+/// marker text in a comment ahead of one would return the leaf AND that CA together. Operator
+/// mode anchors the probe on this block only (#5906): a full-chain `--https-cert` file also
+/// carries the issuing intermediate, and trusting that would let any sibling leaf under it pass,
+/// with hostname checking off.
 [[nodiscard]] inline std::string first_pem_certificate(std::string_view pem) {
     constexpr std::string_view kBegin = "-----BEGIN CERTIFICATE-----";
     constexpr std::string_view kEnd = "-----END CERTIFICATE-----";
     const auto b = pem.find(kBegin);
     if (b == std::string_view::npos)
         return {};
+    if (pem.substr(0, b).find("CERTIFICATE-----") != std::string_view::npos)
+        return {};
     const auto e = pem.find(kEnd, b + kBegin.size());
     if (e == std::string_view::npos)
         return {};
-    return std::string{pem.substr(b, e + kEnd.size() - b)} + '\n';
+    const auto block = pem.substr(b, e + kEnd.size() - b);
+    // One block only: httplib loads every certificate in the text it is handed (stepping over a
+    // TRUSTED one), so marker text in a comment or PEM header must not widen what is returned.
+    if (block.find("-----BEGIN ", kBegin.size()) != std::string_view::npos)
+        return {};
+    return std::string{block} + '\n';
 }
 
 /// `default_cert_dir` and `tls_supported` are injected so a test never touches

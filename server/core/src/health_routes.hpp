@@ -2,10 +2,11 @@
 
 /// @file health_routes.hpp
 /// Extracted from server.cpp's inline registrations onto the HttpRouteSink
-/// seam (#2542 PR-10) — the 6-route Health/Infra cluster: the Prometheus
+/// seam (#2542 PR-10) — the 7-route Health/Infra cluster: the Prometheus
 /// metrics endpoint, the `/health` + `/api/health` JSON probe, the
-/// Kubernetes-style `/livez` + `/readyz` probes, and the HTMX dashboard's
-/// health-summary strip fragment. Every handler body is copied verbatim
+/// Kubernetes-style `/livez` + `/readyz` probes, the HTMX dashboard's
+/// health-summary strip fragment, and the Dashboard health panel fragment.
+/// Every handler body is copied verbatim
 /// from server.cpp; the changes are the receiver (`web_server_->` ->
 /// `sink.`), member/store accesses (`xyz_store_.` -> `deps.xyz_store->`),
 /// the gate closures (`require_auth`/`auth_routes_->resolve_session`/
@@ -119,6 +120,10 @@
 ///   GET /livez                      (no gate, no deps — trivial process-alive probe)
 ///   GET /readyz                     (no gate — draining_, runtime pg_reachable, boot-latched store checks)
 ///   GET /fragments/health/summary   (deny_service_scoped_fn THEN auth_fn)
+///   GET /fragments/dashboard/health (deny_service_scoped_fn THEN auth_fn; every
+///                                     outcome is a 200 panel note — the Dashboard
+///                                     health panel, which calls the registered
+///                                     `health_handler` in-process)
 
 #include "authz_gates.hpp" // authz::FleetReadGate (Dashboard health panel)
 #include "security_headers.hpp"

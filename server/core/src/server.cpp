@@ -10359,19 +10359,28 @@ public:
                 // watcher / a Windows console-handler thread), never inside a real OS
                 // signal handler, so spdlog would be legal here. The raw write() stays
                 // anyway: std::_Exit() below skips atexit handling and any buffered
-                // spdlog sink flush, so a log call here could be silently lost — this
-                // write() is guaranteed to reach stderr before the process ends.
-                std::string msg = "ServerImpl::stop: ";
-                msg += web_wedged ? (redirect_wedged ? "web and redirect listener threads"
-                                                     : "web listener thread")
-                                  : "redirect listener thread";
-                msg += " did not finish within the 15s shutdown grace bound (#2703 Gate 7 "
-                       "item 2, #5906) - force-exiting.\n";
+                // spdlog sink flush, so a log call here could be silently lost — these
+                // write()s are guaranteed to reach stderr before the process ends. Three
+                // raw writes of static pieces, no heap: stop() is noexcept, so an
+                // allocation failure here would terminate before the _Exit.
+                const char* const who = web_wedged ? (redirect_wedged
+                                                          ? "web and redirect listener threads"
+                                                          : "web listener thread")
+                                                   : "redirect listener thread";
+                static constexpr char kPrefix[] = "ServerImpl::stop: ";
+                static constexpr char kSuffix[] =
+                    " did not finish within the 15s shutdown grace bound"
+                    " (#2703 Gate 7 item 2, #5906) - force-exiting.\n";
+                const auto emit = [](const char* s) {
 #ifdef _WIN32
-                _write(2, msg.data(), static_cast<unsigned>(msg.size()));
+                    _write(2, s, static_cast<unsigned>(std::strlen(s)));
 #else
-                (void)::write(STDERR_FILENO, msg.data(), msg.size());
+                    (void)::write(STDERR_FILENO, s, std::strlen(s));
 #endif
+                };
+                emit(kPrefix);
+                emit(who);
+                emit(kSuffix);
                 std::_Exit(1);
             }
         }
@@ -15356,8 +15365,28 @@ private:
                      security_headers.csp.size(), security_headers.https_enabled ? "on" : "off",
                      security_headers.referrer_policy, security_headers.permissions_policy.size());
         spdlog::debug("Resolved Content-Security-Policy: {}", security_headers.csp);
-        web_server_->set_post_routing_handler([this, security_headers](const httplib::Request& req,
-                                                                       httplib::Response& res) {
+        // The ONE spelling of the request counter and its label set (an observability contract):
+        // the main post-routing handler below calls it, and the plain-HTTP redirect listener is
+        // handed the same callable, so a label change reaches both listeners' series (#5906).
+        //
+        // principal_class: bounded actor class (ADR-1005, execution-plan
+        // PR 1.2) — human / agent / none / engine. "engine" is live as of
+        // PR 4.5: principal_class_resolved reads the stash set by the
+        // pre-routing chokepoint from the RESOLVED session, falling back
+        // to presentation-based principal_class_of otherwise. See
+        // principal_class.hpp for the full hybrid-basis contract.
+        auto count_http_request = [this](const httplib::Request& req,
+                                         const httplib::Response& res) {
+            metrics_
+                .counter("yuzu_http_requests_total",
+                         {{"method", req.method},
+                          {"status", std::to_string(res.status)},
+                          {"principal_class", std::string(principal_class_resolved(req))}})
+                .increment();
+        };
+        web_server_->set_post_routing_handler([this, security_headers, count_http_request](
+                                                  const httplib::Request& req,
+                                                  httplib::Response& res) {
             // principal_class metric (PR 4.5) — clear the engine-class stash on EVERY
             // exit from this handler, via a guard whose destructor runs AFTER the
             // metric emission below (never clears before the read — cf. the reset
@@ -15413,18 +15442,7 @@ private:
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 
-            // principal_class: bounded actor class (ADR-1005, execution-plan
-            // PR 1.2) — human / agent / none / engine. "engine" is live as of
-            // PR 4.5: principal_class_resolved reads the stash set by the
-            // pre-routing chokepoint from the RESOLVED session, falling back
-            // to presentation-based principal_class_of otherwise. See
-            // principal_class.hpp for the full hybrid-basis contract.
-            metrics_
-                .counter("yuzu_http_requests_total",
-                         {{"method", req.method},
-                          {"status", std::to_string(res.status)},
-                          {"principal_class", std::string(principal_class_resolved(req))}})
-                .increment();
+            count_http_request(req, res);
         });
 
         // -- Extracted route modules ------------------------------------------------
@@ -15445,21 +15463,13 @@ private:
             };
             yuzu::server::health::install_plaintext_redirect_pre_routing(
                 *redirect_server_, cfg_.web_address, cfg_.https_port);
-            // Five security headers (no HSTS) + request counter, per
+            // Five security headers (no HSTS) + the shared request counter, per
             // install_plaintext_post_routing's contract; principal_class_resolved reduces to the
             // presentation class on these workers (no engine-class stash is written here).
             yuzu::server::health::install_plaintext_post_routing(
                 *redirect_server_,
                 security::HeaderBundle::make(cfg_.csp_extra_sources, /*https_enabled=*/false),
-                [this](const httplib::Request& req, const httplib::Response& res) {
-                    metrics_
-                        .counter("yuzu_http_requests_total",
-                                 {{"method", req.method},
-                                  {"status", std::to_string(res.status)},
-                                  {"principal_class",
-                                   std::string(principal_class_resolved(req))}})
-                        .increment();
-                });
+                count_http_request);
         }
 #endif
         if (redirect_server_)

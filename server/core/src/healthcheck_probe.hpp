@@ -38,7 +38,9 @@ inline constexpr int kRequestMs = 3000; ///< whole-request ceiling (probe_once d
 /// check off, redirects not followed. Operator mode (`partial_chain`) anchors on the first
 /// certificate of the anchor file only (first_pem_certificate). Returns nullptr when the
 /// target has no trust anchor: an empty CA path would make httplib fall back to the OS store.
-/// Throws std::runtime_error when OpenSSL cannot create a client context.
+/// Throws std::runtime_error when OpenSSL cannot create a client context, and in operator mode
+/// when the anchor file is missing, unreadable, or yields no usable first certificate (the file
+/// is never loaded whole). `SSL certificate loading failed` leads that message.
 [[nodiscard]] std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& target);
 #endif
 
