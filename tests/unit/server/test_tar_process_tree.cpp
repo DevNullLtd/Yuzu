@@ -357,8 +357,11 @@ TEST_CASE("tar parse_ts_param_strict: refuses a calendar-impossible date", "[tar
     CHECK_FALSE(parse_ts_param_strict("2026-00-31T00:00"));
     CHECK_FALSE(parse_ts_param_strict("2026-13-31T00:00"));
     // has_value() cannot see a roll-over, so pin the leap day to the day before March 1st.
-    CHECK(*parse_ts_param_strict("2028-02-29T00:00") + 86400 ==
-          *parse_ts_param_strict("2028-03-01T00:00"));
+    const auto leap_day = parse_ts_param_strict("2028-02-29T00:00");
+    const auto march_first = parse_ts_param_strict("2028-03-01T00:00");
+    REQUIRE(leap_day);
+    REQUIRE(march_first);
+    CHECK(*leap_day + 86400 == *march_first);
 }
 
 TEST_CASE("tar parse_ts_param_strict: every month accepts its last day and refuses the next",
