@@ -44,9 +44,10 @@ Take the **first** home that fits.
 
 ### 1. A hookify rule — if it is mechanically checkable at the moment of violation
 
-`.claude/hookify.*.local.md`. Eight already exist: `vcvars64`, Windows Clang,
+`.claude/hookify.*.local.md`. Nine already exist: `vcvars64`, Windows Clang,
 dropping `include_type: 'system'`, `rebar3 eunit --dir`, `sqlite3_changes()`, the CI
-`save-always` guard, and both temp-path salt rules.
+`save-always` guard, both temp-path salt rules, and Python `subprocess` `text=True`
+without `encoding=` (the Windows cp1252 decode).
 
 This is the **best** home for a "never do X" gotcha, because it fires when someone is about to do X
 rather than hoping they read a file first. A rule with a hook needs at most one line elsewhere,
