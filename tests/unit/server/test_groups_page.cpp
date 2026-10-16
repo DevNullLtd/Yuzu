@@ -142,7 +142,7 @@ TEST_CASE("groups page: no inline handlers or style; same-origin scripts only; o
 
 // Management groups stay in Settings for now. The panel is a placeholder, but its id is a hook
 // (nothing may reuse it for another panel) and its link is the operator's way to the real thing.
-TEST_CASE("groups page: the management groups placeholder keeps its id, heading and Settings link",
+TEST_CASE("groups page: the management groups placeholder keeps its id; heading and Settings link",
           "[groups][page]") {
     for (const std::string& page : {std::string(kGroupsTemplate), std::string(kGroupsHtml)}) {
         const auto at = page.find("id=\"grp-list\"");
