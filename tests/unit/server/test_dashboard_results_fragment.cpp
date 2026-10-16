@@ -635,6 +635,11 @@ TEST_CASE("/fragments/results: a filter value over kMaxFacetValueBytes shows a s
         CHECK_FALSE(contains(res->body, kTooLongMarker));
     }
 
+    SECTION("the pct_encode helper encodes bytes, not characters") {
+        CHECK(pct_encode("\xC3\xA9 a~") == "%C3%A9%20a~");
+        CHECK(pct_encode(std::string(1, '\0')) == "%00");
+    }
+
     SECTION("the bound is bytes, not characters") {
         // U+00E9 is two bytes in UTF-8. 1025 of them are 2050 bytes (over); 1024 are exactly
         // 2048 bytes (not over), though both are far under 2048 CHARACTERS.
@@ -678,9 +683,18 @@ TEST_CASE("/fragments/results: a filter value over kMaxFacetValueBytes shows a s
         auto short_body = h.sink.dispatch("GET", path, "f_output=short+output", "text/plain");
         REQUIRE(short_body);
         CHECK_FALSE(contains(short_body->body, kTooLongMarker));
-        // Negative control: the body filter WAS parsed and applied (the matching row is shown),
-        // so the absent hint above cannot be a body that was never read.
-        CHECK(contains(short_body->body, "class=\"result-row\""));
+        // Negative control: the Create Group button is rendered only when a filter was parsed
+        // and matched, so it shows the body filter WAS read and applied; the absent hint above
+        // cannot be a body that was never read. (A bare result-row would not prove it: the
+        // unfiltered page lists the same single row.)
+        CHECK(contains(short_body->body, "Create Group from 1 Agent"));
+
+        // A short body filter that matches nothing must be applied too: zero-match table, no hint.
+        auto nomatch = h.sink.dispatch("GET", path, "f_output=nomatch", "text/plain");
+        REQUIRE(nomatch);
+        CHECK_FALSE(contains(nomatch->body, kTooLongMarker));
+        CHECK(contains(nomatch->body, "No results match your filters."));
+        CHECK_FALSE(contains(nomatch->body, "class=\"result-row\""));
     }
 }
 
