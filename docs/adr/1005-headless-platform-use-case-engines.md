@@ -628,8 +628,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      growth is machine-caught, while growth paired with a raise of the pin, a
      swap or a rebind to a row with the same slug is review-only. They are a
      disclosed residual not covered by #5955. The eight `twinned-rest-only`
-     rows are open gaps counted only by the ratchet; only the hardware rows
-     (#4456) and the management-groups rows are mentioned in this ADR.
+     rows are open gaps counted by the ratchet and tracked by #5963 (the two
+     hardware rows also by #4456).
 
 ## Interim rules (until the named follow-ups ship)
 

@@ -36,7 +36,7 @@ churns the ledger. Each row records:
   `twinned-rest-only` / `twinned-mcp-only` (exactly one machine twin exists;
   counts as untwinned, because ADR-1005 expects both; for a NEW one-sided
   row, name the tracker for the missing side in an issue or an ADR-1005
-  entry - the eight existing ones are untracked by the maintainer's call), `planned:#N` (tracked, not yet built -
+  entry - the eight existing ones are tracked by #5963), `planned:#N` (tracked, not yet built -
   `#2146` is the generic placeholder used when no more specific tracking
   issue exists yet, and its row count may only shrink),
   `composed-of:<capability-ids>` (this row's capability is covered by the
