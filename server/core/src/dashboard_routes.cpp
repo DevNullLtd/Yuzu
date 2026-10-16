@@ -2707,7 +2707,7 @@ std::string DashboardRoutes::render_results(
         html += " <span class=\"result-degrade-banner\" data-filter-too-long=\"true\">"
                 "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
                 " bytes. Newly stored responses do not index values that long, so this "
-                "filter may match nothing. Try the Search box.</span>";
+                "filter may match nothing. Clear the filter and use the Search box.</span>";
     }
     html += "</div>";
 
