@@ -22,7 +22,7 @@
 -export([check_legacy_grpcbox_servers/0, check_legacy_grpcbox_client/0,
          legacy_grpcbox_in_files/2, check_grpc_listeners/0,
          check_upstream_client_config/0,
-         check_mgmt_listener_posture/0]).                                 %% for testing
+         check_mgmt_listener_posture/0, check_memory_shedding/0]).         %% for testing
 -export([evaluate_cluster_id/2, evaluate_cluster_id/3]).                  %% for testing
 -export([apply_env_overrides/1]).                                          %% for testing
 
@@ -85,7 +85,8 @@ do_start_guarded() ->
                 fun check_upstream_channel_mix/0,
                 fun check_upstream_tls_posture/0,
                 fun check_upstream_tls_files/0,
-                fun check_mgmt_listener_posture/0],
+                fun check_mgmt_listener_posture/0,
+                fun check_memory_shedding/0],
                fun do_start_services/0).
 
 run_guards([], Next) ->
@@ -122,10 +123,15 @@ do_start_services() ->
     %% Start the supervision tree. The crash-report filter goes in first so
     %% the upstream's first crash is already redacted (it holds registration
     %% credentials in its mailbox); a tree that does not start removes it again.
+    %% The connection-kill counter filter goes in beside it (it counts the VM's
+    %% max_heap_size report for a connection the memory bound killed).
     ok = yuzu_gw_crash_redact:install(),
+    ok = yuzu_gw_conn_watch:install(),
     case yuzu_gw_sup:start_link() of
         {ok, _} = Started -> Started;
-        Other             -> ok = yuzu_gw_crash_redact:remove(), Other
+        Other             -> ok = yuzu_gw_conn_watch:remove(),
+                             ok = yuzu_gw_crash_redact:remove(),
+                             Other
     end.
 
 %%--------------------------------------------------------------------
@@ -255,6 +261,7 @@ stop(_State) ->
     %% The filter outlives the supervision tree (already down by now), so the
     %% upstream's shutdown reports are redacted too.
     ok = yuzu_gw_crash_redact:remove(),
+    ok = yuzu_gw_conn_watch:remove(),
     logger:info("Gateway shutdown complete"),
     ok.
 
@@ -1039,6 +1046,25 @@ check_agent_listener(Listeners) ->
                         "docs/user-manual/gateway.md). A gateway that is meant to serve none "
                         "(a test) sets {yuzu_gw, allow_no_listeners} to true."),
                     {error, no_agent_listener}
+            end
+    end.
+
+%% @doc Fail-closed guard: refuse to boot on a malformed {yuzu_gw, memory_shedding}
+%% config. Only the SHAPE is checked here (keys and value types); whether the
+%% watermarks can be resolved from system memory is environmental and decided by
+%% yuzu_gw_memory_shedder at init (an unresolvable mark runs the backstop
+%% inactive, it does not fail boot). An unset key is valid (the defaults apply).
+-spec check_memory_shedding() -> ok | {error, bad_memory_shedding}.
+check_memory_shedding() ->
+    case application:get_env(yuzu_gw, memory_shedding, #{}) of
+        Cfg ->
+            case yuzu_gw_memory_shedder:validate_config(Cfg) of
+                ok -> ok;
+                {error, Reason} ->
+                    logger:critical(
+                        "Refusing to start: invalid {yuzu_gw, memory_shedding} config: ~p. "
+                        "See docs/user-manual/gateway.md for the shape.", [Reason]),
+                    {error, bad_memory_shedding}
             end
     end.
 

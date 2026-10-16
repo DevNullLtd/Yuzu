@@ -3975,3 +3975,62 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
         eval_time: 29m
         exp_samples: []
+
+  # YuzuGatewayMemorySheddingActive — the gauge is 1 while the gateway has
+  # suspended its agent listener(s) under memory pressure; the rule needs it true
+  # for 3m so a transient blip of shedding (which is normal and self-healing)
+  # does not page. The gauge is pre-seeded at 0, so a gateway that has never shed
+  # reports 0, not an absent series.
+
+  # CASE: the seeded-0 gauge of a gateway that has never shed stays quiet.
+  - interval: 1m
+    name: gateway memory shedding - a flat zero gauge never fires
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_active{job="yuzu-gateway",instance="g1"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE: a brief blip (shed for two samples, then back to 0) never FIRES (kills a
+  # `for` shorter than 3m, and a bare `== 1` with no `for`). It may be pending
+  # during the blip, but it must never reach firing and must clear afterwards.
+  # `1x1` is samples at minutes 6 and 7; the gauge is 0 again from minute 8.
+  - interval: 1m
+    name: gateway memory shedding - a sub-3m blip never fires
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_active{job="yuzu-gateway",instance="g1"}'
+        values: "0x5 1x1 0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # CASE: sustained shedding is pending at 2m and firing at 4m (kills a `for`
+  # longer than 3m), and resolves after the gauge returns to 0.
+  - interval: 1m
+    name: gateway memory shedding - sustained shedding fires after 3m and resolves
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_active{job="yuzu-gateway",instance="g1"}'
+        values: "0x5 1x10 0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="pending"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="pending", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive"}'
+        eval_time: 20m
+        exp_samples: []

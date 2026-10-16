@@ -64,6 +64,17 @@
     [yuzu, gw, grpc, origin_ignored],
     [yuzu, gw, grpc, dropped_data],
 
+    %% Edge memory bounds. recv_timeout: a one-request stream aborted because it
+    %% buffered its request past limits.request_timeout_ms (yuzu_grpc_stream_h).
+    %% The connection-killed counter (max_heap_size) is incremented directly by
+    %% yuzu_gw_conn_watch; it is only declared/seeded below, not an event here.
+    [yuzu, gw, grpc, recv_timeout],
+
+    %% Node-wide memory load shedding (yuzu_gw_memory_shedder): the current shed
+    %% state (gauge 0/1) and each shed transition (counter).
+    [yuzu, gw, memory_shedding, state],
+    [yuzu, gw, memory_shedding, suspended],
+
     %% A queued upstream proxy call skipped because its requesting gRPC call
     %% had already ended (yuzu_gw_upstream).
     [yuzu, gw, upstream, call_dropped],
@@ -313,6 +324,18 @@ handle_event([yuzu, gw, grpc, origin_ignored], #{count := N}, Meta, _Config) ->
 handle_event([yuzu, gw, grpc, dropped_data], #{bytes := Bytes}, Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_grpc_dropped_data_bytes_total,
                            [atom_to_binary(maps:get(reason, Meta, unknown), utf8)], Bytes);
+
+%% A one-request stream aborted because it buffered its request too long. The
+%% method is in the event meta for tracing but is not a label (the edge is
+%% unauthenticated; the counter must not take attacker-shaped cardinality).
+handle_event([yuzu, gw, grpc, recv_timeout], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_grpc_recv_timeout_total, [], N);
+
+handle_event([yuzu, gw, memory_shedding, state], #{active := V}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_memory_shedding_active, [], V);
+
+handle_event([yuzu, gw, memory_shedding, suspended], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_memory_shedding_suspensions_total, [], N);
 
 handle_event([yuzu, gw, upstream, call_dropped], #{count := N}, Meta, _Config) ->
     %% yuzu_gw_upstream names the call as a binary; an atom is tolerated and any
@@ -712,6 +735,39 @@ declare_metrics() ->
     [prometheus_counter:inc(yuzu_gw_grpc_dropped_data_bytes_total,
                             [atom_to_binary(R, utf8)], 0)
      || R <- dropped_data_reasons()],
+    prometheus_counter:declare([
+        {name, yuzu_gw_grpc_recv_timeout_total},
+        {labels, []},
+        {help, "Unary or server-streaming streams aborted DEADLINE_EXCEEDED "
+               "because the peer buffered the request past "
+               "limits.request_timeout_ms without completing it. A sustained "
+               "non-zero rate on the agent edge is a peer opening streams and "
+               "stalling them half-sent"}]),
+    prometheus_counter:inc(yuzu_gw_grpc_recv_timeout_total, [], 0),
+    prometheus_counter:declare([
+        {name, yuzu_gw_grpc_connection_killed_total},
+        {labels, [reason]},
+        {help, "Connections the VM killed for passing their per-connection "
+               "memory ceiling (limits.max_connection_memory_bytes, a "
+               "max_heap_size on the Cowboy connection process counting shared "
+               "binaries). reason=max_heap_size. A sustained non-zero rate on "
+               "the agent edge is a peer flooding half-finished requests"}]),
+    prometheus_counter:inc(yuzu_gw_grpc_connection_killed_total, [<<"max_heap_size">>], 0),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_memory_shedding_active},
+        {labels, []},
+        {help, "1 while the gateway is shedding load (the agent listener(s) are "
+               "suspended in Ranch because erlang:memory(total) passed the "
+               "high-water mark); 0 otherwise. The management listener is never "
+               "suspended"}]),
+    prometheus_gauge:set(yuzu_gw_memory_shedding_active, [], 0),
+    prometheus_counter:declare([
+        {name, yuzu_gw_memory_shedding_suspensions_total},
+        {labels, []},
+        {help, "Times the gateway began shedding load (suspended its agent "
+               "listener(s) on crossing the high-water mark). A rising count "
+               "means the node is repeatedly hitting its memory high-water mark"}]),
+    prometheus_counter:inc(yuzu_gw_memory_shedding_suspensions_total, [], 0),
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_calls_dropped_total},
         {labels, [rpc_name]},

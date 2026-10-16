@@ -45,7 +45,19 @@
 %%%                  the proxy's, so it cannot be combined with an `auth_fun'.
 %%%   http2          optional overrides of the Cowboy HTTP/2 options (see
 %%%                  http2_opts/1 for the defaults they override)
-%%%   limits         optional #{max_message_bytes, send_timeout_ms, max_connections}
+%%%   limits         optional #{max_message_bytes, send_timeout_ms, max_connections,
+%%%                  max_connection_memory_bytes, request_timeout_ms}
+%%%                  max_connection_memory_bytes caps a single connection's memory
+%%%                  (a max_heap_size on the Cowboy connection process counting the
+%%%                  refc buffers its streams hold); a connection that buffers more
+%%%                  half-finished requests than this is killed. Default: four times
+%%%                  max_message_bytes (`infinity' disables it). request_timeout_ms
+%%%                  is how long a unary/server-streaming stream may buffer its one
+%%%                  request before it is aborted DEADLINE_EXCEEDED (default 30000,
+%%%                  `infinity' disables it); it never cuts a bidirectional or
+%%%                  client-streaming handler, which runs before any message. The
+%%%                  two together bound an unauthenticated peer that opens streams
+%%%                  and stalls them half-sent (yuzu_grpc_stream_h).
 %%%                  max_connections is the most connections the listener holds
 %%%                  at once (default infinity). At the ceiling the listener stops
 %%%                  accepting until one closes; connections that are already
@@ -97,6 +109,7 @@
 -behaviour(gen_server).
 
 -include_lib("public_key/include/public_key.hrl").
+-include("yuzu_grpc.hrl").
 
 -export([start_link/1, start/1, stop/1, child_spec/1]).
 -export([port/1, validate/1, ssl_opts/1, http2_opts/1]).
@@ -127,7 +140,8 @@
                      http2, limits, acceptors]).
 -define(TLS_KEYS, [certfile, keyfile, cacertfile, verify, fail_if_no_peer_cert, ciphers]).
 -define(LISTEN_KEYS, [port, ip, socket_opts]).
--define(LIMIT_KEYS, [max_message_bytes, send_timeout_ms, max_connections]).
+-define(LIMIT_KEYS, [max_message_bytes, send_timeout_ms, max_connections,
+                     max_connection_memory_bytes, request_timeout_ms]).
 -define(LEGACY_ENTRY_KEYS,
         [{transport_opts, "renamed `tls' (a `tls' map is TLS and its absence is plaintext)"},
          {listen_opts, "renamed `listen'"},
@@ -590,7 +604,10 @@ check_limits(_) ->
 
 valid_limit(max_message_bytes, N) -> is_integer(N) andalso N > 0;
 valid_limit(send_timeout_ms, N) -> N =:= infinity orelse (is_integer(N) andalso N > 0);
-valid_limit(max_connections, N) -> N =:= infinity orelse (is_integer(N) andalso N > 0).
+valid_limit(max_connections, N) -> N =:= infinity orelse (is_integer(N) andalso N > 0);
+valid_limit(max_connection_memory_bytes, N) ->
+    N =:= infinity orelse (is_integer(N) andalso N >= ?YUZU_GRPC_MIN_CONN_MEMORY_BYTES);
+valid_limit(request_timeout_ms, N) -> N =:= infinity orelse (is_integer(N) andalso N > 0).
 
 check_origin(Entry) ->
     case maps:get(origin, Entry, undefined) of

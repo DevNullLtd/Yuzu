@@ -30,6 +30,26 @@
 %% How long yuzu_grpc_stream:send/2 waits for the connection process to take
 %% a frame before it gives up with UNAVAILABLE.
 -define(YUZU_GRPC_SEND_TIMEOUT_MS, 30000).
+%% How long a unary or server-streaming stream may stay in `awaiting_request'
+%% (buffering its one request, no handler running yet) before it is aborted with
+%% DEADLINE_EXCEEDED and its buffer dropped. Bounds a peer that opens a stream,
+%% sends all but the last byte of a large message and then stalls, holding the
+%% buffer for as long as the connection lives (limits.request_timeout_ms;
+%% `infinity' disables it).
+-define(YUZU_GRPC_REQUEST_TIMEOUT_MS, 30000).
+%% The per-connection memory ceiling the stream handler sets on the Cowboy
+%% connection process (process_flag(max_heap_size), counting shared binaries, so
+%% the refc buffers of its streams' in-flight requests are included). Default
+%% when limits.max_connection_memory_bytes is unset: four times the max message
+%% size, so a connection may carry a few concurrent full-size messages (a 3 MiB
+%% inventory blob and the copies a binary append makes) but not the dozens a
+%% flood of half-finished streams would (`infinity' disables it).
+-define(YUZU_GRPC_MAX_CONN_MEMORY_FACTOR, 4).
+%% The derived default never goes below this: with a small max_message_bytes,
+%% four times it could fall under a connection process's own baseline memory and
+%% kill every connection at once. An EXPLICIT max_connection_memory_bytes must
+%% also be at least this (or `infinity'); the listener refuses a smaller one.
+-define(YUZU_GRPC_MIN_CONN_MEMORY_BYTES, 1048576).
 
 %% The handle a service handler receives as its `Stream' argument. Opaque to
 %% handlers: use the yuzu_grpc_stream and yuzu_grpc accessors, never the fields.

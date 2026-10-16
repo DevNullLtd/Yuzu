@@ -216,6 +216,39 @@ groups:
             gateway log line "Upstream RPC ... raised" names the RPC and the
             error class, never the request.
 
+      # Node-wide memory load shedding (yuzu_gw_memory_shedder). The gauge is 1
+      # while the gateway has suspended its agent listener(s) because
+      # erlang:memory(total) crossed the high-water mark; /readyz reports
+      # not-ready meanwhile, so a load balancer is already draining this node.
+      # Shedding is a backstop, not a steady state: a few seconds of it under a
+      # transient burst is fine and does not warn (the `for` holds the alert
+      # off), but minutes of it mean the node is undersized for its fleet or
+      # under a sustained flood. The gauge is pre-seeded at 0
+      # (yuzu_gw_telemetry:declare_metrics/0), so a gateway that has never shed
+      # reports 0, not an absent series. Correlate with
+      # yuzu_gw_grpc_connection_killed_total and yuzu_gw_grpc_recv_timeout_total
+      # (a flood of half-finished requests) versus yuzu_gw_agents_current
+      # (genuine fleet growth) to tell the two apart.
+      - alert: YuzuGatewayMemorySheddingActive
+        expr: |
+          yuzu_gw_memory_shedding_active == 1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway is shedding load (agent listener suspended) on {{ $labels.instance }}"
+          description: >-
+            The gateway has suspended its agent listener(s) for more than 3
+            minutes because node memory crossed the high-water mark; new agent
+            connections are refused and /readyz reports not-ready, so a load
+            balancer is draining this node. Established connections keep working
+            and the management plane is never suspended. Sustained shedding means
+            the node is undersized for its fleet, or under a flood: check
+            yuzu_gw_grpc_connection_killed_total and
+            yuzu_gw_grpc_recv_timeout_total (a half-finished-request flood) and
+            yuzu_gw_agents_current (fleet growth). Add gateway capacity or, for a
+            flood, rate-limit per source at the L4 balancer or firewall.
+
       # HA WS-4 4.2b — `#4246` item #1's alert-rule half. Emitted by the
       # SERVER (gateway_service_impl.cpp's record_route_store_failure), not
       # the Erlang gateway, despite living in this group — it is the same

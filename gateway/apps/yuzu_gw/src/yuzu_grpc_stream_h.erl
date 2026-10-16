@@ -29,6 +29,25 @@
 %%% callback may raise: each is wrapped, and a failure ends the stream with
 %%% INTERNAL after one log line naming only the exception class. Nothing in
 %%% this module logs a request, a ctx, a header, a certificate or an exit term.
+%%%
+%%% Two bounds on an unauthenticated peer's memory use live here (a third, the
+%%% node-wide one, is yuzu_gw_memory_shedder):
+%%%
+%%%   - the connection process is given a max_heap_size ceiling on the first
+%%%     stream it serves (init runs here, in that process). The ceiling counts
+%%%     shared binaries, so the refc buffers every stream's in-flight request
+%%%     holds in #st.buf count against it, and a connection that buffers more
+%%%     than limits.max_connection_memory_bytes of half-finished requests is
+%%%     killed by the VM (yuzu_gw_conn_watch counts the kill). Without it a peer
+%%%     could open max_concurrent_streams streams and hold a full message short
+%%%     of its last byte on each, for the life of the connection;
+%%%   - a unary or server-streaming stream that stays in `awaiting_request'
+%%%     (buffering its one request, no handler yet) past limits.request_timeout_ms
+%%%     is aborted with DEADLINE_EXCEEDED and its buffer dropped. It is armed
+%%%     only for the one-request kinds, and only while they await that request:
+%%%     a bidirectional or client-streaming handler (an agent's Subscribe) is
+%%%     spawned before any message and is never cut by it. A grpc-timeout the
+%%%     client sent runs alongside; whichever fires first ends the stream.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_stream_h).
@@ -51,6 +70,9 @@
     ref :: reference() | undefined,
     headers_sent = false :: boolean(),
     timer :: reference() | undefined,
+    %% The request-receive deadline of a one-request stream still awaiting its
+    %% request; cancelled the moment the request is complete (the handler spawns).
+    recv_timer :: reference() | undefined,
     alarms = [] :: [atom()],
     waiting = [] :: [{pid(), reference()}]
 }).
@@ -90,8 +112,9 @@ info(_StreamId, Msg, St) ->
 %% deadline, a closed connection): it does not trap exits, so it ends at once
 %% wherever it is blocked and runs no cleanup of its own (see yuzu_grpc_runner).
 -spec terminate(cowboy_stream:streamid(), cowboy_stream:reason(), #st{}) -> ok.
-terminate(_StreamId, _Reason, #st{handler = Handler, timer = Timer}) ->
+terminate(_StreamId, _Reason, #st{handler = Handler, timer = Timer, recv_timer = RecvTimer}) ->
     cancel_timer(Timer),
+    cancel_timer(RecvTimer),
     _ = case Handler of
         undefined -> ok;
         Pid -> exit(Pid, shutdown)
@@ -110,12 +133,53 @@ early_error(_StreamId, _Reason, _PartialReq, Resp, _Opts) ->
 
 start(StreamId, Req, Env) ->
     Limits = maps:get(limits, Env, #{}),
-    St0 = #st{max_message = maps:get(max_message_bytes, Limits, ?YUZU_GRPC_MAX_MESSAGE_BYTES)},
+    MaxMessage = maps:get(max_message_bytes, Limits, ?YUZU_GRPC_MAX_MESSAGE_BYTES),
+    %% Cap this connection's memory the first time it serves a stream (init runs
+    %% in the connection process). It is per connection, not per stream, so do
+    %% it once; a later stream on the same connection finds it already set.
+    cap_connection_memory(MaxMessage, Limits),
+    St0 = #st{max_message = MaxMessage},
     case authenticate(maps:get(auth_fun, Env, undefined), maps:get(cert, Req, undefined)) of
         false ->
             reject(St0, ?GRPC_STATUS_UNAUTHENTICATED, <<"unauthenticated">>);
         true ->
             admitted(StreamId, Req, Env, St0)
+    end.
+
+%% The max_heap_size ceiling on the connection process. `include_shared_binaries'
+%% makes it count the refc binaries the streams' in-flight requests hold (the
+%% request buffer is one), which is where a flood of half-finished streams keeps
+%% its bytes: the connection process's own heap stays tiny. `kill' ends the
+%% connection (every stream on it) when the ceiling is passed; `error_logger'
+%% emits the report yuzu_gw_conn_watch counts. `infinity' disables it.
+cap_connection_memory(MaxMessage, Limits) ->
+    case get('$yuzu_grpc_conn_capped') of
+        true -> ok;
+        _ ->
+            put('$yuzu_grpc_conn_capped', true),
+            case max_connection_memory_bytes(MaxMessage, Limits) of
+                infinity -> ok;
+                Bytes ->
+                    Words = Bytes div erlang:system_info(wordsize),
+                    _ = process_flag(max_heap_size,
+                                     #{size => Words, kill => true,
+                                       error_logger => true,
+                                       include_shared_binaries => true}),
+                    ok
+            end
+    end.
+
+max_connection_memory_bytes(MaxMessage, Limits) ->
+    case maps:get(max_connection_memory_bytes, Limits, undefined) of
+        undefined ->
+            %% Floor the derived default: four times a small max_message_bytes
+            %% could be below a connection's baseline memory and kill it at once.
+            max(?YUZU_GRPC_MIN_CONN_MEMORY_BYTES,
+                ?YUZU_GRPC_MAX_CONN_MEMORY_FACTOR * MaxMessage);
+        Explicit ->
+            %% An explicit value is used as given (the listener's validation has
+            %% already refused anything below the floor, bar `infinity').
+            Explicit
     end.
 
 %% The authentication is the first thing that happens to a stream, ahead of
@@ -195,7 +259,12 @@ call(StreamId, Req, Headers, Route, Timeout, Env, St0) ->
             {[{spawn, Pid, ?SHUTDOWN_MS}],
              St1#st{phase = running, handler = Pid, ref = Ref}};
         {_, true} ->
-            {[], St1#st{phase = awaiting_request}};
+            %% A one-request stream awaiting its request: arm the receive
+            %% deadline so a peer cannot hold the buffer open forever.
+            RecvTimer = arm_recv_deadline(StreamId,
+                                          maps:get(request_timeout_ms, Limits,
+                                                   ?YUZU_GRPC_REQUEST_TIMEOUT_MS)),
+            {[], St1#st{phase = awaiting_request, recv_timer = RecvTimer}};
         {_, false} ->
             reject(St1, ?GRPC_STATUS_INTERNAL, <<"missing request message">>)
     end.
@@ -222,6 +291,14 @@ arm_deadline(StreamId, {ok, Ms}) ->
     Conn = self(),
     erlang:send_after(Ms, Conn, {{Conn, StreamId}, grpc_deadline}).
 
+arm_recv_deadline(_StreamId, infinity) ->
+    undefined;
+arm_recv_deadline(StreamId, Ms) when is_integer(Ms), Ms > 0 ->
+    Conn = self(),
+    erlang:send_after(Ms, Conn, {{Conn, StreamId}, grpc_recv_deadline});
+arm_recv_deadline(_StreamId, _Other) ->
+    undefined.
+
 spawn_runner(#{kind := Kind, module := Module, function := Function}, Stream, Extra) ->
     proc_lib:spawn_link(yuzu_grpc_runner, run,
                         [Extra#{kind => Kind, module => Module, function => Function,
@@ -237,10 +314,14 @@ on_data(IsFin, Data, #st{phase = awaiting_request, buf = Buf0, max_message = Max
         {ok, Message, Rest} ->
             case decode_request(St, Message) of
                 {ok, Request} ->
+                    %% The request is complete: the handler runs now, so the
+                    %% receive deadline has done its job.
+                    cancel_timer(St#st.recv_timer),
                     Pid = spawn_runner(St#st.route, St#st.stream, #{request => Request}),
                     dropped(byte_size(Rest), St, extra_request_data),
                     {[{spawn, Pid, ?SHUTDOWN_MS} | credit(Size)],
-                     St#st{phase = running_single, handler = Pid, buf = <<>>}};
+                     St#st{phase = running_single, handler = Pid, buf = <<>>,
+                           recv_timer = undefined}};
                 error ->
                     abort(St, ?GRPC_STATUS_INTERNAL, <<"invalid request message">>)
             end;
@@ -337,6 +418,17 @@ on_info({grpc_end, From, Status, Message}, #st{handler = From, phase = Phase} = 
 on_info(grpc_deadline, #st{phase = Phase} = St) when Phase =/= ended ->
     finish(St#st{timer = undefined}, ?GRPC_STATUS_DEADLINE_EXCEEDED,
            <<"deadline exceeded">>, [stop]);
+%% The request-receive deadline fired while the stream was still buffering its
+%% one request: no handler ran, so drop the buffer and end the stream. In any
+%% other phase the timer was cancelled when the request completed; a message
+%% that races the cancel is ignored.
+on_info(grpc_recv_deadline, #st{phase = awaiting_request} = St) ->
+    telemetry:execute([yuzu, gw, grpc, recv_timeout], #{count => 1},
+                      #{method => path_of(St#st.route)}),
+    abort(St#st{recv_timer = undefined, buf = <<>>}, ?GRPC_STATUS_DEADLINE_EXCEEDED,
+          <<"request deadline exceeded">>);
+on_info(grpc_recv_deadline, St) ->
+    {[], St};
 on_info({'EXIT', Pid, Reason}, #st{handler = Pid} = St) ->
     exited(Reason, St);
 %% Cowboy's buffer alarms (see cowboy_http2:maybe_send_data_alarm/3).
@@ -387,14 +479,17 @@ reason_class(_) -> "other".
 %% what follows them (a `stop') is kept.
 finish(#st{phase = ended} = St, _Status, _Message, After) ->
     {After, St};
-finish(#st{headers_sent = Sent, timer = Timer} = St, Status, Message, After) ->
+finish(#st{headers_sent = Sent, timer = Timer, recv_timer = RecvTimer} = St,
+       Status, Message, After) ->
     cancel_timer(Timer),
+    cancel_timer(RecvTimer),
     Trailers = yuzu_grpc_frame:trailers(Status, Message),
     Commands = case Sent of
         true -> [{trailers, Trailers}];
         false -> [{response, 200, trailers_only(Trailers), <<>>}]
     end,
-    {Commands ++ After, nack_senders(St#st{phase = ended, timer = undefined})}.
+    {Commands ++ After,
+     nack_senders(St#st{phase = ended, timer = undefined, recv_timer = undefined})}.
 
 trailers_only(Trailers) ->
     Trailers#{<<"content-type">> => <<"application/grpc">>}.

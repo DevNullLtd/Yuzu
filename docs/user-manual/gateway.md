@@ -1027,7 +1027,7 @@ This is the production shape, from `gateway/config/sys.config.prod` (comments sh
 | `origin` | Keys: `mode`, `sources`, `trusted_hops`. How the caller's address is decided; default `#{mode => transport}`. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy). |
 | `acceptors` | Acceptor processes, a positive integer (default 4). `sys.config.prod` and the reference configs give the agent listener 32 for reconnect storms; the plaintext default, demo and UAT configs set nothing and so run 4. |
 | `http2` | Overrides of the Cowboy HTTP/2 options, by Cowboy's own option names; the options the layer owns and any unknown name are refused. Defaults: `idle_timeout` 600000 ms, `max_concurrent_streams` 1024, `max_frame_size_received` 16384, `linger_timeout` 1000, and, on a listener whose `services` map has `'yuzu.server.v1.ManagementService'` as a key (a combined agent-and-management listener included), `max_received_frame_rate` `{100000, 10000}`: 100000 received frames per 10 s. A listener that routes only the AgentService leaves `max_received_frame_rate` unset and so keeps Cowboy's own `{10000, 10000}`, the flood guard for the agents' unauthenticated connections. The management value is ten times Cowboy's because the server sends every command of a fan-out over its one connection to the management listener, at about 2 received frames per call: Cowboy's ceiling is about 5000 calls per 10 s, and past it Cowboy closes the whole connection with GOAWAY `enhance_your_calm` and every call in flight on it fails (`stream_error`). `{100000, 10000}` is about 5000 calls per second, far above the ~205 responses per second measured per server channel even with 8 channels to one gateway, and it is still finite. Raising `max_concurrent_streams` does not help: the ceiling counts frames, not streams. `sys.config.prod` and `deploy/docker/reference-gateway-sys.config` set `max_received_frame_rate => {100000, 10000}` on the management listener explicitly; every other shipped config gets it from the default. `sys.config.prod` and the reference configs set the agent listener's `idle_timeout` to 180000 because agents ping every 60 s (the 60 s default would race the ping) and `max_concurrent_streams` to 32. The shipped plaintext default, demo and UAT configs set neither and so inherit 600000 ms and 1024 streams. The management client does not ping, so it keeps ten minutes. |
-| `limits` | Keys: `max_connections` (a positive integer or `infinity`, the default; the most simultaneous connections the listener holds, over which Ranch stops accepting until one closes), `max_message_bytes` (a positive integer, default 4194304) and `send_timeout_ms` (a positive integer or `infinity`, default 30000). A request message larger than `max_message_bytes` is refused before it is buffered, but a message that fits is decoded in full, so a smaller `max_message_bytes` also bounds the memory one stream can make the gateway decode. `max_connections` bounds the file descriptors a listener's connections can take. It is **not protection against a hostile peer**: see "Connection ceilings and the unauthenticated ports" below for what it does and does not do on each listener. `sys.config.prod` and the reference configs set `max_connections => 60000` on the agent listener (the systemd unit's `LimitNOFILE` of 65536 less about 5500 of headroom for the upstream channel, the health and metrics ports, the management listener, Erlang distribution and files, so it holds to a fleet of about 30000 agents; raise it together with `LimitNOFILE` and keep about 5500 below it, lower it if the limit is lower) and `max_connections => 256` on the management listener. Both set `max_message_bytes => 4194304` explicitly, which is the default and gRPC's default receive limit: it is not lowered on the agent listener because an agent's installed-software inventory blob may be 3 MiB by design. The plaintext default, demo and UAT configs set no `limits`, so `max_connections` is `infinity` there. Size the file-descriptor limit for the listener's `max_connections` plus the other sockets (about 1.5 to 2 times the agent count plus 200 in use). |
+| `limits` | Keys: `max_connections` (a positive integer or `infinity`, the default; the most simultaneous connections the listener holds, over which Ranch stops accepting until one closes), `max_message_bytes` (a positive integer, default 4194304), `send_timeout_ms` (a positive integer or `infinity`, default 30000), `max_connection_memory_bytes` (a positive integer at least 1048576, or `infinity`; default four times `max_message_bytes`, i.e. 16 MiB for the 4 MiB default) and `request_timeout_ms` (a positive integer or `infinity`, default 30000). A request message larger than `max_message_bytes` is refused before it is buffered, but a message that fits is decoded in full, so a smaller `max_message_bytes` also bounds the memory one stream can make the gateway decode. `max_connection_memory_bytes` caps a single connection's memory (a `max_heap_size` on the Cowboy connection process that counts the refc buffers its streams hold); a connection that buffers more than this of half-finished requests is killed by the VM and the kill is counted in `yuzu_gw_grpc_connection_killed_total`. `request_timeout_ms` is how long a unary or server-streaming stream may buffer its one request before it is aborted `DEADLINE_EXCEEDED` (counted in `yuzu_gw_grpc_recv_timeout_total`) and its buffer dropped; it never cuts a bidirectional or client-streaming handler (an agent's long-lived `Subscribe`), which runs before any message, and a `grpc-timeout` the client sent runs alongside it with the earlier of the two winning. Together these two bound an unauthenticated peer that opens streams and stalls them half-sent (see "Connection ceilings and the unauthenticated ports" below). `max_connections` bounds the file descriptors a listener's connections can take. It is **not protection against a hostile peer**: see that same section for what it does and does not do on each listener. `sys.config.prod` and the reference configs set `max_connections => 60000` on the agent listener (the systemd unit's `LimitNOFILE` of 65536 less about 5500 of headroom for the upstream channel, the health and metrics ports, the management listener, Erlang distribution and files, so it holds to a fleet of about 30000 agents; raise it together with `LimitNOFILE` and keep about 5500 below it, lower it if the limit is lower) and `max_connections => 256` on the management listener. Both set `max_message_bytes => 4194304` explicitly, which is the default and gRPC's default receive limit: it is not lowered on the agent listener because an agent's installed-software inventory blob may be 3 MiB by design. The agent listener also sets `max_connection_memory_bytes => 16777216` and `request_timeout_ms => 30000` explicitly (both the defaults). The plaintext default, demo and UAT configs set no `limits`, so `max_connections` is `infinity` there, but the memory ceiling and request deadline still apply at their defaults. Size the file-descriptor limit for the listener's `max_connections` plus the other sockets (about 1.5 to 2 times the agent count plus 200 in use). |
 
 **Connection ceilings and the unauthenticated ports (known residual risk).**
 `limits.max_connections` bounds file descriptors. It does not protect either port from a
@@ -1052,6 +1052,12 @@ peer that wants to hold connections, and this is what it does on each listener:
   risk of the unauthenticated agent port with follow-up work, not a fixed defect. Mitigate
   it by limiting connections per source address at the L4 balancer or firewall. Behind a
   proxy the gateway sees only the proxy's address, so the limit has to be on the proxy.
+  What the ceiling does **not** bound — the *memory* a held connection can consume — is
+  bounded separately: `limits.max_connection_memory_bytes` kills a connection that buffers
+  more than its ceiling of half-finished requests, `limits.request_timeout_ms` aborts a
+  single stalled request, and node-wide memory shedding (below) suspends the whole listener
+  before the node runs out. A held but quiet connection still occupies a slot; those three
+  stop a held connection from being turned into a memory-exhaustion attack.
 - *Management listener (`:50063`), 256.* The only peers that need it are the server's
   replicas, one connection each. Who can hold the other slots depends on how far the
   connection gets. **Before the TLS handshake**, anyone with layer-4 reach to the port can
@@ -1081,6 +1087,46 @@ peer that wants to hold connections, and this is what it does on each listener:
   is recommended; none ships. *Recovery*: find the source address in the `ss` output and
   block it at the firewall. A process restart does not clear it (the peer reconnects), and
   the server's established connection is unaffected throughout.
+
+**Node-wide memory load shedding.** The per-connection bounds above cap one
+connection; a large enough fleet of well-behaved connections, or a flood that each
+stay just under their own ceiling, can still drive the node's total memory up. The
+memory shedder (`yuzu_gw_memory_shedder`) is the backstop: it samples
+`erlang:memory(total)` every `interval_ms` and, above a **high-water mark**, calls
+`ranch:suspend_listener/1` on the **agent** listener(s) — the socket stops accepting, new
+connections wait in the kernel backlog, and every connection already up is untouched —
+and below a **low-water mark** it resumes them. The two marks give hysteresis so a node
+hovering at the line does not flap. The **management listener is never suspended**: the
+operator and command plane stays reachable so you can drain the fleet and act on the
+pressure. While shed, `/readyz` reports not-ready (a suspended listener reads as not
+running), so a load balancer drains this node automatically.
+
+Configure it under `{yuzu_gw, [{memory_shedding, #{...}}]}`:
+
+| Key | Meaning | Default |
+|---|---|---|
+| `high_water_fraction` / `high_water_bytes` | The mark above which the agent listener(s) are suspended, as a fraction of system memory or absolute bytes (bytes win if both are set). | `0.75` of system memory |
+| `low_water_fraction` / `low_water_bytes` | The mark below which they resume. Must be below the high-water mark. | `0.65` of system memory |
+| `interval_ms` | How often `erlang:memory(total)` is sampled. | `1000` |
+| `enabled` | `false` turns the shedder off. | `true` |
+
+A fraction needs the system's total memory, read from `/proc/meminfo` (the Linux
+production target) without adding `os_mon`. Where it cannot be read (a host with no
+`/proc/meminfo` and no absolute bytes configured) the shedder runs **inactive** and logs
+it, rather than failing boot — it is a backstop, and the per-connection and per-stream
+bounds still hold. Set `high_water_bytes` / `low_water_bytes` to shed on such a host. The
+config shape is validated at boot; a malformed `memory_shedding` map refuses to start.
+
+Metrics: `yuzu_gw_memory_shedding_active` is a gauge, `1` while the agent listener(s) are
+suspended and `0` otherwise; `yuzu_gw_memory_shedding_suspensions_total` counts each time
+shedding began. The shipped alert `YuzuGatewayMemorySheddingActive` fires while the gauge
+is `1` for several minutes (`docs/prometheus/yuzu-alerts.yml`). **Tuning:** if the node
+sheds under normal load, the node is undersized for the fleet (lower the fleet per node or
+raise the memory); if it never sheds under a flood that is hurting it, lower the high-water
+mark. Leave at least a few points between the two marks so it does not flap. The kill and
+receive-timeout counters above (`yuzu_gw_grpc_connection_killed_total`,
+`yuzu_gw_grpc_recv_timeout_total`) tell you whether the pressure is a flood of
+half-finished requests rather than genuine fleet growth.
 
 A leftover `{grpcbox, [{servers, ...}]}` block **refuses boot**: nothing reads it, so
 it would configure no listener while the file reads as if it did. The same goes for a

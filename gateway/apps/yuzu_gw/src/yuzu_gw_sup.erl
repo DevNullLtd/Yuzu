@@ -12,8 +12,10 @@
 %%%   5. yuzu_gw_gauge             — periodic VM/agent gauge emitter
 %%%   6. yuzu_gw_cluster_discovery — cluster-formation redial loop (#4555)
 %%%   7. yuzu_gw_health            — HTTP health/readiness endpoint
-%%%   8. yuzu_gw_agent_sup         — simple_one_for_one for agent processes
-%%%   9. one yuzu_grpc_listener per {yuzu_gw, grpc_listeners} entry — LAST, so
+%%%   8. yuzu_gw_memory_shedder    — node-wide memory load shedder (suspends the
+%%%      agent listener(s) under memory pressure, never the management listener)
+%%%   9. yuzu_gw_agent_sup         — simple_one_for_one for agent processes
+%%%  10. one yuzu_grpc_listener per {yuzu_gw, grpc_listeners} entry — LAST, so
 %%%      nothing is served before the registry, router and agent supervisor a
 %%%      handler calls exist, and a listener that cannot bind stops the tree
 %%%      rather than leaving a gateway that looks up and serves nothing. The
@@ -125,6 +127,15 @@ init([]) ->
 
         #{id       => yuzu_gw_health,
           start    => {yuzu_gw_health, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
+        %% Node-wide memory load shedder (the third edge bound). Ahead of the
+        %% listeners it may suspend; its first tick is one interval away, by
+        %% which time the listeners are up. A crash restarts a fresh sampler.
+        #{id       => yuzu_gw_memory_shedder,
+          start    => {yuzu_gw_memory_shedder, start_link, []},
           restart  => permanent,
           shutdown => 5000,
           type     => worker},
