@@ -1,7 +1,9 @@
 %%%-------------------------------------------------------------------
 %%% @doc What yuzu_grpc_listener:validate/1 accepts and refuses (the key sets
-%%% are closed), the TLS options it derives and the line it logs when a listener
-%%% is up. A refused entry never binds a port.
+%%% are closed), the TLS and HTTP/2 options it derives and the line it logs when
+%%% a listener is up. A refused entry never binds a port. The management
+%%% listener's frame ceiling is also proven on a real listener: a fan-out of
+%%% 6000 unary RPCs over one connection.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_listener_tests).
@@ -626,3 +628,115 @@ no_ceiling_by_default_test() ->
     after
         yuzu_gw_test_listener:stop(Pid)
     end.
+
+%%%-------------------------------------------------------------------
+%%% HTTP/2 options: the management listener's received-frame ceiling
+%%%-------------------------------------------------------------------
+
+-define(MGMT_SVC, 'yuzu.server.v1.ManagementService').
+-define(LIST_AGENTS, <<"/yuzu.server.v1.ManagementService/ListAgents">>).
+
+mgmt_entry() ->
+    mgmt_entry(#{}).
+
+mgmt_entry(Extra) ->
+    maps:merge(#{name => m, service_protos => [management_pb],
+                 services => #{?MGMT_SVC => yuzu_grpc_stub_svc},
+                 listen => #{port => 0}}, Extra).
+
+frame_rate(Entry) ->
+    maps:get(max_received_frame_rate, yuzu_grpc_listener:http2_opts(Entry), cowboy_default).
+
+%% The listener that routes the ManagementService is the one the server fans
+%% commands out over, on one connection: ten times Cowboy's ceiling. A listener
+%% that serves only agents keeps Cowboy's (the option is left unset), including
+%% one that lists management_pb only for the AgentService it embeds. A combined
+%% listener carries the fan-out and gets the raised value. An explicit `http2'
+%% value wins either way, and the other defaults are unchanged.
+http2_frame_rate_default_test_() ->
+    Agent = #{'yuzu.agent.v1.AgentService' => yuzu_grpc_stub_svc},
+    [{"management listener: 100000 frames per 10 s",
+      ?_assertEqual({100000, 10000}, frame_rate(mgmt_entry()))},
+     {"agent listener: Cowboy's own",
+      ?_assertEqual(cowboy_default, frame_rate(entry()))},
+     {"management_pb listing that routes only the AgentService: Cowboy's own",
+      ?_assertEqual(cowboy_default, frame_rate(mgmt_entry(#{services => Agent})))},
+     {"combined agent and management listener: raised",
+      ?_assertEqual({100000, 10000},
+                    frame_rate(mgmt_entry(#{service_protos => [agent_pb, management_pb],
+                                            services => Agent#{?MGMT_SVC => yuzu_grpc_stub_svc}})))},
+     {"an explicit http2 value wins on the management listener",
+      ?_assertEqual({20000, 10000},
+                    frame_rate(mgmt_entry(#{http2 => #{max_received_frame_rate => {20000, 10000}}})))},
+     {"an explicit http2 value applies on the agent listener",
+      ?_assertEqual({20000, 10000},
+                    frame_rate(entry(#{http2 => #{max_received_frame_rate => {20000, 10000}}})))},
+     {"the other defaults are the same on both, and an override leaves the rest",
+      fun() ->
+          Base = #{idle_timeout => 600000, max_concurrent_streams => 1024,
+                   max_frame_size_received => 16384, linger_timeout => 1000},
+          ?assertEqual(Base, yuzu_grpc_listener:http2_opts(entry())),
+          ?assertEqual(Base#{max_received_frame_rate => {100000, 10000}},
+                       yuzu_grpc_listener:http2_opts(mgmt_entry())),
+          ?assertEqual(Base#{max_received_frame_rate => {100000, 10000},
+                             max_concurrent_streams => 32},
+                       yuzu_grpc_listener:http2_opts(
+                         mgmt_entry(#{http2 => #{max_concurrent_streams => 32}})))
+      end}].
+
+%% The server holds ONE connection to the management listener and sends every
+%% command of a fan-out over it. 6000 unary RPCs in 12 waves of 500 concurrent
+%% calls are about 12000 received frames (HEADERS and DATA per call); inside one
+%% 10 s window that is past Cowboy's ceiling, which closes the connection with
+%% enhance_your_calm and fails the calls in flight on it (the review's
+%% reproduction lost 69 of wave 10). Under the management default every call
+%% succeeds, on the connection the fan-out started on. The ceiling counts from
+%% the connection's start, so the run must also finish inside 10 s for the test
+%% to prove anything; on loopback it takes a few seconds.
+mgmt_listener_carries_a_fan_out_over_one_connection_test_() ->
+    {timeout, 60, fun mgmt_fan_out_over_one_connection/0}.
+
+mgmt_fan_out_over_one_connection() ->
+    yuzu_grpc_stub_svc:init_state(),
+    {Port, Pid} = yuzu_gw_test_listener:start(mgmt_entry(#{name => frame_rate_mgmt})),
+    Chan = yuzu_gw_test_listener:client_channel(frame_rate_mgmt_chan, #{port => Port}),
+    try
+        [Conn] = up_conns(Chan),
+        T0 = erlang:monotonic_time(millisecond),
+        Results = lists:append([wave(Chan, 500) || _ <- lists:seq(1, 12)]),
+        Elapsed = erlang:monotonic_time(millisecond) - T0,
+        Failed = [R || R <- Results, not is_ok(R)],
+        ?assertEqual({0, []}, {length(Failed), lists:sublist(Failed, 3)}),
+        ?assertEqual(6000, yuzu_grpc_stub_svc:calls()),
+        %% the same connection, never closed and reopened by the channel
+        ?assertEqual([Conn], up_conns(Chan)),
+        ?assert(is_process_alive(Conn)),
+        ?assert(Elapsed < 10000)
+    after
+        yuzu_gw_test_listener:stop_channel(Chan),
+        yuzu_gw_test_listener:stop(Pid)
+    end.
+
+%% N concurrent ListAgents calls over the channel; every result, in order.
+wave(Chan, N) ->
+    Self = self(),
+    Call = fun() ->
+               Result = try yuzu_grpc_client:unary(#{}, ?LIST_AGENTS, #{filter => <<"ok">>},
+                                                   list_agents_def(),
+                                                   #{channel => Chan, timeout => 15000})
+                        catch Class:Reason -> {Class, Reason}
+                        end,
+               Self ! {self(), Result}
+           end,
+    Pids = [spawn(Call) || _ <- lists:seq(1, N)],
+    [receive {P, R} -> R after 20000 -> {no_result, P} end || P <- Pids].
+
+is_ok({ok, #{agents := []}, _}) -> true;
+is_ok(_) -> false.
+
+up_conns(Chan) ->
+    ets:select(Chan, [{{{slot, '_'}, '$1', up}, [], ['$1']}]).
+
+list_agents_def() ->
+    #{marshal => fun(M) -> management_pb:encode_msg(M, 'yuzu.server.v1.ListAgentsRequest') end,
+      unmarshal => fun(B) -> management_pb:decode_msg(B, 'yuzu.server.v1.ListAgentsResponse') end}.

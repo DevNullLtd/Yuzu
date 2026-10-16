@@ -43,7 +43,8 @@
 %%%                  gateway. forwarded_for reads x-forwarded-for from a proxy
 %%%                  that terminates TLS: the certificate the gateway sees is
 %%%                  the proxy's, so it cannot be combined with an `auth_fun'.
-%%%   http2          optional overrides of the Cowboy HTTP/2 options
+%%%   http2          optional overrides of the Cowboy HTTP/2 options (see
+%%%                  http2_opts/1 for the defaults they override)
 %%%   limits         optional #{max_message_bytes, send_timeout_ms, max_connections}
 %%%                  max_connections is the most connections the listener holds
 %%%                  at once (default infinity). At the ceiling the listener stops
@@ -86,7 +87,10 @@
 %%% The defaults suit a low-volume control listener (idle timeout 10 minutes,
 %%% 1024 concurrent streams per connection, 4 acceptors). A listener that serves
 %%% a fleet sets its own: the agents ping every 60 s, so 180000 for the idle
-%%% timeout, a handful of streams per connection, and more acceptors.
+%%% timeout, a handful of streams per connection, and more acceptors. A listener
+%%% that routes the ManagementService also gets a received-frame ceiling ten
+%%% times Cowboy's (http2_opts/1), because the server fans every command out
+%%% over the one connection it holds to it.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_listener).
@@ -95,7 +99,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([start_link/1, start/1, stop/1, child_spec/1]).
--export([port/1, validate/1, ssl_opts/1]).
+-export([port/1, validate/1, ssl_opts/1, http2_opts/1]).
 -export([serves_agent/1, routes_agent/1, serves_proto/2, proper_list/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -150,6 +154,20 @@
          stream_window_update_threshold]).
 %% The service the agents call; a listener that serves it takes no auth_fun.
 -define(AGENT_SERVICE, 'yuzu.agent.v1.AgentService').
+%% The service the C++ server calls to fan commands out to the fleet.
+-define(MGMT_SERVICE, 'yuzu.server.v1.ManagementService').
+%% Cowboy's flood guard counts the HTTP/2 frames a connection receives and
+%% closes the WHOLE connection (GOAWAY enhance_your_calm) when more than N arrive
+%% inside the period; its own default is {10000, 10000}: 10000 frames per 10 s.
+%% A unary RPC is about two received frames (HEADERS, then DATA with END_STREAM;
+%% WINDOW_UPDATE and PING add a few more), so that is about 5000 RPCs per 10 s on
+%% one connection, and the server holds ONE connection to the management
+%% listener and sends every command of a fan-out over it: past that the
+%% connection is closed and every call in flight on it fails. Ten times Cowboy's
+%% (10000 frames/s, about 5000 RPC/s) is far above the ~205 responses/s measured
+%% per server channel, even with K=8 channels to one gateway, and is still
+%% finite, so a peer that floods the port is still cut off.
+-define(MGMT_FRAME_RATE, {100000, 10000}).
 %% Socket options that would move the bind address or port, which `listen' alone
 %% decides (and the management-plane posture guard reads).
 -define(BIND_SOCKET_OPTS, [ip, ifaddr, fd, port, local]).
@@ -334,14 +352,37 @@ transport_opts(Entry, Tls) ->
       handshake_timeout => 10000,
       socket_opts => SocketOpts}.
 
-protocol_opts(Entry, Routes) ->
-    Limits = maps:get(limits, Entry, #{}),
+%% @doc The Cowboy HTTP/2 options of an entry other than the ones the layer
+%% owns: the defaults, overridden key by key by its `http2' map.
+%%
+%% A listener that routes the ManagementService gets ?MGMT_FRAME_RATE as its
+%% `max_received_frame_rate'; one that does not keeps Cowboy's own, since its
+%% connections are agents' and the stock flood guard is the one to keep there. A
+%% combined agent+management listener gets the raised value: it carries the
+%% server's fan-out, which the stock value would cut, and it cannot be the
+%% network-facing agent edge of a deployment that refuses insecure management
+%% (it may not take an auth_fun, so the boot posture guard refuses it off
+%% loopback unless allow_insecure_mgmt acknowledges a lab rig). The test is what
+%% the entry ROUTES, not management_pb in service_protos (the broad test the
+%% posture guard fails closed on): management_pb embeds the AgentService, so an
+%% agent-only entry may list it, and an entry that does not route the
+%% ManagementService answers its RPCs UNIMPLEMENTED, so no fan-out lands there.
+-spec http2_opts(entry()) -> map().
+http2_opts(Entry) ->
     Defaults = #{idle_timeout => 600000,
                  max_concurrent_streams => 1024,
                  max_frame_size_received => 16384,
                  linger_timeout => 1000},
+    RoleDefaults = case routes_service(Entry, ?MGMT_SERVICE) of
+                       true -> Defaults#{max_received_frame_rate => ?MGMT_FRAME_RATE};
+                       false -> Defaults
+                   end,
+    maps:merge(RoleDefaults, maps:get(http2, Entry, #{})).
+
+protocol_opts(Entry, Routes) ->
+    Limits = maps:get(limits, Entry, #{}),
     Origin = maps:get(origin, Entry, #{mode => transport}),
-    maps:merge(maps:merge(Defaults, maps:get(http2, Entry, #{})),
+    maps:merge(http2_opts(Entry),
                #{stream_handlers => [yuzu_grpc_stream_h],
                  env => #{grpc => Routes,
                           auth_fun => maps:get(auth_fun, Entry, undefined),
@@ -459,9 +500,13 @@ serves_agent(Entry) ->
 %% answers every agent RPC UNIMPLEMENTED, so no agent can use it. Total on any
 %% term.
 -spec routes_agent(term()) -> boolean().
-routes_agent(#{services := Services}) when is_map(Services) ->
-    maps:is_key(?AGENT_SERVICE, Services);
-routes_agent(_) ->
+routes_agent(Entry) ->
+    routes_service(Entry, ?AGENT_SERVICE).
+
+%% Whether the service is a key of the entry's `services'. Total on any term.
+routes_service(#{services := Services}, Service) when is_map(Services) ->
+    maps:is_key(Service, Services);
+routes_service(_, _) ->
     false.
 
 %% @doc Whether the entry lists the proto module among its service_protos. Total:
