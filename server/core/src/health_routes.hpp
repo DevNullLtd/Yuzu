@@ -2,10 +2,11 @@
 
 /// @file health_routes.hpp
 /// Extracted from server.cpp's inline registrations onto the HttpRouteSink
-/// seam (#2542 PR-10) — the 6-route Health/Infra cluster: the Prometheus
+/// seam (#2542 PR-10) — the 7-route Health/Infra cluster: the Prometheus
 /// metrics endpoint, the `/health` + `/api/health` JSON probe, the
-/// Kubernetes-style `/livez` + `/readyz` probes, and the HTMX dashboard's
-/// health-summary strip fragment. Every handler body is copied verbatim
+/// Kubernetes-style `/livez` + `/readyz` probes, the HTMX dashboard's
+/// health-summary strip fragment, and the Dashboard health panel fragment.
+/// Every handler body is copied verbatim
 /// from server.cpp; the changes are the receiver (`web_server_->` ->
 /// `sink.`), member/store accesses (`xyz_store_.` -> `deps.xyz_store->`),
 /// the gate closures (`require_auth`/`auth_routes_->resolve_session`/
@@ -24,7 +25,7 @@
 ///     the request ever reaches the handlers this file registers. That
 ///     exemption is load-bearing infrastructure (a monitoring probe or an
 ///     orchestrator health check must work with no credentials) and stays
-///     in server.cpp untouched — grep `req.path == "/livez"` there.
+///     in server.cpp, which now calls this header's `is_probe_path` for the probe set.
 ///   - `/health`/`/api/health`'s shared `health_handler` ADDITIONALLY does
 ///     its own optional, non-blocking session resolve
 ///     (`deps.resolve_session_fn`, never writes to `res` on failure) to
@@ -32,8 +33,33 @@
 ///     `agents.pending`/`executions.*`/`system.*` fields. An unauthenticated
 ///     caller still gets 200 with the cheap probe fields — this is NOT a
 ///     gate, just a response-shape branch.
-///   - `/fragments/health/summary` is the one route in this cluster that
-///     genuinely requires a session: `deps.deny_service_scoped_fn` first
+///   - PLAINTEXT REDIRECT LISTENER (#5906): when HTTPS is on, the HTTP->HTTPS
+///     redirect listener (`--web-port`, 8080 by default) ALSO serves exactly
+///     `/livez`, `/readyz`, `/health` and `/api/health`, to GET and HEAD
+///     requests that declare no body (`is_plaintext_probe_request`); every
+///     other request still 301s. This is the same recorded ADR-1005 exception
+///     as the main listener's, with two differences: no session is ever
+///     resolved on plaintext (the session resolver is bound to "no session"),
+///     so `/health` and `/api/health` ALWAYS return
+///     the unauthenticated shape there — `system.*`, `agents.pending` and
+///     `executions.*` never travel over plaintext, even when the request carries
+///     a valid session cookie — and every answer is 503
+///     `{"status":"not ready","reason":"https_listener_not_serving"}` while the
+///     HTTPS listener is not bound or has exited. The guarantee is "bound
+///     and not yet exited", NOT "accepting": after a fatal accept error httplib
+///     closes the listening socket but `is_running()` stays true until
+///     already-accepted requests drain (httplib.h:11307-11330, 11269), so the
+///     gate can answer 200 for that drain window; new connections are refused
+///     throughout it. The gate exists because the redirect listener runs on its
+///     own thread and would otherwise report healthy for a server whose only
+///     real listener failed to bind. `/livez` and `/readyz` are the same handlers
+///     as the main sink's, wrapped by the 503 gate; `/health` and `/api/health` go
+///     through a second thin closure over the ONE shared `health_body`.
+///     The redirect listener's responses carry the five security headers (no
+///     HSTS) and are counted in `yuzu_http_requests_total` through
+///     `install_plaintext_post_routing`; the 301s are counted too.
+///   - `/fragments/health/summary` is one of the two routes in this cluster that
+///     require a session (with `/fragments/dashboard/health`): `deps.deny_service_scoped_fn` first
 ///     (guardian-confinement-2298 PR3 §3e — service-scoped tokens denied),
 ///     THEN `deps.auth_fn` (blocking `require_auth`, writes 401 on
 ///     failure) — same double-session-resolution shape documented in
@@ -79,7 +105,8 @@
 /// The corresponding `ServerImpl::nvd_metrics_scrape_mu_` member declaration
 /// is deleted from server.cpp by this extraction (dead after the move).
 ///
-/// Routes (6):
+/// Routes (7), plus /livez, /readyz, /health and /api/health again on
+/// `deps.plaintext_probe_sink` when set:
 ///   GET /metrics                    (unauthenticated from 127.0.0.1/::1 always;
 ///                                     remote depends on cfg_.metrics_require_auth
 ///                                     — that branch lives in server.cpp's
@@ -93,8 +120,17 @@
 ///   GET /livez                      (no gate, no deps — trivial process-alive probe)
 ///   GET /readyz                     (no gate — draining_, runtime pg_reachable, boot-latched store checks)
 ///   GET /fragments/health/summary   (deny_service_scoped_fn THEN auth_fn)
+///   GET /fragments/dashboard/health (deny_service_scoped_fn THEN auth_fn; every
+///                                     outcome after auth is a 200 panel note —
+///                                     without a session the pre-routing gate
+///                                     answers first (a 302 to the sign-in page, or
+///                                     401 with HX-Redirect for HX requests) and
+///                                     auth_fn is the backstop — the Dashboard health panel,
+///                                     which calls the registered `health_handler`
+///                                     in-process)
 
 #include "authz_gates.hpp" // authz::FleetReadGate (Dashboard health panel)
+#include "security_headers.hpp"
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -106,6 +142,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -180,6 +217,49 @@ class NvdSyncManager;
 
 namespace health {
 
+/// The closed set of unauthenticated probe paths (the recorded ADR-1005
+/// exception). ONE definition: the main listener's pre-routing chokepoint and
+/// the plaintext redirect listener both test membership through it.
+[[nodiscard]] constexpr bool is_probe_path(std::string_view p) {
+    return p == "/livez" || p == "/readyz" || p == "/health" || p == "/api/health";
+}
+
+/// True for a request the plaintext redirect listener serves instead of
+/// redirecting: GET or HEAD on an exact probe path that declares no body.
+/// HEAD is admitted because httplib dispatches it to the GET handlers
+/// (httplib.h:11420) and omits the body on write (httplib.h:10822, 10836), so
+/// no second registration is needed. A probe carrying Content-Length or
+/// Transfer-Encoding stays a 301: httplib runs the pre-routing handler BEFORE it
+/// reads a body (httplib.h:11337-11413), so declining those keeps the plaintext
+/// listener from ever buffering one. That ordering is a dependency on httplib
+/// 0.37.1 — a version that read the body first would invalidate this reasoning.
+/// Because no body is ever admitted here, this listener needs no row in
+/// `body_cap_policy.hpp`'s table (the #2407 routed-concerns row).
+[[nodiscard]] inline bool is_plaintext_probe_request(const httplib::Request& req) {
+    return (req.method == "GET" || req.method == "HEAD") && is_probe_path(req.path) &&
+           !req.has_header("Content-Length") && !req.has_header("Transfer-Encoding");
+}
+
+/// The HTTP->HTTPS redirect listener's pre-routing handler. Probe GET/HEAD
+/// requests (`is_plaintext_probe_request`) fall through to the routes
+/// `register_health_routes` puts on this server; everything else 301s to
+/// https://<Host-or-web_address>:<https_port><path>[?query]. Lives here, not in
+/// server.cpp, so a real-listener test covers the production wiring (#5906).
+void install_plaintext_redirect_pre_routing(httplib::Server& srv, std::string web_address,
+                                            int https_port);
+
+/// The redirect listener's post-routing handler (#5906): applies `headers` (the five security
+/// response headers every other HTTP response carries, SOC2-C1) and then calls `on_response`
+/// (the request counter; may be empty). The caller builds `headers` for a non-HTTPS bundle
+/// (`HeaderBundle::make(extras, /*https_enabled=*/false)`), which omits
+/// Strict-Transport-Security (RFC 6797 s7.2: no STS over a non-secure transport) and
+/// upgrade-insecure-requests. Deliberately nothing else from the main listener's post-routing
+/// handler: no engine-class stash (never written on this listener's workers), no quota slot, no
+/// CORS.
+void install_plaintext_post_routing(
+    httplib::Server& srv, security::HeaderBundle headers,
+    std::function<void(const httplib::Request&, const httplib::Response&)> on_response);
+
 /// Construction deps for `register_health_routes`. Every closure/pointer is
 /// bound once at start_web_server() time in server.cpp and never reseated.
 /// See this file's header comment for the REQUIRED-vs-graceful null-safety
@@ -218,6 +298,15 @@ struct Deps {
     ResolveSessionFn resolve_session_fn;      // /health, /api/health
     DenyServiceScopedFn deny_service_scoped_fn; // /fragments/health/summary
     FleetReadFn fleet_read_fn;                  // /fragments/dashboard/health (optional)
+    /// Optional: when set, /livez, /readyz, /health and /api/health are ALSO
+    /// registered here (the HTTP->HTTPS redirect listener) — see the AUTH
+    /// POSTURE banner. Requires `main_listener_serving_fn`.
+    HttpRouteSink* plaintext_probe_sink{nullptr};
+    /// True while the HTTPS listener is bound and has not exited
+    /// (`web_server_->is_running()`); the plaintext sink answers 503 otherwise.
+    /// Required iff `plaintext_probe_sink` is set (registration throws
+    /// `std::invalid_argument` if unbound).
+    std::function<bool()> main_listener_serving_fn;
 
     // ---- REQUIRED (registration throws std::invalid_argument if null) ----
     Config* cfg{nullptr};
@@ -301,9 +390,10 @@ struct Deps {
     NvdSyncManager* nvd_sync{nullptr};
 };
 
-/// Register all 6 Health/Infra routes against `sink`. Throws
-/// `std::invalid_argument` if `deps.cfg` or `deps.metrics` is null — see
-/// this file's header comment.
+/// Register all 7 Health/Infra routes against `sink` (and the four probes on
+/// `deps.plaintext_probe_sink` when set). Throws `std::invalid_argument` if
+/// `deps.cfg` or `deps.metrics` is null, or if a plaintext sink is given
+/// without `main_listener_serving_fn` — see this file's header comment.
 void register_health_routes(HttpRouteSink& sink, Deps deps);
 
 } // namespace health

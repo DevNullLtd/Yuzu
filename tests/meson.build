@@ -1357,6 +1357,7 @@ if build_server
       'unit/server/test_update_registry.cpp',
       'unit/server/test_legacy_sqlite_probe.cpp',
       'unit/server/test_https_config.cpp',
+      'unit/server/test_healthcheck_probe.cpp', # #5906: --healthcheck target/verdict rules + loopback TLS probe
       'unit/server/test_response_store.cpp',
       'unit/server/test_response_routes.cpp', # #2542 PR-11: the 3-route legacy pre-v1 Responses API, extracted onto the HttpRouteSink seam
       'unit/server/test_query_int_parse.cpp', # #4644: the shared strict integer primitive (query_int_parse.hpp)
@@ -3556,6 +3557,21 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
       yuzu_agent_core_lib,
       agent_actions_plugin_lib,
     ],
+  )
+endif
+
+# #5906: `yuzu-server --healthcheck` CLI contract against the real binary (no listener, no
+# Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
+# runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# gate labelled 'server' fails that check on the Windows legs.
+if _bash_test.found() and meson.can_run_host_binaries() and build_server
+  test('healthcheck CLI contract (#5906)',
+    _bash_test,
+    args: [files('shell/test_healthcheck_cli.sh'), meson.project_build_root()],
+    suite: ['server', 'docs'],
+    timeout: 60,
+    depends: [yuzu_server_exe],
   )
 endif
 
