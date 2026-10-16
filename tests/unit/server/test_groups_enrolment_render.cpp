@@ -435,9 +435,14 @@ TEST_CASE("enrolment rules: rule text is honest about what is matched",
     };
     const auto html = render_auto_approve(v, false);
     CHECK_THAT(html, ContainsSubstring("Agent-reported hostname matches <code>EDI-*</code> (not verified)"));
-    CHECK_THAT(html, ContainsSubstring("Address the server sees matches <code>10.0.0.0/8</code>"));
-    CHECK_THAT(html, ContainsSubstring("Agent CA fingerprint <code>abc123</code>"));
-    CHECK_THAT(html, ContainsSubstring("Attestation provider <code>aws</code>"));
+    // The address is what the server saw, so it carries no caveat.
+    CHECK_THAT(html, ContainsSubstring("Address the server sees matches <code>10.0.0.0/8</code></td>"));
+    // A CA fingerprint is never populated at Register, so the rule can never match.
+    CHECK_THAT(html, ContainsSubstring("Agent CA fingerprint <code>abc123</code> "
+                                       "(never matches at this release)"));
+    // The cloud provider is the agent's own claim (a bare compare), not an attestation.
+    CHECK_THAT(html, ContainsSubstring("Agent-reported provider <code>aws</code> (not verified)"));
+    CHECK_THAT(html, !ContainsSubstring("Attestation provider"));
     CHECK_THAT(html, ContainsSubstring("Address rules match IPv4 only."));
     CHECK_THAT(html, !ContainsSubstring("Matches every agent"));
     // Index-keyed routes, as the engine addresses rules by list position.
@@ -563,7 +568,10 @@ TEST_CASE("enrolment rules: add form keeps the field names, blocks colons, no in
         CHECK_THAT(html, ContainsSubstring(n));
     CHECK_THAT(html, ContainsSubstring("hx-post=\"/api/settings/auto-approve\""));
     CHECK_THAT(html, ContainsSubstring("data-rule-form"));
-    CHECK_THAT(html, ContainsSubstring("Hostnames are reported by the agent and are not verified."));
+    // The static floor under the client-built Add confirm covers every agent-stated type.
+    CHECK_THAT(html, ContainsSubstring("Hostnames and cloud providers are reported by the agent "
+                                       "and are not verified."));
+    CHECK_THAT(html, ContainsSubstring("A CA fingerprint rule never matches at this release."));
     CHECK_THAT(html, ContainsSubstring("pattern=\"[^:]*\""));
     for (const char* bad : {"onclick", "onchange", "hx-on", "style=\"", "feedback-error",
                             "user-table", "mini-field"})

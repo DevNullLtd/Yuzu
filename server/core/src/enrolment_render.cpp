@@ -51,7 +51,11 @@ bool is_ipv4_literal(std::string_view s) {
     return octets == 4;
 }
 
-// Honest about what is matched: hostnames are agent-reported, addresses are what the server saw.
+// Honest about what is matched. A hostname and a cloud provider are strings the REGISTERING
+// AGENT states about itself (RegisterRequest.attestation_provider is a bare compare; verified
+// attestation is a later tier), an address is what the server saw, and a CA fingerprint can
+// never match at this release because Register does not populate it (auto_approve.cpp
+// match_rule; docs/user-manual/device-management.md "Auto-Approval Policies").
 const char* rule_phrase(AutoApproveRuleType t) {
     switch (t) {
     case AutoApproveRuleType::trusted_ca:
@@ -61,13 +65,22 @@ const char* rule_phrase(AutoApproveRuleType t) {
     case AutoApproveRuleType::ip_subnet:
         return "Address the server sees matches ";
     case AutoApproveRuleType::cloud_provider:
-        return "Attestation provider ";
+        return "Agent-reported provider ";
     }
     return "";
 }
 
 const char* rule_suffix(AutoApproveRuleType t) {
-    return t == AutoApproveRuleType::hostname_glob ? " (not verified)" : "";
+    switch (t) {
+    case AutoApproveRuleType::trusted_ca:
+        return " (never matches at this release)";
+    case AutoApproveRuleType::hostname_glob:
+    case AutoApproveRuleType::cloud_provider:
+        return " (not verified)";
+    case AutoApproveRuleType::ip_subnet:
+        break;
+    }
+    return "";
 }
 
 // Static-confirm copy for one rule's Enable / Disable and Remove, by match mode AND by how many
@@ -445,15 +458,16 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
         html += "</tbody></table></div>";
     }
 
-    html += "<p class=\"hint pad\">Address rules match IPv4 only. Hostnames are reported by the "
-            "agent and are not verified.</p>";
+    html += "<p class=\"hint pad\">Address rules match IPv4 only. Hostnames and cloud providers are "
+            "reported by the agent and are not verified. A CA fingerprint rule never matches at "
+            "this release.</p>";
 
     // The Add confirm is built client-side (yuzu-groups.js) because it depends on the value
     // typed; the static text here is the floor if the script did not load.
     html += "<form class=\"form\" hx-post=\"/api/settings/auto-approve\" "
             "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" data-rule-form "
             "hx-confirm=\"Add this rule? Agents matching it join the fleet without approval. "
-            "Hostnames are reported by the agent and are not verified.\">"
+            "Hostnames and cloud providers are reported by the agent and are not verified.\">"
             "<div class=\"row2\">"
             "<div class=\"fld\"><label for=\"rule-type\">Type</label>"
             "<select id=\"rule-type\" name=\"type\">"
