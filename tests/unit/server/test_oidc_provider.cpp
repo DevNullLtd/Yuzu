@@ -2529,6 +2529,17 @@ TEST_CASE("OIDC discovery: the second connect attempt is bounded too - the watch
     std::condition_variable gate_cv;
     bool open = false;
     std::chrono::milliseconds stall{0};
+    // Per-operation timeout of this fetch. Windows takes about 2 s to refuse a connect to a closed
+    // loopback port (measured on the Windows test host), which is longer than 1 s: the first
+    // attempt would then end in a connect TIMEOUT, which http_get_bounded deliberately does not
+    // retry, and the second address would never be tried. Give Windows enough room for the first
+    // attempt to be refused; the checks below are derived from this value and the multiplier.
+#ifdef _WIN32
+    constexpr int kPerOpMs = 4000;
+#else
+    constexpr int kPerOpMs = 1000;
+#endif
+    constexpr int kTotalMs = kPerOpMs * OidcProvider::kHttpTotalBoundMultiplier;
     const ScopedTestResolver resolver([&](const std::string& host) -> std::vector<std::string> {
         if (host != "drip.test")
             return {};
@@ -2538,7 +2549,7 @@ TEST_CASE("OIDC discovery: the second connect attempt is bounded too - the watch
     });
     SECTION("the budget is intact when the first attempt is refused") {}
     SECTION("the resolver burns the whole budget first") {
-        stall = std::chrono::milliseconds(OidcProvider::kHttpTotalBoundMultiplier * 1000 + 300);
+        stall = std::chrono::milliseconds(kTotalMs + 300);
     }
 
     const std::string issuer = "https://drip.test:" + std::to_string(drip.port());
@@ -2548,7 +2559,7 @@ TEST_CASE("OIDC discovery: the second connect attempt is bounded too - the watch
         std::chrono::seconds(30),
         [&] {
             doc = OidcProvider::fetch_discovery_document(issuer, true,
-                                                         /*allow_private_networks=*/true, 1000);
+                                                         /*allow_private_networks=*/true, kPerOpMs);
         },
         [&] {
             {
@@ -2564,8 +2575,7 @@ TEST_CASE("OIDC discovery: the second connect attempt is bounded too - the watch
     CAPTURE(doc.error());
     // Not the first attempt's refused connect: the failure is the second attempt's.
     CHECK(doc.error() != "request failed: " + httplib::to_string(httplib::Error::Connection));
-    CHECK(elapsed >=
-          std::chrono::milliseconds(OidcProvider::kHttpTotalBoundMultiplier * 1000 - 500));
+    CHECK(elapsed >= std::chrono::milliseconds(kTotalMs - 500));
     if (stall.count() == 0)
         CHECK(drip.accepted() >= 1); // the handshake lasts to the bound, so B did accept
 }
