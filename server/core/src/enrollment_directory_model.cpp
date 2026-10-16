@@ -9,15 +9,14 @@ namespace yuzu::server {
 
 namespace {
 
-// Machine (snake_case) values, byte-identical to auto_approve.cpp's internal-linkage
-// rule_type_to_string() (used for on-disk persistence) and to the strings its exported
-// parse_auto_approve_rule_type() accepts from the POST body — NOT the page wording: the
-// sentences the Groups and Settings panels show ("Agent-reported hostname matches ...") and
-// the Add-rule <option> list live in enrolment_render.cpp (rule_phrase and
-// render_auto_approve). Three independent hand-synced copies of the type set exist
-// (auto_approve.cpp's persistence pair, the renderer's phrase and option list, this one);
-// auto_approve.cpp's pair could be exported from auto_approve.hpp and reused here instead of
-// a third switch — not done in this pass. A future new rule type must update all three.
+// Machine (snake_case) values, byte-identical to auth::rule_type_to_string() (exported from
+// auto_approve.hpp; on-disk persistence and the dashboard's rule identity use it) and to the
+// strings auth::parse_auto_approve_rule_type() accepts from the POST body — NOT the page
+// wording: the sentences the Groups and Settings panels show ("Agent-reported hostname
+// matches ...") and the Add-rule <option> list live in enrolment_render.cpp (rule_phrase and
+// render_auto_approve). This switch is now a second copy of the exported function and could
+// call it instead — not done in this pass. A future new rule type must update
+// rule_type_to_string, this switch and the renderer's phrase and option list.
 const char* auto_approve_rule_type_str(auth::AutoApproveRuleType t) {
     switch (t) {
     case auth::AutoApproveRuleType::trusted_ca:
