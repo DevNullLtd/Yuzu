@@ -4,10 +4,10 @@
 // common/include/yuzu/log_token.hpp): no raw control byte, so one call can never forge a second
 // log line, and no raw space or '=' inside the claimed id or the hostname, so neither can forge
 // extra key=value tokens (the hostname takes the closed-set id fold; the tag key keeps its space
-// and '=' under the key-token fold). These tests capture the real log output of the sites that are reachable without a
-// device-token store: the service-tag drop, the invalid-tag drop, the superseded refusal and the
-// "Agent registered" line. The revoke-failure line is held by the PG test in
-// test_agent_registry_token_revocation.cpp.
+// and '=' under the key-token fold). These tests capture the real log output of the sites that
+// are reachable without a device-token store: the service-tag drop, the invalid-tag drop, the
+// superseded refusal and the "Agent registered" line. The revoke-failure line is held by the PG
+// test in test_agent_registry_token_revocation.cpp.
 //
 // Not vacuous: the assertions name the neutralised forms, which exist only if the wrap is in
 // place, and the newline count is the number of log calls (a raw '\n' in a printed value would add

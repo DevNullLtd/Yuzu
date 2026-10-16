@@ -60,6 +60,7 @@
 #include "../test_log_capture.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -1464,6 +1465,66 @@ std::size_t count_charset_flag_true(const std::string& src) {
     return static_cast<std::size_t>(std::distance(
         std::sregex_iterator(src.begin(), src.end(), re), std::sregex_iterator()));
 }
+
+// `src` with every // comment, /* */ comment, string literal and character literal body replaced
+// by spaces (newlines kept), so a needle search sees code only. Raw string literals are not
+// special-cased: their bodies are scanned as code, which can only add a false failure.
+std::string blank_comments_and_literals(const std::string& src) {
+    std::string out = src;
+    enum class St { Code, Line, Block, Str, Chr } st = St::Code;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const char c = out[i];
+        const char n = i + 1 < out.size() ? out[i + 1] : '\0';
+        switch (st) {
+        case St::Code:
+            if (c == '/' && n == '/') {
+                st = St::Line;
+                out[i] = out[i + 1] = ' ';
+                ++i;
+            } else if (c == '/' && n == '*') {
+                st = St::Block;
+                out[i] = out[i + 1] = ' ';
+                ++i;
+            } else if (c == '"') {
+                st = St::Str;
+            } else if (c == '\'' &&
+                       !(i > 0 && std::isxdigit(static_cast<unsigned char>(out[i - 1])))) {
+                // A quote after a hex digit is a digit separator (1'000), not a char literal.
+                st = St::Chr;
+            }
+            break;
+        case St::Line:
+            if (c == '\n')
+                st = St::Code;
+            else
+                out[i] = ' ';
+            break;
+        case St::Block:
+            if (c == '*' && n == '/') {
+                st = St::Code;
+                out[i] = out[i + 1] = ' ';
+                ++i;
+            } else if (c != '\n') {
+                out[i] = ' ';
+            }
+            break;
+        case St::Str:
+        case St::Chr: {
+            const char close = st == St::Str ? '"' : '\'';
+            if (c == '\\' && n != '\0') {
+                out[i] = out[i + 1] = ' ';
+                ++i;
+            } else if (c == close) {
+                st = St::Code;
+            } else if (c != '\n') {
+                out[i] = ' ';
+            }
+            break;
+        }
+        }
+    }
+    return out;
+}
 } // namespace
 
 TEST_CASE("Register and ProxyRegister pass enforce_new_id_charset=true at every row-creating write",
@@ -1481,24 +1542,52 @@ TEST_CASE("Register and ProxyRegister pass enforce_new_id_charset=true at every 
     }
 
     // No other source under server/core/src reaches those writes. The two handlers above are the
-    // only callers; auth.cpp and auth_db.cpp hold the wrapper and store definitions. Scanning the
-    // whole directory means a new registration door in a new file fails here instead of needing
-    // someone to extend a list.
+    // only callers; auth.cpp and auth_db.cpp hold the wrapper and store definitions (the headers
+    // that declare them live under server/core/include, outside this tree). The walk is recursive
+    // over .cpp, .hpp and .h, so a new registration door in a new file or a subdirectory such as
+    // pg/ fails here instead of needing someone to extend a list. Comments and string/char
+    // literals are blanked first, so a name mentioned in a comment is not a call.
     std::size_t scanned = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(YUZU_SERVER_SRC_DIR)) {
-        const auto name = entry.path().filename().string();
-        if (entry.path().extension() != ".cpp" || name == "agent_service_impl.cpp" ||
-            name == "gateway_service_impl.cpp" || name == "auth.cpp" || name == "auth_db.cpp")
+    std::size_t scanned_in_subdir = 0;
+    std::size_t scanned_headers = 0;
+    const std::filesystem::path root{YUZU_SERVER_SRC_DIR};
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        if (!entry.is_regular_file())
             continue;
-        INFO("file=" << name);
-        const auto src = read_server_source(name.c_str());
+        const auto ext = entry.path().extension().string();
+        if (ext != ".cpp" && ext != ".hpp" && ext != ".h")
+            continue;
+        const auto rel = entry.path().lexically_relative(root).generic_string();
+        if (rel == "agent_service_impl.cpp" || rel == "gateway_service_impl.cpp" ||
+            rel == "auth.cpp" || rel == "auth_db.cpp")
+            continue;
+        INFO("file=" << rel);
+        const auto src = blank_comments_and_literals(read_server_source(rel.c_str()));
         CHECK(count_occurrences(src, "consume_and_enroll(") == 0);
         CHECK(count_occurrences(src, "ensure_enrolled(") == 0);
         CHECK(count_occurrences(src, "add_pending_agent(") == 0);
         ++scanned;
+        if (rel.find('/') != std::string::npos)
+            ++scanned_in_subdir;
+        if (ext != ".cpp")
+            ++scanned_headers;
     }
-    // Guard against a wrong directory or an empty glob passing vacuously.
-    CHECK(scanned > 100);
+    // Guard against a wrong directory or an empty glob passing vacuously. The tree held about 809
+    // scanned files when this was written (the floor sits well below that), and the walk must
+    // have reached both a subdirectory and a header.
+    CHECK(scanned > 450);
+    CHECK(scanned_in_subdir > 0);
+    CHECK(scanned_headers > 0);
+
+    // The blanking helper must neutralise a comment mention and keep a real call.
+    const auto blanked = [](const char* text, const char* needle) {
+        return count_occurrences(blank_comments_and_literals(text), needle);
+    };
+    CHECK(blanked("// ensure_enrolled(x)\n", "ensure_enrolled(") == 0);
+    CHECK(blanked("/* add_pending_agent( */ int x;", "add_pending_agent(") == 0);
+    CHECK(blanked("auto u = \"http://x\"; ensure_enrolled(a);", "ensure_enrolled(") == 1);
+    CHECK(blanked("int n = 1'000; ensure_enrolled(a);", "ensure_enrolled(") == 1);
+    CHECK(blanked("a.consume_and_enroll(t);\n", "consume_and_enroll(") == 1);
 }
 
 TEST_CASE("Register: an agent_id with a control byte the door lets through is counted as "

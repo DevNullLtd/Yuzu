@@ -154,15 +154,16 @@ In agent_registry.cpp only the claimed ids from `info.agent_id()` (and the local
 `safe_agent_id` built from it) are in scope; the many other spdlog calls in that file print
 ids taken from the session table and are deliberately not matched.
 
-CHECK 3 (REGISTRY_FREE_TEXT_FILES, run on the three files below) requires an
+CHECK 3 (REGISTRY_FREE_TEXT_FILES: server/core/src/agent_registry.cpp,
+agent_service_impl.cpp and gateway_service_impl.cpp; both halves run on all three) requires an
 spdlog:: argument that is an agent-supplied hostname (`info.hostname()` or a local alias bound
 from it) to be wholly one log_id_token call, and the `.error()` of a `revoke_by_device(` or
 `register_agent(` result (a store error string that can quote the device id) to be wholly one
 wrap call. A hostname takes log_id_token ONLY: it sits between genuine key=value tokens, and
 log_key_token / audit_token keep spaces and '=' (a hostname such as `x' plugins=0 id=victim '`
 would close the quote and forge a same-line token), while log_id_token folds space, '=', ',',
-control bytes and every non-ASCII byte to '_' and caps the length. The `register_agent(` half
-also runs on agent_service_impl.cpp and gateway_service_impl.cpp (REGISTRY_FREE_TEXT_FILES).
+control bytes and every non-ASCII byte to '_' and caps the length. A hostname alias is bound by
+`=`, brace or parenthesis init, like the agent-id alias of check 2.
 
 CHECK 4 (COMMAND_TEXT_FILES, agent_service_impl.cpp, gateway_service_impl.cpp and
 agent_registry.cpp)
@@ -224,7 +225,13 @@ constant, finder, known-bad sample), and the selfcheck requires that list to hol
 named in REQUIRED_RULE_GROUPS and every `*_FILES` constant in this module, to scan exactly the
 constant's files, and to flag its own known-bad sample. Removing a group from RULE_GROUPS, adding
 a `*_FILES` constant without registering it, or replacing a finder with a no-op therefore fails
-the selfcheck, which itself checks that each of those three edits is detected.
+the selfcheck. main() additionally records, per group, the files it listed and the files whose
+finder it actually ran, and fails unless the groups it evaluated are exactly
+REQUIRED_RULE_GROUPS and every listed file was read and scanned, so a loop that is emptied, a
+finder result that is dropped or a group sliced off the registry cannot print OK. The
+selfcheck (`_selfcheck_registry_detects_removal`) exercises two of the three registry edits, a
+removed group and a no-op finder; an unregistered `*_FILES` constant is exercised there too, by
+the third case below.
 
 WHITESPACE AND LOGGING FORMS CLOSED. A marker or accessor call is matched with whitespace allowed
 before its parenthesis (`last_error ()`, `PQerrorMessage (c)`, `.error ()`, `.agent_id ()`), a
@@ -233,6 +240,13 @@ call like any other, and an agent-id alias may be a `std::string_view` (const, r
 brace/parenthesis init) as well as `auto` / `std::string`.
 
 STILL OPEN (stated plainly; every check is lexical, a regression net and not a proof):
+  - the scan-completeness ledger in main() fails a loop that did less than the registry lists,
+    but deleting the selfcheck calls or the ledger's verify() call themselves, or editing
+    RULE_GROUPS, REQUIRED_RULE_GROUPS and the `*_FILES` constants together, is not self-detected;
+  - a hostname alias declared as `T const& h = ...` or `auto const& h = ...` (const after the type
+    name) is not tracked, and neither is a hostname logged through `spdlog::get(std::string("x"))->`
+    (a non-literal registry lookup argument) or `logger->log(level, ...)` (the explicit-level
+    form); `spdlog::log(level, ...)` is refused outright by check 5 in its files only;
   - a value copied into a local, a renamed local or a function parameter before it is printed is
     not traced (only the accessor-bound aliases named above, for agent ids and hostnames);
     a later plain assignment to an alias is not tracked either;
@@ -984,17 +998,22 @@ AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
 _RAW_AGENT_ID_ACCESSOR_RE = re.compile(
     r"(?:\.|->)\s*agent_id\s*\(\s*\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
 )
-# A local alias bound from an agent-id accessor: `auto`, `std::string` or `std::string_view`
+# A local alias bound from a request accessor: `auto`, `std::string` or `std::string_view`
 # (optionally const, a reference or a forwarding reference), initialised with `=`, braces or
 # parentheses. `std::string_view` is a borrowed view of the same bytes, so printing it is printing
-# the raw id.
-_AGENT_ID_ACCESSOR_TAIL = r"(?:\.|->)\s*agent_id\s*\(\s*\)\s*"
-_AGENT_ID_ALIAS_DECL_RE = re.compile(
-    r"\b(?:const\s+)?(?:auto|(?:std::)?string_view|std::string)\s*&{0,2}\s*(?:const\s+)?(\w+)\s*"
-    r"(?:=\s*[^;=]*?" + _AGENT_ID_ACCESSOR_TAIL + r";"
-    r"|\{[^;{}]*?" + _AGENT_ID_ACCESSOR_TAIL + r"\}"
-    r"|\([^;]*?" + _AGENT_ID_ACCESSOR_TAIL + r"\)\s*;)"
-)
+# the raw value. The agent-id and hostname alias rules share this one builder so the three init
+# forms cannot drift apart.
+def _accessor_alias_decl_re(accessor: str) -> "re.Pattern[str]":
+    tail = r"(?:\.|->)\s*" + accessor + r"\s*\(\s*\)\s*"
+    return re.compile(
+        r"\b(?:const\s+)?(?:auto|(?:std::)?string_view|std::string)\s*&{0,2}\s*(?:const\s+)?(\w+)\s*"
+        r"(?:=\s*[^;=]*?" + tail + r";"
+        r"|\{[^;{}]*?" + tail + r"\}"
+        r"|\([^;]*?" + tail + r"\)\s*;)"
+    )
+
+
+_AGENT_ID_ALIAS_DECL_RE = _accessor_alias_decl_re("agent_id")
 _SANITIZE_CALL_NAME_RE = re.compile(r"^(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*sanitize_for_log\s*\(")
 
 
@@ -1153,7 +1172,8 @@ def find_pq_error_violations_in_text(
 
 
 # Check 3: agent-supplied free text and store error text in the register path.
-# In agent_registry.cpp an spdlog argument that is
+# In each of the REGISTRY_FREE_TEXT_FILES (agent_registry.cpp, agent_service_impl.cpp and
+# gateway_service_impl.cpp; both halves below run on all three) an spdlog argument that is
 #   - `info.hostname()` (any receiver) or a local alias bound from such an accessor earlier in
 #     the SAME function (`const auto& host = info.hostname();`), or
 #   - `X.error()` where `X` is a local bound earlier in the same function from a
@@ -1174,10 +1194,7 @@ REGISTRY_FREE_TEXT_FILES: tuple[str, ...] = (
 _RAW_HOSTNAME_ACCESSOR_RE = re.compile(
     r"(?:\.|->)\s*hostname\s*\(\s*\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
 )
-_HOSTNAME_ALIAS_DECL_RE = re.compile(
-    r"\b(?:const\s+)?(?:auto|(?:std::)?string_view|std::string)\s*&{0,2}\s*(?:const\s+)?(\w+)\s*="
-    r"\s*[^;=]*?(?:\.|->)\s*hostname\s*\(\s*\)\s*;"
-)
+_HOSTNAME_ALIAS_DECL_RE = _accessor_alias_decl_re("hostname")
 _REVOKE_RESULT_DECL_RE = re.compile(
     r"\b(?:const\s+)?auto\s*&?\s*(\w+)\s*=\s*[\w.>:-]*(?:revoke_by_device|register_agent)\s*\("
 )
@@ -1793,6 +1810,11 @@ def _selfcheck() -> None:
         '  spdlog::info("registered \'{}\'", ::yuzu::log_key_token(host));\n}\n',
         "void F() {\n  const std::string_view host = info.hostname();\n"
         '  spdlog::info("registered \'{}\'", host);\n}\n',
+        # Brace and parenthesis init bind an alias exactly as `=` does.
+        "void F() {\n  const std::string_view host{info.hostname()};\n"
+        '  spdlog::info("registered \'{}\'", host);\n}\n',
+        "void F() {\n  std::string host(info.hostname());\n"
+        '  spdlog::info("registered \'{}\'", host);\n}\n',
         # Through the registry lookup instead of a bound handle.
         'spdlog::get("agent")->info("Agent registered: hostname=\'{}\'", info.hostname());',
         "void F() {\n  const auto& host = info.hostname();\n"
@@ -1816,6 +1838,10 @@ def _selfcheck() -> None:
         "void F() {\n  const auto& host = info.hostname();\n"
         '  spdlog::info("registered \'{}\'", ::yuzu::log_id_token(host));\n}\n',
         "void F() {\n  const std::string_view host = info.hostname();\n"
+        '  spdlog::info("registered \'{}\'", ::yuzu::log_id_token(host));\n}\n',
+        "void F() {\n  const std::string_view host{info.hostname()};\n"
+        '  spdlog::info("registered \'{}\'", ::yuzu::log_id_token(host));\n}\n',
+        "void F() {\n  std::string host(info.hostname());\n"
         '  spdlog::info("registered \'{}\'", ::yuzu::log_id_token(host));\n}\n',
         'spdlog::get("agent")->info("Agent registered: hostname=\'{}\'", ::yuzu::log_id_token(info.hostname()));',
         "void F() {\n  auto revoked = store->revoke_by_device(info.agent_id());\n"
@@ -2123,7 +2149,8 @@ def _selfcheck_registry(groups: tuple[RuleGroup, ...] = RULE_GROUPS) -> None:
 
 
 def _selfcheck_registry_detects_removal() -> None:
-    """The registry check itself must fail on a removed group and on a no-op finder."""
+    """The registry check itself must fail on a removed group, a no-op finder and an
+    unregistered `*_FILES` constant."""
 
     def fails(groups: tuple[RuleGroup, ...]) -> bool:
         try:
@@ -2137,25 +2164,88 @@ def _selfcheck_registry_detects_removal() -> None:
             raise SystemExit(f"selfcheck: removing the {g.name} group from RULE_GROUPS was not detected")
         if not fails(RULE_GROUPS[:i] + (g._replace(find=lambda text, rel: []),) + RULE_GROUPS[i + 1 :]):
             raise SystemExit(f"selfcheck: a no-op finder for the {g.name} group was not detected")
+    # A `*_FILES` constant with no registry entry (the third edit the module docstring names).
+    probe = "_UNREGISTERED_PROBE_FILES"
+    globals()[probe] = ("server/core/src/agent_registry.cpp",)
+    try:
+        if not fails(RULE_GROUPS):
+            raise SystemExit("selfcheck: an unregistered *_FILES constant was not detected")
+    finally:
+        del globals()[probe]
+
+
+class _ScanLedger:
+    """What main() actually did, so a loop that silently did less than the registry says fails.
+
+    `begin(group, files)` records the files a group listed; `scan(group, rel, text)` runs the
+    finder and is the ONLY way a result reaches the hit lists; it notes that `rel` was evaluated. `verify`
+    fails unless the groups begun are exactly REQUIRED_RULE_GROUPS, each listed at least one
+    file, and every listed file was evaluated once. Not self-detected: deleting the
+    selfcheck calls or the `verify` call itself, or editing REQUIRED_RULE_GROUPS together with
+    RULE_GROUPS (the module docstring's STILL OPEN list).
+    """
+
+    def __init__(self) -> None:
+        self.listed: dict[str, tuple[str, ...]] = {}
+        # One entry per evaluated file: (group name, group kind, rel, hit lines). The evaluated
+        # file lists and the hit lists are both derived from it, so dropping a finder result
+        # drops the evaluation record with it and `verify` fails.
+        self._results: list[tuple[str, str, str, list[str]]] = []
+
+    def begin(self, group: RuleGroup, files: tuple[str, ...]) -> None:
+        self.listed[group.name] = tuple(files)
+
+    def scan(self, group: RuleGroup, rel: str, text: str | None) -> None:
+        """Run the group's finder over `text` (None: the file does not exist) and record it."""
+        if text is None:
+            # A rename would otherwise silently shrink the check to nothing.
+            lines = [f"{rel}: file listed in {group.name} does not exist"]
+        else:
+            lines = group.find(text, rel)
+        self._results.append((group.name, group.kind, rel, list(lines)))
+
+    def evaluated(self, name: str) -> list[str]:
+        return [rel for n, _k, rel, _l in self._results if n == name]
+
+    def hits(self, kind: str) -> list[str]:
+        return [line for _n, k, _r, lines in self._results if k == kind for line in lines]
+
+    def verify(self) -> list[str]:
+        problems: list[str] = []
+        if set(self.listed) != set(REQUIRED_RULE_GROUPS):
+            problems.append(
+                f"evaluated rule groups {sorted(self.listed)} != required {sorted(REQUIRED_RULE_GROUPS)}"
+            )
+        for name, files in self.listed.items():
+            if not files:
+                problems.append(f"{name}: the group listed no files")
+            elif sorted(self.evaluated(name)) != sorted(files):
+                problems.append(
+                    f"{name}: listed {len(files)} file(s) but evaluated {len(self.evaluated(name))}"
+                )
+        return problems
 
 
 def main() -> int:
     _selfcheck()
     _selfcheck_registry()
     _selfcheck_registry_detects_removal()
-    hits: list[str] = []
-    agent_hits: list[str] = []
+    ledger = _ScanLedger()
     for group in RULE_GROUPS:
-        sink = hits if group.kind == "rule" else agent_hits
-        for rel in group.files():
+        files = group.files()
+        ledger.begin(group, files)
+        for rel in files:
             path = REPO_ROOT / rel
-            if not path.is_file():
-                # A rename would otherwise silently shrink the check to nothing.
-                sink.append(f"{rel}: file listed in {group.name} does not exist")
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            sink.extend(group.find(text, rel))
+            text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else None
+            ledger.scan(group, rel, text)
+    hits = ledger.hits("rule")
+    agent_hits = ledger.hits("agent")
     rc = 0
+    problems = ledger.verify()
+    if problems:
+        print("FAIL: the scan did not evaluate every required rule group over every listed file:")
+        print("\n".join(problems))
+        rc = 1
     if hits:
         print(
             "FAIL: unwrapped rule-id/Spark-key-shaped spdlog:: argument(s) found (#4665 "
