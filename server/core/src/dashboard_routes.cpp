@@ -103,6 +103,14 @@ static int col_index_for_name(const std::vector<std::string>& cols, const std::s
     return -1;
 }
 
+// -- Helper: does any exact-value facet filter exceed the ingest bound? (#5623) ----
+// A facet value over kMaxFacetValueBytes is never indexed, so such a filter can match nothing;
+// the results page says so rather than let an empty table read as "no agent has this value".
+static bool any_filter_value_too_long(const std::vector<FacetFilter>& filters) {
+    return std::any_of(filters.begin(), filters.end(),
+                       [](const FacetFilter& f) { return f.value.size() > kMaxFacetValueBytes; });
+}
+
 /// Parse CLI-style "plugin action key=val key2=\"quoted val\"" into command + params.
 static std::pair<std::string, std::unordered_map<std::string, std::string>>
 parse_instruction_params(const std::string& text) {
@@ -2691,6 +2699,14 @@ std::string DashboardRoutes::render_results(
         html += "<span class=\"result-degrade-banner\" data-result-truncated=\"true\">"
                 "truncated: the 10,000-row / 50 MiB read cap was reached, so these rows "
                 "and counts are partial</span>";
+    }
+    // #5623: static text only, never the filter value. Applies to a request filter and to a
+    // saved-view default alike (both arrive here in `filters`); no result or count changes.
+    if (any_filter_value_too_long(filters)) {
+        html += " <span class=\"result-degrade-banner\" data-filter-too-long=\"true\">"
+                "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
+                " bytes. Values that long are not indexed, so this filter cannot match "
+                "anything. Shorten the value.</span>";
     }
     html += "</div>";
 

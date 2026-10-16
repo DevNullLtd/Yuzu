@@ -68,7 +68,8 @@ struct FragmentResultsHarness {
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
-    explicit FragmentResultsHarness(ResponseStore* response_store) {
+    explicit FragmentResultsHarness(ResponseStore* response_store,
+                                    InstructionStore* instruction_store = nullptr) {
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -99,7 +100,7 @@ struct FragmentResultsHarness {
             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
             /*caller_fn=*/DashboardRoutes::CallerFn{},
             /*resolve_fn=*/[](const std::string&) { return std::pair<std::string, std::string>{}; },
-            &metrics, /*instruction_store=*/nullptr);
+            &metrics, instruction_store);
     }
 
     std::unique_ptr<httplib::Response> get(const std::string& path) { return sink.Get(path); }
@@ -490,4 +491,144 @@ TEST_CASE("/fragments/results: a cut read that parses to zero lines still says i
     CHECK(contains(cut->body, "data-result-truncated=\"true\""));
     CHECK(contains(cut->body, "so these rows and counts are partial"));
     CHECK_FALSE(contains(cut->body, " results across "));
+}
+
+// -- #5623: a filter value over the facet ingest bound gets a hint, nothing else changes --
+
+namespace {
+
+constexpr std::string_view kTooLongMarker = "data-filter-too-long";
+
+void store_registry_output(ResponseStore& rs, const std::string& command_id,
+                           const std::string& output) {
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-a";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = output;
+    r.plugin = "registry";
+    rs.store(r);
+}
+
+void wire_unfiltered_gate(FragmentResultsHarness& h) {
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+}
+
+} // namespace
+
+TEST_CASE("/fragments/results: a filter value over kMaxFacetValueBytes shows a static hint, "
+          "the result and the Create Group affordance are unchanged",
+          "[pg][server][dashboard][fragment][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-filter-too-long-1";
+    store_registry_output(rs, command_id, "short output");
+
+    FragmentResultsHarness h(&rs);
+    wire_unfiltered_gate(h);
+
+    SECTION("one byte over the bound: hint present, value never echoed, table as before") {
+        const std::string value(kMaxFacetValueBytes + 1, 'z');
+        auto res = h.get("/fragments/results?command_id=" + command_id +
+                         "&plugin=registry&f_output=" + value);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, kTooLongMarker));
+        CHECK(contains(res->body, "longer than " + std::to_string(kMaxFacetValueBytes) + " bytes"));
+        // Static text: the (over-long, caller-supplied) value is not echoed into the hint. The
+        // sort links re-embed the filter as a URL param, so look for the value outside any
+        // `f_output=` URL occurrence by checking the hint span itself.
+        const auto at = res->body.find(kTooLongMarker);
+        const auto end = res->body.find("</span>", at);
+        REQUIRE(end != std::string::npos);
+        CHECK_FALSE(contains(res->body.substr(at, end - at), "zzzz"));
+        // Unchanged otherwise: still the zero-match table, no rows, no Create Group.
+        CHECK(contains(res->body, "No results match your filters."));
+        CHECK_FALSE(contains(res->body, "class=\"result-row\""));
+        CHECK_FALSE(contains(res->body, "btn-create-group"));
+    }
+
+    SECTION("exactly the bound: no hint") {
+        const std::string value(kMaxFacetValueBytes, 'z');
+        auto res = h.get("/fragments/results?command_id=" + command_id +
+                         "&plugin=registry&f_output=" + value);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+    }
+
+    SECTION("a short value that matches: no hint, row and Create Group present") {
+        auto res = h.get("/fragments/results?command_id=" + command_id +
+                         "&plugin=registry&f_output=short+output");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+        CHECK(contains(res->body, "class=\"result-row\""));
+        CHECK(contains(res->body, "Create Group from 1 Agent"));
+    }
+
+    SECTION("no filter at all: no hint") {
+        auto res = h.get("/fragments/results?command_id=" + command_id + "&plugin=registry");
+        REQUIRE(res);
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+    }
+}
+
+TEST_CASE("/fragments/results: a saved View default over the bound shows the hint",
+          "[pg][server][dashboard][fragment][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
+    is.set_require_signed_definitions(false);
+
+    const std::string command_id = "cmd-frag-view-too-long-1";
+    store_registry_output(rs, command_id, "short output");
+
+    auto make_def = [&](const std::string& name, const std::string& filter_value) {
+        InstructionDefinition def;
+        def.name = name;
+        def.version = "1.0";
+        def.plugin = "registry";
+        def.action = "query";
+        def.type = "question";
+        def.description = "view default test";
+        def.enabled = true;
+        def.platforms = "windows,linux,darwin";
+        def.approval_mode = "auto";
+        def.response_templates_spec =
+            R"([{"id":"vw1","name":"v","default":false,"filters":[{"column":"Output","op":"equals","value":")" +
+            filter_value + R"("}]}])";
+        auto id = is.create_definition(def);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    const auto long_def = make_def("view-too-long", std::string(kMaxFacetValueBytes + 1, 'z'));
+    const auto short_def = make_def("view-short", "short output");
+
+    FragmentResultsHarness h(&rs, &is);
+    wire_unfiltered_gate(h);
+
+    auto over = h.get("/fragments/results?command_id=" + command_id + "&plugin=registry" +
+                      "&definition_id=" + long_def + "&template_id=vw1");
+    REQUIRE(over);
+    CHECK(over->status == 200);
+    CHECK(contains(over->body, kTooLongMarker));
+    CHECK(contains(over->body, "No results match your filters."));
+
+    auto ok = h.get("/fragments/results?command_id=" + command_id + "&plugin=registry" +
+                    "&definition_id=" + short_def + "&template_id=vw1");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK_FALSE(contains(ok->body, kTooLongMarker));
+    CHECK(contains(ok->body, "class=\"result-row\""));
 }
