@@ -4399,7 +4399,10 @@ public:
                 oidc_cfg.nat64_prefixes = std::move(*prefixes);
                 if (!oidc_cfg.nat64_prefixes.empty())
                     spdlog::info("OIDC egress: --oidc-nat64-prefix is set; {} NAT64 prefix(es) "
-                                 "are decoded before OIDC requests are vetted",
+                                 "are decoded before OIDC requests are vetted; a configured prefix "
+                                 "can permit HTTPS connections to ULA addresses even when "
+                                 "--oidc-allow-private-networks is off, so declare only actual "
+                                 "translation prefixes",
                                  oidc_cfg.nat64_prefixes.size());
             } else {
                 // main.cpp refuses to start on an unparsable list; a Config built elsewhere must

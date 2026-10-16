@@ -888,7 +888,10 @@ int main(int argc, char* argv[]) {
                    "is classified by the IPv4 address it embeds, so a translator cannot be used "
                    "to reach a private or link-local destination. Prefixes announced by the "
                    "network's DNS64 (RFC 7050) are learned automatically; use this when the "
-                   "network does not announce them. Default: none")
+                   "network does not announce them. A configured prefix asserts that a NAT64 "
+                   "translator lives there and can permit HTTPS connections to ULA addresses "
+                   "even when --oidc-allow-private-networks is off: declare only actual "
+                   "translation prefixes (always-refused addresses stay blocked). Default: none")
         ->envname("YUZU_OIDC_NAT64_PREFIXES")
         ->check(CLI::Validator(
             [](const std::string& value) -> std::string {
