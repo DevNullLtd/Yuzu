@@ -852,11 +852,13 @@ public:
     std::expected<std::vector<auth::PendingAgent>, StoreError>
     list_pending(std::optional<auth::PendingStatus> only = std::nullopt);
 
-    /// Set status approved/denied for an existing row. `true` = row existed.
-    std::expected<bool, StoreError> approve_pending(const std::string& agent_id,
-                                                    const std::string& principal);
-    std::expected<bool, StoreError> deny_pending(const std::string& agent_id,
-                                                 const std::string& principal);
+    /// Move a `pending` row to approved/denied. Guarded on `status = 'pending'`: an
+    /// already-decided row is `wrong_status` and untouched (see
+    /// `auth::PendingTransitionOutcome`), a missing one `not_found`.
+    std::expected<auth::PendingTransitionOutcome, StoreError>
+    approve_pending(const std::string& agent_id, const std::string& principal);
+    std::expected<auth::PendingTransitionOutcome, StoreError>
+    deny_pending(const std::string& agent_id, const std::string& principal);
 
     /// Bulk: every currently-`pending` row -> approved/denied in one statement
     /// (`UPDATE .. WHERE status='pending' RETURNING agent_id`). Returns the

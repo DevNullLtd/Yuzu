@@ -5255,12 +5255,16 @@ void SettingsRoutes::register_routes(
             res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             return;
         }
-        // An unknown token_id is a no-op the operator should be able to see.
+        // An unknown token_id is a no-op the operator must be able to see: the audit row says
+        // denied, so the toast must not say revoked.
         audit_fn_(req, "enrollment.token_revoke", *revoked ? "success" : "denied",
                   "EnrollmentToken", token_id,
                   std::string(*revoked ? "" : "token_not_found ") + "by=" + session->username);
-        res.set_header("HX-Trigger",
-                       R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})");
+        res.set_header(
+            "HX-Trigger",
+            *revoked
+                ? R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})"
+                : R"j({"showToast":{"message":"Token not found - nothing revoked (it may have been removed)","level":"warning"}})j");
         res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
     });
 
@@ -5737,70 +5741,73 @@ void SettingsRoutes::register_routes(
         return true;
     };
 
+    // Single-row Approve and Deny share one body. The store answers changed / wrong_status /
+    // not_found, and each is told to the operator: a stale click must never read as success
+    // (the audit row says denied), and an already-decided row is never reversed.
+    auto decide_pending = [this, refuse_unaddressable_agent_id](const httplib::Request& req,
+                                                                httplib::Response& res,
+                                                                bool approve) {
+        if (!admin_fn_(req, res))
+            return;
+        const char* const action = approve ? "enrollment.approve" : "enrollment.deny";
+        const std::string past = approve ? "approved" : "denied";
+        const auto toast = [&](const std::string& message, const char* level) {
+            res.set_header("HX-Trigger", R"({"showToast":{"message":")" + message +
+                                             R"(","level":")" + level + R"("}})");
+        };
+        auto agent_id = req.matches[1].str();
+        auto session = auth_fn_(req, res);
+        if (!session)
+            return;
+        if (refuse_unaddressable_agent_id(req, res, action, agent_id, session->username))
+            return;
+        auto decided = approve ? auth_mgr_->approve_pending_agent(agent_id, session->username)
+                               : auth_mgr_->deny_pending_agent(agent_id, session->username);
+        if (!decided) {
+            const bool bad_input = !is_store_unavailable(decided.error());
+            audit_fn_(req, action, bad_input ? "denied" : "failure", "Agent", agent_id,
+                      "store_error by=" + session->username);
+            res.status = bad_input ? 400 : 503;
+            toast(bad_input ? "Invalid agent id"
+                            : "Enrollment store unavailable - agent NOT " + past,
+                  "error");
+            res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+            return;
+        }
+        switch (*decided) {
+        case auth::PendingTransitionOutcome::changed:
+            audit_fn_(req, action, "success", "Agent", agent_id, "by=" + session->username);
+            toast("Agent " + past, approve ? "success" : "warning");
+            break;
+        case auth::PendingTransitionOutcome::wrong_status:
+            // Refused: the row was already decided (by this admin in another tab, another
+            // admin, or another replica). Acting on it would reverse that decision with no
+            // trail; the store left it untouched. 409, like the Forget route.
+            audit_fn_(req, action, "denied", "Agent", agent_id,
+                      "refused_wrong_status by=" + session->username);
+            res.status = 409;
+            toast("Cannot " + std::string(approve ? "approve" : "deny") +
+                      ": agent has already been approved or denied",
+                  "error");
+            break;
+        case auth::PendingTransitionOutcome::not_found:
+            audit_fn_(req, action, "denied", "Agent", agent_id,
+                      "agent_not_found by=" + session->username);
+            toast("Agent not found - nothing " + past + " (it may have been removed)",
+                  "warning");
+            break;
+        }
+        res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+    };
+
     sink.Post(R"(/api/settings/pending-agents/(.+)/approve)",
-              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
-                  if (!admin_fn_(req, res))
-                      return;
-                  auto agent_id = req.matches[1].str();
-                  auto session = auth_fn_(req, res);
-                  if (!session)
-                      return;
-                  if (refuse_unaddressable_agent_id(req, res, "enrollment.approve", agent_id,
-                                                    session->username))
-                      return;
-                  auto approved = auth_mgr_->approve_pending_agent(agent_id, session->username);
-                  if (!approved) {
-                      const bool bad_input = !is_store_unavailable(approved.error());
-                      audit_fn_(req, "enrollment.approve", bad_input ? "denied" : "failure",
-                                "Agent", agent_id, "store_error by=" + session->username);
-                      res.status = bad_input ? 400 : 503;
-                      res.set_header("HX-Trigger",
-                                     bad_input
-                                         ? R"({"showToast":{"message":"Invalid agent id","level":"error"}})"
-                                         : R"({"showToast":{"message":"Enrollment store unavailable - agent NOT approved","level":"error"}})");
-                      res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
-                      return;
-                  }
-                  audit_fn_(req, "enrollment.approve", *approved ? "success" : "denied", "Agent",
-                            agent_id,
-                            std::string(*approved ? "" : "agent_not_found ") +
-                                "by=" + session->username);
-                  res.set_header("HX-Trigger",
-                                 R"({"showToast":{"message":"Agent approved","level":"success"}})");
-                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+              [decide_pending](const httplib::Request& req, httplib::Response& res) {
+                  decide_pending(req, res, /*approve=*/true);
               });
 
     sink.Post(R"(/api/settings/pending-agents/(.+)/deny)",
-              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
-                  if (!admin_fn_(req, res))
-                      return;
-                  auto agent_id = req.matches[1].str();
-                  auto session = auth_fn_(req, res);
-                  if (!session)
-                      return;
-                  if (refuse_unaddressable_agent_id(req, res, "enrollment.deny", agent_id,
-                                                    session->username))
-                      return;
-                  auto denied = auth_mgr_->deny_pending_agent(agent_id, session->username);
-                  if (!denied) {
-                      const bool bad_input = !is_store_unavailable(denied.error());
-                      audit_fn_(req, "enrollment.deny", bad_input ? "denied" : "failure",
-                                "Agent", agent_id, "store_error by=" + session->username);
-                      res.status = bad_input ? 400 : 503;
-                      res.set_header("HX-Trigger",
-                                     bad_input
-                                         ? R"({"showToast":{"message":"Invalid agent id","level":"error"}})"
-                                         : R"({"showToast":{"message":"Enrollment store unavailable - agent NOT denied","level":"error"}})");
-                      res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
-                      return;
-                  }
-                  audit_fn_(req, "enrollment.deny", *denied ? "success" : "denied", "Agent",
-                            agent_id,
-                            std::string(*denied ? "" : "agent_not_found ") +
-                                "by=" + session->username);
-                  res.set_header("HX-Trigger",
-                                 R"({"showToast":{"message":"Agent denied","level":"warning"}})");
-                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+              [decide_pending](const httplib::Request& req, httplib::Response& res) {
+                  decide_pending(req, res, /*approve=*/false);
               });
 
     sink.Delete(R"(/api/settings/pending-agents/(.+))",

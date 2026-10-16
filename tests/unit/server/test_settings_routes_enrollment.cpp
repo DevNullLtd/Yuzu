@@ -316,14 +316,101 @@ TEST_CASE("settings enrollment: single approve / deny / remove each write an aud
     CHECK(row.detail.find("agent_not_found") != std::string::npos);
 }
 
+// A decision on a row the store did not match used to toast "Agent approved" while the audit
+// row said denied/agent_not_found. The toast now tells the truth, and nothing is created.
+TEST_CASE("settings enrollment: approve or deny of an unknown agent warns and never reads as done",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    for (const bool approve : {true, false}) {
+        INFO((approve ? "approve" : "deny"));
+        h.audit_calls.clear();
+        auto res = h.sink.Post(std::string("/api/settings/pending-agents/ghost/") +
+                                   (approve ? "approve" : "deny"),
+                               "", kForm);
+        REQUIRE(res);
+        const auto toast = res->get_header_value("HX-Trigger");
+        CHECK(toast.find(approve ? "Agent not found - nothing approved (it may have been removed)"
+                                 : "Agent not found - nothing denied (it may have been removed)") !=
+              std::string::npos);
+        CHECK(toast.find("\"level\":\"warning\"") != std::string::npos);
+        CHECK(toast.find(approve ? "Agent approved" : "Agent denied") == std::string::npos);
+        const auto row = h.only(approve ? "enrollment.approve" : "enrollment.deny");
+        CHECK(row.result == "denied");
+        CHECK(row.detail.find("agent_not_found") != std::string::npos);
+        CHECK_FALSE(h.auth_mgr.get_pending_status("ghost").value().has_value());
+    }
+}
+
+// A stale Approve on a denied row used to flip it back to approved; a stale Deny on an
+// approved row used to flip an enrolled agent to denied. Now 409, an error toast, the row as
+// it was, and a denied audit row that names the refusal.
+TEST_CASE("settings enrollment: a stale approve or deny of a decided row is a 409 and changes nothing",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    h.queue("was-denied");
+    h.queue("was-approved");
+    REQUIRE(h.auth_mgr.deny_pending_agent("was-denied", "other-admin").value() ==
+            auth::PendingTransitionOutcome::changed);
+    REQUIRE(h.auth_mgr.approve_pending_agent("was-approved", "other-admin").value() ==
+            auth::PendingTransitionOutcome::changed);
+    h.audit_calls.clear();
+
+    auto res = h.sink.Post("/api/settings/pending-agents/was-denied/approve", "", kForm);
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger").find("Cannot approve: agent has already been approved or denied") !=
+          std::string::npos);
+    CHECK(res->get_header_value("HX-Trigger").find("\"level\":\"error\"") != std::string::npos);
+    auto row = h.only("enrollment.approve");
+    CHECK(row.result == "denied");
+    CHECK(row.detail.find("refused_wrong_status") != std::string::npos);
+    CHECK(row.detail.find("by=admin") != std::string::npos);
+    CHECK(h.status_of("was-denied") == auth::PendingStatus::denied);
+
+    h.audit_calls.clear();
+    res = h.sink.Post("/api/settings/pending-agents/was-approved/deny", "", kForm);
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger").find("Cannot deny: agent has already been approved or denied") !=
+          std::string::npos);
+    row = h.only("enrollment.deny");
+    CHECK(row.result == "denied");
+    CHECK(row.detail.find("refused_wrong_status") != std::string::npos);
+    CHECK(h.status_of("was-approved") == auth::PendingStatus::approved);
+    // The refreshed list comes back with the 409 (the Forget route does the same): the denied
+    // row is still listed as denied, and the approved one is still not shown.
+    CHECK(res->body.find("0 waiting, 1 denied") != std::string::npos);
+}
+
+TEST_CASE("settings enrollment: revoking an unknown token warns and never reads as revoked",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    auto res = h.sink.Delete("/api/settings/enrollment-tokens/ffffffff");
+    REQUIRE(res);
+    const auto toast = res->get_header_value("HX-Trigger");
+    CHECK(toast.find("Token not found - nothing revoked (it may have been removed)") !=
+          std::string::npos);
+    CHECK(toast.find("\"level\":\"warning\"") != std::string::npos);
+    CHECK(toast.find("Enrollment token revoked") == std::string::npos);
+    CHECK(h.only("enrollment.token_revoke").result == "denied");
+
+    // A real revoke keeps the success toast.
+    auto created = h.auth_mgr.create_enrollment_token("t", 1, std::chrono::hours(1), "admin");
+    REQUIRE(created.has_value());
+    h.audit_calls.clear();
+    auto ok = h.sink.Delete("/api/settings/enrollment-tokens/" + created->token_id);
+    REQUIRE(ok);
+    CHECK(ok->get_header_value("HX-Trigger").find("Enrollment token revoked") != std::string::npos);
+}
+
 TEST_CASE("settings enrollment: remove REFUSES a denied/approved row — 409, denied audit, row "
           "persists",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;
     h.queue("a-denied");
     h.queue("a-approved");
-    REQUIRE(h.auth_mgr.deny_pending_agent("a-denied", "admin").value());
-    REQUIRE(h.auth_mgr.approve_pending_agent("a-approved", "admin").value());
+    REQUIRE(h.auth_mgr.deny_pending_agent("a-denied", "admin").value() == auth::PendingTransitionOutcome::changed);
+    REQUIRE(h.auth_mgr.approve_pending_agent("a-approved", "admin").value() == auth::PendingTransitionOutcome::changed);
     h.audit_calls.clear();
 
     // Removing the DENIED row is refused: 409, "denied" audit outcome, the
@@ -366,8 +453,8 @@ TEST_CASE("settings enrollment: bulk approve moves only PENDING rows, never over
     for (const char* id : {"p1", "p2", "d1", "ok1"})
         h.queue(id);
     // d1 was denied (e.g. by another admin / replica) BEFORE the bulk statement runs.
-    REQUIRE(h.auth_mgr.deny_pending_agent("d1", "other-admin").value());
-    REQUIRE(h.auth_mgr.approve_pending_agent("ok1", "other-admin").value());
+    REQUIRE(h.auth_mgr.deny_pending_agent("d1", "other-admin").value() == auth::PendingTransitionOutcome::changed);
+    REQUIRE(h.auth_mgr.approve_pending_agent("ok1", "other-admin").value() == auth::PendingTransitionOutcome::changed);
 
     auto res = h.sink.Post("/api/settings/pending-agents/bulk-approve", "", kForm);
     REQUIRE(res);
@@ -391,7 +478,7 @@ TEST_CASE("settings enrollment: bulk deny moves only PENDING rows and audits the
     EnrollRoutesHarness h;
     for (const char* id : {"p1", "p2", "ok1"})
         h.queue(id);
-    REQUIRE(h.auth_mgr.approve_pending_agent("ok1", "other-admin").value());
+    REQUIRE(h.auth_mgr.approve_pending_agent("ok1", "other-admin").value() == auth::PendingTransitionOutcome::changed);
 
     auto res = h.sink.Post("/api/settings/pending-agents/bulk-deny", "", kForm);
     REQUIRE(res);

@@ -2732,18 +2732,16 @@ std::expected<std::vector<PendingAgent>, StoreError> AuthManager::list_pending_a
         "list_pending", [](yuzu::server::AuthDB& db) { return db.list_pending(); });
 }
 
-std::expected<bool, StoreError> AuthManager::approve_pending_agent(const std::string& agent_id,
-                                                                   const std::string& principal) {
-    return enrollment_store_call<bool>("approve", [&](yuzu::server::AuthDB& db) {
-        return db.approve_pending(agent_id, principal);
-    });
+std::expected<PendingTransitionOutcome, StoreError>
+AuthManager::approve_pending_agent(const std::string& agent_id, const std::string& principal) {
+    return enrollment_store_call<PendingTransitionOutcome>(
+        "approve", [&](yuzu::server::AuthDB& db) { return db.approve_pending(agent_id, principal); });
 }
 
-std::expected<bool, StoreError> AuthManager::deny_pending_agent(const std::string& agent_id,
-                                                                const std::string& principal) {
-    return enrollment_store_call<bool>("deny", [&](yuzu::server::AuthDB& db) {
-        return db.deny_pending(agent_id, principal);
-    });
+std::expected<PendingTransitionOutcome, StoreError>
+AuthManager::deny_pending_agent(const std::string& agent_id, const std::string& principal) {
+    return enrollment_store_call<PendingTransitionOutcome>(
+        "deny", [&](yuzu::server::AuthDB& db) { return db.deny_pending(agent_id, principal); });
 }
 
 std::expected<std::vector<std::string>, StoreError>

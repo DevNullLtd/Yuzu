@@ -813,6 +813,7 @@ using yuzu::server::auth::EnrollmentTokenError;
 using yuzu::server::auth::PendingAgent;
 using yuzu::server::auth::PendingStatus;
 using yuzu::server::auth::RemovePendingOutcome;
+using yuzu::server::auth::PendingTransitionOutcome;
 
 PendingAgent mk_agent(const std::string& id, const std::string& host = "host") {
     PendingAgent a;
@@ -961,7 +962,7 @@ TEST_CASE("AuthDB consume_and_enroll: admin-denied agent rolls the token use bac
     auto tok = h.db.create_token("t", 1, std::chrono::seconds(3600), "admin");
     REQUIRE(tok.has_value());
     REQUIRE(h.db.add_pending(mk_agent("evil")).value());
-    REQUIRE(h.db.deny_pending("evil", "alice").value());
+    REQUIRE(h.db.deny_pending("evil", "alice").value() == PendingTransitionOutcome::changed);
 
     // An attempted removal of the denied row is REFUSED (Fix 1) — the denial
     // holds, so the token below still cannot re-enroll the agent.
@@ -1179,16 +1180,16 @@ TEST_CASE("AuthDB pending agents: add, five-state lookup, approve/deny/remove, e
     CHECK(**h.db.pending_status("agent-xyz") == PendingStatus::pending);
 
     // approve records the principal
-    CHECK(h.db.approve_pending("agent-xyz", "alice").value());
+    CHECK(h.db.approve_pending("agent-xyz", "alice").value() == PendingTransitionOutcome::changed);
     CHECK(**h.db.pending_status("agent-xyz") == PendingStatus::approved);
     CHECK(scalar(h.conn.get(), "SELECT status_changed_by FROM auth.pending_agents WHERE agent_id='agent-xyz'") == "alice");
-    CHECK_FALSE(h.db.approve_pending("ghost", "alice").value());
+    CHECK(h.db.approve_pending("ghost", "alice").value() == PendingTransitionOutcome::not_found);
 
     // deny
     REQUIRE(h.db.add_pending(mk_agent("agent-abc", "host2")).value());
-    CHECK(h.db.deny_pending("agent-abc", "bob").value());
+    CHECK(h.db.deny_pending("agent-abc", "bob").value() == PendingTransitionOutcome::changed);
     CHECK(**h.db.pending_status("agent-abc") == PendingStatus::denied);
-    CHECK_FALSE(h.db.deny_pending("ghost", "bob").value());
+    CHECK(h.db.deny_pending("ghost", "bob").value() == PendingTransitionOutcome::not_found);
 
     // list + filter (newest first, status carried)
     auto all = h.db.list_pending();
@@ -1229,14 +1230,53 @@ TEST_CASE("AuthDB pending agents: add, five-state lookup, approve/deny/remove, e
     CHECK(**h.db.pending_status("agent-xyz") == PendingStatus::approved);
 }
 
+// A stale Approve on a denied row used to flip it back to approved (reversing the denial) and
+// a stale Deny on an approved row used to flip an enrolled agent to denied: the UPDATE had no
+// status guard. Only a `pending` row moves; the principal and status of a decided row stay.
+TEST_CASE("AuthDB approve and deny are guarded transitions; a decided row is never reversed",
+          "[pg][auth_db][enrollment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    for (const char* id : {"was-denied", "was-approved", "fresh"})
+        REQUIRE(h.db.add_pending(mk_agent(id)).value());
+    REQUIRE(h.db.deny_pending("was-denied", "admin").value() == PendingTransitionOutcome::changed);
+    REQUIRE(h.db.approve_pending("was-approved", "admin").value() ==
+            PendingTransitionOutcome::changed);
+
+    // Approve on a denied row: refused, the denial and its author stay.
+    CHECK(h.db.approve_pending("was-denied", "mallory").value() ==
+          PendingTransitionOutcome::wrong_status);
+    CHECK(**h.db.pending_status("was-denied") == PendingStatus::denied);
+    CHECK(scalar(h.conn.get(), "SELECT status_changed_by FROM auth.pending_agents WHERE agent_id='was-denied'") == "admin");
+
+    // Deny on an approved row: refused, the enrolled agent stays enrolled.
+    CHECK(h.db.deny_pending("was-approved", "mallory").value() ==
+          PendingTransitionOutcome::wrong_status);
+    CHECK(**h.db.pending_status("was-approved") == PendingStatus::approved);
+    CHECK(scalar(h.conn.get(), "SELECT status_changed_by FROM auth.pending_agents WHERE agent_id='was-approved'") == "admin");
+
+    // Repeating a decision is not a transition either, and an unknown id stays not_found.
+    CHECK(h.db.approve_pending("was-approved", "mallory").value() ==
+          PendingTransitionOutcome::wrong_status);
+    CHECK(h.db.deny_pending("was-denied", "mallory").value() ==
+          PendingTransitionOutcome::wrong_status);
+    CHECK(h.db.approve_pending("nobody", "mallory").value() == PendingTransitionOutcome::not_found);
+
+    // The still-pending row moves, exactly once.
+    CHECK(h.db.deny_pending("fresh", "carol").value() == PendingTransitionOutcome::changed);
+    CHECK(h.db.approve_pending("fresh", "mallory").value() ==
+          PendingTransitionOutcome::wrong_status);
+    CHECK(**h.db.pending_status("fresh") == PendingStatus::denied);
+}
+
 TEST_CASE("AuthDB bulk approve/deny transitions only currently-pending rows",
           "[pg][auth_db][enrollment]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     for (const char* id : {"p1", "p2", "p3", "d1", "a1"})
         REQUIRE(h.db.add_pending(mk_agent(id)).value());
-    REQUIRE(h.db.deny_pending("d1", "admin").value());
-    REQUIRE(h.db.approve_pending("a1", "admin").value());
+    REQUIRE(h.db.deny_pending("d1", "admin").value() == PendingTransitionOutcome::changed);
+    REQUIRE(h.db.approve_pending("a1", "admin").value() == PendingTransitionOutcome::changed);
 
     auto approved = h.db.approve_all_pending("carol");
     REQUIRE(approved.has_value());

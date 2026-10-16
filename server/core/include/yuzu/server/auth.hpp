@@ -531,6 +531,18 @@ enum class RemovePendingOutcome : std::uint8_t {
     wrong_status, ///< A row exists but is `approved`/`denied` — refused, not deleted.
 };
 
+/// Outcome of `AuthDB::approve_pending`/`deny_pending` (and the `AuthManager` wrappers). Only a
+/// `pending` row is ever moved: the decision is a guarded transition
+/// (`UPDATE .. WHERE status = 'pending'`), like `bulk_transition` and `remove_pending`. An
+/// unguarded UPDATE let a stale Approve on a denied row silently reverse the denial and a stale
+/// Deny on an approved row flip an enrolled agent to denied, with nothing in the audit trail
+/// to say an earlier decision had been overturned.
+enum class PendingTransitionOutcome : std::uint8_t {
+    changed,      ///< The row existed, was `pending`, and moved to the requested status.
+    not_found,    ///< No row exists for this agent_id.
+    wrong_status, ///< A row exists but is already `approved`/`denied` — left untouched.
+};
+
 /// Why `AuthManager::verify_password` refused (#5342 Gate 7, sec-3). The two
 /// TRANSIENT kinds (`kStoreUnavailable`, `kCredentialChanged`) are NOT a wrong
 /// password: a caller must answer them with a retryable 503 and must NEVER
@@ -1240,10 +1252,11 @@ public:
     /// All pending-agent rows (any status), newest first (admin UI).
     [[nodiscard]] std::expected<std::vector<PendingAgent>, StoreError> list_pending_agents();
 
-    /// Approve / deny a pending agent. `true` = the row existed.
-    [[nodiscard]] std::expected<bool, StoreError>
+    /// Approve / deny a pending agent. Only a `pending` row moves; an already-decided row is
+    /// `wrong_status` and is left as it was — see `PendingTransitionOutcome`.
+    [[nodiscard]] std::expected<PendingTransitionOutcome, StoreError>
     approve_pending_agent(const std::string& agent_id, const std::string& principal);
-    [[nodiscard]] std::expected<bool, StoreError>
+    [[nodiscard]] std::expected<PendingTransitionOutcome, StoreError>
     deny_pending_agent(const std::string& agent_id, const std::string& principal);
 
     /// Bulk approve / deny: every row that is `pending` AT THE TIME OF THE
