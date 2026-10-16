@@ -260,8 +260,12 @@ TEST_CASE("settings enrollment: batch create returns N tokens and audits ids onl
     CHECK(row.detail.find("by=admin") != std::string::npos);
     for (const auto& t : j["tokens"])
         CHECK_FALSE(h.audit_mentions(t.get<std::string>()));
-    // The ids listed in the audit row are real token ids.
-    for (const auto& t : h.auth_mgr.list_enrollment_tokens().value())
+    // The ids listed in the audit row are real token ids. Named local, not a range-for over
+    // `list_enrollment_tokens().value()`: before C++23's P2718R0 (GCC < 15) that temporary dies
+    // before the loop body runs (#5924).
+    const auto tokens = h.auth_mgr.list_enrollment_tokens();
+    REQUIRE(tokens);
+    for (const auto& t : *tokens)
         CHECK(row.detail.find(t.token_id) != std::string::npos);
 }
 

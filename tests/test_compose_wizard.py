@@ -187,7 +187,7 @@ def run_node(mode, payload):
         driver.write_text(DRIVER, encoding="utf-8")
         proc = subprocess.run([NODE, str(driver), str(GENERATE_JS), mode],
                               input=json.dumps(payload), capture_output=True,
-                              text=True, timeout=60)
+                              text=True, encoding="utf-8", timeout=60)
     if proc.returncode != 0:
         raise AssertionError(f"node driver failed ({proc.returncode}):\n{proc.stderr}")
     return json.loads(proc.stdout)
