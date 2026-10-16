@@ -202,6 +202,8 @@ curl -s -X DELETE http://localhost:8080/api/settings/auto-approve/0 \
   -b "$COOKIE"
 ```
 
+Rules are addressed by their position in the list, and the position shifts when another administrator adds or removes a rule. The dashboard therefore also sends the rule it is showing (`type` and `value`, and for a toggle the `enabled` state it saw, as form fields on the toggle and as query parameters on the delete). If the rule now at that position is a different one, nothing changes: the answer is `409` with the refreshed list and a warning, and the audit row is `denied` (`stale_rule_view`). A script that states none of these keeps acting on the position. To make a script safe against a concurrent edit, add them, for example `-d "type=hostname_glob&value=web-*.example.com&enabled=1"` on the toggle.
+
 **View the auto-approve settings fragment (HTMX):**
 
 ```bash
