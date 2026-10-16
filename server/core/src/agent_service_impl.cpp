@@ -167,6 +167,18 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 
     bool is_reauth = false; // Track whether this is a reconnection vs first enrollment
 
+    // The refusal of a NEW agent_id outside the charset, shared by the early gate below and
+    // by the row-creating writes (which re-check at creation, see the notes there).
+    const auto reject_new_agent_id_charset = [&]() {
+        spdlog::warn("Register rejected: agent_id has characters outside [A-Za-z0-9._:-] "
+                     "(or is only dots) for agent {}",
+                     safe_agent_id);
+        metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "charset"}})
+            .increment();
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "agent_id may only contain letters, digits, '.', '_', ':' and '-'");
+    };
+
     // Fast path: agent already enrolled from a prior connection — skip enrollment
     {
         // WS-6 6.2: five-state read. A store ERROR must never read as "absent"
@@ -231,16 +243,12 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         // identifier charset (`auth::is_valid_new_agent_id`). Existing rows —
         // pending, approved or denied — are untouched above/below, so an
         // already-enrolled agent with an unusual id is never locked out.
-        // Checked before any token is consumed or any row is written.
-        if (!prior && !auth::is_valid_new_agent_id(info.agent_id())) {
-            spdlog::warn("Register rejected: agent_id has characters outside [A-Za-z0-9._:-] "
-                         "(or is only dots) for agent {}",
-                         safe_agent_id);
-            metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "charset"}})
-                .increment();
-            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                                "agent_id may only contain letters, digits, '.', '_', ':' and '-'");
-        }
+        // Checked before any token is consumed or any row is written. This is the fast path
+        // only: it rests on the single status read above, so each row-creating write below
+        // also passes enforce_new_id_charset and refuses to CREATE a row for such an id (a
+        // legacy row removed after this read would otherwise be re-created).
+        if (!prior && !auth::is_valid_new_agent_id(info.agent_id()))
+            return reject_new_agent_id_charset();
     }
 
     {
@@ -303,7 +311,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                           yuzu::server::sanitize_enrollment_text(info.hostname()),
                           yuzu::server::sanitize_enrollment_text(info.platform().os()),
                           yuzu::server::sanitize_enrollment_text(info.platform().arch()),
-                          yuzu::server::sanitize_enrollment_text(info.agent_version()))
+                          yuzu::server::sanitize_enrollment_text(info.agent_version()),
+                          /*enforce_new_id_charset=*/true)
                     : std::expected<auth::ConsumeEnrollResult, StoreError>{
                           auth::ConsumeEnrollResult{
                               .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
@@ -323,6 +332,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 response->set_reject_reason("enrollment denied by administrator");
                 response->set_enrollment_status("denied");
                 return grpc::Status::OK;
+            }
+            if (consumed->kind == auth::ConsumeEnrollResult::Kind::charset_refused) {
+                // The store rolled the token use back and created no row.
+                return reject_new_agent_id_charset();
             }
             if (consumed->kind == auth::ConsumeEnrollResult::Kind::token_rejected) {
                 auto err = consumed->token_error;
@@ -499,7 +512,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     yuzu::server::sanitize_enrollment_text(info.platform().os()),
                     yuzu::server::sanitize_enrollment_text(info.platform().arch()),
                     yuzu::server::sanitize_enrollment_text(info.agent_version()),
-                    yuzu::server::sanitize_enrollment_text("auto-approve:" + matched_rule));
+                    yuzu::server::sanitize_enrollment_text("auto-approve:" + matched_rule),
+                    /*enforce_new_id_charset=*/true);
+                if (!enrolled_auto && enrolled_auto.error() == StoreError::CharsetRefused)
+                    return reject_new_agent_id_charset();
                 if (!enrolled_auto) {
                     spdlog::error("Register: auto-approve enroll failed for agent {}",
                                   safe_agent_id);
@@ -528,7 +544,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
                         yuzu::server::sanitize_enrollment_text(info.platform().os()),
                         yuzu::server::sanitize_enrollment_text(info.platform().arch()),
-                        yuzu::server::sanitize_enrollment_text(info.agent_version()));
+                        yuzu::server::sanitize_enrollment_text(info.agent_version()),
+                        /*enforce_new_id_charset=*/true);
+                    if (!added && added.error() == StoreError::CharsetRefused)
+                        return reject_new_agent_id_charset();
                     if (!added) {
                         spdlog::error("Register: add_pending failed for agent {}", safe_agent_id);
                         return enrollment_store_status(added.error());

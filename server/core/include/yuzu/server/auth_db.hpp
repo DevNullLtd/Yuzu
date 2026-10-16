@@ -828,10 +828,17 @@ public:
     /// token (single guarded UPDATE — exactly-N winners across replicas), then
     /// (2) upserts the agent row to `approved` unless an admin denied it; a
     /// denial ROLLS BACK step 1. A miss on step 1 is classified in the same txn.
+    /// `enforce_new_id_charset` (default off, so legacy ids keep enrolling for every
+    /// other caller): when step 2 INSERTs a new row for an id failing
+    /// `auth::is_valid_new_agent_id`, the whole txn rolls back and the result is
+    /// `Kind::charset_refused`. The Register handlers read the status once and gate
+    /// only an absent id, so this closes the window where a legacy row is removed
+    /// between that read and this write. It never affects an UPDATE of an existing row.
     std::expected<ConsumeEnrollResult, StoreError>
     consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                        const std::string& hostname, const std::string& os,
-                       const std::string& arch, const std::string& agent_version);
+                       const std::string& arch, const std::string& agent_version,
+                       bool enforce_new_id_charset = false);
 
     /// Five-state pending lookup: a value = approved/denied/pending; `nullopt` =
     /// absent; `unexpected` = ERROR (callers MUST NOT treat as absent).
@@ -840,13 +847,22 @@ public:
 
     /// Queue an unenrolled agent as `pending`. `true` = NEWLY added (gates the
     /// analytics event + SSE publish); `false` = a row already existed (unchanged).
-    std::expected<bool, StoreError> add_pending(const auth::PendingAgent& agent);
+    /// `enforce_new_id_charset` (default off): an INSERT that would create the row
+    /// for an id failing `auth::is_valid_new_agent_id` is rolled back and returns
+    /// `StoreError::CharsetRefused`; a row that already exists is still `false`.
+    /// The caller's own charset check reads once, so the write re-checks at creation.
+    std::expected<bool, StoreError> add_pending(const auth::PendingAgent& agent,
+                                                bool enforce_new_id_charset = false);
 
     /// No-token enrollment path: upsert to `approved` unless denied. `true` =
     /// enrolled, `false` = admin-denied (tokens/no-token paths never override a
-    /// denial). `by` is recorded as `status_changed_by`.
+    /// denial). `by` is recorded as `status_changed_by`. `enforce_new_id_charset`
+    /// (default off): an upsert that INSERTS a row for an id failing
+    /// `auth::is_valid_new_agent_id` is rolled back and returns
+    /// `StoreError::CharsetRefused`; the update of an existing row is unaffected.
     std::expected<bool, StoreError> ensure_enrolled(const auth::PendingAgent& agent,
-                                                    const std::string& by);
+                                                    const std::string& by,
+                                                    bool enforce_new_id_charset = false);
 
     /// Rows newest-first; `only` filters to one status.
     std::expected<std::vector<auth::PendingAgent>, StoreError>

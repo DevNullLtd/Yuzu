@@ -1255,6 +1255,187 @@ TEST_CASE("AuthDB bulk approve/deny transitions only currently-pending rows",
     CHECK(**h.db.pending_status("p1") == PendingStatus::approved); // earlier approvals untouched
 }
 
+// ── new-id charset re-check at row creation ─────────────────────────────────
+//
+// The Register handlers decide the charset gate from one status read; the writes
+// below re-apply it at the moment they would INSERT (opt-in `enforce_new_id_charset`,
+// default off so legacy callers are unchanged). An UPDATE of an existing row is never
+// refused: a legacy id keeps working.
+
+namespace {
+std::string token_use_count(PGconn* conn, const std::string& token_id) {
+    return scalar(conn, "SELECT use_count FROM auth.enrollment_tokens WHERE token_id = $1",
+                  {token_id});
+}
+std::string pending_rows_for(PGconn* conn, const std::string& id) {
+    return scalar(conn, "SELECT count(*) FROM auth.pending_agents WHERE agent_id = $1", {id});
+}
+} // namespace
+
+TEST_CASE("AuthDB consume_and_enroll(enforce_new_id_charset) refuses to CREATE a bad-charset row",
+          "[pg][auth_db][enrollment][5513]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    for (const char* bad : {"bad id", "a@b", "..."}) {
+        INFO("id=" << bad);
+        auto tok = h.db.create_token("t", 0, std::chrono::seconds(3600), "admin");
+        REQUIRE(tok.has_value());
+
+        // enforce on, no row: refused, rolled back (no row, use NOT consumed).
+        auto refused = h.db.consume_and_enroll(tok->raw_token, bad, "h", "linux", "x86_64", "1",
+                                               /*enforce_new_id_charset=*/true);
+        REQUIRE(refused.has_value());
+        CHECK(refused->kind == CEK::charset_refused);
+        CHECK(pending_rows_for(h.conn.get(), bad) == "0");
+        CHECK(token_use_count(h.conn.get(), tok->token_id) == "0");
+
+        // enforce off (the default): the legacy behaviour is preserved.
+        auto legacy = h.db.consume_and_enroll(tok->raw_token, bad, "h", "linux", "x86_64", "1");
+        REQUIRE(legacy.has_value());
+        CHECK(legacy->kind == CEK::enrolled);
+        CHECK(pending_rows_for(h.conn.get(), bad) == "1");
+        CHECK(token_use_count(h.conn.get(), tok->token_id) == "1");
+    }
+}
+
+TEST_CASE("AuthDB consume_and_enroll(enforce_new_id_charset) still updates an EXISTING legacy row",
+          "[pg][auth_db][enrollment][5513]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    // Pending legacy row.
+    REQUIRE(h.db.add_pending(mk_agent("bad id")).value());
+    auto tok = h.db.create_token("t", 0, std::chrono::seconds(3600), "admin");
+    REQUIRE(tok.has_value());
+    auto r = h.db.consume_and_enroll(tok->raw_token, "bad id", "h", "linux", "x86_64", "1", true);
+    REQUIRE(r.has_value());
+    CHECK(r->kind == CEK::enrolled);
+    CHECK(token_use_count(h.conn.get(), tok->token_id) == "1");
+    CHECK(**h.db.pending_status("bad id") == PendingStatus::approved);
+
+    // Already-approved legacy row: a second claim is again an update, consumed once more.
+    auto again = h.db.consume_and_enroll(tok->raw_token, "bad id", "h", "linux", "x86_64", "1", true);
+    REQUIRE(again.has_value());
+    CHECK(again->kind == CEK::enrolled);
+    CHECK(token_use_count(h.conn.get(), tok->token_id) == "2");
+
+    // A denied legacy row is still the admin_denied outcome, not charset_refused.
+    REQUIRE(h.db.add_pending(mk_agent("a@b")).value());
+    REQUIRE(h.db.deny_pending("a@b", "admin").value());
+    auto denied = h.db.consume_and_enroll(tok->raw_token, "a@b", "h", "linux", "x86_64", "1", true);
+    REQUIRE(denied.has_value());
+    CHECK(denied->kind == CEK::admin_denied);
+    CHECK(token_use_count(h.conn.get(), tok->token_id) == "2");
+}
+
+TEST_CASE("AuthDB consume_and_enroll(enforce_new_id_charset) is unchanged for a valid-charset id",
+          "[pg][auth_db][enrollment][5513]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    auto tok = h.db.create_token("t", 0, std::chrono::seconds(3600), "admin");
+    REQUIRE(tok.has_value());
+    auto r = h.db.consume_and_enroll(tok->raw_token, "good-id_1.2:3", "h", "linux", "x86_64", "1",
+                                     true);
+    REQUIRE(r.has_value());
+    CHECK(r->kind == CEK::enrolled);
+    CHECK(token_use_count(h.conn.get(), tok->token_id) == "1");
+    CHECK(**h.db.pending_status("good-id_1.2:3") == PendingStatus::approved);
+}
+
+TEST_CASE("AuthDB ensure_enrolled(enforce_new_id_charset) refuses to CREATE a bad-charset row",
+          "[pg][auth_db][enrollment][5513]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    for (const char* bad : {"bad id", "a@b", "..."}) {
+        INFO("id=" << bad);
+        auto refused = h.db.ensure_enrolled(mk_agent(bad), "system", /*enforce=*/true);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error() == StoreError::CharsetRefused);
+        CHECK(pending_rows_for(h.conn.get(), bad) == "0");
+
+        // enforce off (the default): legacy behaviour preserved, the row is created.
+        auto legacy = h.db.ensure_enrolled(mk_agent(bad), "system");
+        REQUIRE(legacy.has_value());
+        CHECK(*legacy);
+        CHECK(pending_rows_for(h.conn.get(), bad) == "1");
+    }
+
+    // An existing legacy row (pending, approved) is updated/kept with enforce on.
+    REQUIRE(h.db.add_pending(mk_agent("legacy id")).value());
+    auto up = h.db.ensure_enrolled(mk_agent("legacy id"), "system", true);
+    REQUIRE(up.has_value());
+    CHECK(*up);
+    CHECK(**h.db.pending_status("legacy id") == PendingStatus::approved);
+    auto up2 = h.db.ensure_enrolled(mk_agent("legacy id"), "system", true);
+    REQUIRE(up2.has_value());
+    CHECK(*up2);
+
+    // A denied legacy row keeps answering false (denial), not CharsetRefused.
+    REQUIRE(h.db.add_pending(mk_agent("denied id")).value());
+    REQUIRE(h.db.deny_pending("denied id", "admin").value());
+    auto den = h.db.ensure_enrolled(mk_agent("denied id"), "system", true);
+    REQUIRE(den.has_value());
+    CHECK_FALSE(*den);
+
+    // Valid-charset id with enforce on: unchanged.
+    auto ok = h.db.ensure_enrolled(mk_agent("good-id"), "system", true);
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+    CHECK(**h.db.pending_status("good-id") == PendingStatus::approved);
+}
+
+TEST_CASE("AuthDB add_pending(enforce_new_id_charset) refuses to CREATE a bad-charset row",
+          "[pg][auth_db][enrollment][5513]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    for (const char* bad : {"bad id", "a@b", "..."}) {
+        INFO("id=" << bad);
+        auto refused = h.db.add_pending(mk_agent(bad), /*enforce_new_id_charset=*/true);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error() == StoreError::CharsetRefused);
+        CHECK(pending_rows_for(h.conn.get(), bad) == "0");
+
+        // enforce off (the default): legacy behaviour preserved.
+        auto legacy = h.db.add_pending(mk_agent(bad));
+        REQUIRE(legacy.has_value());
+        CHECK(*legacy);
+        CHECK(pending_rows_for(h.conn.get(), bad) == "1");
+
+        // With the legacy row present, enforce on keeps the existing no-op `false`.
+        auto existing = h.db.add_pending(mk_agent(bad), true);
+        REQUIRE(existing.has_value());
+        CHECK_FALSE(*existing);
+        CHECK(pending_rows_for(h.conn.get(), bad) == "1");
+    }
+
+    // Valid-charset id with enforce on: added, then a second add is the plain `false`.
+    auto added = h.db.add_pending(mk_agent("good-id"), true);
+    REQUIRE(added.has_value());
+    CHECK(*added);
+    auto dup = h.db.add_pending(mk_agent("good-id"), true);
+    REQUIRE(dup.has_value());
+    CHECK_FALSE(*dup);
+}
+
+TEST_CASE("AuthDB kEnrollUpsertSql reports an insert only for a created row (xmax idiom)",
+          "[pg][auth_db][enrollment][5513]") {
+    // Pins, through the observable behaviour, that the INSERT-vs-UPDATE discriminator
+    // survives: a created row is refused under enforce, the same id once it exists is not.
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    CHECK_FALSE(h.db.ensure_enrolled(mk_agent("x y"), "system", true).has_value());
+    REQUIRE(h.db.ensure_enrolled(mk_agent("x y"), "system", false).value());
+    // Row now exists: every further enforced call is an UPDATE and is never refused.
+    for (int i = 0; i < 3; ++i) {
+        auto r = h.db.ensure_enrolled(mk_agent("x y"), "system", true);
+        REQUIRE(r.has_value());
+        CHECK(*r);
+    }
+}
+
 TEST_CASE("AuthDB enrollment store degrade surfaces a typed error, never absent/empty",
           "[pg][auth_db][enrollment]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);

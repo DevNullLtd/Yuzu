@@ -1778,6 +1778,128 @@ TEST_CASE("ProxyRegister: the same charset gate, new ids only, with the gateway_
     CHECK(resp.accepted());
 }
 
+// ── charset gate vs a legacy row that vanishes between the handler's read and its write ──
+//
+// The handler reads the status once and gates only an ABSENT id. A legacy bad-charset row
+// that exists at that read and is gone at the write would otherwise be re-created by the
+// row-creating write. The race is made deterministic with a row lock: a side connection locks
+// the legacy row (a plain status read is MVCC and still sees it), the handler's write queues on
+// that lock, and only then does the side connection delete the row and commit, so the write
+// finds no row and takes its INSERT arm.
+namespace {
+
+struct VanishingRowOutcome {
+    grpc::Status status;
+    bool write_was_queued{false};
+};
+
+template <class Call>
+VanishingRowOutcome run_with_row_vanishing_before_write(const std::string& dsn,
+                                                        const std::string& agent_id, Call&& call) {
+    yuzu::server::pg::PgConn side{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(side.get()) == CONNECTION_OK);
+    const char* params[1] = {agent_id.c_str()};
+    auto exec = [&](const char* sql, int n = 0) {
+        yuzu::server::pg::PgResult r{
+            PQexecParams(side.get(), sql, n, nullptr, n ? params : nullptr, nullptr, nullptr, 0)};
+        return r.status();
+    };
+    REQUIRE(exec("BEGIN") == PGRES_COMMAND_OK);
+    REQUIRE(exec("SELECT 1 FROM auth.pending_agents WHERE agent_id = $1 FOR UPDATE", 1) ==
+            PGRES_TUPLES_OK);
+
+    VanishingRowOutcome out;
+    std::thread worker([&] { out.status = call(); });
+    out.write_was_queued =
+        yuzu::test::wait_for_pg_lock_waiter(dsn, "%INSERT INTO auth.pending_agents%");
+    // Release either way so a timeout fails the CHECK instead of hanging the suite.
+    REQUIRE(exec("DELETE FROM auth.pending_agents WHERE agent_id = $1", 1) == PGRES_COMMAND_OK);
+    REQUIRE(exec("COMMIT") == PGRES_COMMAND_OK);
+    worker.join();
+    return out;
+}
+
+std::string count_scalar(const std::string& dsn, const char* sql, const std::string& id = {}) {
+    yuzu::server::pg::PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    const char* params[1] = {id.c_str()};
+    yuzu::server::pg::PgResult r{PQexecParams(c.get(), sql, id.empty() ? 0 : 1, nullptr,
+                                              id.empty() ? nullptr : params, nullptr, nullptr, 0)};
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return PQgetvalue(r.get(), 0, 0);
+}
+
+} // namespace
+
+TEST_CASE("Register and ProxyRegister: a legacy bad-charset row removed after the read is not "
+          "re-created, whichever write path runs",
+          "[pg][agent_service][register][gateway][agent_id_charset][race][5513]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    const std::string dsn = h.auth_db.dsn();
+    const std::string kCharsetMessage =
+        "agent_id may only contain letters, digits, '.', '_', ':' and '-'";
+
+    enum class Path { token, auto_approve };
+    for (const bool via_gateway : {false, true}) {
+        for (const Path path : {Path::token, Path::auto_approve}) {
+            const std::string id = std::string("legacy ") + (via_gateway ? "gw " : "direct ") +
+                                   (path == Path::token ? "token" : "auto");
+            INFO("id=" << id << " gateway=" << via_gateway
+                       << " path=" << (path == Path::token ? "token" : "auto_approve"));
+            REQUIRE(h.auth_mgr.add_pending_agent(id, "h", "linux", "x86_64", "1").value());
+
+            auto req = make_plain_register(id);
+            if (path == Path::token) {
+                req.set_enrollment_token(
+                    mint_enrollment_token(h.auth_mgr, "t", 0, std::chrono::hours(1)));
+            } else {
+                // The request hostname is "host"; an exact hostname rule approves it.
+                REQUIRE(h.auto_approve.add_rule(
+                    {yuzu::server::auth::AutoApproveRuleType::hostname_glob, "host", "race", true}));
+            }
+
+            apb::RegisterResponse resp;
+            const auto out = run_with_row_vanishing_before_write(dsn, id, [&] {
+                return via_gateway ? gateway_svc.ProxyRegister(nullptr, &req, &resp)
+                                   : h.svc.Register(nullptr, &req, &resp);
+            });
+
+            CHECK(out.write_was_queued);
+            // The same refusal the door gives a new bad-charset id.
+            CHECK(out.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+            CHECK(out.status.error_message() == kCharsetMessage);
+            CHECK_FALSE(resp.accepted());
+            // Nothing created, no token use consumed.
+            auto st = h.auth_mgr.get_pending_status(id);
+            REQUIRE(st.has_value());
+            CHECK_FALSE(st->has_value());
+            if (path == Path::token) {
+                // Every token minted so far is unused: the refused claim rolled back.
+                CHECK(count_scalar(dsn, "SELECT coalesce(sum(use_count), 0) FROM "
+                                        "auth.enrollment_tokens") == "0");
+            }
+            // Cleared so the next iteration's auto-approve rule is the only one.
+            if (path == Path::auto_approve)
+                REQUIRE(h.auto_approve.remove_rule(0).status ==
+                        yuzu::server::auth::RuleEdit::Status::ok);
+        }
+    }
+
+    // Counted as reason=charset on each surface, once per refusal (two paths each).
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", {{"reason", "charset"}}).value() ==
+          2.0);
+    CHECK(h.metrics
+              .counter("yuzu_register_invalid_agent_id_total",
+                       {{"reason", "charset"}, {"source", "gateway_proxy"}})
+              .value() == 2.0);
+    CHECK(count_scalar(dsn, "SELECT count(*) FROM auth.pending_agents") == "0");
+}
+
 TEST_CASE("is_valid_new_agent_id: the charset table", "[agent_service][agent_id_charset]") {
     using yuzu::server::auth::is_valid_new_agent_id;
     using yuzu::server::auth::kMaxAgentIdLength;
