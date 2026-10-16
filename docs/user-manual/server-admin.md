@@ -5181,7 +5181,7 @@ An agent id seen for the first time must also use only letters, digits, `.`, `_`
 
 `/groups` (first entry of the **Estate** group in the navigation) puts the three enrolment panels on one page: **Agents waiting for approval**, **Auto-approve rules** and **Enrolment tokens**. A fourth panel, **Management groups**, only points to Settings, where management groups are still managed. The panels are the Settings fragments below, served by the same routes; the page adds no endpoint of its own beyond the page and its script.
 
-The page opens for every signed-in user and redirects to `/login` without a session. Each panel needs the Administrator account role, so a user without it sees "Not available to your account" and the reason in each panel instead of a list.
+The page opens for every signed-in user and redirects to `/login` without a session. Each panel needs the Administrator account role, so a user without it sees "Not available to your account" and the reason in each panel instead of a list. A refused browser session writes no denied-access audit row for any of the three panels (they load automatically, and the queue reloads whenever an agent arrives, so a page view must not fill the audit log); a refused API or MCP token that reaches a fragment URL does, and so does every refused write.
 
 | Method | Route | Description |
 |---|---|---|

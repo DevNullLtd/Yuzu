@@ -24,7 +24,7 @@ The agent will attempt registration, receive a "pending" status, and retry perio
 
 **Server side (dashboard):** Navigate to **Estate > Groups and enrolment** (panel **Agents waiting for approval**) or **Settings > Pending Agent Approvals**; both show the same queue. The page is named "Groups and enrolment" (UK spelling); the Settings panels keep their existing US-spelling names. Each entry shows the agent's hostname, OS, architecture, version and the time it first asked to join (UTC). Click **Approve**, **Deny**, or **Forget** (removes a waiting request; the agent is queued again the next time it asks to join). A denied agent stays listed as **Denied** ("denial recorded") with no button: the page cannot reverse a denial, and the **Deny all** confirmation says so. **Approve all** and **Deny all** act on every waiting agent, including any that arrive after the page loaded, and their confirmation gives the total and the first ten hostnames. At most 200 rows are listed (waiting agents first, then denied); when more than 200 agents are waiting, the panel says "Showing 200 of N" and the two bulk buttons are disabled, because they would also act on the agents not shown.
 
-The page opens for any signed-in user, but the three panels need the Administrator account role; other users see "Not available to your account" in each panel.
+The page opens for any signed-in user, but the three panels need the Administrator account role; other users see "Not available to your account" in each panel, and those page views write no denied-access audit rows.
 
 **Server side (API):**
 
