@@ -340,6 +340,42 @@ TEST_CASE("tar parse_ts_param_strict: refuses what the lenient parser reads as u
     CHECK_FALSE(parse_ts_param_strict("-5"));
 }
 
+TEST_CASE("tar parse_ts_param_strict: refuses a calendar-impossible date", "[tar][tree][parse]") {
+    // The lenient parser rolls these into the next month; the strict one must refuse them.
+    CHECK_FALSE(parse_ts_param_strict("2026-02-31T00:00"));
+    CHECK_FALSE(parse_ts_param_strict("2026-02-29T00:00")); // 2026 is not a leap year
+    CHECK_FALSE(parse_ts_param_strict("2026-04-31T00:00:00"));
+    CHECK_FALSE(parse_ts_param_strict("2100-02-29T00:00")); // divisible by 100, not by 400
+    CHECK(parse_ts_param_strict("2028-02-29T00:00").has_value()); // leap year
+    CHECK(parse_ts_param_strict("2000-02-29T00:00").has_value()); // divisible by 400
+    CHECK(parse_ts_param_strict("2026-04-30T23:59:59").has_value());
+    CHECK(parse_ts_param_strict("2026-01-31T00:00").has_value());
+    CHECK_FALSE(parse_ts_param_strict("2028-02-30T00:00")); // 30 Feb never exists
+    CHECK(parse_ts_param_strict("2026-02-28T00:00").has_value());
+    CHECK(parse_ts_param_strict("2026-12-31T23:59:59").has_value());
+    // Month 00 and 13 stay out of the day-length table; the lenient range check refuses them.
+    CHECK_FALSE(parse_ts_param_strict("2026-00-31T00:00"));
+    CHECK_FALSE(parse_ts_param_strict("2026-13-31T00:00"));
+    // has_value() cannot see a roll-over, so pin the leap day to the day before March 1st.
+    const auto leap_day = parse_ts_param_strict("2028-02-29T00:00");
+    const auto march_first = parse_ts_param_strict("2028-03-01T00:00");
+    REQUIRE(leap_day);
+    REQUIRE(march_first);
+    CHECK(*leap_day + 86400 == *march_first);
+}
+
+TEST_CASE("tar parse_ts_param_strict: every month accepts its last day and refuses the next",
+          "[tar][tree][parse]") {
+    constexpr int kLastDay[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}; // 2026
+    const auto two = [](int n) { return std::string(n < 10 ? "0" : "") + std::to_string(n); };
+    for (int m = 1; m <= 12; ++m) {
+        const std::string ym = "2026-" + two(m) + "-";
+        INFO("month " << m);
+        CHECK(parse_ts_param_strict(ym + two(kLastDay[m - 1]) + "T00:00").has_value());
+        CHECK_FALSE(parse_ts_param_strict(ym + two(kLastDay[m - 1] + 1) + "T00:00"));
+    }
+}
+
 TEST_CASE("tar anchors: non-positive ts cannot poison observed_since", "[tar][tree][anchor]") {
     std::vector<TarProcEvent> e{ev(0, "started", 9, 0, "garbage"),     // ts<=0 ignored
                                 ev(-5, "started", 8, 0, "garbage"),    // negative ignored
