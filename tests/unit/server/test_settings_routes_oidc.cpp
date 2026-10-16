@@ -640,7 +640,7 @@ TEST_CASE("Settings OIDC: an elevated-only session is refused and audited; nothi
     h.cfg.oidc_issuer = "https://orig.example";
 
     auto res = h.sink.Post("/api/settings/oidc",
-                           "issuer=https://evil.example&client_id=cid&client_secret=s&redirect_uri="
+                           "issuer=https://evil.example&client_id=cid&client_secret=s&redirect_uri=https://yuzu.example/auth/callback"
                            "&admin_group=evil-group&skip_tls_verify=false",
                            "application/x-www-form-urlencoded");
     REQUIRE(res);
@@ -664,7 +664,7 @@ TEST_CASE("Settings OIDC: an elevated-only session leaves the stored settings un
     h.session_user = "mallory";
     h.session_role = auth::Role::user;
     auto res = h.sink.Post("/api/settings/oidc",
-                           "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri="
+                           "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri=https://yuzu.example/auth/callback"
                            "&admin_group=evil-group&skip_tls_verify=false",
                            "application/x-www-form-urlencoded");
     REQUIRE(res);
@@ -677,7 +677,7 @@ TEST_CASE("Settings OIDC: an elevated-only session leaves the stored settings un
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
     res = h.sink.Post("/api/settings/oidc",
-                      "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri="
+                      "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri=https://yuzu.example/auth/callback"
                       "&admin_group=group-1&skip_tls_verify=false",
                       "application/x-www-form-urlencoded");
     REQUIRE(res);
@@ -689,7 +689,7 @@ TEST_CASE("Settings OIDC: an elevated-only session leaves the stored settings un
     h.session_user = "oidc:https://idp.example|u-123";
     h.session_role = auth::Role::admin;
     res = h.sink.Post("/api/settings/oidc",
-                      "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri="
+                      "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri=https://yuzu.example/auth/callback"
                       "&admin_group=group-2&skip_tls_verify=false",
                       "application/x-www-form-urlencoded");
     REQUIRE(res);

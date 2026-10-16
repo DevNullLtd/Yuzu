@@ -710,7 +710,7 @@ TEST_CASE("OIDC discovery route: a full login works with endpoints and JWKS from
 
     auto cb = rig.get(a, rig.callback_path(*start));
     CHECK(cb->status == 302);
-    CHECK(cb->get_header_value("Location") == "/");
+    CHECK(cb->get_header_value("Location") == "/home");
     CHECK(has_cookie_named(*cb, "yuzu_session="));
     const auto events = rig.fix.audit_events(1);
     REQUIRE_FALSE(events.empty());
@@ -847,7 +847,7 @@ TEST_CASE(
     Browser ok_browser;
     const auto ok_flow = rig.start(ok_browser, "alice-sub");
     auto ok = rig.callback(ok_browser, ok_flow);
-    REQUIRE(ok->get_header_value("Location") == "/");
+    REQUIRE(ok->get_header_value("Location") == "/home");
     REQUIRE(has_cookie_named(*ok, "yuzu_session="));
 
     // Fault: drop the durable session schema so the next INSERT fails.
