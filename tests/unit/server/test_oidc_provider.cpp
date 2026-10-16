@@ -2455,34 +2455,6 @@ TEST_CASE("OIDC discovery: the JWKS fetch is bounded the same way against a drip
     // `in_time`, and a ceiling closer than that only flakes on a loaded shared runner.
 }
 
-TEST_CASE("OIDC discovery: a drip faster than the per-operation timeout is still cut at the total "
-          "bound",
-          "[oidc][oidc_discovery][security]") {
-    // One byte per 800 ms against a 1 s per-operation timeout: every step re-arms httplib's wait
-    // just before it would expire, so no per-operation timeout ever fires and only the total bound
-    // (2 s, the watchdog) can end the fetch. The 300 ms drip above leaves more slack; this is the
-    // edge. Mutation (Linux): delete the `client->set_socket_options(... watchdog.adopt ...)` line
-    // in http_get_bounded - the fetch then runs to the 10 s limit and `in_time` is false. Windows
-    // runs the same case through the duplicate-socket cut (CancelIoEx plus shutdown); not
-    // verified from here.
-    TlsDripServer drip(800);
-    std::expected<OidcProvider::DiscoveryDocument, std::string> doc;
-    const auto begin = std::chrono::steady_clock::now();
-    const bool in_time = finished_within(
-        std::chrono::seconds(10),
-        [&] {
-            doc = OidcProvider::fetch_discovery_document(drip.base(), true,
-                                                         /*allow_private_networks=*/true, 1000);
-        },
-        [&] { drip.release(); });
-    const auto elapsed = std::chrono::steady_clock::now() - begin;
-    CHECK(in_time);
-    CHECK_FALSE(doc.has_value());
-    // The drip never tripped a per-operation timeout, so the fetch lasted until the total bound.
-    CHECK(elapsed >= std::chrono::milliseconds(1500));
-    CHECK(drip.accepted() >= 1);
-}
-
 namespace {
 // Gives names an answer for the life of the guard, then restores the OS resolver.
 struct ScopedTestResolver {

@@ -263,7 +263,7 @@ public:
     /// this instance's binding SHA-256 fail exactly as a broken crypto provider would;
     /// `add_test_pending_flow` plants a pending flow with a chosen binding hash (hex), bypassing
     /// `start_auth_flow`, so the stored-hash validation can be driven with a value no honest
-    /// flow stores. TEST-ONLY: none of the nine test seams in this block (these two,
+    /// flow stores. TEST-ONLY: none of the test seams in this block (these two,
     /// `set_http_timeouts_for_test`, `set_discovery_negative_cache_for_test`,
     /// `set_resolver_for_test`, `set_jwks_key_age_for_test`, `age_jwks_keys_for_test`,
     /// `clear_nat64_discovery_cache_for_test` and `pending_flow_count_for_test`) has

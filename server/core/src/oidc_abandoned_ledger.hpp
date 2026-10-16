@@ -33,7 +33,14 @@ public:
     using IsComplete = std::function<bool(const Request&)>;
 
     AbandonedRequestLedger(std::size_t max, IsComplete is_complete)
-        : max_(max), is_complete_(std::move(is_complete)) {}
+        : max_(max), is_complete_(std::move(is_complete)) {
+        // The abandoned list can never hold more than `max_` entries (try_reserve refuses when
+        // abandoned plus in-flight reach it), so reserving that many up front means the move
+        // into it in `abandon` never allocates and so cannot throw while a lookup is still
+        // pending. Without it a failed allocation there would destroy the one request the OS may
+        // still write into.
+        abandoned_.reserve(max_);
+    }
     AbandonedRequestLedger(const AbandonedRequestLedger&) = delete;
     AbandonedRequestLedger& operator=(const AbandonedRequestLedger&) = delete;
 
@@ -56,12 +63,21 @@ public:
     }
 
     /// A reserved request could not be cancelled in time: the ledger takes ownership and keeps it
-    /// until `is_complete` says its operation is over.
-    void abandon(std::unique_ptr<Request> request) {
+    /// until `is_complete` says its operation is over. Never destroys a live request: the storage
+    /// is reserved by the constructor so the move cannot allocate. `noexcept`, so the one thing
+    /// that could still throw (locking the mutex, which only fails on a broken process) ends the
+    /// program instead of freeing a request the operating system may still write into.
+    void abandon(std::unique_ptr<Request> request) noexcept {
         std::lock_guard lock(mu_);
+        abandoned_.push_back(std::move(request));
         if (in_flight_ > 0)
             --in_flight_;
-        abandoned_.push_back(std::move(request));
+    }
+
+    /// Capacity of the abandoned list, for the test that pins the up-front reservation.
+    [[nodiscard]] std::size_t abandoned_capacity_for_test() const {
+        std::lock_guard lock(mu_);
+        return abandoned_.capacity();
     }
 
     /// Requests currently owned (not yet seen complete by a sweep).

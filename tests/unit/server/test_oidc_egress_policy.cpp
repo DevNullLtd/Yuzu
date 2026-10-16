@@ -929,6 +929,28 @@ TEST_CASE("OIDC egress: stuck resolver requests bound the ledger - a new lookup 
     CHECK_FALSE(ledger.try_reserve()); // 2 abandoned + 1 in flight == 3
 }
 
+TEST_CASE("OIDC egress: the ledger reserves its storage up front so abandoning cannot allocate",
+          "[oidc][oidc_egress][security]") {
+    // `abandon` takes the last owner of a request the operating system may still write into. A
+    // push_back that had to grow the list could throw (bad_alloc) and destroy that request, so
+    // the whole capacity is reserved by the constructor and filling the ledger never reallocates.
+    // Mutation: remove `abandoned_.reserve(max_)` in the constructor - the capacity check fails.
+    constexpr std::size_t kMax = 16;
+    std::atomic<int> destroyed{0};
+    FakeLedger ledger = make_ledger(kMax);
+    const std::size_t reserved = ledger.abandoned_capacity_for_test();
+    CHECK(reserved >= kMax);
+    for (std::size_t i = 0; i < kMax; ++i) {
+        REQUIRE(ledger.try_reserve());
+        FakeLedger::Slot slot(ledger);
+        slot.abandon(std::make_unique<FakeRequest>(&destroyed));
+        CHECK(ledger.abandoned_capacity_for_test() == reserved); // no reallocation, ever
+    }
+    CHECK(ledger.abandoned_count() == kMax);
+    CHECK_FALSE(ledger.try_reserve()); // full: the next lookup fails closed
+    CHECK(destroyed.load() == 0);      // nothing was freed while the requests were still live
+}
+
 TEST_CASE("OIDC egress: handing a request to the ledger gives its slot back exactly once",
           "[oidc][oidc_egress][security]") {
     // `abandon` frees the slot itself; the Slot's destructor must then NOT finish() a second time,

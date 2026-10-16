@@ -1211,10 +1211,9 @@ discovered_nat64_prefixes(int dns_timeout_ms) {
         }
         // A failed lookup changes nothing (an earlier overflow stays in force).
         cache.filled = true;
-        cache.expires =
-            std::chrono::steady_clock::now() +
-            (answered && !cache.overflowed && !cache.prefixes.empty() ? kNat64PositiveTtl
-                                                                      : kNat64NegativeTtl);
+        cache.expires = std::chrono::steady_clock::now() +
+                        (answered && !cache.overflowed && !found.empty() ? kNat64PositiveTtl
+                                                                         : kNat64NegativeTtl);
         if (!cache.overflowed)
             result = cache.prefixes;
     }
