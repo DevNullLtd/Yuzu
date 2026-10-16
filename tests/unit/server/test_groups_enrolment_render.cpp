@@ -582,7 +582,9 @@ TEST_CASE("enrolment rules: rule text is honest about what is matched",
     // The cloud provider is the agent's own claim (a bare compare), not an attestation.
     CHECK_THAT(html, ContainsSubstring("Agent-reported provider <code>aws</code> (not verified)"));
     CHECK_THAT(html, !ContainsSubstring("Attestation provider"));
-    CHECK_THAT(html, ContainsSubstring("Address rules match IPv4 only."));
+    CHECK_THAT(html, ContainsSubstring("Address rules match IPv4 only, and never match an agent "
+                                       "that enrols through a gateway (no address is passed on)."));
+    CHECK(count_of(html, "enrols through a gateway") == 1); // one hint paragraph, not per row
     CHECK_THAT(html, !ContainsSubstring("Matches every agent"));
     // Index-keyed routes, as the engine addresses rules by list position.
     CHECK_THAT(html, ContainsSubstring("hx-post=\"/api/settings/auto-approve/3/toggle\""));

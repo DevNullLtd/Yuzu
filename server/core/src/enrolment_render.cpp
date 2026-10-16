@@ -508,7 +508,11 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
         html += "</tbody></table></div>";
     }
 
-    html += "<p class=\"hint pad\">Address rules match IPv4 only. Hostnames and cloud providers are "
+    // An agent enrolling through a gateway reaches the server with no peer address
+    // (gateway_service_impl.cpp registers it with an empty one), so an address rule can never
+    // match it; saying so keeps an operator from reading "no match" as "rule misconfigured".
+    html += "<p class=\"hint pad\">Address rules match IPv4 only, and never match an agent that "
+            "enrols through a gateway (no address is passed on). Hostnames and cloud providers are "
             "reported by the agent and are not verified. A CA fingerprint rule never matches at "
             "this release.</p>";
 
