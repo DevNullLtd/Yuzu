@@ -1520,6 +1520,18 @@ jobs:
       # leaf of the same CA that is not pinned must be refused). Agents reach the gateway over
       # one-way TLS and enrol for a per-agent leaf.
       #
+      # The OTHER hop, server -> gateway management listener (the privileged command plane, #5175), is
+      # covered too, in the production posture: strict mutual TLS, auth_fun
+      # yuzu_gw_authz:check_mgmt_peer/1 and mgmt_peer_pins = the server's default leaf, the server
+      # pointed at it with --gateway-command-addr. The script dispatches commands to the real agent
+      # through the server's REST API (one round trip, then a 300-command burst over the server's one
+      # management connection, each required to return the agent's SUCCESS), and
+      # yuzu_gw_real_mgmt_SUITE dials the same listener as the server would and as the peers the pin
+      # must refuse (the gateway's own leaf and an enrolled agent's leaf: valid certificates of the
+      # same CA, UNAUTHENTICATED), plus SendCommand over one connection, the deadline-passes-first
+      # and the cancelled-stream paths. Both logs are then grepped for the #5175 signature
+      # (function_clause / crash reports in the gateway, 'Socket closed' in the server).
+      #
       # Runs on the gcc-15/debug leg only (the one that already carries pg_mode=full and the PR
       # fast path): the gateway release and the Common Test profile are built here, so the cost is
       # a few minutes per leg, and the wire behaviour under test does not depend on the server's

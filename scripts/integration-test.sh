@@ -26,10 +26,22 @@
 #       gateway over one-way TLS and enrol for a per-agent leaf. The script
 #       asserts the server booted enforcing with the gateway leaf's SPKI prefix,
 #       and that the gateway was never denied.
+#       --tls also covers the OTHER hop, server -> gateway (the privileged command
+#       plane, #5175): the gateway's management listener runs in the production
+#       posture (strict mutual TLS, auth_fun yuzu_gw_authz:check_mgmt_peer/1, and
+#       mgmt_peer_pins naming the server's default leaf), the server is pointed at
+#       it with --gateway-command-addr, and the script dispatches commands to the
+#       real agent through the server's REST API: one round trip, then a burst
+#       multiplexed over the server's single management connection. It asserts
+#       every one completed with the agent's SUCCESS and that neither side logged
+#       a crash or a transport error.
 #
 # --gateway-ct runs gateway/apps/yuzu_gw/integration_test/yuzu_gw_real_upstream_SUITE
 # (Common Test) against this stack's real server, over the same pinned TLS hop in
-# --tls mode (#5652, #5653). Its result counts as a test result of this script.
+# --tls mode (#5652, #5653); in --tls mode it also runs yuzu_gw_real_mgmt_SUITE
+# against the gateway's management listener (an unpinned leaf of the same CA is
+# refused; SendCommand streams, the deadline and the cancel paths). Their results
+# count as test results of this script.
 #
 # --free-ports takes every port from the OS (one allocation call, so no two are
 # equal) instead of the 5005x/5006x defaults, which makes concurrent runs on one
@@ -475,9 +487,18 @@ if $USE_TLS; then
     log "TLS mode: server default certificates under $CA_DIR, automatic gateway pin"
     PEER_FLAGS=""
     TLS_AGENT_FLAGS="--ca-cert $CA_DIR/default-ca.pem"
+    # The command plane: the server forwards every gateway-routed command to the
+    # gateway's management listener over mutual TLS, presenting its own default
+    # leaf, which the gateway pins (mgmt_peer_pins, below).
+    #
+    # The REST per-IP limit (100 requests/s by default) is raised: the burst below
+    # is the load under test, and with the default the limiter answers 429 for
+    # most of it, so the commands never overlap on the management connection.
+    MGMT_FLAGS="--gateway-command-addr 127.0.0.1:$GW_MGMT_PORT --rate-limit 10000"
 else
     PEER_FLAGS="--no-tls --insecure-gateway-peer"
     TLS_AGENT_FLAGS="--no-tls"
+    MGMT_FLAGS=""
 fi
 
 # ── Per-run database and server config (own-stack only) ───────────────
@@ -569,6 +590,7 @@ if ! $REUSE_STACK; then
         --gateway-mode \
         --gateway-upstream "127.0.0.1:$SERVER_GW_PORT" \
         $PEER_FLAGS \
+        $MGMT_FLAGS \
         > "$WORK_DIR/server.log" 2>&1 &
     SERVER_PID=$!
     log "  Server PID: $SERVER_PID"
@@ -627,11 +649,21 @@ if $USE_TLS; then
     # The production shape (deploy/docker/reference-gateway-sys.config): one-way TLS
     # for agents (an unenrolled agent has no client certificate yet) and an https
     # upstream channel with verify_peer, the install CA and the gateway leaf as the
-    # client certificate. The server pins that leaf's SPKI. The management plane is
-    # not started: nothing in this script dispatches commands.
+    # client certificate. The server pins that leaf's SPKI.
+    #
+    # The management listener is the production one (the `mgmt' entry of
+    # deploy/docker/reference-gateway-sys.config): strict mutual TLS (verify and
+    # fail_if_no_peer_cert left at their defaults, which the boot guard requires to
+    # be verify_peer / true), auth_fun yuzu_gw_authz:check_mgmt_peer/1, and
+    # mgmt_peer_pins naming the SERVER's default leaf as a `cert_file' pin, the
+    # shipped form: the gateway pins that leaf's SPKI and requires serverAuth. The
+    # gateway's own leaf (a valid certificate of the same CA, serverAuth included)
+    # is therefore NOT admitted on it, which the Common Test suite checks. It binds
+    # loopback; the limits and http2 values are the shipped ones.
     cat > "$GW_SYS_CONFIG" << ERLCFG
 [
     {yuzu_gw, [$GW_COMMON_CFG
+        {mgmt_peer_pins, [{cert_file, "$CA_DIR/default-server.pem"}]},
         {grpc_listeners, [
             #{name => agent,
               service_protos => [agent_pb],
@@ -643,7 +675,19 @@ if $USE_TLS; then
                        verify => verify_none,
                        fail_if_no_peer_cert => false},
               acceptors => 4,
-              http2 => #{idle_timeout => 180000, max_concurrent_streams => 32}}
+              http2 => #{idle_timeout => 180000, max_concurrent_streams => 32}},
+            #{name => mgmt,
+              service_protos => [management_pb],
+              services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
+              listen => #{port => $GW_MGMT_PORT, ip => {127,0,0,1}},
+              tls => #{certfile   => "$CA_DIR/default-gateway.pem",
+                       keyfile    => "$CA_DIR/default-gateway.key",
+                       cacertfile => "$CA_DIR/default-ca.pem"},
+              auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1,
+              acceptors => 4,
+              limits => #{max_connections => 256, max_message_bytes => 4194304},
+              http2 => #{idle_timeout => 600000, max_concurrent_streams => 1024,
+                         max_received_frame_rate => {100000, 10000}}}
         ]},
         {upstream_client, #{channels => [
             {default_channel, [{https, "127.0.0.1", $SERVER_GW_PORT, [
@@ -736,6 +780,11 @@ log "  Gateway PID: $GATEWAY_PID"
 # startup is usually 1-2s but can be slower on cold BEAM VM. wait_for_port
 # returns as soon as the port accepts connections.
 if ! wait_for_port "$GW_AGENT_PORT" "Gateway agent-facing gRPC" 30; then
+    echo "--- gateway.log ---"
+    cat "$WORK_DIR/gateway.log"
+    exit 1
+fi
+if $USE_TLS && ! wait_for_port "$GW_MGMT_PORT" "Gateway management gRPC (pinned mTLS)" 30; then
     echo "--- gateway.log ---"
     cat "$WORK_DIR/gateway.log"
     exit 1
@@ -1273,6 +1322,198 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════
+# PHASE 5a: The management hop — server -> gateway :$GW_MGMT_PORT -> agent (#5175)
+# ══════════════════════════════════════════════════════════════════════
+# The server dials the gateway's management listener for every command it routes
+# to a gateway-connected agent. That listener is the privileged command plane, so
+# it runs here in the production posture (see the gateway sys.config above):
+# strict mutual TLS and an SPKI pin on the server's leaf. #5175 was an h2 stream
+# crash on exactly this call (every SendCommand reached the server as 'Socket
+# closed' with no gRPC status). The commands below go through the server's REST
+# API, so the real server's real gRPC client makes the calls: one round trip, then
+# a burst whose streams are all multiplexed over the server's one connection.
+# The listener's refusals and the deadline/cancel paths, which the server cannot
+# drive (it always sends a 300 s deadline and never cancels), are in
+# yuzu_gw_real_mgmt_SUITE (Phase 5b).
+MGMT_BURST=300
+MGMT_CONCURRENCY=16
+if $USE_TLS && ! $REUSE_STACK; then
+    log ""
+    log "Test Category: server -> gateway management hop (pinned mutual TLS)"
+
+    # Boot facts: the server forwards over mutual TLS to the address it was given,
+    # and the gateway's management listener came up with TLS and the pin hook.
+    assert_contains "Server forwards commands to the gateway over mutual TLS" \
+        "Gateway command forwarding enabled: 127.0.0.1:$GW_MGMT_PORT (mutual TLS)" \
+        "$(cat "$SERVER_LOG_PATH" 2>/dev/null || true)"
+    assert_contains "Gateway management listener is up with TLS and the pin auth_fun" \
+        "grpc listener mgmt up on port $GW_MGMT_PORT (tls=true, auth_fun=true" \
+        "$(cat "$GATEWAY_LOG_PATH" 2>/dev/null || true)"
+    GW_METRICS_BEFORE=$(curl -sf --max-time 5 "http://127.0.0.1:$GW_METRICS_PORT/metrics" 2>/dev/null || echo "")
+    assert_contains "Gateway scrapes (management auth counters are registered)" \
+        "yuzu_gw_mgmt_auth_rejected_total" "$GW_METRICS_BEFORE"
+    assert_eq "No management pin is unresolved (the server leaf file is read)" "0" \
+        "$(awk '/^yuzu_gw_mgmt_auth_pin_unresolved_total/ { sum += $NF } END { print sum + 0 }' \
+            <<< "$GW_METRICS_BEFORE")"
+
+    MGMT_DRIVER="$WORK_DIR/mgmt_driver.py"
+    cat > "$MGMT_DRIVER" << 'MGMTPY'
+#!/usr/bin/env python3
+# Dispatches os_info.os_name to one agent through the server's REST API and waits
+# for each command's terminal SUCCESS. Stdlib only (the Rocky/RHEL python is 3.9).
+#   mgmt_driver.py <web-port> <agent-id> <user> <password> <burst> <concurrency>
+# Prints KEY=value lines; exits 1 if anything failed.
+import http.client, json, sys, threading, time, urllib.parse
+
+port, agent, user, password, burst, conc = (
+    int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), int(sys.argv[6]))
+ORIGIN = "http://127.0.0.1:%d" % port
+TERMINAL_OK = (1, "SUCCESS")
+TERMINAL_BAD = (2, 3, 4, "FAILURE", "TIMEOUT", "REJECTED")
+
+
+def connect():
+    return http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+
+
+def login():
+    c = connect()
+    c.request("POST", "/login",
+              body=urllib.parse.urlencode({"username": user, "password": password}),
+              headers={"Content-Type": "application/x-www-form-urlencoded"})
+    r = c.getresponse()
+    r.read()
+    cookies = [v.split(";", 1)[0] for k, v in r.getheaders() if k.lower() == "set-cookie"]
+    c.close()
+    if not any(x.startswith("yuzu_session=") for x in cookies):
+        print("FATAL=login returned no session cookie (HTTP %d)" % r.status)
+        sys.exit(1)
+    return "; ".join(cookies)
+
+
+COOKIE = login()
+
+
+def call(c, method, path, body=None):
+    headers = {"Cookie": COOKIE, "Origin": ORIGIN}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    c.request(method, path, body=body, headers=headers)
+    r = c.getresponse()
+    data = r.read()
+    try:
+        return r.status, json.loads(data)
+    except ValueError:
+        return r.status, {"raw": data[:200].decode("utf-8", "replace")}
+
+
+def one(c):
+    """Dispatch one command and wait for its terminal state. Returns (outcome, ms, detail)."""
+    t0 = time.time()
+    body = json.dumps({"plugin": "os_info", "action": "os_name", "agent_ids": [agent]})
+    status, resp = call(c, "POST", "/api/command", body)
+    cid = resp.get("command_id") if isinstance(resp, dict) else None
+    if status != 200 or not cid:
+        return "DISPATCH_FAILED", 0, "HTTP %s %s" % (status, json.dumps(resp)[:200])
+    deadline = t0 + 60
+    last = None
+    while time.time() < deadline:
+        status, resp = call(c, "GET", "/api/responses/" + cid)
+        last = resp
+        for x in resp.get("responses", []) if isinstance(resp, dict) else []:
+            st = x.get("status")
+            if st in TERMINAL_OK and x.get("output"):
+                return "SUCCESS", int((time.time() - t0) * 1000), x.get("output", "")[:80]
+            if st in TERMINAL_BAD:
+                return "BAD_TERMINAL", int((time.time() - t0) * 1000), json.dumps(x)[:200]
+        time.sleep(0.05)
+    return "TIMEOUT", int((time.time() - t0) * 1000), json.dumps(last)[:300]
+
+
+# One command first: it prints what a response looks like, and proves the path.
+c = connect()
+outcome, ms, detail = one(c)
+print("ROUNDTRIP_OUTCOME=%s" % outcome)
+print("ROUNDTRIP_MS=%d" % ms)
+print("ROUNDTRIP_DETAIL=%s" % detail.replace("\n", " "))
+if outcome != "SUCCESS":
+    sys.exit(1)
+
+# Then the burst: `conc` workers, each with its own REST connection; the server
+# sends all of them to the gateway over its single management channel.
+counts, times, errors = {}, [], []
+lock = threading.Lock()
+todo = [burst]
+
+
+def worker():
+    cw = connect()
+    while True:
+        with lock:
+            if todo[0] <= 0:
+                return
+            todo[0] -= 1
+        try:
+            o, t, d = one(cw)
+        except Exception as e:  # noqa: BLE001 - the harness reports every failure
+            o, t, d = "EXCEPTION", 0, repr(e)
+            cw = connect()
+        with lock:
+            counts[o] = counts.get(o, 0) + 1
+            if o == "SUCCESS":
+                times.append(t)
+            elif len(errors) < 5:
+                errors.append("%s: %s" % (o, d))
+
+
+t0 = time.time()
+threads = [threading.Thread(target=worker) for _ in range(conc)]
+[t.start() for t in threads]
+[t.join() for t in threads]
+elapsed = int((time.time() - t0) * 1000)
+times.sort()
+print("BURST_TOTAL=%d" % burst)
+print("BURST_SUCCESS=%d" % counts.get("SUCCESS", 0))
+print("BURST_ELAPSED_MS=%d" % elapsed)
+if times:
+    print("BURST_P50_MS=%d" % times[len(times) // 2])
+    print("BURST_MAX_MS=%d" % times[-1])
+for e in errors:
+    print("BURST_ERROR=%s" % e)
+sys.exit(0 if counts.get("SUCCESS", 0) == burst else 1)
+MGMTPY
+
+    log "  Dispatching 1 + $MGMT_BURST commands through the server's REST API ($MGMT_CONCURRENCY at a time)..."
+    MGMT_RC=0
+    python3 "$MGMT_DRIVER" "$SERVER_WEB_PORT" "integration-agent-1" admin adminpassword1 \
+        "$MGMT_BURST" "$MGMT_CONCURRENCY" > "$WORK_DIR/mgmt_driver.log" 2>&1 || MGMT_RC=$?
+    cat "$WORK_DIR/mgmt_driver.log" | sed 's/^/    /'
+    mgmt_field() { sed -n "s/^$1=//p" "$WORK_DIR/mgmt_driver.log" | head -1; }
+    assert_eq "REST command reached the real agent through the management hop and returned SUCCESS" \
+        "SUCCESS" "$(mgmt_field ROUNDTRIP_OUTCOME)"
+    assert_eq "Every command of the burst over the one management connection completed SUCCESS" \
+        "$MGMT_BURST" "$(mgmt_field BURST_SUCCESS)"
+    assert_eq "The driver exited clean" "0" "$MGMT_RC"
+
+    # The server's own account of the forwards: every one 'ok', none of the
+    # failure statuses (unavailable, unauthenticated, other, unknown_cluster, ...).
+    SERVER_METRICS=$(curl -sf --max-time 5 "http://127.0.0.1:$SERVER_WEB_PORT/metrics" 2>/dev/null || echo "")
+    FWD_OK=$(awk '/^yuzu_server_gateway_forward_total\{.*status="ok"\}/ { sum += $NF } END { print sum + 0 }' \
+        <<< "$SERVER_METRICS")
+    FWD_BAD=$(awk '/^yuzu_server_gateway_forward_total\{/ && !/status="ok"/ { sum += $NF } END { print sum + 0 }' \
+        <<< "$SERVER_METRICS")
+    assert_eq "Server counted every forwarded command as ok" "$((MGMT_BURST + 1))" "${FWD_OK%.*}"
+    assert_eq "Server counted no forward as failed" "0" "${FWD_BAD%.*}"
+    # The gateway admitted the server's pinned leaf every time.
+    GW_METRICS_AFTER=$(curl -sf --max-time 5 "http://127.0.0.1:$GW_METRICS_PORT/metrics" 2>/dev/null || echo "")
+    assert_contains "Gateway metrics are readable after the burst" \
+        "yuzu_gw_mgmt_auth_rejected_total" "$GW_METRICS_AFTER"
+    GW_REJECTED=$(awk '/^yuzu_gw_mgmt_auth_rejected_total/ { sum += $NF } END { print sum + 0 }' \
+        <<< "$GW_METRICS_AFTER")
+    assert_eq "Gateway rejected no management call from the pinned server" "0" "${GW_REJECTED%.*}"
+fi
+
+# ══════════════════════════════════════════════════════════════════════
 # PHASE 5b: Common Test — the gateway's real upstream client against this server
 # ══════════════════════════════════════════════════════════════════════
 # yuzu_gw_real_upstream_SUITE drives the gateway's own upstream modules and gRPC
@@ -1309,17 +1550,77 @@ if $RUN_GATEWAY_CT; then
             "YUZU_REAL_UPSTREAM_REQUIRE_PIN=1"
         )
     fi
+    CT_SUITES="yuzu_gw_real_upstream_SUITE"
+    if $USE_TLS; then
+        # The gateway's management listener, dialled as the server would (its own
+        # pinned leaf) and as the peers the pin must refuse.
+        CT_SUITES="$CT_SUITES,yuzu_gw_real_mgmt_SUITE"
+        CT_ENV+=(
+            "YUZU_REAL_MGMT_STRICT=1"
+            "YUZU_MGMT_HOST=127.0.0.1"
+            "YUZU_MGMT_PORT=$GW_MGMT_PORT"
+            "YUZU_MGMT_CACERT=$CA_DIR/default-ca.pem"
+            # The leaf the gateway pins: the server's own.
+            "YUZU_MGMT_CERT=$CA_DIR/default-server.pem"
+            "YUZU_MGMT_KEY=$CA_DIR/default-server.key"
+            # Valid leaves of the same CA that are NOT pinned: the gateway's own
+            # (serverAuth present, so only the SPKI pin refuses it) and the real
+            # agent's enrolled leaf (clientAuth only).
+            "YUZU_MGMT_UNPINNED_CERT=$CA_DIR/default-gateway.pem"
+            "YUZU_MGMT_UNPINNED_KEY=$CA_DIR/default-gateway.key"
+            "YUZU_MGMT_AGENT_CERT=$WORK_DIR/agent-1/certs/agent-client.pem"
+            "YUZU_MGMT_AGENT_KEY=$WORK_DIR/agent-1/certs/agent-client.key"
+            "YUZU_MGMT_AGENT_ID=integration-agent-1"
+            "YUZU_GW_METRICS_URL=http://127.0.0.1:$GW_METRICS_PORT/metrics"
+        )
+    fi
     TESTS=$((TESTS + 1))
     if (cd "$GATEWAY_DIR" && env "${CT_ENV[@]}" rebar3 as test ct \
             --dir apps/yuzu_gw/integration_test \
-            --suite yuzu_gw_real_upstream_SUITE \
+            --suite "$CT_SUITES" \
             --logdir "$WORK_DIR/ct-logs") > "$WORK_DIR/ct.log" 2>&1; then
-        pass "yuzu_gw_real_upstream_SUITE passed against the real server"
+        pass "$CT_SUITES passed against the real server and gateway"
         grep -E "All [0-9]+ tests passed|tests passed" "$WORK_DIR/ct.log" | tail -1 || true
     else
-        fail "yuzu_gw_real_upstream_SUITE failed (see $WORK_DIR/ct.log)"
+        fail "$CT_SUITES failed (see $WORK_DIR/ct.log)"
         echo "--- ct.log (last 80 lines) ---"
         tail -80 "$WORK_DIR/ct.log"
+    fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════
+# PHASE 5c: The management hop left no failure signature on either side (#5175)
+# ══════════════════════════════════════════════════════════════════════
+# Runs after Phase 5a (a REST burst) and 5b (refusals, deadlines, cancelled
+# streams), so the logs cover all of it. The signature of #5175 is a stream
+# process crashing with function_clause in the gateway and, in the server's log,
+# `Gateway SendCommand ... unavailable (attempt N): Socket closed`. The patterns
+# are crash markers, not any line containing a word (compare Test 18).
+if $USE_TLS && ! $REUSE_STACK; then
+    log ""
+    log "Test: management-hop failure signatures (gateway and server logs)"
+    GW_SIGNATURE='function_clause|CRASH REPORT|=ERROR REPORT|Supervisor: .* terminating|\[error\]'
+    SERVER_SIGNATURE='Socket closed|Gateway SendCommand .* (unavailable|REJECTED|DROPPED)|Gateway command forwarding is CONFIGURED but not usable|Gateway command forwarding NOT enabled'
+    TESTS=$((TESTS + 1))
+    if grep -qE -- "$GW_SIGNATURE" "$GATEWAY_LOG_PATH"; then
+        fail "Gateway log shows a crash or error report after the management traffic"
+        grep -E -- "$GW_SIGNATURE" "$GATEWAY_LOG_PATH" | head -10
+    else
+        pass "Gateway log: no function_clause, crash report or [error] line"
+    fi
+    TESTS=$((TESTS + 1))
+    if grep -qE -- "$SERVER_SIGNATURE" "$SERVER_LOG_PATH"; then
+        fail "Server log shows a failed SendCommand or 'Socket closed' on the management hop"
+        grep -E -- "$SERVER_SIGNATURE" "$SERVER_LOG_PATH" | head -10
+    else
+        pass "Server log: no 'Socket closed' and no failed gateway SendCommand"
+    fi
+    TESTS=$((TESTS + 1))
+    if kill -0 "$GATEWAY_PID" 2>/dev/null && kill -0 "$SERVER_PID" 2>/dev/null \
+       && kill -0 "${AGENT_PIDS[0]}" 2>/dev/null; then
+        pass "Server, gateway and agent are all still running"
+    else
+        fail "A process of the stack died during the management traffic"
     fi
 fi
 
@@ -1390,6 +1691,7 @@ log "    Server Web:    $SERVER_WEB_PORT"
 log "    Server Agent:  $SERVER_AGENT_PORT"
 log "    Server GW:     $SERVER_GW_PORT"
 log "    Gateway Agent: $GW_AGENT_PORT"
+log "    Gateway Mgmt:  $GW_MGMT_PORT"
 log ""
 log "  Results:"
 if [[ $FAILURES -eq 0 ]]; then
@@ -1404,6 +1706,7 @@ log "Logs available in: $WORK_DIR"
 log "  server.log    — C++ server output"
 log "  gateway.log   — Erlang gateway output"
 log "  agent-N.log   — Agent N output"
+log "  mgmt_driver.log — the REST command burst through the management hop (--tls)"
 log ""
 
 # Detailed failure report if any tests failed

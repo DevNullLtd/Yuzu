@@ -31,7 +31,8 @@ The primary integration test runs all three components together:
 ./scripts/integration-test.sh --tls
 
 # What CI runs: TLS, every port taken from the OS, plus the gateway's real-upstream
-# Common Test suite (yuzu_gw_real_upstream_SUITE) against the stack's server
+# and management-listener Common Test suites (yuzu_gw_real_upstream_SUITE,
+# yuzu_gw_real_mgmt_SUITE) against the stack's server and gateway
 ./scripts/integration-test.sh --tls --free-ports --gateway-ct
 ```
 
@@ -42,8 +43,10 @@ gateway release). `--free-ports` makes concurrent runs on one host safe.
 This test:
 - Starts the C++ server in gateway mode with `--gateway-upstream`. The gateway-upstream service refuses to start without gateway peer authorization or an acknowledgement. The plaintext mode passes `--no-tls --insecure-gateway-peer` (the check is disabled, so that mode does not exercise it). `--tls` passes no acknowledgement: the server runs on its generated default certificates and enforces the automatic pin of its own `default-gateway.pem`, the leaf the gateway presents, so the gateway hop is pinned mutual TLS and the script asserts the server booted enforcing with that leaf's SPKI prefix and denied no call
 - Starts the Erlang gateway (the `rebar3 as prod release` build, on a generated `sys.config`) connecting to the server
+- With `--tls`, runs the gateway's management listener (`:50063`, the privileged command plane) in the production posture: strict mutual TLS, `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1`, and `mgmt_peer_pins` naming the server's default leaf. The server is started with `--gateway-command-addr` (and `--rate-limit 10000`, so the burst below is not answered with 429) and forwards commands over it
 - Starts N C++ agents connecting through the gateway
 - Runs ~20 test scenarios covering connectivity, registration, heartbeats, and stability
+- With `--tls`, covers the management hop (server to gateway to agent and back, #5175): it logs in to the server's REST API, dispatches `os_info.os_name` to the real agent through the gateway (one round trip, then 300 commands over the server's single management connection) and requires every command to return the agent's SUCCESS and the server to count every forward as `ok`. With `--gateway-ct`, `yuzu_gw_real_mgmt_SUITE` also dials the management listener directly: the server's pinned leaf is served, while a valid but unpinned leaf of the same CA (the gateway's own, or an enrolled agent's) is refused with `UNAUTHENTICATED` and counted in `yuzu_gw_mgmt_auth_rejected_total`; 300 `SendCommand` streams over one connection complete; and the early-end paths (unknown agent, a fan-out deadline that passes before the agent answers, cancelled streams) leave the connection serving. Afterwards the gateway log must hold no `function_clause`, crash report or `[error]` line and the server log no `Socket closed` or failed `Gateway SendCommand`
 
 ### 2. Erlang Gateway Unit Tests (EUnit)
 
