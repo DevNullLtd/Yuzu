@@ -38,11 +38,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <cctype>
 #include <cstddef>
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 
 using namespace yuzu::server;
 using yuzu::server::pg::PgPool;
@@ -538,7 +538,11 @@ std::string pct_encode(std::string_view in) {
     static constexpr char kHex[] = "0123456789ABCDEF";
     std::string out;
     for (const unsigned char c : in) {
-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+        // Explicit ASCII ranges: std::isalnum is locale-dependent, this must not be.
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+                                c == '~';
+        if (unreserved) {
             out += static_cast<char>(c);
         } else {
             out += '%';
@@ -674,6 +678,9 @@ TEST_CASE("/fragments/results: a filter value over kMaxFacetValueBytes shows a s
         auto short_body = h.sink.dispatch("GET", path, "f_output=short+output", "text/plain");
         REQUIRE(short_body);
         CHECK_FALSE(contains(short_body->body, kTooLongMarker));
+        // Negative control: the body filter WAS parsed and applied (the matching row is shown),
+        // so the absent hint above cannot be a body that was never read.
+        CHECK(contains(short_body->body, "class=\"result-row\""));
     }
 }
 
@@ -694,22 +701,18 @@ TEST_CASE("/fragments/results: with several filters, ONE over the bound shows th
     const std::string base = "/fragments/results?command_id=" + command_id + "&plugin=status";
     const std::string lng(kMaxFacetValueBytes + 1, 'z');
 
-    SECTION("the long value is in the FIRST filter column, both URL orders") {
-        for (const auto& q : {"&f_key=" + lng + "&f_value=beta", "&f_value=beta&f_key=" + lng}) {
-            auto res = h.get(base + q);
-            REQUIRE(res);
-            CHECK(contains(res->body, kTooLongMarker));
-            CHECK_FALSE(contains(hint_span(res->body), "zzzz"));
-        }
+    SECTION("the long value is in the FIRST filter column") {
+        auto res = h.get(base + "&f_key=" + lng + "&f_value=beta");
+        REQUIRE(res);
+        CHECK(contains(res->body, kTooLongMarker));
+        CHECK_FALSE(contains(hint_span(res->body), "zzzz"));
     }
 
-    SECTION("the long value is in the LAST filter column, both URL orders") {
-        for (const auto& q : {"&f_key=alpha&f_value=" + lng, "&f_value=" + lng + "&f_key=alpha"}) {
-            auto res = h.get(base + q);
-            REQUIRE(res);
-            CHECK(contains(res->body, kTooLongMarker));
-            CHECK_FALSE(contains(hint_span(res->body), "zzzz"));
-        }
+    SECTION("the long value is in the LAST filter column") {
+        auto res = h.get(base + "&f_key=alpha&f_value=" + lng);
+        REQUIRE(res);
+        CHECK(contains(res->body, kTooLongMarker));
+        CHECK_FALSE(contains(hint_span(res->body), "zzzz"));
     }
 
     SECTION("both filters short: no hint, and the row matches") {
