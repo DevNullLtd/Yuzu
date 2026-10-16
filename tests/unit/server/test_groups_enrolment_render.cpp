@@ -42,6 +42,17 @@ auth::PendingAgent agent(std::string id, std::string host,
     return {std::move(id), std::move(host), "linux", "x86_64", "1.2.3", kNow, st};
 }
 
+// Every hx-target="..." value in `html`, in order.
+std::vector<std::string> hx_targets(const std::string& html) {
+    std::vector<std::string> out;
+    const std::string key = "hx-target=\"";
+    for (auto p = html.find(key); p != std::string::npos; p = html.find(key, p + key.size())) {
+        const auto from = p + key.size();
+        out.push_back(html.substr(from, html.find('"', from) - from));
+    }
+    return out;
+}
+
 std::size_t count_of(const std::string& hay, const std::string& needle) {
     std::size_t n = 0;
     for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size()))
@@ -84,6 +95,39 @@ TEST_CASE("enrolment: utc_stamp prints out of range instead of a bogus date",
     CHECK_THAT(html, ContainsSubstring("<span class=\"pill info\">Active</span>"));
 }
 
+// The element ids are baked into the Groups template and the Settings page, and an htmx swap
+// lands in whatever hx-target names. A renderer that targeted another panel's id would drop its
+// refreshed list into the wrong panel, so every target must be the section that owns the fragment.
+TEST_CASE("enrolment: every hx-target is the section that owns the fragment",
+          "[groups][enrolment][render]") {
+    using T = auth::AutoApproveRuleType;
+    const auto check = [](const std::string& html, const std::string& section,
+                          std::size_t at_least) {
+        const auto targets = hx_targets(html);
+        INFO("section=" << section);
+        CHECK(targets.size() >= at_least); // not vacuous: the buttons and forms are really there
+        for (const auto& t : targets)
+            CHECK(t == section);
+    };
+
+    const std::vector<auth::EnrollmentToken> toks = {token("aaaaaaaa", "live"),
+                                                     token("bbbbbbbb", "gone", 0, 0, true)};
+    // Done + Revoke + the generate form.
+    check(render_tokens(&toks, "secret", kNow), "#token-section", 3);
+    check(render_tokens(nullptr, "", kNow), "#token-section", 0);
+
+    const std::vector<auth::PendingAgent> agents = {agent("one", "h1"), agent("two", "h2"),
+                                                    agent("three", "h3", auth::PendingStatus::denied)};
+    // Approve + Deny + Forget for two rows, then Approve all and Deny all.
+    check(render_pending(&agents), "#pending-section", 8);
+
+    const std::vector<auth::AutoApproveRule> rules = {{T::hostname_glob, "a.corp", "", true},
+                                                      {T::ip_subnet, "10.0.0.0/8", "", false}};
+    // The other match mode, Toggle + Remove for two rules, and the Add form.
+    check(render_auto_approve(rules, false), "#auto-approve-section", 6);
+    check(render_auto_approve(rules, true), "#auto-approve-section", 6);
+}
+
 TEST_CASE("enrolment: match-everything detection", "[groups][enrolment][render]") {
     using T = auth::AutoApproveRuleType;
     // warns
@@ -108,7 +152,7 @@ TEST_CASE("enrolment: match-everything detection", "[groups][enrolment][render]"
 
 // ── tokens ──────────────────────────────────────────────────────────────────
 
-TEST_CASE("enrolment tokens: an unanswered store is a failbox, never an empty table",
+TEST_CASE("enrolment tokens: an unanswered store is a failbox; never an empty table",
           "[groups][enrolment][render]") {
     const auto html = render_tokens(nullptr, "", kNow);
     CHECK_THAT(html, ContainsSubstring("failbox"));
@@ -126,7 +170,7 @@ TEST_CASE("enrolment tokens: a fresh secret survives a failed list read",
     CHECK_THAT(html, ContainsSubstring("failbox"));
 }
 
-TEST_CASE("enrolment tokens: reveal block has Copy and Done, secret escaped, no timer",
+TEST_CASE("enrolment tokens: reveal block has Copy and Done; secret escaped; no timer",
           "[groups][enrolment][render]") {
     const std::vector<auth::EnrollmentToken> none;
     const auto html = render_tokens(&none, std::string("ab<") + kXss, kNow);
@@ -168,7 +212,7 @@ TEST_CASE("enrolment tokens: empty list says so and keeps the generate form",
     CHECK_THAT(html, ContainsSubstring("Anyone holding this token can enrol agents indefinitely"));
 }
 
-TEST_CASE("enrolment tokens: Active, Expired, Exhausted and Revoked are distinct states",
+TEST_CASE("enrolment tokens: Active; Expired; Exhausted and Revoked are distinct states",
           "[groups][enrolment][render]") {
     const std::vector<auth::EnrollmentToken> v = {
         token("aaaaaaaa", "live", 5, 1),
@@ -195,7 +239,7 @@ TEST_CASE("enrolment tokens: Active, Expired, Exhausted and Revoked are distinct
     CHECK_THAT(html, ContainsSubstring("0 / \xe2\x88\x9e"));
 }
 
-TEST_CASE("enrolment tokens: expiry is a UTC date, never raw epoch seconds",
+TEST_CASE("enrolment tokens: expiry is a UTC date; never raw epoch seconds",
           "[groups][enrolment][render]") {
     const std::vector<auth::EnrollmentToken> v = {
         token("aaaaaaaa", "x", 0, 0, false, Clock::time_point{std::chrono::seconds{1'900'000'000}}),
@@ -238,7 +282,7 @@ TEST_CASE("enrolment pending: an unanswered store is a failbox", "[groups][enrol
     CHECK_THAT(html, !ContainsSubstring("<table"));
 }
 
-TEST_CASE("enrolment pending: empty, and approved rows are never shown",
+TEST_CASE("enrolment pending: empty; and approved rows are never shown",
           "[groups][enrolment][render]") {
     const std::vector<auth::PendingAgent> none;
     CHECK_THAT(render_pending(&none), ContainsSubstring("No agents are waiting."));
@@ -290,8 +334,12 @@ TEST_CASE("enrolment pending: a hostile agent id reaches every row URL as one en
         REQUIRE(yuzu::test::has_url(urls, base)); // Forget
         for (const auto& u : urls) {
             CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+            // Skip only the two bulk routes themselves. A hostile id such as "./bulk-approve?"
+            // encodes to a URL that merely CONTAINS "bulk-", and that is exactly the URL these
+            // checks exist for.
             if (u.rfind("/api/settings/pending-agents/", 0) == 0 &&
-                u.find("bulk-") == std::string::npos) {
+                u != "/api/settings/pending-agents/bulk-approve" &&
+                u != "/api/settings/pending-agents/bulk-deny") {
                 // <prefix>/<one segment>[/<verb>]: the id contributes no slash, '?' or '#'.
                 CHECK(yuzu::test::path_slashes(u) <= 5);
                 CHECK(u.find('?') == std::string::npos);
@@ -301,7 +349,7 @@ TEST_CASE("enrolment pending: a hostile agent id reaches every row URL as one en
     }
 }
 
-TEST_CASE("enrolment pending: empty and dot-only ids get no row action, only the note",
+TEST_CASE("enrolment pending: empty and dot-only ids get no row action; only the note",
           "[groups][enrolment][render][url_path_segment]") {
     for (const char* id : {"", ".", "..", "%2e%2e", "%2E", ".%2e"}) {
         INFO("id=" << id);
@@ -630,7 +678,7 @@ TEST_CASE("enrolment rules: a hostile value stays inside its hx-vals string and 
     CHECK(count_of(html, " hx-vals=\"") == 3); // mode switch + Toggle + Remove
 }
 
-TEST_CASE("enrolment rules: add form keeps the field names, blocks colons, no inline handlers",
+TEST_CASE("enrolment rules: add form keeps the field names; blocks colons; no inline handlers",
           "[groups][enrolment][render]") {
     const std::vector<auth::AutoApproveRule> none;
     const auto html = render_auto_approve(none, false);

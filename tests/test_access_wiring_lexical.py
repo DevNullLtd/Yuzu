@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Static lexical gate over server/core/src/server.cpp's production wiring of the Access Users
-page (access::register_access_routes) and the Settings enrolment fragments.
+page (access::register_access_routes), the Settings enrolment fragments and the Groups page.
 
-The route tests stub every dependency, so a permissive admin gate or a swapped account source in
-server.cpp would leave them all green. This gate pins the production wiring.
+The route tests stub every dependency, so a permissive admin gate, a swapped account source or a
+route family that is never installed would leave them all green. This gate pins the production
+wiring.
 
 Access Users (register_access_routes block):
 
@@ -21,6 +22,12 @@ Settings enrolment fragments (settings_routes_ wiring):
      view writes no auth.admin_required row per panel (the Users page fix, ef7adec0c).
   5. `settings_routes_->register_routes(...)` still binds the LOUD `require_admin` as `admin_fn`
      and never `probe_admin`: every mutating route keeps its denial row.
+
+Groups page (register_groups_routes block):
+
+  6. `groups::register_groups_routes(inline_sink, Deps{.auth_fn = auth_fn})` is called: nothing
+     else installs GET /groups or /static/yuzu-groups.js, and test_groups_page.cpp drives the
+     registrar directly, so a deleted call would leave every unit test green.
 
 `//` comments are stripped and whitespace collapsed before matching. Lexical only: it cannot see
 a relocation that keeps the tokens (review-enforced). The self-test applies in-memory mutations
@@ -81,6 +88,20 @@ def settings_problems(src):
     return out
 
 
+def groups_problems(src):
+    g = block(src, "groups::register_groups_routes(")
+    if g is None:
+        return ["server.cpp no longer calls groups::register_groups_routes( "
+                "(GET /groups and /static/yuzu-groups.js are not installed)"]
+    out = []
+    if not re.match(r"\( ?inline_sink, ", g):
+        out.append("groups register_groups_routes( is no longer installed on inline_sink "
+                   "(the shared route seam)")
+    if "Deps{ .auth_fn = auth_fn" not in g and "Deps{.auth_fn = auth_fn" not in g:
+        out.append("groups register_groups_routes( no longer binds Deps{.auth_fn = auth_fn}")
+    return out
+
+
 def problems(src):
     b = block(src)
     if b is None:
@@ -107,7 +128,7 @@ def problems(src):
         out.append("access block reads the in-memory AuthManager fallback")
     if re.search(r"return (std::vector<auth::UserEntry>\{\}|\{\});", b):
         out.append("access block returns a literal empty list as success")
-    return out + settings_problems(src)
+    return out + settings_problems(src) + groups_problems(src)
 
 
 # (pattern, replacement, expected substring of the first problem)
@@ -132,6 +153,10 @@ MUTATIONS = [
      r"return require_admin\(req, res\);(\s*\},\s*\[this\]\(const httplib::Request& req, "
      r"httplib::Response& res,\s*const std::string& securable_type)",
      r"\1return auth_routes_->probe_admin(req, res);\2", "loud require_admin"),
+    # Groups page: the call that installs /groups and its script.
+    (r"yuzu::server::groups::register_groups_routes\(", "yuzu::server::groups::register_groups_route(",
+     "register_groups_routes"),
+    (r"groups::Deps\{\.auth_fn = auth_fn\}", "groups::Deps{}", "auth_fn"),
 ]
 
 

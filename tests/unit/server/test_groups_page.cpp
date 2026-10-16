@@ -101,7 +101,7 @@ TEST_CASE("groups page: only the enrolment fragments that already exist are load
     CHECK_THAT(t, ContainsSubstring("sse:pending-agent"));
 }
 
-TEST_CASE("groups page: htmx-config precedes the htmx script (htmx reads it once, at load)",
+TEST_CASE("groups page: htmx-config precedes the htmx script (htmx reads it once; at load)",
           "[groups][page]") {
     const std::string t = kGroupsTemplate;
     const auto meta = t.find("<meta name=\"htmx-config\"");
@@ -116,7 +116,7 @@ TEST_CASE("groups page: htmx-config precedes the htmx script (htmx reads it once
     CHECK(baked.find("<meta name=\"htmx-config\"") < baked.find("<script src=\"/static/htmx.js\">"));
 }
 
-TEST_CASE("groups page: no inline handlers or style, same-origin scripts only, one shell",
+TEST_CASE("groups page: no inline handlers or style; same-origin scripts only; one shell",
           "[groups][page]") {
     const std::string t = kGroupsTemplate;
     CHECK_THAT(t, !ContainsSubstring("<style"));
@@ -138,6 +138,22 @@ TEST_CASE("groups page: no inline handlers or style, same-origin scripts only, o
     const std::string baked = kGroupsHtml;
     CHECK(count_of(baked, std::string(yuzu::server::shell::kShellBegin)) == 1);
     CHECK(count_of(baked, "fetch('/api/me')") == 1);
+}
+
+// Management groups stay in Settings for now. The panel is a placeholder, but its id is a hook
+// (nothing may reuse it for another panel) and its link is the operator's way to the real thing.
+TEST_CASE("groups page: the management groups placeholder keeps its id, heading and Settings link",
+          "[groups][page]") {
+    for (const std::string& page : {std::string(kGroupsTemplate), std::string(kGroupsHtml)}) {
+        const auto at = page.find("id=\"grp-list\"");
+        REQUIRE(at != std::string::npos);
+        CHECK(count_of(page, "id=\"grp-list\"") == 1);
+        const auto end = page.find("</section>", at);
+        REQUIRE(end != std::string::npos);
+        const auto panel = page.substr(at, end - at);
+        CHECK_THAT(panel, ContainsSubstring("<h2>Management groups</h2>"));
+        CHECK_THAT(panel, ContainsSubstring("<a href=\"/settings\">Settings</a>"));
+    }
 }
 
 TEST_CASE("groups page: every loader panel carries its own denied and unavailable sentence",

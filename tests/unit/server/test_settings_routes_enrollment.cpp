@@ -283,6 +283,30 @@ TEST_CASE("settings enrollment: batch create returns N tokens and audits ids onl
         CHECK(row.detail.find(t.token_id) != std::string::npos);
 }
 
+// The batch response carries N raw tokens; so does the mid-failure response, which returns the
+// tokens minted BEFORE the failure (they are real and valid). It must not be cacheable either.
+// A 254-character label makes `<label>-1` .. `<label>-9` fit the 256-character bound and
+// `<label>-10` exceed it, so the tenth mint fails after nine succeeded.
+TEST_CASE("settings enrollment: a batch that fails part way returns its minted tokens as no-store",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    const std::string label(254, 'a');
+    auto res = h.sink.Post("/api/settings/enrollment-tokens/batch",
+                           R"({"label":")" + label + R"(","count":11,"max_uses":1})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["tokens"].size() == 9);
+    CHECK(j["count"] == 9);
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res->get_header_value("Vary") == "Cookie");
+    CHECK(h.only("enrollment.bulk_token_create").detail.find("minted_before_failure=9") !=
+          std::string::npos);
+    // Their raw values are not in the audit trail.
+    for (const auto& t : j["tokens"])
+        CHECK_FALSE(h.audit_mentions(t.get<std::string>()));
+}
+
 TEST_CASE("settings enrollment: batch create with the store down is a 503 A4 error + failure audit",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h(/*with_store=*/false);
@@ -449,7 +473,7 @@ TEST_CASE("settings enrollment: a non-admin GET of an auto-loading fragment is 4
     CHECK(h.audit_calls.empty());
 }
 
-TEST_CASE("settings enrollment: an unwired read probe falls back to the loud gate, never to none",
+TEST_CASE("settings enrollment: an unwired read probe falls back to the loud gate; never to none",
           "[pg][settings_routes][enrollment][admin_gate]") {
     EnrollRoutesHarness h(/*with_store=*/false);
     h.routes.set_read_admin_fn({});
@@ -798,9 +822,12 @@ TEST_CASE("settings pending: a hostile agent id reaches Approve/Deny only as one
         REQUIRE(yuzu::test::has_url(urls, base)); // Forget (hx-delete) on the bare segment
         for (const auto& u : urls) {
             CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
-            // /api/settings/pending-agents/<seg>[/<verb>]; the bulk routes carry no id.
+            // /api/settings/pending-agents/<seg>[/<verb>]; the two bulk routes carry no id. Only
+            // those exact URLs are skipped: a hostile id such as "./bulk-approve?" encodes to a
+            // URL that merely contains "bulk-" and is exactly what this check is for.
             if (u.rfind("/api/settings/pending-agents/", 0) == 0 &&
-                u.find("bulk-") == std::string::npos)
+                u != "/api/settings/pending-agents/bulk-approve" &&
+                u != "/api/settings/pending-agents/bulk-deny")
                 CHECK(yuzu::test::path_slashes(u) <= 5);
         }
         CHECK(page->body.find("/api/settings/pending-agents/bulk-approve") != std::string::npos);
