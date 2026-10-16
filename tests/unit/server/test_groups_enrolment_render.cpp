@@ -363,7 +363,9 @@ TEST_CASE("enrolment pending: row actions use the existing routes; Forget only o
     const auto html = render_pending(&v);
     CHECK_THAT(html, ContainsSubstring("hx-post=\"/api/settings/pending-agents/agent-one/approve\""));
     CHECK_THAT(html, ContainsSubstring("hx-post=\"/api/settings/pending-agents/agent-one/deny\""));
-    CHECK_THAT(html, ContainsSubstring("hx-confirm=\"Deny agent enrollment?\""));
+    // Single-row Deny carries the same irreversibility sentence as the bulk Deny.
+    CHECK_THAT(html, ContainsSubstring("hx-confirm=\"Deny agent enrollment? This page offers no way "
+                                       "to reverse a denial.\""));
     CHECK_THAT(html, ContainsSubstring("hx-delete=\"/api/settings/pending-agents/agent-one\""));
     CHECK_THAT(html, ContainsSubstring("The agent is queued again the next time it asks to join."));
     // A denial is a durable record: no action on that row.
@@ -469,6 +471,9 @@ TEST_CASE("enrolment pending: bulk actions name the total and up to ten hostname
     CHECK_THAT(html, ContainsSubstring("hx-post=\"/api/settings/pending-agents/bulk-approve\""));
     CHECK_THAT(html, ContainsSubstring("hx-post=\"/api/settings/pending-agents/bulk-deny\""));
     CHECK_THAT(html, ContainsSubstring("(12 as of this view, including any that arrive since)?"));
+    // The bulk Deny and the single-row Deny say it in the same words.
+    CHECK_THAT(html, ContainsSubstring("including any that arrive since)? This page offers no way "
+                                       "to reverse a denial."));
     CHECK_THAT(html, ContainsSubstring("and 2 more"));
     CHECK_THAT(html, !ContainsSubstring("<img src=x"));      // hostnames in the confirm are escaped
     CHECK_THAT(html, !ContainsSubstring(" disabled"));

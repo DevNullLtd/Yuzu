@@ -34,6 +34,10 @@ TokenState token_state(const auth::EnrollmentToken& t,
     return TokenState::active;
 }
 
+// A denial is a durable record: the Forget route refuses to remove it (409) and nothing on the
+// page re-approves it. Both Deny confirms say so, so one-row Deny is not the lighter choice.
+constexpr std::string_view kNoReverseDenial = "This page offers no way to reverse a denial.";
+
 // "Active" is mild information, never the green OK pill: a lapsed credential is not "healthy".
 std::string pill(const char* cls, const char* text) {
     return std::string("<span class=\"pill ") + cls + "\">" + text + "</span>";
@@ -372,7 +376,8 @@ std::string render_pending(const std::vector<auth::PendingAgent>* agents) {
                     "<button class=\"btn link danger\" type=\"button\" hx-post=\"" +
                     base +
                     "/deny\" hx-target=\"#pending-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Deny agent enrollment?\">Deny</button>"
+                    "hx-confirm=\"Deny agent enrollment? " + std::string(kNoReverseDenial) +
+                    "\">Deny</button>"
                     "<button class=\"btn link\" type=\"button\" hx-delete=\"" +
                     base +
                     "\" hx-target=\"#pending-section\" hx-swap=\"innerHTML\" "
@@ -411,9 +416,8 @@ std::string render_pending(const std::vector<auth::PendingAgent>* agents) {
         const std::string approve_q =
             "Approve every agent currently waiting (" + count + tail +
             " They join the fleet and can receive instructions." + names;
-        const std::string deny_q =
-            "Deny every agent currently waiting (" + count + tail +
-            " This page offers no way to reverse a denial." + names;
+        const std::string deny_q = "Deny every agent currently waiting (" + count + tail + " " +
+                                   std::string(kNoReverseDenial) + names;
         const char* off = whole ? "" : " disabled";
         html += "<div class=\"btns\"><button class=\"btn primary\" type=\"button\"" +
                 std::string(off) +
