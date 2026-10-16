@@ -333,7 +333,7 @@ jobs:
       # Named without the "yuzu-" prefix on purpose: the release job downloads
       # every artifact matching 'yuzu-*' into its asset directory.
       - name: Upload ELF floor report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: linux-elf-floor-report
@@ -416,7 +416,7 @@ jobs:
             *.rpm
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-linux-x64
@@ -424,7 +424,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .deb artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-linux-deb
@@ -432,7 +432,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .rpm artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-linux-rpm
@@ -440,7 +440,7 @@ jobs:
           retention-days: 3
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-linux-x64-sbom
@@ -607,7 +607,7 @@ jobs:
             *.rpm
 
       - name: Upload tarball artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-gateway-linux-x64
@@ -615,7 +615,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-gateway-deb
@@ -623,7 +623,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .rpm artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-gateway-rpm
@@ -631,7 +631,7 @@ jobs:
           retention-days: 3
 
       - name: Upload gateway SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-gateway-linux-x64-sbom
@@ -970,7 +970,7 @@ jobs:
             YuzuServerSetup-*.exe
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-windows-x64
@@ -978,7 +978,7 @@ jobs:
           retention-days: 3
 
       - name: Upload installer artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-windows-installer
@@ -988,7 +988,7 @@ jobs:
           retention-days: 3
 
       - name: Upload Windows SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-windows-x64-sbom
@@ -1347,7 +1347,7 @@ jobs:
             YuzuAgent-*.pkg
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-macos-arm64
@@ -1355,7 +1355,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .pkg artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-macos-pkg
@@ -1363,7 +1363,7 @@ jobs:
           retention-days: 3
 
       - name: Upload macOS SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-macos-arm64-sbom
@@ -1581,7 +1581,7 @@ jobs:
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242): if this upload fails, the pushed tag is
         # already signed and attested, rather than left unsigned until a re-run.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # No continue-on-error (#5242): the SBOM is a release asset, so a failed
         # upload must fail this job rather than leave a green leg with an
         # earlier attempt's SBOM (or none) for the release to sign.
@@ -1756,7 +1756,7 @@ jobs:
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242): if this upload fails, the pushed tag is
         # already signed and attested, rather than left unsigned until a re-run.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # No continue-on-error (#5242): the SBOM is a release asset, so a failed
         # upload must fail this job rather than leave a green leg with an
         # earlier attempt's SBOM (or none) for the release to sign.
@@ -2045,7 +2045,7 @@ jobs:
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242): if this upload fails, the pushed tag is
         # already signed and attested, rather than left unsigned until a re-run.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # No continue-on-error (#5242): the SBOM is a release asset, so a failed
         # upload must fail this job rather than leave a green leg with an
         # earlier attempt's SBOM (or none) for the release to sign.
@@ -2189,7 +2189,7 @@ jobs:
           upload-artifact: false
 
       - name: Upload bundle SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-agent-bundle-chisel-image-sbom
@@ -2262,7 +2262,7 @@ jobs:
           bash scripts/check-compose-versions.sh "$BASE_VERSION"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           # Skip docker buildx attestation/provenance artifacts (auto-named

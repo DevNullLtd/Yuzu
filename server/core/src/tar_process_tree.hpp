@@ -212,6 +212,8 @@ TarWindow resolve_tar_window(const std::string& preset, std::int64_t custom_from
 /// datetime-local value `YYYY-MM-DDTHH:MM[:SS]` interpreted as UTC. Returns 0 for
 /// empty/invalid/out-of-range input (callers treat 0 as "unset"). Overflow-guarded:
 /// an oversized digit string or an absurd year yields 0, never signed-overflow UB.
+/// The day is range-checked as 1..31 only, so a day beyond the month length (2026-02-31)
+/// rolls into the next month; operator-supplied windows go through `parse_ts_param_strict`.
 /// Pure + free so it is unit-testable without the HTTP layer.
 std::int64_t parse_ts_param(const std::string& s);
 
