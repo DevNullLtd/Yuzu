@@ -22714,6 +22714,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string event_types = param_str(args, "event_types", "*");
                 const auto batch_size_opt = param_int_strict(args, "batch_size", 1);
                 if (!batch_size_opt) {
+                    // REST parity (offload_routes.cpp): a refused field type leaves a denied row.
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "offload_target.create", "denied", "offload_target",
+                        audit_token(name), "invalid_field_type");
                     res.set_content(
                         // retry-hint-exempt: caller-input type rejection, not a
                         // store/query fault - resending the identical malformed
@@ -22727,6 +22731,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // buffer, which flushes only when it reaches batch_size and has no other
                 // cap, grow without bound, so enforce the declared range here.
                 if (*batch_size_opt < 1 || *batch_size_opt > kMaxOffloadBatchSize) {
+                    // REST parity: its range row is written only once name and url are present,
+                    // so an empty name never becomes an empty audit target.
+                    if (!name.empty() && !url.empty())
+                        (void)yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, "offload_target.create", "denied", "offload_target",
+                            audit_token(name), "validation_failed");
                     res.set_content(
                         // retry-hint-exempt: caller-input range rejection, not a
                         // store/query fault - resending the identical value cannot succeed.

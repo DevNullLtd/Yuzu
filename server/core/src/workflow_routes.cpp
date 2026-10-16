@@ -469,7 +469,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // rather than printing zeros. The list route does not audit, so neither does this.
             std::string strip;
             if (!gate.scope && execution_tracker) {
-                if (auto fs = execution_tracker->get_fleet_summary_checked(0, false)) {
+                if (auto fs = execution_tracker->get_fleet_summary_checked(std::nullopt, false)) {
                     strip = operate_pages::render_stats_strip(
                         {fs->executions_today, fs->total_executions, fs->overall_success_rate,
                          fs->avg_duration_seconds});

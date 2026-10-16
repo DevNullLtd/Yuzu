@@ -35133,6 +35133,55 @@ TEST_CASE("MCP B5: create_offload_target enforces batch_size 1..10000 and reject
     }
 }
 
+// REST parity: a refused batch_size leaves a denied offload_target.create row, like the REST
+// twin (invalid_field_type for a wrong type, validation_failed for an out-of-range integer),
+// and creates nothing. An empty name writes no range row, as on REST.
+TEST_CASE("MCP B5: create_offload_target audits a refused batch_size as a denied row",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+    int rpc_id = 0;
+    auto create = [&](const std::string& name, const std::string& batch_json) {
+        nlohmann::json args = {{"url", "https://example.com/hook"}};
+        if (!name.empty())
+            args["name"] = name;
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(++rpc_id) +
+            R"(,"params":{"name":"create_offload_target","arguments":)" +
+            args.dump().substr(0, args.dump().size() - 1) + R"(,"batch_size":)" + batch_json +
+            "}}}";
+        auto res = ts.call(body);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    struct Case {
+        const char* batch;
+        const char* detail;
+    };
+    for (const Case c : {Case{"\"10\"", "invalid_field_type"}, Case{"1.5", "invalid_field_type"},
+                         Case{"0", "validation_failed"}, Case{"10001", "validation_failed"}}) {
+        INFO("batch_size=" << c.batch);
+        const auto before = ts.audit_log.size();
+        auto b = create("audited-target", c.batch);
+        REQUIRE(b.contains("error"));
+        REQUIRE(ts.audit_log.size() == before + 1);
+        CHECK(ts.audit_log.back() == "offload_target.create|denied");
+        CHECK(ts.audit_target_ids.back() == "audited-target");
+        CHECK(ts.audit_details.back() == c.detail);
+    }
+    // No empty-target row for a range reject with no name.
+    const auto before = ts.audit_log.size();
+    auto noname = create("", "0");
+    REQUIRE(noname.contains("error"));
+    CHECK(ts.audit_log.size() == before);
+    // Nothing was created.
+    auto listed = store->list();
+    REQUIRE(listed.has_value());
+    CHECK(listed->empty());
+}
+
 // Gate 8 fix (#2146 Batch B5 review): fail-OPEN type confusion - a
 // non-boolean enabled (e.g. the JSON string "false") previously silently
 // created an ENABLED target via args.contains()+is_boolean() short-circuit

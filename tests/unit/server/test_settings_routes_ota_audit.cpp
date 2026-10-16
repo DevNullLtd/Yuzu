@@ -244,6 +244,10 @@ TEST_CASE("OTA rollout change refuses an empty or above-100 percentage and chang
     REQUIRE(neg);
     CHECK(neg->status == 200);
     CHECK(h.registry->list_packages().front().rollout_pct == 0);
+    // The audit row reports the stored value, never the raw -5 the caller sent.
+    REQUIRE_FALSE(h.audited.empty());
+    CHECK(h.audited.back().detail.find("to=0%") != std::string::npos);
+    CHECK(h.audited.back().detail.find("-5") == std::string::npos);
     auto encoded = h.post_rollout("1.2.3", "%37");
     REQUIRE(encoded);
     CHECK(encoded->status == 200);
