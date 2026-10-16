@@ -70,8 +70,10 @@ struct HealthcheckOutcome {
 /// OpenSSL accepts a BEGIN line only at the start of a line (after an optional UTF-8 BOM on the
 /// first), so a marker in mid-line text is not the first certificate and returns empty; and a
 /// block carrying a PEM header (`Proc-Type`, `DEK-Info`) is refused, because OpenSSL would
-/// prompt for a pass phrase. OpenSSL also reads in 254-byte line chunks, a case where this
-/// function fails closed (empty) rather than agree. It may return empty where OpenSSL would
+/// prompt for a pass phrase. OpenSSL also reads in 254-byte line chunks, and its file reader
+/// (`fgets` + `strlen`, what the server's chain loader uses) cuts a chunk at a NUL while the
+/// memory reader httplib uses counts bytes, so a block holding a NUL is refused: the two
+/// readers would decode different text from it. It may return empty where OpenSSL would
 /// load a certificate, never a different certificate than the one the server presents.
 [[nodiscard]] inline std::string first_pem_certificate(std::string_view pem) {
     constexpr std::string_view kBegin = "-----BEGIN CERTIFICATE-----";
@@ -91,8 +93,11 @@ struct HealthcheckOutcome {
     // TRUSTED one), so marker text in a comment or PEM header must not widen what is returned.
     if (block.find("-----BEGIN ", kBegin.size()) != std::string_view::npos)
         return {};
-    // A base64 body never holds ':'; a PEM header does (`Proc-Type: 4,ENCRYPTED`).
-    if (block.find(':') != std::string_view::npos)
+    // A base64 body holds neither ':' (a PEM header does: `Proc-Type: 4,ENCRYPTED`) nor a NUL.
+    // OpenSSL's file reader (fgets + strlen, what the server's chain loader uses) cuts a line at
+    // a NUL while the memory reader httplib uses counts bytes, so the two would decode different
+    // text from the same block. `block` is a counted view: the NUL reaches this test intact.
+    if (block.find_first_of(std::string_view{":\0", 2}) != std::string_view::npos)
         return {};
     return std::string{block} + '\n';
 }

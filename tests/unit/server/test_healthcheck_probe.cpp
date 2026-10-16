@@ -220,12 +220,32 @@ TEST_CASE("healthcheck: first_pem_certificate reads a block the way OpenSSL does
     CHECK(first_pem_certificate(bom + bom + a).empty());
     // A marker after a newline is a line start (CRLF files included).
     CHECK(first_pem_certificate("prose\r\n" + a) == a);
+    // OpenSSL starts a BEGIN line only after a newline (or a leading UTF-8 BOM): three bytes of
+    // other text, or a lone CR, ahead of a block make it a mid-line marker, so the second
+    // certificate must not be returned.
+    CHECK(first_pem_certificate("abc" + a + b).empty());
+    CHECK(first_pem_certificate("x\r" + a + b).empty());
     // A block carrying a PEM header is refused: OpenSSL would prompt for a pass phrase on
     // stderr, a second line against the one-line contract (a base64 body never holds ':').
     CHECK(first_pem_certificate("-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n"
                                 "DEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF\n\n"
                                 "AAAA\n-----END CERTIFICATE-----\n" +
                                 b)
+              .empty());
+    // OpenSSL's file reader stops a line at a NUL (fgets + strlen) and the memory reader does
+    // not, so a block holding one is refused rather than decoded differently from what the
+    // server loads (#5906). The first shape is one long first line - BOM, marker, padding, NUL,
+    // 64 base64 characters - whose 254-byte chunking differs between the two readers.
+    const std::string nul(1, '\0');
+    CHECK(first_pem_certificate(bom + "-----BEGIN CERTIFICATE-----" + std::string(226, ' ') + nul +
+                                std::string(64, 'A') + "\nAAAA\nAAAA\n-----END CERTIFICATE-----\n" +
+                                b)
+              .empty());
+    CHECK(first_pem_certificate("-----BEGIN CERTIFICATE-----" + nul +
+                                "\nAAAA\n-----END CERTIFICATE-----\n" + b)
+              .empty());
+    CHECK(first_pem_certificate("-----BEGIN CERTIFICATE-----\nAA" + nul +
+                                "AA\n-----END CERTIFICATE-----\n" + b)
               .empty());
 }
 

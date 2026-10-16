@@ -122,8 +122,10 @@
 ///   GET /fragments/health/summary   (deny_service_scoped_fn THEN auth_fn)
 ///   GET /fragments/dashboard/health (deny_service_scoped_fn THEN auth_fn; every
 ///                                     outcome after auth is a 200 panel note —
-///                                     without a session auth_fn answers (401 for
-///                                     HX requests) — the Dashboard health panel,
+///                                     without a session the pre-routing gate
+///                                     answers first (a 302 to the sign-in page, or
+///                                     401 with HX-Redirect for HX requests) and
+///                                     auth_fn is the backstop — the Dashboard health panel,
 ///                                     which calls the registered `health_handler`
 ///                                     in-process)
 

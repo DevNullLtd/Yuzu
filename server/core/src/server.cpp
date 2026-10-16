@@ -15461,9 +15461,9 @@ private:
             redirect_server_ = std::make_unique<httplib::Server>();
             // Eager fixed pool, as web_server_ (rationale at its pool: the default dynamic pool
             // spawns on the accept loop with no handler). Size = httplib's default maximum
-            // (4 x max(8, hw-1)) capped at 64: this port serves 301s and four probes, so the
-            // host's core count must not scale it outside kMaxHttpWorkerThreads and the
-            // --http-worker-threads TasksMax guidance. Up to 17 cores the cap is not reached
+            // (4 x max(8, hw-1), hw = logical CPUs) capped at 64: this port serves 301s and four
+            // probes, so the host's CPU count must not scale it outside kMaxHttpWorkerThreads and
+            // the --http-worker-threads TasksMax guidance. Up to 17 logical CPUs it never binds
             // (36 at 10); above that the pool is 64 threads, created at boot and resident for
             // the life of the process. It is not slow-connection resistance: no pool size is
             // (stop() bounds that wait instead).

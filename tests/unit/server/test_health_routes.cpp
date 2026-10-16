@@ -714,8 +714,9 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
            "the request counter's method label is bounded, never the raw request-line token");
     expect("count_http_request(req, res);", 1,
            "the main post-routing handler counts through the shared lambda");
-    expect("redirect_thread_done_ = true; } web_thread_done_cv_.notify_all();", 1,
-           "the redirect thread sets its flag under the mutex and wakes stop()'s bounded wait");
+    expect("std::lock_guard<std::mutex> lk(web_thread_done_mtx_); redirect_thread_done_ = true; } "
+           "web_thread_done_cv_.notify_all();",
+           1, "the redirect thread sets its flag under the mutex and wakes stop()'s bounded wait");
     expect("return (web_thread_done_ || !web_thread_.joinable()) && "
            "(redirect_thread_done_ || !redirect_thread_.joinable());",
            1, "stop() waits for BOTH listener threads inside the one 15s bound");

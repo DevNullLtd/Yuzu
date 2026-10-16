@@ -5467,7 +5467,7 @@ The shipped images contain no `curl` (the chiselled image ships a static busybox
 | Aspect | Behaviour |
 |---|---|
 | Target | `https://<web-address>:<https-port>/readyz` (a wildcard bind, `0.0.0.0` or `::`, is dialled over loopback); with `--no-https`, `http://<web-address>:<web-port>/readyz`. `--healthcheck-path /livez` selects liveness. |
-| Trust | The certificate chain is verified against **only** a trust anchor, never the system trust store. Default-certs mode: `<ca-dir>/default-ca.pem` (the install CA). Operator certificate (`--https-cert`): the first certificate in that file (the server certificate itself); certificates after it are not trusted, and a first certificate that is not a `-----BEGIN CERTIFICATE-----` block (for example `X509 CERTIFICATE` or `TRUSTED CERTIFICATE`) is refused with an `SSL certificate loading failed` error, never the whole file. The host name is not checked. |
+| Trust | The certificate chain is verified against **only** a trust anchor, never the system trust store. Default-certs mode: `<ca-dir>/default-ca.pem` (the install CA). Operator certificate (`--https-cert`): the first certificate in that file (the server certificate itself); certificates after it are not trusted, and a first certificate that is not a `-----BEGIN CERTIFICATE-----` block (for example `X509 CERTIFICATE` or `TRUSTED CERTIFICATE`) is refused with an `SSL certificate loading failed` error, never the whole file. The anchor must be a regular file of at most 64 KiB; a larger, missing or unreadable file is refused with the same error. The host name is not checked. |
 | Redirects | Not followed. A `301` is a failure. |
 | Time | Each phase is bounded: TCP connect 1 s, each TLS handshake step 1 s, the request as a whole 3 s; and the whole probe, name resolution and handshake included, is cut at 4 s with the reason `timed out after 4000 ms`. A plain or post-handshake server that accepts but never answers is reported in about 2 s, a TLS peer that accepts and never starts the handshake in about 1 s, one that trickles a response in about 3 s, one that trickles its TLS handshake at 4 s. |
 | Output | Nothing on success. Exit status `0` is healthy, non-zero otherwise (`1` is a failed probe; a bad flag exits with CLI11's own code). On failure one stderr line naming the target, the HTTP status or TLS reason (for example `certificate has expired`), and the trust anchor used. It never prints a key path or a response body. `docker inspect --format '{{json .State.Health}}' <container>` shows the last lines; for a `503`, the server's `docker logs` carry the `[readyz]` line that says why. |
@@ -5484,14 +5484,14 @@ healthcheck:
   start_period: 30s
 ```
 
-Operator certificate (the same `--https-cert` the server uses; the probe trusts the first certificate in that file as its anchor, which must be a `-----BEGIN CERTIFICATE-----` block, and refuses anything else rather than trusting the whole file):
+Operator certificate (the same `--https-cert` the server uses; the probe trusts the first certificate in that file as its anchor, which must be a `-----BEGIN CERTIFICATE-----` block in a regular file of at most 64 KiB, and refuses anything else rather than trusting the whole file):
 
 ```yaml
 healthcheck:
   test: ["CMD", "yuzu-server", "--healthcheck", "--https-cert", "/etc/yuzu/tls/server.pem"]
   interval: 30s
   timeout: 5s
-  retries: 3
+  retries: 4
   start_period: 30s
 ```
 
@@ -5517,7 +5517,7 @@ Notes:
 - A check that restarts the container (Kubernetes liveness, Swarm, autoheal) should use `--healthcheck-path /livez`: a database outage turns `/readyz` red on every replica, and restarting them all fixes nothing. Keep the default `/readyz` for readiness and Compose `depends_on: condition: service_healthy`. Never set `timeout` below 5 s.
 - If the server runs with a non-default `--ca-dir` or `--https-port`, repeat them on the healthcheck line.
 - Once `--https-cert` is set, a `default-ca.pem` left in the certificate directory by an earlier default-certs boot is **not** used. Omitting `--https-cert` from the healthcheck line while the server uses an operator certificate makes the probe anchor on that stale file and report `SSL server verification failed`.
-- After you rotate the `--https-cert` file, the probe anchors on the new certificate while the server keeps serving the old one until its next reload (`--cert-reload-interval`, 60 s by default), and reports `SSL server verification failed` in between. Make `interval` × `retries` longer than the reload interval, or restart the server after rotating. An expired certificate fails the probe with `certificate has expired`, and a restart cannot fix that: renew the certificate.
+- After you rotate the `--https-cert` file, the probe anchors on the new certificate while the server keeps serving the old one until its next reload (`--cert-reload-interval`, 60 s by default), and reports `SSL server verification failed` in between. A check reports unhealthy at its last allowed consecutive failure, so the time it tolerates is (`retries` − 1) × `interval` in Compose and (`failureThreshold` − 1) × `periodSeconds` in Kubernetes. Make that longer than the reload interval (the `interval: 30s`, `retries: 4` snippet above tolerates 90 s; on Kubernetes with `periodSeconds: 10` set `failureThreshold: 8`, which tolerates 70 s), or restart the server after rotating. An expired certificate fails the probe with `certificate has expired`, and a restart cannot fix that: renew the certificate.
 - Images built before `--healthcheck` existed (#5906) exit on the unknown argument; keep their existing probes.
 
 ### Load balancers and shutdown drain
@@ -5586,8 +5586,8 @@ A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first s
 
 | Port | Service | Deployment |
 |---|---|---|
-| 8080 | HTTP→HTTPS redirect + cleartext health probes (`--no-https-redirect` removes it) | Always when HTTPS is on |
-| 8443 | Web dashboard + REST API (HTTPS) | Always |
+| 8080 | HTTP→HTTPS redirect + cleartext health probes with HTTPS on (`--no-https-redirect` removes it); the dashboard and REST API in plain HTTP with `--no-https` | Always |
+| 8443 | Web dashboard + REST API (HTTPS) | Always when HTTPS is on (the default) |
 | 50051 | gRPC (agent connections) | Always -- server in standalone, gateway in scaled |
 | 50052 | gRPC (management) | Always |
 | 50055 | gRPC (gateway upstream) | Gateway deployments only |
