@@ -16,12 +16,16 @@
 #include "inventory_eval.hpp"
 #include "license_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "rest_api_v1.hpp"
 #include "software_deployment_store.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
+#include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <stdexcept>
@@ -675,6 +679,100 @@ TEST_CASE("T2 REST: license activate and get active", "[rest_api_t2][license][pg
     CHECK((*active)->organization == "Acme Corp");
     CHECK((*active)->seat_count == 100);
     CHECK((*active)->edition == "enterprise");
+}
+
+// #4644: POST /api/v1/license read seat_count/expires_at with `body.value`, a plain static_cast, so
+// 4294967297 seats became 1, 5.5 became 5, a negative expires_at was stored and then read back as
+// perpetual, and a string or null threw. Mirrors the MCP twin activate_platform_license: both are
+// non-negative JSON integers, and 0 keeps its meaning (unlimited seats / perpetual).
+TEST_CASE("T2 REST: POST /api/v1/license rejects a wrapped, negative or wrong-typed "
+          "seat_count / expires_at and activates nothing (#4644)",
+          "[rest_api_t2][license][pg][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    int audits = 0;
+    yuzu::MetricsRegistry metrics;
+    RestApiV1 api;
+    yuzu::server::test::TestRouteSink sink;
+    api.register_routes(
+        sink,
+        [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "admin";
+            s.role = auth::Role::admin;
+            return s;
+        },
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) { return true; },
+        [&audits](const httplib::Request&, const std::string&, const std::string&,
+                  const std::string&, const std::string&, const std::string&) -> bool {
+            ++audits;
+            return true;
+        },
+        /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
+        /*quarantine_store=*/nullptr, /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+        /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr,
+        /*tag_store=*/nullptr, /*audit_store=*/nullptr, /*service_group_fn=*/{},
+        /*tag_push_fn=*/{}, /*inventory_store=*/nullptr, /*product_pack_store=*/nullptr,
+        /*sw_deploy_store=*/nullptr, /*device_token_store=*/nullptr, &store,
+        /*guaranteed_state_store=*/nullptr, &metrics);
+
+    const auto active_org = [&store]() -> std::string {
+        auto a = store.get_active_license();
+        REQUIRE(a.has_value());
+        return a->has_value() ? (*a)->organization : std::string{};
+    };
+
+    int key_n = 0;
+    const auto post = [&](const std::string& fields) {
+        return sink.Post("/api/v1/license",
+                         R"({"organization":"Acme","license_key":"K-)" + std::to_string(key_n++) +
+                             "\"" + fields + "}");
+    };
+    // 4294967297 is a VALID non-negative 64-bit integer: it is accepted below, never wrapped to 1.
+    const std::vector<std::string> bad = {
+        "9223372036854775808", "18446744073709551615", "-1", "1e3", "5.5", "\"7\"", "\"\"",
+        "null", "true", "[]", "{}"};
+    for (const char* key : {"seat_count", "expires_at"}) {
+        for (const auto& v : bad) {
+            const std::string fields = std::string(R"(,")") + key + "\":" + v;
+            INFO(fields);
+            auto res = post(fields);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.find(key) != std::string::npos); // names the offending key
+        }
+    }
+    // A truncated body and a non-object body.
+    for (const char* body : {R"({"organization":"Acme","license_key":"K-t","seat_count":5)", "[]",
+                             "5", "null", "not json", ""}) {
+        INFO(body);
+        auto res = sink.Post("/api/v1/license", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    CHECK(active_org().empty());
+    CHECK(audits == 0);
+
+    // A real count and expiry round-trip unchanged (4294967297 is a valid 64-bit count, no longer
+    // wrapped to 1)...
+    auto big = post(R"(,"seat_count":4294967297,"expires_at":4102444800)");
+    REQUIRE(big);
+    CHECK(big->status == 201);
+    CHECK(audits == 1);
+    auto active = store.get_active_license();
+    REQUIRE(active.has_value());
+    REQUIRE(active->has_value());
+    CHECK((*active)->seat_count == 4294967297LL);
+    CHECK((*active)->expires_at == 4102444800LL);
+    // ...and 0 keeps its documented meaning (unlimited seats / perpetual) and is accepted.
+    auto zero = post(R"(,"seat_count":0,"expires_at":0)");
+    REQUIRE(zero);
+    CHECK(zero->status == 201);
+    CHECK(audits == 2);
 }
 
 TEST_CASE("T2 REST: license validate with agent count generates alerts on exceeded",

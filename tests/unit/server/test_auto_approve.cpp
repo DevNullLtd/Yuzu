@@ -251,6 +251,16 @@ TEST_CASE("CIDR: malformed or out-of-range prefix never throws and never matches
     }
 }
 
+TEST_CASE("CIDR: a blank ip_subnet value never matches, including an empty peer IP",
+          "[auto_approve][cidr][hardening]") {
+    // The gateway-proxied Register path sets no peer IP, so an empty rule value used to equal it
+    // and auto-approve every such agent. load() accepts the line; the match is the last guard.
+    AutoApproveEngine engine;
+    engine.add_rule({AutoApproveRuleType::ip_subnet, "", "blank"});
+    CHECK(engine.evaluate(make_ctx("", "")).empty());
+    CHECK(engine.evaluate(make_ctx("", "10.1.2.3")).empty());
+}
+
 TEST_CASE("validate_auto_approve_rule: accepts well-formed rules",
           "[auto_approve][hardening]") {
     using T = AutoApproveRuleType;

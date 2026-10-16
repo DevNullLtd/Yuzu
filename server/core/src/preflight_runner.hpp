@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+#include "preflight_eval.hpp" // kResponseFetchCap (Deps::response_fetch_cap default)
 
 /// @file preflight_runner.hpp
 /// Background lifecycle driver for `/auto` pre-flight runs — the
@@ -53,6 +54,10 @@ public:
         CommandDispatchFn dispatch_fn;
         NowFn now_ms_fn;
         int retention_days{14};
+        /// Per-check response fetch cap. Production keeps `preflight::kResponseFetchCap`; a
+        /// test lowers it to drive the saturated-window path (#4644) without seeding
+        /// 50,000 rows.
+        int response_fetch_cap{preflight::kResponseFetchCap};
         // #3495: lets a shutdown request stop tick() from STARTING further
         // runs' dispatch once stop_requested_ flips — checked once per run,
         // before that run's per-check dispatch_fn calls begin, so an

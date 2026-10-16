@@ -28,8 +28,10 @@ difference. That equal treatment does not extend
 to confinement: **neither surface confines results to the caller's
 management-group scope** - a caller with `Response:Read` sees every connected
 agent's process/connection/listener data fleet-wide on both REST and MCP
-alike (#4313, tracked parallel to #3526's identical gap on the
-execution/fleet-statistics tools).
+alike (#4313, tracked parallel to #3526's gap on the
+execution/fleet-statistics tools, which is closed for the per-agent rollup
+`GET /api/v1/execution-statistics/agents` and its MCP twin only; the
+fleet-summary and by-definition aggregates are unconfined by design).
 
 ## REST and routing surface
 

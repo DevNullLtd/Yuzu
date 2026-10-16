@@ -43,6 +43,7 @@
 
 #include "fleet_topology_store.hpp"
 #include "fleet_topology_types.hpp"
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "http_route_sink.hpp"
 #include "offline_endpoint_store.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
@@ -195,7 +196,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     int machines_max = kDefaultMachinesMax;
     try {
         if (req.has_param("machines_max")) {
-            machines_max = std::stoi(req.get_param_value("machines_max"));
+            machines_max = strict_stoi(req.get_param_value("machines_max"));
             if (machines_max <= 0 || machines_max > kMachinesMaxCeiling) {
                 res.status = 400;
                 res.set_content(error_envelope(res, "machines_max must be in [1, 100000]"),
@@ -207,8 +208,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
             }
         }
     } catch (const std::exception&) {
-        // std::stoi throws std::invalid_argument on non-numeric and
-        // std::out_of_range on overflow; both land here.
+        // strict_stoi throws std::invalid_argument on non-numeric or
+        // trailing-garbage input and on overflow; all land here.
         res.status = 400;
         res.set_content(error_envelope(res, "invalid machines_max"), "application/json");
         if (audit_fn_)
