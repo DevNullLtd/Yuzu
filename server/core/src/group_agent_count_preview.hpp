@@ -63,6 +63,12 @@ std::vector<FacetFilter> resolve_group_preview_filters(
 /// down", which is the right answer: both are "cannot answer right now").
 /// `agent_scope`: `nullopt` = unfiltered (global grant / elevated / RBAC
 /// off); engaged (including empty) = filter to exactly these agents.
+///
+/// Known limit (#5623): an exact-match value longer than `kMaxFacetValueBytes`
+/// (response_store.hpp) is not indexed in newly stored responses, so for such a
+/// value this answers a bare count that can be 0 without saying why. The
+/// results page shows a hint for it; this surface does not (a follow-up change
+/// will report it).
 std::optional<std::int64_t>
 group_agent_count_preview(ResponseStore* store, const std::string& command_id,
                           const std::vector<FacetFilter>& filters,
