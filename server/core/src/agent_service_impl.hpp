@@ -61,7 +61,6 @@ inline void seed_register_invalid_agent_id_series(yuzu::MetricsRegistry& metrics
 }
 
 // Forward declarations to avoid pulling in full store headers
-
 class ResponseStore;
 class TagStore;
 class AnalyticsEventStore;

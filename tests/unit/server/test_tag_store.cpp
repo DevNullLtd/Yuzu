@@ -107,12 +107,7 @@ std::size_t count_of(const std::string& text, const std::string& needle) {
         ++n;
     return n;
 }
-std::ptrdiff_t stray_control_bytes(const std::string& text) {
-    return std::count_if(text.begin(), text.end(), [](char ch) {
-        const auto c = static_cast<unsigned char>(ch);
-        return (c < 0x20 && c != '\n') || c == 0x7F;
-    });
-}
+using yuzu::test::stray_control_bytes;
 void exec_ddl(const std::string& dsn, const char* sql) {
     PgConn conn{PQconnectdb(dsn.c_str())};
     REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

@@ -601,9 +601,12 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
     // label on the metric is `gateway_proxy` so SRE can see attacks coming
     // through the gateway vs direct-connect agents.
     if (info.agent_id().empty() || info.agent_id().size() > auth::kMaxAgentIdLength) {
-        spdlog::warn(
-            "[gateway] ProxyRegister rejected: agent_id length {} (max {}, empty disallowed)",
-            info.agent_id().size(), auth::kMaxAgentIdLength);
+        // The id is neutralised and capped at 256 bytes by log_id_token, so an over-length id
+        // cannot inflate the line; `size` carries the real length.
+        spdlog::warn("[gateway] ProxyRegister rejected: agent_id length {} (max {}, empty "
+                     "disallowed) for agent {}",
+                     info.agent_id().size(), auth::kMaxAgentIdLength,
+                     ::yuzu::log_id_token(info.agent_id()));
         if (metrics_) {
             metrics_
                 ->counter("yuzu_register_invalid_agent_id_total",
@@ -615,7 +618,9 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
     }
     // Embedded NUL: same rejection as the direct Register (see AgentServiceImpl::Register).
     if (info.agent_id().find('\0') != std::string::npos) {
-        spdlog::warn("[gateway] ProxyRegister rejected: agent_id contains an embedded NUL");
+        spdlog::warn("[gateway] ProxyRegister rejected: agent_id contains an embedded NUL for "
+                     "agent {}",
+                     ::yuzu::log_id_token(info.agent_id()));
         if (metrics_) {
             metrics_
                 ->counter("yuzu_register_invalid_agent_id_total",
@@ -708,7 +713,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
         // must use the agent's own identifier charset; existing rows are exempt.
         if (!prior && !auth::is_valid_new_agent_id(info.agent_id())) {
             spdlog::warn("[gateway] ProxyRegister rejected: agent_id has characters outside "
-                         "[A-Za-z0-9._:-] (or is only dots)");
+                         "[A-Za-z0-9._:-] (or is only dots) for agent {}",
+                         safe_agent_id);
             if (metrics_) {
                 metrics_
                     ->counter("yuzu_register_invalid_agent_id_total",
@@ -1960,7 +1966,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                             "matching local session; the agent recovers by reconnecting (logged "
                             "at most once per 5s; see yuzu_server_gateway_route_desync_total)",
                             onbehalf::sanitize_for_log(session_id, 64),
-                            onbehalf::sanitize_for_log(agent_id, 64));
+                            ::yuzu::log_id_token(agent_id));
                     }
                     record_directory_desync(metrics_, "notify_stream_status",
                                             "connected_unverified");
@@ -1982,7 +1988,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             if (it == gateway_sessions_.end() || it->second != agent_id) {
                 spdlog::warn("[gateway] NotifyStreamStatus: unknown session {} for agent {}",
                              onbehalf::sanitize_for_log(session_id, 64),
-                             onbehalf::sanitize_for_log(agent_id, 64));
+                             ::yuzu::log_id_token(agent_id));
                 // 4.2a #8: systemic desync visibility for a replica that lost its
                 // gateway_sessions_ map or never saw this session's ProxyRegister.
                 record_directory_desync(metrics_, "notify_stream_status", "unknown_session");
@@ -1996,7 +2002,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             spdlog::warn("[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) but "
                          "the directory names a different session — rejecting",
                          onbehalf::sanitize_for_log(session_id, 64),
-                         onbehalf::sanitize_for_log(agent_id, 64));
+                         ::yuzu::log_id_token(agent_id));
             record_directory_desync(metrics_, "notify_stream_status", "stale_connected_session");
             response->set_acknowledged(false);
             return grpc::Status::OK;

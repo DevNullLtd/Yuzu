@@ -30,6 +30,7 @@
  * spdlog's ostream sink, which most test_helpers.hpp consumers don't need.
  */
 
+#include <cstddef>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -82,5 +83,23 @@ private:
     spdlog::level::level_enum prev_level_;
     bool stopped_{false};
 };
+
+/// Count the control bytes in captured log text that a single well-formed line could not
+/// contain: every byte below 0x20 and DEL (0x7F), except a '\n' and a '\r' that is immediately
+/// followed by '\n' (spdlog ends a line with "\r\n" on Windows and "\n" elsewhere). A lone
+/// '\r' injected mid-line still counts.
+[[nodiscard]] inline std::size_t stray_control_bytes(const std::string& s) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (c == '\n')
+            continue;
+        if (c == '\r' && i + 1 < s.size() && s[i + 1] == '\n')
+            continue;
+        if (c < 0x20 || c == 0x7F)
+            ++n;
+    }
+    return n;
+}
 
 } // namespace yuzu::test

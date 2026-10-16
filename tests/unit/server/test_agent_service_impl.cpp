@@ -62,9 +62,12 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <random>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1296,12 +1299,88 @@ double invalid_id_count(yuzu::MetricsRegistry& m, const char* reason, bool gatew
 
 } // namespace
 
-TEST_CASE("kRegisterInvalidAgentIdReasons is exactly the closed reason set the Register paths emit",
+// The length, NUL and charset refusals name the claimed id, neutralised, so an operator can tell
+// which agent was refused; the raw form (space, '=', NUL) must never reach the line.
+TEST_CASE("Register: the length, NUL and charset refusals log the claimed id neutralised",
+          "[pg][agent_service][register][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    struct Shape {
+        std::string id;
+        std::string line;   // the refusal text that must appear
+        std::string folded; // the neutralised id that must follow it
+        std::string raw;    // a raw fragment that must not appear
+    };
+    const std::vector<Shape> shapes{
+        {"x y=" + std::string(300, 'A'), "agent_id length 304 (max 256, empty disallowed) for agent ",
+         "x_y_AAAA", "x y="},
+        {std::string("agent a\0x=1", 11), "agent_id contains an embedded NUL for agent ",
+         "agent_a_x_1", "x=1"},
+        {"agent a=1", "characters outside [A-Za-z0-9._:-] (or is only dots) for agent ",
+         "agent_a_1", "a=1"},
+    };
+    for (const auto& sh : shapes) {
+        INFO("line=" << sh.line);
+        auto req = make_register_request(sh.id);
+        apb::RegisterResponse resp;
+        yuzu::test::LogCapture cap;
+        auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+        cap.stop();
+        CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+        CHECK(cap.text().find("Register rejected: ") != std::string::npos);
+        CHECK(cap.text().find(sh.line + sh.folded) != std::string::npos);
+        CHECK(cap.text().find(sh.raw) == std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(cap.text()) == 0);
+    }
+}
+
+TEST_CASE("ProxyRegister: the length, NUL and charset refusals log the claimed id neutralised",
+          "[pg][agent_service][register][gateway][failclosed]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    struct Shape {
+        std::string id;
+        std::string line;
+        std::string folded;
+        std::string raw;
+    };
+    const std::vector<Shape> shapes{
+        {"x y=" + std::string(300, 'A'),
+         "agent_id length 304 (max 256, empty disallowed) for agent ", "x_y_AAAA", "x y="},
+        {std::string("agent a\0x=1", 11), "agent_id contains an embedded NUL for agent ",
+         "agent_a_x_1", "x=1"},
+        {"agent a=1", "characters outside [A-Za-z0-9._:-] (or is only dots) for agent ",
+         "agent_a_1", "a=1"},
+    };
+    for (const auto& sh : shapes) {
+        INFO("line=" << sh.line);
+        auto req = make_register_request(sh.id);
+        apb::RegisterResponse resp;
+        yuzu::test::LogCapture cap;
+        auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+        cap.stop();
+        CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+        CHECK(cap.text().find("ProxyRegister rejected: ") != std::string::npos);
+        CHECK(cap.text().find(sh.line + sh.folded) != std::string::npos);
+        CHECK(cap.text().find(sh.raw) == std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(cap.text()) == 0);
+    }
+}
+
+TEST_CASE("kRegisterInvalidAgentIdReasons is the closed reason set the seed function creates, "
+          "idempotently",
           "[agent_service][register][metrics]") {
-    // ServerImpl pre-seeds yuzu_register_invalid_agent_id_total from this list. The four reasons
-    // are the literals at the increment sites in agent_service_impl.cpp (length, nul, control,
-    // charset) and gateway_service_impl.cpp (same four, source="gateway_proxy"); a reason added
-    // there without being added here would be absent from a healthy scrape.
+    // This proves only that the seed function creates exactly the documented reason set (direct
+    // and gateway_proxy series, all at 0, with HELP/TYPE) and that seeding twice is harmless. It
+    // does not look at the increment sites: the "Register increment sites only use the closed
+    // reason set" case below reads their source text for that.
     const std::vector<std::string> expected{"length", "nul", "control", "charset"};
     const std::vector<std::string> actual(kRegisterInvalidAgentIdReasons.begin(),
                                           kRegisterInvalidAgentIdReasons.end());
@@ -1319,6 +1398,54 @@ TEST_CASE("kRegisterInvalidAgentIdReasons is exactly the closed reason set the R
               std::string::npos);
         CHECK(text.find("yuzu_register_invalid_agent_id_total{reason=\"" + reason +
                         "\",source=\"gateway_proxy\"} 0") != std::string::npos);
+    }
+
+    // Idempotent: a second seed neither throws nor changes the exposition.
+    yuzu::server::seed_register_invalid_agent_id_series(m);
+    CHECK(m.serialize() == text);
+}
+
+namespace {
+std::string read_server_source(const char* name) {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / name, std::ios::binary);
+    REQUIRE(in.is_open());
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// Every `"reason", "<x>"` literal passed to yuzu_register_invalid_agent_id_total in `src`.
+// Tolerant of whitespace and line breaks between the tokens.
+std::vector<std::string> register_invalid_id_reasons(const std::string& src) {
+    static const std::regex re(
+        R"re(yuzu_register_invalid_agent_id_total"\s*,\s*\{\{\s*"reason"\s*,\s*"([^"]*)")re");
+    std::vector<std::string> out;
+    for (std::sregex_iterator it(src.begin(), src.end(), re), end; it != end; ++it)
+        out.push_back((*it)[1].str());
+    return out;
+}
+} // namespace
+
+TEST_CASE("Register increment sites only use the closed reason set, and ServerImpl still seeds it",
+          "[agent_service][register][metrics]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    // Wiring pin: the seed function above is only useful while server.cpp still calls it.
+    CHECK(read_server_source("server.cpp").find("seed_register_invalid_agent_id_series(") !=
+          std::string::npos);
+
+    // A reason literal added at an increment site without being added to
+    // kRegisterInvalidAgentIdReasons would be absent from a healthy scrape.
+    for (const char* file : {"agent_service_impl.cpp", "gateway_service_impl.cpp"}) {
+        INFO("file=" << file);
+        const auto reasons = register_invalid_id_reasons(read_server_source(file));
+        // Floor: the regex must still see the four increment sites, or this passes vacuously.
+        CHECK(reasons.size() >= kRegisterInvalidAgentIdReasons.size());
+        for (const auto& r : reasons) {
+            INFO("reason=" << r);
+            CHECK(std::find(kRegisterInvalidAgentIdReasons.begin(),
+                            kRegisterInvalidAgentIdReasons.end(),
+                            r) != kRegisterInvalidAgentIdReasons.end());
+        }
     }
 }
 

@@ -23,7 +23,9 @@
 #       string-literal arguments, across server/core/src/*.cpp AND
 #       agents/core/src/*.cpp (the agent registers its own metrics at
 #       agents/core/src/agent.cpp, e.g. around the AgentImpl constructor, and
-#       would otherwise be uncovered).
+#       would otherwise be uncovered), plus the few headers listed in
+#       "describe_files" that carry an inline `describe(` call of their own
+#       (a header is not globbed: most headers hold no HELP text).
 #
 #   (b) HELP_TABLE_FILES -- every double-quoted string literal in the two
 #       Guardian HELP-table headers (guardian_journal_fleet_tags.hpp,
@@ -92,6 +94,8 @@ selftest_flag = sys.argv[2] == "1"
 # Kept in one constant so adding a future HELP table is a one-line change.
 SCAN_TARGETS = {
     "describe_dirs": ["server/core/src", "agents/core/src"],
+    # Headers with an inline describe(...) call, scanned like the .cpp files above.
+    "describe_files": ["server/core/src/agent_service_impl.hpp"],
     "help_tables": [
         "server/core/src/guardian_journal_fleet_tags.hpp",
         "server/core/src/guardian_health_fleet_tags.hpp",
@@ -196,20 +200,30 @@ def non_ascii_findings(rel, base_line, base_offset, segment):
 
 def scan_describe_surface(root):
     findings = []
+    paths = []
     for scan_dir in SCAN_TARGETS["describe_dirs"]:
         base = os.path.join(root, scan_dir)
         if not os.path.isdir(base):
             continue
-        for full in sorted(glob.glob(os.path.join(base, "*.cpp"))):
-            rel = os.path.relpath(full, root).replace(os.sep, "/")
-            try:
-                with open(full, "r", encoding="utf-8") as f:
-                    text = f.read()
-            except OSError as e:
-                findings.append((rel, 0, 0, f"<unreadable: {type(e).__name__}>"))
-                continue
-            for line, byte_offset, call_text in find_describe_calls(text):
-                findings.extend(non_ascii_findings(rel, line, byte_offset, call_text))
+        paths.extend(sorted(glob.glob(os.path.join(base, "*.cpp"))))
+    for rel_file in SCAN_TARGETS["describe_files"]:
+        full = os.path.join(root, rel_file)
+        if os.path.isfile(full):
+            paths.append(full)
+        elif root == repo_root:
+            # A listed header that vanished from the real tree is a config error, not a silent
+            # pass (selftest fixture trees hold only the files they seed).
+            findings.append((rel_file, 0, 0, "<missing scan target>"))
+    for full in paths:
+        rel = os.path.relpath(full, root).replace(os.sep, "/")
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            findings.append((rel, 0, 0, f"<unreadable: {type(e).__name__}>"))
+            continue
+        for line, byte_offset, call_text in find_describe_calls(text):
+            findings.extend(non_ascii_findings(rel, line, byte_offset, call_text))
     return findings
 
 
@@ -347,6 +361,20 @@ def run_selftest():
             SCAN_TARGETS["help_tables"] = saved_files
         if not any(ch == "—" for _r, _l, _b, ch in table_findings):
             print(f"SELFTEST FAILED: HELP-table fixture was NOT flagged: {table_findings}")
+            return 1
+
+        # Seeded fixture (a, header): a describe() call inline in a listed header is scanned too.
+        hdr_dir = os.path.join(tmp, "header_seeded", "server", "core", "src")
+        os.makedirs(hdr_dir)
+        with open(os.path.join(hdr_dir, "agent_service_impl.hpp"), "w", encoding="utf-8") as f:
+            f.write(
+                'inline void seed(Metrics& m) {\n'
+                '    m.describe("yuzu_x_total", "Reintroduced em dash — in a header", "counter");\n'
+                '}\n'
+            )
+        hdr_findings = scan_describe_surface(os.path.join(tmp, "header_seeded"))
+        if not any(ch == "—" for _r, _l, _b, ch in hdr_findings):
+            print(f"SELFTEST FAILED: header describe() fixture was NOT flagged: {hdr_findings}")
             return 1
 
         # Metric NAME / TYPE arguments are never edited by the fix this gate

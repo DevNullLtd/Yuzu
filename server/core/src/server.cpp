@@ -13348,7 +13348,7 @@ private:
                     "Gateway SendCommand for {} DROPPED: no configured mgmt address for "
                     "cluster_id '{}' (--gateway-cluster-addr) — command forwarding to this "
                     "cluster is DOWN until it is added",
-                    cmd_id, gp.cluster_id.value_or("<none>"));
+                    cmd_id, ::yuzu::log_id_token(gp.cluster_id.value_or("<none>")));
                 metrics_
                     .counter("yuzu_server_gateway_forward_total",
                              {{"cluster_id", resolution.label}, {"status", "unknown_cluster"}})

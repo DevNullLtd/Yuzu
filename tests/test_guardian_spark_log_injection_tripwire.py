@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""#4665 tripwire: no NEW spdlog:: call prints a rule-id/Spark-key-shaped value unwrapped.
+"""#4665 / #5513 tripwire: no NEW spdlog:: call prints a rule-id/Spark-key-shaped value, a claimed
+agent id, agent-supplied free text or store error text unwrapped.
 
-#4665 closed CWE-117 log-injection on operator-authored Guardian `rule_id` /
+Seven checks, numbered in the order they appear below. Check 1 is the #4665 rule-id / Spark-key
+check; checks 2 to 7 are the #5513 agent-id, free-text and store-error checks.
+
+CHECK 1 (#4665). #4665 closed CWE-117 log-injection on operator-authored Guardian `rule_id` /
 Spark `key` (and the path/hive/service/unit-name values a Spark mechanism embeds
 in a log line): every raw print site across the agent's guard_*/spark_*/
 guardian_* sources and the server's guardian_push_builder.cpp/
@@ -130,10 +134,11 @@ the wrap happens INSIDE the formatter:
     it gets flagged and a reviewer has to consciously verify the line shape
     rather than inherit a blanket pass.
 
-SECOND, SEPARATE CHECK (#5513): claimed agent ids in seven named files outside the
+CHECK 2 (#5513): claimed agent ids in seven named files outside the
 Guardian/Spark basename family -- server/core/src/agent_service_impl.cpp,
 gateway_service_impl.cpp, agent_registry.cpp, custom_properties_store.cpp,
-custom_properties_routes.cpp, tag_store.cpp and config_routes.cpp (AGENT_ID_FILES). It flags a spdlog:: argument that is a request-derived agent id
+custom_properties_routes.cpp, tag_store.cpp and config_routes.cpp (AGENT_ID_FILES). It flags a
+spdlog:: argument that is a request-derived agent id
 (`info.agent_id()`, `request->agent_id()`, `req->agent_id()`, a local alias bound from
 one of those in the same function, or the bare `agent_id` in the custom-properties
 files and tag_store.cpp, where the bare caller-supplied tag `key` is also matched; the bare `key`
@@ -144,16 +149,18 @@ onbehalf::sanitize_for_log call or the local `safe_agent_id`. It is LEXICAL: it 
 argument text, not data flow, so an id reaching the log through a variable it cannot
 trace to a request accessor, or a new spelling, is not seen. The exact scope and limits
 are in the block comment above find_agent_id_violations_in_text(). FILE_BASENAME_RE and
-the pattern check above are unchanged and do not apply to these seven files.
+the check 1 pattern scan are unchanged and do not apply to these seven files.
 In agent_registry.cpp only the claimed ids from `info.agent_id()` (and the local
 `safe_agent_id` built from it) are in scope; the many other spdlog calls in that file print
 ids taken from the session table and are deliberately not matched.
-A fourth, narrower rule (REGISTRY_FREE_TEXT_FILES, agent_registry.cpp only) requires an
+
+CHECK 3 (REGISTRY_FREE_TEXT_FILES, agent_registry.cpp only) requires an
 spdlog:: argument that is an agent-supplied hostname (`info.hostname()` or a local alias bound
 from it) or the `.error()` of a `revoke_by_device(` or `register_agent(` result (a store error
 string that can quote the device id) to be wholly one wrap call. The `register_agent(` half
 also runs on agent_service_impl.cpp and gateway_service_impl.cpp (REGISTRY_FREE_TEXT_FILES).
-A fifth, narrower rule (COMMAND_TEXT_FILES, agent_service_impl.cpp, gateway_service_impl.cpp and
+
+CHECK 4 (COMMAND_TEXT_FILES, agent_service_impl.cpp, gateway_service_impl.cpp and
 agent_registry.cpp)
 requires every spdlog:: argument that is `.command_id()` or `.plugin()` on a message receiver
 (these are free-form bytes on a CommandResponse frame the agent sends), `.gateway_node()` on a
@@ -164,43 +171,48 @@ member form `.gateway_node` (no parentheses, a session-table read) in agent_regi
 reads argument text only: a value copied into a local under another name first is not seen;
 request-metadata session ids printed before their lookup, `sync.error()`-style fixed-text
 errors and member-form session reads other than `.gateway_node` are not tracked (lexical limit).
-A sixth guard (UNSCANNED_LOGGING_FILES, the second check's files except config_routes.cpp, which
+
+CHECK 5 (UNSCANNED_LOGGING_FILES, the check 2 files except config_routes.cpp, which
 reads the default logger's level without logging through it, plus server/core/src/pg/pg_pool.cpp)
 fails on any
 logging FORM the scanner does not parse: an `SPDLOG_TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL(`
-macro, `spdlog::log(` or `default_logger`. The rules above only understand `spdlog::<level>(`
+macro, `spdlog::log(` or `default_logger`. The checks above only understand `spdlog::<level>(`
 and `<logger>-><level>(` calls, so a different form would otherwise escape them silently;
-this makes it fail loudly instead. A new file added to the second check is covered by
+this makes it fail loudly instead. A new file added to check 2 is covered by
 extending that tuple, not by this note.
-A third, narrower rule (PQ_ERROR_FILES) requires every spdlog:: argument that contains a
-PQerrorMessage( or PQresultErrorMessage( call in custom_properties_store.cpp, tag_store.cpp and
-pg/pg_pool.cpp to be wrapped (libpq error text can quote the claimed agent id). It matches the
-call name only: a value copied into a local first is not seen, which is why pg_pool.cpp's
-connect-failure line (it prints a local `err` copied from PQerrorMessage) is wrapped by hand but
-not covered here. The same rule keyed on a store `.error()` argument covers config_routes.cpp
-(STORE_ERROR_FILES).
 
-A seventh, narrower rule (PKI_SIGNER_FILES, server/core/src/server.cpp only) covers the PKI signer
+CHECK 6 (PQ_ERROR_FILES, STORE_ERROR_FILES, POOL_ERROR_FILES): store error text. Every spdlog::
+argument that contains a PQerrorMessage( or PQresultErrorMessage( call in
+custom_properties_store.cpp, tag_store.cpp and pg/pg_pool.cpp must be wrapped (libpq error text can
+quote the claimed agent id), and so must every argument that contains a `last_error()` call (the
+pool's connection-failure text, which can carry libpq text) in custom_properties_store.cpp and
+tag_store.cpp. It matches the call name only, with no data flow: a value copied into a local first
+is not seen, which is why pg_pool.cpp's connect-failure line (it prints a local `err` copied from
+PQerrorMessage) is wrapped by hand but not covered here. The same rule keyed on a store `.error()`
+argument covers config_routes.cpp (STORE_ERROR_FILES).
+
+CHECK 7 (PKI_SIGNER_FILES, server/core/src/server.cpp only) covers the PKI signer
 legs of the Register / ProxyRegister path: an spdlog:: statement whose format literal starts with
 "PKI:" must wrap a bare `agent_id` argument (only `.size()`, `.empty()` and `.length()` on it are
 exempt), any `.what()` argument and any store `.error()` argument. It is not the broad bare-name
-rule and does not apply to the rest of server.cpp. server.cpp is also NOT in the sixth guard
+rule and does not apply to the rest of server.cpp. server.cpp is also NOT in check 5's file list
 (UNSCANNED_LOGGING_FILES): it makes one legitimate non-logging use of the default logger
 (`spdlog::default_logger()->level()` in the log-level report), which the guard
 would fail on; it has no `spdlog::log(` or `SPDLOG_*(` use.
 
-WHAT THE SECOND CHECK DELIBERATELY DOES NOT COVER (session-resolved ids). Log lines that print an
+WHAT CHECKS 2 TO 7 DELIBERATELY DO NOT COVER (session-resolved ids). Log lines that print an
 agent id read back from the session table or the enrollment store print it as stored: the
 Heartbeat / BatchHeartbeat and ReportInventory / ProxyInventory ingest paths and the shared
-ingestion modules they call, the Subscribe stream open and close lines, and the registry's removal
-and sweep lines (in agent_registry.cpp only claimed ids from `info.agent_id()` are matched).
+ingestion modules they call, the Subscribe stream open and close lines, and the agent registry's
+other log lines that print a session-table id (removal, rollback, session-timeout, sweep and
+dispatch-routing lines); in agent_registry.cpp only claimed ids from `info.agent_id()` are matched.
 AuthDB's agent-id check (`agent_id_ok`, auth_db.cpp) has already refused control bytes and ',' for
 such an id, so it cannot add a newline-delimited line (it does accept U+0085, U+2028 and U+2029,
 which a splitlines()-style reader treats as breaks), but an id enrolled or imported before the
 new-id charset gate (`auth::is_valid_new_agent_id`; the legacy cfg import in
 enrollment_cfg_import.cpp does not apply it) may still contain a space, '=' or a non-ASCII byte,
 and so can add same-line key=value tokens. The `ex.what()` of the ingest catch-alls on those paths is likewise
-printed as-is. This is a stated limit of the check, not a claim that those lines are neutralised.
+printed as-is. This is a stated limit of the checks, not a claim that those lines are neutralised.
 
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml,
 same precedent shape as test_no_connless_pq_escape.py and
@@ -854,7 +866,7 @@ def find_violations_in_text(text: str) -> list[tuple[int, str, list[str]]]:
 
 
 # ---------------------------------------------------------------------------
-# Second check: raw CLAIMED AGENT ID in a log call (register path, OTA path,
+# Check 2: raw CLAIMED AGENT ID in a log call (register path, OTA path,
 # custom-properties). Separate from the rule-id/Spark-key check above: that one
 # is pattern-driven and confined to the Guardian/Spark basename family, which
 # does not include the files below.
@@ -1020,7 +1032,7 @@ def find_agent_id_violations_in_text(
     return out
 
 
-# Third, narrower rule: libpq error text (`PQerrorMessage`) can quote the statement
+# Check 6: libpq error text (`PQerrorMessage`) can quote the statement
 # parameters, i.e. the claimed agent id, so in the custom-properties store every spdlog
 # argument that contains a `PQerrorMessage(` call must be wholly one wrap call. Lexical,
 # like the check above; it covers only this one file.
@@ -1036,6 +1048,16 @@ PQ_ERROR_FILES: tuple[str, ...] = (
 # database-failure path carries a kRuntimeConfigDbErrorPrefix plus libpq text) must be wrapped
 # wherever it is an spdlog argument.
 STORE_ERROR_FILES: tuple[str, ...] = ("server/core/src/config_routes.cpp",)
+
+# Same rule, third marker: the pool's own connection-failure text (`pool_.last_error()`), which
+# can carry libpq text, in the two stores that print it. Name-only, like the rules above: the
+# marker is matched inside the argument text, so an error string copied into a local first is
+# not seen.
+POOL_ERROR_FILES: tuple[str, ...] = (
+    "server/core/src/custom_properties_store.cpp",
+    "server/core/src/tag_store.cpp",
+)
+POOL_ERROR_MARKERS: tuple[str, ...] = ("last_error()",)
 
 
 # Name-only: the rule matches the call NAME inside the argument text. A value copied into a
@@ -1055,7 +1077,7 @@ def find_pq_error_violations_in_text(
     return out
 
 
-# Fourth, narrower rule: agent-supplied free text and store error text in the register path.
+# Check 3: agent-supplied free text and store error text in the register path.
 # In agent_registry.cpp an spdlog argument that is
 #   - `info.hostname()` (any receiver) or a local alias bound from such an accessor earlier in
 #     the SAME function (`const auto& host = info.hostname();`), or
@@ -1105,7 +1127,7 @@ def find_registry_free_text_violations_in_text(text: str) -> list[tuple[int, str
     return out
 
 
-# Fifth, narrower rule: `.command_id()` / `.plugin()` on a message receiver are free-form bytes
+# Check 4: `.command_id()` / `.plugin()` on a message receiver are free-form bytes
 # on a CommandResponse frame the agent sends, and `.gateway_node()` / `.cluster_id()` / the local
 # `cluster_id` are gateway-asserted provenance strings on the stream-status and heartbeat
 # notifications. In the two files below every spdlog argument that contains one (not merely
@@ -1155,7 +1177,7 @@ def find_command_text_violations_in_text(text: str) -> list[tuple[int, str]]:
     return out
 
 
-# Seventh, narrower rule: the PKI signer legs in server.cpp. The Register / ProxyRegister signer
+# Check 7: the PKI signer legs in server.cpp. The Register / ProxyRegister signer
 # (the `cert_signer` lambda and `sign_agent_csr`) prints the claimed `agent_id` and, on a throw,
 # `e.what()`. In server.cpp, an spdlog statement whose format literal starts with "PKI:" must not
 # print a bare `agent_id`, an `e.what()` argument or a store `.error()` argument: each must be
@@ -1195,7 +1217,7 @@ def find_pki_signer_violations_in_text(text: str) -> list[tuple[int, str]]:
     return out
 
 
-# Sixth guard: logging forms the scanner above does not parse. find_spdlog_statements only
+# Check 5: logging forms the scanner above does not parse. find_spdlog_statements only
 # understands `spdlog::<level>(` and `<logger>-><level>(`; any other form in the files of
 # the second check would print its arguments unexamined. They are absent today, so the guard
 # fails on any occurrence (a mention in a comment too: reword it) rather than trying to scan them.
@@ -1577,6 +1599,14 @@ def _selfcheck() -> None:
     if find_pq_error_violations_in_text(pq_res_must_not):
         raise SystemExit(f"selfcheck: unexpected PQresultErrorMessage violation: {pq_res_must_not!r}")
 
+    # 9a. The same rule keyed on the pool's `last_error()` (custom-properties and tag stores).
+    pool_must_match = 'spdlog::warn("no connection ({})", pool_.last_error());'
+    if not find_pq_error_violations_in_text(pool_must_match, POOL_ERROR_MARKERS):
+        raise SystemExit(f"selfcheck: expected a last_error() violation: {pool_must_match!r}")
+    pool_must_not = 'spdlog::warn("no connection ({})", ::yuzu::log_key_token(pool_.last_error()));'
+    if find_pq_error_violations_in_text(pool_must_not, POOL_ERROR_MARKERS):
+        raise SystemExit(f"selfcheck: unexpected last_error() violation: {pool_must_not!r}")
+
     # 9b. The same rule keyed on a store `.error()` (config_routes.cpp).
     store_must_match = 'spdlog::error("write failed: {}", result.error());'
     if not find_pq_error_violations_in_text(store_must_match, (".error()",)):
@@ -1794,6 +1824,15 @@ def main() -> int:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for line_no, stmt in find_pq_error_violations_in_text(text, (".error()",)):
+            snippet = " ".join(stmt.split())[:160]
+            agent_hits.append(f"{rel}:{line_no}: {snippet}")
+    for rel in POOL_ERROR_FILES:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            agent_hits.append(f"{rel}: file listed in POOL_ERROR_FILES does not exist")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for line_no, stmt in find_pq_error_violations_in_text(text, POOL_ERROR_MARKERS):
             snippet = " ".join(stmt.split())[:160]
             agent_hits.append(f"{rel}:{line_no}: {snippet}")
     for rel in REGISTRY_FREE_TEXT_FILES:

@@ -162,7 +162,7 @@ CustomPropertiesStore::CustomPropertiesStore(pg::PgPool& pool) : pool_(pool) {
     if (!lease) {
         spdlog::error("CustomPropertiesStore: no database connection at construction ({}) — "
                       "custom-properties persistence disabled",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return;
     }
     if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
@@ -260,7 +260,7 @@ CustomPropertiesStore::get_properties(const std::string& agent_id) const {
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_props_sampler))
             spdlog::warn("CustomPropertiesStore::get_properties: no connection in time ({})",
-                        pool_.last_error());
+                        ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -302,7 +302,7 @@ CustomPropertiesStore::get_property(const std::string& agent_id, const std::stri
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_prop_sampler))
             spdlog::warn("CustomPropertiesStore::get_property: no connection in time ({})",
-                        pool_.last_error());
+                        ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -350,7 +350,7 @@ CustomPropertiesStore::get_property_map(const std::string& agent_id) const {
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_map_sampler))
             spdlog::warn("CustomPropertiesStore::get_property_map: no connection in time ({})",
-                        pool_.last_error());
+                        ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -386,7 +386,7 @@ CustomPropertiesStore::get_values_for_keys(const std::vector<std::string>& keys)
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_values_for_keys_sampler))
             spdlog::warn("CustomPropertiesStore::get_values_for_keys: no connection in time ({})",
-                        pool_.last_error());
+                        ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     std::vector<std::string_view> key_views(keys.begin(), keys.end());
@@ -470,14 +470,14 @@ CustomPropertiesStore::set_property(const std::string& agent_id, const std::stri
 bool CustomPropertiesStore::delete_property(const std::string& agent_id, const std::string& key) {
     if (!open_)
         return false;
-    // Honest not-found, as TagStore::delete_tag: the write guard means no row can exist under
-    // such an identity.
+    // Honest not-found, as TagStore::delete_tag: the write guard means no row can be written
+    // under such an identity.
     if (!valid_agent_id(agent_id))
         return false;
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::delete_property: no connection in time ({})",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return false;
     }
     pg::PgResult res = pg::exec_params(
@@ -504,7 +504,7 @@ void CustomPropertiesStore::delete_all_properties(const std::string& agent_id) {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::delete_all_properties: no connection in time ({})",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return;
     }
     pg::PgResult res = pg::exec_params(
@@ -526,7 +526,7 @@ std::vector<CustomPropertySchema> CustomPropertiesStore::list_schemas() const {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::list_schemas: no connection in time ({})",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return results;
     }
     pg::PgResult res = pg::exec_params(
@@ -562,7 +562,7 @@ CustomPropertiesStore::get_schema(const std::string& key) const {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::get_schema: no connection in time ({})",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -635,7 +635,7 @@ CustomPropertiesStore::delete_schema(const std::string& key) {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::delete_schema: no connection in time ({})",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(

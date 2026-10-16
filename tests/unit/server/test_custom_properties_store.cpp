@@ -946,10 +946,7 @@ TEST_CASE("CustomPropertiesStore: a failed statement logs the libpq error text o
     // The statement-error continuation is folded into the same line: the newline after the
     // "ERROR: ..." sentence became '_' before "LINE 1:".
     CHECK(text.find("does not exist_LINE 1:") != std::string::npos);
-    CHECK(std::count_if(text.begin(), text.end(), [](char ch) {
-              const auto c = static_cast<unsigned char>(ch);
-              return (c < 0x20 && c != '\n') || c == 0x7F;
-          }) == 0);
+    CHECK(yuzu::test::stray_control_bytes(text) == 0);
 }
 
 TEST_CASE("CustomPropertiesStore: an invalid stored schema regex is logged on one line",

@@ -54,13 +54,7 @@ std::size_t count_char(const std::string& s, char c) {
     return static_cast<std::size_t>(std::count(s.begin(), s.end(), c));
 }
 
-// Every byte below 0x20 other than the one trailing '\n' per log line, and DEL.
-std::size_t stray_control_bytes(const std::string& s) {
-    return static_cast<std::size_t>(std::count_if(s.begin(), s.end(), [](char ch) {
-        const auto c = static_cast<unsigned char>(ch);
-        return (c < 0x20 && c != '\n') || c == 0x7F;
-    }));
-}
+using yuzu::test::stray_control_bytes;
 
 } // namespace
 
@@ -166,4 +160,17 @@ TEST_CASE("AgentRegistry::send_to: the gateway-capability refusal logs the gatew
     CHECK(stray_control_bytes(text) == 0);
     // One refusal line: exactly one newline, the log terminator.
     CHECK(count_char(text, '\n') == 1);
+}
+
+TEST_CASE("stray_control_bytes: accepts both line endings, counts every other control byte",
+          "[log_injection][5513]") {
+    CHECK(stray_control_bytes("line one\nline two\n") == 0);
+    CHECK(stray_control_bytes("line one\r\nline two\r\n") == 0);
+    CHECK(stray_control_bytes("") == 0);
+    // A '\r' that does not end a line is an injected control byte.
+    CHECK(stray_control_bytes("line one\rforged\r\n") == 1);
+    CHECK(stray_control_bytes("trailing\r") == 1);
+    CHECK(stray_control_bytes(std::string("del\x7f\n")) == 1);
+    CHECK(stray_control_bytes(std::string("esc\x1b[0m\n")) == 1);
+    CHECK(stray_control_bytes(std::string("nul\0byte\n", 9)) == 1);
 }

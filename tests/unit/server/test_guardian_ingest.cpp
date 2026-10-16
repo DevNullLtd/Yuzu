@@ -527,9 +527,9 @@ TEST_CASE("guardian ingest: #4606 the server's other id-printing log lines neutr
         cap.stop();
         CHECK(cap.text().find("event ingest error (agent=agent_x_1, rule=rule-err)") !=
               std::string::npos);
-        // The store error text is wrapped too: its spaces are folded, so it cannot run on as
-        // free text in the log line.
-        CHECK(cap.text().find("): event_field_contains_an_embedded_NUL_byte") != std::string::npos);
+        // The store error text is wrapped too (log_key_token): control bytes are folded, spaces
+        // are kept so the message stays readable.
+        CHECK(cap.text().find("): event field contains an embedded NUL byte") != std::string::npos);
     }
     { // an action other than "event" is ignored (debug): the action name and the agent id are
         // printed

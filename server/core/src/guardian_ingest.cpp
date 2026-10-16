@@ -367,12 +367,12 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             // duplicate event_id is resolved to Redelivered or Conflict before this path unless
             // the compare SELECT or the ROLLBACK TO SAVEPOINT itself errors ("redelivery
             // compare failed"), which also returns libpq text. detail_json is capped at 16 KiB
-            // (kMaxDetailJson, earlier in this function). So it is wrapped like the
-            // identifiers: log_id_token folds control bytes, spaces, '=' and ',' and caps the
-            // length at 256 bytes, keeping the head and the tail of a longer message.
+            // (kMaxDetailJson, earlier in this function). So it is wrapped: log_key_token folds
+            // control bytes and keeps spaces, so the message stays readable on one line, and
+            // caps the length at 256 bytes, keeping the head and the tail of a longer message.
             spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}",
                          log_id_token(agent_id), log_id_token(ev_row.rule_id),
-                         log_id_token(res.error));
+                         log_key_token(res.error));
             return;
         }
         if (ev_row.rule_id != kObservationRuleId) {
@@ -451,11 +451,19 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                 if (alert_router)
                     alert_router->observe(obs_type, subject, safe_agent, now);
             } catch (const std::exception& e) {
-                spdlog::warn("Guardian ingest: observer threw for {} from agent {}: {}",
-                             log_id_token(obs_type), log_id_token(safe_agent), e.what());
+                // The token wrappers allocate, so a bad_alloc here would otherwise leave the
+                // handler and tear down the stream this catch-all exists to protect.
+                try {
+                    spdlog::warn("Guardian ingest: observer threw for {} from agent {}: {}",
+                                 log_id_token(obs_type), log_id_token(safe_agent), e.what());
+                } catch (...) {
+                }
             } catch (...) {
-                spdlog::warn("Guardian ingest: observer threw (non-std) for {} from agent {}",
-                             log_id_token(obs_type), log_id_token(safe_agent));
+                try { // same reason as above: the wrappers allocate
+                    spdlog::warn("Guardian ingest: observer threw (non-std) for {} from agent {}",
+                                 log_id_token(obs_type), log_id_token(safe_agent));
+                } catch (...) {
+                }
             }
         }
         return;

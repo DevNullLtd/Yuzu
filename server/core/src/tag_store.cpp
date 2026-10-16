@@ -223,7 +223,7 @@ TagStore::TagStore(pg::PgPool& pool) : pool_(pool) {
     if (!lease) {
         spdlog::error("TagStore: no database connection at construction ({}) — tag persistence "
                       "disabled",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return;
     }
     if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
@@ -328,7 +328,8 @@ std::expected<bool, TagReadError> TagStore::delete_tag(const std::string& agent_
     }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
-        spdlog::warn("TagStore::delete_tag: no connection in time ({})", pool_.last_error());
+        spdlog::warn("TagStore::delete_tag: no connection in time ({})",
+                     ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(TagReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -484,7 +485,8 @@ TagStore::get_tag(const std::string& agent_id, const std::string& key) const {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_get_tag_sampler))
-            spdlog::warn("TagStore::get_tag: no connection in time ({})", pool_.last_error());
+            spdlog::warn("TagStore::get_tag: no connection in time ({})",
+                         ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(TagReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -513,7 +515,8 @@ TagStore::get_all_tags(const std::string& agent_id) const {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_all_tags_sampler))
-            spdlog::warn("TagStore::get_all_tags: no connection in time ({})", pool_.last_error());
+            spdlog::warn("TagStore::get_all_tags: no connection in time ({})",
+                         ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(TagReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -554,7 +557,8 @@ TagStore::get_tag_map(const std::string& agent_id) const {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_tag_map_sampler))
-            spdlog::warn("TagStore::get_tag_map: no connection in time ({})", pool_.last_error());
+            spdlog::warn("TagStore::get_tag_map: no connection in time ({})",
+                         ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(TagReadError::kDegraded);
     }
     pg::PgResult res =
@@ -585,7 +589,7 @@ TagStore::agents_with_tag(const std::string& key, const std::string& value) cons
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_agents_with_tag_sampler))
             spdlog::warn("TagStore::agents_with_tag: no connection in time ({})",
-                         pool_.last_error());
+                         ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(TagReadError::kDegraded);
     }
     pg::PgResult res =
@@ -626,7 +630,7 @@ TagStore::get_values_for_keys(const std::vector<std::string>& keys) const {
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_values_for_keys_sampler))
             spdlog::warn("TagStore::get_values_for_keys: no connection in time ({})",
-                         pool_.last_error());
+                         ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(TagReadError::kDegraded);
     }
     std::vector<std::string_view> key_views(keys.begin(), keys.end());
@@ -659,7 +663,7 @@ TagStore::get_compliance_gaps() const {
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_compliance_sampler))
             spdlog::warn("TagStore::get_compliance_gaps: no connection in time ({})",
-                         pool_.last_error());
+                         ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(TagReadError::kDegraded);
     }
     // Two queries on ONE lease (a lease may span successive queries; it may
@@ -720,7 +724,7 @@ TagStore::get_distinct_values(const std::string& key) const {
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_distinct_values_sampler))
             spdlog::warn("TagStore::get_distinct_values: no connection in time ({})",
-                         pool_.last_error());
+                         ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(TagReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -751,7 +755,7 @@ std::expected<std::vector<std::string>, TagReadError> TagStore::get_distinct_key
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_distinct_keys_sampler))
             spdlog::warn("TagStore::get_distinct_keys: no connection in time ({})",
-                         pool_.last_error());
+                         ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(TagReadError::kDegraded);
     }
     pg::PgResult res =
@@ -782,7 +786,7 @@ TagStore::get_values_for_key(const std::string& key) const {
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_values_for_key_sampler))
             spdlog::warn("TagStore::get_values_for_key('{}'): no connection in time ({})",
-                         ::yuzu::log_key_token(key), pool_.last_error());
+                         ::yuzu::log_key_token(key), ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(TagReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(

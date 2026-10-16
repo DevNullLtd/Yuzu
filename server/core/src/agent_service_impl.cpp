@@ -104,8 +104,11 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
     // a distinct metric name from token rejections so SRE alerts on
     // input-shape attacks don't bucket into credential-failure noise.
     if (info.agent_id().empty() || info.agent_id().size() > auth::kMaxAgentIdLength) {
-        spdlog::warn("Register rejected: agent_id length {} (max {}, empty disallowed)",
-                     info.agent_id().size(), auth::kMaxAgentIdLength);
+        // The id is neutralised and capped at 256 bytes by log_id_token, so an over-length id
+        // cannot inflate the line; `size` carries the real length.
+        spdlog::warn("Register rejected: agent_id length {} (max {}, empty disallowed) for agent {}",
+                     info.agent_id().size(), auth::kMaxAgentIdLength,
+                     ::yuzu::log_id_token(info.agent_id()));
         metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "length"}})
             .increment();
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
@@ -114,15 +117,16 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
     // Defence in depth: libpq text binds take agent_id as a NUL-terminated string, so an id
     // containing a NUL byte is refused here as well, instead of relying on the AuthDB agent-id
     // check alone. No legitimate agent produces one. Distinct `reason` label from the length
-    // check; the id itself is not logged (client-supplied).
+    // check. The refusal line prints the id neutralised (client-supplied).
     if (info.agent_id().find('\0') != std::string::npos) {
-        spdlog::warn("Register rejected: agent_id contains an embedded NUL");
+        spdlog::warn("Register rejected: agent_id contains an embedded NUL for agent {}",
+                     ::yuzu::log_id_token(info.agent_id()));
         metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "nul"}}).increment();
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                             "agent_id contains an embedded NUL");
     }
-    // The enrollment store rejects control bytes and ',' in an agent_id later (get_pending_status),
-    // so every log line below prints the id neutralised, never raw.
+    // The enrollment store only validates the id later (get_pending_status), so until then it is
+    // unvalidated and every log line below prints it neutralised.
     const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
 
     // PR3: Register is bootstrap-exempt. A first-enrollment agent presents NO
@@ -230,7 +234,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         // Checked before any token is consumed or any row is written.
         if (!prior && !auth::is_valid_new_agent_id(info.agent_id())) {
             spdlog::warn("Register rejected: agent_id has characters outside [A-Za-z0-9._:-] "
-                         "(or is only dots)");
+                         "(or is only dots) for agent {}",
+                         safe_agent_id);
             metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "charset"}})
                 .increment();
             return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
