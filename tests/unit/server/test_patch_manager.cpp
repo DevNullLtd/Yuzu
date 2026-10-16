@@ -11,9 +11,12 @@
  * execute_deployment"), not ported.
  */
 
+#include "discovery_routes.hpp"
 #include "patch_manager.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+
+#include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -430,4 +433,48 @@ TEST_CASE("PatchManager reports !is_open on a migration failure and degrades wri
     CHECK(mgr.get_missing_patches().empty());
     CHECK(mgr.list_deployments().empty());
     CHECK_FALSE(mgr.get_deployment("anything").has_value());
+}
+
+// ── #4644: the patch list routes read `limit` strictly ────────────────
+
+TEST_CASE("DiscoveryRoutes: GET /api/patches and /api/patches/deployments reject a malformed "
+          "limit with 400 instead of ignoring it",
+          "[patch_manager][pg][routes]") {
+    PATCH_MANAGER(mgr);
+    DiscoveryRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    auto auth_fn = [](const httplib::Request&,
+                      httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "patcher";
+        return s;
+    };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) -> bool { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    routes.register_routes(sink, auth_fn, perm_fn, audit_fn, /*directory_sync=*/nullptr, &mgr,
+                           /*deployment_store=*/nullptr, /*discovery_store=*/nullptr);
+
+    for (const char* route : {"/api/patches", "/api/patches/deployments"}) {
+        for (const char* bad : {"limit=abc", "limit=50x", "limit=1e3", "limit=0x10",
+                                "limit=4294967296", "limit=",
+                                // PG rejects a negative LIMIT; the store answered an empty 200.
+                                "limit=-1"}) {
+            INFO(route << "?" << bad);
+            auto res = sink.Get(std::string(route) + "?" + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        // A present-but-empty `limit=` is malformed like every other converted
+        // route (the docs table says so); an absent `limit` is still the default.
+        auto absent = sink.Get(std::string(route));
+        REQUIRE(absent);
+        CHECK(absent->status == 200);
+        auto ok = sink.Get(std::string(route) + "?limit=10");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
 }

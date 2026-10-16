@@ -60,11 +60,13 @@
 /// `Content-Length` — is REFUSED outright rather than admitted up to the
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
-/// DEFAULTS OFF and is opted into per class, not per table. It is ON only
-/// for `/mcp/`: that surface's own protocol/client contract already requires
-/// `Content-Length` on every framed body (see `web_utils.hpp:577`'s
-/// `mcp_body_unmeasurable` rationale), so refusing an unmeasurable MCP body
-/// costs a conforming client nothing. Every other class below — public REST
+/// DEFAULTS OFF and is opted into per class, not per table. It is ON for
+/// three classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
+/// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
+/// costs a conforming client nothing), `upload_session`, and `hardware` (the
+/// Hardware CI routes carry only a tiny JSON body from the dashboard and API
+/// callers). Every other class below — public REST
 /// (bundles), SCIM, certificate import (REST + dashboard), the plugin trust
 /// bundle, product-pack/workflow authoring, and the OTA upload — keeps it
 /// OFF and falls back to httplib's 100 MiB backstop for a body it cannot
@@ -481,9 +483,13 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // /api/v1/hardware — the Hardware CI list/record/sync REST v1 twin
     // (hardware_routes.cpp). ANY method: GET /api/v1/hardware and
     // GET /api/v1/hardware/{id} are bodyless list/record reads; only
-    // POST /api/v1/hardware/{id}/sync carries a body, and it is a single
-    // JSON object with one short "source" token (one of 5 fixed literals,
-    // e.g. "installed_software") — a few dozen bytes at most. 4 KiB leaves
+    // POST /api/v1/hardware/{id}/sync and the fleet fan-out POST
+    // /api/v1/hardware/sync carry a body. The first is a single JSON object
+    // with one short "source" token (one of 5 fixed literals, e.g.
+    // "installed_software") — a few dozen bytes at most; the second adds a
+    // "scope" token or a "scope_expression" (the route refuses one over
+    // 1024 characters, so 4 KiB is ample and no separate entry is needed —
+    // it inherits this one by segment-boundary prefix). 4 KiB leaves
     // generous headroom over that real shape while keeping this three orders
     // of magnitude under the 4 MiB catch-all (governance Gate 2: this route
     // had no reviewed entry, per the routed-concern row's requirement that

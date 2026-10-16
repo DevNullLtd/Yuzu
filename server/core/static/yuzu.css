@@ -40,7 +40,10 @@
   src: url('/static/fonts/ibm-plex-mono-latin-500-normal.woff2') format('woff2');
 }
 
-/* Yuzu Design System - slate dark theme (docs/design/ui-redesign).
+/* Yuzu Design System - slate dark theme (docs/design/ui-redesign), plus five
+ * alternates selected by html[data-theme] (navy, jade; light, light-baby,
+ * light-hot). Slate is :root; each alternate block below overrides only the
+ * tokens that differ.
  *
  * Token-driven: every visual primitive (colour / type / spacing / radius /
  * elevation) is a --mds-* semantic token; the design's short names (--ink
@@ -53,8 +56,9 @@
  * Direction: utilitarian ops console. Blue is the action colour (buttons,
  * links, switches). Yellow (--hl) is the highlight: brand mark, active nav,
  * active tab, selected row - nothing else. Green / orange / red / sky are
- * status colours only. No gradients, glow, blur or decorative shadow
- * (--shadow appears on pop-overs and menus alone); state changes take 120ms.
+ * status colours only. No glow or blur. Depth is limited to --shadow on
+ * pop-overs and menus, the chart-card elevation (--mds-elevation-2) and the
+ * sparkline gradient fill; state changes take 120ms.
  */
 :root {
   color-scheme: dark;
@@ -154,9 +158,10 @@
   --mds-border-radius-md: 3px;
   --mds-border-radius-lg: 4px;
 
-  /* Elevation - panels are flat; only pop-overs and menus lift */
+  /* Elevation - panels are flat; pop-overs and menus lift (-3), chart cards
+     lift a little (-2: the one deliberate exception to "no decorative shadow") */
   --mds-elevation-1: none;
-  --mds-elevation-2: none;
+  --mds-elevation-2: 0 6px 18px rgba(0,0,0,.35);
   --mds-elevation-3: 0 12px 32px rgba(0,0,0,.6);
 
   /* Interaction state colours - translucent layers stacked on any surface
@@ -272,6 +277,183 @@
   --radius-sm: var(--mds-border-radius-sm);
   --radius-md: var(--mds-border-radius-md);
   --radius-lg: var(--mds-border-radius-lg);
+}
+
+/* -- Alternate colour schemes ------------------------------------------
+   Selected by html[data-theme] (boot script in the shell and /home head; the
+   picker is Settings > General > Appearance). Each block sits on html, the
+   same element as :root, so the short-name aliases above re-resolve, and
+   redefines the minimal token set: UA colour scheme, surfaces and outlines,
+   text, action, highlight, focus, status colours and the two shadows. Chart
+   colours stay as they are on the dark schemes; the light ones darken
+   chart-1..5 (blue, teal, amber, red, violet) because Home's family headings,
+   tile icons and the Trends line use them as text and strokes, which needs 4.5:1
+   on every light surface. Every text pair on the light schemes is held to
+   4.5:1 (primary-button hover included); highlight and focus to 3:1. */
+html[data-theme="navy"] {
+  color-scheme: dark;
+  --mds-color-theme-background-canvas: #0b1526;
+  --mds-color-theme-background-solid-primary: #101e36;
+  --mds-color-theme-background-solid-secondary: #172845;
+  --mds-color-theme-outline-primary: #1f3354;
+  --mds-color-theme-outline-secondary: #2f4a74;
+  --raise: #1c2f50;
+  --mds-color-theme-text-primary: #e8eef9;
+  --mds-color-theme-text-secondary: #bfcce3;
+  --mds-color-theme-text-tertiary: #93a6c4;
+  --mds-color-theme-text-disabled: #62769a;
+  --faint: #8a9dbb;
+  --mds-color-theme-accent-primary-normal: #22d3ee;
+  --mds-color-theme-accent-primary-hover: #67e8f9;
+  --mds-color-theme-accent-primary-active: #06b6d4;
+  --mds-color-text-on-accent: #04141c;
+  --hl: #f5c542;
+  --focus: #67e8f9;
+  --mds-color-theme-indicator-success: #34d399;
+  --mds-color-theme-indicator-warning: #fbbf24;
+  --mds-color-theme-indicator-error: #fb7185;
+  --mds-color-theme-indicator-info: #7aa7ff;
+  --mds-color-indicator-success-bright: #6ee7b7;
+  --mds-color-indicator-warning-bright: #fcd34d;
+  --mds-color-indicator-error-bright: #fda4af;
+  --mds-color-indicator-info-bright: #a5c4ff;
+  --mds-elevation-2: 0 6px 18px rgba(0,6,20,.45);
+  --mds-elevation-3: 0 12px 32px rgba(0,6,20,.7);
+}
+html[data-theme="jade"] {
+  color-scheme: dark;
+  --mds-color-theme-background-canvas: #0a1714;
+  --mds-color-theme-background-solid-primary: #0f211d;
+  --mds-color-theme-background-solid-secondary: #152b26;
+  --mds-color-theme-outline-primary: #1d3a33;
+  --mds-color-theme-outline-secondary: #2b5247;
+  --raise: #1a332d;
+  --mds-color-theme-text-primary: #e6f3ef;
+  --mds-color-theme-text-secondary: #bcd6cd;
+  --mds-color-theme-text-tertiary: #8fb0a5;
+  --mds-color-theme-text-disabled: #5f8478;
+  --faint: #86a89c;
+  --mds-color-theme-accent-primary-normal: #2fd6a0;
+  --mds-color-theme-accent-primary-hover: #5eeabb;
+  --mds-color-theme-accent-primary-active: #1fb585;
+  --mds-color-text-on-accent: #03150f;
+  --hl: #e8c76a;
+  --focus: #5eeabb;
+  --mds-color-theme-indicator-success: #4ade80;
+  --mds-color-theme-indicator-warning: #fbbf24;
+  --mds-color-theme-indicator-error: #ff7a85;
+  --mds-color-theme-indicator-info: #5cc8ff;
+  --mds-color-indicator-success-bright: #86efac;
+  --mds-color-indicator-warning-bright: #fcd34d;
+  --mds-color-indicator-error-bright: #ffa3ab;
+  --mds-color-indicator-info-bright: #8fd9ff;
+  --mds-elevation-2: 0 6px 18px rgba(0,12,8,.45);
+  --mds-elevation-3: 0 12px 32px rgba(0,12,8,.7);
+}
+html[data-theme="light"] {
+  color-scheme: light;
+  --mds-color-theme-background-canvas: #f5f6f8;
+  --mds-color-theme-background-solid-primary: #ffffff;
+  --mds-color-theme-background-solid-secondary: #eef0f4;
+  --mds-color-theme-outline-primary: #dfe3ea;
+  --mds-color-theme-outline-secondary: #b4bcc9;
+  --raise: #ffffff;
+  --mds-color-theme-text-primary: #12161c;
+  --mds-color-theme-text-secondary: #3a424f;
+  --mds-color-theme-text-tertiary: #566070;
+  --mds-color-theme-text-disabled: #98a0ad;
+  --faint: #5f6979;
+  --mds-color-theme-accent-primary-normal: #1a5fd0;
+  --mds-color-theme-accent-primary-hover: #154eab;
+  --mds-color-theme-accent-primary-active: #103f8a;
+  --mds-color-text-on-accent: #ffffff;
+  --hl: #b87900;
+  --focus: #1a5fd0;
+  --mds-color-theme-indicator-success: #146a35;
+  --mds-color-theme-indicator-warning: #8c4a00;
+  --mds-color-theme-indicator-error: #b3222f;
+  --mds-color-theme-indicator-info: #0a6091;
+  --mds-color-indicator-success-bright: #0d5429;
+  --mds-color-indicator-warning-bright: #703c00;
+  --mds-color-indicator-error-bright: #911a2a;
+  --mds-color-indicator-info-bright: #064d70;
+  --mds-color-chart-1: #1d5fc2;  /* blue   */
+  --mds-color-chart-2: #13766b;  /* teal   */
+  --mds-color-chart-3: #86610a;  /* amber  */
+  --mds-color-chart-4: #c8293a;  /* red    */
+  --mds-color-chart-5: #6b44d6;  /* violet */
+  --mds-elevation-2: 0 4px 14px rgba(16,24,40,.10);
+  --mds-elevation-3: 0 12px 32px rgba(16,24,40,.18);
+}
+html[data-theme="light-baby"] {
+  color-scheme: light;
+  --mds-color-theme-background-canvas: #fff4f7;
+  --mds-color-theme-background-solid-primary: #ffffff;
+  --mds-color-theme-background-solid-secondary: #ffe9ef;
+  --mds-color-theme-outline-primary: #f3d3dc;
+  --mds-color-theme-outline-secondary: #e0b0c0;
+  --raise: #ffffff;
+  --mds-color-theme-text-primary: #2a3340;
+  --mds-color-theme-text-secondary: #434d5e;
+  --mds-color-theme-text-tertiary: #566073;
+  --mds-color-theme-text-disabled: #a3a8b5;
+  --faint: #5e687a;
+  --mds-color-theme-accent-primary-normal: #c2255c;
+  --mds-color-theme-accent-primary-hover: #a61e4d;
+  --mds-color-theme-accent-primary-active: #8a1840;
+  --mds-color-text-on-accent: #ffffff;
+  --hl: #d6336c;
+  --focus: #c2255c;
+  --mds-color-theme-indicator-success: #146f36;
+  --mds-color-theme-indicator-warning: #9a4407;
+  --mds-color-theme-indicator-error: #b3222a;
+  --mds-color-theme-indicator-info: #095a86;
+  --mds-color-indicator-success-bright: #0f5f2d;
+  --mds-color-indicator-warning-bright: #833804;
+  --mds-color-indicator-error-bright: #8f1b21;
+  --mds-color-indicator-info-bright: #064a6f;
+  --mds-color-chart-1: #1d5fc2;  /* blue   */
+  --mds-color-chart-2: #13766b;  /* teal   */
+  --mds-color-chart-3: #86610a;  /* amber  */
+  --mds-color-chart-4: #c8293a;  /* red    */
+  --mds-color-chart-5: #6b44d6;  /* violet */
+  --mds-elevation-2: 0 4px 14px rgba(190,60,100,.12);
+  --mds-elevation-3: 0 12px 32px rgba(120,40,70,.2);
+}
+html[data-theme="light-hot"] {
+  color-scheme: light;
+  --mds-color-theme-background-canvas: #ffffff;
+  --mds-color-theme-background-solid-primary: #fff6fa;
+  --mds-color-theme-background-solid-secondary: #ffeaf3;
+  --mds-color-theme-outline-primary: #f6cfe1;
+  --mds-color-theme-outline-secondary: #e8a3c3;
+  --raise: #ffffff;
+  --mds-color-theme-text-primary: #1f1a24;
+  --mds-color-theme-text-secondary: #3d3445;
+  --mds-color-theme-text-tertiary: #5a4f63;
+  --mds-color-theme-text-disabled: #a89cb0;
+  --faint: #63586c;
+  --mds-color-theme-accent-primary-normal: #cf006b;
+  --mds-color-theme-accent-primary-hover: #b8005f;
+  --mds-color-theme-accent-primary-active: #9c0050;
+  --mds-color-text-on-accent: #ffffff;
+  --hl: #cf006b;
+  --focus: #cf006b;
+  --mds-color-theme-indicator-success: #146f36;
+  --mds-color-theme-indicator-warning: #9a4407;
+  --mds-color-theme-indicator-error: #b3222a;
+  --mds-color-theme-indicator-info: #095a86;
+  --mds-color-indicator-success-bright: #0f5f2d;
+  --mds-color-indicator-warning-bright: #833804;
+  --mds-color-indicator-error-bright: #8f1b21;
+  --mds-color-indicator-info-bright: #064a6f;
+  --mds-color-chart-1: #1d5fc2;  /* blue   */
+  --mds-color-chart-2: #13766b;  /* teal   */
+  --mds-color-chart-3: #86610a;  /* amber  */
+  --mds-color-chart-4: #c8293a;  /* red    */
+  --mds-color-chart-5: #6b44d6;  /* violet */
+  --mds-elevation-2: 0 4px 14px rgba(212,0,111,.12);
+  --mds-elevation-3: 0 12px 32px rgba(120,0,60,.2);
 }
 
 /* Global reset */
@@ -616,12 +798,18 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 }
 
 /* System: general ---------------------------------------------------------
-   Appearance card and the table-density preview on /settings/general. Token
-   colours only. */
-.pals { display: grid; grid-template-columns: minmax(0, 340px); gap: 12px; }
-.pal { display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--line2);
-       border-radius: var(--rad-panel); background: var(--bg); }
+   Appearance card (colour-scheme radios: one .pal per palette, swatches carry
+   their own colours inline) and the table-density preview on /settings/general. */
+.pals { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); max-width: 720px; gap: 12px; }
+.pal { position: relative; display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--line2);
+       border-radius: var(--rad-panel); background: var(--bg); cursor: pointer; }
+.pal:hover { border-color: var(--mut); }
+.pal:has(input:checked) { border-color: var(--primary); box-shadow: inset 0 0 0 1px var(--primary); }
+.pal:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 2px; }
+.pal input { position: absolute; opacity: 0; pointer-events: none; }
 .pal b { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.pal:has(input:checked) b::after { content: "Current"; padding: 1px 8px; border-radius: 3px; font-size: 12.5px;
+                                   font-weight: 500; color: var(--mut); background: var(--surface2); }
 .pal small { color: var(--mut); font-size: 12.5px; }
 .sw-row { display: flex; gap: 6px; }
 .swatch { width: 28px; height: 28px; border-radius: 3px; border: 1px solid var(--line2); }

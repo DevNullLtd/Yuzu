@@ -587,3 +587,57 @@ TEST_CASE("ScheduleEngine reports !is_open on a migration failure and degrades e
     REQUIRE_FALSE(checked.has_value());
     CHECK(checked.error().find("schedule engine not open") != std::string::npos);
 }
+
+// The advance SQL multiplied an INTEGER column by 60 in int4, which overflows (SQLSTATE 22003)
+// above 35791394 minutes; the whole UPDATE then failed and the row re-fired on every poller tick.
+// Rows stored before the create-time cap can hold up to INT32_MAX, so advance must survive them.
+TEST_CASE("ScheduleEngine: advance_schedule survives a stored interval at INT32_MAX",
+          "[schedule_engine][pg][numeric_params]") {
+    ScheduleEnginePg fx;
+
+    auto sched = make_schedule("def-huge", "interval", "Huge");
+    sched.interval_minutes = 60;
+    auto result = fx->create_schedule(sched);
+    REQUIRE(result.has_value());
+
+    {
+        // Simulate a row written before the cap existed (create_schedule now refuses it).
+        PgConn conn{PQconnectdb(fx.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string sql = "UPDATE schedule_engine.schedules SET interval_minutes = 2147483647 "
+                                "WHERE id = '" + *result + "'";
+        PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    const auto now = now_epoch();
+    poke_next_execution_at(fx, *result, now - 60);
+    fx->advance_schedule(*result);
+
+    bool found = false;
+    for (const auto& s : fx->query_schedules()) {
+        if (s.id != *result)
+            continue;
+        found = true;
+        CHECK(s.execution_count == 1);
+        // 2147483647 minutes * 60 s, in bigint: a valid, far-future next run (no overflow, no wrap).
+        CHECK(s.next_execution_at >= now + int64_t{2147483647} * 60);
+        CHECK(s.next_execution_at <= now + int64_t{2147483647} * 60 + 60);
+    }
+    REQUIRE(found);
+}
+
+TEST_CASE("ScheduleEngine: create_schedule refuses an interval above the engine ceiling",
+          "[schedule_engine][pg][numeric_params]") {
+    ScheduleEnginePg fx;
+
+    auto sched = make_schedule("def-cap", "interval", "Cap");
+    sched.interval_minutes = static_cast<int>(kMaxScheduleIntervalMinutes) + 1;
+    auto refused = fx->create_schedule(sched);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("interval_minutes must be <=") != std::string::npos);
+    CHECK(fx->query_schedules().empty());
+
+    sched.interval_minutes = static_cast<int>(kMaxScheduleIntervalMinutes);
+    CHECK(fx->create_schedule(sched).has_value());
+}

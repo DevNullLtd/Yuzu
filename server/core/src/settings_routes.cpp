@@ -3,10 +3,12 @@
 /// Extracted from server.cpp — Phase 1 of the god-object decomposition.
 
 #include "settings_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "cert_upload_files.hpp"
 #include "ota_signature_sidecar.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
+#include "rollout_pct_reject.hpp" // the shared malformed-rollout_pct 400 + toast
 
 #include <atomic>
 #include <cstdio>
@@ -47,6 +49,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -287,6 +290,29 @@ std::string highlight_yaml_kv(const std::string& line) {
 // extract_json_string moved to json_extract.hpp (#2557) — SettingsRoutes
 // lives in namespace yuzu::server, so this unqualified name still resolves.
 
+// One OPTIONAL number of the batch enrollment-token body (#4644): `out` keeps its default when
+// the key is absent or an EMPTY string (the documented "empty or omitted" default). A JSON
+// integer and a numeric string are both accepted (the shipped curl example sends numbers,
+// scripts/ci/qa-stack.sh and the form-style callers send strings); a float, bool, null, array,
+// object, a non-numeric string and anything outside the `int` range throw std::invalid_argument
+// (the caller's single `invalid_numeric_parameter` branch). Before this, a JSON number was
+// silently ignored, so the documented example minted single-use tokens that never expire.
+void read_enrollment_int(const nlohmann::json& body, const char* key, int& out) {
+    if (!body.contains(key))
+        return;
+    const auto& v = body[key];
+    if (v.is_string()) {
+        const auto s = v.get<std::string>();
+        if (!s.empty())
+            out = yuzu::server::strict_stoi(s);
+        return;
+    }
+    const auto wide = yuzu::server::read_json_int_strict(body, key, 0);
+    if (!wide || *wide < std::numeric_limits<int>::min() || *wide > std::numeric_limits<int>::max())
+        throw std::invalid_argument("not an integer");
+    out = static_cast<int>(*wide);
+}
+
 // #4028 — success-envelope wrapper matching rest_api_v1.cpp's ok_json() wire
 // shape ({"data":...,"meta":{"api_version":"v1"}}) exactly. ok_json() itself
 // is TU-local to rest_api_v1.cpp (declared in its own anonymous namespace,
@@ -342,12 +368,12 @@ std::string SettingsRoutes::render_server_config_fragment() {
             "s</code></td></tr>";
     {
         const auto idle = v.at("session_inactivity_seconds").get<std::int64_t>();
-        html += "<tr><td>Dashboard idle timeout</td><td>" +
+        html += "<tr><td>Console idle timeout</td><td>" +
                 (idle > 0 ? "<code>" + std::to_string(idle) + "s</code>"
                           : std::string("Off")) +
                 "</td></tr>";
     }
-    html += "<tr><td>Dashboard session lifetime</td><td><code>" +
+    html += "<tr><td>Console session lifetime</td><td><code>" +
             std::to_string(v.at("session_absolute_lifetime_seconds").get<std::int64_t>()) +
             "s</code></td></tr>";
     html += "<tr><td>Max Agents</td><td><code>" +
@@ -3458,18 +3484,33 @@ void SettingsRoutes::register_routes(
         // Clamp server-side to the same ranges update_alert_shape enforces, so
         // the STORED values always match the LIVE values (no silent divergence
         // between what the UI shows and what the detector runs).
+        // A present-but-malformed field is a 400 with NOTHING saved: `stoi("0x10")` is 0 and
+        // `stoi("5abc")` is 5, so a typo used to persist a different (clamped) threshold
+        // than the one the operator typed (#4644). Empty/absent keeps the default.
+        bool malformed = false;
         auto clamp_int = [&](const char* field, int lo, int hi, int fallback) {
-            try {
-                const auto v = extract_form_value(req.body, field);
-                if (!v.empty())
-                    return std::clamp(std::stoi(v), lo, hi);
-            } catch (...) {}
-            return fallback;
+            const auto v = extract_form_value(req.body, field);
+            if (v.empty())
+                return fallback;
+            const auto parsed = yuzu::server::parse_query_int<int>(v);
+            if (!parsed) {
+                malformed = true;
+                return fallback;
+            }
+            return std::clamp(*parsed, lo, hi);
         };
         const BlastRadiusConfig d{};
         const int min_dev = clamp_int("min_devices", 2, 100000, d.min_devices);
         const int win_s = clamp_int("window_seconds", 60, 86400, d.window_seconds);
         const int cool_s = clamp_int("cooldown_seconds", 0, 7 * 86400, d.cooldown_seconds);
+        if (malformed) {
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Thresholds must be whole numbers","level":"error"}})");
+            res.set_content(detail::a4_error(res, "invalid numeric parameter"),
+                            "application/json");
+            return;
+        }
         auto session = auth_fn_(req, res);
         const std::string by = session ? session->username : "unknown";
         bool ok = true;
@@ -5133,14 +5174,25 @@ void SettingsRoutes::register_routes(
         int max_uses = 0;
         int ttl_hours = 0;
         try {
+            // Strict: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit
+            // used to mint an unlimited token. Only an EMPTY field or a literal 0 means
+            // "unlimited" / "no expiry"; anything else must be one base-10 integer.
             if (!max_uses_s.empty())
-                max_uses = std::stoi(max_uses_s);
+                max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
-                ttl_hours = std::stoi(ttl_s);
+                ttl_hours = yuzu::server::strict_stoi(ttl_s);
+            // A negative TTL computes `ttl_hours > 0 ? ... : 0` and 0 means NEVER EXPIRES, so a
+            // typed `-1` used to mint a credential with no expiry. Refuse it. (`-0` and `00`
+            // parse to a literal 0 and keep the documented meaning.)
+            if (ttl_hours < 0)
+                throw std::invalid_argument("negative ttl_hours");
         } catch (const std::exception&) {
             audit_fn_(req, "enrollment.token_create", "denied", "EnrollmentToken", "",
                       "invalid_numeric_parameter");
             res.status = 400;
+            // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Invalid numeric parameter - nothing was created","level":"error"}})");
             res.set_content(detail::a4_error(res, "invalid numeric parameter"),
                             "application/json");
             return;
@@ -5217,25 +5269,47 @@ void SettingsRoutes::register_routes(
                                                               httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        auto label = extract_json_string(req.body, "label");
-        auto count_s = extract_json_string(req.body, "count");
-        auto max_uses_s = extract_json_string(req.body, "max_uses");
-        auto ttl_s = extract_json_string(req.body, "ttl_hours");
+        // A blank body keeps every default; any other body must be one JSON object (a truncated
+        // document used to mint the default 10 single-use tokens with no expiry).
+        nlohmann::json batch_body = nlohmann::json::object();
+        const bool body_blank =
+            std::all_of(req.body.begin(), req.body.end(),
+                        [](unsigned char c) { return std::isspace(c) != 0; });
+        if (!body_blank) {
+            batch_body = nlohmann::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+            if (batch_body.is_discarded() || !batch_body.is_object()) {
+                audit_fn_(req, "enrollment.bulk_token_create", "denied", "EnrollmentToken", "",
+                          "invalid_body");
+                res.status = 400;
+                res.set_header("HX-Trigger",
+                               R"({"showToast":{"message":"Request body must be a JSON object - nothing was created","level":"error"}})");
+                res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                                "application/json");
+                return;
+            }
+        }
+        auto label = extract_json_string(batch_body, "label");
 
         int count = 10;
         int max_uses = 1;
         int ttl_hours = 0;
         try {
-            if (!count_s.empty())
-                count = std::stoi(count_s);
-            if (!max_uses_s.empty())
-                max_uses = std::stoi(max_uses_s);
-            if (!ttl_s.empty())
-                ttl_hours = std::stoi(ttl_s);
+            // Strict (see the single-token route): a malformed limit must never read as 0.
+            read_enrollment_int(batch_body, "count", count);
+            read_enrollment_int(batch_body, "max_uses", max_uses);
+            read_enrollment_int(batch_body, "ttl_hours", ttl_hours);
+            // A negative TTL computes `ttl_hours > 0 ? ... : 0` and 0 means NEVER EXPIRES, so a
+            // typed `-1` used to mint a credential with no expiry. Refuse it. (`-0` and `00`
+            // parse to a literal 0 and keep the documented meaning.)
+            if (ttl_hours < 0)
+                throw std::invalid_argument("negative ttl_hours");
         } catch (const std::exception&) {
             audit_fn_(req, "enrollment.bulk_token_create", "denied", "EnrollmentToken", "",
                       "invalid_numeric_parameter");
             res.status = 400;
+            // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Invalid numeric parameter - nothing was created","level":"error"}})");
             res.set_content(detail::a4_error(res, "invalid numeric parameter"),
                             "application/json");
             return;
@@ -5342,7 +5416,10 @@ void SettingsRoutes::register_routes(
         int64_t expires_at = 0;
         if (!ttl_s.empty()) {
             try {
-                int ttl_hours = std::stoi(ttl_s);
+                // Strict: a mistyped TTL ("0x5" -> 0) used to mint a token that never expires.
+                int ttl_hours = yuzu::server::strict_stoi(ttl_s);
+                if (ttl_hours < 0) // would mint a token that never expires; refused, nothing minted
+                    throw std::invalid_argument("negative ttl_hours");
                 if (ttl_hours > 0) {
                     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                                    std::chrono::system_clock::now().time_since_epoch())
@@ -6193,15 +6270,14 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        int rollout_pct = 100;
-        try {
-            if (!rollout_s.empty())
-                rollout_pct = std::stoi(rollout_s);
-        } catch (...) {}
-        if (rollout_pct < 0)
-            rollout_pct = 0;
-        if (rollout_pct > 100)
-            rollout_pct = 100;
+        // A malformed percentage must NOT fall back to 100 (a full-fleet rollout the operator
+        // did not ask for): 400, nothing stored. Shared with the rollout route.
+        const auto rollout_parsed = yuzu::server::parse_rollout_pct(rollout_s);
+        if (!rollout_parsed) {
+            yuzu::server::reject_bad_rollout_pct(res, yuzu::server::RolloutRejectEffect::kStored);
+            return;
+        }
+        const int rollout_pct = *rollout_parsed;
 
         // Shape-check the signature BEFORE the binary is written. A well-sized
         // file of garbage would otherwise be stored, reported "signed" by the
@@ -6488,15 +6564,16 @@ void SettingsRoutes::register_routes(
                   auto version = req.matches[3].str();
                   auto pct_s = extract_form_value(req.body, "rollout_pct");
 
-                  int pct = 100;
-                  try {
-                      if (!pct_s.empty())
-                          pct = std::stoi(pct_s);
-                  } catch (...) {}
-                  if (pct < 0)
-                      pct = 0;
-                  if (pct > 100)
-                      pct = 100;
+                  // Malformed, EMPTY or above 100 => 400, never the 100% default or a clamp to
+                  // it: on an EXISTING package either would silently make it a full-fleet
+                  // rollout. (The upload route keeps its lenient default; it creates the row.)
+                  const auto pct_parsed = yuzu::server::parse_rollout_pct_strict(pct_s);
+                  if (!pct_parsed) {
+                      yuzu::server::reject_bad_rollout_pct(
+                          res, yuzu::server::RolloutRejectEffect::kChanged);
+                      return;
+                  }
+                  const int pct = *pct_parsed;
 
                   // Capture the PRIOR percentage before the write. It is the whole
                   // evidentiary value of this row: #3692's scenario is an admin —

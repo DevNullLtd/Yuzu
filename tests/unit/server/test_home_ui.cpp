@@ -1,7 +1,7 @@
 /// @file test_home_ui.cpp
 /// Page pins for the landing and sign-in page (home_ui.{hpp,cpp}, login_ui.cpp):
-/// the fifteen tiles with the design's exact names and sentences, the family
-/// tokens, no shell (no sidebar, header bar, search, bell, badge or account
+/// the fifteen tiles (signed in only) with the design's exact names and sentences,
+/// the family tokens, no shell (no sidebar, header bar, search, bell, badge or account
 /// menu), no fragment loads, the signed-out and signed-in variants, the
 /// `next` allow-list, and the redirect location the auth chokepoint uses.
 
@@ -52,7 +52,7 @@ struct Expected {
     const char* sentence;
 };
 constexpr Expected kTable[] = {
-    {"Operate", "Dashboard", "/", "Ask every device a question and watch the answers arrive."},
+    {"Operate", "Console", "/", "Ask every device a question and watch the answers arrive."},
     {"Operate", "Instructions", "/instructions",
      "A library of questions and actions, with approval where it matters."},
     {"Operate", "Result sets", "/result-sets", "Save answers, re-run them, reuse them as targets."},
@@ -60,7 +60,7 @@ constexpr Expected kTable[] = {
     {"Posture", "Guardian", "/guardian", "Hold settings to the state you set and undo drift."},
     {"Posture", "DEX", "/dex", "See crashes, slow starts and noisy apps as users feel them."},
     {"Posture", "TAR", "/tar", "A recorded history of what ran and connected on each device."},
-    {"Estate", "Devices", "/devices", "Every device, with tags, properties and quarantine."},
+    {"Estate", "Devices", "/devices", "Every device, with tags and properties."},
     {"Estate", "Hardware", "/hardware", "CPU, memory, disks and firmware across the fleet."},
     {"Estate", "Software", "/software", "What is installed, how current it is, and roll out updates."},
     {"Estate", "Fleet", "/viz/fleet", "The estate as a 3D map. Open any machine and its processes."},
@@ -93,7 +93,7 @@ TEST_CASE("landing: fifteen tiles in five families with the design's exact names
     }
     CHECK(i == 15);
 
-    const auto html = home_ui::render_landing(signed_out());
+    const auto html = home_ui::render_landing(signed_in());
     CHECK(count_of(html, "<a class=\"tile\" href=\"") == 15);
     for (const auto& row : kTable) {
         CHECK_THAT(html, ContainsSubstring(std::string("<span class=\"tt\">") + row.name + "</span>"));
@@ -110,6 +110,31 @@ TEST_CASE("landing: fifteen tiles in five families with the design's exact names
     // Tile icons are 24x24 stroke paths, no second tinted square, no image.
     CHECK(count_of(html, "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"") == 15);
     CHECK(count_of(html, "<img") == 0);
+}
+
+TEST_CASE("landing: the head carries the first-paint theme boot; one inline script; whitelisted",
+          "[home][ui][theme]") {
+    for (const auto& html : {home_ui::render_landing(signed_out()), home_ui::render_landing(signed_in())}) {
+        const auto head_end = html.find("</head><body>");
+        REQUIRE(head_end != std::string::npos);
+        const auto head = html.substr(0, head_end);
+        // Exactly one inline script (the only other head script is the htmx src), and it runs
+        // in the head, before any body content paints.
+        std::size_t inline_scripts = 0;
+        for (auto p = head.find("<script>"); p != std::string::npos; p = head.find("<script>", p + 1))
+            ++inline_scripts;
+        CHECK(inline_scripts == 1);
+        const auto from = head.find("<script>");
+        REQUIRE(from != std::string::npos);
+        const auto script = head.substr(from, head.find("</script>", from) - from);
+        // Reads the stored key inside try/catch, accepts an EXACT whitelist of the six names,
+        // and sets data-theme on the root element.
+        CHECK_THAT(script, ContainsSubstring("try{"));
+        CHECK_THAT(script, ContainsSubstring("}catch(e){}"));
+        CHECK_THAT(script, ContainsSubstring("localStorage.getItem('yuzu-theme')"));
+        CHECK_THAT(script, ContainsSubstring("/^(slate|navy|jade|light|light-baby|light-hot)$/.test("));
+        CHECK_THAT(script, ContainsSubstring("document.documentElement.setAttribute('data-theme',"));
+    }
 }
 
 TEST_CASE("landing: no shell, no header-bar controls, no bell, no fragment loads, no data",
@@ -214,20 +239,37 @@ TEST_CASE("landing signed out with next: notice above the form and the key on th
     const auto html = home_ui::render_landing(v);
     CHECK_THAT(html, ContainsSubstring("id=\"signin\" aria-label=\"Sign in\" data-next=\"devices\">"));
     CHECK_THAT(html, ContainsSubstring("<div class=\"note\" id=\"signin-notice\">Sign in to open <b>Devices</b>.</div>"));
-    // Tiles stay real links to their screens; the server, not the tile, sends a signed-out click here.
-    CHECK_THAT(html, ContainsSubstring("<a class=\"tile\" href=\"/devices\">"));
+    // No tiles before sign-in: the screens sit behind the form.
+    CHECK(count_of(html, "class=\"tile\"") == 0);
     CHECK(count_of(html, "href=\"#signin\"") == 0);
 }
 
-TEST_CASE("landing signed in: the signed-in region replaces the form, Open <area> or Open Dashboard, Sign out",
+TEST_CASE("landing signed out: brand; headline and sign-in only; no tiles", "[home][ui][login]") {
+    auto with_next = signed_out();
+    with_next.next = home_ui::screen_by_key("devices");
+    for (const auto& v : {signed_out(), with_next}) {
+        const auto html = home_ui::render_landing(v);
+        CHECK_THAT(html, ContainsSubstring("<a class=\"brand\" href=\"/home\""));
+        CHECK_THAT(html, ContainsSubstring("<h1>Ask every device a question.<br>Hold it to the state you set.</h1>"));
+        CHECK_THAT(html, ContainsSubstring("id=\"signin\""));
+        CHECK(count_of(html, "class=\"tiles") == 0);
+        CHECK(count_of(html, "class=\"tile\"") == 0);
+        CHECK(count_of(html, "class=\"fam ") == 0);
+        CHECK(count_of(html, "What you can do in Yuzu") == 0);
+        for (const auto& row : kTable)
+            CHECK(count_of(html, std::string("<span class=\"tt\">") + row.name + "</span>") == 0);
+    }
+}
+
+TEST_CASE("landing signed in: the signed-in region replaces the form; Open <area> or Open Console; Sign out",
           "[home][ui][login]") {
     const auto html = home_ui::render_landing(signed_in());
     CHECK_THAT(html, ContainsSubstring("<section class=\"panel login\" id=\"signed-in\" aria-label=\"Signed in\">"));
     CHECK_THAT(html, ContainsSubstring("<div class=\"who\"><b>dave.rae</b><span>Administrator</span></div>"));
-    CHECK_THAT(html, ContainsSubstring("<a class=\"btn primary\" id=\"open-area\" href=\"/\">Open Dashboard</a>"));
+    CHECK_THAT(html, ContainsSubstring("<a class=\"btn primary\" id=\"open-area\" href=\"/\">Open Console</a>"));
     CHECK_THAT(html, ContainsSubstring("<button class=\"btn\" type=\"button\" hx-post=\"/logout\">Sign out</button>"));
-    CHECK_THAT(html, ContainsSubstring("<p class=\"small\">You are signed in. Open the Dashboard, or pick an area below.</p>"));
-    CHECK_THAT(html, ContainsSubstring("<p class=\"lede\">Yuzu runs on your own servers. Open the Dashboard to ask your first question, or pick an area below.</p>"));
+    CHECK_THAT(html, ContainsSubstring("<p class=\"small\">You are signed in. Open the Console, or pick an area below.</p>"));
+    CHECK_THAT(html, ContainsSubstring("<p class=\"lede\">Yuzu runs on your own servers. Open the Console to ask your first question, or pick an area below.</p>"));
     // No form, no sign-in script, no SSO error.
     CHECK(count_of(html, "id=\"signin\"") == 0);
     CHECK(count_of(html, "<form") == 0);

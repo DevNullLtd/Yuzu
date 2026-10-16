@@ -58,6 +58,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
 - [Authentication](#authentication)
 - [JSON Envelope](#json-envelope)
 - [Pre-Auth Request Body Caps](#pre-auth-request-body-caps-2407)
+- [Numeric Query Parameters](#numeric-query-parameters-4644)
 - [REST API v1 Endpoints](#rest-api-v1-endpoints)
   - [Current User](#current-user)
   - [Devices](#devices)
@@ -238,6 +239,62 @@ The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin
 
 ---
 
+## Numeric Query Parameters (#4644)
+
+A numeric query parameter must be **one complete base-10 integer**, on the routes that read it
+this way, or the route answers `400` with the A4 message `invalid numeric query parameter` (the
+message names the parameter on several routes, for example `window`, the `software` inventory
+`limit`, the event stream's `since` and the delivery-list `limit`; the wording otherwise varies by
+route family). They were read leniently, stopping at the first
+non-digit, so `?limit=100abc` was read as `100`, `?since=1e9` as `1` and
+`?since=junk` was swallowed into the default ("from the beginning"): a malformed filter silently
+answered a different question than the one asked. Rejected now: trailing characters, hex and
+exponent forms, decimals, whitespace, a leading `+` and a value too large for its type (an
+empty value and an overflow were already refused on most of these routes). Zero padding (`007`) is accepted.
+Omitting a parameter still means its default, and each route's existing clamping and sentinel
+values (for example `limit` clamped to a ceiling) are unchanged. The epoch bounds `since`/`until` (and
+`from`/`to` on the auth-sample export) are presence-tracked: omitting one leaves that side
+unbounded, `since=0` is accepted as a harmless literal bound that matches exactly what omitting it
+matches, and `until=0` (or `to=0`), like any negative bound, is `400`: `0` is not an
+"unbounded" sentinel on the upper side, so a computed window that collapsed to `0` fails instead
+of silently returning everything.
+
+Routes that parse strictly (the response routes are listed in
+[Command/Instruction Responses](#commandinstruction-responses--v1-read-twins-2146-a2-r2) and
+[Responses](#responses) below):
+
+| Family | Routes and parameters |
+|---|---|
+| Execution statistics | `GET /api/v1/execution-statistics/agents` and `/definitions`: `since`, `limit` (a negative `since` is `400` too, and so is a `limit` below 1, which the MCP twins also reject with `-32602`) |
+| Executions | `GET /api/executions`, `GET /api/v1/executions`: `limit`; `GET /api/v1/executions/{id}/visualization`: `index` |
+| Audit | `GET /api/v1/audit`: `since`, `until`, `limit`, `offset`; `GET /api/audit`: `since`, `until`, `limit`, `offset`; `GET /api/analytics/recent`: `limit` (a malformed value used to be ignored) |
+| Instructions, product packs, workflows | `GET /api/instructions`, `GET /api/v1/instructions`, `GET /api/v1/product-packs`, `GET /api/product-packs`, `GET /api/workflows`, `GET /api/v1/workflows`: `limit` |
+| Compliance | `GET /api/policy-fragments`, `GET /api/policies`, `GET /api/v1/policy-fragments`, `GET /api/v1/policies`: `limit`. On the two legacy routes (`/api/policy-fragments`, `/api/policies`) a negative `limit` is `400` too: it used to reach Postgres as `LIMIT -1`, fail, and answer `503`. The `/api/v1/` routes clamp `limit` to 1..1000 as before |
+| Patches | `GET /api/patches`, `GET /api/patches/deployments`: `limit` (a malformed value used to be ignored; a negative `limit` is `400` too, where the store answered an empty `200`) |
+| Inventory | `GET /api/v1/inventory/software` and `/software/catalogue`: `limit` (trailing characters were read as their numeric prefix; an EMPTY `limit=` means the default on these routes, see the note below the table); `conditions[].value` on `POST /api/v1/inventory/evaluate` and `POST /api/v1/result-sets/from-inventory-query` (a JSON number became the empty string, see the condition table under `inventory/evaluate`) |
+| DEX window | `GET /api/v1/dex/signals`, `/dex/scope` and `/dex/signals/{obs_type}`: `window` must be `24h`, `7d`, `30d` or `all` (omitted = `7d`; an empty `?window=` is `400`, like on every other DEX route); `90d`, `30`, `junk` or an empty value used to be answered with 7 days of data |
+| Fleet visualization | `GET /api/v1/viz/fleet/topology`: `machines_max` |
+| Verification | the app-performance compare route: `window` (a malformed value used to fall back to 7 days). This dashboard fragment keeps its own rejection style: an honest `200` note ("The window must be a whole number of days."), because the dashboard's htmx config drops `4xx` bodies; nothing is computed or audited. The other dashboard fragments in this table (results, hardware, DEX perf, network quality) still answer a JSON `400` that an operator in the dashboard never sees: that is a known UX gap, tracked in issue #5637, not a deliberate inconsistency |
+| Dashboard fragments | `GET /fragments/results`: `page`, `per_page`; the three software inventory fragments (`/fragments/inventory/software`, `/software/devices`, `/software/versions`): a malformed `limit` answers `200` with an `inv-caveat` note, not a JSON `400` (htmx drops `4xx` bodies), and the store is not read; a well-formed `limit` is validated and then ignored, because these fragments use a fixed page size; the DEX perf devices fragment and the network quality devices fragment: `limit`; the hardware list fragment and `GET /api/v1/hardware`: `offset`, `limit` (a negative value is refused too, it used to be clamped to `0`); the hardware sync poll: `await_since` (a malformed freshness bound used to read as "no bound", so a stale snapshot could be served as fresh); `GET /fragments/tar/process-tree/detail`: `node` (`stoul` read `-1` as the largest node id and `5x` as `5`) |
+| Delivery and list routes | `GET /api/notifications`: `limit`, `offset` (a negative value is `400` too, where the store answered an empty `200`); `GET /api/webhooks/{id}/deliveries` and `GET /api/v1/offload-targets/{id}/deliveries`: `limit`; `GET /api/v1/ca/issued`: `limit`, `offset`; `GET /api/v1/preflight/runs`: `limit`; the pre-flight run form: `min_gib` and `window` (a malformed value is `400`; a negative `min_gib` is `400` too) and the version thresholds `app_min`, `app_max` and `os_min` (empty, or a dotted-decimal version with an optional `-beta` / `+build` suffix; anything else is `400`, see [Pre-flight readiness checks](preflight.md)); `GET /api/v1/result-sets` and `GET /api/v1/result-sets/{id}/members`: `limit` (trailing characters are `400`, not their numeric prefix; an integer outside the route's page range still uses the default page size); `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices` and `GET /api/v1/network/devices`: `limit`; `GET /api/v1/guaranteed-state/events`: `limit` and `offset` (a negative value is `400` too; both are parsed before the `dex.device.view` audit row is written, so a `400` leaves no access row) |
+| Event streams | `GET /api/v1/events`: `since` (a non-negative integer; a malformed value is `400`, answered before the stream budget is touched). A malformed `Last-Event-ID` **header** on `GET /api/v1/events` or the workflow execution stream is served **live only**: nothing buffered is replayed (never the whole ring buffer) and it is not a `400`, because the header is browser-supplied inference and a `400` would fail a reconnect. The cursor is parsed strictly, so `-1` and `5abc` are never accepted as a position (`5abc` used to replay from position 5; `-1` wrapped past every event and also replayed nothing, so that input's outcome is unchanged); valid ids replay exactly as before. A rejected `?since` leaves no success audit row, because it is parsed before the audit write |
+| Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only an **empty** field, or a value that parses to a literal `0` such as `0`, `-0` or `00`, means unlimited or no expiry now; on `/batch` an empty `max_uses` defaults to `1`, not unlimited; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (an out-of-range integer on upload is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. **Behaviour change on the rollout change route only:** an empty `rollout_pct` and a value above `100` are also `400` there (an empty value used to mean `100` and a larger one was clamped to `100`), while a negative value still clamps to `0` (the least exposure); the upload route is unchanged. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
+| JSON request bodies (security-gating numbers) | `POST /api/v1/tokens` `expires_at` (a negative value or one above 9223372036854775807 minted a token that never expires, `5.5` or `1e3` an already-expired one, and a wrong type threw a bare `500`; now `400`, and `0` or omitted still means never expires); `POST /api/v1/tokens/{id}/rotate` and `POST /api/v1/engine-principals/{id}/credentials/rotate` `overlap_secs` (a truncated or non-object body used to rotate with the 7-day default; now `400`, and an empty body still takes the default); `POST /api/v1/guaranteed-state/rules` `version` (`5.5` was stored as `5` and a wrong type threw; now `400`); `POST /api/v1/upload-grants` `ttl_secs` (a wrong type, `0` or a negative value was ignored and the grant got the 900 s maximum; now `400`); `POST /api/settings/enrollment-tokens/batch` `count`, `max_uses`, `ttl_hours` (a JSON number was silently ignored, so the documented example minted single-use tokens that never expire; now a JSON integer **and** a numeric string are both read, an empty string keeps the default, and a float, boolean, `null`, overflow or a truncated or non-object body is `400` and mints nothing). The `ip_subnet` auto-approve rule value is validated when it is added (`POST /api/settings/auto-approve`, `400` for anything but an IPv4 address or `a.b.c.d/0` to `/32`) |
+
+On the query-parameter routes in the table above, a parameter that is **present but empty** (`?limit=`) is malformed, not absent (`GET /api/v1/audit` `limit` included). Two exceptions. The software list and catalogue routes (`GET /api/v1/inventory/software` and `/software/catalogue`, and the three software fragments) share one parser in which an EMPTY `limit=` means the default; a non-empty malformed or overflowing `limit` is still refused (`400` on the REST routes, a `200` `inv-caveat` note on the fragments). And the auth-sample export: a present but empty `from` or `to` on `GET /api/v1/audit/auth-sample` is accepted as unbounded on that side. The admin forms are different: an EMPTY form field means that field's default.
+
+Not covered by this change, and still lenient (the list is not exhaustive): the `n` retry-attempt
+counter on the live-snapshot poll fragments (the deployment, device, hardware, DEX, pre-flight and
+TAR process-tree polls), which is clamped to a fixed range per poll (`1` to `100000` on the
+deployment and pre-flight polls, at most `50` on the others); and values that are parsed from stored rows, agent output or server
+configuration rather than from a request. Numeric path segments matched by a `(\d+)` pattern
+(`/api/notifications/{id}/read`, `/dismiss` and the webhook routes) answer `404` for an id that
+does not fit a signed 64-bit integer (the auto-approve rule index answers `200` with an audited
+`denied` row and changes nothing); they used to throw and answer
+`500`.
+
+---
+
 ## Pre-Auth Request Body Caps (#2407)
 
 Every request is checked against a per-route body-size cap **before authentication runs and before the body is read** — a single pre-routing chokepoint (`server.cpp`) resolves the caller's `(method, path)` against the policy table in `body_cap_policy.hpp` and rejects an oversized or unmeasurable body without buffering it. **The four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are NOT exempt from this gate** — the cap is a single lambda, `enforce_pre_auth_body_cap` in `server.cpp`'s pre-routing handler, invoked from exactly two sites: once INSIDE the probe branch, before its early return, and once after the on-behalf-of guard and the rate limiter for every other route. One definition, two call sites — so the probes cannot drift out of coverage without deleting a call. `tests/unit/server/test_body_cap_policy.cpp`'s "POST /health … is rejected (D3)" case exercises that DECISION on a real socket, but against a test server that reproduces the gate rather than invoking the production one, so it does not pin the wiring: deleting either call site in `server.cpp` would leave the suite green. Treat the wiring as verified by review, not by test, until that gap is closed. Before this fix the probes' early-return sat above the cap entirely, making them the server's last unauthenticated 100 MiB buffer — closing that was the point. The probes remain exempt from the on-behalf-of guard and the rate limiter that run further below (a header-stamping proxy or orchestrator must not be able to crash-loop the server by tripping either on its own liveness check) — that exemption is unchanged; only the body cap now also reaches them. Three status codes:
@@ -245,7 +302,7 @@ Every request is checked against a per-route body-size cap **before authenticati
 | Status | Meaning |
 |---|---|
 | `413` | The body's **declared `Content-Length`** exceeds the resolved cap for this route's class. |
-| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Two classes refuse an unmeasurable body today: `/mcp/` and `upload_session`** (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes) — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
+| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Three classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes) and `hardware`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
 | `415` | The request carries a `Content-Encoding` header set to anything other than `identity` (case-insensitive). Refused **unconditionally, on every route class, regardless of `requires_measurable`** — unlike the framing rule above, this does not depend on a per-class opt-in. Why: this build compiles `CPPHTTPLIB_BROTLI_SUPPORT`, httplib decompresses transparently and enforces only its 100 MiB global limit against the **decompressed** size, so `Content-Length` on a compressed body measures the wrong thing and a sub-cap compressed body can expand to ~100 MiB before anything downstream sees it. No Yuzu route accepts a compressed request body today, so this costs a conforming client nothing — send the body identity-encoded by **omitting `Content-Encoding` entirely**. Do **not** send `Content-Encoding: identity` explicitly: `has_non_identity_content_encoding` correctly admits it past this gate (it isn't a compressed encoding), but httplib's own body reader then calls `create_decompressor("identity")` — which matches none of gzip/deflate/br/zstd, returns null, and httplib answers a bare `415` itself (`httplib.h`'s `prepare_content_receiver`), before this gate, any route handler, or the A4/SCIM envelope code ever runs. That response carries none of the structure this section promises — no A4 envelope, no `correlation_id`, no `yuzu_body_cap_rejected_total` increment. Until that gap is closed at the code level, the only conforming way to send an identity-encoded body is to omit the header. |
 
 All three responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved) — **except the `scim` class**, which publishes SCIM's own RFC 7644 §3.12 error shape (`schemas`/`status`/`detail`) on `application/scim+json` instead of the generic envelope (`scim::error()`, `scim_json.hpp:192`; wired into all three status codes above in `server.cpp`'s pre-routing handler). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first. **This is not purely a timing change for every affected class.** For most (response templates, CA import), an earlier rejection at the same byte count is the entire effect. SCIM is **no longer** an exception to that either (fixed as part of this change, D7): the pre-routing rejection's SCIM shape matches the wording of the handler's own (now-superseded, and unreachable — the pre-routing cap and the handler check the identical 64 KiB threshold, so the pre-routing gate always wins first) `413` check exactly, and extends the same shape to the `411`/`415` cases the handler-level check never covered.
@@ -273,7 +330,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 
 | Method | Path prefix | Cap | `path_class` | Notes |
 |---|---|---|---|---|
-| any | `/mcp/` | 4 MiB | `mcp` | One of two classes with `requires_measurable=true` — see the 411 row above. |
+| any | `/mcp/` | 4 MiB | `mcp` | One of three classes with `requires_measurable=true` — see the 411 row above. |
 | POST | `/api/v1/bundles` | 70 MiB | `bundles` | Sized to the live-query bundle route's own computed 64 MiB parameter-byte floor plus JSON overhead headroom. |
 | any | `/api/v1/uploads` | 8 MiB | `upload_session` | The other `requires_measurable=true` class. Exact mirror of the PR1.6a chunked-receive protocol's own `kDefaultChunkMaxBytes` (`upload_grant_parsers.hpp`), bound to it by a `static_assert` in `file_retrieval_routes.cpp` so the two cannot drift. Any method — the session-open POST, chunk PUT, status GET, commit POST, and cancel DELETE all share this class; only the chunk PUT carries a large body, but scoping to PUT alone would silently drop the sibling verbs to the 4 MiB catch-all. |
 | any | `/api/v1/plugin-config` | 256 KiB | `plugin_config` | † The store's own grammar caps a config value at 8 KiB and a secret plaintext at 64 KiB (`plugin_config_parsers.hpp`); 256 KiB covers the larger of the two plus JSON framing/escaping headroom, while keeping an unauthenticated flood against this surface two orders of magnitude under the 4 MiB catch-all. Any method — PUT config/secret writes, DELETE carries no body, GET/list are bodyless. |
@@ -302,7 +359,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/instructions/yaml` | 3076 KiB | `instruction_yaml` | † The handler checks the FORM-DECODED `yaml_source` field at 1048576 chars (`instruction_yaml.cpp:165`); 3× worst-case percent-encoding of that value, plus 4 KiB flat headroom for field-name framing and the `id` field (save only). |
 | POST | `/api/instructions/validate-yaml` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | POST | `/fragments/instructions/yaml-preview` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
-| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` carries a body (a single short `source` enum token); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
+| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` and `POST /api/v1/hardware/sync` carry a body (a short `source` enum token, and for the fan-out a scope token or an expression of at most 1,024 bytes); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any | `/api/v1/rbac/roles/` | 4 KiB | `rbac_role_assignment` | A2 global human role assignment — see "Fleet-Wide Role Assignment" below. `POST .../assignments` body is `{principal_type, principal_id}`, two short strings; `DELETE .../assignments/{principal_id}` carries none. Any method — the DELETE sibling shares this literal prefix once past the role-name path segment. |
 | any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/users` | 16 KiB | `users` | The local-account user subtree: `POST .../me/password` and `POST .../{name}/password` (#5342) plus the bodyless `.../unlock` and the small `.../elevation-eligibility`. The largest legitimate body is two passwords at the 1024-byte policy maximum; worst-case JSON escaping puts that near 12.3 KiB, so 16 KiB admits every policy-conformant request. Any method, because the bodyless siblings share the prefix. |
@@ -445,7 +502,7 @@ existence-oracle closure exactly).
 
 ### Hardware
 
-The Hardware CI list and single-device CI record: the two read routes of the OpenAPI tag `Hardware`, followed by a short entry for the on-demand sync `POST /api/v1/hardware/{id}/sync`. Both read routes are audited on a served read, and with `result=failure` when the device roster could not be read.
+The Hardware CI list and single-device CI record: the two read routes of the OpenAPI tag `Hardware`, followed by short entries for the on-demand syncs `POST /api/v1/hardware/{id}/sync` (one device) and `POST /api/v1/hardware/sync` (a scope or the fleet). Both read routes are audited on a served read, and with `result=failure` when the device roster could not be read.
 
 #### `GET /api/v1/hardware`
 
@@ -488,9 +545,17 @@ One device's CI record: identity, device-CI blob, installed software and tags, e
 
 ---
 
+#### `POST /api/v1/hardware/sync`
+
+Requests an on-demand software-inventory sync for a device, a scope or the whole fleet (the Software page's **Sync now**). **Permission:** `Execution:Execute`, checked as a global grant: an operator whose `Execution:Execute` is limited to management groups is refused with `403` for every scope kind. The route also confines its targets to the caller's own `Execution:Execute` visible set and refuses the whole fleet (`"scope":"__all__"`) unless that set is unfiltered (`403`); with a global grant neither changes the outcome today, and both are defence in depth for when the gate becomes scope-aware. The body names the targets with exactly one of `scope` (`__all__`, `group:<id>` or a device id, up to 256 bytes) or `scope_expression` (a scope expression, up to 1,024 bytes); `source` may only be `installed_software`.
+
+A run reaches agents attached to **this server process** only. `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability). Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing. `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents below 0.13.1 are skipped and counted in `skipped_version`. At most 500 devices are reached per request (`413`). A group, scope or fleet run is limited to one per operator per 60 seconds (`429`, `Retry-After`) (an attempt refused for exceeding 500 devices, or with no live target, counts as a run; a send every device refused does not) and one at a time (`409`; the slot is a 120 s lease a later run can take over, but only while fewer than three stalled runs are alive, after which `409` persists until one of them unwinds or the server restarts), both per server process rather than cluster-wide (with several active servers each allows its own run, still bounded by the 500-device cap); a single named device is exempt. The `202` body carries counts only (`requested`, `agents_reached`, `skipped_offline`, `skipped_version`) plus `command_id`, never device ids. A server that is missing a required component answers `500` and writes a `result=failure` audit row. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site, otherwise it is refused with `403` and a `csrf.denied` audit row; API-token and MCP-token callers are exempt. Who is reached is decided at send time by the `dispatch_confined_arms` system-reserved arm, which intersects the target list with the caller's own `Execution:Execute` visible set. The MCP tool `sync_hardware_software` is the twin of this route and shares its cooldown and its single in-flight run. The request, statuses and bounds are in the OpenAPI document. **Audit:** `inventory.sync.request`, written before dispatch (see [audit-log.md](audit-log.md)).
+
+---
+
 #### `POST /api/v1/hardware/{id}/sync`
 
-Requests an on-demand agent sync for one device. **Permission:** `Execution:Execute` scoped to the device. The body, the `202` and the `409` are described in the OpenAPI document. A device id longer than 256 bytes or containing a byte below `0x20` is a `400`, answered before the permission check and with no audit row (the same id rule as `GET /api/v1/hardware/{id}`, including the registration note there). **Audit:** `inventory.sync.request` (see [audit-log.md](audit-log.md)).
+Requests an on-demand agent sync for one device. **Permission:** `Execution:Execute` scoped to the device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The body, the `202` and the `409` are described in the OpenAPI document. A device id longer than 256 bytes or containing a byte below `0x20` is a `400`, answered before the permission check and with no audit row (the same id rule as `GET /api/v1/hardware/{id}`, including the registration note there). **Audit:** `inventory.sync.request` (see [audit-log.md](audit-log.md)).
 
 ---
 
@@ -981,15 +1046,17 @@ Create a new API token. The raw token is returned in the response and is never s
 ```json
 {
   "name": "CI Pipeline Token",
-  "expires_at": 1742385600,
+  "expires_at": 1794355200,
   "mcp_tier": "readonly"
 }
 ```
 
+The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in the future and at most 90 days out, so compute it at call time, for example `$(date -d '+30 days' +%s)` (macOS: `date -v+30d +%s`).
+
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | Yes | Human-readable label |
-| `expires_at` | integer | No | Unix epoch seconds. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). |
+| `expires_at` | integer | No | Unix epoch seconds, in the future. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). Must be one JSON integer: a string, float, boolean, `null`, a negative or past value, or one above 9223372036854775807 is `400` and mints nothing. |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
 `mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
@@ -999,8 +1066,11 @@ Create a new API token. The raw token is returned in the response and is never s
 | Condition | Response |
 |---|---|
 | `mcp_tier` is not one of `readonly` / `operator` / `supervised` | `400` — `invalid mcp_tier: must be one of readonly, operator, supervised (or omitted)` |
-| `mcp_tier` set (or `scope_service` set) but `expires_at` omitted / `≤ 0` | `400` — `expires_at is required for an MCP-tier or service-scoped token` |
+| `mcp_tier` set (or `scope_service` set) but `expires_at` omitted or `0` | `400`: `expires_at is required for an MCP-tier or service-scoped token` |
 | `mcp_tier` set and `expires_at` is more than 90 days out | `400` — `MCP token TTL cannot exceed 90 days` |
+| The body is not a JSON object (truncated, empty, array, string, number, `null`), or `name`, `scope_service` or `mcp_tier` is not a string | `400`: `request body must be a JSON object` / `<field> must be a string` |
+| `expires_at` is not a JSON integer (`"7"`, `5.5`, `1e3`, `true`, `null`, `18446744073709551615`) | `400`: `expires_at must be a JSON integer (unix epoch seconds)` |
+| `expires_at` is negative, or a positive epoch that is not in the future | `400`: `expires_at must be 0 (never expires) or a unix epoch second in the future` |
 
 **Response (201):**
 
@@ -1095,7 +1165,8 @@ Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6
 |---|---|
 | No such token, or the token exists but is not owned by the caller | `404` — `token not found` (identical body; not an enumeration oracle) |
 | The token exists and IS owned by the caller, but the caller's OWN current `mcp_tier`/`scope_service` (from their authenticated session) does not equal the token's own (the authority-inheritance guard), AND the caller holds SOME non-empty `mcp_tier`/`scope_service` of its own — a caller holding NO standing tier/scope at all (an untiered dashboard/cookie session) is instead admitted regardless of the token's own tier/scope (#2963; the successor still inherits the token's own tier/scope, never the caller's) | `400` — `no such token to rotate` (store-level; distinct from the route's own `404` pre-check above, and worded identically to the absent/not-owned case on purpose, so this is not an authority-probing oracle either — see [Rotating a Token](authentication.md#rotating-a-token) for the operator-facing explanation) |
-| `overlap_secs` present in the body but not an integer (e.g. a string) | `400` — `overlap_secs must be an integer (seconds)` |
+| `overlap_secs` present in the body but not a JSON integer (a string, float, boolean, `null`, or a value above 9223372036854775807) | `400`: `overlap_secs must be an integer (seconds)` |
+| A non-blank body that is not a JSON object (truncated, array, string, number, `null`); an empty or whitespace-only body keeps the default | `400`: `request body must be a JSON object` |
 | Overlap window below the 24h floor, or above the 10-year ceiling | `400` |
 | Overlap window would outlive the predecessor's or the successor's own expiry — by design, a token within 24h of its own expiry cannot be rotated (rotation is lifetime-neutral, so there is no way to shrink the overlap below the 24h floor to fit); mint a new token instead | `400` |
 | The token is not a human-owned credential (an engine-principal credential somehow reached this route) | `400` — `token is not a human-owned credential` |
@@ -1291,7 +1362,7 @@ Mint the **first** credential for an engine principal. The raw secret is returne
 { "ttl_days": 90 }
 ```
 
-`ttl_days` defaults to `90` and must be between `1` and `90` (`400` otherwise — the engine-credential ceiling matches the tiered-token 90-day cap elsewhere on this surface).
+The body is optional only when it is empty or whitespace-only (the credential then lasts 90 days). Any other body must be a JSON object: a truncated document, an array, a string, a number or `null` is `400` and mints nothing. Within an object, `ttl_days` defaults to `90` only when it is omitted. It must be a JSON integer between `1` and `90` (`400` otherwise, including a string, float, boolean or `null` — the engine-credential ceiling matches the tiered-token 90-day cap elsewhere on this surface).
 
 **Response (201):** headers carry `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache` so a shared proxy or browser history never retains the secret.
 
@@ -1304,7 +1375,7 @@ Mint the **first** credential for an engine principal. The raw secret is returne
 
 `token` is the raw secret (shown once); `token_id` and `expires_at` let a pure-REST caller correlate the credential it just minted without a follow-up `GET`.
 
-**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` out of range. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`). `503` + `Sec-Audit-Failed: true` — the mint audit row could not persist: the credential was created but its **one-time secret is withheld** (never in the body), so the credential exists but is unusable — see *Audit-persist failure* above for recovery.
+**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` wrong type or out of range, or a non-empty body that is not a JSON object. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`). `503` + `Sec-Audit-Failed: true` — the mint audit row could not persist: the credential was created but its **one-time secret is withheld** (never in the body), so the credential exists but is unusable — see *Audit-persist failure* above for recovery.
 
 ---
 
@@ -1320,7 +1391,7 @@ Overlap-pair rotation (design doc §7): mints a successor credential while the e
 { "overlap_secs": 604800 }
 ```
 
-`overlap_secs` defaults to 7 days (`604800`). The overlap window has a **24-hour floor** and a 10-year ceiling — a value below the floor (or above the ceiling) is rejected outright (`400`), never silently truncated up to the floor.
+`overlap_secs` defaults to 7 days (`604800`). The overlap window has a **24-hour floor** and a 10-year ceiling — a value below the floor (or above the ceiling) is rejected outright (`400`), never silently truncated up to the floor. `overlap_secs` must be a JSON integer when present, and a non-blank body must be a JSON object: a string, float, boolean or `null` value, or a truncated or non-object body, is `400` and rotates nothing (an empty or whitespace-only body keeps the default).
 
 **Grace-window re-serve:** a same-caller retry within a ~120-second grace window after the original mint re-serves the **same** successor secret (rather than erroring or minting a second successor). Each successful return — the original reveal or a grace-window re-serve — is independently recorded under its own `engine_principal.credential.reveal` audit row, since every time the raw secret leaves the server is independently on the audit chain, whether or not the bytes are new. Once the grace window lapses, a further rotate call while a rotation is already in flight errors — the caller must fall back to `credentials/confirm` (below) or the principal-level revoke-and-replace runbook, never an indefinite retry loop.
 
@@ -2073,7 +2144,10 @@ Quarantine a device.
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
 
-Release a device from quarantine.
+Release a device from quarantine. This ends the server's quarantine **record** only: it does
+**not** remove the device's firewall rules. To lift those, run the quarantine plugin's release
+instruction (`security.quarantine.release`, "Release Device from Quarantine") from the Instructions
+page or through `execute_instruction`.
 
 **Permission:** `Security:Execute`, scoped per-device (see the note above)
 
@@ -2975,8 +3049,9 @@ session are both structurally denied before any store read.
 { "enabled": true }
 ```
 
-`enabled` must be a genuine JSON boolean — the strings `"true"`/`"false"`
-and the numbers `0`/`1` are rejected, never coerced.
+`enabled` must be a JSON boolean, the integer `0` or `1`, or the exact string `"true"` or
+`"false"` (so a client that sends the value as text can still disable a runaway schedule). Any
+other value is `400` and changes nothing.
 
 **Response (200):**
 
@@ -3542,8 +3617,8 @@ Query audit events.
 | `action` | string | No | Filter by action name |
 | `target_type` | string | No | Filter by target type (exact match) |
 | `target_id` | string | No | Filter by target id (exact match); requires `target_type` |
-| `since` | integer | No | Inclusive lower bound, epoch seconds; `0` or absent is unbounded |
-| `until` | integer | No | Inclusive upper bound, epoch seconds; `0` or absent is unbounded |
+| `since` | integer | No | Inclusive lower bound, epoch seconds. Omit for no bound; `0` is accepted and matches the same rows as omitting it. Negative is `400` |
+| `until` | integer | No | Inclusive upper bound, epoch seconds. Omit for no bound; `0` or negative is `400` |
 
 **Response:**
 
@@ -3603,17 +3678,15 @@ Rows carry `id`, `timestamp`, `principal`, `action`, `result`, `target_type`,
 by the legacy `GET /api/audit`; the MCP `query_audit_log` tool returns the
 same row set as this route.
 
-**Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` parses to
-less than 1, `since`/`until` is not a non-negative integer, `since` is
+**Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` is not one
+base-10 integer or is less than 1, `since` is negative or not an integer,
+`until` is `0`, negative or not an integer, `since` is
 greater than `until`, `offset` is not an integer in `0..10000`, a string
 filter holds a NUL or invalid UTF-8, or
 `target_id` is given without `target_type` (the index leads with
 `target_type`, so a bare `target_id` would scan the table); `503` — the
 audit store is unavailable or the query degraded (ADR-0040 deny-on-degrade —
-see the note above this section; never a false-empty `200`). A non-numeric
-`limit` (e.g. `abc`) is NOT a 400 here — the request proceeds with the
-default `limit` (100); the sibling `auth-sample` route below is stricter and
-400s on the same input.
+see the note above this section; never a false-empty `200`).
 
 #### `GET /api/v1/audit/auth-sample`
 
@@ -3650,8 +3723,8 @@ window, and how many rows) so evidence access stays on the audit chain.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `from` | integer | No | Window start, epoch seconds, digits only (omit for unbounded) |
-| `to` | integer | No | Window end, epoch seconds, digits only (omit for unbounded) |
+| `from` | integer | No | Window start, epoch seconds, digits only (omit for unbounded; `0` is accepted and matches the same rows as omitting it) |
+| `to` | integer | No | Window end, epoch seconds, digits only (omit for unbounded; `to=0` is `400`, `0` is not a way to say unbounded) |
 | `limit` | integer | No | Sample size (default 100, max 1000) |
 
 ```bash
@@ -5585,7 +5658,7 @@ Fetch a single target by numeric id. `auth_credential` is redacted (`has_credent
 
 #### `POST /api/v1/offload-targets`
 
-Create a new offload target. Returns 201 + `{id, status}` on success, 400 when validation fails (invalid URL scheme, empty `name`, `batch_size < 1`, duplicate `name`, a control byte in a free-text field, a present-but-wrong-typed field such as `batch_size` sent as a string, or an unrecognized `auth_type`).
+Create a new offload target. Returns 201 + `{id, status}` on success, 400 when validation fails (invalid URL scheme, empty `name`, `batch_size` outside `1`..`10000`, duplicate `name`, a control byte in a free-text field, a present-but-wrong-typed field such as `batch_size` sent as a string, or an unrecognized `auth_type`).
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -5594,7 +5667,7 @@ Create a new offload target. Returns 201 + `{id, status}` on success, 400 when v
 | `auth_type` | string | No (`none`) | One of `none`, `bearer`, `basic`, `hmac`. |
 | `auth_credential` | string | No | Bearer token (Bearer), `user:pass` (Basic), shared secret (Hmac). Never returned by any endpoint. |
 | `event_types` | string | No (`*`) | Comma-separated list of event types or `*` for all. Same semantics as webhooks. |
-| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. |
+| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. Must be `1`..`10000` (read as a 64-bit value, so an oversized number is rejected rather than wrapped; a float such as `5.5`, a string, a boolean or `null` is `400` `invalid_field_type`, where a float used to be truncated); the per-target buffer flushes only at this size and has no other cap, so the store refuses a larger value (the same range MCP `create_offload_target` enforces). |
 | `enabled` | bool | No (true) | When false, no events are dispatched until re-enabled. |
 
 **Auth headers (set per `auth_type`):**
@@ -6985,6 +7058,7 @@ re-eval, unchanged.
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"tar_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
@@ -7035,9 +7109,9 @@ Query inventory data across agents with filters.
 |---|---|---|---|
 | `agent_id` | string | No | Filter by agent ID |
 | `plugin` | string | No | Filter by plugin name |
-| `since` | integer | No | Unix timestamp — only records collected after this time |
-| `until` | integer | No | Unix timestamp — only records collected before this time |
-| `limit` | integer | No | Max results (default 100, max 1000) |
+| `since` | integer | No | Unix timestamp, inclusive lower bound on collection time. Omit for no lower bound; `0` is accepted and matches the same rows as omitting it; a negative value or a non-integer is `400` |
+| `until` | integer | No | Unix timestamp, inclusive upper bound on collection time. Omit for no upper bound; `0`, a negative value or a non-integer is `400` (`0` is not a way to say unbounded) |
+| `limit` | integer | No | Max results (default 100, max 1000; a larger integer is clamped to 1000, a value below 1 or a non-integer is `400`) |
 
 **Response:** List of inventory records matching the query, plus top-level
 `result_truncated_by_cap`. When that flag is `true`, the server's row or 8 MiB aggregate
@@ -7061,8 +7135,8 @@ Evaluate inventory conditions across agents. Returns agents whose inventory data
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `agent_id` | string | No | Scope to a single agent |
-| `combine` | string | No | `"and"` (default) or `"or"` — how to combine multiple conditions |
-| `conditions` | array | Yes | List of condition objects |
+| `combine` | string | No | `"all"` (default) or `"any"`: how to combine multiple conditions; any other value means all |
+| `conditions` | array | Yes | List of condition objects (at most 500; more is `400`) |
 
 Each condition object:
 
@@ -7070,8 +7144,8 @@ Each condition object:
 |---|---|---|
 | `plugin` | string | Plugin name to query |
 | `field` | string | JSON field path within the inventory data |
-| `op` | string | Operator: `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `contains` |
-| `value` | string | Value to compare against |
+| `op` | string | Operator: `==`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `exists`, `version_gte`, `version_lte`. An unrecognised operator matches nothing |
+| `value` | string | Value to compare against. A JSON number is accepted with a comparison operator (`==`, `!=`, `>`, `>=`, `<`, `<=`) and a boolean with `==` or `!=` (`true` / `false`). A number is compared as a number, not as text, under all six operators: two integers compare exactly (a stored `9007199254740993` does not equal `9007199254740992` and is greater than it), an integer against a decimal compares exactly, `==` and `!=` with a number are exact for JSON integers; every JSON float (a number written with a decimal point or exponent, such as `5.0`, `1e3`, `5.5`, `22359.09411`, or an integer outside `-9223372036854775808` to `18446744073709551615`, which arrives as a float) is `400` with a hint, because its original text is lost once parsed (`5.00000000000000001` arrives as the double `5.0`); send an integer, or send the decimal as a string; a decimal is sent as a JSON string under `>`, `>=`, `<`, `<=` and is accepted when it is a whole number written in digits (an all-zero fraction is allowed) or as an integer-valued exponent form (`"1e16"`, `"564141138995e7"`) within int64/uint64, which is read exactly, or has at most 15 significant digits (digits after leading and trailing zeros), a magnitude below 2^53, a value that is zero or at least the smallest normal double (a subnormal such as `"1e-320"` is refused), and a value within the range of a double; otherwise it is `400`, because a double rounds a longer decimal and a comparison against a stored integer could then flip (`"5.00000000000000001"` would equal `5`), and a non-integer at or above 2^53 such as `"9007199254740992.5"` is refused for the same reason; a decimal string compares as a double (so `>= "5.5"` and `<= "5.5"` both match a stored `5.5`), but `==` and `!=` with a string stay a text compare, so a non-integer decimal cannot be matched for equality numerically; a plain-decimal string outside the double range such as `"1e400"` is `400` too, instead of ordering lexically: write a whole number as an integer up to `18446744073709551615`, or as a string of digits (a string such as `"9007199254740993.0"` whose fraction is all zeros is read as that exact integer), a stored string that parses in full as a number counts as that number (a stored `"10.0"` equals `10`, a stored `"10"` is greater than `9`), and any other stored value never equals it and never satisfies `>`, `>=`, `<` or `<=` against it (a stored `"5 GB"` or `"N/A"` used to be read as `5` or compared as text, so `"N/A" > 5` selected the device); a string operand with `==` / `!=` stays an exact text compare (`"1.10"` and `"1.1"` differ), while under `>`, `>=`, `<`, `<=` a string operand that is a plain decimal number in full (`"4"`, `"-5.5"`, `"2e-7"`) is compared exactly against a stored number or fully numeric string (a stored integer within int64/uint64, including an integer-valued exponent spelling that fits (such as `"564141138995e7"`), and a stored decimal with a fraction of at most 15 significant digits and a magnitude below 2^53 compare exactly; any other stored decimal, one of more digits or a non-integer at or above 2^53, or a stored negative integer below `-9223372036854775808`, is compared as the nearest double), a stored string that merely starts with a number (a dotted version such as `"1.2.3"`, or `"5 GB"`) has its leading number read and compared the same way (`"1.2.3"` reads as `1.2`, `"9007199254740993 B"` as that exact integer, so `"1.2.3" < "2.0"` still matches; use `version_gte` / `version_lte` for dotted versions), and any other stored value (`"N/A"`, `""`, `"v2.1"`, `" 5"`, a boolean) never matches, never as text; a JSON number operand is stricter and never matches a stored string that is not a number in full; only a non-numeric string operand (`"abc"`, `"1.2.3"`, `"v2"`, `" 5"`, `"5 GB"`) keeps the legacy numeric-prefix-then-text ordering. Any other type, or a number or boolean with another operator, is `400` (`conditions[].value must be a JSON string ...`); a non-string `plugin`, `field` or `op` is `400` too (#4644). A numeric `5` used to become the empty string, and with `>` that selected every device that had the field. The same rule holds on `POST /api/v1/result-sets/from-inventory-query` and the MCP tool `create_result_set_from_inventory_query` (`-32602`) |
 
 **Response:**
 
@@ -7328,7 +7402,7 @@ List the caller's owned result sets, most recently used first (`last_used_at` th
 | Param | Type | Description |
 |---|---|---|
 | `cursor` | string | Opaque pagination cursor from a previous response |
-| `limit` | integer | Max results (default 50, max 500) |
+| `limit` | integer | Max results (default 50, max 500). A value that is not one base-10 integer (`10abc`, empty, too large for `int`) is `400`; an integer outside `1`..`500` uses the default of 50 |
 
 **Response:**
 
@@ -7343,6 +7417,7 @@ List the caller's owned result sets, most recently used first (`last_used_at` th
 
 | Status | Reason |
 |---|---|
+| 400 | `limit` is not one base-10 integer |
 | 403 | Service-scoped API token — result-set listing cannot be confined to the token's service |
 | 503 | `RESULT_SET_STORE_UNAVAILABLE` — a store-level read failure while listing |
 
@@ -7429,7 +7504,7 @@ Page through a result set's member device ids.
 | Param | Type | Description |
 |---|---|---|
 | `cursor` | string | Opaque pagination cursor |
-| `limit` | integer | Max results (default 1000, max 10000) |
+| `limit` | integer | Max results (default 1000, max 10000). A value that is not one base-10 integer is `400`; an integer outside `1`..`10000` uses the default of 1000 |
 
 **Response:** `{"data": {"device_ids": [...], "next_cursor": ""}, "meta": {"api_version": "v1"}}`
 
@@ -7437,6 +7512,7 @@ Page through a result set's member device ids.
 
 | Status | Reason |
 |---|---|
+| 400 | `limit` is not one base-10 integer |
 | 403 | Service-scoped API token, or the caller lacks `Infrastructure:Read` |
 | 404 | No such set, or not owned by the caller |
 | 503 | Result-set store unavailable, or the visibility check is unavailable |
@@ -7620,6 +7696,12 @@ Get fleet-wide execution summary.
 
 **Permission:** `Execution:Read`
 
+**Degraded store (this route, `/agents`, `/definitions` and `GET /api/v1/statistics`):** a
+statistics read that fails because the execution store is not open, the connection pool timed
+out or a query failed answers `503` with `retry_after_ms: 2000`. It used to answer `200` with an
+empty list (or an all-zero summary), which reads as "no executions". A scope or filter that
+genuinely matches nothing is still `200` with an empty `data` array.
+
 **Response:**
 
 ```json
@@ -7628,7 +7710,7 @@ Get fleet-wide execution summary.
     "total_executions": 15420,
     "executions_today": 230,
     "active_agents": 142,
-    "overall_success_rate": 0.973,
+    "overall_success_rate": 97.3,
     "avg_duration_seconds": 4.2
   },
   "meta": { "api_version": "v1" }
@@ -7639,15 +7721,15 @@ Get fleet-wide execution summary.
 
 Get per-agent execution statistics.
 
-**Permission:** `Execution:Read`
+**Permission:** `Execution:Read`, through the fleet-read chokepoint (ADR-0017 admit-then-filter, #3526): a management-group-confined caller is admitted and sees only the rows of the agents it can see (filtered in SQL before the `limit`), while a global grant sees every agent. A caller holding only a management-group-scoped grant, refused with `403` before, is admitted as a confined view. A service-scoped API token, also refused before, is admitted as a confined view only when RBAC enforcement is on (it must clear the `ITServiceOwner` authority ceiling, which holds `Execution:Read`, and the rows are then intersected with the token's service tag scope); with RBAC off it is refused with `403`. With RBAC off (the shipped default) the rollup is unfiltered for every authenticated non-service, non-engine caller. The sibling `/definitions` route and the fleet summary carry no agent identity and keep the plain `Execution:Read` gate. A malformed `since` or `limit` is `400`, and so is a negative `since`.
 
 **Query parameters:**
 
 | Param | Type | Description |
 |---|---|---|
 | `agent_id` | string | Filter to a single agent |
-| `since` | integer | Unix timestamp — only executions after this time |
-| `limit` | integer | Max results (default 100, max 1000) |
+| `since` | integer | Unix timestamp, inclusive lower bound on dispatch time. Omit for no bound; `0` is accepted and matches the same rows as omitting it; a negative value is `400` (it used to read as no bound) |
+| `limit` | integer | Max results (default 50, max 1000). A value below 1 or one that is not one base-10 integer is `400`; the MCP twin rejects a `limit` below 1 with `-32602` too |
 
 **Response:**
 
@@ -7659,7 +7741,7 @@ Get per-agent execution statistics.
       "total_executions": 324,
       "success_count": 310,
       "failure_count": 14,
-      "success_rate": 0.957,
+      "success_rate": 95.7,
       "avg_duration_seconds": 3.8,
       "last_execution_at": 1711900800
     }
@@ -7679,8 +7761,8 @@ Get per-definition execution statistics.
 | Param | Type | Description |
 |---|---|---|
 | `definition_id` | string | Filter to a single definition |
-| `since` | integer | Unix timestamp — only executions after this time |
-| `limit` | integer | Max results (default 100, max 1000) |
+| `since` | integer | Unix timestamp, inclusive lower bound on dispatch time. Omit for no bound; `0` is accepted and matches the same rows as omitting it; a negative value is `400` (it used to read as no bound) |
+| `limit` | integer | Max results (default 50, max 1000). A value below 1 or one that is not one base-10 integer is `400`; the MCP twin rejects a `limit` below 1 with `-32602` too |
 
 **Response:**
 
@@ -7691,7 +7773,7 @@ Get per-definition execution statistics.
       "definition_id": "os-info-query",
       "total_executions": 5200,
       "total_agents": 142,
-      "success_rate": 0.995,
+      "success_rate": 99.5,
       "avg_duration_seconds": 1.2
     }
   ],
@@ -8465,9 +8547,9 @@ Activate a license.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `organization` | string | Yes | Organization name |
-| `seat_count` | integer | Yes | Licensed seat count |
+| `seat_count` | integer | Yes | Licensed seat count: a JSON integer of at least 0 (`0` = unlimited); a float, string, `null`, negative or above-INT64_MAX value is `400` (#4644) |
 | `edition` | string | No | License edition (default `"community"`) |
-| `expires_at` | integer | No | Unix timestamp for license expiration |
+| `expires_at` | integer | No | Unix timestamp for license expiration: a JSON integer of at least 0 (`0` or omitted = perpetual); a float, string, `null`, negative or above-INT64_MAX value is `400`, where a negative value used to be stored and read back as perpetual (#4644) |
 | `features_json` | string | No | JSON array of enabled feature flags |
 | `license_key` | string | Yes | License activation key |
 
@@ -8484,7 +8566,8 @@ Activate a license.
 
 | Condition | Response |
 |---|---|
-| Malformed JSON body | `400` — `invalid JSON` |
+| Malformed JSON body, or a body that is not a JSON object | `400` — `invalid JSON` |
+| `seat_count` or `expires_at` not a JSON integer of at least 0 | `400`: nothing activated (#4644) |
 | `license_key` or `organization` empty | `400` |
 | `license_key` already activated on another license | `400` — `license key already activated` |
 | A genuine database write failure | `503` |
@@ -8797,7 +8880,7 @@ Get an aggregated view of fleet execution statistics.
     "executions": {
       "total": 15420,
       "today": 230,
-      "success_rate": 0.973,
+      "success_rate": 97.3,
       "avg_duration_seconds": 4.2
     },
     "active_agents": 142
@@ -8833,7 +8916,7 @@ Mint a one-time upload grant for an agent. Operator-facing.
 | `source_path` | string | No | Informational only — never used to derive the destination key |
 | `expected_sha256` | string | No | Optional expected content hash, 64 lowercase hex characters |
 | `retention_class` | string | No | `standard` (default), `extended`, or `transient` |
-| `ttl_secs` | integer | No | Grant expiry override; server default applies when omitted (<= 15 min) |
+| `ttl_secs` | integer | No | Grant expiry override; server default applies when omitted (<= 15 min). When present it must be a JSON integer of at least `1` (a string, float, boolean, `null`, `0` or a negative value is `400` and mints nothing); a larger value is clamped to the 15-minute maximum. |
 
 **Response (`201`):**
 
@@ -8928,7 +9011,7 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 | `assertion` | object | Structured | `{type, params}` desired-state block, e.g. `registry-value-equals`, `file-exists`, `file-hash-equals`. |
 | `remediation` | object | No | `{type, params}` — `alert-only` (default) or `enforce`. `params` carries the **resilience policy** (`mode`, `max_attempts`, `backoff_*`, …) and `event_debounce_ms`. |
 | `yaml_source` | string | Legacy | Full rule YAML; required only when no structured `spark`+`assertion` is given. The server generates `yaml_source` from the structured form otherwise. |
-| `version` | integer | No | Starting version (default `1`). |
+| `version` | integer | No | Starting version (default `1`). Must be a JSON integer in `1`..`2147483647` (`400` otherwise, including a string, float, boolean or `null`): an update adds one to the stored version and the agent push casts it to an unsigned 64-bit value, so a value near the 64-bit maximum would overflow. |
 | `enabled` | boolean | No | Default `true`. |
 | `enforcement_mode` | string | No | `enforce` (default) or `audit`. **Set once at creation — immutable on update** (see PUT below). |
 | `severity` | string | No | `low` / `medium` (default) / `high` / `critical`. |
@@ -8938,7 +9021,7 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 The catalog of valid `spark` / `assertion` / `remediation` types and their `params` (including the resilience-policy bounds) is discoverable at [`GET /api/v1/guaranteed-state/schemas`](#get-apiv1guaranteed-stateschemas).
 
 - **Response:** `201` with `data.rule_id`.
-- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), a `rule_id` that doesn't match `[A-Za-z0-9._-]+` or exceeds 256 bytes (#4665), or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
+- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), a `rule_id` that doesn't match `[A-Za-z0-9._-]+` or exceeds 256 bytes (#4665), or a `version` outside `1`..`2147483647`, an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
 - **Audit:** `guaranteed_state.rule.create` (`success` / `denied`; an invalid `rule_id` is audited as `denied` too — #4665).
 - **MCP twin:** `create_guardian_rule` (#2146 Batch B1) — same store write and validation.
 
@@ -8961,7 +9044,7 @@ Update a rule. Version is incremented on every successful update regardless of w
 - **Request body:** Any subset of the create-body fields *except* `enforcement_mode` (absent fields retain their current values). A body carrying structured `spark`/`assertion`/`remediation` blocks **re-authors** the Guard (re-deriving the canonical spec and re-validating the resilience policy) rather than dropping them; a metadata-only body leaves the existing spec intact.
 - **`enforcement_mode` is immutable.** A body whose `enforcement_mode` differs from the stored value is rejected with `400` (`enforcement_mode is immutable — create a new Guard for a different posture (Watch vs Enforce)`); a different posture is a different Guard. A no-op echo of the current value is accepted.
 - **Response:** `200` with `data.updated = true` and `data.version`.
-- **4xx:** `400` invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), an invalid resilience policy (A4 envelope), or an `enforcement_mode` change; `404` rule not found; `409` on name conflict; `403` if a service-scoped API token calls this route (same reasoning as the create route above).
+- **4xx:** `400` invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), an invalid resilience policy (A4 envelope), or an `enforcement_mode` change; `404` rule not found; `409` on name conflict or when the stored version counter is exhausted (a row stored at `2147483647` or above, which only a row written before the bound existed can be; create a new rule instead); `403` if a service-scoped API token calls this route (same reasoning as the create route above).
 - **5xx:** `503` if the pre-update rule lookup hits a degraded store (A4 envelope, `retry_after_ms: 5000`).
 - **Audit:** `guaranteed_state.rule.update`.
 - **MCP twin:** `update_guardian_rule` (#2146 Batch B1) — same validation and version-bump. No optimistic-concurrency check against concurrent writers on either transport (tracked in #4303).
@@ -9019,7 +9102,7 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 - **Permission:** two gated shapes behind one route. A query with a non-empty `agent_id` (max 256 chars, no control characters) requires per-device-scoped `GuaranteedState:Read` — management-group aware, and a service-scoped API token is confined to its own service's agents. A query with no `agent_id` (fleet-wide) requires global `GuaranteedState:Read` **and** denies a service-scoped token outright (`403`): the fleet fan-out returns every reporting agent's `agent_id` + `detail_json`, which the bare service-token role check alone would not confine.
 - **Query parameters:** `rule_id`, `agent_id`, `severity`, `limit` (default 100, capped at 1000), `offset` (default 0).
 - **Response:** `data[]` of event objects. Each object: `event_id`, `rule_id`, `agent_id`, `event_type`, `severity`, `guard_type`, `guard_category`, `detected_value`, `expected_value`, **`detail_json`**, `remediation_action`, `remediation_success`, `detection_latency_us`, `remediation_latency_us`, `timestamp`. `detail_json` is a structured JSON string: for DEX observations it carries the uniform keys `subject`/`reason`/`symbolic`/`component`/`metric`/`platform` (plus, for `process.crashed`, the legacy `process`/`exception_code`/`faulting_module`); empty string for plain drift events. Per-signal shapes are documented in [`docs/dex-signal-catalog.md`](../dex-signal-catalog.md).
-- **4xx:** `400` on non-integer or negative `limit` / `offset`, or on an `agent_id` over 256 characters / containing a control character. `403` if a service-scoped token queries the fleet-wide shape, or names a device outside its own service's scope.
+- **4xx:** `400` on non-integer or negative `limit` / `offset` (both are parsed before the `dex.device.view` audit row is written, so a `400` here leaves no access row), or on an `agent_id` over 256 characters / containing a control character. `403` if a service-scoped token queries the fleet-wide shape, or names a device outside its own service's scope.
 - **Ruleless DEX signal observations share this endpoint.** Filter `rule_id=__observation__` to retrieve `event_type=<obs_type>` rows (`process.crashed`, `process.hung`, `service.crashed`, `os.boot`, … — fleet-wide signals recorded independent of any rule; `severity` is a fixed `info`; `expected_value` empty). See [DEX signal observations](guaranteed-state.md#dex-signal-observations) and the [DEX dashboard](dex.md).
 - **Audit (behavioral PII):** BOTH shapes emit a **`dex.device.view`** audit row on every read — the per-device shape returns that device's signal history (`detail_json` reveals which apps a person runs) and audits `target_type=Agent`, `target_id=<agent_id>` (the same verb as the dashboard per-device drill-down); the fleet-wide shape returns every reporting agent's rows and audits `target_type=GuaranteedState`, `target_id=` (empty — no single agent). **Fail-closed on both shapes:** the audit fires before the data is serialized; if the audit row cannot persist, the endpoint returns `503` + `Sec-Audit-Failed: true` and serves no data (parity with `GET /api/v1/dex/devices/{id}`). A service-scoped token denied the fleet-wide shape also gets a `dex.device.view` `denied` audit row, so a rejected probe still leaves a trace.
 - **MCP twin:** `list_guardian_events` (#4037) — same dual gate shape, same query params. `audit_persisted:false` posture instead of REST's fail-closed (JSON-RPC has no `Sec-Audit-Failed` header channel). The fleet-wide branch's confinement gap (#3238) is **not** closed by this twin — it deliberately keeps the same bare-`perm_fn` posture REST has today rather than inventing a different MCP-only gate.
@@ -9154,7 +9237,7 @@ Guard authoring schema catalog — the static registry of `spark` / `assertion` 
 
 ### DEX (Digital Employee Experience)
 
-The DEX aggregation endpoints are the machine-readable equivalent of the [DEX dashboard](dex.md): the same store rollups the HTMX fragments render, JSON-shaped for agentic workers. The signal endpoints read the ruleless `__observation__` projection (the same data the [events](#get-apiv1guaranteed-stateevents) endpoint exposes per-row); the perf endpoints aggregate registry heartbeat state at request time. All are gated on the same `GuaranteedState:Read` securable. The signal endpoints accept a `window` query parameter — one of `24h`, `7d`, `30d`, `all` (default `7d`; any other value resolves to `7d`) — and an optional `os` filter (`windows`/`linux`/`macos`; omitted or any other value = every OS), which scopes them to one OS's own signals exactly as the dashboard catalogue OS filter does; the perf endpoints are now-views with no window.
+The DEX aggregation endpoints are the machine-readable equivalent of the [DEX dashboard](dex.md): the same store rollups the HTMX fragments render, JSON-shaped for agentic workers. The signal endpoints read the ruleless `__observation__` projection (the same data the [events](#get-apiv1guaranteed-stateevents) endpoint exposes per-row); the perf endpoints aggregate registry heartbeat state at request time. All are gated on the same `GuaranteedState:Read` securable. The signal endpoints accept a `window` query parameter — one of `24h`, `7d`, `30d`, `all` (omitted = `7d`; any other value, including an empty one, is `400`) — and an optional `os` filter (`windows`/`linux`/`macos`; omitted or any other value = every OS), which scopes them to one OS's own signals exactly as the dashboard catalogue OS filter does; the perf endpoints are now-views with no window.
 
 **Audit boundary.** The catalogue rollup, per-OS scope and the perf endpoints are aggregates / machine-health telemetry and are **not** audited. The per-signal drill-down returns a most-affected **devices** list (`agent_id`s — behavioral, individual-identifying) and emits a **`dex.signal.view`** audit row (`target_type=ObsType`, `target_id=<obs_type>`) on every call — the same verb as the dashboard per-signal view and consistent with the `agent_id`-filtered events query.
 
@@ -9163,7 +9246,7 @@ The DEX aggregation endpoints are the machine-readable equivalent of the [DEX da
 Whole-catalogue rollup — every observation type present in the window.
 
 - **Permission:** `GuaranteedState:Read`
-- **Query parameters:** `window`; `os` (`windows`/`linux`/`macos` narrows the rollup to that OS's own signals; omitted = every OS).
+- **Query parameters:** `window` (`24h`, `7d`, `30d` or `all`; omitted = `7d`; an empty value or anything else is `400`, where `90d` or `30` used to be answered with 7 days of data); `os` (`windows`/`linux`/`macos` narrows the rollup to that OS's own signals; omitted = every OS).
 - **Response:** `data[]` of `{obs_type, count, distinct_devices, last_seen}`. `obs_type` is the stable machine key (e.g. `process.crashed`, `os.boot`); map your own labels. Not audited.
 
 #### `GET /api/v1/dex/scope`
@@ -9171,7 +9254,7 @@ Whole-catalogue rollup — every observation type present in the window.
 Per-OS signal coverage — how many distinct observation types each platform reports, with total event count (the live cross-OS coverage the dashboard derives).
 
 - **Permission:** `GuaranteedState:Read`
-- **Query parameters:** `window`.
+- **Query parameters:** `window` (`24h`, `7d`, `30d` or `all`; omitted = `7d`; an empty value or anything else is `400`).
 - **Response:** `data[]` of `{platform, distinct_types, total_events}`. Not audited.
 
 #### `GET /api/v1/dex/signals/{obs_type}`
@@ -9180,7 +9263,7 @@ One signal type's drill-down.
 
 - **Permission:** `GuaranteedState:Read`
 - **Path parameter:** `obs_type` — must match `[A-Za-z0-9._-]{1,64}`.
-- **Query parameters:** `window`; `os` (`windows`/`linux`/`macos` scopes `subjects[]`, `devices[]` and `by_day[]` to that OS; `by_os[]` stays cross-OS since it IS the split; omitted = every OS); `limit` (caps `subjects[]` and `devices[]`, default 50, clamped to 500).
+- **Query parameters:** `window` (`24h`, `7d`, `30d` or `all`; omitted = `7d`; an empty value or anything else is `400`, refused before the `dex.signal.view` audit row is written); `os` (`windows`/`linux`/`macos` scopes `subjects[]`, `devices[]` and `by_day[]` to that OS; `by_os[]` stays cross-OS since it IS the split; omitted = every OS); `limit` (caps `subjects[]` and `devices[]`, default 50, clamped to 500).
 - **Response (`200`):** an object `{obs_type, os, subjects[], by_os[], devices[], by_day[]}` where `os` echoes the applied filter (`all` when unscoped), `subjects[]` is `{subject, count, distinct_devices, last_seen}`, `by_os[]` is `{platform, count, distinct_devices}`, `devices[]` is `{agent_id, count, last_seen}`, and `by_day[]` is `{day, count}`. A well-formed `obs_type` with no observations in the window returns `200` with empty arrays (it is a read-model query, not an entity lookup).
 - **4xx:** `400` on a malformed `obs_type` or a non-integer / negative `limit`. `403` if a service-scoped API token queries this route — the `devices[]` array is fleet-wide (every agent exhibiting this signal), with no single agent to confine a per-target check against, so a service-scoped token is denied outright (the bare permission gate alone checks only the token's ITServiceOwner role, never its own service-tag scope).
 - **Audit (behavioral PII):** the `devices[]` array names the `agent_id`s exhibiting this signal, so the endpoint emits **`dex.signal.view`** (`target_type=ObsType`, `target_id=<obs_type>`) before serving — see the audit boundary note above. A denied service-scoped token also emits `dex.signal.view` (`result=denied`, `target_id=` empty) so a rejected probe still leaves a trace. **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no device list (parity with `GET /api/v1/dex/devices/{id}`).
@@ -9277,10 +9360,10 @@ The same trend shape as `/dex/perf/group` above, aggregated **on-the-fly over th
 The **`/auto` VERIFY** before/after comparison: did upgrading `app` from `baseline` to `candidate` change how the **same machines** in `group` perform? For each machine that ran *both* versions in the window, a per-machine CPU and working-set delta is computed (each device's own baseline-version window vs its own candidate-version window, the window anchored to that machine's transition, not to "today"), then the per-machine deltas are aggregated. A machine that ran only one version in-window is excluded and counted. **Evidential only** — no verdict, no threshold, no pass/fail. The same pure engine backs this endpoint, the `compare_app_perf_versions` MCP tool, and the dashboard VERIFY stage, so the numbers cannot disagree.
 
 - **Permission:** `GuaranteedState:Read`, gated on the **global** permission (same posture as `/dex/perf/group`, including the same DIFFERENT-axis caveat for service-scoped tokens — see that section). A service-scoped API token is denied outright (`403`); found by this branch's own governance review (PR #3156), while re-verifying the external review's separate findings on this same file. The near-individual nature of this endpoint (real canaries are often 2-3 devices) makes the gap especially severe for it.
-- **Query parameters:** `group` — **required**, ≤ 512 bytes, no control characters; the management group whose members are the cohort. `app`, `baseline`, `candidate` — **required**, same validation; `baseline` and `candidate` must differ (`400` if equal after canonicalization). `window` — optional integer days, default `7`, clamped `1`–`31`.
+- **Query parameters:** `group` — **required**, ≤ 512 bytes, no control characters; the management group whose members are the cohort. `app`, `baseline`, `candidate` — **required**, same validation; `baseline` and `candidate` must differ (`400` if equal after canonicalization). `window` — optional integer days, default `7`; an integer in range is clamped to `1`–`31`, while a value that is not one base-10 integer or does not fit a signed 32-bit integer (`window=99999999999`) is a `400` (the dashboard fragment answers its usual `200` note instead).
 - **Response (`200`):** `{app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, truncated, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{…}, distribution{up, flat, down}}`. `truncated:true` means the cohort exceeded the 100,000-row read cap — the counts are **incomplete and may mis-pair** machines (a device that ran both versions can be mis-reported as one-version-only); treat the result as unreliable and narrow the group or shorten the window. A zero-sample machine (one that measured nothing in-window) is excluded from pairing rather than counted as a 0%-CPU pair. `cohort_size` = group members; `paired` = ran both (the comparison population); `baseline_only`/`candidate_only` = excluded (one version only); `no_data` = `cohort_size − paired − baseline_only − candidate_only`. `small_cohort:true` = `paired` non-zero but below the cohort floor — **not** suppressed (canaries are deliberately small); with the floor at one device the field stays on the wire but is always `false`. `insufficient:true` = `paired == 0` (no machine ran both — the `cpu`/`ws`/`distribution` values are zero and should not be displayed). `cpu.*` are percent (float); `ws.*` are bytes (int64); `delta_median` is the median per-machine delta (positive = candidate heavier). `distribution.{up,flat,down}` count machines whose per-machine CPU delta exceeded / stayed within / fell below ±0.3 pp.
 - **No per-machine identity in the response** — the aggregate carries no `agent_id`. The per-machine pairs are a **dashboard-only** drill (`/fragments/auto/verify/drill`, audited `dex.app_perf.compare.drill`); there is **no REST or MCP per-machine surface** in this slice (a REST audited-fail-closed per-machine drill is a deferred follow-up).
-- **Error paths:** `400` on a missing/invalid required parameter or `baseline == candidate`; `403` if a service-scoped API token calls this route; `503` on store degrade or startup warmup (the A4 body's `retry_after_ms` carries the suggested delay).
+- **Error paths:** `400` on a missing/invalid required parameter, a malformed `window`, or `baseline == candidate`; `403` if a service-scoped API token calls this route; `503` on store degrade or startup warmup (the A4 body's `retry_after_ms` carries the suggested delay).
 - **Headers:** `X-Correlation-Id` on every response path; `Sec-Audit-Failed: true` when the audit row could not persist (the read still proceeds — operational set-and-proceed).
 - **Audit:** emits **`dex.app_perf.compare`** (`target_id=<group_id>`, `detail` carries `app=<name> base=<v> cand=<v> cohort=<N> paired=<N> view=aggregate cid=<cid>` — `paired=` so a singleton (paired=1) aggregate, which is effectively per-machine, is distinguishable in the log). Because VERIFY has no cohort floor, this recorded read is the accountability that replaces suppression (operational set-and-proceed, not fail-closed — the aggregate carries no per-machine identity, so a lost row leaks no PII). A service-scoped-token denial is also recorded under this same verb (`result=denied`, `target_id=` empty). The MCP twin is recorded under the generic `mcp.compare_app_perf_versions` tool-call audit on SUCCESS, which carries the same subject in its detail (group/app/versions/cohort/paired) and sets `audit_persisted:false` in the result body on a dropped row (MCP has no `Sec-Audit-Failed` header channel) — but a service-scoped-token DENIAL over MCP is recorded under `dex.app_perf.compare` too, matching the REST verb rather than the generic one (the deny-path convention every REST/MCP twin pair in this doc uses).
 
@@ -9915,8 +9998,8 @@ Send a command to one or more connected agents.
 | `agent_ids` | array of string | No | -- | Target agent IDs. **Omit the field** to broadcast. A supplied `[]`, a non-array value, or a non-string entry returns `400` (#2500). |
 | `params` | object | No | `{}` | Key-value parameters passed to the plugin. (This table previously named the field `parameters`; the handler has always read `params`, so a client written to the old text silently dispatched with no parameters at all.) |
 | `scope` | string | No | -- | Scope expression for device targeting (alternative to `agent_ids`), or `__all__` for every enrolled agent. A supplied `""` or non-string value returns `400` (#2500). |
-| `stagger` | integer | No | `0` | Max random delay in seconds per agent before execution. Prevents thundering herd on large-fleet dispatch. `0` = no stagger. |
-| `delay` | integer | No | `0` | Fixed delay in seconds per agent before execution. Added before the random stagger. `0` = immediate. Total agent wait = `delay` + random(`0`, `stagger`). |
+| `stagger` | integer | No | `0` | Max random delay in seconds per agent before execution. Prevents thundering herd on large-fleet dispatch. `0` = no stagger. A JSON integer from `0` to `300` (the agent caps both `stagger` and `delay` at 300 seconds, so a larger value would run after five minutes while you believed it was held longer); anything else (a float, string, `null`, negative, or above `300`) is `400` and nothing is sent. A float, string or `null` used to read as `0`, `4294967297` as `1`, and any value above `300` was silently capped (#4644). |
+| `delay` | integer | No | `0` | Fixed delay in seconds per agent before execution. Added before the random stagger. `0` = immediate. Total agent wait = `delay` + random(`0`, `stagger`). Same range and `400` rule as `stagger`, so a malformed delay can no longer dispatch a held command immediately (#4644). |
 
 **Targeting: omitted means everything, supplied-but-empty is an error (#2500).**
 Omitting **both** `agent_ids` and `scope` broadcasts to all connected agents, as does an
@@ -10479,6 +10562,11 @@ Create a recurring schedule for an instruction definition. Requires **both**
 primitive (empty `scope_expression` targets every agent; `requires_approval` defaults to
 `false`).
 
+`interval_minutes` (default `60`, `1` to `35791394`, a ceiling of floor(INT32_MAX/60), about 68 years), `day_of_week` (default `0`, `0` to `6`) and
+`day_of_month` (default `1`, `1` to `28`) must each be a JSON integer in range when present. A float,
+string, `null`, boolean, array, out-of-range value or a number that does not fit (`4294967297`
+minutes used to become an every-minute schedule) is `400` and nothing is created (#4644).
+
 #### `DELETE /api/schedules/{id}`
 
 Delete a schedule you created. Requires `Schedule:Delete`; a schedule created by another
@@ -10490,6 +10578,11 @@ Enable or disable a schedule you created. Requires `Schedule:Write`; enabling (b
 disabling) additionally requires `Execution:Execute`, since enabling arms the schedule to
 fire — an operator can always disable a schedule to stop it even without
 `Execution:Execute`.
+
+`enabled` is a JSON boolean, or the integer `0` (disable) or `1` (enable). An omitted key or a blank
+(empty or whitespace-only) body enables, as before. A string (including the old `"true"` / `"false"` encoding), any other number,
+`null`, an array or object, or a body that is truncated or not a JSON object is `400` and the schedule
+is neither armed nor changed: `{"enabled":0}` used to arm it (#4644).
 
 ---
 
@@ -10619,8 +10712,10 @@ at 10000.
 
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — a `since`/`until`/
 `limit`/`offset` query parameter is not a valid integer, `limit < 1`,
-`offset` outside `0..10000`, `since`/`until` is negative or `since` is after `until`, or a string filter
-contains a NUL or invalid UTF-8; `503` — the audit store is closed, or the page-rows query
+`offset` outside `0..10000`, `since` is negative, `until` is `0` or negative (a negative bound,
+and `until=0`, used to read as no bound and returned the whole log; omit the parameter for no
+bound, and `since=0` is accepted and matches the same rows as omitting it), `since` is after
+`until`, or a string filter contains a NUL or invalid UTF-8; `503` — the audit store is closed, or the page-rows query
 degraded (ADR-0040 deny-on-degrade; never a false-empty `200`).
 
 ---
@@ -10858,7 +10953,7 @@ valid, else returned as a raw string. `404` if no record exists for that agent+p
 
 Query inventory records across agents. Request body (all fields optional):
 `{"agent_id": "...", "plugin": "...", "since": <epoch>, "until": <epoch>, "limit": N}`.
-`limit` is capped at 1000 regardless of the requested value. Returns `{"results": [...],
+`limit` is capped at 1000 regardless of the requested value (any larger integer, including one above the 32-bit range, clamps to 1000); a `limit` below 1 or one that is not a JSON integer is `400`. Returns `{"results": [...],
 "count": N, "result_truncated_by_cap": bool, "results_excluded_by_poison": N}`.
 `result_truncated_by_cap` is `true` when more matching rows existed than `limit`
 allowed; `results_excluded_by_poison` (#4496) is the count of matching rows
@@ -11122,8 +11217,8 @@ The browser-oriented `/sse/executions/{id}` route is preserved for the dashboard
 
 | Parameter | Type | Description |
 |---|---|---|
-| `since` (query) | integer ≥ 0 | Replay events with `id > since`. Overrides `Last-Event-ID`. Non-integer values silently degrade to 0 (no replay) — mirrors the dashboard sibling. |
-| `Last-Event-ID` (header) | string | Browser EventSource auto-reconnect header. Used only when `?since` is absent. |
+| `since` (query) | integer ≥ 0 | Replay events with `id > since`. Overrides `Last-Event-ID`. A value that is not one non-negative base-10 integer is a `400` (answered before the stream budget and before the success audit row). |
+| `Last-Event-ID` (header) | string | Browser EventSource auto-reconnect header. Used only when `?since` is absent. A malformed value is served live only (nothing replayed), never a `400` and never the whole buffer. |
 
 **Event envelope (every `data:` line):**
 

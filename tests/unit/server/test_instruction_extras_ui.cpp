@@ -204,6 +204,23 @@ TEST_CASE("instruction extras ui: templates panel names the built-in default and
     CHECK(has(rw, "data-tpl-name=\"Brief &quot;view&quot;\""));
 }
 
+TEST_CASE("instruction extras ui: templates panel has a heading naming the definition and a Close",
+          "[ui][instruction_extras]") {
+    for (const bool can_write : {false, true}) {
+        const auto h = ex::render_templates_panel("def1", "Disk <usage>", {}, can_write);
+        CHECK(has(h, "<h2>Response templates: Disk &lt;usage&gt;</h2>"));
+        // Close empties the host; plain inline handler, no hx-on, and no data-ox hook (a
+        // read-only panel carries none).
+        CHECK(has(h, "aria-label=\"Close response templates\""));
+        CHECK(has(h, "getElementById('ox-templates').replaceChildren()\""));
+        CHECK_FALSE(has(h, "hx-on"));
+    }
+    // Every state of the panel sits inset inside the library panel that hosts it.
+    for (const auto& h : {ex::render_templates_denied(), ex::render_templates_degraded(),
+                          ex::render_templates_not_found()})
+        CHECK(has(h, "style=\"margin:12px 16px\" data-panel=\"response-templates\""));
+}
+
 TEST_CASE("instruction extras ui: the library filter form repeats and escapes its values",
           "[ui][instruction_extras]") {
     const auto f = ex::render_library_filter_form("a\"b", "os_info", "");

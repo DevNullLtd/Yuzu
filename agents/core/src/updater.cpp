@@ -980,6 +980,12 @@ std::expected<bool, UpdateError> Updater::apply_update(const std::filesystem::pa
 
 void Updater::cleanup_old_binary() {
     namespace fs = std::filesystem;
+    // Self-guarded, not just guarded by perform_startup_maintenance(): a disabled
+    // updater never touches files beside the executable, whichever caller asks
+    // (a sealed macOS app bundle's signature covers that directory).
+    if (!config_.enabled) {
+        return;
+    }
 
     auto old_path = exe_path_;
 #ifdef _WIN32
@@ -998,8 +1004,21 @@ void Updater::cleanup_old_binary() {
     }
 }
 
+bool Updater::perform_startup_maintenance() {
+    if (!config_.enabled) {
+        return false;
+    }
+
+    const bool rolled_back = rollback_if_needed();
+    cleanup_old_binary();
+    return rolled_back;
+}
+
 bool Updater::rollback_if_needed() {
     namespace fs = std::filesystem;
+    if (!config_.enabled) { // self-guarded; see cleanup_old_binary()
+        return false;
+    }
 
     auto old_path = exe_path_;
 #ifdef _WIN32
@@ -1032,6 +1051,34 @@ bool Updater::rollback_if_needed() {
     // The marker does not exist — the update may have failed (agent could not
     // register or crashed on startup). Roll back to the previous binary.
     spdlog::warn("Update verification marker not found — rolling back to previous binary");
+
+#ifndef _WIN32
+    // The rename below makes .old the executable the service manager runs next.
+    // Only this process's own account may have written it: a planted file left
+    // in a once-writable directory would otherwise be promoted to the daemon
+    // (PR #4482 governance ch-4). lstat, so a symlink is refused, not followed.
+    // A second link means the bytes are shared with another path, such as a
+    // hard link to some other file this account owns (governance g8c-2).
+    struct stat old_st {};
+    if (::lstat(old_path.c_str(), &old_st) != 0) {
+        spdlog::error("Refusing rollback: cannot inspect '{}'", old_path.string());
+        return false;
+    }
+    // root's own files are trusted too: a non-root agent never wrote them, but
+    // no other account could have planted them (governance xp-19).
+    const bool owner_trusted = old_st.st_uid == ::geteuid() || old_st.st_uid == 0;
+    if (!S_ISREG(old_st.st_mode) || !owner_trusted || old_st.st_nlink != 1 ||
+        (old_st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        spdlog::error("Refusing rollback: '{}' is not a singly-linked regular file owned by this "
+                      "account or root and writable only by its owner (uid {}, mode {:o}, links {}, "
+                      "inode {})",
+                      old_path.string(), static_cast<unsigned long>(old_st.st_uid),
+                      static_cast<unsigned>(old_st.st_mode & 07777),
+                      static_cast<unsigned long>(old_st.st_nlink),
+                      static_cast<unsigned long long>(old_st.st_ino));
+        return false;
+    }
+#endif
 
     fs::rename(old_path, exe_path_, ec);
     if (ec) {

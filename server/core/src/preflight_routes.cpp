@@ -14,6 +14,7 @@
 /// (created_by) so one operator can't open another's run.
 
 #include "preflight_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
 #include "preflight_eval.hpp"       // collect/applicable/dispatch_params/check_*/config_*/checks_from_json
@@ -89,14 +90,38 @@ std::int64_t now_ms() {
         .count();
 }
 
-preflight::PreflightConfig config_from_req(const httplib::Request& req) {
+/// A whole-number form field. Absent or EMPTY (a cleared `type=number` input) keeps `dflt`;
+/// anything else must be ONE base-10 integer (nullopt otherwise). `preflight::parse_i64` read
+/// "junk" as 0, so a typo in the disk threshold became "no minimum" and passed every device.
+std::optional<std::int64_t> form_int(const httplib::Request& req, const char* key,
+                                     std::int64_t dflt) {
+    if (!req.has_param(key))
+        return dflt;
+    const std::string raw = req.get_param_value(key);
+    if (raw.empty())
+        return dflt;
+    return yuzu::server::parse_query_int<std::int64_t>(raw);
+}
+
+/// nullopt when `min_gib` is present but malformed or negative, or when a version threshold
+/// (`app_min`, `app_max`, `os_min`) is non-empty and not a dotted-numeric version with an optional
+/// pre-release suffix (the caller answers 400). An EMPTY version field means "no threshold" (the
+/// form always submits it): a malformed one used to compare as version 0, so a floor of `abc`
+/// passed every device.
+std::optional<preflight::PreflightConfig> config_from_req(const httplib::Request& req) {
     preflight::PreflightConfig c;
     c.app_name = param(req, "app_name");
     c.app_min_version = param(req, "app_min");
     c.app_max_version = param(req, "app_max");
     c.os_min_version = param(req, "os_min");
+    for (const auto* v : {&c.app_min_version, &c.app_max_version, &c.os_min_version})
+        if (!v->empty() && !preflight::is_valid_version_threshold(*v))
+            return std::nullopt;
     c.req_arch = param(req, "arch");
-    c.min_free_gib = preflight::parse_i64(param(req, "min_gib"));
+    const auto min_gib = form_int(req, "min_gib", 0);
+    if (!min_gib || *min_gib < 0)
+        return std::nullopt;
+    c.min_free_gib = *min_gib;
     c.volume = param(req, "volume");
     c.reboot_block = param(req, "reboot") != "warn"; // default block
     return c;
@@ -409,13 +434,27 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                             "text/html; charset=utf-8");
             return;
         }
-        const auto cfg = config_from_req(req);
+        // A malformed (or, for the disk threshold, negative) number, or a malformed version
+        // threshold, is a 400 with nothing dispatched: it used to read as 0, i.e. "no minimum
+        // free disk" / the default window / version 0 (every device passes).
+        const auto parsed_cfg = config_from_req(req);
+        const auto parsed_window = form_int(req, "window", 0);
+        if (!parsed_cfg || !parsed_window) {
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Pre-flight thresholds must be whole numbers, and versions dotted numbers such as 4.2.0","level":"error"}})");
+            res.set_content(detail::a4_error(res, "invalid threshold parameter"),
+                            "application/json");
+            return;
+        }
+        const auto& cfg = *parsed_cfg;
         const std::string group_id = param(req, "group");
         const std::string os_filter = param(req, "os_filter");
-        int window_min = static_cast<int>(preflight::parse_i64(param(req, "window")));
-        if (window_min <= 0)
-            window_min = 30;
-        window_min = std::clamp(window_min, kMinWindowMin, kMaxWindowMin);
+        // Narrow only AFTER the 64-bit clamp: a wrapped cast must not pick the window.
+        int window_min = *parsed_window <= 0
+                             ? 30
+                             : static_cast<int>(std::clamp<std::int64_t>(
+                                   *parsed_window, kMinWindowMin, kMaxWindowMin));
 
         auto targets =
             resolve_targets(devices_fn_, group_members_fn_, session->username, group_id, os_filter);
@@ -586,7 +625,7 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
         int64_t limit = 12;
         if (req.has_param("limit")) {
             try {
-                limit = std::clamp<int64_t>(std::stoll(req.get_param_value("limit")), 1, 100);
+                limit = std::clamp<int64_t>(yuzu::server::strict_stoll(req.get_param_value("limit")), 1, 100);
             } catch (...) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid limit"), "application/json");

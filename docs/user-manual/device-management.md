@@ -104,6 +104,8 @@ Response:
 }
 ```
 
+`count`, `max_uses` and `ttl_hours` may each be a JSON integer or a numeric string (`"count": "10"`); an empty string or an omitted key keeps the default (`count` 10, `max_uses` 1, `ttl_hours` 0 = no expiry). A float, boolean, `null`, a number outside the 32-bit range, a negative `ttl_hours` or `max_uses`, a `count` outside 1 to 10000, or a body that is not one JSON object is `400` and mints nothing. Before this check a JSON number was silently ignored, so the example above minted single-use tokens that never expired.
+
 **Agent side:**
 
 ```bash
@@ -176,6 +178,7 @@ Supported modes:
 |---|---|
 | `any` | First matching enabled rule auto-approves the agent (default) |
 | `all` | All enabled rules must match for auto-approval |
+
 
 Note: Auto-approval only applies when rules exist and are enabled. When no rules are configured, all agents enter the pending queue regardless of mode. To disable auto-approval entirely, remove or disable all rules.
 
@@ -467,7 +470,7 @@ curl -s -X POST http://localhost:8080/api/settings/updates/upload \
 | `file` | Yes | The agent binary to upload |
 | `platform` | Yes | Target platform (`linux`, `windows`, `darwin`) |
 | `arch` | Yes | Target architecture (`x86_64`, `aarch64`) |
-| `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`) |
+| `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`). An empty value is the default; a malformed value (`0x5`, `5abc`, `1e1`) is `400` and nothing is stored, it never becomes `100`; an out-of-range integer is clamped to 0--100 |
 | `mandatory` | No | Whether agents must apply this update (`true`/`false`, default: `false`) |
 
 ### View Available Updates
@@ -535,7 +538,7 @@ Unless noted, these endpoints accept form-encoded parameters and return HTML fra
 | `POST` | `/api/settings/auto-approve/{index}/toggle` | Enable/disable a rule | HTMX |
 | `DELETE` | `/api/settings/auto-approve/{index}` | Delete a rule | HTMX |
 | `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart) | HTMX |
-| `POST` | `/api/settings/updates/{platform}/{arch}/{version}/rollout` | Set rollout percentage (form: `rollout_pct`) | HTMX |
+| `POST` | `/api/settings/updates/{platform}/{arch}/{version}/rollout` | Set rollout percentage (form: `rollout_pct`; a malformed value is `400` with an error toast and nothing changes) | HTMX |
 | `DELETE` | `/api/settings/updates/{platform}/{arch}/{version}` | Remove an uploaded binary | HTMX |
 
 ---

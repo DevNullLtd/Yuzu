@@ -237,9 +237,9 @@ TEST_CASE("server-config twin and fragment carry the sign-in limits and the true
     CHECK(frag->body.find("Session Timeout") == std::string::npos);
     CHECK(frag->body.find("<td>Agent heartbeat timeout</td><td><code>75s</code>") !=
           std::string::npos);
-    CHECK(frag->body.find("<td>Dashboard idle timeout</td><td><code>900s</code>") !=
+    CHECK(frag->body.find("<td>Console idle timeout</td><td><code>900s</code>") !=
           std::string::npos);
-    CHECK(frag->body.find("<td>Dashboard session lifetime</td><td><code>28800s</code>") !=
+    CHECK(frag->body.find("<td>Console session lifetime</td><td><code>28800s</code>") !=
           std::string::npos);
 }
 
@@ -249,7 +249,7 @@ TEST_CASE("server-config fragment says the idle timeout is off when it is 0",
     h.cfg.session_inactivity_secs = 0;
     auto frag = h.sink.Get("/fragments/settings/server-config");
     REQUIRE(frag);
-    CHECK(frag->body.find("<td>Dashboard idle timeout</td><td>Off</td>") != std::string::npos);
+    CHECK(frag->body.find("<td>Console idle timeout</td><td>Off</td>") != std::string::npos);
 }
 
 TEST_CASE("GET /api/v1/settings/mcp returns the A4 envelope and ServerConfig:Read",

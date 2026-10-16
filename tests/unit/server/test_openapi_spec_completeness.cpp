@@ -336,6 +336,87 @@ TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the
     CHECK(perms.value("description", "").find("retry_after_ms") != std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out request and every refusal",
+          "[openapi][hardware][sync_fanout]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& paths = spec["paths"];
+
+    // The collection route is its own path, distinct from the per-device one.
+    REQUIRE(paths.contains("/hardware/sync"));
+    REQUIRE(paths.contains("/hardware/{id}/sync"));
+    REQUIRE(paths["/hardware/sync"].contains("post"));
+    CHECK_FALSE(paths["/hardware/sync"].contains("get"));
+    const auto& op = paths["/hardware/sync"]["post"];
+
+    REQUIRE(op.contains("tags"));
+    CHECK(op["tags"][0] == "Hardware");
+    const std::string description = op.value("description", "");
+    CHECK(description.find("Execution:Execute") != std::string::npos);
+    CHECK(description.find("500") != std::string::npos);
+
+    // Request body: required, JSON, with the three documented properties.
+    REQUIRE(op.contains("requestBody"));
+    CHECK(op["requestBody"]["required"] == true);
+    REQUIRE(op["requestBody"]["content"].contains("application/json"));
+    const auto& props = op["requestBody"]["content"]["application/json"]["schema"]["properties"];
+    REQUIRE(props.contains("scope"));
+    REQUIRE(props.contains("scope_expression"));
+    REQUIRE(props.contains("source"));
+    CHECK(props["scope"]["type"] == "string");
+    CHECK(props["scope_expression"]["type"] == "string");
+    CHECK(props["scope_expression"]["maxLength"] == 1024);
+    CHECK(props["source"]["enum"] == json::array({"installed_software"}));
+    CHECK(props.size() == 3);
+    // Machine-readable bounds and the exactly-one-selector rule, not prose alone.
+    CHECK(props["scope"]["minLength"] == 1);
+    CHECK(props["scope"]["maxLength"] == 256);
+    CHECK(props["scope_expression"]["minLength"] == 1);
+    const auto& req_schema = op["requestBody"]["content"]["application/json"]["schema"];
+    CHECK(req_schema["oneOf"] ==
+          json::array({json{{"required", json::array({"scope"})}},
+                       json{{"required", json::array({"scope_expression"})}}}));
+
+    // Every status the route can answer, no more and no fewer.
+    REQUIRE(op.contains("responses"));
+    std::set<std::string> keys;
+    for (auto it = op["responses"].begin(); it != op["responses"].end(); ++it)
+        keys.insert(it.key());
+    CHECK(keys == std::set<std::string>{"202", "400", "401", "403", "409", "413", "429", "500", "503"});
+    // The 202 shape names the four counts and carries no per-device list.
+    const std::string accepted = op["responses"]["202"].value("description", "");
+    for (const char* field : {"requested", "agents_reached", "skipped_offline", "skipped_version", "command_id"})
+        CHECK(accepted.find(field) != std::string::npos);
+    // skipped_offline is defined as "not reached by this server process", not "disconnected", and
+    // the counts are said not to be a census of the fleet (in the 202 text and the description).
+    CHECK(accepted.find("this server process did not reach") != std::string::npos);
+    CHECK(accepted.find("not the fleet") != std::string::npos);
+    CHECK(description.find("not a census of the fleet") != std::string::npos);
+    CHECK(description.find("the send was refused by the live stream") != std::string::npos);
+    // The 429 leg names its Retry-After and the 413 leg its cap.
+    CHECK(op["responses"]["429"].value("description", "").find("Retry-After") != std::string::npos);
+    CHECK(op["responses"]["413"].value("description", "").find("500") != std::string::npos);
+    // The 429 carries a typed integer Retry-After header; the 202 is a typed envelope; every
+    // refusal body is the A4 error envelope.
+    REQUIRE(op["responses"]["429"].contains("headers"));
+    REQUIRE(op["responses"]["429"]["headers"].contains("Retry-After"));
+    CHECK(op["responses"]["429"]["headers"]["Retry-After"]["schema"]["type"] == "integer");
+    REQUIRE(op["responses"]["202"].contains("content"));
+    const auto& accepted_schema =
+        op["responses"]["202"]["content"]["application/json"]["schema"];
+    REQUIRE(accepted_schema.contains("properties"));
+    REQUIRE(accepted_schema["properties"].contains("data"));
+    CHECK(accepted_schema["required"] == json::array({"data", "meta"}));
+    for (const char* field : {"requested", "agents_reached", "skipped_offline", "skipped_version",
+                              "command_id", "source", "requested_at"})
+        CHECK(accepted_schema["properties"]["data"]["properties"].contains(field));
+    for (const char* code : {"400", "403", "409", "413", "429", "500", "503"}) {
+        REQUIRE(op["responses"][code].contains("content"));
+        CHECK(op["responses"][code]["content"]["application/json"]["schema"]["$ref"] ==
+              "#/components/schemas/A4ErrorEnvelope");
+    }
+}
+
 TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query parameter and "
           "response shape (#5294)",
           "[openapi][plugin_config][5294]") {
@@ -382,6 +463,30 @@ TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query
             const std::string enabled_desc = enabled.value("description", "");
             CHECK(enabled_desc.find("no dispatch effect") != std::string::npos);
         }
+    }
+}
+
+TEST_CASE("openapi_spec_json(): the execution-statistics reads document their degraded-read 503 "
+          "(A4 envelope, retry_after_ms 2000)",
+          "[openapi][execution_statistics]") {
+    const auto& spec_json = yuzu::server::openapi_spec_json();
+    json spec = json::parse(spec_json, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec.contains("paths"));
+
+    for (const char* path : {"/execution-statistics", "/execution-statistics/agents",
+                             "/execution-statistics/definitions", "/statistics"}) {
+        INFO("path: " << path);
+        REQUIRE(spec["paths"].contains(path));
+        const auto& get_op = spec["paths"][path]["get"];
+        REQUIRE(get_op.contains("responses"));
+        REQUIRE(get_op["responses"].contains("503"));
+        const auto& r503 = get_op["responses"]["503"];
+        const std::string desc = r503.value("description", "");
+        CHECK(desc.find("retry_after_ms 2000") != std::string::npos);
+        REQUIRE(r503.contains("content"));
+        CHECK(r503["content"]["application/json"]["schema"]["$ref"] ==
+              "#/components/schemas/A4ErrorEnvelope");
     }
 }
 

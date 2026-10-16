@@ -27,6 +27,7 @@
 #include "file_retrieval_routes.hpp"
 #include "dex_perf_model.hpp"
 #include "discovered_devices_model.hpp" // list_discovered_devices read seam (DiscoveredDevicesReadFn)
+#include "software_sync_runner.hpp"      // sync_hardware_software: the shared fleet-run (Runner)
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
@@ -654,6 +655,13 @@ public:
     using GuardianPushFn = std::function<int(const std::string& scope, bool full_sync)>;
     void set_guardian_push_fn(GuardianPushFn fn) { guardian_push_fn_ = std::move(fn); }
 
+    /// The fleet "Sync now" run behind `sync_hardware_software` - the SAME instance
+    /// `POST /api/v1/hardware/sync` uses, so the per-operator cooldown and the single in-flight
+    /// slot bind both surfaces. Wired once before register_routes (permanent when unset).
+    void set_software_sync_runner(std::shared_ptr<software_sync::Runner> runner) {
+        software_sync_runner_ = std::move(runner);
+    }
+
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
     /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_tar_process_
     /// tree_devices`/`list_tar_capture_sources_devices` previously intersected
@@ -1231,6 +1239,7 @@ private:
     BaselineStore* baseline_store_{nullptr};
     // #2146 Batch B1 — see set_guardian_push_fn above.
     GuardianPushFn guardian_push_fn_;
+    std::shared_ptr<software_sync::Runner> software_sync_runner_;
     // #2146 Batch B3 — see set_viz_deps above.
     FleetTopologyStore* fleet_topology_store_{nullptr};
     yuzu::server::OfflineRosterFn offline_roster_fn_;

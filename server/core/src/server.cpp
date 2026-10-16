@@ -12371,6 +12371,169 @@ private:
         return ok;
     }
 
+    [[nodiscard]] static std::string mint_sync_now_command_id() {
+        const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        return "__sync__-now-" + std::to_string(now_s) + "-" +
+               auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+    }
+
+    [[nodiscard]] auto build_sync_now_command(const std::string& command_id, const std::string& source) {
+        return build_classified_command(yuzu::server::DispatchCaller{.system = true}, "__sync__", "now",
+                                        command_id, /*parameters=*/{{"source", source}});
+    }
+
+    /// Sync-on-demand (`__sync__.now {source}`): a system-reserved push to each id under ONE
+    /// command id and ONE gateway flush (the TAR fleet_snapshot shape). This is the
+    /// Guardian-push path (build_classified_command(system) + send_system_reserved +
+    /// forward_gateway_pending) - NOT dispatch_confined, which would withhold `__sync__` as a
+    /// plugin no agent advertises (#3511). Authorization and targeting belong to the caller:
+    /// the per-device sync route gates (scoped Execution:Execute) before it gets here; the fleet
+    /// fan-out uses `push_sync_now_confined`, whose reach the confined-dispatch seam decides. The
+    /// agent ignores stagger for this action, so the caller bounds the herd. `sent`
+    /// counts sessions that accepted the frame; a command that cannot be classified sends
+    /// nothing and returns the empty result (no command id).
+    [[nodiscard]] yuzu::server::software_sync::DispatchResult
+    push_sync_now(const std::vector<std::string>& ids, const std::string& source) {
+        auto out = yuzu::server::software_sync::fan_out(
+            ids, [] { return mint_sync_now_command_id(); },
+            [&](const std::string& command_id) { return build_sync_now_command(command_id, source); },
+            [&](const std::string& id, const detail::ClassifiedCommand& cmd) {
+                return send_system_reserved(id, cmd,
+                                            yuzu::server::SystemReservedPush::inventory_sync_now);
+            });
+        if (out.sent > 0)
+            forward_gateway_pending(); // gateway agents are only QUEUED
+        return out;
+    }
+
+    /// Selector -> the caller's candidate ids for a "Sync now" fleet run. Only the store reads live
+    /// here; the confinement and every fail-closed branch are software_sync::resolve_targets.
+    [[nodiscard]] yuzu::server::software_sync::Resolved
+    software_sync_resolve(const auth::Session& sess, const yuzu::server::software_sync::Selector& sel) {
+        namespace software_sync = yuzu::server::software_sync;
+        software_sync::Expansion ex;
+        ex.all_ids = [this] { return registry_.all_ids(); };
+        ex.group_members =
+            [this](const std::string& group_id)
+            -> std::optional<std::vector<std::string>> {
+            if (!mgmt_group_store_)
+                return std::nullopt;
+            const auto members = mgmt_group_store_->get_members_checked(group_id);
+            if (!members)
+                return std::nullopt;
+            std::vector<std::string> ids;
+            ids.reserve(members->size());
+            for (const auto& m : *members)
+                ids.push_back(m.agent_id);
+            return ids;
+        };
+        ex.scope_matches =
+            [this, &sess](const std::string& expression)
+            -> software_sync::ScopeExpansion {
+            // The same ladder a real dispatch uses (alias -> owner
+            // check -> parse -> registry evaluation, fail closed).
+            const std::string role = auth::role_to_string(sess.role);
+            const std::string ref_id =
+                "__sync__-scope-" + auth::AuthManager::bytes_to_hex(
+                                        auth::AuthManager::random_bytes(8));
+            yuzu::server::ScopeLadderAudit audit;
+            audit.resolution_failed = [&](const std::string& ref) {
+                audit_scope_resolution_failed(sess.username, role, ref_id, ref);
+            };
+            audit.evaluation_aborted = [&](const std::string& reason) {
+                audit_scope_evaluation_aborted(sess.username, role, ref_id,
+                                               reason);
+            };
+            auto ladder = yuzu::server::resolve_scope_targets(
+                expression, sess.username, result_set_store_.get(),
+                [&](const yuzu::scope::Expression& parsed) {
+                    return registry_.evaluate_scope(
+                        parsed, tag_store_.get(),
+                        custom_properties_store_.get(),
+                        result_set_store_.get(), sess.username);
+                },
+                audit);
+            software_sync::ScopeExpansion out;
+            out.parse_error = std::move(ladder.parse_error);
+            out.matched = std::move(ladder.matched);
+            if (!out.matched && !out.parse_error)
+                out.abort_detail = ladder.abort_reason
+                                       ? to_string(*ladder.abort_reason)
+                                       : "unknown";
+            return out;
+        };
+        return software_sync::resolve_targets(sel, derive_exec_visible(sess),
+                                               ex);
+    }
+
+    /// The ONE fleet-run instance, shared by `POST /api/v1/hardware/sync` and the MCP tool
+    /// `sync_hardware_software`, so the per-operator cooldown and the single in-flight slot bind
+    /// both surfaces. Built on first use (all members it reads exist by then).
+    [[nodiscard]] std::shared_ptr<yuzu::server::software_sync::Runner> software_sync_runner() {
+        if (!sync_runner_) {
+            yuzu::server::software_sync::Env env;
+            env.resolve = [this](const auth::Session& sess,
+                                 const yuzu::server::software_sync::Selector& sel) {
+                return software_sync_resolve(sess, sel);
+            };
+            env.dispatch = [this](const auth::Session& sess, const std::vector<std::string>& ids) {
+                return push_sync_now_confined(
+                    sess, ids, std::string(yuzu::server::software_sync::kSource));
+            };
+            env.caller_unfiltered = [this](const auth::Session& sess) {
+                return !derive_exec_visible(sess).has_value();
+            };
+            env.agent_version = [this](const std::string& id) -> std::optional<std::string> {
+                auto sess = registry_.get_session(id);
+                if (!sess)
+                    return std::nullopt;
+                return sess->agent_version;
+            };
+            env.on_takeover_refused = [] {
+                spdlog::warn("software sync: a takeover was refused because the maximum number of "
+                             "stalled runs are still alive; sync stays unavailable until one of their "
+                             "sends unwinds (a stalled agent stream) or the server restarts");
+            };
+            env.on_takeover = [] {
+                spdlog::warn("software sync: a run took over a lapsed in-flight lease; the previous "
+                             "holder is still sending (a stalled agent stream)");
+            };
+            sync_runner_ = std::make_shared<yuzu::server::software_sync::Runner>(std::move(env));
+        }
+        return sync_runner_;
+    }
+
+    /// The fleet-wide sync fan-out: the same push as `push_sync_now`, but WHO IS REACHED is
+    /// decided by `dispatch_confined_arms` (the system-reserved fan-out arm), not by the
+    /// resolver that produced `ids`. The id list is intersected with the caller's own
+    /// Execution:Execute visible set at send time, so a hidden device is never sent to even if the
+    /// list reached this point carrying it. One command id, one gateway flush, like the
+    /// per-device path.
+    [[nodiscard]] yuzu::server::software_sync::DispatchResult
+    push_sync_now_confined(const auth::Session& sess, const std::vector<std::string>& ids,
+                           const std::string& source) {
+        yuzu::server::software_sync::DispatchResult out;
+        if (ids.empty())
+            return out;
+        const std::string command_id = mint_sync_now_command_id();
+        auto cmd = build_sync_now_command(command_id, source);
+        if (!cmd)
+            return out; // a command that cannot be classified sends nothing and reports no id
+        out.command_id = command_id;
+        const auto result = yuzu::server::dispatch_system_reserved_ids(
+            ids, derive_exec_visible(sess),
+            [this, &cmd](const std::string& id) {
+                return send_system_reserved(id, *cmd,
+                                            yuzu::server::SystemReservedPush::inventory_sync_now);
+            });
+        out.sent = static_cast<std::size_t>(result.sent);
+        if (out.sent > 0)
+            forward_gateway_pending(); // gateway agents are only QUEUED
+        return out;
+    }
+
     /// #3687: the `has_permission` binder `classify_and_authorize_dispatch`
     /// needs, extracted so `build_classified_command`'s authoritative check
     /// and the MCP pre-dispatch dry run (`authorize_dispatch_fn_` below, the
@@ -18499,32 +18662,13 @@ private:
                                          return std::nullopt;
                                      return doc->json;
                                  },
-                             // Sync-on-demand: system-reserved push, the Guardian-push path
-                             // (build_classified_command(system) + send_system_reserved +
-                             // forward_gateway_pending) — NOT dispatch_confined, which would
-                             // withhold `__sync__` as a plugin no agent advertises (#3511).
+                             // Sync-on-demand for ONE device: push_sync_now (the Guardian-push
+                             // path, NOT dispatch_confined - #3511).
                              .sync_dispatch_fn =
                                  [this](const std::string& id, const std::string& source)
                                      -> HardwareRoutes::HwSyncDispatchResult {
-                                     const auto now_s =
-                                         std::chrono::duration_cast<std::chrono::seconds>(
-                                             std::chrono::system_clock::now().time_since_epoch())
-                                             .count();
-                                     const auto command_id =
-                                         "__sync__-now-" + std::to_string(now_s) + "-" +
-                                         auth::AuthManager::bytes_to_hex(
-                                             auth::AuthManager::random_bytes(8));
-                                     auto classified = build_classified_command(
-                                         yuzu::server::DispatchCaller{.system = true}, "__sync__",
-                                         "now", command_id, /*parameters=*/{{"source", source}});
-                                     if (!classified)
-                                         return {};
-                                     const bool ok = send_system_reserved(
-                                         id, *classified,
-                                         yuzu::server::SystemReservedPush::inventory_sync_now);
-                                     if (ok)
-                                         forward_gateway_pending(); // gateway agents are only QUEUED
-                                     return {ok, command_id};
+                                     const auto r = push_sync_now({id}, source);
+                                     return {r.sent > 0, r.command_id};
                                  },
                              .agent_version_fn =
                                  [this](const std::string& id) -> std::optional<std::string> {
@@ -18554,6 +18698,12 @@ private:
                                          return std::nullopt;
                                      return quarantine_store_->list_quarantined_in(ids, limit);
                                  },
+                             // POST /api/v1/hardware/sync (Software "Sync now" for a scope).
+                             // Type-level Execution:Execute; the targets are then resolved
+                             // against the caller's OWN Execution:Execute visible set.
+                             .sync_perm_fn = perm_fn,
+                             .sync_runner = software_sync_runner(),
+                             .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
                          });
 
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
@@ -20856,6 +21006,7 @@ private:
             // the IDENTICAL scope-to-agents dispatch — they cannot drift on what
             // gets pushed or to whom.
             mcp_server_->set_guardian_push_fn(guardian_push_fn_);
+            mcp_server_->set_software_sync_runner(software_sync_runner());
             // #2146 Batch B1 — the SAME BaselineStore GET
             // /guaranteed-state/device-compliance already reads, backing MCP
             // get_guardian_device_compliance's identical baseline lookup.
@@ -21923,6 +22074,7 @@ private:
     std::unique_ptr<DeviceLensRoutes> device_lens_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<HardwareRoutes> hardware_routes_;
+    std::shared_ptr<yuzu::server::software_sync::Runner> sync_runner_; // fleet "Sync now" (REST + MCP)
     std::unique_ptr<home::DashboardSummaryRoutes> dashboard_summary_routes_;
     std::unique_ptr<DeviceContainmentRoutes> device_containment_routes_;
     std::unique_ptr<DeviceEstateRoutes> device_estate_routes_;
