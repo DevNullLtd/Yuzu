@@ -68,6 +68,10 @@ a_failed_connected_arms_a_replay_on_the_next_success() ->
                       (_) -> ok
                    end),
     ok = notify(connected, 1),
+    %% Settled alone is also true BEFORE the cast has started its worker, and
+    %% the reset below would then make the first notification succeed: wait for
+    %% the failing call itself first (S1, PR #5695 review).
+    ok = wait_until(fun() -> notify_count() =:= 1 end),
     ok = wait_until(fun notifications_settled/0),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
 
@@ -90,6 +94,10 @@ a_successful_notification_after_a_failure_arms_a_replay() ->
                       (_) -> ok
                    end),
     ok = notify(connected, 1),
+    %% Settled alone is also true BEFORE the cast has started its worker, and
+    %% the reset below would then make the first notification succeed: wait for
+    %% the failing call itself first (S1, PR #5695 review).
+    ok = wait_until(fun() -> notify_count() =:= 1 end),
     ok = wait_until(fun notifications_settled/0),
 
     meck:reset(yuzu_grpc_client),
