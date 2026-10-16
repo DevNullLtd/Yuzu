@@ -28,9 +28,11 @@ Pass the encoding the child actually writes:
 
     subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")  # Node, git
 
-- A Python child (meson included) writes the locale code page on Windows, not UTF-8: run
-  it with `env={**os.environ, "PYTHONUTF8": "1"}` and decode as `utf-8`; decoding with
-  `errors="replace"` instead never raises but turns non-ASCII into U+FFFD.
+- A Python child (meson included) writes the locale code page on Windows, not UTF-8: add
+  `PYTHONUTF8=1` to the env the call already passes (`{**base_env, "PYTHONUTF8": "1"}`,
+  where `base_env` is `os.environ` only if the call passed no `env=`) and decode as
+  `utf-8`; decoding with `errors="replace"` instead never raises but turns non-ASCII into
+  U+FFFD.
 - For output you only log or scan (a long build, a streamed reader), use
   `encoding="utf-8", errors="replace"` so one stray byte cannot kill the reader (#4839).
 - `encoding=` also encodes `input=`.

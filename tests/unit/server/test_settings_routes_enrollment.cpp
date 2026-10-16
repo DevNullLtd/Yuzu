@@ -265,8 +265,10 @@ TEST_CASE("settings enrollment: batch create returns N tokens and audits ids onl
     // P2718R0 (GCC <= 14, Clang <= 18, and MSVC per its conformance table) the returned
     // std::expected is destroyed before the loop body runs (#5924).
     const auto tokens = h.auth_mgr.list_enrollment_tokens();
-    INFO("list_enrollment_tokens StoreError: " << (tokens ? -1 : static_cast<int>(tokens.error())));
-    REQUIRE(tokens.has_value());
+    {
+        INFO("list_enrollment_tokens StoreError: " << (tokens ? -1 : static_cast<int>(tokens.error())));
+        REQUIRE(tokens.has_value());
+    }
     REQUIRE(tokens->size() == 3);
     for (const auto& t : *tokens)
         CHECK(row.detail.find(t.token_id) != std::string::npos);
