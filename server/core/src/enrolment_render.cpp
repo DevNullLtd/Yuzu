@@ -379,6 +379,14 @@ std::string render_pending(const std::vector<auth::PendingAgent>* agents) {
     }
     html += "</tbody></table></div>";
 
+    // Waiting rows come first, so the rows the cap cuts off are denied ones whenever every
+    // waiting agent is shown. (When waiting agents are cut, the bulk-bar banner below says so.)
+    if (rows.size() > shown && n_waiting <= kRenderCap) {
+        html += "<p class=\"hint pad\">Showing " + std::to_string(shown) + " of " +
+                std::to_string(rows.size()) + " agents. Every waiting agent is listed; the " +
+                std::to_string(rows.size() - shown) + " other denied agents are not.</p>";
+    }
+
     // A lone waiting row whose id cannot be addressed would otherwise have no action at all.
     const bool lone_unaddressable =
         n_waiting == 1 && !path_segment_ok(waiting.front()->agent_id);

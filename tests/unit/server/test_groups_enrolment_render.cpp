@@ -493,6 +493,31 @@ TEST_CASE("enrolment pending: past the render cap the bulk buttons are disabled 
     CHECK_THAT(html, ContainsSubstring("id0/approve"));
 }
 
+// Denied rows are listed after the waiting ones and are cut by the same cap. The bulk-bar banner
+// only speaks when WAITING agents are cut, so a silent drop of denied rows needs its own note.
+TEST_CASE("enrolment pending: denied rows cut off by the render cap are announced",
+          "[groups][enrolment][render]") {
+    std::vector<auth::PendingAgent> v = {agent("w1", "waiting-host")};
+    for (std::size_t i = 0; i < kRenderCap + 5; ++i)
+        v.push_back(agent("d" + std::to_string(i), "denied-host", auth::PendingStatus::denied));
+    const auto html = render_pending(&v);
+    CHECK(count_of(html, "<tr><td><code") == kRenderCap);
+    CHECK_THAT(html, ContainsSubstring("Showing 200 of 206 agents. Every waiting agent is listed; "
+                                       "the 6 other denied agents are not."));
+    // Every waiting agent is shown, so the bulk actions stay on and the waiting-cut banner is absent.
+    CHECK_THAT(html, ContainsSubstring("1 waiting, 205 denied"));
+    CHECK_THAT(html, !ContainsSubstring("including the ones not shown"));
+
+    // Nothing is cut: no note. Cut waiting agents: the bulk-bar banner, not this note.
+    const std::vector<auth::PendingAgent> small = {agent("w1", "h"),
+                                                   agent("d1", "h", auth::PendingStatus::denied)};
+    CHECK_THAT(render_pending(&small), !ContainsSubstring("Showing "));
+    std::vector<auth::PendingAgent> many;
+    for (std::size_t i = 0; i < kRenderCap + 1; ++i)
+        many.push_back(agent("p" + std::to_string(i), "h"));
+    CHECK_THAT(render_pending(&many), !ContainsSubstring("Every waiting agent is listed"));
+}
+
 TEST_CASE("enrolment pending: pending rows are shown before denied ones under the cap",
           "[groups][enrolment][render]") {
     std::vector<auth::PendingAgent> v;
