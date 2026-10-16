@@ -2595,7 +2595,7 @@ jobs:
   # ── CI canary (PR-8 of overhaul plan) ─────────────────────────────────
   # Detects whether a PR (or a push to main) touches CI infrastructure
   # (workflows / actions / CI helper scripts). If it does, the canary leg
-  # runs the linux build on GHA-hosted ubuntu-24.04 — a fresh-disk runner
+  # runs the linux build on GHA-hosted ubuntu-26.04 — a fresh-disk runner
   # with no warm caches and no self-hosted assumptions — so workflow
   # regressions are caught against a vanilla environment BEFORE the
   # change lands on main and becomes the next CI run for everyone.
@@ -2720,10 +2720,18 @@ jobs:
           fi
 
   canary:
-    name: "Workflow canary (GHA-hosted ubuntu-24.04)"
+    name: "Workflow canary (GHA-hosted ubuntu-26.04)"
     needs: [detect-ci-changes, trusted_inputs]
     if: needs.detect-ci-changes.outputs.workflows_changed == 'true'
-    runs-on: ubuntu-24.04
+    # ubuntu-26.04 + gcc-15 + mold + linux-gcc15.ini: the same OS, compiler
+    # and native file as the Big Tam Linux legs (#5929). Until 2026-10 this
+    # leg ran ubuntu-24.04 + gcc-13 + linux-gcc13.ini, which kept a compiler
+    # below the supported floor (GCC 15, docs/build-guide.md "Compiler floor")
+    # in CI; ubuntu-24.04 has no gcc-15 in its archive. The ubuntu-26.04
+    # hosted image was a GitHub public preview when this moved
+    # (actions/runner-images#14226) — if it is withdrawn or breaks, fall back
+    # to an ubuntu:26.04 `container:` on ubuntu-24.04, never back to gcc-13.
+    runs-on: ubuntu-26.04
     # A genuinely cold cache builds the whole vcpkg closure from source on a
     # 2-vCPU GHA-hosted runner — ~65-70 min for grpc/protobuf/abseil/openssl
     # plus libpq, which compiles PostgreSQL from source (ADR-0006/0008) —
@@ -2765,7 +2773,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake ninja-build gcc-13 g++-13 \
+            cmake ninja-build gcc-15 g++-15 mold \
             pkg-config curl zip unzip tar python3-pip ccache \
             bison flex libsystemd-dev libblkid-dev autoconf automake libtool
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
@@ -2807,12 +2815,24 @@ jobs:
         # the save-always deprecation rationale and the documented split
         # restore + always-save pattern.
         #
-        # The bare `vcpkg-canary-x64-linux-` fallback below is the same
+        # The bare `vcpkg-canary-gcc15-x64-linux-` fallback below is the same
         # open-prefix shape the ccache step a few lines down used to have
         # (see that step's comment for why that's a risk). Not fixed here:
         # `VCPKG_COMMIT` has never changed in this repo's history, so the
         # path that would resurrect a dead-format entry has never fired —
         # tracked as #3888.
+        #
+        # The `gcc15-` segment in both canary key names (this one and the
+        # ccache key below) is the toolchain discriminator added when the
+        # canary moved from ubuntu-24.04/gcc-13 to ubuntu-26.04/gcc-15
+        # (#5929). Without it the new toolchain would EXACT-hit a tree built
+        # by gcc-13: vcpkg's ABI hash covers the compiler, so every run would
+        # rebuild all ports (~65-70 min) and then skip its own save because
+        # the key already matched — a cache that can never be repaired (#3229
+        # class). Renaming the prefix also keeps the bare-prefix fallback
+        # below from ever restoring an old gcc-13 tree. A compiler bump on
+        # the hosted image (e.g. gcc 15.2 -> 15.3) has the same shape and is
+        # NOT caught by this segment: bump it (gcc15a-, ...) when that happens.
         #
         # A miss here isn't announced anywhere a human would notice short of
         # reading this step's raw log for "Cache not found" — a silent
@@ -2824,10 +2844,10 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/x64-linux.cmake') }}
+          key: vcpkg-canary-gcc15-x64-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/x64-linux.cmake') }}
           restore-keys: |
-            vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
-            vcpkg-canary-x64-linux-
+            vcpkg-canary-gcc15-x64-linux-${{ env.VCPKG_COMMIT }}-
+            vcpkg-canary-gcc15-x64-linux-
 
       - name: Compute ccache time bucket (canary)
         # The ccache key deliberately does NOT hash sources any more. The
@@ -2900,7 +2920,7 @@ jobs:
         # design this replaces had the unbounded-growth failure instead.
         #
         # restore-keys names the specific previous bucket, never a bare
-        # `ccache-canary-x64-linux-` prefix. (GitHub's restore-keys match by
+        # `ccache-canary-gcc15-x64-linux-` prefix. (GitHub's restore-keys match by
         # PREFIX, not exact string — but a bucket is a plain small integer,
         # so the one named value can't accidentally prefix-match anything
         # else live in the pool.) An open-ended prefix matches every entry
@@ -2928,9 +2948,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache
-          key: ccache-canary-x64-linux-${{ env.CCACHE_BUCKET }}
+          key: ccache-canary-gcc15-x64-linux-${{ env.CCACHE_BUCKET }}
           restore-keys: |
-            ccache-canary-x64-linux-${{ env.CCACHE_PREV_BUCKET }}
+            ccache-canary-gcc15-x64-linux-${{ env.CCACHE_PREV_BUCKET }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -2953,14 +2973,14 @@ jobs:
             --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
 
-      - name: Configure (Meson, gcc-13 debug)
+      - name: Configure (Meson, gcc-15 debug)
         env:
-          CC: ccache gcc-13
-          CXX: ccache g++-13
+          CC: ccache gcc-15
+          CXX: ccache g++-15
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
           meson setup build-linux \
-            --native-file meson/native/linux-gcc13.ini \
+            --native-file meson/native/linux-gcc15.ini \
             --buildtype=debug \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true

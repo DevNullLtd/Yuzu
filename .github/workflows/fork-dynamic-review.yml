@@ -24,7 +24,12 @@ concurrency:
 jobs:
   linux:
     name: Hosted Linux build and tests
-    runs-on: ubuntu-24.04
+    # ubuntu-26.04 + gcc-15 + mold + linux-gcc15.ini: the Big Tam Linux
+    # toolchain, which is also the supported compiler floor (#5929). This job
+    # previously built with ubuntu-24.04's default gcc-13, below the floor;
+    # 24.04 has no gcc-15 in its archive. ubuntu-26.04 was a GitHub public
+    # preview when this moved (actions/runner-images#14226).
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
 
     steps:
@@ -59,7 +64,7 @@ jobs:
       - name: Install trusted host prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y autoconf automake bison ccache cmake flex libblkid-dev libtool ninja-build
+          sudo apt-get install -y autoconf automake bison ccache cmake flex gcc-15 g++-15 libblkid-dev libsystemd-dev libtool mold ninja-build pkg-config
           python3 -m venv /tmp/yuzu-review-venv
           # requirements-ci.txt is read from the FORK's own checked-out tree
           # (already at HEAD above), so --require-hashes only proves each
@@ -75,14 +80,18 @@ jobs:
       # `find_program('rebar3', required: false)` silently skips `gateway
       # eunit` / `gateway ct`, and this leg would claim a green `meson test`
       # without having run the gateway (#4800, #4841). Same pin as ci.yml's
-      # Linux leg and release.yml. The runner is a GitHub-hosted, ephemeral
-      # VM, so ImageOS is auto-detected and setup-beam's tool cache is
-      # discarded with the VM (no shared self-hosted tool_cache to isolate).
+      # Linux leg and release.yml. ImageOS is pinned to ubuntu24 exactly as
+      # ci.yml's Big Tam leg does: setup-beam has no ubuntu26 prebuilt OTP, and
+      # the 24.04 build runs on 26.04. The runner is a GitHub-hosted, ephemeral
+      # VM, so setup-beam's tool cache is discarded with the VM (no shared
+      # self-hosted tool_cache to isolate).
       # setup-beam uses the tool cache, not the Actions cache service, so
       # this does not reopen the quarantine-cache concern described at the
       # purge job below.
       - name: Install Erlang/OTP and rebar3
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        env:
+          ImageOS: ubuntu24
         with:
           otp-version: '28'
           rebar3-version: '3.24'
@@ -97,10 +106,12 @@ jobs:
         env:
           VCPKG_BINARY_SOURCES: clear
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+          CC: ccache gcc-15
+          CXX: ccache g++-15
         run: |
           ./scripts/setup.sh \
             --tests \
-            --native-file meson/native/linux-gcc13.ini
+            --native-file meson/native/linux-gcc15.ini
           python3 scripts/ci/assert-gateway-tests.py build-linux
 
       - name: Compile
