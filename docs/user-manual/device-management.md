@@ -47,6 +47,8 @@ curl -s -X POST http://localhost:8080/api/settings/pending-agents/agent-001/deny
   -b "$COOKIE"
 ```
 
+Approve and deny, like remove below, only act on a row that is still `pending`. On an agent that was already approved or denied they return `409` (with the refreshed list and an error toast) and change nothing, so a stale click or a repeated request can never reverse a denial or turn an enrolled agent into a denied one. An unknown agent id changes nothing and gets a warning toast; both cases are recorded as `denied` audit rows.
+
 ```bash
 # Remove a pending agent from the queue entirely
 curl -s -X DELETE http://localhost:8080/api/settings/pending-agents/agent-001 \

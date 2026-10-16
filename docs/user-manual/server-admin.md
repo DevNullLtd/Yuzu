@@ -5152,15 +5152,15 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `GET` | `/fragments/settings/tokens` | Render the enrollment tokens fragment (HTMX); also the **Enrolment tokens** panel of `/groups`. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`. |
 | `POST` | `/api/settings/enrollment-tokens` | Generate a new enrollment token. Form fields: `label`, `max_uses` (empty or `0` = unlimited), `ttl_hours` (empty or `0` = never). A malformed or negative number is a `400` and nothing is minted. The response is the token-list fragment with the raw token shown once; it carries `Cache-Control: no-store, private`. |
 | `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. Defaults when a field is empty or omitted: `count` 10 (allowed 1 to 10000), `max_uses` 1, `ttl_hours` 0 (no expiry). Each number may be a JSON integer or a numeric string. A malformed, fractional, boolean, `null` or negative number, one outside the 32-bit range, a `count` outside 1 to 10000, or a body that is not one JSON object, is a `400` and nothing is minted. The response carries `Cache-Control: no-store, private`. |
-| `DELETE` | `/api/settings/enrollment-tokens/{id}` | Revoke a token by ID. |
+| `DELETE` | `/api/settings/enrollment-tokens/{id}` | Revoke a token by ID. An unknown ID revokes nothing: the response carries a warning toast ("Token not found - nothing revoked") and the audit row is `denied`. |
 
 ### Pending Agents
 
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/fragments/settings/pending` | Render the pending agents fragment (HTMX); also the **Agents waiting for approval** panel of `/groups`. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`. |
-| `POST` | `/api/settings/pending-agents/{id}/approve` | Approve a pending agent. |
-| `POST` | `/api/settings/pending-agents/{id}/deny` | Deny a pending agent. |
+| `POST` | `/api/settings/pending-agents/{id}/approve` | Approve a pending agent. Only a `pending` row is moved: `409` if the agent was already approved or denied (an approve never reverses a denial), with the refreshed list in the body and an error toast. An unknown id changes nothing and answers with a warning toast; the audit row is `denied` in both cases. |
+| `POST` | `/api/settings/pending-agents/{id}/deny` | Deny a pending agent. Same rule as approve: `409` if the agent was already approved or denied (a deny never flips an enrolled agent). |
 | `DELETE` | `/api/settings/pending-agents/{id}` | Remove a pending agent from the queue. `409` if the row is no longer `pending` (already `approved`/`denied`) — removal only succeeds against a genuinely pending row, by design (WS-6 6.2). |
 
 The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin routes) may not contain an ASCII control character or a comma — both are rejected before the row is ever created, closing an audit-log injection path (WS-6 6.2). A UUID, hostname, or MAC-derived id is unaffected.
