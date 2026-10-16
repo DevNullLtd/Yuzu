@@ -1165,6 +1165,67 @@ TEST_CASE("SettingsRoutes GET /fragments/settings/users: no password controls on
     }
 }
 
+// ── #4644: the API-token form's ttl_hours is strict, and refusal mints nothing ──
+// `ttl_hours` of `0x5` used to read as 0 (never expires) and a negative TTL still computes 0.
+// This form answers 200 with a feedback span (its existing convention), so the proof that
+// matters is that NO token exists afterwards. `0`, an empty field and `-0` keep their documented
+// meaning (no expiry).
+TEST_CASE("SettingsRoutes POST api-tokens: a malformed or negative ttl_hours mints nothing",
+          "[pg][settings][api_tokens][numeric_params]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    for (const char* body : {"name=t1&ttl_hours=0x5", "name=t1&ttl_hours=5h", "name=t1&ttl_hours=%205",
+                             "name=t1&ttl_hours=1e1", "name=t1&ttl_hours=-1",
+                             "name=t1&ttl_hours=99999999999999999999"}) {
+        SettingsAdr2001Harness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->body.find("Invalid TTL value") != std::string::npos);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        CHECK(listed->empty());
+    }
+}
+
+TEST_CASE("SettingsRoutes POST api-tokens: an empty or literal-zero ttl_hours still mints a token",
+          "[pg][settings][api_tokens][numeric_params]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    for (const char* body : {"name=t1", "name=t1&ttl_hours=", "name=t1&ttl_hours=0",
+                             "name=t1&ttl_hours=-0", "name=t1&ttl_hours=24"}) {
+        SettingsAdr2001Harness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->body.find("Invalid TTL value") == std::string::npos);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        CHECK(listed->size() == 1);
+    }
+}
+
+// The auto-approve rule index is a `(\d+)` path segment: a 21-digit value made `stoul` THROW (a
+// 500). It cannot name a rule, so the engine reports "not found": the page re-renders (200), a
+// denied `rule_not_found` row is audited, and the rule list is untouched.
+TEST_CASE("SettingsRoutes auto-approve: a rule index that overflows is not a 500 and changes nothing",
+          "[pg][settings][numeric_params]") {
+    SettingsAdr2001Harness h;
+    h.auto_approve.add_rule({});
+    const auto before = h.auto_approve.list_rules().size();
+    auto toggle = h.sink.Post("/api/settings/auto-approve/99999999999999999999/toggle", "",
+                              "application/x-www-form-urlencoded");
+    REQUIRE(toggle);
+    CHECK(toggle->status == 200);
+    auto del = h.sink.Delete("/api/settings/auto-approve/99999999999999999999");
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(h.auto_approve.list_rules().size() == before);
+    std::size_t not_found_rows = 0;
+    for (const auto& c : h.audit_calls)
+        if (c.result == "denied" && c.detail.find("rule_not_found") != std::string::npos)
+            ++not_found_rows;
+    CHECK(not_found_rows == 2);
+}
+
 // ── #4966: the last-Administrator guard on the dashboard delete and role routes ──────────────
 //
 // The harness seeds exactly one active admin ("admin") and one user ("bob"). The caller is the

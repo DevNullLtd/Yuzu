@@ -7,6 +7,7 @@
 /// filter/paginate/JSON logic in hardware_list_model.{hpp,cpp}.
 
 #include "hardware_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
 #include "authz_model.hpp"          // authz::in_scope
@@ -14,6 +15,7 @@
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
 
+#include <yuzu/protective_actions.hpp> // protective::is_quarantine_control_plugin
 #include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
 
 #include <nlohmann/json.hpp>
@@ -25,6 +27,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_set>
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp).
@@ -90,12 +93,14 @@ bool bad_hw_ident(std::string_view v) {
     });
 }
 
-std::string hw_lens_or_overview(const std::string& raw) {
-    static constexpr std::string_view kLenses[] = {"overview", "software", "tags",    "containment",
-                                                   "dex",      "guardian", "live",    "actions"};
+std::string hw_lens_or_overview(const std::string& raw, bool containment_ui) {
+    static constexpr std::string_view kLenses[] = {"overview", "software", "tags",  "dex",
+                                                   "guardian", "live",     "actions"};
     for (const auto l : kLenses)
         if (raw == l)
             return raw;
+    if (containment_ui && raw == "containment")
+        return raw;
     return "overview";
 }
 
@@ -105,7 +110,9 @@ std::int64_t now_secs() {
         .count();
 }
 
-HardwareListQuery query_from_request(const httplib::Request& req) {
+// nullopt when `offset`/`limit` is present but not ONE base-10 integer: the caller
+// answers 400 rather than serving a page the operator did not ask for (#4644).
+std::optional<HardwareListQuery> query_from_request(const httplib::Request& req) {
     HardwareListQuery q;
     if (req.has_param("q")) q.q = req.get_param_value("q");
     if (req.has_param("os")) q.os = req.get_param_value("os");
@@ -113,15 +120,20 @@ HardwareListQuery query_from_request(const httplib::Request& req) {
     if (req.has_param("sort")) q.sort = req.get_param_value("sort");
     if (req.has_param("dir")) q.desc = req.get_param_value("dir") == "desc";
     if (req.has_param("tag")) q.tag = req.get_param_value("tag");
+    bool malformed = false;
     auto parse_u = [&](const char* name, std::size_t dflt) -> std::size_t {
         if (!req.has_param(name)) return dflt;
-        try {
-            long long v = std::stoll(req.get_param_value(name));
-            return v < 0 ? 0 : static_cast<std::size_t>(v);
-        } catch (...) { return dflt; }
+        const auto v = yuzu::server::parse_query_int<long long>(req.get_param_value(name));
+        if (!v) { malformed = true; return dflt; }
+        // A negative offset/limit is malformed (the other converted sites reject it too),
+        // not a request for page 0.
+        if (*v < 0) { malformed = true; return dflt; }
+        return static_cast<std::size_t>(*v);
     };
     q.offset = parse_u("offset", 0);
     q.limit = parse_u("limit", 50);
+    if (malformed)
+        return std::nullopt;
     return q;
 }
 
@@ -170,6 +182,7 @@ HwCiAffordances HardwareRoutes::affordances_for(const httplib::Request& req, con
     aff.can_write_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Write", id);
     aff.can_read_guaranteed_state =
         deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "GuaranteedState", "Read", id);
+    aff.containment_ui = deps_.containment_ui;
     return aff;
 }
 
@@ -224,7 +237,14 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const InventoryDevicesResult all = deps_.roster_fn();
         auto [scoped, omitted] = scoped_roster(all, gate.scope);
 
-        auto raw = query_from_request(req);
+        const auto raw_opt = query_from_request(req);
+        if (!raw_opt) {
+            res.status = 400;
+            send_html(res, "<div class=\"gp-placeholder\"><b>Bad request.</b> offset and limit "
+                           "must be whole numbers.</div>");
+            return;
+        }
+        auto raw = *raw_opt;
         auto normalised = normalise_hardware_query(raw);
         if (!normalised) {
             res.status = 400;
@@ -240,10 +260,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                 "Inventory", "fleet", "hardware roster read failed");
             HardwareListPage degraded;
             degraded.query = *normalised;
+            degraded.containment_ui = deps_.containment_ui;
             send_html(res, render_hardware_list_fragment(degraded, false, /*roster_unavailable=*/true, results_only));
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        page.containment_ui = deps_.containment_ui;
         // DEX is scored ONLY on the page's rendered rows (device_routes.cpp's own
         // "score only rendered rows" rule) — a GROUP-BY per device is too costly to
         // run over the whole roster on every filter/sort/page click.
@@ -260,7 +282,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // list itself is the response): a 403 means "this caller may not see pills" and draws
         // none; an unavailable or unwired gate, or a degraded store, sets the banner flag and
         // no pill (absence is then not evidence).
-        if (deps_.quarantine_list_fn && !page.rows.empty()) {
+        if (deps_.containment_ui && deps_.quarantine_list_fn && !page.rows.empty()) {
             std::vector<std::string> page_ids;
             page_ids.reserve(page.rows.size());
             for (const auto& row : page.rows)
@@ -309,8 +331,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         // Allowlisted: the value reaches the audit detail and echoed markup, so an unknown
         // or oversized `lens` falls back to the overview rather than being carried through.
-        const std::string lens = hw_lens_or_overview(req.has_param("lens") ? req.get_param_value("lens")
-                                                                          : std::string{});
+        const std::string lens = hw_lens_or_overview(
+            req.has_param("lens") ? req.get_param_value("lens") : std::string{}, deps_.containment_ui);
         const bool lens_only = req.has_param("lens_only") && req.get_param_value("lens_only") == "1";
         if (!deps_.ci_detail_fn) {
             res.status = 503;
@@ -325,7 +347,16 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         int attempt = 1;
         std::string command_id;
         if (req.has_param("await_since")) {
-            try { await_since = std::stoll(req.get_param_value("await_since")); } catch (...) {}
+            // await_since is the freshness bound the poll waits past: a malformed value
+            // must not read as "no bound" (the poll would then serve the STALE snapshot as
+            // fresh), so it is a 400, not a silent default.
+            await_since = yuzu::server::parse_query_int<long long>(req.get_param_value("await_since"));
+            if (!await_since) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
             if (req.has_param("n")) {
                 try { attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 30); } catch (...) {}
             }
@@ -397,7 +428,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // bar re-swapped (the active tab hasn't changed), so it's skipped there.
             std::string body = render_hardware_lens_body(id, detail, lens, now_secs(), aff);
             if (!await_since)
-                body = render_hardware_lens_bar(id, lens, /*oob=*/true) + body;
+                body = render_hardware_lens_bar(id, lens, /*oob=*/true, aff.containment_ui) + body;
             send_html(res, body);
         } else {
             send_html(res, render_hardware_ci_fragment(id, detail, lens, now_secs(), aff));
@@ -419,6 +450,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) return;
+        if (deps_.write_gate.refuse_cross_site(deps_.audit_fn, req, res, "hardware.device_sync")) return;
 
         std::string source = "all";
         if (!req.body.empty()) {
@@ -530,6 +562,90 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(out.dump(), "application/json");
     });
 
+    // -- REST v1: POST /api/v1/hardware/sync — "Sync now" for a scope (the Software page) --
+    // One click, many devices. `scope` is __all__ / group:<id> / an agent id; `scope_expression`
+    // is a scope DSL expression (software_sync_decision.hpp owns the request grammar and every
+    // bound below).
+    // GATE: the type-level Execution:Execute check (sync_perm_fn = require_permission), which reads
+    // GLOBAL grants only, so an operator whose Execute is limited to management groups gets 403
+    // for every scope kind; then the same-site write gate (a cookie-session write must name this
+    // site; token callers are exempt). WHO IS REACHED is decided by `dispatch_confined_arms`
+    // (the system-reserved fan-out arm): the id list is intersected with the caller's own
+    // Execution:Execute visible set at SEND time, so a hidden device is never sent to. The
+    // resolver's narrowing (software_sync::resolve_targets) and the fleet-wide refusal for a
+    // filtered caller keep the counts, the 413 cap and the audit row from describing devices the
+    // caller may not see; with a global grant none of them changes the outcome today.
+    // The sequence (cooldown, in-flight lease, partition + cap, audit, dispatch, stamp) is
+    // software_sync::Runner, shared with the MCP tool sync_hardware_software.
+    // REACH: this server process only. Sessions and sends are per process, so an agent attached to
+    // another replica has no session here and is not sent to. skipped_offline = candidates this
+    // process did not reach that are not too old: no live session here (disconnected, or attached
+    // to another server) or a send the live stream refused. A group or a named device lists its
+    // disconnected members too; __all__ and a scope expression list only this process's sessions
+    // plus the shared presence record, so a device offline everywhere is never counted. The counts
+    // describe what THIS server could reach, not the fleet.
+    // Audit BEFORE dispatch, fail closed. 202 means REQUESTED: `agents_reached` is sessions that
+    // accepted the frame, not devices that have synced.
+    static_assert(software_sync::kMaxIdLen == auth::kMaxAgentIdLength);
+    sink.Post("/api/v1/hardware/sync", [this](const httplib::Request& req, httplib::Response& res) {
+        namespace ss = software_sync;
+        constexpr const char* kAction = "inventory.sync.request";
+        detail::ensure_correlation_id(res);
+        if (!deps_.sync_perm_fn || !deps_.auth_fn || !deps_.sync_runner) {
+            // The derivation of "which devices may this caller sync" is this route's only
+            // per-device authorization, so a missing dependency is a server misconfiguration
+            // (500), not a transient outage, and it is audited. Nothing here may use the
+            // dependencies that are missing; the audit sink is optional (audit-off is legal).
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "failure", "Scope", "",
+                                            "sync fan-out unwired");
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "sync fan-out is not configured on this server"),
+                            "application/json");
+            return;
+        }
+        if (!deps_.sync_perm_fn(req, res, "Execution", "Execute")) return;
+        const auto session = deps_.auth_fn(req, res);
+        if (!session) return;
+        // After the permission gate (an unauthorised caller keeps its 403) and before anything
+        // is parsed, resolved, slotted, audited or sent.
+        if (deps_.write_gate.refuse_cross_site(deps_.audit_fn, req, res, "hardware.sync")) return;
+
+        const auto parsed = ss::parse_request(nlohmann::json::parse(req.body, nullptr, false));
+        if (!parsed) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "denied", "Scope", "",
+                                            "bad request: " + parsed.error());
+            res.status = 400;
+            res.set_content(detail::a4_error(res, parsed.error()), "application/json");
+            return;
+        }
+
+        // The audit sink for this request: refusals are best-effort rows, the pre-dispatch row
+        // is fail closed (`emit_behavioral_audit` also marks the response Sec-Audit-Failed).
+        ss::Audit audit;
+        audit.note = [&](std::string_view result, std::string_view type, const std::string& id,
+                         const std::string& detail_text) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, std::string(result),
+                                            std::string(type), id, detail_text);
+        };
+        audit.persist = [&](std::string_view result, std::string_view type, const std::string& id,
+                            const std::string& detail_text) {
+            return detail::emit_behavioral_audit(deps_.audit_fn, req, res, kAction, std::string(result),
+                                                 std::string(type), id, detail_text);
+        };
+        const auto out = deps_.sync_runner->run(*session, *parsed, audit);
+        if (out.status != ss::Status::Accepted) {
+            if (out.status == ss::Status::Cooldown)
+                res.set_header("Retry-After", std::to_string(*out.retry_after_ms / 1000));
+            res.status = out.http;
+            res.set_content(detail::a4_error(res, out.message, {.retry_after_ms = out.retry_after_ms}),
+                            "application/json");
+            return;
+        }
+        nlohmann::json body = {{"data", out.summary}, {"meta", {{"api_version", "v1"}}}};
+        res.status = 202;
+        res.set_content(body.dump(), "application/json");
+    });
+
     // -- REST v1: GET /api/v1/hardware --
     sink.Get("/api/v1/hardware", [this](const httplib::Request& req, httplib::Response& res) {
         detail::ensure_correlation_id(res);
@@ -551,7 +667,14 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const InventoryDevicesResult all = deps_.roster_fn();
         auto [scoped, omitted] = scoped_roster(all, gate.scope);
 
-        auto raw = query_from_request(req);
+        const auto raw_opt = query_from_request(req);
+        if (!raw_opt) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                            "application/json");
+            return;
+        }
+        auto raw = *raw_opt;
         auto normalised = normalise_hardware_query(raw);
         if (!normalised) {
             res.status = 400;
@@ -724,6 +847,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const std::optional<std::string> manifest =
                 deps_.manifest_fn ? deps_.manifest_fn(plugin.name) : std::nullopt;
             for (const auto& action : plugin.actions) {
+                // Hidden with the rest of the containment UI: a Run button on the quarantine
+                // plugin's own actions is a quarantine control. REST, MCP and the Instructions
+                // page are unchanged.
+                if (!deps_.containment_ui &&
+                    yuzu::protective::is_quarantine_control_plugin(plugin.name, action))
+                    continue;
                 HwActionRow row;
                 row.plugin = plugin.name;
                 row.action = action;

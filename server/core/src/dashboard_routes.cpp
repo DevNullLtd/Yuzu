@@ -1,4 +1,5 @@
 #include "dashboard_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
 #include "on_behalf_guard.hpp"              // sanitize_for_log
@@ -28,7 +29,7 @@
 #include "http_route_sink.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
-#include "response_query_params.hpp" // export_body_byte_cap (#4644 Gate 7, row 6a)
+#include "response_query_params.hpp" // export_body_byte_cap (#4644, row 6a)
 #include "response_store.hpp"
 #include "response_templates_engine.hpp"
 #include "visualization_engine.hpp"
@@ -82,11 +83,13 @@ static int64_t now_epoch() {
                std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// -- Helper: safe int from query param ----------------------------------------
-static int param_int(const httplib::Request& req, const char* name, int def) {
+// -- Helper: strict int from query param --------------------------------------
+// Absent => `def`. Present-but-malformed (trailing garbage, empty, overflow) => nullopt,
+// and the caller answers 400: a page size that silently became the default is a
+// different, valid-looking query (#4644).
+static std::optional<int> param_int(const httplib::Request& req, const char* name, int def) {
     if (!req.has_param(name)) return def;
-    try { return std::stoi(req.get_param_value(name)); }
-    catch (...) { return def; }
+    return yuzu::server::parse_query_int<int>(req.get_param_value(name));
 }
 
 // -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
@@ -319,8 +322,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 if (sort_col.empty()) sort_col = "agent";
                 if (sort_dir.empty()) sort_dir = "asc";
 
-                int page = clamp(param_int(req, "page", 1), 1, 100000);
-                int per_page = clamp(param_int(req, "per_page", 50), 10, 200);
+                const auto page_opt = param_int(req, "page", 1);
+                const auto per_page_opt = param_int(req, "per_page", 50);
+                if (!page_opt || !per_page_opt) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                    "application/json");
+                    return;
+                }
+                int page = clamp(*page_opt, 1, 100000);
+                int per_page = clamp(*per_page_opt, 10, 200);
 
                 auto filters = parse_filters(req, plugin);
                 bool filters_explicit = !filters.empty();
@@ -2366,7 +2377,7 @@ std::string DashboardRoutes::render_results(
     // sites below (tbody empty-state, #result-summary) so an operator sees "store
     // degraded, not zero matches" rather than a silently wrong "no results".
     bool store_degraded = false;
-    // #4644 Gate 7 (row 6a): set when the unfiltered read below was cut by the row or the
+    // #4644 (row 6a): set when the unfiltered read below was cut by the row or the
     // byte cap, so the render says "partial" instead of presenting a cut result as complete.
     bool result_truncated = false;
     if (filters.empty()) {
@@ -3097,7 +3108,7 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
     // "every collector is running normally" — the operator-facing claim this
     // view exists to make.
     //
-    // #4644 Gate 7 (row 6a): the read is byte-aware (ResponseStore::query_bounded applies the
+    // #4644 (row 6a): the read is byte-aware (ResponseStore::query_bounded applies the
     // 50 MiB payload cap in SQL), because a buggy or hostile agent can store many large
     // responses under one command_id. A cut is NOT silent: dropped rows would read as agents
     // that never answered, i.e. as "collecting normally", so `result_truncated_by_cap` is set
@@ -3307,7 +3318,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
     html += "</div>";
     if (scan.result_truncated_by_cap) {
         // A cut read drops whole responses, which reads as agents that never answered, i.e. as
-        // "collecting normally". Say the picture is partial (#4644 Gate 7, row 6a).
+        // "collecting normally". Say the picture is partial (#4644, row 6a).
         html += "<div class=\"result-degrade-banner\" data-result-truncated=\"true\">"
                 "<b>Partial result.</b> The scan's response read reached its "
                 "10,000-row / 50 MiB cap, so some agents' responses are missing "

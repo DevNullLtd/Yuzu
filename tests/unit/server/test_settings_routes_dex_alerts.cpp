@@ -228,6 +228,36 @@ TEST_CASE("cohort-export POST: non-admin → 403, nothing persisted",
     CHECK(h.apply_calls == 0);
 }
 
+// #4644: a present-but-malformed blast-radius threshold is a 400 with NOTHING saved and
+// no live apply. `stoi("0x10")` is 0 and `stoi("5abc")` is 5, so a typo used to persist a
+// different (clamped) threshold than the one typed. Valid integers keep the documented clamp.
+TEST_CASE("blast POST: a malformed threshold 400s and persists nothing and a valid one clamps",
+          "[pg][settings][dex][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_alerts_tpl);
+    DexAlertsHarness h(db.dsn());
+    for (const char* body : {"min_devices=5abc&window_seconds=300&cooldown_seconds=60",
+                             "min_devices=3&window_seconds=0x10&cooldown_seconds=60",
+                             "min_devices=3&window_seconds=300&cooldown_seconds=1e2",
+                             "min_devices=99999999999999999999"}) {
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/dex-alerts/blast", body,
+                               "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.apply_calls == 0);
+        CHECK(h.runtime_config->get_value("dex_blast_min_devices").empty());
+        CHECK(h.runtime_config->get_value("dex_blast_window_seconds").empty());
+        CHECK(h.runtime_config->get_value("dex_blast_cooldown_seconds").empty());
+    }
+    auto ok = h.sink.Post("/api/settings/dex-alerts/blast",
+                          "min_devices=1&window_seconds=300&cooldown_seconds=60",
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.runtime_config->get_value("dex_blast_min_devices") == "2"); // clamped up to the floor
+    CHECK(h.apply_calls == 1);
+}
+
 // ── N2: GET /fragments/dex/alerts (the DEX page's Alerts tab) ─────────────────
 
 namespace {

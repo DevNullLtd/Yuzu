@@ -464,6 +464,9 @@ std::expected<void, std::string>
 GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
     if (!open_)
         return std::unexpected("database not open");
+    if (!rule_version_in_range(row.version))
+        return std::unexpected("rule version out of range (1.." + std::to_string(kMaxRuleVersion) +
+                               ")");
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected("no database connection: " + pool_.last_error());
@@ -508,6 +511,12 @@ std::expected<void, std::string>
 GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
     if (!open_)
         return std::unexpected("database not open");
+    // The range is enforced on a version CHANGE only. A row stored before the bound existed (or
+    // written out of band) may carry an out-of-range version, and `apply_guard_change`
+    // rewrites it UNCHANGED when an operator disables the rule: refusing that would leave the
+    // rule impossible to disable. The `AND (version = $3 OR $3 in range)` predicate below does
+    // the comparison atomically with the write; an in-range incoming version (the common case)
+    // costs nothing extra.
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected("no database connection: " + pool_.last_error());
@@ -519,14 +528,16 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
         "name = $1, yaml_source = $2, version = $3::bigint, enabled = $4::boolean, "
         "enforcement_mode = $5, severity = $6, os_target = $7, scope_expr = $8, "
         "signature = decode($9,'hex'), updated_at = $10, updated_by = $11, spec_json = $12, "
-        "prerequisites = $13 WHERE rule_id = $14 RETURNING rule_id",
+        "prerequisites = $13 WHERE rule_id = $14 "
+        "AND (version = $3::bigint OR $3::bigint BETWEEN 1 AND $15::bigint) RETURNING rule_id",
         std::vector<std::optional<std::string>>{
             row.name, row.yaml_source, std::to_string(row.version),
             std::string(row.enabled ? "true" : "false"), row.enforcement_mode, row.severity,
             row.os_target, row.scope_expr,
             row.signature.empty() ? std::nullopt
                                   : std::optional<std::string>(bytes_to_hex(row.signature)),
-            row.updated_at, row.updated_by, row.spec_json, row.prerequisites, row.rule_id});
+            row.updated_at, row.updated_by, row.spec_json, row.prerequisites, row.rule_id,
+            std::to_string(kMaxRuleVersion)});
     if (res.status() != PGRES_TUPLES_OK) {
         const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
         const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
@@ -534,8 +545,24 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
             return std::unexpected(format_conflict("rule name '" + row.name + "' already exists"));
         return std::unexpected("update failed: " + std::string(PQresultErrorMessage(res.get())));
     }
-    if (PQntuples(res.get()) == 0)
+    if (PQntuples(res.get()) == 0) {
+        // Zero rows is either "no such rule" or "the version predicate refused the change".
+        if (!rule_version_in_range(row.version)) {
+            pg::PgResult exists = pg::exec_params(
+                conn,
+                "SELECT 1 FROM guaranteed_state_store.guaranteed_state_rules WHERE rule_id = $1",
+                std::vector<std::string>{row.rule_id});
+            // A failed probe is a store error, not "no such rule": reporting not-found would
+            // answer an operator 404 for a rule that exists.
+            if (exists.status() != PGRES_TUPLES_OK)
+                return std::unexpected("update failed: " +
+                                       std::string(PQresultErrorMessage(exists.get())));
+            if (PQntuples(exists.get()) > 0)
+                return std::unexpected("rule version out of range (1.." +
+                                       std::to_string(kMaxRuleVersion) + ")");
+        }
         return std::unexpected("not found: rule_id '" + row.rule_id + "'");
+    }
     bump_policy_generation_on(conn); // rule set changed → new generation
     return {};
 }

@@ -957,6 +957,98 @@ TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
     CHECK(h.audit_log[1].result == "denied");
 }
 
+TEST_CASE("REST gs.rules: create bounds version to 1..2147483647 with a denied audit",
+          "[pg][rest][guaranteed_state][create]") {
+    RestGsHarness h;
+    int n = 0;
+    // The last group is the #4644 strict-read probes: a float (5.5 was truncated to 5, 1e3 to
+    // 1000), a string, bool, null or array threw out of `body.value` (a bare 500), and a value
+    // above INT64_MAX wrapped.
+    for (const char* bad : {"0", "-1", "2147483648", "9223372036854775807", "4294967297",
+                            "9223372036854775808", "18446744073709551615", "5.5", "1e3", "\"7\"",
+                            "\"\"", "null", "true", "[]"}) {
+        INFO("version=" << bad);
+        auto body = nlohmann::json::parse(
+            RestGsHarness::make_rule_body("r-v" + std::to_string(++n), "name-v" + std::to_string(n)));
+        body["version"] = nlohmann::json::parse(bad);
+        auto res = h.sink.Post("/api/v1/guaranteed-state/rules", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("1 to 2147483647") != std::string::npos);
+        REQUIRE_FALSE(h.audit_log.empty());
+        CHECK(h.audit_log.back().action == "guaranteed_state.rule.create");
+        CHECK(h.audit_log.back().result == "denied");
+        CHECK(h.audit_log.back().detail == "version out of range"); // the documented SIEM string
+    }
+    CHECK(h.store->rule_count() == 0);
+
+    auto ok = nlohmann::json::parse(RestGsHarness::make_rule_body("r-edge", "name-edge"));
+    ok["version"] = 2147483647;
+    auto res = h.sink.Post("/api/v1/guaranteed-state/rules", ok.dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+}
+
+// The denied rows are written BEFORE is_valid_rule_id runs, so a hostile rule_id (CR/LF, space)
+// must be neutralised by audit_token before it becomes the audit target (CWE-117 log forging).
+TEST_CASE("REST gs.rules: create denied audit rows neutralise a hostile rule_id",
+          "[pg][rest][guaranteed_state][create][audit]") {
+    RestGsHarness h;
+    const std::string hostile = "evil\r\nforged=1 x";
+    for (const char* mode : {"version", "enforcement_mode"}) {
+        INFO(mode);
+        auto body = nlohmann::json::parse(RestGsHarness::make_rule_body("r-h", "name-h"));
+        body["rule_id"] = hostile;
+        if (std::string(mode) == "version")
+            body["version"] = 0;
+        else
+            body["enforcement_mode"] = "bogus";
+        auto res = h.sink.Post("/api/v1/guaranteed-state/rules", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE_FALSE(h.audit_log.empty());
+        const auto& row = h.audit_log.back();
+        CHECK(row.result == "denied");
+        CHECK(row.target_id == "evil__forged_1_x");
+        CHECK(row.target_id.find_first_of("\r\n =") == std::string::npos);
+    }
+}
+
+// An update bumps the version by one. A row at (or past) the bound could only be stored
+// before the bound existed, so the test writes it directly and expects a clean 409 instead
+// of the signed-overflow increment.
+TEST_CASE("REST gs.rules: update refuses an exhausted version counter with 409",
+          "[pg][rest][guaranteed_state][update]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-x", "rule-x"))
+                ->status == 201);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto r = yuzu::server::pg::exec_params(
+            conn.get(),
+            "UPDATE guaranteed_state_store.guaranteed_state_rules SET version = "
+            "9223372036854775807 WHERE rule_id = 'r-x'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    nlohmann::json patch;
+    patch["severity"] = "critical";
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-x", patch.dump());
+    REQUIRE(upd);
+    CHECK(upd->status == 409);
+    CHECK(upd->body.find("counter exhausted") != std::string::npos);
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "guaranteed_state.rule.update");
+    CHECK(h.audit_log.back().result == "denied");
+    auto stored = h.store->get_rule("r-x");
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->has_value());
+    CHECK((*stored)->severity != "critical"); // the refused update wrote nothing
+}
+
 TEST_CASE("REST gs.rules: list, get, update, delete round-trip", "[pg][rest][guaranteed_state][crud]") {
     RestGsHarness h;
     REQUIRE(h.sink
@@ -1168,6 +1260,27 @@ TEST_CASE("REST gs.events: invalid limit → 400", "[pg][rest][guaranteed_state]
     auto res = h.sink.Get("/api/v1/guaranteed-state/events?limit=-7");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+// from_chars alone accepted `10abc` as 10 (the handler checked `ec` but never the end pointer).
+TEST_CASE("REST gs.events: a trailing-garbage limit or offset is a 400 not its prefix (#4644)",
+          "[pg][rest][guaranteed_state][events][validation][numeric_params]") {
+    RestGsHarness h;
+    for (const char* q : {"limit=10abc", "limit=1e1", "limit=0x10", "limit=", "offset=5x",
+                          "offset=", "offset=1.5"}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/v1/guaranteed-state/events?") + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    // A rejected request serves no device data, so it must leave no dex.device.view access row.
+    CHECK(h.audit_log.empty());
+
+    // Control: the same route with a clean limit/offset is a 200, so the 400s above are the
+    // value's doing and not a broken route.
+    auto ok = h.sink.Get("/api/v1/guaranteed-state/events?limit=10&offset=0");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }
 
 // ── SEC-3 regression coverage: agent_id present → scoped_perm_fn, agent_id
@@ -3773,6 +3886,21 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
         REQUIRE(res);
         CHECK(res->status == 400);
     }
+    SECTION("#4644: a malformed window → 400, not the 7-day default") {
+        RestGsHarness h;
+        for (const char* bad : {"window=7days", "window=1e1", "window=0x7", "window=", "window=abc",
+                                "window=4294967296"}) {
+            INFO(bad);
+            auto res = h.sink.Get(std::string("/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1"
+                                              "&baseline=4.2.0.0&candidate=4.3.0.0&") + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        auto ok = h.sink.Get("/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1"
+                             "&baseline=4.2.0.0&candidate=4.3.0.0&window=30");
+        REQUIRE(ok);
+        CHECK(ok->status != 400);
+    }
     SECTION("provider absent → 503") {
         RestGsHarness h(true, true, /*wire_app_perf=*/false);
         auto res = h.sink.Get(
@@ -4290,6 +4418,19 @@ TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[pg][rest][dex][sig
                           h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 400);
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex.signals/{type}: a trailing-garbage limit is a 400 not its prefix (#4644)",
+          "[pg][rest][dex][signals][numeric_params]") {
+    RestGsHarness h;
+    for (const char* q : {"limit=10abc", "limit=1e1", "limit=0x10", "limit="}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/v1/dex/signals/process.crashed?") + q,
+                              h.status_route_headers());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
     CHECK(h.audit_log.empty());
 }
 
@@ -5468,4 +5609,36 @@ TEST_CASE("REST gs.events (seam-bypass tripwire): answers via GuardianApi, not t
     REQUIRE(j["data"].is_array());
     REQUIRE(j["data"].size() == 1);
     CHECK(j["data"][0]["event_id"] == "seam-event");
+}
+
+// #4644: `window` on dex/signals, dex/scope and dex/signals/{obs_type} was passed raw to a
+// resolver that maps anything unknown to 7d, so `window=90d` or `window=30` answered with 7 days
+// of data under a label the caller never chose. The eleven sibling routes already 400 it, an empty
+// `?window=` included: only an ABSENT window keeps the 7d default.
+TEST_CASE("REST dex/signals, dex/scope and dex/signals/{obs_type}: a window outside "
+          "24h|7d|30d|all, an empty one included, is a 400; an absent one keeps the 7d default "
+          "(#4644)",
+          "[pg][rest][dex][signals][numeric_params]") {
+    RestGsHarness h;
+    h.seed_obs("w1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+
+    for (const char* base : {"/api/v1/dex/signals", "/api/v1/dex/scope",
+                             "/api/v1/dex/signals/process.crashed"}) {
+        for (const char* bad : {"", "90d", "7D", "30", "1y", "junk", "4294967297", "-1", "5.5",
+                                "24h%20", "7d%0A"}) {
+            const std::string url = std::string(base) + "?window=" + bad;
+            INFO(url);
+            auto res = h.sink.Get(url);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.find("invalid window") != std::string::npos);
+        }
+        for (const char* ok : {"", "?window=24h", "?window=7d", "?window=30d", "?window=all"}) {
+            const std::string url = std::string(base) + ok;
+            INFO(url);
+            auto res = h.sink.Get(url);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+        }
+    }
 }

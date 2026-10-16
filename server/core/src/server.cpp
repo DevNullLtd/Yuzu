@@ -209,6 +209,7 @@
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -711,9 +712,10 @@ public:
                           "counter");
         // Pre-seed the closed principal_class dimension (docs/observability-
         // conventions.md — every value of a closed-set label is initialised at
-        // startup, matching yuzu_onbehalf_rejected_total below). method/status
-        // are NOT closed sets, so a single representative GET/200 point per
-        // class is the seed — not a cross-product, which would be unbounded.
+        // startup, matching yuzu_onbehalf_rejected_total below). method is
+        // bounded by http_method_label (accepted methods + UNKNOWN) but, like
+        // status, is not pre-seeded as a cross-product with it, so a single
+        // representative GET/200 point per class is the seed.
         // "engine" is now included (PR 4.5 — principal_class_resolved makes it
         // live, emitted for a resolved engine-principal session): the closed
         // set is human/agent/none/engine and every value gets its 0-point.
@@ -10299,13 +10301,12 @@ public:
 
         // cert_reloader_/redirect_server_/web_server_ were already stopped
         // early, above (#2703 Gate 7 item 2) — just the joins remain here.
-        // redirect_thread_ gets a bare join: the redirect server serves only
-        // 301s, never a held-open response, so unlike web_thread_ it has no
-        // plausible hang scenario and does not need the bounded treatment
-        // below.
-        if (redirect_thread_.joinable()) {
-            redirect_thread_.join();
-        }
+        // redirect_thread_ is NOT given a bare join (#5906): its handlers do no I/O, but
+        // httplib has only per-recv socket timeouts and ThreadPool::shutdown() joins every
+        // worker, so one peer trickling header bytes holds a worker, and so listen()'s return,
+        // for as long as it keeps trickling; and Server::stop() is a no-op before listen_internal
+        // sets is_running_, so a SIGTERM racing startup leaves listen() running with nothing to
+        // stop it. It shares the bounded wait below with web_thread_.
 
         // #2703 Gate 7 merge-slice item 2 (operator-adjudicated: 15s
         // shutdown grace bound). std::thread has no timed join, so
@@ -10333,34 +10334,56 @@ public:
         // by the write timeout rather than the tick — the close-signals above
         // wake a WAITING pump, not one already mid-write) or a genuinely
         // wedged handler unrelated to any stream.
-        if (web_thread_.joinable()) {
+        if (web_thread_.joinable() || redirect_thread_.joinable()) {
             // #3007 governance (sre, unhappy-path UP-7/UP-8): stop() now runs off the
             // signal handler, so this wait is silent-by-design up to 15s with no
             // progress evidence — indistinguishable from a genuine wedge to an operator
             // watching logs. One line here costs nothing and closes that gap.
-            spdlog::info("Shutting down server: waiting up to 15s for the web listener "
-                         "thread to finish...");
+            spdlog::info("Shutting down server: waiting up to 15s for the listener thread(s) "
+                         "to finish...");
             std::unique_lock<std::mutex> lk(web_thread_done_mtx_);
+            // One 15s bound covers both listeners. A listener thread that was never started
+            // (not joinable) counts as done.
             const bool finished = web_thread_done_cv_.wait_for(
-                lk, std::chrono::seconds(15), [this] { return web_thread_done_; });
+                lk, std::chrono::seconds(15), [this] {
+                    return (web_thread_done_ || !web_thread_.joinable()) &&
+                           (redirect_thread_done_ || !redirect_thread_.joinable());
+                });
+            const bool web_wedged = web_thread_.joinable() && !web_thread_done_;
+            const bool redirect_wedged = redirect_thread_.joinable() && !redirect_thread_done_;
             lk.unlock();
             if (finished) {
-                web_thread_.join();
+                if (web_thread_.joinable())
+                    web_thread_.join();
+                if (redirect_thread_.joinable())
+                    redirect_thread_.join();
             } else {
                 // #3007: stop() now runs on an ordinary thread (main.cpp's shutdown
                 // watcher / a Windows console-handler thread), never inside a real OS
                 // signal handler, so spdlog would be legal here. The raw write() stays
                 // anyway: std::_Exit() below skips atexit handling and any buffered
-                // spdlog sink flush, so a log call here could be silently lost — this
-                // write() is guaranteed to reach stderr before the process ends.
-                const char msg[] =
-                    "ServerImpl::stop: web thread did not finish within the 15s shutdown "
-                    "grace bound (#2703 Gate 7 item 2) - force-exiting.\n";
+                // spdlog sink flush, so a log call here could be silently lost — these
+                // write()s are guaranteed to reach stderr before the process ends. Three
+                // raw writes of static pieces, no heap: stop() is noexcept, so an
+                // allocation failure here would terminate before the _Exit.
+                const char* const who = web_wedged ? (redirect_wedged
+                                                          ? "web and redirect listener threads"
+                                                          : "web listener thread")
+                                                   : "redirect listener thread";
+                static constexpr char kPrefix[] = "ServerImpl::stop: ";
+                static constexpr char kSuffix[] =
+                    " did not finish within the 15s shutdown grace bound"
+                    " (#2703 Gate 7 item 2, #5906) - force-exiting.\n";
+                const auto emit = [](const char* s) {
 #ifdef _WIN32
-                _write(2, msg, sizeof(msg) - 1);
+                    _write(2, s, static_cast<unsigned>(std::strlen(s)));
 #else
-                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+                    (void)::write(STDERR_FILENO, s, std::strlen(s));
 #endif
+                };
+                emit(kPrefix);
+                emit(who);
+                emit(kSuffix);
                 std::_Exit(1);
             }
         }
@@ -12369,6 +12392,169 @@ private:
                       {"result", ok ? "sent" : "undelivered"}})
             .increment();
         return ok;
+    }
+
+    [[nodiscard]] static std::string mint_sync_now_command_id() {
+        const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        return "__sync__-now-" + std::to_string(now_s) + "-" +
+               auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+    }
+
+    [[nodiscard]] auto build_sync_now_command(const std::string& command_id, const std::string& source) {
+        return build_classified_command(yuzu::server::DispatchCaller{.system = true}, "__sync__", "now",
+                                        command_id, /*parameters=*/{{"source", source}});
+    }
+
+    /// Sync-on-demand (`__sync__.now {source}`): a system-reserved push to each id under ONE
+    /// command id and ONE gateway flush (the TAR fleet_snapshot shape). This is the
+    /// Guardian-push path (build_classified_command(system) + send_system_reserved +
+    /// forward_gateway_pending) - NOT dispatch_confined, which would withhold `__sync__` as a
+    /// plugin no agent advertises (#3511). Authorization and targeting belong to the caller:
+    /// the per-device sync route gates (scoped Execution:Execute) before it gets here; the fleet
+    /// fan-out uses `push_sync_now_confined`, whose reach the confined-dispatch seam decides. The
+    /// agent ignores stagger for this action, so the caller bounds the herd. `sent`
+    /// counts sessions that accepted the frame; a command that cannot be classified sends
+    /// nothing and returns the empty result (no command id).
+    [[nodiscard]] yuzu::server::software_sync::DispatchResult
+    push_sync_now(const std::vector<std::string>& ids, const std::string& source) {
+        auto out = yuzu::server::software_sync::fan_out(
+            ids, [] { return mint_sync_now_command_id(); },
+            [&](const std::string& command_id) { return build_sync_now_command(command_id, source); },
+            [&](const std::string& id, const detail::ClassifiedCommand& cmd) {
+                return send_system_reserved(id, cmd,
+                                            yuzu::server::SystemReservedPush::inventory_sync_now);
+            });
+        if (out.sent > 0)
+            forward_gateway_pending(); // gateway agents are only QUEUED
+        return out;
+    }
+
+    /// Selector -> the caller's candidate ids for a "Sync now" fleet run. Only the store reads live
+    /// here; the confinement and every fail-closed branch are software_sync::resolve_targets.
+    [[nodiscard]] yuzu::server::software_sync::Resolved
+    software_sync_resolve(const auth::Session& sess, const yuzu::server::software_sync::Selector& sel) {
+        namespace software_sync = yuzu::server::software_sync;
+        software_sync::Expansion ex;
+        ex.all_ids = [this] { return registry_.all_ids(); };
+        ex.group_members =
+            [this](const std::string& group_id)
+            -> std::optional<std::vector<std::string>> {
+            if (!mgmt_group_store_)
+                return std::nullopt;
+            const auto members = mgmt_group_store_->get_members_checked(group_id);
+            if (!members)
+                return std::nullopt;
+            std::vector<std::string> ids;
+            ids.reserve(members->size());
+            for (const auto& m : *members)
+                ids.push_back(m.agent_id);
+            return ids;
+        };
+        ex.scope_matches =
+            [this, &sess](const std::string& expression)
+            -> software_sync::ScopeExpansion {
+            // The same ladder a real dispatch uses (alias -> owner
+            // check -> parse -> registry evaluation, fail closed).
+            const std::string role = auth::role_to_string(sess.role);
+            const std::string ref_id =
+                "__sync__-scope-" + auth::AuthManager::bytes_to_hex(
+                                        auth::AuthManager::random_bytes(8));
+            yuzu::server::ScopeLadderAudit audit;
+            audit.resolution_failed = [&](const std::string& ref) {
+                audit_scope_resolution_failed(sess.username, role, ref_id, ref);
+            };
+            audit.evaluation_aborted = [&](const std::string& reason) {
+                audit_scope_evaluation_aborted(sess.username, role, ref_id,
+                                               reason);
+            };
+            auto ladder = yuzu::server::resolve_scope_targets(
+                expression, sess.username, result_set_store_.get(),
+                [&](const yuzu::scope::Expression& parsed) {
+                    return registry_.evaluate_scope(
+                        parsed, tag_store_.get(),
+                        custom_properties_store_.get(),
+                        result_set_store_.get(), sess.username);
+                },
+                audit);
+            software_sync::ScopeExpansion out;
+            out.parse_error = std::move(ladder.parse_error);
+            out.matched = std::move(ladder.matched);
+            if (!out.matched && !out.parse_error)
+                out.abort_detail = ladder.abort_reason
+                                       ? to_string(*ladder.abort_reason)
+                                       : "unknown";
+            return out;
+        };
+        return software_sync::resolve_targets(sel, derive_exec_visible(sess),
+                                               ex);
+    }
+
+    /// The ONE fleet-run instance, shared by `POST /api/v1/hardware/sync` and the MCP tool
+    /// `sync_hardware_software`, so the per-operator cooldown and the single in-flight slot bind
+    /// both surfaces. Built on first use (all members it reads exist by then).
+    [[nodiscard]] std::shared_ptr<yuzu::server::software_sync::Runner> software_sync_runner() {
+        if (!sync_runner_) {
+            yuzu::server::software_sync::Env env;
+            env.resolve = [this](const auth::Session& sess,
+                                 const yuzu::server::software_sync::Selector& sel) {
+                return software_sync_resolve(sess, sel);
+            };
+            env.dispatch = [this](const auth::Session& sess, const std::vector<std::string>& ids) {
+                return push_sync_now_confined(
+                    sess, ids, std::string(yuzu::server::software_sync::kSource));
+            };
+            env.caller_unfiltered = [this](const auth::Session& sess) {
+                return !derive_exec_visible(sess).has_value();
+            };
+            env.agent_version = [this](const std::string& id) -> std::optional<std::string> {
+                auto sess = registry_.get_session(id);
+                if (!sess)
+                    return std::nullopt;
+                return sess->agent_version;
+            };
+            env.on_takeover_refused = [] {
+                spdlog::warn("software sync: a takeover was refused because the maximum number of "
+                             "stalled runs are still alive; sync stays unavailable until one of their "
+                             "sends unwinds (a stalled agent stream) or the server restarts");
+            };
+            env.on_takeover = [] {
+                spdlog::warn("software sync: a run took over a lapsed in-flight lease; the previous "
+                             "holder is still sending (a stalled agent stream)");
+            };
+            sync_runner_ = std::make_shared<yuzu::server::software_sync::Runner>(std::move(env));
+        }
+        return sync_runner_;
+    }
+
+    /// The fleet-wide sync fan-out: the same push as `push_sync_now`, but WHO IS REACHED is
+    /// decided by `dispatch_confined_arms` (the system-reserved fan-out arm), not by the
+    /// resolver that produced `ids`. The id list is intersected with the caller's own
+    /// Execution:Execute visible set at send time, so a hidden device is never sent to even if the
+    /// list reached this point carrying it. One command id, one gateway flush, like the
+    /// per-device path.
+    [[nodiscard]] yuzu::server::software_sync::DispatchResult
+    push_sync_now_confined(const auth::Session& sess, const std::vector<std::string>& ids,
+                           const std::string& source) {
+        yuzu::server::software_sync::DispatchResult out;
+        if (ids.empty())
+            return out;
+        const std::string command_id = mint_sync_now_command_id();
+        auto cmd = build_sync_now_command(command_id, source);
+        if (!cmd)
+            return out; // a command that cannot be classified sends nothing and reports no id
+        out.command_id = command_id;
+        const auto result = yuzu::server::dispatch_system_reserved_ids(
+            ids, derive_exec_visible(sess),
+            [this, &cmd](const std::string& id) {
+                return send_system_reserved(id, *cmd,
+                                            yuzu::server::SystemReservedPush::inventory_sync_now);
+            });
+        out.sent = static_cast<std::size_t>(result.sent);
+        if (out.sent > 0)
+            forward_gateway_pending(); // gateway agents are only QUEUED
+        return out;
     }
 
     /// #3687: the `has_permission` binder `classify_and_authorize_dispatch`
@@ -14746,7 +14932,9 @@ private:
             // monitoring integrations behind a NAT or sharing a source-IP
             // bucket with authed REST traffic cannot 429-starve the health
             // probe. The endpoints themselves are strictly read-only and
-            // documented as unauthenticated. This IS the probes' only gate:
+            // documented as unauthenticated. This is the probes' only gate
+            // on the HTTPS listener (the plaintext redirect listener admits
+            // no body at all: is_plaintext_probe_request, health_routes.hpp):
             // the cap check runs here, unconditionally, before the
             // Unhandled return, precisely because everything past this
             // point (on-behalf-of, rate limiting) is skipped for these four
@@ -14761,8 +14949,7 @@ private:
             // identity-bearing action, nothing consumes the header on this
             // path, and a bricked orchestrator hides the misconfiguration the
             // guard exists to surface. Every other path rejects below.
-            if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
-                req.path == "/api/health") {
+            if (yuzu::server::health::is_probe_path(req.path)) {
                 if (enforce_pre_auth_body_cap())
                     return httplib::Server::HandlerResponse::Handled;
                 return httplib::Server::HandlerResponse::Unhandled;
@@ -15181,8 +15368,32 @@ private:
                      security_headers.csp.size(), security_headers.https_enabled ? "on" : "off",
                      security_headers.referrer_policy, security_headers.permissions_policy.size());
         spdlog::debug("Resolved Content-Security-Policy: {}", security_headers.csp);
-        web_server_->set_post_routing_handler([this, security_headers](const httplib::Request& req,
-                                                                       httplib::Response& res) {
+        // The ONE spelling of the request counter and its label set (an observability contract):
+        // the main post-routing handler below calls it, and the plain-HTTP redirect listener is
+        // handed the same callable, so a label change reaches both listeners' series (#5906).
+        // The method is normalised through http_method_label: httplib counts requests it rejects
+        // (400) with the raw request-line token, which an unauthenticated peer on the plain port
+        // controls, so the raw value would mint an unbounded series set (#5906, adversarial
+        // review round 3).
+        //
+        // principal_class: bounded actor class (ADR-1005, execution-plan
+        // PR 1.2) — human / agent / none / engine. "engine" is live as of
+        // PR 4.5: principal_class_resolved reads the stash set by the
+        // pre-routing chokepoint from the RESOLVED session, falling back
+        // to presentation-based principal_class_of otherwise. See
+        // principal_class.hpp for the full hybrid-basis contract.
+        auto count_http_request = [this](const httplib::Request& req,
+                                         const httplib::Response& res) {
+            metrics_
+                .counter("yuzu_http_requests_total",
+                         {{"method", std::string(http_method_label(req.method))},
+                          {"status", std::to_string(res.status)},
+                          {"principal_class", std::string(principal_class_resolved(req))}})
+                .increment();
+        };
+        web_server_->set_post_routing_handler([this, security_headers, count_http_request](
+                                                  const httplib::Request& req,
+                                                  httplib::Response& res) {
             // principal_class metric (PR 4.5) — clear the engine-class stash on EVERY
             // exit from this handler, via a guard whose destructor runs AFTER the
             // metric emission below (never clears before the read — cf. the reset
@@ -15238,23 +15449,44 @@ private:
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 
-            // principal_class: bounded actor class (ADR-1005, execution-plan
-            // PR 1.2) — human / agent / none / engine. "engine" is live as of
-            // PR 4.5: principal_class_resolved reads the stash set by the
-            // pre-routing chokepoint from the RESOLVED session, falling back
-            // to presentation-based principal_class_of otherwise. See
-            // principal_class.hpp for the full hybrid-basis contract.
-            metrics_
-                .counter("yuzu_http_requests_total",
-                         {{"method", req.method},
-                          {"status", std::to_string(res.status)},
-                          {"principal_class", std::string(principal_class_resolved(req))}})
-                .increment();
+            count_http_request(req, res);
         });
 
         // -- Extracted route modules ------------------------------------------------
         // Common callback lambdas shared by all extracted route modules.
         HttplibRouteSink inline_sink{*web_server_};
+        // #5906: the HTTP->HTTPS redirect listener is built here, not at listen
+        // time, so register_health_routes can put the four health probes on it.
+        // Its pre-routing handler 301s everything except those probes.
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        if (cfg_.https_enabled && cfg_.https_redirect) {
+            redirect_server_ = std::make_unique<httplib::Server>();
+            // Eager fixed pool, as web_server_ (rationale at its pool: the default dynamic pool
+            // spawns on the accept loop with no handler). Size = httplib's default maximum
+            // (4 x max(8, hw-1), hw = logical CPUs) capped at 64: this port serves 301s and four
+            // probes, so the host's CPU count must not scale it outside kMaxHttpWorkerThreads and
+            // the --http-worker-threads TasksMax guidance. Up to 17 logical CPUs it never binds
+            // (36 at 10); above that the pool is 64 threads, created at boot and resident for
+            // the life of the process. It is not slow-connection resistance: no pool size is
+            // (stop() bounds that wait instead).
+            const std::size_t redirect_pool =
+                std::min<std::size_t>(CPPHTTPLIB_THREAD_POOL_MAX_COUNT, 64);
+            redirect_server_->new_task_queue = [redirect_pool] {
+                return new httplib::ThreadPool(redirect_pool, redirect_pool);
+            };
+            yuzu::server::health::install_plaintext_redirect_pre_routing(
+                *redirect_server_, cfg_.web_address, cfg_.https_port);
+            // Five security headers (no HSTS) + the shared request counter, per
+            // install_plaintext_post_routing's contract; principal_class_resolved reduces to the
+            // presentation class on these workers (no engine-class stash is written here).
+            yuzu::server::health::install_plaintext_post_routing(
+                *redirect_server_,
+                security::HeaderBundle::make(cfg_.csp_extra_sources, /*https_enabled=*/false),
+                count_http_request);
+        }
+#endif
+        if (redirect_server_)
+            redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_);
         auto auth_fn = [this](const httplib::Request& req,
                               httplib::Response& res) -> std::optional<auth::Session> {
             return require_auth(req, res);
@@ -15694,6 +15926,14 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .fleet_read_fn = draw_fleet_read_fn, // HM-2 /fragments/dashboard/health (draw-time)
+                             // #5906: is_running() is set after a successful bind (httplib.h:11268)
+                             // and cleared on return (11269), so a failed bind, pre-accept
+                             // startup and a completed shutdown all read "not serving". No finer
+                             // signal in httplib 0.37.1; web_thread_done_ is set only after the
+                             // drain (caveat: AUTH POSTURE banner, health_routes.hpp).
+                             .plaintext_probe_sink = redirect_sink_.get(),
+                             .main_listener_serving_fn =
+                                 [this] { return web_server_ && web_server_->is_running(); },
                              .cfg = &cfg_,
                              .metrics = &metrics_,
                              .registry = &registry_,
@@ -18494,32 +18734,13 @@ private:
                                          return std::nullopt;
                                      return doc->json;
                                  },
-                             // Sync-on-demand: system-reserved push, the Guardian-push path
-                             // (build_classified_command(system) + send_system_reserved +
-                             // forward_gateway_pending) — NOT dispatch_confined, which would
-                             // withhold `__sync__` as a plugin no agent advertises (#3511).
+                             // Sync-on-demand for ONE device: push_sync_now (the Guardian-push
+                             // path, NOT dispatch_confined - #3511).
                              .sync_dispatch_fn =
                                  [this](const std::string& id, const std::string& source)
                                      -> HardwareRoutes::HwSyncDispatchResult {
-                                     const auto now_s =
-                                         std::chrono::duration_cast<std::chrono::seconds>(
-                                             std::chrono::system_clock::now().time_since_epoch())
-                                             .count();
-                                     const auto command_id =
-                                         "__sync__-now-" + std::to_string(now_s) + "-" +
-                                         auth::AuthManager::bytes_to_hex(
-                                             auth::AuthManager::random_bytes(8));
-                                     auto classified = build_classified_command(
-                                         yuzu::server::DispatchCaller{.system = true}, "__sync__",
-                                         "now", command_id, /*parameters=*/{{"source", source}});
-                                     if (!classified)
-                                         return {};
-                                     const bool ok = send_system_reserved(
-                                         id, *classified,
-                                         yuzu::server::SystemReservedPush::inventory_sync_now);
-                                     if (ok)
-                                         forward_gateway_pending(); // gateway agents are only QUEUED
-                                     return {ok, command_id};
+                                     const auto r = push_sync_now({id}, source);
+                                     return {r.sent > 0, r.command_id};
                                  },
                              .agent_version_fn =
                                  [this](const std::string& id) -> std::optional<std::string> {
@@ -18549,6 +18770,12 @@ private:
                                          return std::nullopt;
                                      return quarantine_store_->list_quarantined_in(ids, limit);
                                  },
+                             // POST /api/v1/hardware/sync (Software "Sync now" for a scope).
+                             // Type-level Execution:Execute; the targets are then resolved
+                             // against the caller's OWN Execution:Execute visible set.
+                             .sync_perm_fn = perm_fn,
+                             .sync_runner = software_sync_runner(),
+                             .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
                          });
 
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
@@ -20851,6 +21078,7 @@ private:
             // the IDENTICAL scope-to-agents dispatch — they cannot drift on what
             // gets pushed or to whom.
             mcp_server_->set_guardian_push_fn(guardian_push_fn_);
+            mcp_server_->set_software_sync_runner(software_sync_runner());
             // #2146 Batch B1 — the SAME BaselineStore GET
             // /guaranteed-state/device-compliance already reads, backing MCP
             // get_guardian_device_compliance's identical baseline lookup.
@@ -21248,45 +21476,30 @@ private:
         if (cfg_.https_enabled) {
             listen_port = cfg_.https_port;
 
-            // Start HTTP→HTTPS redirect server
-            // No on_behalf_guard here (ADR-1005): this instance routes nothing —
-            // every request gets a 301 and the re-request hits the guarded main
-            // listener, so this is not a bypass of the pre-routing chokepoint.
-            if (cfg_.https_redirect) {
-                redirect_server_ = std::make_unique<httplib::Server>();
-                auto https_port = cfg_.https_port;
-                auto web_address = cfg_.web_address;
-                redirect_server_->set_pre_routing_handler(
-                    [web_address,
-                     https_port](const httplib::Request& req,
-                                 httplib::Response& res) -> httplib::Server::HandlerResponse {
-                        auto host = req.get_header_value("Host");
-                        // Strip port from host if present
-                        auto colon = host.find(':');
-                        if (colon != std::string::npos) {
-                            host = host.substr(0, colon);
-                        }
-                        if (host.empty())
-                            host = web_address;
-                        auto location =
-                            "https://" + host + ":" + std::to_string(https_port) + req.path;
-                        if (!req.params.empty()) {
-                            location += "?";
-                            bool first = true;
-                            for (const auto& [k, v] : req.params) {
-                                if (!first)
-                                    location += "&";
-                                location += k + "=" + v;
-                                first = false;
-                            }
-                        }
-                        res.set_redirect(location, 301);
-                        return httplib::Server::HandlerResponse::Handled;
-                    });
+            // Start HTTP→HTTPS redirect server (built, and given its four health
+            // probe routes, earlier in this function).
+            // No on_behalf_guard here (ADR-1005): this instance routes ONLY the four
+            // health-probe paths — the recorded ADR-1005 exception (ledger entry
+            // 2026-07-07, amended 2026-10-15), with session resolution bound to none —
+            // and every other request 301s to the guarded main listener
+            // (health::install_plaintext_redirect_pre_routing), so this is not a bypass
+            // of the pre-routing chokepoint.
+            if (redirect_server_) {
                 redirect_thread_ = std::thread([this] {
-                    spdlog::info("HTTP→HTTPS redirect on http://{}:{}/", cfg_.web_address,
-                                 cfg_.web_port);
-                    redirect_server_->listen(cfg_.web_address, cfg_.web_port);
+                    spdlog::info("HTTP→HTTPS redirect on http://{}:{}/ (health probes served "
+                                 "directly)",
+                                 cfg_.web_address, cfg_.web_port);
+                    // listen() returns false on a failed bind or a fatal accept error (and true
+                    // after stop()); the flag below is set either way so stop()'s wait ends.
+                    if (!redirect_server_->listen(cfg_.web_address, cfg_.web_port))
+                        spdlog::error(
+                            "Redirect listener failed to bind or exited with an error on {}:{}",
+                            cfg_.web_address, cfg_.web_port);
+                    {
+                        std::lock_guard<std::mutex> lk(web_thread_done_mtx_);
+                        redirect_thread_done_ = true;
+                    }
+                    web_thread_done_cv_.notify_all();
                 });
             }
         }
@@ -21298,7 +21511,12 @@ private:
             } else {
                 spdlog::info("Web UI available at http://{}:{}/", cfg_.web_address, listen_port);
             }
-            web_server_->listen(cfg_.web_address, listen_port);
+            if (!web_server_->listen(cfg_.web_address, listen_port))
+                spdlog::error("Web listener failed to bind or exited with an error on {}:{}{}",
+                              cfg_.web_address, listen_port,
+                              cfg_.https_enabled && cfg_.https_redirect
+                                  ? "; plain-port probes answer 503 https_listener_not_serving"
+                                  : "");
             // #2703 Gate 7 item 2: listen() returned (every worker drained back
             // into the pool and the pool itself joined — see httplib's
             // ThreadPool::shutdown()), so this thread is about to exit. Signal
@@ -21608,6 +21826,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
         yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
         yuzu::server::capdecls::plugin_action_catalogue_mgmt_posture(),
+        yuzu::server::capdecls::plugin_action_catalogue_shares(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
@@ -21671,7 +21890,14 @@ private:
 
     // HTTPS redirect server
     std::unique_ptr<httplib::Server> redirect_server_;
+    // Route sink over redirect_server_, declared after it so it is destroyed first.
+    // The health-route closures keep this pointer (Deps is copied into them), so it
+    // must outlive start_web_server().
+    std::unique_ptr<HttplibRouteSink> redirect_sink_;
     std::thread redirect_thread_;
+    // #5906: like web_thread_done_ (same mutex and cv), signalled by the redirect thread's body
+    // once listen() returns, so stop()'s one bounded wait covers both listeners.
+    bool redirect_thread_done_{false};
 
     // Certificate hot-reload
     std::unique_ptr<CertReloader> cert_reloader_;
@@ -21918,6 +22144,7 @@ private:
     std::unique_ptr<DeviceLensRoutes> device_lens_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<HardwareRoutes> hardware_routes_;
+    std::shared_ptr<yuzu::server::software_sync::Runner> sync_runner_; // fleet "Sync now" (REST + MCP)
     std::unique_ptr<home::DashboardSummaryRoutes> dashboard_summary_routes_;
     std::unique_ptr<DeviceContainmentRoutes> device_containment_routes_;
     std::unique_ptr<DeviceEstateRoutes> device_estate_routes_;

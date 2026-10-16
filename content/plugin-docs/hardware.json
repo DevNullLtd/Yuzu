@@ -1316,6 +1316,7 @@
     "tests": [
       "tests/unit/server/test_hardware_list_model.cpp",
       "tests/unit/server/test_hardware_routes.cpp",
+      "tests/unit/server/test_hardware_sync_routes.cpp",
       "tests/unit/server/test_hardware_ui.cpp",
       "tests/unit/test_hardware_device_identity_posix_actions.cpp",
       "tests/unit/test_hardware_disks_macos.cpp",

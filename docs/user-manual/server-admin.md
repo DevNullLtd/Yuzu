@@ -39,7 +39,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the platform default: `/etc/yuzu/yuzu-server.cfg` on Linux (and on macOS as root), `~/Library/Application Support/Yuzu/yuzu-server.cfg` on macOS as a non-root user, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows. |
 | `--data-dir` | *(config dir)* | Directory for runtime state files (auto-approve rules) and the NVD CVE cache `nvd_cves.db`, the one remaining server SQLite store, plus the `agent-updates/` (unless `--update-dir` is set) and `upload-blobs/` file directories. All other server data is in PostgreSQL — enrollment tokens and pending agents are PostgreSQL-authoritative (WS-6 6.2), not `--data-dir` files; see the blockquote below. Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but state files need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
 | `--postgres-dsn-file` | *(none)* | Read the PostgreSQL connection string from this file instead of `--postgres-dsn`, which puts it, password included, on the command line where every local user can read it. The whole file is the connection string; trailing whitespace (including the final newline) and a UTF-8 byte-order mark are ignored. Fails at startup if the file is missing, empty or larger than 64 KiB, and cannot be combined with `--postgres-dsn` / `YUZU_POSTGRES_DSN`. The file's own permissions are not checked (a Docker or Kubernetes secret is mounted world-readable inside its container): keep it where only the server's account can read it. The Windows installer stores it in the locked `%ProgramData%\Yuzu Server\postgres.dsn` and passes this flag. Env: `YUZU_POSTGRES_DSN_FILE`. |
-| `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
+| `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. When HTTPS is on this port is the HTTP→HTTPS redirect listener, which still answers `GET`/`HEAD` on the four health-probe paths directly (see [Probing a TLS-enabled server](#probing-a-tls-enabled-server)). |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
 | `--shutdown-drain-seconds` | `0` | On `SIGTERM`, keep serving for at least this many seconds after `/readyz` turns `503 draining`, so a load balancer stops routing here before the listener closes (HA WS-8). Range 0–60; `0` keeps the listener-closes-at-once behaviour a single server has always had. Set it to at least the load balancer's health-check interval × unhealthy threshold, plus one interval — see "Load balancers and shutdown drain" below. Env: `YUZU_SHUTDOWN_DRAIN_SECONDS`. |
 | `--no-https` | off | Disable HTTPS (insecure, for development only). HTTPS is **enabled by default**; provide `--https-cert` and `--https-key`, or pass `--no-https` to disable. Env: `YUZU_NO_HTTPS`. |
@@ -64,7 +64,9 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--https-port` | `8443` | HTTPS listen port. |
 | `--https-cert` | *(auto)* | Path to PEM-encoded TLS certificate for the dashboard. **A per-install default cert is auto-generated when omitted** (unless `--no-default-certs`); `--no-https` disables HTTPS entirely. |
 | `--https-key` | *(auto)* | Path to PEM-encoded TLS private key. Auto-generated default used when omitted (unless `--no-default-certs`). The file must not be world-readable (Unix: `chmod 600`). |
-| `--no-https-redirect` | off | When HTTPS is enabled, do not redirect HTTP requests to HTTPS. By default, HTTP requests are redirected. |
+| `--no-https-redirect` | off | When HTTPS is enabled, do not start the HTTP listener at all (no redirect, and no plain-HTTP health probes). By default, HTTP requests are redirected, except `GET`/`HEAD` on `/livez`, `/readyz`, `/health` and `/api/health`, which are served directly. |
+| `--healthcheck` | off | Probe this server's own health endpoint and exit `0` (HTTP 200) or non-zero, without starting the server. Uses the same listener flags and environment as the server (`--no-https`, `--https-port`, `--web-port`, `--web-address`, `--https-cert`, `--ca-dir`). Has no environment variable and never reads `yuzu-server.cfg`. See [Probing a TLS-enabled server](#probing-a-tls-enabled-server). |
+| `--healthcheck-path` | `/readyz` | With `--healthcheck`: the path to probe, `/readyz` or `/livez`. |
 | `--no-cert-reload` | off | Disable automatic certificate hot-reload. By default, the server polls cert/key files and hot-swaps the SSL context when they change. Env: `YUZU_NO_CERT_RELOAD`. |
 | `--cert-reload-interval` | `60` | Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
 | `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. **Warning:** enabling this exposes fleet composition data (OS, architecture, version counts) — and, when the cohort metrics export is enabled, **operator tag values** as `cohort` labels — to any network client. See [Metrics Security](metrics.md#security-considerations). Env: `YUZU_METRICS_NO_AUTH`. |
@@ -283,14 +285,16 @@ separately.
 **Settings → General** (`/settings/general`, admin only; every panel it shows also stays on the
 `/settings` page).
 
-- **Appearance** holds the table-density preference (Comfortable or Compact). It is saved in this
-  browser only and applies to the Dashboard results table.
+- **Appearance** holds the colour scheme and the table-density preference. The scheme is one of
+  six: Slate (the default), Navy and Jade are dark; Light, Light Baby Pink and Light Hot Pink are
+  light. It applies to every page and repaints as soon as you pick it. Density (Comfortable or
+  Compact) applies to the Console results table. Both are saved in this browser only.
 - **Server** holds the two runtime settings that change on a running server, written through
   `PUT /api/config/{key}`: the **agent heartbeat timeout** (`heartbeat_timeout`; seconds of silence
   after which this server drops an agent connected directly to it) and the **log level**
   (`log_level`). Both apply to this server process only, are stored, and are re-applied at restart;
   the log level then wins over `--log-level`. Neither is the dashboard sign-in expiry: that is the
-  read-only **Dashboard idle timeout** (`--session-inactivity-secs`) and **Dashboard session
+  read-only **Console idle timeout** (`--session-inactivity-secs`) and **Console session
   lifetime** (fixed, 8 hours) rows in the server-configuration table below the form. The heartbeat
   timeout must be 30 seconds or more (a lower value stored by an earlier build is raised to 30 at
   start, with a log line); keep it well above the agents' own heartbeat interval, since 30 leaves no
@@ -3109,7 +3113,7 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 1. Navigate to **Settings > TLS Configuration**.
 2. Toggle **Enable HTTPS**.
 3. Upload PEM-encoded certificate and private key files using the **Upload PEM** button, or paste PEM content directly using the **Paste PEM** button.
-4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS.
+4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS, except GET/HEAD on the four health-probe paths (see Probing a TLS-enabled server).
 
 ### Certificate Requirements
 
@@ -3618,6 +3622,7 @@ For automated or bulk deployment. Agents present a token at startup for instant 
 3. Configure token properties:
    - **Expiry** -- time limit (e.g., 24 hours, 7 days).
    - **Max uses** -- how many agents can use this token (1 for single-device, unlimited for bulk).
+     Leave the field empty or enter `0` for unlimited. Any other value must be one whole number: a typo such as `0x5` or `5abc` is refused with `400` and no token is minted (it used to be read as `0`, which means unlimited). The same rule applies to the token lifetime (`ttl_hours`, empty or `0` for no expiry); a negative `ttl_hours` is refused with `400` too, because it used to compute to "never expires".
 4. Copy the generated token string.
 
 **Agent side:**
@@ -3800,7 +3805,7 @@ editing the unit:
 | Platform | How |
 |---|---|
 | Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
-| macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
+| macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. Package upgrades keep every `YUZU_*` variable there, except `YUZU_PLUGIN_DIR` and `YUZU_DATA_DIR`, which the package sets. |
 | Windows | Set them in the service's own environment, a `REG_MULTI_SZ` value named `Environment` under the service's registry key, then restart the service. **Not in its binary path:** every installer run rewrites that path and drops them, and signing is then silently off (#5196). See *Windows: the service's `Environment` value* below for the commands and the cases that remove the value. |
 
 Every flag below has the environment variable shown beside it:
@@ -4392,7 +4397,7 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 — backup tooling, Grafana's data source, ad-hoc `psql`. Sized this way the servers cannot exhaust the database by themselves; only other clients can. To keep *them* out of the servers' share, the shipped `yuzu-postgres` images (single-node and the HA Patroni profile) set **`reserved_connections`** (PostgreSQL 16+; default **40**, env `YUZU_PG_RESERVED_CONNECTIONS`, `0` disables) and **grant `pg_use_reserved_connections` to the app role** at first boot. Once the free slots fall to `superuser_reserved_connections + reserved_connections`, only the app role (and superusers) can still connect — so a backup job or a stray session can never take the slot the `/readyz` probe needs to reconnect, which would otherwise turn a replica red on a database that still serves (the probe holds its connection in steady state and reconnects only after a failure; at the limit that reconnect was the connection refused first). The reserve covers the pool and the probe alike — the probe connects exactly as a pool connection does, so it is never green while the pool is refused. Set `YUZU_PG_RESERVED_CONNECTIONS` to `N_servers × (pool_size + 2)` (the default fits two servers at the default pool, e.g. 2 × (16 + 2) = 36 ≤ 40). **Never set it to `max_connections` minus `superuser_reserved_connections` or higher** — both scripts refuse to boot on that value (the boot-time check reads the live `max_connections`; the Patroni entrypoint checks against its own literal 200), because it would leave zero connection slots any ordinary (non-privileged) client could ever use, not merely under load. **On the single-node image this refusal happens AFTER the role/database/grant already exist** on the now-initialized data directory (Postgres's initdb-only-runs-once convention means those steps ran before this check) — restarting the SAME container with a corrected value does **not** retroactively apply anything; either start over on a fresh (wiped) data volume, or apply the fix by hand per "Existing databases" just below. The Patroni entrypoint's check runs before ANY of that (at bootstrap, before the cluster exists), so a Patroni refusal is a clean, no-op-safe retry. **This check runs once, at bootstrap.** A later `patronictl edit-config --set postgresql.parameters.max_connections=...` on an already-running Patroni cluster is not re-validated against the `reserved_connections` value already in force — re-check the arithmetic by hand after any live `max_connections` change (tracked for a real runtime check: #4943 fast-follow). **Existing databases:** first-boot init does not re-run; apply it by hand — `ALTER SYSTEM SET reserved_connections = 40;` (restart required; under Patroni, `patronictl edit-config --set postgresql.parameters.reserved_connections=40` then `patronictl restart <scope>` — `edit-config` alone only writes the DCS config and marks the member pending-restart, it does not apply a postmaster-context GUC like this one; the GRANT below is unchanged either way) and `GRANT pg_use_reserved_connections TO yuzu;`. Verify with `SHOW reserved_connections` and `SELECT pg_has_role('yuzu', 'pg_use_reserved_connections', 'MEMBER')`. On PostgreSQL 15 or older the grant is skipped with a notice and only the formula protects you. **Re-run this same verification** after anything that can silently undo it: a first boot interrupted between the `GRANT` and the `ALTER SYSTEM` (the init script never re-runs once the data directory exists, so a kill in that narrow window leaves the grant in place but the GUC at Postgres's own default of 0 — inert, not incorrect, but not protecting anything either), or any role recreation, credential rotation, or disaster-recovery restore that can drop and re-add the app role without this script running again.
 
-**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. `Register` also draws a short-lived lease per call, and a mass-reconnect event (a fleet-wide server restart, or a network partition healing across many agents at once) can spike concurrent `Register` calls well above the steady-state heartbeat rate — size with that burst in mind, not just steady-state. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing`, `YuzuServerPostgresUnreachable` in `docs/prometheus/yuzu-alerts.yml`). Pool saturation never affects `/readyz` — a busy but healthy server must stay in rotation — while an unreachable database turns `/readyz` red within seconds, well before those alerts' `for:` windows page. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
+**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. `Register` also draws a short-lived lease per call, and a mass-reconnect event (a fleet-wide server restart, or a network partition healing across many agents at once) can spike concurrent `Register` calls well above the steady-state heartbeat rate — size with that burst in mind, not just steady-state. A Software-page **Sync now** run can do the same on purpose: up to 500 agents (the per-request cap) re-send their inventory at nearly the same moment, a transient ingest burst on the pool. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing`, `YuzuServerPostgresUnreachable` in `docs/prometheus/yuzu-alerts.yml`). Pool saturation never affects `/readyz` — a busy but healthy server must stay in rotation — while an unreachable database turns `/readyz` red within seconds, well before those alerts' `for:` windows page. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 
 **Saturation fast-fail (not operator-configurable).** When the pool is already saturated at the moment of acquire (no idle connection, no spare capacity to open one), every bounded acquire across every Postgres-backed store now gives up after a short, fixed ceiling (~500 ms) instead of running to the caller's own, often much longer, timeout, freeing the calling worker thread for other routes rather than pinning it on a connection unlikely to free up in time. This substantially reduces, but does not eliminate, the risk of a saturated pool cascading into broader worker-thread exhaustion (including on unrelated routes such as auth) under sustained load; the underlying pool-to-worker sizing ratio is unchanged, so a large enough sustained saturation event can still exhaust worker capacity, just at a materially higher load threshold than before this mitigation. This ceiling is a compiled-in default, not exposed via a CLI flag or environment variable; if it proves wrong for your deployment's connection-hold-time distribution, that is a code change, not a config change. The metrics and alert rules named above (particularly `yuzu_pg_acquire_wait_seconds` and `YuzuPgAcquireWaitHigh`) remain the right signals to watch; a rising rate of fast-failed acquires under this ceiling is visible via the same `yuzu_pg_acquire_timeout_total` counter as a genuine full-timeout exhaustion (the counter does not currently distinguish the two).
 
@@ -5145,7 +5150,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|---|
 | `GET` | `/fragments/settings/tokens` | Render the enrollment tokens fragment (HTMX). |
 | `POST` | `/api/settings/enrollment-tokens` | Generate a new enrollment token. Body: `{ "expiry", "max_uses" }`. |
-| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. |
+| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. Defaults when a field is empty or omitted: `count` 10 (allowed 1 to 10000), `max_uses` 1, `ttl_hours` 0 (no expiry). Each number may be a JSON integer or a numeric string. A malformed, fractional, boolean, `null` or negative number, one outside the 32-bit range, a `count` outside 1 to 10000, or a body that is not one JSON object, is a `400` and nothing is minted. |
 | `DELETE` | `/api/settings/enrollment-tokens/{id}` | Revoke a token by ID. |
 
 ### Pending Agents
@@ -5217,7 +5222,7 @@ DEX alerting is configured on the **DEX page, Alerts tab** (it moved out of Sett
 | `GET` | `/fragments/dex/alerts` | The Alerts tab: DEX sub-nav, role note and the configuration form (HTMX). Any signed-in viewer may load it; the form renders for administrators only. Composed of the settings fragment below. |
 | `GET` | `/fragments/settings/dex-alerts` | Render the DEX alerts configuration form body only (HTMX). Admin-only. |
 | `POST` | `/api/settings/dex-alerts/routing` | Update the routed signal types. Body: form-encoded `types=<obs_type>` repeated per checked type; values are allow-listed against the signal catalogue. Persisted to `runtime_config` key `dex_alert_routing` (sorted JSON array). Applied live. Audit: `settings.dex_alerts.routing` (detail records the full routed set). |
-| `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
+| `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (a malformed value is `400` and nothing is saved; a well-formed integer is clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
 | `POST` | `/api/settings/dex-alerts/cohort-export` | Set (or clear) the cohort metrics export tag key. Body: `export_key` (tag-key alphabet `[A-Za-z0-9_.:-]`, max 64; empty disables — the default). When set, the per-cohort `yuzu_fleet_perf_cohort_*` Prometheus gauges are published for that key's cohorts (top 50 by population, the one-device floor — an empty cohort is withheld —, `yuzu_fleet_perf_cohort_clipped` makes capping visible). Persisted to `dex_cohort_export_key`. Applied on the next gauge sweep. Audit: `settings.dex_alerts.cohort_export`. |
 
 **New `runtime_config` keys.** All are runtime-set via the DEX Alerts tab and applied live (and re-applied at boot):
@@ -5242,15 +5247,15 @@ DEX alerting is configured on the **DEX page, Alerts tab** (it moved out of Sett
 
 ### Home (sign-in landing page)
 
-`GET /home` is the landing and sign-in page: the first page a visitor sees, with no sidebar and no header bar because there may be no session yet. Top to bottom it shows a slim bar (the Yuzu mark; the server's host name and the running version are added only once signed in, because the page is reachable without a session), a headline with the sign-in panel beside it, and the fifteen screens of the product as tiles in five families (Operate, Posture, Estate, Access, System), each saying what the area does. The page fetches no data. It is reached from the Yuzu logo on every other page; it has no sidebar entry, and `/` stays the Dashboard.
+`GET /home` is the landing and sign-in page: the first page a visitor sees, with no sidebar and no header bar because there may be no session yet. Top to bottom it shows a slim bar (the Yuzu mark; the server's host name and the running version are added only once signed in, because the page is reachable without a session), and a headline with the sign-in panel beside it. Signed out, that is all the page shows. Once signed in, the fifteen screens of the product appear below as tiles in five families (Operate, Posture, Estate, Access, System), each saying what the area does. The page fetches no data. It is reached from the Yuzu logo on every other page; it has no sidebar entry, and `/` stays the Console.
 
-**Signing in.** The panel carries the one sign-in form: username and password, a "Sign in with single sign-on" link when an identity provider (OIDC or SAML) is configured, and a note about two-factor codes when `--mfa-enforcement` is `admin-only` or `required`. The form posts to `POST /login` and, where applicable, `POST /login/mfa` or `POST /login/mfa/enroll`, exactly as before; `GET /login` now redirects to `/home`, so bookmarks and the SSO error bounces keep working. After signing in the user stays on `/home`: the panel is replaced by a signed-in panel showing the display name and role, an "Open Dashboard" button, a "Sign out" button, and the line "You are signed in. Open the Dashboard, or pick an area below." A signed-in user who opens `/home` (or clicks the logo) sees that panel straight away. Sign out returns to the form.
+**Signing in.** The panel carries the one sign-in form: username and password, a "Sign in with single sign-on" link when an identity provider (OIDC or SAML) is configured, and a note about two-factor codes when `--mfa-enforcement` is `admin-only` or `required`. The form posts to `POST /login` and, where applicable, `POST /login/mfa` or `POST /login/mfa/enroll`, exactly as before; `GET /login` now redirects to `/home`, so bookmarks and the SSO error bounces keep working. After signing in the user stays on `/home`: the panel is replaced by a signed-in panel showing the display name and role, an "Open Console" button, a "Sign out" button, and the line "You are signed in. Open the Console, or pick an area below." A signed-in user who opens `/home` (or clicks the logo) sees that panel straight away. Sign out returns to the form.
 
-**Opening a screen without a session.** Any page requested without a session is redirected to `/home?next=<key>`, where `<key>` names the requested screen (`devices`, `compliance`, ... one of the fifteen tiles; a sub-page such as `/approvals` counts as its parent, Instructions). The page shows "Sign in to open <area>." above the form and, after sign-in, labels the primary button "Open <area>" instead of "Open Dashboard". `next` is only ever one of those keys: a path, a URL or an unknown value is ignored, so it cannot redirect anywhere, and the server never redirects automatically after sign-in. A signed-out click on a tile goes through the same redirect, because the tiles are ordinary links to their screens.
+**Opening a screen without a session.** Any page requested without a session is redirected to `/home?next=<key>`, where `<key>` names the requested screen (`devices`, `compliance`, ... one of the fifteen tiles; a sub-page such as `/approvals` counts as its parent, Instructions). The page shows "Sign in to open <area>." above the form and, after sign-in, labels the primary button "Open <area>" instead of "Open Console". `next` is only ever one of those keys: a path, a URL or an unknown value is ignored, so it cannot redirect anywhere, and the server never redirects automatically after sign-in.
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/home` | The landing and sign-in page. No session needed: a signed-out visitor gets the sign-in form (with `?next=<screen key>` driving the "Sign in to open <area>." notice), a signed-in one the signed-in panel. Never cached. |
+| `GET` | `/home` | The landing and sign-in page. No session needed: a signed-out visitor gets the sign-in form and headline, with no tiles (with `?next=<screen key>` driving the "Sign in to open <area>." notice), a signed-in one the signed-in panel. Never cached. |
 | `GET` | `/login` | Redirects (`302`) to `/home`, forwarding a validated `next` key and a known `error` code (`sso_denied`, `sso_failed`, `sso_invalid`, `saml`) and nothing else. |
 
 ### Dashboard panels
@@ -5405,9 +5410,12 @@ management-group-confined principal, or rate-limit the export routes at the prox
 pool-acquire timeout on a response read surfaces as `503` `response store degraded`.
 
 **Malformed filters.** `yuzu_server_response_param_rejected_total{surface}` counts requests refused
-for a malformed numeric parameter on the response routes and MCP `query_responses` only. A steady
+for a malformed numeric parameter on the response routes, MCP `query_responses` and MCP `list_issued_certs` only (both MCP tools count under `surface="mcp"`). A steady
 non-zero rate on one surface is a client sending fractional timestamps, `null`s or trailing
-characters; it is not a server fault.
+characters; it is not a server fault. The same strict parsing now answers `400` (or `-32602` on
+MCP) on about a dozen other route families and on MCP `query_audit_log`, and those rejections have
+no counter of their own: after an upgrade, a rise in 4xx on those routes is visible only in the
+generic request metrics.
 
 ## File Logging
 
@@ -5445,6 +5453,76 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 - **A sustained overload also reds every replica together, and that is deliberate (#4944).** If the probe's one-row, no-table `SELECT` misses its 2 s deadline twice in a row, the database cannot answer real requests within their deadlines either (nearly every request validates a session and writes an audit row), so the replica is truthfully unable to serve — and, from the client side, a hopelessly slow backend and a frozen one look the same. There is **no server-side hysteresis** by decision: the rule stays two failures to go red, one success to recover, and your load balancer's thresholds are the damping — see "Load balancers and shutdown drain" below for the recommended values. A *brief* stall never evicts: one failed probe is a blip (`scripts/ha/ha-readyz-scenarios.sh`, scenario M holds a 3 s pause green; scenario L shows a CPU-starved database going red and recovering within one probe of the limit being lifted).
 - **The store rows are startup checks.** Every other row (`response_store`, `session_store`, ...) reports whether that store opened and migrated when the server started. They do not re-check a running store — a runtime problem with one store (a revoked grant, a dropped table) shows up as `503`s on that store's routes and in metrics, not on `/readyz`, because every replica shares the same database and moving traffic elsewhere would not help.
 - **Leadership is not readiness.** A replica that is not the background-work leader is fully ready.
+
+### Probing a TLS-enabled server
+
+The shipped images contain no `curl` (the chiselled image ships a static busybox with `wget`, see `deploy/docker/Dockerfile.server.chisel`), and images built before `--healthcheck` existed (#5906) answer every request on the HTTP port with a redirect when HTTPS is on. Two mechanisms let an orchestrator probe such a server.
+
+**1. The HTTP port answers the four probes directly, in cleartext.** With HTTPS on, the redirect listener (`--web-port`, `8080` by default) serves `/livez`, `/readyz`, `/health` and `/api/health` without redirecting. The port is **unencrypted and unauthenticated**: `/health` returns the version, the store names, `agents.online` and the `tls` block (whether default certificates are active, the install CA fingerprint and its expiry), and a failing `/readyz` names the failed stores and the Postgres state. Publish it only to the orchestrator network or `127.0.0.1`, or remove it with `--no-https-redirect`. `--web-address 127.0.0.1` binds the HTTPS dashboard to loopback too (both listeners share that address), so it is not a way to restrict only the plain port: for that, use network placement or `--no-https-redirect`. The rules:
+
+- `GET` and `HEAD` only, on those exact paths. Every other path, any other method, and a probe that declares a request body (`Content-Length`, even `0`, or `Transfer-Encoding`) still receives the `301` to HTTPS; the HTTPS listener does answer a probe with `Content-Length: 0`.
+- No session is ever resolved on this port. `/health` and `/api/health` always return the unauthenticated shape here (no `agents.pending`, `executions.*` or `system.*`), even when the request carries a valid session cookie.
+- Every answer is `503 {"status":"not ready","reason":"https_listener_not_serving"}` while the HTTPS listener is not bound or has exited. The check means "bound and not yet exited", not "accepting": if the HTTPS listener hits a fatal accept error, requests it had already accepted keep answering normally until they finish, while new connections are refused. A broken certificate reload that leaves the socket open is not seen by this check; use `--healthcheck` for that. A failed HTTPS bind logs an error and turns plain `/livez` into `503` as well, so a liveness probe on this port restarts the server: that is intended, the port never reports healthy for a server whose HTTPS listener is down.
+- The listener has a fixed worker pool (at most 64 threads, created at boot; count them in any `pids`/`TasksMax` budget) and no request deadline, so many idle or trickling connections can make plain-port probes time out while the server itself is fine. Keep it on the orchestrator network, and use `--healthcheck` for any check that restarts the container.
+- A server started with `--no-https-redirect` has no HTTP listener, so there is nothing to probe on this port.
+
+**2. `yuzu-server --healthcheck`.** Probes the real HTTPS listener from inside the container and exits `0` only on HTTP 200:
+
+| Aspect | Behaviour |
+|---|---|
+| Target | `https://<web-address>:<https-port>/readyz` (a wildcard bind, `0.0.0.0` or `::`, is dialled over loopback); with `--no-https`, `http://<web-address>:<web-port>/readyz`. `--healthcheck-path /livez` selects liveness. |
+| Trust | The certificate chain is verified against **only** a trust anchor, never the system trust store. Default-certs mode: `<ca-dir>/default-ca.pem` (the install CA). Operator certificate (`--https-cert`): the first certificate in that file (the server certificate itself); certificates after it are not trusted, and a first certificate that is not a `-----BEGIN CERTIFICATE-----` block (for example `X509 CERTIFICATE` or `TRUSTED CERTIFICATE`) is refused with an `SSL certificate loading failed` error, never the whole file. In operator-certificate mode the anchor must resolve to a regular file of at most 64 KiB; a larger, missing or unreadable file is refused with the same error. The host name is not checked. |
+| Redirects | Not followed. A `301` is a failure. |
+| Time | Each phase is bounded: TCP connect 1 s, each TLS handshake step 1 s, the request as a whole 3 s; and the whole probe, name resolution and handshake included, is cut at 4 s with the reason `timed out after 4000 ms`. A plain or post-handshake server that accepts but never answers is reported in about 2 s, a TLS peer that accepts and never starts the handshake in about 1 s, one that trickles a response in about 3 s, one that trickles its TLS handshake at 4 s. |
+| Output | Nothing on success. Exit status `0` is healthy, non-zero otherwise (`1` is a failed probe; a bad flag exits with CLI11's own code). On failure one stderr line naming the target, the HTTP status or TLS reason (for example `certificate has expired`), and the trust anchor used. It never prints a key path or a response body. `docker inspect --format '{{json .State.Health}}' <container>` shows the last lines; for a `503`, the server's `docker logs` carry the `[readyz]` line that says why. |
+| Inputs | The server's own flags and environment variables, with the server's defaults. It does not read `yuzu-server.cfg`. |
+
+A compose `healthcheck:` does not inherit the container's `CMD` arguments, so repeat any listener flags the server was started with. Default certificates:
+
+```yaml
+healthcheck:
+  test: ["CMD", "yuzu-server", "--healthcheck"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+```
+
+Operator certificate (the same `--https-cert` the server uses; the probe trusts the first certificate in that file as its anchor, which must be a `-----BEGIN CERTIFICATE-----` block in a regular file of at most 64 KiB, and refuses anything else rather than trusting the whole file):
+
+```yaml
+healthcheck:
+  test: ["CMD", "yuzu-server", "--healthcheck", "--https-cert", "/etc/yuzu/tls/server.pem"]
+  interval: 30s
+  timeout: 5s
+  retries: 4
+  start_period: 30s
+```
+
+Kubernetes `exec` probe. `timeoutSeconds` defaults to 1, which is under the probe's own 4 s bound, so always set it to 5 or more. The `startupProbe` holds the liveness probe off for up to 5 minutes, because a large upgrade's first boot builds an index before anything answers (see `docs/user-manual/upgrading.md`):
+
+```yaml
+startupProbe:
+  exec:
+    command: ["yuzu-server", "--healthcheck", "--healthcheck-path", "/livez"]
+  failureThreshold: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+livenessProbe:
+  exec:
+    command: ["yuzu-server", "--healthcheck", "--healthcheck-path", "/livez"]
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+```
+
+Notes:
+
+- A check that restarts the container (Kubernetes liveness, Swarm, autoheal) should use `--healthcheck-path /livez`: a database outage turns `/readyz` red on every replica, and restarting them all fixes nothing. Keep the default `/readyz` for readiness and Compose `depends_on: condition: service_healthy`. Never set `timeout` below 5 s.
+- If the server runs with a non-default `--ca-dir` or `--https-port`, repeat them on the healthcheck line.
+- Once `--https-cert` is set, a `default-ca.pem` left in the certificate directory by an earlier default-certs boot is **not** used. Omitting `--https-cert` from the healthcheck line while the server uses an operator certificate makes the probe anchor on that stale file and report `SSL server verification failed`.
+- After you rotate the `--https-cert` file, the probe anchors on the new certificate while the server keeps serving the old one until its next reload (`--cert-reload-interval`, 60 s by default), and reports `SSL server verification failed` in between. A check turns unhealthy on its `retries`-th (Kubernetes: `failureThreshold`-th) consecutive failure, so the time it tolerates is (`retries` − 1) × `interval` in Compose and (`failureThreshold` − 1) × `periodSeconds` in Kubernetes. Make that longer than the reload interval (the `interval: 30s`, `retries: 4` snippet above tolerates 90 s; on Kubernetes with `periodSeconds: 10` set `failureThreshold: 8`, which tolerates 70 s), or restart the server after rotating. The server's reload watches the file the path resolves to when it starts, so a rotation that replaces a symlink instead of rewriting the file (a certbot `live/` link, a Kubernetes Secret volume) is never reloaded: restart the server after such a rotation, or the probe keeps failing. An expired certificate fails the probe with `certificate has expired`, and a restart cannot fix that: renew the certificate.
+- Images built before `--healthcheck` existed (#5906) exit on the unknown argument; keep their existing probes.
 
 ### Load balancers and shutdown drain
 
@@ -5512,7 +5590,8 @@ A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first s
 
 | Port | Service | Deployment |
 |---|---|---|
-| 8080 | Web dashboard + REST API | Always |
+| 8080 | HTTP→HTTPS redirect + cleartext health probes with HTTPS on (`--no-https-redirect` removes it); the dashboard and REST API in plain HTTP with `--no-https` | Always |
+| 8443 | Web dashboard + REST API (HTTPS) | Always when HTTPS is on (the default) |
 | 50051 | gRPC (agent connections) | Always -- server in standalone, gateway in scaled |
 | 50052 | gRPC (management) | Always |
 | 50055 | gRPC (gateway upstream) | Gateway deployments only |

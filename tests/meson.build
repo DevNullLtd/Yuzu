@@ -242,6 +242,7 @@ agent_test_exe = executable(
     'unit/test_progress_listener.cpp', # #4018 per-test START/END progress log, env-gated
     'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
     'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
+    'unit/test_agent_ota_disabled_lifecycle.cpp', # registration → command → reconnect, OTA disabled
     'unit/test_update_signature_mode.cpp', # OTA update-signature mode report + env typo check (#5249)
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
@@ -569,6 +570,10 @@ agent_test_exe = executable(
     'unit/test_mgmt_posture_parsers.cpp',           # mgmt_posture: pure sssd/ipa/profiles parsers, plane classifier, row formatters; portable
     'unit/test_mgmt_posture_legs.cpp',              # mgmt_posture: OS-free posture_linux/posture_macos decision seams over injected fakes; portable
     'unit/test_mgmt_posture_local_dispatcher.cpp',  # mgmt_posture: real plugin via LocalDispatcher + execute seam, unguarded on every OS
+    'unit/test_shares_parsers.cpp',                 # shares: pure exports/smb.conf parsers + row formatters over labelled fixtures; portable
+    'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux decision seam over injected fakes; portable
+    'unit/test_shares_posix_fs.cpp',                # shares: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd); body #if !defined(_WIN32)
+    'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
     'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
@@ -612,6 +617,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/mgmt_posture/src'),  # mgmt_posture_parsers.hpp / _legs.hpp
+    include_directories('../agents/plugins/shares/src'),  # shares_parsers.hpp / _legs.hpp / _posix_fs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
@@ -798,6 +804,7 @@ agent_test_exe = executable(
                 browser_policy_plugin_lib,  # Wave 10 PR10.2-b
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 mgmt_posture_plugin_lib,  # management-plane posture
+                shares_plugin_lib,  # shares
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 local_security_policy_plugin_lib,  # Wave 8 PR8.3
@@ -888,6 +895,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
     files('unit/test_plugin_abi_oom_containment.cpp'),
     include_directories: [include_directories('../agents/plugins/browser_policy/src'),
                           include_directories('../agents/plugins/mgmt_posture/src'),
+                          include_directories('../agents/plugins/shares/src'),
                           include_directories('../agents/plugins/update_source_trust/src'),
                           include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
                           include_directories('../agents/shared')],
@@ -1307,6 +1315,7 @@ tar_test_exe = executable(
   ],
   cpp_args: tar_test_cpp_args,
   objcpp_args: tar_test_objcpp_args,
+  link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: tar_test_deps,
 )
 test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
@@ -1348,8 +1357,10 @@ if build_server
       'unit/server/test_update_registry.cpp',
       'unit/server/test_legacy_sqlite_probe.cpp',
       'unit/server/test_https_config.cpp',
+      'unit/server/test_healthcheck_probe.cpp', # #5906: --healthcheck target/verdict rules + loopback TLS probe
       'unit/server/test_response_store.cpp',
       'unit/server/test_response_routes.cpp', # #2542 PR-11: the 3-route legacy pre-v1 Responses API, extracted onto the HttpRouteSink seam
+      'unit/server/test_query_int_parse.cpp', # #4644: the shared strict integer primitive (query_int_parse.hpp)
       'unit/server/test_preflight_parse.cpp',
       'unit/server/test_preflight_eval.cpp',
       'unit/server/test_preflight_run_store.cpp',
@@ -1550,6 +1561,9 @@ if build_server
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
+      'unit/server/test_software_sync_decision.cpp', # Software "Sync now": pure request grammar, partition, fleet-wide rule, 500 cap, cooldown, audit wording
+      'unit/server/test_software_sync_runner.cpp',   # Software sync: the shared Runner (REST + MCP) - cooldown, lease, bounded partition, audit-before-send
+      'unit/server/test_hardware_sync_routes.cpp', # Software "Sync now": POST /api/v1/hardware/sync route matrix (HwHarness pattern)
       'unit/server/test_home_render.cpp',         # Dashboard summary: pure renderers, partitions, states
       'unit/server/test_home_routes.cpp',         # Dashboard summary: gates, scope, degrade, caller matrix
       'unit/server/test_dashboard_ui.cpp',        # Dashboard page: row order, moved placeholders, controls, part pins
@@ -2908,6 +2922,19 @@ endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
 _python3_test = yuzu_python
+test('macOS Endpoint Security app packaging',
+  _python3_test,
+  args: [files('test_macos_app_packaging.py')],
+  suite: 'agent',
+  # ~25 s on the macOS CI runner with 81 cases; more since (governance bci-2).
+  timeout: 90,
+)
+test('macOS development foundation checks',
+  _python3_test,
+  args: [files('test_macos_foundation.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 test('proto gen_proto version check',
   _python3_test,
   args: [files('test_gen_proto_version.py')],
@@ -3174,6 +3201,16 @@ test('update_source_trust definition columns',
 test('mgmt_posture definition columns',
   _python3_test,
   args: [files('test_mgmt_posture_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# shares' definition-column contract (content/definitions/shares.yaml): row_kind first, then the
+# generic field_1..field_7 sequence pinned to the wire rows shares_parsers.hpp emits (the test
+# holds the expected literals; it does not read the C++).
+test('shares definition columns',
+  _python3_test,
+  args: [files('test_shares_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -3520,6 +3557,21 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
       yuzu_agent_core_lib,
       agent_actions_plugin_lib,
     ],
+  )
+endif
+
+# #5906: `yuzu-server --healthcheck` CLI contract against the real binary (no listener, no
+# Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
+# runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# gate labelled 'server' fails that check on the Windows legs.
+if _bash_test.found() and meson.can_run_host_binaries() and build_server
+  test('healthcheck CLI contract (#5906)',
+    _bash_test,
+    args: [files('shell/test_healthcheck_cli.sh'), meson.project_build_root()],
+    suite: ['server', 'docs'],
+    timeout: 60,
+    depends: [yuzu_server_exe],
   )
 endif
 

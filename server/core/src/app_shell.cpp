@@ -43,7 +43,7 @@ constexpr NavItem kSettingsSub[] = {
 };
 
 constexpr NavItem kOperate[] = {
-    {.key = "dashboard", .label = "Dashboard", .href = "/", .icon = "M4 17l6-6-6-6 M12 19h8"},
+    {.key = "dashboard", .label = "Console", .href = "/", .icon = "M4 17l6-6-6-6 M12 19h8"},
     {.key = "instructions",
      .label = "Instructions",
      .href = "/instructions",
@@ -583,10 +583,19 @@ std::vector<std::string> breadcrumb_trail(const ShellCtx& ctx) {
     return trail;
 }
 
+// Colour scheme (Settings > General > Appearance, localStorage 'yuzu-theme'). Runs first in the
+// chrome, right after <body> opens and before any content paints, so a saved scheme never
+// flashes slate. Exact-match whitelist; a blocked or absent store leaves slate (the :root).
+constexpr std::string_view kThemeBoot =
+    "<script>try{var t=localStorage.getItem('yuzu-theme');"
+    "if(/^(slate|navy|jade|light|light-baby|light-hot)$/.test(t))"
+    "document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>";
+
 std::string render_shell(const ShellCtx& ctx) {
     std::string out;
     out.reserve(9000);
     out += kShellBegin;
+    out += kThemeBoot;
     out += kShellCss;
     out += kBellCss;
     append_sidebar(out, ctx.active_key);

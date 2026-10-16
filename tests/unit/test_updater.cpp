@@ -17,6 +17,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <future>
 #include <memory>
 #include <string>
@@ -49,8 +50,13 @@ struct TempUpdaterDir {
 
 /// Helper: write a small file to simulate a binary.
 void write_fake_binary(const fs::path& path) {
-    std::ofstream out(path, std::ios::binary);
-    out << "fake-binary-content";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "fake-binary-content";
+    }
+    // As the updater writes binaries: owner-only, whatever the test's umask.
+    std::error_code ec;
+    fs::permissions(path, fs::perms::owner_all, fs::perm_options::replace, ec);
 }
 
 } // anonymous namespace
@@ -189,6 +195,162 @@ TEST_CASE("rollback_if_needed returns true when .old exists but NO verified mark
     // After rollback, the old binary should have been moved back to exe_path
     REQUIRE(fs::exists(exe_path));
     REQUIRE_FALSE(fs::exists(old_path));
+}
+
+#ifndef _WIN32
+// PR #4482 governance ch-4: a .old another account could have written is never
+// promoted to the executable, whether group/world-writable or a symlink.
+TEST_CASE("rollback_if_needed refuses a writable or symlinked .old",
+          "[updater][rollback]") {
+    TempUpdaterDir tmp("rollback_untrusted");
+    const auto& dir = tmp.guard.path;
+    auto exe_path = dir / "yuzu-agent";
+    auto old_path = dir / "yuzu-agent.old";
+    write_fake_binary(exe_path);
+
+    UpdateConfig config;
+    Updater updater(config, "test-agent", "0.1.0", "darwin", "arm64", exe_path);
+
+    SECTION("group- or world-writable") {
+        write_fake_binary(old_path);
+        fs::permissions(old_path, fs::perms::group_write | fs::perms::others_write,
+                        fs::perm_options::add);
+        REQUIRE_FALSE(updater.rollback_if_needed());
+    }
+    SECTION("a symlink") {
+        auto target = dir / "planted";
+        write_fake_binary(target);
+        fs::create_symlink(target, old_path);
+        REQUIRE_FALSE(updater.rollback_if_needed());
+    }
+    SECTION("a hard link to another file") {
+        auto target = dir / "planted";
+        write_fake_binary(target);
+        fs::create_hard_link(target, old_path);
+        REQUIRE_FALSE(updater.rollback_if_needed());
+    }
+    // The executable was not replaced.
+    REQUIRE_FALSE(fs::is_symlink(exe_path));
+    std::ifstream in(exe_path, std::ios::binary);
+    REQUIRE(std::string(std::istreambuf_iterator<char>(in), {}) == "fake-binary-content");
+}
+
+// Governance g8q-2: startup maintenance removes a refused .old (cleanup runs after
+// the refusal), keeps the executable, and never deletes through a symlink.
+TEST_CASE("startup maintenance removes a refused .old and keeps the executable",
+          "[updater][rollback][maintenance]") {
+    TempUpdaterDir tmp("rollback_refused_cleanup");
+    const auto& dir = tmp.guard.path;
+    auto exe_path = dir / "yuzu-agent";
+    auto old_path = dir / "yuzu-agent.old";
+    auto target = dir / "planted";
+    write_fake_binary(exe_path);
+
+    UpdateConfig config;
+    config.enabled = true;
+    Updater updater(config, "test-agent", "0.1.0", "darwin", "arm64", exe_path);
+
+    SECTION("group- or world-writable") {
+        write_fake_binary(old_path);
+        fs::permissions(old_path, fs::perms::group_write | fs::perms::others_write,
+                        fs::perm_options::add);
+        REQUIRE_FALSE(updater.perform_startup_maintenance());
+    }
+    SECTION("a symlink") {
+        write_fake_binary(target);
+        fs::create_symlink(target, old_path);
+        REQUIRE_FALSE(updater.perform_startup_maintenance());
+        REQUIRE(fs::exists(target));
+    }
+    REQUIRE_FALSE(fs::exists(fs::symlink_status(old_path)));
+    REQUIRE_FALSE(fs::is_symlink(exe_path));
+    std::ifstream in(exe_path, std::ios::binary);
+    REQUIRE(std::string(std::istreambuf_iterator<char>(in), {}) == "fake-binary-content");
+}
+#endif
+
+TEST_CASE("disabled startup maintenance leaves executable-adjacent rollback files untouched",
+          "[updater][maintenance][no-auto-update]") {
+    TempUpdaterDir tmp("disabled_maintenance");
+    const auto& dir = tmp.guard.path;
+
+#ifdef _WIN32
+    const auto exe_path = dir / "yuzu-agent.exe";
+    const auto old_path = dir / "yuzu-agent.old.exe";
+#else
+    const auto exe_path = dir / "yuzu-agent";
+    const auto old_path = dir / "yuzu-agent.old";
+#endif
+    const auto marker_path = dir / ".yuzu-update-verified";
+    write_fake_binary(exe_path);
+    write_fake_binary(old_path);
+    write_fake_binary(marker_path);
+
+    UpdateConfig config;
+    config.enabled = false;
+    Updater updater(config, "test-agent", "0.1.0", "macos", "arm64", exe_path);
+
+    REQUIRE_FALSE(updater.perform_startup_maintenance());
+    REQUIRE(fs::exists(exe_path));
+    REQUIRE(fs::exists(old_path));
+    REQUIRE(fs::exists(marker_path));
+}
+
+TEST_CASE("a disabled updater's rollback and cleanup primitives are self-guarded",
+          "[updater][maintenance]") {
+    // PR #4482 review: the disabled no-write mode must not depend on every caller
+    // going through perform_startup_maintenance().
+    TempUpdaterDir tmp("disabled_primitives");
+    const auto& dir = tmp.guard.path;
+
+#ifdef _WIN32
+    const auto exe_path = dir / "yuzu-agent.exe";
+    const auto old_path = dir / "yuzu-agent.old.exe";
+#else
+    const auto exe_path = dir / "yuzu-agent";
+    const auto old_path = dir / "yuzu-agent.old";
+#endif
+    write_fake_binary(exe_path);
+    { std::ofstream{old_path, std::ios::binary} << "previous-binary"; }
+    // No verification marker, so an ENABLED updater would roll back here.
+
+    UpdateConfig config;
+    config.enabled = false;
+    Updater updater(config, "test-agent", "0.1.0", "macos", "arm64", exe_path);
+
+    REQUIRE_FALSE(updater.rollback_if_needed());
+    updater.cleanup_old_binary();
+    REQUIRE(fs::exists(old_path));
+    std::ifstream current{exe_path, std::ios::binary};
+    const std::string content{std::istreambuf_iterator<char>{current}, {}};
+    REQUIRE(content == "fake-binary-content");
+}
+
+TEST_CASE("enabled startup maintenance retains rollback and cleanup semantics",
+          "[updater][maintenance]") {
+    TempUpdaterDir tmp("enabled_maintenance");
+    const auto& dir = tmp.guard.path;
+
+#ifdef _WIN32
+    const auto exe_path = dir / "yuzu-agent.exe";
+    const auto old_path = dir / "yuzu-agent.old.exe";
+#else
+    const auto exe_path = dir / "yuzu-agent";
+    const auto old_path = dir / "yuzu-agent.old";
+#endif
+    const auto marker_path = dir / ".yuzu-update-verified";
+    write_fake_binary(exe_path);
+    write_fake_binary(old_path);
+    write_fake_binary(marker_path);
+
+    UpdateConfig config;
+    config.enabled = true;
+    Updater updater(config, "test-agent", "0.1.0", "macos", "arm64", exe_path);
+
+    REQUIRE_FALSE(updater.perform_startup_maintenance());
+    REQUIRE(fs::exists(exe_path));
+    REQUIRE_FALSE(fs::exists(old_path));
+    REQUIRE_FALSE(fs::exists(marker_path));
 }
 
 // ── Construction ────────────────────────────────────────────────────────────

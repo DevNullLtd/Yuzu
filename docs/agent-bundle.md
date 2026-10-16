@@ -140,9 +140,12 @@ DYLD_LIBRARY_PATH="$PWD/bin" ./bin/yuzu-agent \
   --server <GATEWAY_HOST>:50051 --no-tls --enrollment-token <TOKEN> \
   --plugin-dir "$PWD/plugins" --data-dir ./data --log-level info
 ```
-Persistent: `sudo installer -pkg installers/<pkg> -target /`, then add
-`--server`/`--enrollment-token` to `/Library/LaunchDaemons/com.yuzu.agent.plist`
-and `launchctl bootstrap system …`. If Gatekeeper quarantines copied files,
+Persistent: `sudo installer -pkg installers/<pkg> -target /` installs the agent
+but does not start it until a server trust anchor is configured. Add
+`--server`, `--ca-cert` (or `--no-tls` for this demo) and `--enrollment-token` to
+`/Library/LaunchDaemons/com.yuzu.agent.plist`, then run `launchctl bootstrap system …`.
+To start it on first install instead, pre-stage the plist
+([Deploying with MDM](../deploy/packaging/macos/README.md#deploying-with-mdm)). If Gatekeeper quarantines copied files,
 clear it first: `xattr -dr com.apple.quarantine yuzu-agents/macos-arm64`.
 
 **Windows** — foreground (demo, PowerShell):

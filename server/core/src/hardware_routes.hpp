@@ -22,13 +22,20 @@
 
 #include "authz_gates.hpp"           // authz::FleetReadGate
 #include "command_capability.hpp"    // CommandCapability, ClassificationError
+#include "device_containment_render.hpp" // kContainmentUi
 #include "dex_routes.hpp"            // DexAgentResponse (ResponsesFn return type)
 #include "hardware_action_form.hpp"  // ActionFormSpec
 #include "hardware_list_model.hpp"
 #include "inventory_routes.hpp"      // InventoryDeviceRow / InventoryDevicesResult reuse
 #include "quarantine_visible.hpp"    // QuarantineListFn (list pill)
+#include "audited_write.hpp"         // WriteGate (same-site gate for the sync POSTs)
+#include "software_sync_decision.hpp" // software_sync::{Selector, Resolved, DispatchResult}
+#include "software_sync_runner.hpp"   // software_sync::Runner (the shared fleet-run sequence)
 
+#include <atomic>
+#include <cstdint>
 #include <expected>
+#include <mutex>
 #include <unordered_map>
 
 #include <httplib.h>
@@ -75,6 +82,9 @@ struct HwCiAffordances {
     // not swap a 403, so the lens body checks this first and renders an honest note
     // instead of an hx-get a caller without the permission could never see resolve.
     bool can_read_guaranteed_state{false};
+    /// Render the record banner placeholder, the Containment tab and the Containment lens body.
+    /// Copied from HardwareRoutes::Deps; the default is the compile-time kContainmentUi.
+    bool containment_ui{kContainmentUi};
 };
 
 /// The lens tab bar alone, id="hw-lens-bar" — factored out so a lens-only response
@@ -83,7 +93,8 @@ struct HwCiAffordances {
 /// changes which tab looks active). `oob=true` emits `hx-swap-oob="true"` on the
 /// wrapping div; the full record render uses `oob=false` since the bar is already
 /// in the right place in the DOM.
-std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob);
+std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob,
+                                     bool containment_ui = kContainmentUi);
 
 /// The CI record: back link + header (hostname/OS/online/last-seen/agent id/Sync now)
 /// + lens tabs + the active lens's body. `lens` in {"overview","software","tags","actions"}.
@@ -263,7 +274,9 @@ public:
     /// registry refused (no live session / stream write failed).
     using SyncDispatchFn = std::function<HwSyncDispatchResult(const std::string& agent_id,
                                                               const std::string& source)>;
-    /// The live session's self-reported agent_version; nullopt == no live session.
+    /// The live session's self-reported agent_version; nullopt == no session on THIS server
+    /// process (sessions are per process, so a device attached to another replica reads the same
+    /// as a disconnected one).
     using AgentVersionFn = std::function<std::optional<std::string>(const std::string& agent_id)>;
     /// One plugin's pre-serialised plugin-docs manifest JSON (`plugin_docs_manifest`),
     /// nullopt when no manifest documents that plugin.
@@ -275,6 +288,11 @@ public:
     /// `device_routes.cpp`'s list already follows.
     using DexScoreFn = std::function<int(const std::string& agent_id)>;
 
+    /// Type-level (not per-device) permission gate: same contract as `ScopedPermFn` minus
+    /// the agent id — false means the response is already written.
+    using SyncPermFn = std::function<bool(const httplib::Request&, httplib::Response&,
+                                          const std::string& securable_type,
+                                          const std::string& operation)>;
     struct Deps {
         AuthFn auth_fn;
         ScopedPermFn scoped_perm_fn;
@@ -295,6 +313,23 @@ public:
         /// The authoritative active-quarantine read, for the list's Quarantined pill. Empty
         /// = no pill and no banner (the panel and lens have their own routes).
         QuarantineListFn quarantine_list_fn;
+        /// Show every quarantine/containment control on the Hardware pages. False: no pill,
+        /// row link, banner, panel, tab or lens, no list-time quarantine read, and the quarantine
+        /// plugin's rows are left out of the Actions lens. The default is kContainmentUi.
+        bool containment_ui{kContainmentUi};
+        /// POST /api/v1/hardware/sync — the Software page's fleet/group/scope "Sync now".
+        /// `sync_perm_fn` is the type-level Execution:Execute gate (it writes the 401/403).
+        /// `sync_runner` is the fleet run (resolve, cap, cooldown, in-flight lease, audit, send).
+        /// `sync_perm_fn`, `auth_fn` or `sync_runner` empty == the route answers an AUDITED 500
+        /// (result=failure, nothing sent): a missing derivation is a misconfiguration, not an
+        /// outage.
+        SyncPermFn sync_perm_fn;
+        /// Shared with the MCP tool `sync_hardware_software` so the per-operator cooldown and
+        /// the single in-flight slot bind BOTH surfaces: production wires one instance into both.
+        std::shared_ptr<software_sync::Runner> sync_runner;
+        /// Same-site gate for the cookie-authorised sync POSTs (both the fleet and the
+        /// per-device route). Unwired fails closed: a header-less request is refused.
+        WriteGate write_gate;
     };
 
     void register_routes(httplib::Server& svr, Deps deps);
@@ -307,6 +342,7 @@ private:
                                     const HardwareCiDetail& detail) const;
 
     Deps deps_;
+
 };
 
 } // namespace yuzu::server

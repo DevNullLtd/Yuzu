@@ -28,7 +28,7 @@ struct Panel {
 constexpr std::array<Panel, 21> kPanels{{
     {"Server Configuration", "server-config-section", "/fragments/settings/server-config"},
     {"TLS / mTLS Configuration", "tls-section", "/fragments/settings/tls"},
-    {"HTTPS Dashboard", "https-section", "/fragments/settings/https"},
+    {"HTTPS Console", "https-section", "/fragments/settings/https"},
     {"Internal Certificate Authority", "ca-section", "/fragments/settings/ca"},
     {"User Management", "user-section", "/fragments/settings/users"},
     {"Multi-Factor Authentication", "mfa-section", "/fragments/settings/mfa"},

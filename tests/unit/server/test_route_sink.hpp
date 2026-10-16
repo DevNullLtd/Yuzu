@@ -235,4 +235,26 @@ private:
     std::vector<Route> routes_;
 };
 
+
+/// Drive a response's chunked content provider ONCE with a capturing DataSink and return what it wrote.
+/// The sink hands back the real `httplib::Response`; an SSE provider writes only through
+/// `DataSink::write`, drains the subscription queue (replayed + live events) and ends with a
+/// heartbeat, so one invocation yields the frames queued so far. Precondition: the response has a
+/// chunked provider (`res.content_provider_` set) and at least one frame is already queued, otherwise
+/// the provider waits out its own 3 s idle timeout. Not modelled: transfer-encoding framing, a second
+/// invocation, or a slow reader.
+inline std::string drain_chunked_provider_once(httplib::Response& res) {
+    std::string out;
+    httplib::DataSink sink;
+    sink.write = [&out](const char* d, size_t n) {
+        out.append(d, n);
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    sink.done = [] {};
+    if (res.content_provider_)
+        res.content_provider_(0, 0, sink);
+    return out;
+}
+
 } // namespace yuzu::server::test
