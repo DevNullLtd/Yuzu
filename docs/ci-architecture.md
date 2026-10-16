@@ -773,15 +773,46 @@ of reading as NOT TESTED.
 **Gateway-upstream peer authorization and the rigs.** The server refuses to start with
 `--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
 (`--insecure-gateway-peer`, or `YUZU_INSECURE_GATEWAY_PEER=1`). The rigs that run the server from
-the build under test pass the flag: `scripts/integration-test.sh` (in both its plaintext and
-`--tls` branches), `scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/start-stack.sh`
-and the locally built full, sanitizer and viz UAT composes. None of them exercises a pinned
-gateway hop, and no workflow under `.github/` invokes `integration-test.sh` (it runs from
-`scripts/run-tests.sh`); running its `--tls` branch with a real pinned gateway leaf is a deferred
-follow-up. The pre-release `integration` job (`scripts/ci/qa-stack.sh`) starts no server itself:
-it runs this checkout's reference-gateway template on the release's published images, so any
-acknowledgement or pin that rig needs belongs in that template (an environment variable, which an
-image older than the flag ignores), not in the script.
+the build under test pass the flag: `scripts/integration-test.sh` in its plaintext mode,
+`scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/start-stack.sh` and the locally built
+full, sanitizer and viz UAT composes. None of those exercises a pinned gateway hop. One rig does:
+`scripts/integration-test.sh --tls` runs the server on its generated default certificates with no
+acknowledgement, so it enforces the automatic pin of its own `default-gateway.pem`, and the gateway
+release dials it over `https` with `verify_peer` and that leaf as its client certificate. The `linux`
+job runs it as the step "Gateway real-wire test (pinned TLS)" (below). The pre-release `integration`
+job (`scripts/ci/qa-stack.sh`) starts no server itself: it runs this checkout's reference-gateway
+template on the release's published images, so any acknowledgement or pin that rig needs belongs in
+that template (an environment variable, which an image older than the flag ignores), not in the
+script.
+
+**Gateway real-wire gate (#5652, #5653).** The gateway's unit tests mock the upstream client
+(`meck` on `yuzu_grpc_client`), so on their own they cannot show that a call site and the real client
+still agree. The `linux` job's gcc-15/debug leg therefore runs `scripts/integration-test.sh --tls
+--free-ports --gateway-ct`: the real `yuzu-server` under test, the gateway built as the prod
+release (`rebar3 as prod release`, started with `foreground` on a generated `sys.config` that has
+the production shape of `deploy/docker/reference-gateway-sys.config`) and one real `yuzu-agent`
+(agent to gateway over one-way TLS), then `yuzu_gw_real_upstream_SUITE` (Common Test) against that
+same server. The hop is pinned over TLS: the suite presents the gateway leaf the server auto-pins,
+and a valid leaf of the same CA that is not pinned must be refused with `UNAUTHENTICATED` (counted as
+`not_pinned`). The suite pairs every upstream call site (`ProxyRegister`, `BatchHeartbeat`,
+`ProxyInventory`, `NotifyStreamStatus`, `ForwardGuardianMessage`) with the real client and reads the
+effect back from the server (the decoded reply, or the server's `/metrics` for the two casts), checks
+the error shapes (a server status as `{error, {Status, Message}}`, a non-200 HTTP response as the
+`http_error` text, which needs an in-VM cowboy answering 502 because the real server never sends one),
+and forces a registration replay: the server must adopt the agent's existing session (read back
+through its answer to a heartbeat for that session), and a presented session it did not mint must
+tear the agent down. A swapped request marshal function, a lost `x-yuzu-session-id` header or
+`{error, _}` returned where `{http_error, _}` belongs each fails a named case (checked by mutating
+the gateway source and rerunning the suite). It cannot skip: the script has no skip path, a missing
+prerequisite exits non-zero, and `YUZU_REAL_UPSTREAM_STRICT=1` turns a check the suite cannot make
+(server unreachable, `/metrics` unreadable) into a failure. The four runner agents share one OS
+identity (#1871), so every named resource is per-run: all 8 ports come from the OS in one
+allocation (`--free-ports`), the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
+the job's `YUZU_TEST_POSTGRES_DSN` and dropped on exit, the work directory is a `mktemp` name under
+`runner.temp`, and the gateway's Erlang node name and cookie carry a random salt (the release's own
+fixed `yuzu_gw` short name would contest the shared EPMD). A failed run keeps its work directory and
+the step "Upload gateway real-wire logs on failure" uploads its logs (`failure() &&` leads the
+condition) and the Common Test logs, never the run's throwaway CA or agent keys.
 
 **Gateway peer authorization gates.** Four pieces enforce it in CI. (1) The `linux` job in
 `ci.yml` installs the `postgresql-client` apt package (it provides `psql`) and runs the step

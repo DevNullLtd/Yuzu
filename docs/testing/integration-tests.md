@@ -26,13 +26,22 @@ The primary integration test runs all three components together:
 # Test with multiple agents
 ./scripts/integration-test.sh --agents 10
 
-# Test with mTLS enabled
-./scripts/integration-test.sh --agents 5 --tls
+# Real TLS stack: the server on its generated default certificates, the gateway hop
+# pinned over mutual TLS, agents to the gateway over one-way TLS
+./scripts/integration-test.sh --tls
+
+# What CI runs: TLS, every port taken from the OS, plus the gateway's real-upstream
+# Common Test suite (yuzu_gw_real_upstream_SUITE) against the stack's server
+./scripts/integration-test.sh --tls --free-ports --gateway-ct
 ```
 
+The script needs Postgres (`YUZU_TEST_POSTGRES_DSN`; it creates a uniquely named database and
+drops it on exit), `psql`, `openssl`, `curl`, `python3` and Erlang/OTP with `rebar3` (it builds the
+gateway release). `--free-ports` makes concurrent runs on one host safe.
+
 This test:
-- Starts the C++ server in gateway mode, with `--gateway-upstream` and `--insecure-gateway-peer` (the gateway-upstream service refuses to start without gateway peer authorization or that acknowledgement; the flag disables the check, so this script does not exercise it, and `--tls` does not make the gateway hop mutual TLS). A deferred follow-up is to run the `--tls` branch with a real pinned gateway leaf instead of the acknowledgement
-- Starts the Erlang gateway connecting to the server
+- Starts the C++ server in gateway mode with `--gateway-upstream`. The gateway-upstream service refuses to start without gateway peer authorization or an acknowledgement. The plaintext mode passes `--no-tls --insecure-gateway-peer` (the check is disabled, so that mode does not exercise it). `--tls` passes no acknowledgement: the server runs on its generated default certificates and enforces the automatic pin of its own `default-gateway.pem`, the leaf the gateway presents, so the gateway hop is pinned mutual TLS and the script asserts the server booted enforcing with that leaf's SPKI prefix and denied no call
+- Starts the Erlang gateway (the `rebar3 as prod release` build, on a generated `sys.config`) connecting to the server
 - Starts N C++ agents connecting through the gateway
 - Runs ~20 test scenarios covering connectivity, registration, heartbeats, and stability
 
@@ -177,7 +186,7 @@ open _build/test/cover/index.html
 - Check gateway logs for connection errors
 - Verify enrollment token is valid
 - Check server is in gateway mode (`--gateway-mode`)
-- If a hand-started server exits at boot with a gateway peer authorization error, it needs `--insecure-gateway-peer` (plaintext rig), a gateway key pin, or the generated default certificates; `scripts/integration-test.sh` passes `--insecure-gateway-peer` itself
+- If a hand-started server exits at boot with a gateway peer authorization error, it needs `--insecure-gateway-peer` (plaintext rig), a gateway key pin, or the generated default certificates; `scripts/integration-test.sh` passes `--insecure-gateway-peer` in its plaintext mode and relies on the automatic pin of the generated default certificates with `--tls`
 
 ### Tests time out
 - Increase timeouts in test configuration

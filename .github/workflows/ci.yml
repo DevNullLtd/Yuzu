@@ -1508,6 +1508,57 @@ jobs:
           YUZU_REQUIRE_PSQL: "1"
         run: bash tests/shell/test_gateway_peer_boot_refusal.sh
 
+      # Gateway real-wire gate (#5652, #5653): the REAL yuzu-server under test, the REAL gateway
+      # release (`rebar3 as prod release`) and one REAL yuzu-agent, brought up by
+      # scripts/integration-test.sh --tls, then gateway/apps/yuzu_gw/integration_test/
+      # yuzu_gw_real_upstream_SUITE against that server. Everything the gateway-side unit tests mock
+      # (meck on yuzu_grpc_client) is real here: every upstream RPC call site through the real gun
+      # client, the x-yuzu-session-id header of a registration replay and the server adopting that
+      # session, and the gateway->server hop PINNED OVER TLS (the server runs on its generated
+      # default certificates with no --insecure-gateway-peer, so it enforces the automatic pin of
+      # its own default-gateway.pem, which is the leaf the gateway and the suite present; a valid
+      # leaf of the same CA that is not pinned must be refused). Agents reach the gateway over
+      # one-way TLS and enrol for a per-agent leaf.
+      #
+      # Runs on the gcc-15/debug leg only (the one that already carries pg_mode=full and the PR
+      # fast path): the gateway release and the Common Test profile are built here, so the cost is
+      # a few minutes per leg, and the wire behaviour under test does not depend on the server's
+      # compiler or optimisation level. Never a silent skip: scripts/integration-test.sh has no
+      # skip path, a missing prerequisite (Postgres DSN, psql, openssl, erl/rebar3, a binary) exits
+      # non-zero, and the step fails the job on any failed check.
+      #
+      # Per-job salting (#1871: the four runner agents share ONE OS identity on ONE box). --free-ports
+      # takes all 8 ports from the OS in one allocation (no fixed 5005x/5006x/8080/8081/9568);
+      # the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on this job's
+      # YUZU_TEST_POSTGRES_DSN (the per-agent instance ensure-postgres.sh exported) and dropped on
+      # exit; the work directory is a mktemp name under runner.temp (per agent); the gateway's
+      # Erlang node name and cookie carry a per-run random salt (the release's own fixed
+      # `yuzu_gw` short name would contest the shared EPMD). Nothing is derived from a fixed value.
+      - name: Gateway real-wire test (pinned TLS)
+        id: gateway_real_wire
+        if: matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'
+        timeout-minutes: 20
+        env:
+          YUZU_BUILDDIR: ${{ github.workspace }}/build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          YUZU_IT_TMPDIR: ${{ runner.temp }}
+        run: bash scripts/integration-test.sh --tls --free-ports --gateway-ct
+
+      # A failed run keeps its work directory (scripts/integration-test.sh preserves it on any
+      # non-zero exit). Logs only: the directory also holds the run's throwaway CA and agent keys,
+      # its server config and Erlang cookie, which are not uploaded. `failure() &&` is mandatory:
+      # without a status function an `if:` that reads only a step outcome is unsatisfiable.
+      - name: Upload gateway real-wire logs on failure
+        if: failure() && steps.gateway_real_wire.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-real-wire-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/yuzu-integration.*/*.log
+            ${{ runner.temp }}/yuzu-integration.*/gw_sys.config
+            ${{ runner.temp }}/yuzu-integration.*/ct-logs
+          if-no-files-found: warn
+          retention-days: 14
+
       # Graceful shutdown is not exercisable by the Catch2 suite (which never drives main(), so
       # never installs a signal handler). Nothing in unit, integration or CI failed if it broke
       # completely — and three shutdown defects shipped and were each caught only by a human
