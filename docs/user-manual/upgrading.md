@@ -146,9 +146,10 @@ Group button and the `422` are unchanged.
 The other surfaces give no such indication for an over-long filter value. The REST agent-count
 preview and the MCP preview tool (`preview_management_group_agent_count`) answer 0, the create-group
 form says "0 agents will be added", and a direct group-from-results submit answers `422`, all with no
-reason. For a value in the 2049 bytes to about 2.6 KB band the answer 0 can be wrong: older servers
-indexed those values, so rows ingested before the upgrade still match the results page filter, but
-newly ingested ones do not and are not counted. A follow-up change will report it.
+reason. For a value in the 2049 bytes to about 2.6 KB band the answer 0 can be wrong: agents whose
+newly ingested output contains the value are not counted, because the value is not indexed (rows
+ingested before the upgrade, when older servers indexed it, are still counted). A follow-up change
+will report it.
 
 **5,000-facet cap.** Above 5,000 distinct facets in one response, the facets kept are now chosen in a
 fixed order: most lines first, then column index ascending, then value ascending. Before, they were
