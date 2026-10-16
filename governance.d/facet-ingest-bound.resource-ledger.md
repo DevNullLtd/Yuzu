@@ -16,3 +16,7 @@ No fd, HANDLE, SOCKET, `FILE*`, OpenSSL object, BCrypt handle, allocated C strin
 | test code | stack objects and the existing PG fixtures (`YUZU_REQUIRE_PG_DB_TPL`) | per test | per test scope | an RAII `std::ifstream` to read `server.cpp`; a test-local trigger and function created in the cloned test database and dropped in-test; no raw owning pointers, no threads, no temp paths or fixed ports |
 
 Platform notes: no `#ifdef` added; the bound is a plain `std::size_t`; the comparator is a captureless lambda over `std::get`. Behaviour intentionally unchanged: the 5000 facet cap value, the ingest byte cap, the schema and indexes.
+
+## Addendum: results-page hint commit (bbd9209e6)
+
+No resource added. `any_filter_value_too_long` (`dashboard_routes.cpp`) is a file-local pure function over `const std::vector<FacetFilter>&` (no ownership, no allocation); the hint is a `std::string` built into the existing `html` local of `render_results`, with `std::to_string(kMaxFacetValueBytes)` as a temporary. No `#ifdef`, no thread, no callback. Tests add two test cases and an optional `InstructionStore*` member to the existing results-fragment harness (borrowed, test-scope lifetime).
