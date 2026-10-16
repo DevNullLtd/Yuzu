@@ -178,10 +178,10 @@
          forward_guardian_message/2,
          replay_sessions/1,
          circuit_state/0]).
-%% Read without a call into this process, so it answers while the process is
-%% inside a slow RPC: the lane counts for the pressure sampler
-%% (yuzu_gw_upstream_pressure).
--export([lane_snapshot/0]).
+%% Read without a call into this process, so they answer while it is inside a
+%% slow RPC: the breaker state for /readyz (yuzu_gw_health), the lane counts for
+%% the pressure sampler (yuzu_gw_upstream_pressure).
+-export([circuit_state_now/0, lane_snapshot/0]).
 -export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
 -export([call_timeout/0]).        %% for testing (upstream_call_timeout_ms validation)
 %% The reason/stacktrace redaction format_status/1 applies, shared with the
@@ -241,18 +241,27 @@
 %% The lock-free cell: an `atomics' array behind a persistent_term, written only
 %% by this process and read by anyone. It exists because everything else this
 %% process knows is behind its mailbox, and a mailbox read waits for the RPC in
-%% progress; the pressure sampler must answer exactly when that RPC is slow.
+%% progress; the two readers (the readiness probe and the pressure sampler) must
+%% answer exactly when that RPC is slow.
 %%   IN_RPC    1 while this process is inside an RPC it makes itself (a proxied
 %%             Register or Inventory, a replay step), 0 otherwise. The notify and
 %%             Guardian workers run their RPCs in their own processes and do not
 %%             set it.
 %%   NOTIFY    stream-status notifications in flight (of MAX_NOTIFY_INFLIGHT)
 %%   GUARDIAN  Guardian forwards in flight (of MAX_GUARDIAN_INFLIGHT)
+%%   CB        the breaker state (CB_CLOSED, CB_OPEN, CB_HALF_OPEN), published by
+%%             publish_breaker/1 wherever cb_state is assigned: init/1, the
+%%             circuit_half_open timer, on_success/1 from half_open and
+%%             trip_circuit/1. A new assignment of cb_state must publish too.
 -define(CELL, {?MODULE, cell}).
--define(CELL_SLOTS, 3).
+-define(CELL_SLOTS, 4).
 -define(CELL_IN_RPC, 1).
 -define(CELL_NOTIFY, 2).
 -define(CELL_GUARDIAN, 3).
+-define(CELL_CB, 4).
+-define(CB_CLOSED, 0).
+-define(CB_OPEN, 1).
+-define(CB_HALF_OPEN, 2).
 
 %% CC-03 wire-capability handshake (proto/yuzu/gateway/v1/gateway.proto,
 %% StreamStatusNotification.wire_capabilities): the literal this gateway
@@ -410,10 +419,28 @@ forward_guardian_message(AgentId, ResponseFrame) ->
 replay_sessions(SessionIds) ->
     gen_server:cast(?SERVER, {replay_sessions, SessionIds}).
 
-%% @doc Query the current circuit breaker state (for health checks).
+%% @doc Query the current circuit breaker state by a call into this process.
+%% The call queues behind whatever RPC the process is making, so against a slow
+%% server it waits (it gives up after 5 s); /readyz reads circuit_state_now/0.
 -spec circuit_state() -> closed | open | half_open.
 circuit_state() ->
     gen_server:call(?SERVER, circuit_state, 5000).
+
+%% @doc The circuit breaker state as last published by this process, read
+%% without a call into it, so it answers while the process is inside a slow RPC.
+%% Exits with `noproc' when this process is not running, as a call would.
+-spec circuit_state_now() -> closed | open | half_open.
+circuit_state_now() ->
+    case {whereis(?SERVER), persistent_term:get(?CELL, undefined)} of
+        {Pid, Cell} when is_pid(Pid), Cell =/= undefined ->
+            case atomics:get(Cell, ?CELL_CB) of
+                ?CB_OPEN      -> open;
+                ?CB_HALF_OPEN -> half_open;
+                _             -> closed
+            end;
+        _ ->
+            exit({noproc, {?MODULE, circuit_state_now, []}})
+    end.
 
 %% @doc What the pressure sampler needs, read without a call into this process:
 %% whether it is inside an RPC of its own, how many messages wait in its mailbox,
@@ -443,26 +470,39 @@ lane_snapshot() ->
             undefined
     end.
 
-%% Create the cell on first use and zero it on every start, so a restarted
-%% process never inherits the previous one's `in an RPC'. The term is put once
-%% and kept: replacing a persistent_term makes the VM scan every process.
+%% Create the cell on first use and zero the lane slots on every start, so a
+%% restarted process never inherits the previous one's `in an RPC'. The breaker
+%% slot is not zeroed here: init/1 publishes its initial state. The term is put
+%% once and kept: replacing a persistent_term makes the VM scan every process.
+%% A cell with fewer slots than this module uses (one put by an older version of
+%% it, still loaded in this VM) is replaced, once.
 init_cell() ->
     Cell = case persistent_term:get(?CELL, undefined) of
                undefined ->
-                   New = atomics:new(?CELL_SLOTS, [{signed, false}]),
-                   persistent_term:put(?CELL, New),
-                   New;
+                   new_cell();
                Existing ->
-                   Existing
+                   case atomics:info(Existing) of
+                       #{size := Size} when Size >= ?CELL_SLOTS -> Existing;
+                       _                                        -> new_cell()
+                   end
            end,
-    [atomics:put(Cell, Slot, 0) || Slot <- lists:seq(1, ?CELL_SLOTS)],
+    [atomics:put(Cell, Slot, 0) || Slot <- [?CELL_IN_RPC, ?CELL_NOTIFY, ?CELL_GUARDIAN]],
     ok.
+
+new_cell() ->
+    Cell = atomics:new(?CELL_SLOTS, [{signed, false}]),
+    persistent_term:put(?CELL, Cell),
+    Cell.
 
 cell_put(Slot, Value) ->
     case persistent_term:get(?CELL, undefined) of
         undefined -> ok;
         Cell      -> atomics:put(Cell, Slot, Value)
     end.
+
+publish_breaker(closed)    -> cell_put(?CELL_CB, ?CB_CLOSED);
+publish_breaker(open)      -> cell_put(?CELL_CB, ?CB_OPEN);
+publish_breaker(half_open) -> cell_put(?CELL_CB, ?CB_HALF_OPEN).
 
 %% Run an RPC this process makes itself, one at a time, with the lane marked busy
 %% for as long as it lasts.
@@ -548,7 +588,7 @@ init_state(ClusterId) ->
 
     ok = init_cell(),
 
-    {ok, #state{
+    State = #state{
         notify_pids     = #{},
         notify_pending  = yuzu_gw_notify_queue:new(NotifyPendingMax),
         notify_pending_max = NotifyPendingMax,
@@ -567,7 +607,9 @@ init_state(ClusterId) ->
         replay_queue_max = QueueMax,
         guardian_pids   = #{},
         cluster_id      = ClusterId
-    }}.
+    },
+    publish_breaker(State#state.cb_state),
+    {ok, State}.
 
 %% The effective cap: the configured one, or the initial duration when the cap is
 %% below it. The warning names the configuration that did not take effect: the
@@ -947,6 +989,7 @@ handle_info(circuit_half_open, #state{cb_gen = Gen} = State) ->
     %% The only entry into half_open, so the only place the generation moves. A
     %% held notification is sent as the probe (drain/1).
     Before = notify_counts(State),
+    publish_breaker(half_open),
     State1 = State#state{cb_state = half_open, cb_timer = undefined, cb_gen = Gen + 1},
     {noreply, report_notify_counts(Before, drain(State1))};
 
@@ -1376,6 +1419,7 @@ on_success(#state{cb_state = half_open, cb_base_timeout = BaseTimeout} = State) 
     telemetry:execute([yuzu, gw, upstream, circuit_state],
                       #{count => 1},
                       #{state => <<"closed">>}),
+    publish_breaker(closed),
     {State#state{
         cb_state      = closed,
         cb_failures   = 0,
@@ -1406,6 +1450,7 @@ trip_circuit(#state{cb_cur_timeout = CurTimeout, cb_max_timeout = MaxTimeout} = 
                       #{count => 1},
                       #{state => <<"open">>}),
 
+    publish_breaker(open),
     State#state{
         cb_state      = open,
         cb_cur_timeout = NewTimeout,

@@ -201,9 +201,13 @@ check_upstream_tls_files() ->
     {<<"upstream_tls_files">>,
      lists:all(fun(N) -> yuzu_grpc_client_channel:config_error(N) =:= none end, Names)}.
 
+%% Read from the state the upstream process publishes, never by a call into it:
+%% a call queues behind the RPC in progress, so against a slow server it waited
+%% out its 5 s timeout and /readyz answered 503 with the breaker closed (#5680).
+%% Not running is not ready: circuit_state_now/0 then exits, as a call would.
 check_circuit_breaker() ->
     try
-        case yuzu_gw_upstream:circuit_state() of
+        case yuzu_gw_upstream:circuit_state_now() of
             closed    -> {<<"circuit_breaker">>, true};
             half_open -> {<<"circuit_breaker">>, true};  % allowing probes
             open      -> {<<"circuit_breaker">>, false}

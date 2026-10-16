@@ -1130,7 +1130,9 @@ no other process. `/readyz` answers 200 only when every check in its body passes
 `not_ready` otherwise: the registry, upstream, agent supervisor and router processes are alive
 (`registry`, `upstream`, `agent_sup`, `router`); the registry's session index table exists
 (`sessions_index`); no upstream channel's latest connection attempt failed on unusable TLS
-files (`upstream_tls_files`); the upstream circuit breaker is not open (`circuit_breaker`); and
+files (`upstream_tls_files`); the upstream circuit breaker is not open (`circuit_breaker`, read
+from the state the upstream process publishes rather than by a call into it, so it answers at
+once while that process is inside a slow RPC); and
 every configured listener is running (its Ranch listener `{yuzu_grpc, Name}` reports `running`,
 shown as `listeners`) with at least one of them routing the AgentService (the same rule as boot: the entry's `services` map has the key `'yuzu.agent.v1.AgentService'`); an empty list, or a list with no entry that routes it, is ready only with `allow_no_listeners` set to `true`. The `listeners` check asks
 Ranch and does not connect to the ports, and the `upstream` check tests only that the process is
@@ -3039,12 +3041,14 @@ What it does not tell apart, and does not do:
   server that answers every call in 3 to 5 s never opens it; this is how that case is seen. What
   the gateway should do about it is open (#5681). The process still runs one RPC at a time
   (#5381).
-- A slow server is not a readiness input, and `/readyz` is not immune to one: its
-  `circuit_breaker` check calls the `yuzu_gw_upstream` process, so while that process is inside a
-  slow RPC the call can wait out its 5 s timeout and `/readyz` can answer 503 with the breaker
-  closed (INFERRED from the code, and a call into the stuck process was seen to time out in a test;
-  the 503 was not observed end to end). A load balancer probing `/readyz` can then take the gateway
-  out of rotation while the server is slow (#5680).
+- A slow server is not a readiness input. The `/readyz` `circuit_breaker` check reads the breaker
+  state the `yuzu_gw_upstream` process publishes at each breaker transition, without a call into
+  that process, so it answers at once while the process is inside a slow RPC: a closed breaker
+  reads `true`, and a slow server alone does not turn `/readyz` 503 (#5680). Before this, the
+  check called the process, waited out its 5 s timeout behind the RPC in progress and reported
+  `circuit_breaker` false with the breaker closed. Covered by a unit test against a mocked server
+  whose RPC does not return (`circuit_breaker` true within the test's 2 s bound; the old check
+  answered false after 5 s), not run against a live server.
 - One alert ships: `YuzuGatewayUpstreamSlow` (warning) fires when `yuzu_gw_upstream_slow` has been 1
   for 5 minutes, per gateway, so with many gateways behind one slow server they fire together and
   its alert name should be grouped in Alertmanager. The threshold and window are initial values,
