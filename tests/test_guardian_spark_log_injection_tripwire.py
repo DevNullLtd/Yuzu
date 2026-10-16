@@ -182,8 +182,12 @@ not covered here. The same rule keyed on a store `.error()` argument covers conf
 
 A seventh, narrower rule (PKI_SIGNER_FILES, server/core/src/server.cpp only) covers the PKI signer
 legs of the Register / ProxyRegister path: an spdlog:: statement whose format literal starts with
-"PKI:" must wrap a bare `agent_id` argument and any `.what()` argument. It is not the broad
-bare-name rule and does not apply to the rest of server.cpp.
+"PKI:" must wrap a bare `agent_id` argument (only `.size()`, `.empty()` and `.length()` on it are
+exempt), any `.what()` argument and any store `.error()` argument. It is not the broad bare-name
+rule and does not apply to the rest of server.cpp. server.cpp is also NOT in the sixth guard
+(UNSCANNED_LOGGING_FILES): it makes one legitimate non-logging use of the default logger
+(`spdlog::default_logger()->level()` in the log-level report), which the guard
+would fail on; it has no `spdlog::log(` or `SPDLOG_*(` use.
 
 WHAT THE SECOND CHECK DELIBERATELY DOES NOT COVER (session-resolved ids). Log lines that print an
 agent id read back from the session table or the enrollment store print it as stored: the
@@ -191,9 +195,11 @@ Heartbeat / BatchHeartbeat and ReportInventory / ProxyInventory ingest paths and
 ingestion modules they call, the Subscribe stream open and close lines, and the registry's removal
 and sweep lines (in agent_registry.cpp only claimed ids from `info.agent_id()` are matched).
 AuthDB's agent-id check (`agent_id_ok`, auth_db.cpp) has already refused control bytes and ',' for
-such an id, so it cannot add a physical log line, but an id enrolled before the new-id charset gate
-(`auth::is_valid_new_agent_id`) may still contain a space, '=' or a non-ASCII byte, and so can add
-same-line key=value tokens. The `ex.what()` of the ingest catch-alls on those paths is likewise
+such an id, so it cannot add a newline-delimited line (it does accept U+0085, U+2028 and U+2029,
+which a splitlines()-style reader treats as breaks), but an id enrolled or imported before the
+new-id charset gate (`auth::is_valid_new_agent_id`; the legacy cfg import in
+enrollment_cfg_import.cpp does not apply it) may still contain a space, '=' or a non-ASCII byte,
+and so can add same-line key=value tokens. The `ex.what()` of the ingest catch-alls on those paths is likewise
 printed as-is. This is a stated limit of the check, not a claim that those lines are neutralised.
 
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml,
@@ -1152,15 +1158,23 @@ def find_command_text_violations_in_text(text: str) -> list[tuple[int, str]]:
 # Seventh, narrower rule: the PKI signer legs in server.cpp. The Register / ProxyRegister signer
 # (the `cert_signer` lambda and `sign_agent_csr`) prints the claimed `agent_id` and, on a throw,
 # `e.what()`. In server.cpp, an spdlog statement whose format literal starts with "PKI:" must not
-# print a bare `agent_id` or an `e.what()` argument: each must be wholly one wrap call. This is
+# print a bare `agent_id`, an `e.what()` argument or a store `.error()` argument: each must be
+# wholly one wrap call. Only `agent_id.size()` / `.empty()` / `.length()` is exempt. This is
 # deliberately NOT the broad bare-name rule of AGENT_ID_FILES (server.cpp is a very large file in
 # which `agent_id` is a common name outside the PKI lines). Lexical: it reads the literal's prefix
 # and the argument text, so a PKI line whose literal does not start with "PKI:", or an id copied
 # into another local first, is not seen.
 PKI_SIGNER_FILES: tuple[str, ...] = ("server/core/src/server.cpp",)
 
-_PKI_BARE_AGENT_ID_RE = re.compile(r"(?<![\w.>:])agent_id\b(?!\s*[(.])")
+# Only a size / emptiness / length test of the bare local is exempt; `agent_id.c_str()`,
+# `agent_id.substr(...)` and the like still print (a view of) the claimed bytes.
+_PKI_BARE_AGENT_ID_RE = re.compile(
+    r"(?<![\w.>:])agent_id\b(?!\s*\.\s*(?:size|empty|length)\s*\()"
+)
 _PKI_WHAT_RE = re.compile(r"\.what\(\)")
+# A store / ca_store `std::expected` error string (`root_or_err.error()`): not agent data, but it
+# can quote the stored row, so it is wrapped like the other free-text store errors.
+_PKI_STORE_ERROR_RE = re.compile(r"\.error\(\)")
 
 
 def find_pki_signer_violations_in_text(text: str) -> list[tuple[int, str]]:
@@ -1170,7 +1184,11 @@ def find_pki_signer_violations_in_text(text: str) -> list[tuple[int, str]]:
         if parsed is None or not parsed[0].lstrip().startswith("PKI:"):
             continue
         for arg in split_top_level_args(parsed[1]):
-            raw = _PKI_BARE_AGENT_ID_RE.search(arg) is not None or _PKI_WHAT_RE.search(arg) is not None
+            raw = (
+                _PKI_BARE_AGENT_ID_RE.search(arg) is not None
+                or _PKI_WHAT_RE.search(arg) is not None
+                or _PKI_STORE_ERROR_RE.search(arg) is not None
+            )
             if raw and not argument_is_wrapped(arg):
                 out.append((text.count("\n", 0, pos) + 1, stmt))
                 break
@@ -1185,6 +1203,8 @@ def find_pki_signer_violations_in_text(text: str) -> list[tuple[int, str]]:
 # (`spdlog::default_logger()->level()`, line 38) to report the effective log level and never logs
 # through it, so the guard would fail on a non-logging use. Its spdlog:: calls are all the
 # `spdlog::<level>(` form the other rules parse.
+# server.cpp (PKI_SIGNER_FILES) is left out for the same reason: its one `default_logger` use is the
+# same kind of level read, not a log call.
 UNSCANNED_LOGGING_FILES: tuple[str, ...] = tuple(
     f for f in AGENT_ID_FILES if f != "server/core/src/config_routes.cpp"
 ) + ("server/core/src/pg/pg_pool.cpp",)
@@ -1687,6 +1707,12 @@ def _selfcheck() -> None:
         " agent_id);",
         'spdlog::warn("PKI: x {}", "a=" + agent_id);',
         'spdlog::warn("PKI: x {}", ::yuzu::log_id_token(a) + agent_id);',
+        'spdlog::warn("PKI: x {}", agent_id.c_str());',
+        'spdlog::warn("PKI: x {}", agent_id.substr(0, 8));',
+        'spdlog::error("PKI: read failed: {}", root_or_err.error());',
+        'spdlog::error("PKI: read failed: {}", ca_store_->get_root().error());',
+        'spdlog::error("PKI: list failed ({}) for {}", ::yuzu::log_key_token(r.error()) + "x",'
+        " e.error());",
     ]
     for src in pki_must_match:
         if not find_pki_signer_violations_in_text(src):
@@ -1696,6 +1722,11 @@ def _selfcheck() -> None:
         'spdlog::error("PKI: x ({}) for {}", ::yuzu::log_key_token(e.what()),'
         " ::yuzu::log_id_token(agent_id));",
         'spdlog::warn("PKI: n {}", agent_id.size());',
+        'spdlog::warn("PKI: n {}", agent_id.empty());',
+        'spdlog::warn("PKI: n {}", agent_id . length ());',
+        'spdlog::error("PKI: read failed: {}", ::yuzu::log_key_token(root_or_err.error()));',
+        'spdlog::error("PKI: read failed: {}", ::yuzu::log_key_token(r.error()),'
+        " ::yuzu::log_id_token(agent_id));",
         'spdlog::warn("PKI: x {}", rev.agent_id);',
         'spdlog::warn("PKI: x {}", my_agent_id);',
         'spdlog::warn("PKI: initial CRL publish failed: {}", err);',

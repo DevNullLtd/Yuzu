@@ -737,16 +737,7 @@ public:
         // Register / ProxyRegister agent_id shape refusals (#5513). Pre-seeded to 0 for every
         // closed-set combination per docs/observability-conventions.md: the direct Register series
         // carries only `reason`, the gateway path adds source="gateway_proxy".
-        metrics_.describe("yuzu_register_invalid_agent_id_total",
-                          "Register/ProxyRegister requests refused because of the shape of "
-                          "the agent id (reason: length/nul/control/charset; source "
-                          "gateway_proxy for the gateway path)",
-                          "counter");
-        for (auto reason : kRegisterInvalidAgentIdReasons) {
-            metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", reason}});
-            metrics_.counter("yuzu_register_invalid_agent_id_total",
-                             {{"reason", reason}, {"source", "gateway_proxy"}});
-        }
+        seed_register_invalid_agent_id_series(metrics_);
 
         // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
         // per docs/observability-conventions.md so absent() alerts stay
@@ -8287,7 +8278,7 @@ public:
                 spdlog::error("PKI: get_root() failed while wiring per-agent mTLS at boot ({}) — "
                               "refusing to start rather than serve with revocation enforcement "
                               "unwired",
-                              root_or_err.error());
+                              ::yuzu::log_key_token(root_or_err.error()));
                 startup_failed_ = true;
                 // Bare return, not fall-through: nothing has called BuildAndStart yet at this
                 // point in run() (same precedent as the TLS-credential failures a few dozen
@@ -9156,7 +9147,7 @@ public:
                                       "list_revoked_serials() failed ({}); live Subscribe "
                                       "streams left untouched rather than treated as "
                                       "mass-revoked",
-                                      revoked_or_err.error());
+                                      ::yuzu::log_key_token(revoked_or_err.error()));
                         metrics_.counter("yuzu_server_ca_revocation_sweep_read_failures_total")
                             .increment();
                     } else {
@@ -11347,7 +11338,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: agent CSR signing aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return std::nullopt;
         }
         auto& root = *root_or_err;
@@ -11395,7 +11386,7 @@ private:
                 // revocation-bypass guard below — fail closed (refuse to issue) rather than
                 // treat "couldn't read the revoked set" as "nothing is revoked".
                 spdlog::error("PKI: agent CSR signing aborted — list_revoked failed: {}",
-                              revoked_or_err.error());
+                              ::yuzu::log_key_token(revoked_or_err.error()));
                 return std::nullopt;
             }
             const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
@@ -11601,7 +11592,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: code-signing issuance aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return std::unexpected("ca store read failed");
         }
         auto& root = *root_or_err;
@@ -11729,7 +11720,7 @@ private:
             // it out (mirrors sign_agent_csr's record_issued failure path).
             spdlog::error(
                 "PKI: failed to record issued code-signing cert for {} — not issuing: {}", label,
-                rec_result.error());
+                ::yuzu::log_key_token(rec_result.error()));
             return std::unexpected("failed to record issued certificate");
         }
 
@@ -11764,7 +11755,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: CA CSR export aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return std::nullopt;
         }
         auto& root = *root_or_err;
@@ -11814,7 +11805,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: subordinate import aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return CaRoutes::ImportOutcome::StoreError;
         }
         auto& root = *root_or_err;
@@ -11881,7 +11872,7 @@ private:
                                 .count();
         if (auto set_result = ca_store_->set_root(updated); !set_result) {
             spdlog::error("PKI: subordinate import validated but set_root failed: {}",
-                          set_result.error());
+                          ::yuzu::log_key_token(set_result.error()));
             return CaRoutes::ImportOutcome::StoreError;
         }
         spdlog::warn("PKI: issuing identity switched to SUBORDINATE — intermediate {} now chains "

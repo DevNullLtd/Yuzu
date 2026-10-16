@@ -1307,14 +1307,13 @@ TEST_CASE("kRegisterInvalidAgentIdReasons is exactly the closed reason set the R
                                           kRegisterInvalidAgentIdReasons.end());
     CHECK(actual == expected);
 
-    // A pre-seeded series reads 0 and is the same series a later rejection increments.
+    // The REAL seed function ServerImpl calls at construction: a pre-seeded series reads 0 and is
+    // the same series a later rejection increments, and the family carries its HELP/TYPE lines.
     yuzu::MetricsRegistry m;
-    for (const auto* reason : kRegisterInvalidAgentIdReasons) {
-        m.counter("yuzu_register_invalid_agent_id_total", yuzu::Labels{{"reason", reason}});
-        m.counter("yuzu_register_invalid_agent_id_total",
-                  yuzu::Labels{{"reason", reason}, {"source", "gateway_proxy"}});
-    }
+    yuzu::server::seed_register_invalid_agent_id_series(m);
     const auto text = m.serialize();
+    CHECK(text.find("# HELP yuzu_register_invalid_agent_id_total ") != std::string::npos);
+    CHECK(text.find("# TYPE yuzu_register_invalid_agent_id_total counter") != std::string::npos);
     for (const auto& reason : expected) {
         CHECK(text.find("yuzu_register_invalid_agent_id_total{reason=\"" + reason + "\"} 0") !=
               std::string::npos);
