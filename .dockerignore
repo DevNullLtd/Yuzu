@@ -42,6 +42,8 @@ gateway/rebar3.crashdump
 gateway/test_ebin/
 
 # UAT / test artifacts
+# Git ignore rules do not exclude files from a Docker build context.
+/.agent-runs/
 .uat/
 test_output.txt
 test_xml.txt

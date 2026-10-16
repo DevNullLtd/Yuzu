@@ -965,6 +965,33 @@ jobs:
             echo "::error::expected exactly one YuzuAgent-*.pkg in the release, found ${#PKGS[@]}: ${PKGS[*]}"
             exit 1
           fi
+          CHAIN=(/usr/local /usr/local/lib /usr/local/lib/yuzu /usr/local/bin)
+          for d in "${CHAIN[@]}"; do [ -e "$d" ] && /usr/bin/stat -f '%Su:%Sg %Sp %N' "$d"; done
+          # The hosted image creates /usr/local/bin as runner:admin 775
+          # (actions/runner-images configure-machine.sh), which the installer
+          # must refuse for the loose lane before installing anything (#4482).
+          loose=0
+          for d in "${CHAIN[@]}"; do
+            [ -e "$d" ] || continue
+            [ "$(/usr/bin/stat -f '%u' "$d")" = 0 ] && [ $(( 8#$(/usr/bin/stat -f '%Lp' "$d") & 8#022 )) = 0 ] || loose=1
+          done
+          if [ "$loose" = 1 ]; then
+            echo "Checking the refusal on the loosened /usr/local chain"
+            if sudo installer -pkg "${PKGS[0]}" -target / -verboseR; then
+              echo "::error::the installer accepted an untrusted /usr/local chain"; exit 1
+            fi
+            test ! -e /usr/local/bin/yuzu-agent || { echo "::error::refused install left a binary"; exit 1; }
+            grep -q 'must be root-owned and not group/world writable' /var/log/install.log ||
+              { echo "::error::refusal reason missing from install.log"; exit 1; }
+            echo "PASS: untrusted /usr/local chain refused; nothing installed"
+            # An administrator's remediation: root-own the chain, drop group/world write.
+            for d in "${CHAIN[@]}"; do
+              [ -e "$d" ] || continue
+              sudo chown root:wheel "$d"; sudo chmod go-w "$d"
+            done
+          else
+            echo "::notice::the hosted image's /usr/local chain is already trusted; the refusal path was not exercised"
+          fi
           echo "Installing: ${PKGS[0]}"
           sudo installer -pkg "${PKGS[0]}" -target / -verboseR
 
@@ -973,6 +1000,11 @@ jobs:
           test -x /usr/local/bin/yuzu-agent && echo "PASS: binary installed" || { echo "FAIL: binary missing"; exit 1; }
           /usr/local/bin/yuzu-agent --version || { echo "FAIL: --version exited $?"; exit 1; }
           test -f /Library/LaunchDaemons/com.yuzu.agent.plist && echo "PASS: launchd plist installed" || { echo "FAIL: plist missing"; exit 1; }
+          # A first install with no server trust anchor is installed, not started (#4482).
+          if sudo launchctl print system/com.yuzu.agent >/dev/null 2>&1; then
+            echo "FAIL: an unconfigured first install was loaded"; exit 1
+          fi
+          echo "PASS: unconfigured first install left unloaded"
           # Same floor as the Windows job: an install with no plugins is an
           # agent that can do nothing, and used to pass here.
           PLUGINS=$(find /usr/local/lib/yuzu/plugins -maxdepth 1 -name '*.dylib' 2>/dev/null | wc -l | tr -d ' ')

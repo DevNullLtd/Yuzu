@@ -36,6 +36,7 @@ power_health_plugin_lib = shared_library(
   include_directories: include_directories('../../shared'),
   dependencies: power_health_deps,
   objcpp_args: power_health_objcpp_args,
+  link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',
 )

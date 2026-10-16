@@ -36,11 +36,8 @@ elif host_machine.system() == 'darwin'
   # so this dependency() call is required: true — a failure here is a real
   # toolchain problem, not an optional-capability fallback. (EndpointSecurity
   # is NOT a counter-example of an SDK-gated framework — despite a long-
-  # standing myth, it ships lib+header in both SDKs too. Its top-level probe
-  # in THIS tree is still the broken required:false appleframeworks one
-  # (correctly documented as such at the probe site, meson.build's darwin
-  # block); a sibling slice (feat/macos-spark-a0.5-es-probe, not yet merged
-  # onto this branch) will switch it to cxx.find_library()+cxx.has_header(),
+  # standing myth, it ships lib+header in both SDKs too; the top-level probe
+  # in meson.build's darwin block uses cxx.find_library()+cxx.has_header(),
   # which finds it on either SDK — see docs/darwin-compat.md's
   # EndpointSecurity row.) See docs/darwin-compat.md
   # and docs/native-objcpp-conventions.md.
@@ -63,6 +60,7 @@ wifi_plugin_lib = shared_library(
   dependencies: wifi_deps,
   cpp_args: wifi_cpp_args,
   objcpp_args: wifi_objcpp_args,
+  link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',
 )

@@ -2024,10 +2024,9 @@ public:
                     current_executable_path());
                 set_updater(updater);
 
-                if (updater->rollback_if_needed()) {
+                if (updater->perform_startup_maintenance()) {
                     spdlog::warn("OTA rollback was triggered - running previous binary");
                 }
-                updater->cleanup_old_binary();
             }
 
             // 4. Open Subscribe bidi stream
@@ -3326,7 +3325,7 @@ public:
                     }
 
                     // Write health marker after first successful read (OTA rollback guard)
-                    if (!update_verified) {
+                    if (cfg_.auto_update && !update_verified) {
                         update_verified = true;
                         auto marker =
                             current_executable_path().parent_path() / ".yuzu-update-verified";
