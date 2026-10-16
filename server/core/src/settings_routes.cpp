@@ -874,19 +874,13 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
         return "<span class=\"muted\">API token store unavailable.</span>";
     }
 
+    // The shared chrono formatter, not gmtime/strftime: an expiry past year 3000 made MSVC's
+    // gmtime_s fail and strftime terminate the process, and POSIX printed a bogus date. A value
+    // outside 1970..9999 reads "out of range".
     auto fmt_epoch = [](int64_t epoch) -> std::string {
         if (epoch == 0)
             return "Never";
-        auto tt = static_cast<std::time_t>(epoch);
-        std::tm tm_buf{};
-#ifdef _WIN32
-        gmtime_s(&tm_buf, &tt);
-#else
-        gmtime_r(&tt, &tm_buf);
-#endif
-        char buf[32]{};
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-        return std::string(buf) + " UTC";
+        return enrolment::utc_stamp_epoch_secs(epoch);
     };
 
     // Scope by caller principal for non-admin sessions. list_tokens already
@@ -1027,19 +1021,13 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                "(not configured — requires PostgreSQL, design doc §3.1).</span>";
     }
 
+    // The shared chrono formatter, not gmtime/strftime: an expiry past year 3000 made MSVC's
+    // gmtime_s fail and strftime terminate the process, and POSIX printed a bogus date. A value
+    // outside 1970..9999 reads "out of range".
     auto fmt_epoch = [](int64_t epoch) -> std::string {
         if (epoch == 0)
             return "—";
-        auto tt = static_cast<std::time_t>(epoch);
-        std::tm tm_buf{};
-#ifdef _WIN32
-        gmtime_s(&tm_buf, &tt);
-#else
-        gmtime_r(&tt, &tm_buf);
-#endif
-        char buf[32]{};
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-        return std::string(buf) + " UTC";
+        return enrolment::utc_stamp_epoch_secs(epoch);
     };
 
     // Admin/auditor list surface — every engine principal, any lifecycle
@@ -1286,16 +1274,7 @@ namespace {
 std::string ar_fmt_epoch_ms(int64_t epoch_ms) {
     if (epoch_ms == 0)
         return "n/a";
-    auto tt = static_cast<std::time_t>(epoch_ms / 1000);
-    std::tm tm_buf{};
-#ifdef _WIN32
-    gmtime_s(&tm_buf, &tt);
-#else
-    gmtime_r(&tt, &tm_buf);
-#endif
-    char buf[32]{};
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-    return std::string(buf) + " UTC";
+    return enrolment::utc_stamp_epoch_secs(epoch_ms / 1000);
 }
 
 /// The self-contained JS helper block for the Access Reviews fragment's

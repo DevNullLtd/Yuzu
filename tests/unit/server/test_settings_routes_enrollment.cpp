@@ -69,6 +69,7 @@ constexpr const char* kForm = "application/x-www-form-urlencoded";
 /// AuthDB. Declared so the sink comes AFTER the route owner it registers.
 struct EnrollRoutesHarness {
     std::unique_ptr<yuzu::test::AuthDbPgShared> auth_db; // null => store unavailable
+    std::unique_ptr<ApiTokenStore> api_tokens;           // only when asked for (with_api_tokens)
     Config cfg{};
     auth::AuthManager auth_mgr{};
     auth::AutoApproveEngine auto_approve{};
@@ -85,10 +86,14 @@ struct EnrollRoutesHarness {
     std::vector<auth::AutoApproveRule> rules_at_attempt; ///< engine state seen BY the attempt hook
     bool mode_at_attempt{false};
 
-    explicit EnrollRoutesHarness(bool with_store = true) {
+    explicit EnrollRoutesHarness(bool with_store = true, bool with_api_tokens = false) {
         if (with_store) {
             auth_db = std::make_unique<yuzu::test::AuthDbPgShared>();
             auth_mgr.set_auth_db(auth_db->get());
+            if (with_api_tokens) {
+                api_tokens = std::make_unique<ApiTokenStore>(auth_db->pool());
+                REQUIRE(api_tokens->is_open());
+            }
         }
         auto auth_fn = [this](const httplib::Request&, httplib::Response&)
             -> std::optional<auth::Session> {
@@ -133,7 +138,7 @@ struct EnrollRoutesHarness {
         auto gateway_count_fn = []() -> std::size_t { return 0; };
         auto agents_json_fn = []() -> std::string { return "[]"; };
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
-                               auto_approve, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                               auto_approve, api_tokens.get(), nullptr, nullptr, nullptr, nullptr, nullptr,
                                /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
                                oidc_mu, oidc_provider, /*metrics_registry=*/nullptr,
                                /*step_up_fn=*/{}, audit_read_fn);
@@ -1467,6 +1472,36 @@ TEST_CASE("settings enrollment: a year-9999 expiry is listed Active and never as
     REQUIRE(pill != std::string::npos);
     CHECK(res->body.substr(pill, res->body.find("</span>", pill) - pill) == "pill info\">Active");
     CHECK(res->body.find("pill warn") == std::string::npos);
+}
+
+// The API-token table formatted its dates with gmtime_s/gmtime_r + strftime on the raw epoch. An
+// expiry past year 3000 makes MSVC's gmtime_s fail and the following strftime terminate the
+// process; POSIX printed a bogus date. The caller chooses a human token's expiry, so any int64
+// can be stored. A value outside 1970..9999 reads "out of range", never a crash or a fake date.
+TEST_CASE("settings enrollment: an API token with a far-future expiry renders without a CRT date call",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h(/*with_store=*/true, /*with_api_tokens=*/true);
+    const auto make = [&](const char* name, std::int64_t expires_at) {
+        auto raw = h.api_tokens->create_token(name, "admin", expires_at);
+        REQUIRE(raw.has_value());
+    };
+    make("last-second", 253'402'300'799);       // 9999-12-31 23:59:59 UTC
+    make("past-9999", 253'402'300'800);         // year 10000
+    make("huge", 9'000'000'000'000'000'000);    // far past anything gmtime can take
+
+    auto res = h.sink.Get("/fragments/settings/api-tokens");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto row_of = [&](const std::string& name) {
+        const auto at = res->body.find("<td>" + name + "</td>");
+        REQUIRE(at != std::string::npos);
+        return res->body.substr(at, res->body.find("</tr>", at) - at);
+    };
+    CHECK(row_of("last-second").find("<td>9999-12-31 23:59 UTC</td>") != std::string::npos);
+    CHECK(row_of("past-9999").find("<td>out of range</td>") != std::string::npos);
+    CHECK(row_of("huge").find("<td>out of range</td>") != std::string::npos);
+    // The created column is today's date, formatted by the same helper.
+    CHECK(row_of("huge").find(" UTC</td>") != std::string::npos);
 }
 
 TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as Active",
