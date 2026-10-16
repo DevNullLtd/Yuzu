@@ -634,6 +634,21 @@ const char* const kSettingsPageTemplate =
       showToast(d.message || 'Done', d.level || 'success');
     });
 
+    /* ── Enrollment token form: the "unlimited" hint hides once either limit is
+       finite. The Groups page does the same in yuzu-groups.js (this page does
+       not load it). ── */
+    document.addEventListener('input', function(e) {
+      var f = e.target.closest('[data-token-form]');
+      if (!f) return;
+      var zero = function(n) {
+        var i = f.querySelector('[name="' + n + '"]');
+        var v = i ? i.value.trim() : '';
+        return v === '' || /^0+$/.test(v);
+      };
+      var w = f.querySelector('[data-token-unlimited]');
+      if (w) w.hidden = !(zero('max_uses') && zero('ttl_hours'));
+    });
+
     /* ── Two-click confirm for bulk destructive operations ── */
     function twoClickConfirm(btn, action) {
       if (btn.dataset.confirming === 'true') {

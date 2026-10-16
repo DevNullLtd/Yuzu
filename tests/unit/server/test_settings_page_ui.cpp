@@ -99,3 +99,15 @@ TEST_CASE("Settings page keeps the td-level state colours", "[settings][settings
     CHECK(count_of(html, ".user-table td.muted { color: var(--mut); }") == 1);
     CHECK(count_of(html, ".user-table td.feedback-error { color: var(--bad); }") == 1);
 }
+
+TEST_CASE("Settings page hides the unlimited-token hint once a limit is typed",
+          "[settings][settings_page]") {
+    // The enrolment-token fragment always renders the hint; the Settings page does not load
+    // yuzu-groups.js, so its own script must follow the two limit fields. The logic is the
+    // same as the Groups glue (pinned in test_groups_js.cpp).
+    const std::string html = kSettingsHtml;
+    CHECK(count_of(html, "document.addEventListener('input'") == 1);
+    CHECK(count_of(html, "closest('[data-token-form]')") == 1);
+    CHECK(count_of(html, "querySelector('[data-token-unlimited]')") == 1);
+    CHECK(count_of(html, "zero('max_uses') && zero('ttl_hours')") == 1);
+}
