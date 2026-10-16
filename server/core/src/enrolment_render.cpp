@@ -70,19 +70,33 @@ const char* rule_suffix(AutoApproveRuleType t) {
     return t == AutoApproveRuleType::hostname_glob ? " (not verified)" : "";
 }
 
-// Static-confirm copy for one rule's Enable / Disable and Remove, by match mode. In "all" mode
-// every enabled rule is REQUIRED, so enabling narrows and disabling or removing widens.
-std::string enable_confirm(bool require_all) {
-    return require_all ? "Require this rule as well? Fewer agents will join without approval."
-                       : "Enable this rule? Matching agents join without approval.";
+// Static-confirm copy for one rule's Enable / Disable and Remove, by match mode AND by how many
+// rules are enabled (`enabled_count`). In "all" mode every enabled rule is REQUIRED, so enabling
+// narrows and disabling or removing widens, with one exception at each end: with ZERO enabled
+// rules the engine matches nobody (auto_approve.cpp evaluate), so enabling the first rule WIDENS
+// admission from nobody to whatever that rule matches, and disabling or removing the LAST
+// enabled rule leaves nobody admitted.
+std::string enable_confirm(bool require_all, std::size_t enabled_count) {
+    if (!require_all || enabled_count == 0)
+        return "Enable this rule? Matching agents will join without approval.";
+    return "Require this rule as well? Fewer agents will join without approval.";
 }
-std::string disable_confirm(bool require_all) {
-    return require_all ? "Stop requiring this rule? More agents may join without approval." : "";
+std::string disable_confirm(bool require_all, std::size_t enabled_count) {
+    if (!require_all)
+        return "";
+    if (enabled_count <= 1)
+        return "Disable the last enabled rule? No agent will join without approval until a rule "
+               "is enabled.";
+    return "Stop requiring this rule? More agents may join without approval.";
 }
-std::string remove_confirm(bool require_all, bool enabled) {
-    if (require_all && enabled)
+std::string remove_confirm(bool require_all, bool enabled, std::size_t enabled_count) {
+    if (require_all && enabled) {
+        if (enabled_count <= 1)
+            return "Remove this auto-approve rule? It is the last enabled rule, so no agent will "
+                   "join without approval until a rule is enabled.";
         return "Remove this auto-approve rule? It is currently required, so more agents may join "
                "without approval.";
+    }
     return "Remove this auto-approve rule?";
 }
 
@@ -401,6 +415,8 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
         html += "<div class=\"empty\"><b>No auto-approve rules.</b>"
                 "<span>New agents wait for approval.</span></div>";
     } else {
+        const auto enabled_count = static_cast<std::size_t>(
+            std::count_if(rules.begin(), rules.end(), [](const auto& r) { return r.enabled; }));
         html += "<div class=\"tw\"><table><thead><tr><th>Rule</th><th>Label</th><th>State</th>"
                 "<th></th></tr></thead><tbody>";
         for (std::size_t i = 0; i < rules.size(); ++i) {
@@ -415,14 +431,15 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
                     (r.enabled ? pill("info", "Enabled") : pill("idle", "Disabled")) +
                     "</td><td class=\"acts\">";
             // Enabling widens (any mode) or narrows (all mode); the copy says which.
-            const std::string q = r.enabled ? disable_confirm(require_all) : enable_confirm(require_all);
+            const std::string q = r.enabled ? disable_confirm(require_all, enabled_count)
+                                            : enable_confirm(require_all, enabled_count);
             html += "<button class=\"btn link\" type=\"button\" hx-post=\"" + base +
                     "/toggle\" hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\"" +
                     attr_confirm(q) + ">" + (r.enabled ? "Disable" : "Enable") +
                     "</button>"
                     "<button class=\"btn link danger\" type=\"button\" hx-delete=\"" +
                     base + "\" hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\"" +
-                    attr_confirm(remove_confirm(require_all, r.enabled)) + ">Remove</button>";
+                    attr_confirm(remove_confirm(require_all, r.enabled, enabled_count)) + ">Remove</button>";
             html += "</td></tr>";
         }
         html += "</tbody></table></div>";

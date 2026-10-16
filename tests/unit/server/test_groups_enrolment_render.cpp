@@ -458,25 +458,101 @@ TEST_CASE("enrolment rules: a match-everything rule wears a warning", "[groups][
     CHECK(count_of(html, "Matches every agent") == 3);
 }
 
-TEST_CASE("enrolment rules: enable, disable and remove copy follows the match mode",
+namespace {
+
+// The hx-confirm text of the button whose opening tag contains `anchor` ("" when it has none).
+std::string confirm_of(const std::string& html, const std::string& anchor) {
+    const auto at = html.find(anchor);
+    REQUIRE(at != std::string::npos);
+    const auto end = html.find("</button>", at);
+    const auto attr = html.find(" hx-confirm=\"", at);
+    if (attr == std::string::npos || attr > end)
+        return {};
+    const auto from = attr + std::string(" hx-confirm=\"").size();
+    return html.substr(from, html.find('"', from) - from);
+}
+
+std::vector<auth::AutoApproveRule> rules_with(std::size_t enabled, std::size_t disabled) {
+    std::vector<auth::AutoApproveRule> v;
+    for (std::size_t i = 0; i < enabled; ++i)
+        v.push_back({auth::AutoApproveRuleType::hostname_glob, "on" + std::to_string(i), "", true});
+    for (std::size_t i = 0; i < disabled; ++i)
+        v.push_back({auth::AutoApproveRuleType::hostname_glob, "off" + std::to_string(i), "", false});
+    return v;
+}
+
+std::string toggle_confirm(const std::string& html, std::size_t index) {
+    return confirm_of(html, "auto-approve/" + std::to_string(index) + "/toggle\"");
+}
+std::string remove_confirm_of(const std::string& html, std::size_t index) {
+    return confirm_of(html, "hx-delete=\"/api/settings/auto-approve/" + std::to_string(index) + "\"");
+}
+
+constexpr const char* kEnableWidens = "Enable this rule? Matching agents will join without approval.";
+constexpr const char* kEnableNarrows =
+    "Require this rule as well? Fewer agents will join without approval.";
+constexpr const char* kDisableLast =
+    "Disable the last enabled rule? No agent will join without approval until a rule is enabled.";
+constexpr const char* kDisableWidens =
+    "Stop requiring this rule? More agents may join without approval.";
+constexpr const char* kRemoveLast =
+    "Remove this auto-approve rule? It is the last enabled rule, so no agent will join without "
+    "approval until a rule is enabled.";
+constexpr const char* kRemoveWidens =
+    "Remove this auto-approve rule? It is currently required, so more agents may join without "
+    "approval.";
+constexpr const char* kRemovePlain = "Remove this auto-approve rule?";
+
+} // namespace
+
+// In "any" mode enabling widens and disabling narrows. The enabled-rule count does not matter.
+TEST_CASE("enrolment rules: any mode confirm copy ignores the enabled count",
           "[groups][enrolment][render]") {
-    using T = auth::AutoApproveRuleType;
-    const std::vector<auth::AutoApproveRule> v = {
-        {T::hostname_glob, "on-rule", "", true},
-        {T::hostname_glob, "off-rule", "", false},
-    };
-    // any mode: enabling widens (confirm); disabling narrows (no confirm); remove keeps its text.
-    const auto any = render_auto_approve(v, false);
-    CHECK_THAT(any, ContainsSubstring("Enable this rule? Matching agents join without approval."));
-    CHECK_THAT(any, !ContainsSubstring("Stop requiring this rule?"));
-    CHECK_THAT(any, ContainsSubstring("hx-confirm=\"Remove this auto-approve rule?\""));
-    // all mode: enabling narrows, disabling and removing an enabled rule widen.
-    const auto all = render_auto_approve(v, true);
-    CHECK_THAT(all, ContainsSubstring("Require this rule as well? Fewer agents will join without approval."));
-    CHECK_THAT(all, ContainsSubstring("Stop requiring this rule? More agents may join without approval."));
-    CHECK_THAT(all, ContainsSubstring("It is currently required, so more agents may join without approval."));
-    // The disabled rule is not required: removing it widens nothing.
-    CHECK(count_of(all, "It is currently required") == 1);
+    for (std::size_t enabled : {0u, 1u, 3u}) {
+        INFO("enabled=" << enabled);
+        const auto html = render_auto_approve(rules_with(enabled, 1), false);
+        CHECK(toggle_confirm(html, enabled) == kEnableWidens); // the disabled rule
+        CHECK(remove_confirm_of(html, enabled) == kRemovePlain);
+        if (enabled > 0) {
+            CHECK(toggle_confirm(html, 0).empty()); // disabling narrows: no confirm
+            CHECK(remove_confirm_of(html, 0) == kRemovePlain);
+        }
+        CHECK_THAT(html, !ContainsSubstring("Stop requiring"));
+        CHECK_THAT(html, !ContainsSubstring("Require this rule as well?"));
+    }
+}
+
+// In "all" mode every enabled rule is required, so the engine admits nobody while NONE is
+// enabled: enabling the first rule widens from nobody, and removing or disabling the last
+// enabled rule leaves nobody admitted. "Fewer agents" / "More agents" are false at those ends.
+TEST_CASE("enrolment rules: all mode confirm copy follows the number of enabled rules",
+          "[groups][enrolment][render]") {
+    SECTION("zero enabled: enabling the first rule widens admission") {
+        const auto html = render_auto_approve(rules_with(0, 2), true);
+        CHECK(toggle_confirm(html, 0) == kEnableWidens);
+        CHECK(toggle_confirm(html, 1) == kEnableWidens);
+        CHECK(remove_confirm_of(html, 0) == kRemovePlain); // a disabled rule is not required
+        CHECK_THAT(html, !ContainsSubstring("Require this rule as well?"));
+    }
+    SECTION("one enabled: it is the last, the other enables narrow") {
+        const auto html = render_auto_approve(rules_with(1, 1), true);
+        CHECK(toggle_confirm(html, 0) == kDisableLast);
+        CHECK(remove_confirm_of(html, 0) == kRemoveLast);
+        CHECK(toggle_confirm(html, 1) == kEnableNarrows);
+        CHECK(remove_confirm_of(html, 1) == kRemovePlain);
+        CHECK_THAT(html, !ContainsSubstring("Stop requiring"));
+        CHECK_THAT(html, !ContainsSubstring("It is currently required"));
+    }
+    SECTION("several enabled: disabling or removing one widens, enabling another narrows") {
+        const auto html = render_auto_approve(rules_with(3, 1), true);
+        for (std::size_t i = 0; i < 3; ++i) {
+            CHECK(toggle_confirm(html, i) == kDisableWidens);
+            CHECK(remove_confirm_of(html, i) == kRemoveWidens);
+        }
+        CHECK(toggle_confirm(html, 3) == kEnableNarrows);
+        CHECK(remove_confirm_of(html, 3) == kRemovePlain);
+        CHECK_THAT(html, !ContainsSubstring("last enabled rule"));
+    }
 }
 
 TEST_CASE("enrolment rules: add form keeps the field names, blocks colons, no inline handlers",
