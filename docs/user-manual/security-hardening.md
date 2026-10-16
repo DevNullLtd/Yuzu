@@ -75,7 +75,7 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 
 | Port | Protocol | Direction | Purpose | Restrict To |
 |------|----------|-----------|---------|-------------|
-| 8080 | TCP | Inbound | Web dashboard + REST API | Admin network |
+| 8080 | TCP | Inbound | HTTP→HTTPS redirect + unauthenticated health probes in cleartext (the dashboard with `--no-https`) | Orchestrator/admin network |
 | 8443 | TCP | Inbound | HTTPS dashboard | Admin network |
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
 | 50052 | TCP | Inbound | Management gRPC | Admin network |
