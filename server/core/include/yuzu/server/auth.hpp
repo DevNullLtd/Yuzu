@@ -1239,7 +1239,8 @@ public:
     /// analytics event + SSE publish); `false` = a row already existed.
     /// `enforce_new_id_charset`: refuse with `StoreError::CharsetRefused` when this
     /// would CREATE the row for an id failing `is_valid_new_agent_id` (an existing
-    /// row still yields `false`); see `consume_and_enroll`. Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
+    /// row still yields `false`); see `consume_and_enroll`. Production registration
+    /// doors must pass true (pinned by test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<bool, StoreError>
     add_pending_agent(const std::string& agent_id, const std::string& hostname,
                       const std::string& os, const std::string& arch,
@@ -1251,7 +1252,8 @@ public:
     /// recorded as the row's `status_changed_by`. `enforce_new_id_charset`: refuse
     /// with `StoreError::CharsetRefused` (rolled back, no row) when this would
     /// CREATE the row for an id failing `is_valid_new_agent_id`; see
-    /// `consume_and_enroll`. Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
+    /// `consume_and_enroll`. Production registration doors must pass true (pinned by
+    /// test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<bool, StoreError>
     ensure_enrolled(const std::string& agent_id, const std::string& hostname,
                     const std::string& os, const std::string& arch,

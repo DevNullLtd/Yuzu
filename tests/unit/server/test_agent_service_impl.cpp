@@ -1480,16 +1480,25 @@ TEST_CASE("Register and ProxyRegister pass enforce_new_id_charset=true at every 
         CHECK(count_charset_flag_true(src) == 3);
     }
 
-    // No other request-path source reaches those writes (auth.cpp holds the wrapper
-    // definitions and is not scanned), so a new registration door is a new line in this list.
-    for (const char* file : {"mcp_server.cpp", "rest_api_v1.cpp", "settings_routes.cpp",
-                             "scim_routes.cpp", "auth_routes.cpp", "server.cpp"}) {
-        INFO("file=" << file);
-        const auto src = read_server_source(file);
+    // No other source under server/core/src reaches those writes. The two handlers above are the
+    // only callers; auth.cpp and auth_db.cpp hold the wrapper and store definitions. Scanning the
+    // whole directory means a new registration door in a new file fails here instead of needing
+    // someone to extend a list.
+    std::size_t scanned = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(YUZU_SERVER_SRC_DIR)) {
+        const auto name = entry.path().filename().string();
+        if (entry.path().extension() != ".cpp" || name == "agent_service_impl.cpp" ||
+            name == "gateway_service_impl.cpp" || name == "auth.cpp" || name == "auth_db.cpp")
+            continue;
+        INFO("file=" << name);
+        const auto src = read_server_source(name.c_str());
         CHECK(count_occurrences(src, "consume_and_enroll(") == 0);
         CHECK(count_occurrences(src, "ensure_enrolled(") == 0);
         CHECK(count_occurrences(src, "add_pending_agent(") == 0);
+        ++scanned;
     }
+    // Guard against a wrong directory or an empty glob passing vacuously.
+    CHECK(scanned > 100);
 }
 
 TEST_CASE("Register: an agent_id with a control byte the door lets through is counted as "
@@ -1853,6 +1862,19 @@ VanishingRowOutcome run_with_row_vanishing_before_write(const std::string& dsn,
 
     VanishingRowOutcome out;
     std::thread worker([&] { out.status = call(); });
+    // If anything below throws before the explicit join (only an allocation failure can), the
+    // worker is still parked on the row lock this side connection holds, so release the lock
+    // first and then join; a bare joinable std::thread destructor would std::terminate.
+    struct JoinOnExit {
+        std::thread& t;
+        PGconn* c;
+        ~JoinOnExit() {
+            if (t.joinable()) {
+                yuzu::server::pg::PgResult rollback{PQexec(c, "ROLLBACK")};
+                t.join();
+            }
+        }
+    } join_on_exit{worker, side.get()};
     out.write_was_queued =
         yuzu::test::wait_for_pg_lock_waiter(dsn, "%INSERT INTO auth.pending_agents%");
     // Release the lock whether or not the waiter was seen, so the worker always unblocks. The
@@ -1860,8 +1882,7 @@ VanishingRowOutcome run_with_row_vanishing_before_write(const std::string& dsn,
     // std::terminate the binary, so the statuses are only captured here and asserted after
     // the join. A failed DELETE aborts the transaction, so COMMIT then rolls it back, which
     // releases the row lock all the same.
-    const auto delete_status =
-        exec("DELETE FROM auth.pending_agents WHERE agent_id = $1", 1);
+    const auto delete_status = exec("DELETE FROM auth.pending_agents WHERE agent_id = $1", 1);
     const auto commit_status = exec("COMMIT");
     worker.join();
     REQUIRE(delete_status == PGRES_COMMAND_OK);
@@ -1956,7 +1977,9 @@ TEST_CASE("Register and ProxyRegister: a legacy bad-charset row removed after th
     CHECK(count_scalar(dsn, "SELECT count(*) FROM auth.pending_agents") == "0");
 
     // A charset refusal is caller input, not a store outage: the enrollment-store degrade
-    // counter must not move for either write op these iterations drove.
+    // counter must not move. Only the ensure_enrolled series can catch a regression of the
+    // exclusion (its refusal is a StoreError); the token path reports the refusal as a value
+    // (Kind::charset_refused), so its zero is a plain regression guard.
     for (const char* op : {"consume", "ensure_enrolled"}) {
         for (const char* reason : {"no_store", "pool_acquire_timeout", "query_error"}) {
             INFO("op=" << op << " reason=" << reason);
