@@ -23505,6 +23505,7 @@ TEST_CASE("MCP preview_management_group_agent_count: unindexed_filter_keys is pr
     REQUIRE(shortf.contains("result"));
     const auto& s1 = shortf["result"]["structuredContent"];
     CHECK(s1["agent_count"] == 1);
+    REQUIRE(s1.contains("unindexed_filter_keys"));
     CHECK(s1["unindexed_filter_keys"].empty());
 }
 
@@ -23534,6 +23535,7 @@ TEST_CASE("MCP preview_management_group_agent_count: a filter value over kMaxFac
         REQUIRE(body.contains("result"));
         const auto& sc = body["result"]["structuredContent"];
         CHECK(sc["agent_count"] == 0);
+        REQUIRE(sc.contains("unindexed_filter_keys"));
         REQUIRE(sc["unindexed_filter_keys"].is_array());
         REQUIRE(sc["unindexed_filter_keys"].size() == 1);
         CHECK(sc["unindexed_filter_keys"][0] == "output");
@@ -23545,6 +23547,7 @@ TEST_CASE("MCP preview_management_group_agent_count: a filter value over kMaxFac
     SECTION("2048 bytes: not named") {
         auto body = call(yuzu::server::kMaxFacetValueBytes);
         REQUIRE(body.contains("result"));
+        REQUIRE(body["result"]["structuredContent"].contains("unindexed_filter_keys"));
         CHECK(body["result"]["structuredContent"]["unindexed_filter_keys"].empty());
     }
 }
@@ -23567,6 +23570,7 @@ TEST_CASE("MCP preview_management_group_agent_count: tools/list documents uninde
     CHECK(description.find("unindexed_filter_keys") != std::string::npos);
     CHECK(description.find("2048 bytes") != std::string::npos);
     const auto& out = (*tool)["outputSchema"];
+    REQUIRE(out.contains("properties"));
     REQUIRE(out["properties"].contains("unindexed_filter_keys"));
     CHECK(out["properties"]["unindexed_filter_keys"]["type"] == "array");
     CHECK(out["properties"]["unindexed_filter_keys"]["items"]["type"] == "string");
@@ -23601,6 +23605,7 @@ TEST_CASE("preview agent count: REST and MCP report the same count and keys for 
         REQUIRE(rest_res != nullptr);
         REQUIRE(rest_res->status == 200);
         const auto rest_data = nlohmann::json::parse(rest_res->body)["data"];
+        REQUIRE(rest_data.contains("unindexed_filter_keys"));
 
         const nlohmann::json args = {{"command_id", command_id},
                                      {"plugin", "registry"},
@@ -23608,6 +23613,7 @@ TEST_CASE("preview agent count: REST and MCP report the same count and keys for 
         auto mcp_body = mcp_tool_call(ts, "preview_management_group_agent_count", args.dump());
         REQUIRE(mcp_body.contains("result"));
         const auto& mcp_data = mcp_body["result"]["structuredContent"];
+        REQUIRE(mcp_data.contains("unindexed_filter_keys"));
 
         CHECK(rest_data["agent_count"] == mcp_data["agent_count"]);
         CHECK(rest_data["unindexed_filter_keys"] == mcp_data["unindexed_filter_keys"]);
