@@ -28,6 +28,7 @@
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -84,9 +85,26 @@ struct MockIdp {
     int trickle_interval_ms{40};
     int trickle_chunks{100};
     std::string jwks_body; ///< non-empty = GET /jwks serves this verbatim (a malformed JWKS)
-    // Non-empty `token_body` = POST /token answers it verbatim, with `token_status`.
+    // Non-empty `token_body` = POST /token answers it verbatim, with `token_status`; the normal
+    // (valid, signed) answer carries `token_status` too.
     std::string token_body;
     int token_status{200};
+    // Non-empty = the token answer (either form) carries a `Location` header of this value, so a
+    // 3xx `token_status` is a real redirect a client could follow.
+    std::string token_location;
+    // true = POST /token answers `token_status` with NO body (a 204, say), whatever `token_body`
+    // is.
+    bool token_no_body{false};
+    // > 0 = the normal answer is padded to EXACTLY this many bytes in total (the id_token itself
+    // stays valid), so a test can sit on either side of a size cap. Below the smallest padded form
+    // the answer is unpadded.
+    std::size_t token_body_total{0};
+    // > 0 = the normal answer is sent as a CHUNKED body of pieces of this many bytes (no
+    // Content-Length), so a size cap sees a stream whose pieces are each small.
+    std::size_t token_chunk_size{0};
+    // Counts requests to /elsewhere (GET and POST): where a redirect from the token endpoint
+    // points. A client that follows the redirect, with either method, makes it non-zero.
+    std::atomic<int> elsewhere_calls{0};
     // > 0 = the normal POST /token answer carries an extra `"pad":"xxx..."` member of this many
     // bytes (a token response of a chosen size; the id_token itself stays valid).
     std::size_t token_body_pad{0};
@@ -201,31 +219,70 @@ struct MockIdp {
         const auto token_handler = [this](const httplib::Request& req, httplib::Response& res) {
             token_calls.fetch_add(1);
             std::string tok;
+            std::string location;
+            int status;
+            bool no_body;
+            std::size_t total, chunk;
             {
                 std::lock_guard lk(mu);
                 last_token_target = req.target;
-                if (!token_body.empty()) {
-                    res.status = token_status;
-                    res.set_content(token_body, "application/json");
-                    return;
-                }
-                tok = id_token;
-                if (tok.empty()) {
-                    oidc::OidcConfig c;
-                    c.issuer = discovery_issuer.empty() ? base() : discovery_issuer;
-                    c.client_id = token_client_id;
-                    tok = rs256_sign(token_kid, id_token_payload(c, last_nonce, "alice-sub"));
-                }
+                location = token_location;
+                status = token_status;
+                no_body = token_no_body;
+                total = token_body_total;
+                chunk = token_chunk_size;
             }
-            std::string pad;
+            res.status = status;
+            if (!location.empty())
+                res.set_header("Location", location);
+            if (no_body)
+                return;
+            std::string out;
             {
                 std::lock_guard lk(mu);
-                if (token_body_pad > 0)
-                    pad = R"(,"pad":")" + std::string(token_body_pad, 'x') + '"';
+                if (!token_body.empty()) {
+                    out = token_body;
+                } else {
+                    tok = id_token;
+                    if (tok.empty()) {
+                        oidc::OidcConfig c;
+                        c.issuer = discovery_issuer.empty() ? base() : discovery_issuer;
+                        c.client_id = token_client_id;
+                        tok = rs256_sign(token_kid, id_token_payload(c, last_nonce, "alice-sub"));
+                    }
+                    out = R"({"id_token":")" + tok + R"(","token_type":"Bearer")";
+                    // `,"pad":"` + n bytes + `"` is 9 bytes plus the pad; the closing brace is 1.
+                    constexpr std::size_t kPadFrame = 9;
+                    if (total > 0 && total >= out.size() + 1 + kPadFrame)
+                        out += R"(,"pad":")" +
+                               std::string(total - out.size() - 1 - kPadFrame, 'x') + '"';
+                    else if (token_body_pad > 0)
+                        out += R"(,"pad":")" + std::string(token_body_pad, 'x') + '"';
+                    out += "}";
+                }
             }
-            res.set_content(R"({"id_token":")" + tok + R"(","token_type":"Bearer")" + pad + "}",
-                            "application/json");
+            if (chunk == 0) {
+                res.set_content(out, "application/json");
+                return;
+            }
+            auto data = std::make_shared<std::string>(std::move(out));
+            res.set_chunked_content_provider(
+                "application/json", [data, chunk](std::size_t offset, httplib::DataSink& sink) {
+                    if (offset >= data->size()) {
+                        sink.done();
+                        return true;
+                    }
+                    return sink.write(data->data() + offset,
+                                      std::min(chunk, data->size() - offset));
+                });
         };
+        // Where a redirect from the token endpoint points (see `elsewhere_calls`).
+        const auto elsewhere_handler = [this](const httplib::Request&, httplib::Response& res) {
+            elsewhere_calls.fetch_add(1);
+            res.set_content("elsewhere", "text/plain");
+        };
+        svr.Get("/elsewhere", elsewhere_handler);
+        svr.Post("/elsewhere", elsewhere_handler);
         svr.Post("/token", token_handler);
         svr.Post("/", token_handler); // an empty-path token endpoint with a query: POST /?x=1
         // Generate the shared key here, on the test thread: the first call may otherwise run on

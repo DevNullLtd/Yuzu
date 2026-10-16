@@ -1018,4 +1018,72 @@ TEST_CASE("OIDC egress: the strict vet mode refuses a mixed answer the pinning m
     }
 }
 
+TEST_CASE("OIDC egress: the token POST's pre-check - pinned where the connect is pinned, strict "
+          "where it cannot be",
+          "[oidc][oidc_egress][security]") {
+    // The discovery document names the token endpoint by a HOST NAME ("idp.test", which only the
+    // resolver seam knows); the issuer, authorization endpoint and JWKS are the mock's own IP
+    // literal, so only the token host consults the seam. On Linux/macOS the token POST is an
+    // httplib client pinned to the vetted address; on Windows it is WinHTTP, which does its own
+    // second lookup and may use ANY member of the answer, so exchange_code vets it in the STRICT
+    // mode (vet_egress_target(..., require_all_permitted=true)): one refused address in the answer
+    // refuses the target.
+    //
+    // Mutation (Linux): pass `/*require_all_permitted=*/true` in exchange_code's httplib branch -
+    // the mixed-answer section's success turns into a refusal. On Windows (not performed here)
+    // dropping `/*require_all_permitted=*/true` from the WinHTTP branch turns the same section's
+    // refusal into a request that reaches the mock.
+    MockIdp idp;
+    idp.with([](MockIdp& m) {
+        m.discovery_body = R"({"issuer":")" + m.base() + R"(","authorization_endpoint":")" +
+                           m.base() + R"(/authorize","token_endpoint":"http://idp.test:)" +
+                           std::to_string(m.port) + R"(/token","jwks_uri":")" + m.base() +
+                           R"(/jwks"})";
+    });
+    const auto login = [&] {
+        // The switch is on: the mock IdP (issuer, JWKS) is on loopback, which is refused otherwise.
+        OidcProvider provider(provider_cfg(idp.base(), true));
+        const auto flow = provider.start_auth_flow();
+        REQUIRE_FALSE(idp.follow_authorize(flow.url).empty());
+        return provider.handle_callback("the-code",
+                                        yuzu::server::test::url_query_param(flow.url, "state"),
+                                        flow.binding_secret);
+    };
+
+    SECTION("a mixed answer (link-local plus the loopback IdP): pinned on POSIX, refused strictly "
+            "on Windows") {
+        ResolverGuard resolver([](const std::string& host) -> std::vector<std::string> {
+            if (host == "idp.test")
+                return {"169.254.169.254", "127.0.0.1"};
+            return {};
+        });
+        const auto claims = login();
+#ifdef _WIN32
+        // The strict pre-check: the refused member refuses the whole target, before WinHTTP.
+        REQUIRE_FALSE(claims.has_value());
+        CHECK(claims.error() ==
+              std::string("token endpoint request failed: ") + OidcProvider::kEgressRefused);
+        CHECK(idp.token_calls.load() == 0);
+#else
+        // The httplib path drops the refused address and pins the permitted one.
+        REQUIRE(claims.has_value());
+        CHECK(claims->sub == "alice-sub");
+        CHECK(idp.token_calls.load() == 1);
+#endif
+    }
+    SECTION("a name that resolves only to a PUBLIC address over plain http is refused everywhere, "
+            "before any request") {
+        ResolverGuard resolver([](const std::string& host) -> std::vector<std::string> {
+            if (host == "idp.test")
+                return {"93.184.216.34"};
+            return {};
+        });
+        const auto claims = login();
+        REQUIRE_FALSE(claims.has_value());
+        CHECK(claims.error().find(kCleartextPublic) != std::string::npos);
+        CHECK(claims.error().find("93.184.216.34") == std::string::npos);
+        CHECK(idp.token_calls.load() == 0); // refused before any request, on every platform
+    }
+}
+
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN

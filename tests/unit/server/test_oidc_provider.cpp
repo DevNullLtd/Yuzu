@@ -1374,6 +1374,17 @@ std::string signed_token(const OidcConfig& cfg, const std::string& kid,
                                           yuzu::server::test::id_token_payload(cfg, nonce));
 }
 
+// Starts a login against `idp` (the knobs already set) and returns what `handle_callback` made of
+// the token endpoint's answer. Never asserts on the outcome: the caller does.
+std::expected<IdTokenClaims, std::string> token_login(MockIdp& idp) {
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    const auto flow = provider.start_auth_flow();
+    REQUIRE_FALSE(idp.follow_authorize(flow.url).empty());
+    return provider.handle_callback(
+        "the-code", yuzu::server::test::url_query_param(flow.url, "state"), flow.binding_secret);
+}
+
 } // namespace
 
 TEST_CASE("OIDC discovery: all three endpoints come from the document and a full login works",
@@ -1426,6 +1437,148 @@ TEST_CASE("OIDC token exchange: the token response is capped at 256 KiB",
         REQUIRE_FALSE(claims.has_value());
         CHECK(claims.error().starts_with("token endpoint request failed"));
     }
+}
+
+TEST_CASE("OIDC token exchange: only a 200 is a token response - a 3xx is never followed",
+          "[oidc][oidc_discovery][security]") {
+    // On Linux/macOS the token POST is an httplib client (status check in exchange_code, redirects
+    // off); on Windows it is winhttp_post (status check before the body is read, and
+    // WINHTTP_OPTION_REDIRECT_POLICY_NEVER). One expectation per status, run on every platform. The
+    // IdP counts its token requests: exactly one in every case, and a redirect target that
+    // answers BOTH GET and POST (a followed 302 keeps the method) must stay at zero hits.
+    //
+    // Mutations: Linux, delete the `status_code != 200` branch of exchange_code - the 302
+    // section then SUCCEEDS (a valid token rides in its body), and the 204 section fails with a
+    // different text (a JSON parse error). Linux, `client->set_follow_location(true)` on the
+    // token client - the 302 section's redirect counter goes to 1. Windows (not performed here):
+    // remove the `status_code != 200` check in winhttp_post, or the WINHTTP_OPTION_REDIRECT_POLICY
+    // call, for the same two outcomes.
+    MockIdp idp;
+    std::string posix_error;
+    SECTION("302 with a Location and a VALID token body") {
+        idp.with([](MockIdp& m) {
+            m.token_status = 302;
+            m.token_location = m.base() + "/elsewhere";
+        });
+        posix_error = "token endpoint returned 302";
+    }
+    SECTION("401 with an OAuth error body") {
+        idp.with([](MockIdp& m) {
+            m.token_status = 401;
+            m.token_body = R"({"error":"invalid_client"})";
+        });
+        posix_error = "token endpoint returned 401";
+    }
+    SECTION("500") {
+        idp.with([](MockIdp& m) {
+            m.token_status = 500;
+            m.token_body = "internal error";
+        });
+        posix_error = "token endpoint returned 500";
+    }
+    SECTION("204 with no body") {
+        idp.with([](MockIdp& m) {
+            m.token_status = 204;
+            m.token_no_body = true;
+        });
+        posix_error = "token endpoint returned 204";
+    }
+
+    const auto claims = token_login(idp);
+    REQUIRE_FALSE(claims.has_value());
+    CHECK(claims.error().starts_with("token endpoint"));
+#ifdef _WIN32
+    // winhttp_post returns an empty string for any non-200 (it logs the status itself), which
+    // exchange_code reports as its one fixed WinHTTP failure.
+    CHECK(claims.error() == "token endpoint request failed (WinHTTP)");
+#else
+    CHECK(claims.error() == posix_error);
+#endif
+    CHECK(idp.token_calls.load() == 1);
+    CHECK(idp.elsewhere_calls.load() == 0); // the redirect was not followed
+}
+
+TEST_CASE("OIDC token exchange: a 200 with a valid token is the control for the status cases",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    const auto claims = token_login(idp);
+    REQUIRE(claims.has_value());
+    CHECK(claims->sub == "alice-sub");
+    CHECK(idp.token_calls.load() == 1);
+    CHECK(idp.elsewhere_calls.load() == 0);
+}
+
+TEST_CASE("OIDC token exchange: the 256 KiB cap holds at its boundary and for a streamed body",
+          "[oidc][oidc_discovery][security]") {
+    // kHttpMaxBody (oidc_provider.cpp) is private to that file, so the value is restated here and
+    // the source pin below fails if the two ever differ.
+    constexpr std::size_t kTokenResponseCap = 256 * 1024;
+    constexpr std::size_t kChunk = 16 * 1024; // each piece far below the cap; only the sum is over
+
+    // What these cases pin, and what they cannot. Linux/macOS: httplib's payload_max_length
+    // (a Content-Length body larger than the cap, or a chunked stream whose running total passes
+    // it, is refused; a body of exactly the cap is accepted, which pins the comparison direction).
+    // Windows: winhttp_post's two cap checks (`bytes_available > kHttpMaxBody - response.size()`
+    // BEFORE the buffer is allocated, `response.size() > kHttpMaxBody` after the append). They log
+    // the same text and return the same empty string, so a test cannot tell which one fired: the
+    // streamed case is where the pre-allocation bound trips first, but WinHTTP may coalesce chunks,
+    // so even there `bytes_available` is not the IdP's piece size. Removing only the pre-check
+    // leaves the post-check to refuse the same body one allocation later (same outcome, green);
+    // removing both goes red. The pre-check's value (never allocating past the cap) is therefore
+    // asserted by reading the code, not by an outside observation.
+    //
+    // Mutations (Linux): remove `client->set_payload_max_length(kHttpMaxBody)` from exchange_code:
+    // the 300 KiB, 256 KiB + 1 and streamed sections go red. Raising the cap by one byte turns the
+    // 256 KiB + 1 section red; lowering it by one turns the 256 KiB section red.
+    const auto login = [](std::size_t total, std::size_t chunk) {
+        MockIdp idp;
+        idp.with([&](MockIdp& m) {
+            m.token_body_total = total;
+            m.token_chunk_size = chunk;
+        });
+        auto claims = token_login(idp);
+        CHECK(idp.token_calls.load() == 1);
+        return claims;
+    };
+
+    SECTION("exactly 256 KiB in one body is accepted") {
+        const auto claims = login(kTokenResponseCap, 0);
+        REQUIRE(claims.has_value());
+        CHECK(claims->sub == "alice-sub");
+    }
+    SECTION("256 KiB + 1 byte in one body is refused") {
+        const auto claims = login(kTokenResponseCap + 1, 0);
+        REQUIRE_FALSE(claims.has_value());
+        CHECK(claims.error().starts_with("token endpoint request failed"));
+    }
+    SECTION("a streamed body of exactly 256 KiB is accepted (the stream is not the failure)") {
+        const auto claims = login(kTokenResponseCap, kChunk);
+        REQUIRE(claims.has_value());
+        CHECK(claims->sub == "alice-sub");
+    }
+    SECTION("a streamed body of 256 KiB + 1 byte is refused") {
+        const auto claims = login(kTokenResponseCap + 1, kChunk);
+        REQUIRE_FALSE(claims.has_value());
+        CHECK(claims.error().starts_with("token endpoint request failed"));
+    }
+    SECTION("a streamed body of 300 KiB in 16 KiB pieces is refused") {
+        const auto claims = login(300 * 1024, kChunk);
+        REQUIRE_FALSE(claims.has_value());
+        CHECK(claims.error().starts_with("token endpoint request failed"));
+    }
+}
+
+TEST_CASE("OIDC token exchange: the response cap in these cases is the one the provider uses "
+          "(source pin)",
+          "[oidc][oidc_discovery][source_pin]") {
+    // The cap cases above restate kHttpMaxBody because it is private to oidc_provider.cpp.
+    // Hoisting it to the header would make this pin unnecessary.
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "oidc_provider.cpp",
+                     std::ios::binary);
+    REQUIRE(in.is_open());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    CHECK(ss.str().find("constexpr std::size_t kHttpMaxBody = 256 * 1024;") != std::string::npos);
 }
 
 TEST_CASE("OIDC discovery: an explicitly configured field is authoritative and is never discovered",
@@ -2064,7 +2217,10 @@ struct OwnedSock {
 
 class TlsDripServer {
 public:
-    explicit TlsDripServer(int interval_ms = 300) : interval_ms_(interval_ms) {
+    /// `loopback_v6` listens on [::1] instead of 127.0.0.1; when that cannot be set up (no IPv6
+    /// loopback) `usable()` is false and nothing is running, so a test can skip with a reason.
+    explicit TlsDripServer(int interval_ms = 300, bool loopback_v6 = false)
+        : interval_ms_(interval_ms), v6_(loopback_v6) {
 #ifdef _WIN32
         // httplib starts Winsock in this translation unit too; WSAStartup is reference counted,
         // so asking again here only makes the helper independent of that. Deliberately never
@@ -2082,6 +2238,24 @@ public:
         static const auto ignored = std::signal(SIGPIPE, SIG_IGN);
         (void)ignored;
 #endif
+        if (v6_) {
+            listen_.reset(::socket(AF_INET6, SOCK_STREAM, 0));
+            sockaddr_in6 addr6{};
+            addr6.sin6_family = AF_INET6;
+            addr6.sin6_addr = in6addr_loopback;
+            DripLen len6 = sizeof(addr6);
+            if (!listen_.valid() ||
+                ::bind(listen_.s, reinterpret_cast<sockaddr*>(&addr6), sizeof(addr6)) != 0 ||
+                ::listen(listen_.s, 8) != 0 ||
+                ::getsockname(listen_.s, reinterpret_cast<sockaddr*>(&addr6), &len6) != 0) {
+                listen_.reset();
+                return; // usable() is false; no thread was started
+            }
+            port_ = ntohs(addr6.sin6_port);
+            usable_ = true;
+            thread_ = std::thread([this] { run(); });
+            return;
+        }
         listen_.reset(::socket(AF_INET, SOCK_STREAM, 0));
         REQUIRE(listen_.valid());
         sockaddr_in addr{};
@@ -2093,10 +2267,13 @@ public:
         DripLen len = sizeof(addr);
         REQUIRE(::getsockname(listen_.s, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
         port_ = ntohs(addr.sin_port);
+        usable_ = true;
         thread_ = std::thread([this] { run(); });
     }
     ~TlsDripServer() {
         release();
+        if (!thread_.joinable())
+            return; // never started (no IPv6 loopback)
         wake_acceptor();
         thread_.join();
         // The sockets close as the members are destroyed, after the thread is gone.
@@ -2116,12 +2293,25 @@ public:
     int port() const { return port_; }
     std::string base() const { return "https://127.0.0.1:" + std::to_string(port_); }
     int accepted() const { return accepted_.load(); }
+    /// False only for a `loopback_v6` server that could not listen on [::1].
+    bool usable() const { return usable_; }
 
 private:
     // Unblocks the acceptor: a connection to the listener makes accept() return, and `stop_` is
     // already set, so run() then returns. A loopback connect to a listening socket completes
     // from the backlog whether or not anyone is in accept().
     void wake_acceptor() {
+        if (v6_) {
+            OwnedSock waker6(::socket(AF_INET6, SOCK_STREAM, 0));
+            if (!waker6.valid())
+                return;
+            sockaddr_in6 addr6{};
+            addr6.sin6_family = AF_INET6;
+            addr6.sin6_addr = in6addr_loopback;
+            addr6.sin6_port = htons(static_cast<unsigned short>(port_));
+            (void)::connect(waker6.s, reinterpret_cast<sockaddr*>(&addr6), sizeof(addr6));
+            return;
+        }
         OwnedSock waker(::socket(AF_INET, SOCK_STREAM, 0));
         if (!waker.valid())
             return;
@@ -2171,6 +2361,8 @@ private:
     }
 
     const int interval_ms_;
+    const bool v6_;
+    bool usable_{false};
     OwnedSock listen_;
     int port_{0};
     std::mutex mu_;
@@ -2261,6 +2453,121 @@ TEST_CASE("OIDC discovery: the JWKS fetch is bounded the same way against a drip
     CHECK(elapsed >= std::chrono::seconds(1));
     // No upper bound on `elapsed`: a missing watchdog ends at the 10 s limit above and fails
     // `in_time`, and a ceiling closer than that only flakes on a loaded shared runner.
+}
+
+TEST_CASE("OIDC discovery: a drip faster than the per-operation timeout is still cut at the total "
+          "bound",
+          "[oidc][oidc_discovery][security]") {
+    // One byte per 800 ms against a 1 s per-operation timeout: every step re-arms httplib's wait
+    // just before it would expire, so no per-operation timeout ever fires and only the total bound
+    // (2 s, the watchdog) can end the fetch. The 300 ms drip above leaves more slack; this is the
+    // edge. Mutation (Linux): delete the `client->set_socket_options(... watchdog.adopt ...)` line
+    // in http_get_bounded - the fetch then runs to the 10 s limit and `in_time` is false. Windows
+    // runs the same case through the duplicate-socket cut (CancelIoEx plus shutdown); not
+    // verified from here.
+    TlsDripServer drip(800);
+    std::expected<OidcProvider::DiscoveryDocument, std::string> doc;
+    const auto begin = std::chrono::steady_clock::now();
+    const bool in_time = finished_within(
+        std::chrono::seconds(10),
+        [&] {
+            doc = OidcProvider::fetch_discovery_document(drip.base(), true,
+                                                         /*allow_private_networks=*/true, 1000);
+        },
+        [&] { drip.release(); });
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    CHECK(in_time);
+    CHECK_FALSE(doc.has_value());
+    // The drip never tripped a per-operation timeout, so the fetch lasted until the total bound.
+    CHECK(elapsed >= std::chrono::milliseconds(1500));
+    CHECK(drip.accepted() >= 1);
+}
+
+namespace {
+// Gives names an answer for the life of the guard, then restores the OS resolver.
+struct ScopedTestResolver {
+    explicit ScopedTestResolver(OidcProvider::ResolverForTest r) {
+        OidcProvider::set_resolver_for_test(std::move(r));
+    }
+    ~ScopedTestResolver() { OidcProvider::set_resolver_for_test({}); }
+    ScopedTestResolver(const ScopedTestResolver&) = delete;
+    ScopedTestResolver& operator=(const ScopedTestResolver&) = delete;
+};
+} // namespace
+
+TEST_CASE("OIDC discovery: the second connect attempt is bounded too - the watchdog follows the "
+          "retry",
+          "[oidc][oidc_discovery][security]") {
+    // http_get_bounded tries the next vetted address only when a CONNECT fails. Address A
+    // (127.0.0.1) has nothing listening on the port, so its connect is refused; address B (::1)
+    // is the drip server, so the second attempt's TLS handshake drips. Both pins share the URL's
+    // port. The watchdog must adopt the SECOND socket as well: with the cut missing for it the
+    // fetch would run to the 30 s limit. Its escalation count restarts for each adopted socket
+    // (`cuts_ = 0`); that restart cannot be observed from here, because the cut alone (CancelIoEx
+    // plus shutdown) ends the wait and the abortive-close escalation is only the fallback, so
+    // deleting the reset stays green. What these cases pin is that a second adopt happens and is
+    // cut.
+    TlsDripServer drip(300, /*loopback_v6=*/true);
+    if (!drip.usable())
+        SKIP("this host has no IPv6 loopback to listen on");
+    {
+        // Nothing may listen on 127.0.0.1 at the drip server's port, or A would not be refused.
+        OwnedSock probe(::socket(AF_INET, SOCK_STREAM, 0));
+        REQUIRE(probe.valid());
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(static_cast<unsigned short>(drip.port()));
+        if (::bind(probe.s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+            SKIP("127.0.0.1 at the drip server's port is in use");
+    }
+
+    // The resolver seam answers the name with A then B. In the "stalled" section it first holds
+    // for longer than the whole 2 s bound, so the watchdog has ALREADY expired when the first
+    // socket is adopted and each adopt is cut at once.
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool open = false;
+    std::chrono::milliseconds stall{0};
+    const ScopedTestResolver resolver([&](const std::string& host) -> std::vector<std::string> {
+        if (host != "drip.test")
+            return {};
+        std::unique_lock lk(gate_mu);
+        gate_cv.wait_for(lk, stall, [&] { return open; });
+        return {"127.0.0.1", "::1"};
+    });
+    SECTION("the budget is intact when the first attempt is refused") {}
+    SECTION("the resolver burns the whole budget first") {
+        stall = std::chrono::milliseconds(OidcProvider::kHttpTotalBoundMultiplier * 1000 + 300);
+    }
+
+    const std::string issuer = "https://drip.test:" + std::to_string(drip.port());
+    std::expected<OidcProvider::DiscoveryDocument, std::string> doc;
+    const auto begin = std::chrono::steady_clock::now();
+    const bool in_time = finished_within(
+        std::chrono::seconds(30),
+        [&] {
+            doc = OidcProvider::fetch_discovery_document(issuer, true,
+                                                         /*allow_private_networks=*/true, 1000);
+        },
+        [&] {
+            {
+                std::lock_guard lk(gate_mu);
+                open = true;
+            }
+            gate_cv.notify_all();
+            drip.release();
+        });
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    CHECK(in_time);
+    REQUIRE_FALSE(doc.has_value());
+    CAPTURE(doc.error());
+    // Not the first attempt's refused connect: the failure is the second attempt's.
+    CHECK(doc.error() != "request failed: " + httplib::to_string(httplib::Error::Connection));
+    CHECK(elapsed >=
+          std::chrono::milliseconds(OidcProvider::kHttpTotalBoundMultiplier * 1000 - 500));
+    if (stall.count() == 0)
+        CHECK(drip.accepted() >= 1); // the handshake lasts to the bound, so B did accept
 }
 
 // ── Descriptor exhaustion fails closed (#5692, Gate 8 passes 2 and 4) ────────

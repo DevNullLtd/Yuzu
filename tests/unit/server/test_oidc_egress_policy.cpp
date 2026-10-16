@@ -929,6 +929,28 @@ TEST_CASE("OIDC egress: stuck resolver requests bound the ledger - a new lookup 
     CHECK_FALSE(ledger.try_reserve()); // 2 abandoned + 1 in flight == 3
 }
 
+TEST_CASE("OIDC egress: handing a request to the ledger gives its slot back exactly once",
+          "[oidc][oidc_egress][security]") {
+    // `abandon` frees the slot itself; the Slot's destructor must then NOT finish() a second time,
+    // or it would free the slot of a DIFFERENT lookup still in flight and the bound would leak by
+    // one per stuck lookup. Mutation: make ~Slot finish() unconditionally - the second CHECK_FALSE
+    // goes red.
+    std::atomic<int> destroyed{0};
+    FakeLedger ledger = make_ledger(3);
+    REQUIRE(ledger.try_reserve());
+    FakeLedger::Slot still_in_flight(ledger);
+    {
+        REQUIRE(ledger.try_reserve());
+        FakeLedger::Slot stuck(ledger);
+        stuck.abandon(std::make_unique<FakeRequest>(&destroyed));
+    }
+    // One abandoned plus one in flight is 2 of 3: exactly one slot is left.
+    CHECK(ledger.abandoned_count() == 1);
+    CHECK(ledger.try_reserve());
+    CHECK_FALSE(ledger.try_reserve());
+    CHECK(destroyed.load() == 0);
+}
+
 TEST_CASE("OIDC egress: in-flight resolver lookups count against the ledger and slots come back",
           "[oidc][oidc_egress][security]") {
     FakeLedger ledger = make_ledger(2);
