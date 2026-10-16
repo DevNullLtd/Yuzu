@@ -134,18 +134,29 @@ std::string render_set_select(const std::string& definition_id, const std::strin
     return h + "</select>";
 }
 
+namespace {
+// The templates panel is hosted inside the library panel (#ox-templates, under its toolbar),
+// so every state of it opens with the same inset margin.
+constexpr const char* kTplPanelOpen =
+    "<section class=\"panel\" style=\"margin:12px 16px\" data-panel=\"response-templates\"";
+} // namespace
+
 std::string render_templates_panel(const std::string& definition_id,
                                    const std::string& definition_name,
                                    const std::vector<ResponseTemplate>& templates, bool can_write) {
     ResponseTemplatesEngine engine;
-    std::string h = "<section class=\"panel\" data-panel=\"response-templates\" "
-                    "data-def-id=\"" +
+    std::string h = std::string(kTplPanelOpen) + " data-def-id=\"" +
                     html_escape(definition_id) + "\"><div class=\"hd\"><h2>Response templates: " +
                     html_escape(definition_name) + "</h2>";
+    h += "<div class=\"end\">";
     if (can_write)
-        h += "<div class=\"end\"><button type=\"button\" class=\"btn btn-secondary btn-sm\" "
-             "data-ox=\"tpl-new\" data-def-id=\"" +
-             html_escape(definition_id) + "\">New template</button></div>";
+        h += "<button type=\"button\" class=\"btn btn-secondary btn-sm\" data-ox=\"tpl-new\" "
+             "data-def-id=\"" +
+             html_escape(definition_id) + "\">New template</button>";
+    // Close empties the host (#ox-templates, in the library fragment). Constants only.
+    h += "<button type=\"button\" class=\"btn btn-ghost btn-sm\" "
+         "aria-label=\"Close response templates\" onclick=\"document.getElementById("
+         "'ox-templates').replaceChildren()\">Close</button></div>";
     h += "</div><div class=\"tw\"><table><thead><tr><th>Name</th><th>Columns</th><th>Sort</th>"
          "<th>Filters</th><th></th></tr></thead><tbody>";
     // The synthesised default: fixed, no actions. An authored default hides it in the API list;
@@ -180,20 +191,20 @@ std::string render_templates_panel(const std::string& definition_id,
 }
 
 std::string render_templates_denied() {
-    return "<section class=\"panel\" data-panel=\"response-templates\"><div class=\"empty-state\" "
-           "data-denied=\"true\">Viewing response templates needs the instruction definition "
-           "read permission.</div></section>";
+    return std::string(kTplPanelOpen) +
+           "><div class=\"empty-state\" data-denied=\"true\">Viewing response templates needs the "
+           "instruction definition read permission.</div></section>";
 }
 
 std::string render_templates_degraded() {
-    return "<section class=\"panel\" data-panel=\"response-templates\"><div class=\"empty-state\" "
-           "data-degraded=\"1\">Response templates unavailable. This is not an empty list."
-           "</div></section>";
+    return std::string(kTplPanelOpen) +
+           "><div class=\"empty-state\" data-degraded=\"1\">Response templates unavailable. "
+           "This is not an empty list.</div></section>";
 }
 
 std::string render_templates_not_found() {
-    return "<section class=\"panel\" data-panel=\"response-templates\"><div class=\"empty-state\">"
-           "That definition was not found.</div></section>";
+    return std::string(kTplPanelOpen) +
+           "><div class=\"empty-state\">That definition was not found.</div></section>";
 }
 
 std::string render_sets_denied() {

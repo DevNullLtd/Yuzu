@@ -63,12 +63,11 @@ sudo rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in_progress
 CLT SDK is sufficient for CI parity: the ES SDK (`usr/lib/libEndpointSecurity.tbd`
 + `usr/include/EndpointSecurity/`) ships with the Command Line Tools SDK too
 (it is not an `.framework` bundle, and "needs full Xcode" is a myth — see
-`docs/darwin-compat.md`'s EndpointSecurity row); today's build probe is
-mis-formed and never finds it on any SDK (`feat/macos-spark-a0.5-es-probe`
-fixes this), so the real ES client currently compiles as a `required:false`
-no-op regardless of SDK. The `com.apple.developer.endpoint-security.client`
-entitlement + root + a signed/notarized binary are the actual on-device
-gates for the real ES path, not the SDK choice.
+`docs/darwin-compat.md`'s EndpointSecurity row), and the build probe finds it
+on either SDK, so the real ES client compiles with CLT alone. The `com.apple.developer.endpoint-security.client`
+entitlement (granted to a signed app bundle through its provisioning
+profile), root, and Full Disk Access are the actual on-device gates for the
+real ES path, not the SDK choice. Notarization is not one of them.
 
 ### 2. Shared build substrate
 

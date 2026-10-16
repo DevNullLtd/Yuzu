@@ -2,6 +2,87 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the macOS agent package installs transactionally and can refuse
+
+This applies to every macOS `.pkg`, including the release package.
+
+**What changed.**
+
+- The installer stages the new agent beside the running one and validates it.
+  The running agent is stopped only after that succeeds. If a running agent was
+  replaced and the new one does not stay running, the previous version is
+  restored and restarted.
+- The installer now **refuses** in these cases, before anything is stopped or
+  changed, and says which one applies:
+  - `/usr/local`, `/usr/local/lib` or `/usr/local/lib/yuzu`, or `/usr/local/bin`
+    for the loose-binary package, is not root-owned or is group- or
+    world-writable. That is typical of Macs whose Homebrew lives in
+    `/usr/local`: Intel Macs, and Apple silicon Macs running an Intel or
+    migrated Homebrew.
+  - An agent binary, rollback file or plugin (at any depth) in those directories
+    is a symlink, or another account could have written it, including through
+    an access control list. The installer lists each entry.
+  - `/etc/yuzu-agent` or `/etc/yuzu-agent/certs` is not root-owned, or is group-
+    or world-writable.
+  - `/Library/Application Support/Yuzu` or `/Library/Logs/Yuzu`, or anything
+    in them, is not root-owned, is group- or world-writable, or has an access
+    control list that lets another account write to it; or an entry in them is
+    a symlink, a special file or a hard-linked file. The agent runs as root and
+    opens files there by name. A Mac where `scripts/install-agent-user.sh` gave
+    them to `_yuzu` needs them returned to root first. The refusal lists each
+    entry; inspect and fix them one at a time, and never `chown -R`, which would
+    make a planted symlink look root-owned (see the packaging README).
+  - `/var/db/yuzu-agent`, or a recovery snapshot in it, has an access control
+    list. The installer never sets one, so it refuses rather than remove it.
+  - A new plugin has the same name as one no Yuzu package installed, or as a
+    Yuzu plugin whose bytes were changed after installation.
+  - The existing service requires signed plugins (`--plugin-require-signature`)
+    and the package contains an unsigned plugin. Every release `.pkg` does.
+- A first install of the stock package is **installed but not started**,
+  because the agent will not run without a server trust anchor. An agent that
+  was stopped is left stopped, including one disabled with
+  `launchctl disable system/com.yuzu.agent`; a disabled agent that was still
+  running is restarted and stays disabled for the next boot. Previously the installer loaded
+  the service every time.
+- Upgrades keep the existing service definition's arguments, every `YUZU_*`
+  environment variable and the standard proxy variables. Previously an upgrade
+  replaced `/Library/LaunchDaemons/com.yuzu.agent.plist`, losing anything added
+  to it. Any other environment variable is dropped and named in
+  `/var/log/install.log`. If the existing definition cannot be parsed, the
+  package default is installed with a warning and the agent is not started;
+  earlier settings must be re-applied.
+- An unrecognized development app under the data directory is moved to
+  `/var/db/yuzu-agent/quarantine/` and reported; it no longer blocks the install
+  or `uninstall.sh`.
+
+**What to check.**
+
+- If a refusal names a `/usr/local` directory, make it root-owned and remove
+  the group and world write bits. Then inspect the files it lists: changing
+  the directory's mode does not change who wrote what is already in it. Do not
+  `chown -R` them: that makes another account's files look root-installed.
+- If the data directory is refused, never delete it: it holds the agent's
+  identity and enrolment. Run `chmod go-w` on it, or restore its owner.
+- For signed-plugin enforcement, remove `--plugin-require-signature` before
+  upgrading to an unsigned package, or build a signed one.
+- Fleet deployment: pre-stage the server address and trust anchor so the first
+  install starts the agent. See
+  [Deploying with MDM](../../deploy/packaging/macos/README.md#deploying-with-mdm).
+- Rolling a fleet back to an older package and forward again is supported. A
+  package from before this installer replaces the service definition with its
+  default, so re-apply the server and trust settings after such a rollback.
+- After a failed install there is nothing to clean up: the next package run
+  repairs or discards any recovery state it finds under `/var/db/yuzu-agent`.
+
+The opt-in signed-app development lane (Endpoint Security) additionally moves
+the executable into `/Library/Application Support/YuzuAgent/YuzuAgent.app` and
+always runs with `--no-auto-update`, which preserves the bundle signature.
+Update that lane by installing a new package (for example through MDM), not
+over the air. The development `.pkg` is intentionally unsigned; it is not a
+customer-distribution lane. Before switching lanes, read the
+[packaging and recovery runbook](../../deploy/packaging/macos/README.md) and the
+[macOS development foundation](../macos-development-foundation.md).
+
 ## Version Compatibility
 
 | Server Version | Min Agent Version | Min Gateway Version | Notes |
@@ -27,6 +108,29 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
+
+## Behaviour change: web UI wording and layout (Console, Home after sign-in, hidden quarantine controls)
+
+- **"Dashboard" is now "Console".** The navigation item, the Home tile, the page title,
+  the "back to" links and the related Settings labels use the new name. Routes
+  (`/`, `/fragments/dashboard/...`), API paths, MCP tool names and permission names are
+  unchanged, so bookmarks and scripts keep working. Prose elsewhere in this manual still
+  says "dashboard" for the web UI as a whole.
+- **Home lists the screens only after sign-in.** Signed out, `/home` shows the sign-in
+  form and nothing else; the fifteen screen tiles appear once you are signed in. Health
+  probes that fetch `/home` still receive `200`.
+- **The Hardware pages no longer show quarantine controls.** The Quarantine link, the
+  Quarantined pill, the Quarantined devices panel, the containment banner and tab, and the
+  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
+  plugin and the role-gated quarantine instructions on the Instructions page all work as
+  before, and server-side enforcement does not depend on the UI. While the controls are
+  hidden, use `GET /api/v1/quarantine` to list records. `DELETE /api/v1/quarantine/{agent_id}`
+  ends the server record only; to remove the device's firewall rules, run the quarantine
+  plugin's release instruction (`security.quarantine.release`, "Release Device from Quarantine")
+  from the Instructions page (or through `execute_instruction`) and confirm with the
+  status instruction. No configuration change is needed.
+- **Colour schemes.** Settings > General > Appearance now offers six schemes (Slate stays
+  the default). The choice is stored in the browser, not on the server.
 
 ## Behaviour change: new agent, policy and fragment identifiers are restricted; page links encode identifiers
 
@@ -87,6 +191,12 @@ ignoring it.
 `GET /api/v1/rbac/roles/{role}/permissions` now answer `503` when the permission
 store is degraded (previously an empty `200`) and `404` for an unknown role
 (previously `200 {"data":[]}`).
+
+## Behaviour change: `POST /api/v1/hardware/{id}/sync` refuses cross-site cookie writes
+
+**What changed.** A call to `POST /api/v1/hardware/{id}/sync` (and the new fleet form `POST /api/v1/hardware/sync`) authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise it answers `403 cross-site request refused` and is audited as `csrf.denied`. API, MCP and engine token callers are not affected.
+
+**What to check.** A script that signs in with a cookie and calls the per-device sync route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. The Hardware and Software pages already send it. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`.
 
 ## Behaviour change: `PUT /api/config/{key}` is audit-first, refuses cross-site cookie writes and floors `heartbeat_timeout` at 30 seconds
 

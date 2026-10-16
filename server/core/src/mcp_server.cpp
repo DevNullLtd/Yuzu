@@ -3842,6 +3842,33 @@ static const ToolDef kTools[] = {
      "mcp.get_software_versions.",
      R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
+
+    // ── Software "Sync now": MCP twin of POST /api/v1/hardware/sync. Both call the SAME
+    // software_sync::Runner instance, so the 60 s per-operator cooldown and the single in-flight run
+    // bind both surfaces. Appended at the VERY END of kTools[] per the standing governance note
+    // above.
+    {"sync_hardware_software",
+     "Ask connected agents to re-run their installed-software sync now and report (the Software "
+     "page's 'Sync now'). ASYNC and counts-only: returns once the request is sent, not when devices "
+     "have synced; agents_reached is the sessions that accepted the frame. Supply exactly one of "
+     "scope (__all__, group:<id>, or one agent id) or scope_expression (a scope DSL expression). "
+     "Reach is this server process only. A run is at most 500 devices (narrow the scope), one per "
+     "operator per 60 seconds, and one at a time per server process; the 429/409 refusals carry "
+     "retry_after_ms. Naming the whole fleet needs a fleet-wide Execution:Execute grant (a "
+     "management-group-confined operator is refused). Devices you may not see are dropped, never "
+     "reported. Service-scoped API tokens are denied. Every accepted request is audited before "
+     "anything is sent (inventory.sync.request). Mirrors POST /api/v1/hardware/sync. Requires "
+     "Execution:Execute.",
+     R"j({"type":"object","properties":{)j"
+     R"j("scope":{"type":"string","minLength":1,"maxLength":256,"description":"__all__, group:<id>, or one agent id (alternative to scope_expression)"},)j"
+     R"j("scope_expression":{"type":"string","minLength":1,"maxLength":1024,"description":"A scope DSL expression (alternative to scope)"},)j"
+     R"j("source":{"type":"string","enum":["installed_software"],"default":"installed_software"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("requested":{"type":"integer"},"agents_reached":{"type":"integer"},"skipped_offline":{"type":"integer"},"skipped_version":{"type":"integer"},)j"
+     R"j("command_id":{"type":"string"},"source":{"type":"string"},"requested_at":{"type":"integer"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"})j"
+     R"j(},"required":["requested","agents_reached","skipped_offline","skipped_version","command_id","source","requested_at"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -3861,6 +3888,7 @@ static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
 // THIS array, before the lookup set below is derived, so a duplicate entry is
 // an offence — not a silent first-wins collapse at static init.
 static const char* const kWriteToolsRaw[] = {
+    "sync_hardware_software",
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle", "issue_code_signing_cert", "import_ca_chain",
@@ -4417,6 +4445,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // two rows above — fleet-wide host list with no per-agent confinement
     // mechanism, so a service-scoped token is denied at the C8 chokepoint.
     {"list_discovered_devices", {"Infrastructure", "Read"}},
+    {"sync_hardware_software", {"Execution", "Execute"}},
 
     // #2146 Batch B3 — fleet visualization + execution/fleet statistics read
     // twins. Default (2-element) form, so a service-scoped MCP token is
@@ -5153,6 +5182,11 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_deployments", {ToolEffect::ReadOnly, true, "List deployments"}},
     {"get_deployment", {ToolEffect::ReadOnly, true, "Get deployment"}},
     {"list_discovered_devices", {ToolEffect::ReadOnly, true, "List discovered devices"}},
+    // Requests a re-run of a read-only daily sync on the selected agents; changes no server or
+    // endpoint configuration. Execution:Execute, so the safe-direction floor (every Execute tool
+    // is destructiveHint true) applies even though the sync itself only reads. Not idempotent:
+    // each call mints a command id and sends frames.
+    {"sync_hardware_software", {ToolEffect::Destructive, false, "Sync hardware software"}},
     // #2146 Batch B3 — plain reads, repeat calls return the same shape for
     // unchanged server state (get_fleet_topology's fresh=true param busts a
     // shared cache but is still safe/repeatable -- it never mutates
@@ -15364,6 +15398,93 @@ McpServer::HandlerFn McpServer::build_handler(
                     success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                     "application/json");
                 return;
+            }
+
+            // sync_hardware_software: MCP twin of POST /api/v1/hardware/sync. The whole sequence
+            // (cooldown, in-flight slot, resolve, cap, fail-closed audit, dispatch through the
+            // dispatch_confined_arms system-reserved arm) is software_sync::Runner, the same
+            // instance the REST route calls, so neither bound can be dodged by switching surface.
+            if (tool_name == "sync_hardware_software") {
+                namespace ss = yuzu::server::software_sync;
+                if (!tier_allows(tier, "Execution", "Execute")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                // Fleet-wide per-agent action with no per-agent parameter to scope against: a
+                // service-scoped token has no confinement mechanism here (the type-level gate
+                // reads global grants only, and a service-scoped session's reach is its service),
+                // so it is denied outright.
+                if (deny_fleet_wide_service_scoped(
+                        "inventory.sync.request", "Scope",
+                        "Software sync denied to a service-scoped token (MCP sync_hardware_software)",
+                        "service-scoped tokens may not run a fleet software sync"))
+                    return;
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                if (!software_sync_runner_) {
+                    // Wired once at construction: permanent, so no retry hint.
+                    res.set_content(a4_error(kInternalError, "software sync is not configured"),
+                                    "application/json");
+                    return;
+                }
+                const auto parsed = ss::parse_request(args);
+                if (!parsed) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "inventory.sync.request", "denied", "Scope", "",
+                        "bad request: " + parsed.error());
+                    // retry-hint-exempt: input-parse failure, retrying the same call cannot succeed
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()),
+                                    "application/json");
+                    return;
+                }
+                ss::Audit audit;
+                audit.note = [&](std::string_view result, std::string_view type, const std::string& tid,
+                                 const std::string& detail_text) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "inventory.sync.request", std::string(result), std::string(type),
+                        tid, detail_text);
+                };
+                // The pre-dispatch row is FAIL CLOSED for a dispatch (same contract as REST): a
+                // row that cannot be stored refuses the run before anything is sent.
+                audit.persist = [&](std::string_view result, std::string_view type, const std::string& tid,
+                                    const std::string& detail_text) {
+                    return yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "inventory.sync.request", std::string(result), std::string(type),
+                        tid, detail_text);
+                };
+                const auto out = software_sync_runner_->run(*session, *parsed, audit);
+                if (out.status == ss::Status::Accepted) {
+                    nlohmann::json payload = out.summary;
+                    if (!mcp_audit("success"))
+                        payload["audit_persisted"] = false; // set-and-proceed: the pre-dispatch row stands
+                    res.set_content(
+                        success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("denied", "sync_hardware_software refused: " + ss::audit_token(out.message));
+                switch (out.status) {
+                case ss::Status::BadScope:
+                    // retry-hint-exempt: the scope expression is a client-input error
+                    res.set_content(error_response(id, kInvalidParams, out.message), "application/json");
+                    return;
+                case ss::Status::TooMany:
+                    // retry-hint-exempt: over the 500-device cap, narrowing the scope is the fix
+                    res.set_content(error_response(id, kInvalidParams, out.message), "application/json");
+                    return;
+                case ss::Status::FleetWideRequired:
+                    // retry-hint-exempt: a missing grant is not cured by retrying
+                    res.set_content(a4_error(kPermissionDenied, out.message), "application/json");
+                    return;
+                default:
+                    // Cooldown, in-flight, unresolved scope, audit unavailable, nothing reachable:
+                    // the Runner supplies the hint where retrying can help.
+                    res.set_content(a4_error(kInternalError, out.message, {}, out.retry_after_ms.value_or(-1)),
+                                    "application/json");
+                    return;
+                }
             }
 
             if (tool_name == "push_guardian_rules") {

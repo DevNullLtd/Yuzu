@@ -132,8 +132,9 @@ New set asks for a name and description. Delete set states that its definitions
 stay and become unassigned. Each library row has a set select that assigns the
 definition to a set or clears it.
 
-**Response templates.** Templates on a library row loads that definition's
-templates: the built-in default (never editable) first, then the authored ones.
+**Response templates.** Templates on a library row opens a panel directly under the
+library filters, scrolled into view, with that definition's templates: the built-in
+default (never editable) first, then the authored ones. Close empties the panel.
 New, Edit and Delete open dialogs that call
 `/api/v1/definitions/{id}/response-templates`. Filters are written one per line as
 `column | op | value`.

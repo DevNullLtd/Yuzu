@@ -80,7 +80,7 @@ struct Harness {
 
     bool deny_scoped{false};
     bool deny_scoped_fn_called{false};
-    std::string last_deny_action, last_deny_target_type, last_deny_target_id;
+    std::string last_deny_action, last_deny_message, last_deny_target_type, last_deny_target_id;
 
     // HM-2 /fragments/dashboard/health: the optional Execution:Read fleet gate.
     bool fleet_wired{false};
@@ -117,11 +117,12 @@ struct Harness {
             return s;
         };
         deps.deny_service_scoped_fn = [this](const httplib::Request&, httplib::Response& res,
-                                             const std::string& action, const std::string&,
+                                             const std::string& action, const std::string& message,
                                              const std::string& target_type,
                                              const std::string& target_id) -> bool {
             deny_scoped_fn_called = true;
             last_deny_action = action;
+            last_deny_message = message;
             last_deny_target_type = target_type;
             last_deny_target_id = target_id;
             if (deny_scoped) {
@@ -714,6 +715,8 @@ TEST_CASE("health_routes: /fragments/dashboard/health denies a service-scoped to
     CHECK(r->status == 200);
     CHECK(h.deny_scoped_fn_called);
     CHECK(h.last_deny_action == "dashboard.fragment.access_denied");
+    // The audited denial names the panel (this text is the audit detail, not the page).
+    CHECK(h.last_deny_message == "service-scoped tokens may not read the Dashboard health panel");
     CHECK_FALSE(h.auth_fn_called); // deny runs BEFORE auth_fn
     CHECK(r->body.find("service-scoped tokens") == std::string::npos); // gate text never reaches the page
     CHECK(r->body.find("id=\"dash-health\"") != std::string::npos);

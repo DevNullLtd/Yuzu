@@ -242,6 +242,7 @@ agent_test_exe = executable(
     'unit/test_progress_listener.cpp', # #4018 per-test START/END progress log, env-gated
     'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
     'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
+    'unit/test_agent_ota_disabled_lifecycle.cpp', # registration → command → reconnect, OTA disabled
     'unit/test_update_signature_mode.cpp', # OTA update-signature mode report + env typo check (#5249)
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
@@ -1307,6 +1308,7 @@ tar_test_exe = executable(
   ],
   cpp_args: tar_test_cpp_args,
   objcpp_args: tar_test_objcpp_args,
+  link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: tar_test_deps,
 )
 test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
@@ -1551,6 +1553,9 @@ if build_server
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
+      'unit/server/test_software_sync_decision.cpp', # Software "Sync now": pure request grammar, partition, fleet-wide rule, 500 cap, cooldown, audit wording
+      'unit/server/test_software_sync_runner.cpp',   # Software sync: the shared Runner (REST + MCP) - cooldown, lease, bounded partition, audit-before-send
+      'unit/server/test_hardware_sync_routes.cpp', # Software "Sync now": POST /api/v1/hardware/sync route matrix (HwHarness pattern)
       'unit/server/test_home_render.cpp',         # Dashboard summary: pure renderers, partitions, states
       'unit/server/test_home_routes.cpp',         # Dashboard summary: gates, scope, degrade, caller matrix
       'unit/server/test_dashboard_ui.cpp',        # Dashboard page: row order, moved placeholders, controls, part pins
@@ -2909,6 +2914,19 @@ endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
 _python3_test = yuzu_python
+test('macOS Endpoint Security app packaging',
+  _python3_test,
+  args: [files('test_macos_app_packaging.py')],
+  suite: 'agent',
+  # ~25 s on the macOS CI runner with 81 cases; more since (governance bci-2).
+  timeout: 90,
+)
+test('macOS development foundation checks',
+  _python3_test,
+  args: [files('test_macos_foundation.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 test('proto gen_proto version check',
   _python3_test,
   args: [files('test_gen_proto_version.py')],
