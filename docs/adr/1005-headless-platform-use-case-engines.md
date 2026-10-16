@@ -326,9 +326,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/mcp-server.md:21` already states explicitly requires "its own
        security-guardian-reviewed amendment... not a side effect of a
        routine REST-twin PR." This stands as a standing exception until
-       that amendment happens, not a numbered issue with a revisit date. (The
-       2026-10-15 entry below dates the three #4031 enrollment/OIDC rows for
-       re-confirmation; the eight #4028 rows keep their undated legacy form.)
+       that amendment happens, not a numbered issue with a revisit date. (#4031
+       made the identical call for the three REST-only enrollment/OIDC reads:
+       `GET /api/v1/enrollment/auto-approve-rules`, `.../pending-agents` and
+       `GET /api/v1/settings/oidc`, ledgered as `get.fragments-settings-
+       auto-approve`, `-pending` and `-directory`. They were previously
+       ledgered `twinned`; they are now `exception:#520 revisit:2027-04-30`,
+       a re-confirmation date set by the 2026-10-15 ledger change. #520 is a
+       closed decision issue used as the record. The eight #4028 rows keep
+       their undated legacy form.)
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -610,9 +616,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `exception:#5955 revisit:2026-11-30` in `scripts/ci/api-parity/*.json`.
      The gate requires the dated shape for any new exception but does not yet
      cap how many there are, so growth beyond these rows is review-enforced
-     for now. The #520 no-MCP rows (the three #4031 enrollment/OIDC read
-     twins) carry a re-confirmation date in the same shape, which re-confirms
-     that standing decision and does not retire it.
+     for now: so is re-dating, re-pointing to another issue or relabelling an
+     existing exception row, and a revisit date that has passed is not
+     machine-checked (#5955 is the reminder). The #520 dating of the #4031
+     rows (see the #4028 entry) is not part of the 2026-10-15 acceptance. The
+     17 older `exception:` rows are undated legacy rows (a size-pinned set;
+     keeping it from growing or being swapped is review-enforced) and are a
+     disclosed residual not covered by #5955.
 
 ## Interim rules (until the named follow-ups ship)
 

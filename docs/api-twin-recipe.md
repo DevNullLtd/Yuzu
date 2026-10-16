@@ -599,10 +599,14 @@ see §5 for which chokepoints apply.
     the strict shape does the same. A new exception needs a maintainer ruling named in ADR-1005.
     Then regenerate the doc block: run `python3 scripts/ci/check-api-parity.py --render-doc` and
     replace the region from the BEGIN line through the END line inclusive, in
-    `docs/api-parity-ledger.md`, with its output. A PR that edits a `BASELINE_*` constant should be
-    rebased immediately before merge: two PRs that each lower the same baseline by the same amount
-    merge cleanly yet fail the ratchet on the merged tree (the fix is to set the constant to the
-    value the checker prints).
+    `docs/api-parity-ledger.md`, with its output. A PR that edits a `BASELINE_*` constant (raise or
+    lower, `BASELINE_GENERIC_PLANNED` included) or the `GRANDFATHERED_MAX` / set-size pair should be
+    rebased immediately before merge: two PRs that each change the same baseline by the same
+    amount merge cleanly yet fail the ratchet on the merged tree, and two PRs that each remove a
+    different grandfathered id and lower the max merge clean and leave the set at 15 with the max
+    at 16. The fix is to set the constants to the values the checker prints, then re-run
+    `--render-doc` and splice the block again. Name the tracker for a `twinned-rest-only` row's
+    missing side in an issue or an ADR-1005 entry.
 
 ---
 

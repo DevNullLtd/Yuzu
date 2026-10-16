@@ -29,18 +29,21 @@ churns the ledger. Each row records:
 - `status` - one of `twinned` (BOTH a REST v1 and an MCP twin exist and are
   verified against the current source; the `mcp_twin` is a tool name, or
   `resource:<uri>` for a fixed `kResources[]` entry; the gate cannot verify a
-  resource template yet, so ledger such a row `twinned-rest-only` and cite
-  ADR-1005's 2026-09-07 / 2026-09-14 class entry), `twinned-rest-only` /
-  `twinned-mcp-only` (exactly one machine twin exists; counts as untwinned,
-  because ADR-1005 expects both), `planned:#N` (tracked, not yet built -
+  resource-template twin yet, so such a row is ledgered `twinned-rest-only`,
+  which overstates the gap relative to ADR-1005's 2026-09-14 addendum until
+  the gate can verify templates - a temporary limitation, not a rule),
+  `twinned-rest-only` / `twinned-mcp-only` (exactly one machine twin exists;
+  counts as untwinned, because ADR-1005 expects both; name the tracker for
+  the missing side in an issue or an ADR-1005 entry), `planned:#N` (tracked, not yet built -
   `#2146` is the generic placeholder used when no more specific tracking
   issue exists yet, and its row count may only shrink),
   `composed-of:<capability-ids>` (this row's capability is covered by the
   union of other ledgered capabilities, not a 1:1 twin),
   `exception:#<issue> revisit:<YYYY-MM-DD> <reason>` (a deliberate, reviewed
   exception with a tracking issue and a revisit date - an ADR-1005 ledger
-  entry, not a free pass; a closed, shrink-only set of older rows predates
-  the shape and is grandfathered by `capability_id` in the script), or `retire` (the
+  entry, not a free pass; a size-pinned set of older rows predates the shape
+  and is grandfathered by `capability_id` in the script - extending it,
+  swapping an id or rebinding an id to another row is caught only in review), or `retire` (the
   fragment route no longer exists; kept for history until the ledger row
   itself is deleted).
 
@@ -111,9 +114,11 @@ ledger row; a ledger row still claiming a route that no longer exists
 current extraction (a `resource:<uri>` twin must be a registered MCP
 resource); a duplicate `capability_id`; an `exception:` row without an issue,
 a real revisit date and a reason (outside the grandfathered set); a
+`capability_id` that is not the one derived from the row's method and path; a
 grandfathered set whose size is not its pinned maximum, or that holds a stale
-entry (a row gone, converted, or already in the strict shape - a swap of one
-id for another keeps the size and is caught only in review); a registered
+entry (a row gone, converted, or already in the strict shape - an extension
+paired with a maximum raise, a swap of one id for another and a rebind keep
+the size and are caught only in review); a registered
 `/api/v1/*` route missing from OpenAPI and not in the allowlist; the total
 untwinned-row count, or the generic `planned:#2146` row count, moving off its
 own baseline recorded in the script (the generic count never rises; the
