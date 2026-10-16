@@ -75,7 +75,7 @@ cleanup({Level, Agent}) ->
     stop_named(yuzu_gw_heartbeat_buffer),
     case whereis(?SUP) of
         undefined -> ok;
-        Sup -> catch unlink(Sup), catch exit(Sup, kill)
+        Sup -> catch unlink(Sup), catch exit(Sup, kill), wait_down(Sup)
     end,
     stop_named(yuzu_gw_registry),
     flush_events(),
