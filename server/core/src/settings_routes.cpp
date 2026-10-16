@@ -4775,8 +4775,7 @@ void SettingsRoutes::register_routes(
         // The login's own path: the same bounded GET and the same document validation
         // (issuer match, absolute endpoints on the issuer's scheme) a login applies.
         const auto fail = [&res](const std::string& what) {
-            res.set_content("<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">" +
-                                html_escape(what) + "</span>",
+            res.set_content("<span class=\"feedback-error\">" + html_escape(what) + "</span>",
                             "text/html; charset=utf-8");
         };
         const auto nat64 = oidc::egress::parse_nat64_prefix_list(nat64_text);
@@ -4803,7 +4802,7 @@ void SettingsRoutes::register_routes(
                  (keys ? std::string{} : ": " + keys.error()));
             return;
         }
-        res.set_content("<span class=\"feedback-ok\" style=\"color:#3fb950;font-size:0.8rem\">"
+        res.set_content("<span class=\"feedback-ok\">"
                         "Connected &#x2014; discovered authorization, token and JWKS endpoints; " +
                             std::to_string(keys->size()) + " signing key" +
                             (keys->size() == 1 ? "" : "s") + "</span>",
