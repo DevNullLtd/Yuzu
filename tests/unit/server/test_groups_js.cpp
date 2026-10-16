@@ -87,7 +87,7 @@ TEST_CASE("groups glue: Retry reloads with the panel as the request source", "[g
     CHECK_THAT(js, !ContainsSubstring("dataset.act"));
 }
 
-TEST_CASE("groups glue: no HTML-string injection, eval, storage or ad-hoc network calls",
+TEST_CASE("groups glue: no HTML-string injection; eval; storage or ad-hoc network calls",
           "[groups][js]") {
     const std::string& js = yuzu::server::kYuzuGroupsJs;
     for (const char* bad : {"innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "new Function",
