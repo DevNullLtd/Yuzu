@@ -60,7 +60,8 @@ void PreflightRunner::tick() {
         const auto applicable = preflight::applicable_checks(cfg);
         std::vector<preflight::PreflightCheckResponses> checks;
         if (d_.response_store)
-            checks = preflight::collect_check_responses(*d_.response_store, run.run_id, applicable);
+            checks = preflight::collect_check_responses(*d_.response_store, run.run_id, applicable,
+                                                        d_.response_fetch_cap);
 
         if (preflight::any_check_degraded(checks)) {
             // #2691 finding 10: a degraded read must not overwrite an
@@ -85,7 +86,17 @@ void PreflightRunner::tick() {
         // NOT reuse this frozen cohort; it must re-resolve devices_fn(creator)∩group
         // authorization at each dispatch, or an operator who has since lost scope to
         // a device would still command it.
-        if (!past_deadline && d_.dispatch_fn) {
+        // #4644: when a check's fetch window is saturated, an agent absent from it is
+        // ambiguous (answered-then-evicted vs unanswered) and re-dispatching only adds rows that
+        // evict more answers. Stop dispatching for this run; the grid already labels those cells
+        // "inconclusive: response cap reached" and the run still completes at its deadline, so
+        // it neither wedges nor reports a false go.
+        const bool window_saturated = preflight::any_check_truncated(checks);
+        if (window_saturated)
+            spdlog::warn("preflight_runner: run {} response window saturated; re-dispatch "
+                         "suppressed until the deadline",
+                         run.run_id);
+        if (!past_deadline && !window_saturated && d_.dispatch_fn) {
             std::vector<std::string> pending;
             for (const auto& dr : grid)
                 if (dr.bucket == preflight::Bucket::kIncomplete)

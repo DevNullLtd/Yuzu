@@ -176,9 +176,15 @@ Recommended order for a fresh install:
 > with no per-agent filter. Dashboard `/fragments/results/filter-bar`,
 > `/fragments/create-group-form`, and `POST /api/dashboard/group-from-results`
 > (tracked #3489; #3525 tracked the same finding and was closed as its
-> duplicate); REST `GET /api/v1/execution-statistics/agents` (tracked #3526);
-> `summarize_working_set` `kind=fleet`/`result_set` (an unscoped whole-registry
-> agent count, tracked #4753). So
+> duplicate); `summarize_working_set` `kind=fleet`/`result_set` (an unscoped
+> whole-registry agent count, tracked #4753). (REST
+> `GET /api/v1/execution-statistics/agents` and the MCP
+> `get_execution_statistics_by_agent` twin, formerly listed here under #3526, now gate on the
+> fleet-read chokepoint and are confined, effective only with RBAC enforcement on (a
+> management-group-scoped-only operator, refused before, is now admitted as a confined view;
+> with RBAC off the rollup is unfiltered for every authenticated non-service, non-engine
+> caller); the `/definitions` and fleet-summary
+> statistics carry no agent identity and keep the plain `Execution:Read` gate.) So
 > a degraded store looks like "no agents in scope" / "no responses" / `503`
 > across every reader on this page now — check the server startup log for
 > `RbacStore` errors, the `/health` store status, and

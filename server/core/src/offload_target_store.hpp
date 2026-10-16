@@ -119,11 +119,17 @@ struct OffloadDelivery {
     std::string error;
 };
 
+/// Largest accepted `batch_size`. The per-target buffer flushes only when it reaches
+/// `batch_size` and has no other cap, so an unbounded value is unbounded memory growth.
+/// Enforced in `OffloadTargetStore::create_target`, the one writer every surface (REST,
+/// MCP) goes through; the MCP schema's `maximum` and the docs name this same number.
+inline constexpr int kMaxOffloadBatchSize = 10000;
+
 /// Typed mutator failure (#3097 lesson — 400 vs 503 classification at the
 /// REST seam, mirrors `WebhookWriteError`). `invalid_input` is a CALLER
 /// error (400); the other two are store/infra degradation (503).
 enum class OffloadWriteError {
-    invalid_input,     ///< empty name/url, bad url scheme, batch_size < 1, duplicate name,
+    invalid_input,     ///< empty name/url, bad url scheme, batch_size outside 1..kMaxOffloadBatchSize, duplicate name,
                        ///< or a control byte in a free-text field — caller error, 400
     store_unavailable, ///< not open / pool exhausted / codec unavailable — 503
     db_error,          ///< a query against an open store failed — 503

@@ -170,6 +170,33 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
         CHECK(by_plugin->size() == 2);
     }
 
+    SECTION("since and until are presence-tracked: since 0 matches unset, until 0 matches nothing "
+            "(#4644)") {
+        const auto rows = [&store](const InventoryQuery& q) {
+            auto r = store.query(q);
+            REQUIRE(r.has_value());
+            return r->size();
+        };
+        InventoryQuery none;
+        CHECK_FALSE(none.since.has_value());
+        CHECK_FALSE(none.until.has_value());
+        CHECK(rows(none) == 3);
+        InventoryQuery since_zero;
+        since_zero.since = 0; // literal bound at the epoch: every collected_at is positive
+        CHECK(rows(since_zero) == 3);
+        InventoryQuery since_2000;
+        since_2000.since = 2000; // inclusive lower bound
+        CHECK(rows(since_2000) == 1);
+        InventoryQuery until_1000;
+        until_1000.until = 1000; // inclusive upper bound
+        CHECK(rows(until_1000) == 2);
+        // A literal `until = 0` is a bound at the epoch, not "unbounded": the REST edge refuses
+        // it, and the store must not quietly widen it to every row.
+        InventoryQuery until_zero;
+        until_zero.until = 0;
+        CHECK(rows(until_zero) == 0);
+    }
+
     SECTION("get_agent_inventory returns all of one agent's rows") {
         auto rows = store.get_agent_inventory("agent-1");
         REQUIRE(rows.has_value());

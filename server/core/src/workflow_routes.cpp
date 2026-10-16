@@ -2,6 +2,7 @@
 
 #include "command_capability.hpp"        // CommandCapability / ClassificationError / CommandCapabilityRegistry
 #include "compliance_eval.hpp"
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "dispatch_destructive_gate.hpp" // BR-001: evaluate_destructive_targeting / requires_explicit_targets
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
@@ -35,6 +36,7 @@
 #include <cstring>
 #include <expected>
 #include <format>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -467,7 +469,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // rather than printing zeros. The list route does not audit, so neither does this.
             std::string strip;
             if (!gate.scope && execution_tracker) {
-                if (auto fs = execution_tracker->get_fleet_summary_checked(0, false)) {
+                if (auto fs = execution_tracker->get_fleet_summary_checked(std::nullopt, false)) {
                     strip = operate_pages::render_stats_strip(
                         {fs->executions_today, fs->total_executions, fs->overall_success_rate,
                          fs->avg_duration_seconds});
@@ -1409,14 +1411,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  auto sink_state = std::make_shared<detail::SseSinkState>();
                  // Replay ring-buffer events newer than the client's
                  // Last-Event-ID header (browser EventSource sets this on
-                 // auto-reconnect). 0 = no header / first connect → no replay.
+                 // auto-reconnect). No header = cursor 0 = the whole ring buffer is
+                 // replayed (every id is > 0), so a late joiner sees recent history.
                  std::uint64_t since_id = 0;
                  if (req.has_header("Last-Event-ID")) {
-                     try {
-                         since_id = std::stoull(req.get_header_value("Last-Event-ID"));
-                     } catch (...) {
-                         since_id = 0;
-                     }
+                     // Strict cursor (stoull accepted "-1", wrapping past every event, and
+                     // "5abc" as 5). A MALFORMED header is served LIVE ONLY: see
+                     // sse_cursor_from_header, whose maximum cursor replays nothing; a cursor
+                     // of 0 would replay the whole ring buffer instead.
+                     since_id = sse_cursor_from_header(req.get_header_value("Last-Event-ID")).since_id;
                  }
                  auto* bus = execution_event_bus;
                  // Install the listener and replay atomically, using one scope
@@ -2112,7 +2115,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             q.name_filter = req.get_param_value("name");
         try {
             if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
         } catch (const std::exception&) {
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
@@ -2888,7 +2891,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             q.name_filter = req.get_param_value("name");
         try {
             if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
         } catch (const std::exception&) {
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
@@ -3955,7 +3958,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             q.name_filter = req.get_param_value("name");
         try {
             if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
         } catch (const std::exception&) {
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid numeric query parameter"),

@@ -1,9 +1,11 @@
 // security_headers.hpp — HTTP security response header construction (SOC2-C1).
 //
 // Pure helpers that build the response-header values applied to every HTTP
-// response by the post-routing handler in `server.cpp`. Extracted from
-// server.cpp so the logic is unit-testable in isolation and so the post-
-// routing handler stays focused on dispatch rather than string construction.
+// response by the post-routing handlers: server.cpp's main listener and
+// health_routes.cpp's plain-HTTP listener (install_plaintext_post_routing).
+// Extracted from server.cpp so the logic is unit-testable in isolation and so
+// the post-routing handlers stay focused on dispatch rather than string
+// construction.
 
 #pragma once
 

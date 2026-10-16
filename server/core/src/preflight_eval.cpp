@@ -9,16 +9,9 @@
 namespace yuzu::server::preflight {
 
 namespace {
-// Per-check fetch cap. MUST exceed the run's cohort cap (PreflightRunStore
-// kRowCap=20000) with headroom for the multiple rows/agent that re-dispatch
-// accrues — `query_by_execution` is `ORDER BY ts DESC LIMIT`, a sliding window,
-// so an undersized cap evicts already-answered agents' terminal rows and the run
-// can never complete (#governance perf-S2/architect). 50000 covers realistic
-// re-dispatch depth at the 20k cohort ceiling; the true fix (per-agent keyset
-// paging so size is independent of row count) is a tracked follow-up — a
-// truncation hit is logged below as the signal that we've reached it.
-constexpr int kResponseFetchCap = 50000;
-
+// Latest-wins scoring for one agent's rows (the cap constant kResponseFetchCap and its
+// sliding-window rationale live in preflight_eval.hpp; the true fix, per-agent keyset paging, is
+// a tracked follow-up).
 int score_response(const StoredResponse& r) {
     int s = 0;
     if (r.status != 0) // 0 = RUNNING; terminal beats running
@@ -58,11 +51,12 @@ std::unordered_map<std::string, std::string> dispatch_params(std::string_view ke
 
 std::vector<PreflightCheckResponses>
 collect_check_responses(ResponseStore& store, const std::string& run_id,
-                        const std::vector<std::pair<std::string, std::string>>& applicable) {
+                        const std::vector<std::pair<std::string, std::string>>& applicable,
+                        int fetch_cap) {
     std::vector<PreflightCheckResponses> out;
     out.reserve(applicable.size());
     ResponseQuery q;
-    q.limit = kResponseFetchCap;
+    q.limit = fetch_cap;
     for (const auto& [key, label] : applicable) {
         PreflightCheckResponses cr;
         cr.key = key;
@@ -76,10 +70,15 @@ collect_check_responses(ResponseStore& store, const std::string& run_id,
         auto rows_opt = store.query_by_execution(check_execution_id(run_id, key), q);
         cr.degraded = !rows_opt.has_value();
         auto rows = rows_opt.value_or(std::vector<StoredResponse>{});
-        if (static_cast<int>(rows.size()) >= kResponseFetchCap)
+        if (static_cast<int>(rows.size()) >= fetch_cap) {
+            // The window is saturated: an agent missing from the result is ambiguous (see
+            // PreflightCheckResponses::truncated). Surfaced to the grid, not only the log.
+            cr.truncated = true;
             spdlog::warn("preflight: check '{}' response fetch hit the {}-row cap for run {} — "
-                         "some agents' latest may be evicted (keyset-paging follow-up)",
-                         key, kResponseFetchCap, run_id);
+                         "agents absent from the window are reported inconclusive, not "
+                         "unanswered (keyset-paging follow-up)",
+                         key, fetch_cap, run_id);
+        }
         // latest_per_agent: terminal beats running, then non-empty output, then
         // the later arrival (mirrors policy_evaluator.cpp).
         std::unordered_map<std::string, const StoredResponse*> best;
@@ -104,6 +103,13 @@ collect_check_responses(ResponseStore& store, const std::string& run_id,
 bool any_check_degraded(const std::vector<PreflightCheckResponses>& checks) {
     for (const auto& c : checks)
         if (c.degraded)
+            return true;
+    return false;
+}
+
+bool any_check_truncated(const std::vector<PreflightCheckResponses>& checks) {
+    for (const auto& c : checks)
+        if (c.truncated)
             return true;
     return false;
 }

@@ -209,6 +209,7 @@
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -711,9 +712,10 @@ public:
                           "counter");
         // Pre-seed the closed principal_class dimension (docs/observability-
         // conventions.md — every value of a closed-set label is initialised at
-        // startup, matching yuzu_onbehalf_rejected_total below). method/status
-        // are NOT closed sets, so a single representative GET/200 point per
-        // class is the seed — not a cross-product, which would be unbounded.
+        // startup, matching yuzu_onbehalf_rejected_total below). method is
+        // bounded by http_method_label (accepted methods + UNKNOWN) but, like
+        // status, is not pre-seeded as a cross-product with it, so a single
+        // representative GET/200 point per class is the seed.
         // "engine" is now included (PR 4.5 — principal_class_resolved makes it
         // live, emitted for a resolved engine-principal session): the closed
         // set is human/agent/none/engine and every value gets its 0-point.
@@ -10298,13 +10300,12 @@ public:
 
         // cert_reloader_/redirect_server_/web_server_ were already stopped
         // early, above (#2703 Gate 7 item 2) — just the joins remain here.
-        // redirect_thread_ gets a bare join: the redirect server serves only
-        // 301s, never a held-open response, so unlike web_thread_ it has no
-        // plausible hang scenario and does not need the bounded treatment
-        // below.
-        if (redirect_thread_.joinable()) {
-            redirect_thread_.join();
-        }
+        // redirect_thread_ is NOT given a bare join (#5906): its handlers do no I/O, but
+        // httplib has only per-recv socket timeouts and ThreadPool::shutdown() joins every
+        // worker, so one peer trickling header bytes holds a worker, and so listen()'s return,
+        // for as long as it keeps trickling; and Server::stop() is a no-op before listen_internal
+        // sets is_running_, so a SIGTERM racing startup leaves listen() running with nothing to
+        // stop it. It shares the bounded wait below with web_thread_.
 
         // #2703 Gate 7 merge-slice item 2 (operator-adjudicated: 15s
         // shutdown grace bound). std::thread has no timed join, so
@@ -10332,34 +10333,56 @@ public:
         // by the write timeout rather than the tick — the close-signals above
         // wake a WAITING pump, not one already mid-write) or a genuinely
         // wedged handler unrelated to any stream.
-        if (web_thread_.joinable()) {
+        if (web_thread_.joinable() || redirect_thread_.joinable()) {
             // #3007 governance (sre, unhappy-path UP-7/UP-8): stop() now runs off the
             // signal handler, so this wait is silent-by-design up to 15s with no
             // progress evidence — indistinguishable from a genuine wedge to an operator
             // watching logs. One line here costs nothing and closes that gap.
-            spdlog::info("Shutting down server: waiting up to 15s for the web listener "
-                         "thread to finish...");
+            spdlog::info("Shutting down server: waiting up to 15s for the listener thread(s) "
+                         "to finish...");
             std::unique_lock<std::mutex> lk(web_thread_done_mtx_);
+            // One 15s bound covers both listeners. A listener thread that was never started
+            // (not joinable) counts as done.
             const bool finished = web_thread_done_cv_.wait_for(
-                lk, std::chrono::seconds(15), [this] { return web_thread_done_; });
+                lk, std::chrono::seconds(15), [this] {
+                    return (web_thread_done_ || !web_thread_.joinable()) &&
+                           (redirect_thread_done_ || !redirect_thread_.joinable());
+                });
+            const bool web_wedged = web_thread_.joinable() && !web_thread_done_;
+            const bool redirect_wedged = redirect_thread_.joinable() && !redirect_thread_done_;
             lk.unlock();
             if (finished) {
-                web_thread_.join();
+                if (web_thread_.joinable())
+                    web_thread_.join();
+                if (redirect_thread_.joinable())
+                    redirect_thread_.join();
             } else {
                 // #3007: stop() now runs on an ordinary thread (main.cpp's shutdown
                 // watcher / a Windows console-handler thread), never inside a real OS
                 // signal handler, so spdlog would be legal here. The raw write() stays
                 // anyway: std::_Exit() below skips atexit handling and any buffered
-                // spdlog sink flush, so a log call here could be silently lost — this
-                // write() is guaranteed to reach stderr before the process ends.
-                const char msg[] =
-                    "ServerImpl::stop: web thread did not finish within the 15s shutdown "
-                    "grace bound (#2703 Gate 7 item 2) - force-exiting.\n";
+                // spdlog sink flush, so a log call here could be silently lost — these
+                // write()s are guaranteed to reach stderr before the process ends. Three
+                // raw writes of static pieces, no heap: stop() is noexcept, so an
+                // allocation failure here would terminate before the _Exit.
+                const char* const who = web_wedged ? (redirect_wedged
+                                                          ? "web and redirect listener threads"
+                                                          : "web listener thread")
+                                                   : "redirect listener thread";
+                static constexpr char kPrefix[] = "ServerImpl::stop: ";
+                static constexpr char kSuffix[] =
+                    " did not finish within the 15s shutdown grace bound"
+                    " (#2703 Gate 7 item 2, #5906) - force-exiting.\n";
+                const auto emit = [](const char* s) {
 #ifdef _WIN32
-                _write(2, msg, sizeof(msg) - 1);
+                    _write(2, s, static_cast<unsigned>(std::strlen(s)));
 #else
-                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+                    (void)::write(STDERR_FILENO, s, std::strlen(s));
 #endif
+                };
+                emit(kPrefix);
+                emit(who);
+                emit(kSuffix);
                 std::_Exit(1);
             }
         }
@@ -14908,7 +14931,9 @@ private:
             // monitoring integrations behind a NAT or sharing a source-IP
             // bucket with authed REST traffic cannot 429-starve the health
             // probe. The endpoints themselves are strictly read-only and
-            // documented as unauthenticated. This IS the probes' only gate:
+            // documented as unauthenticated. This is the probes' only gate
+            // on the HTTPS listener (the plaintext redirect listener admits
+            // no body at all: is_plaintext_probe_request, health_routes.hpp):
             // the cap check runs here, unconditionally, before the
             // Unhandled return, precisely because everything past this
             // point (on-behalf-of, rate limiting) is skipped for these four
@@ -14923,8 +14948,7 @@ private:
             // identity-bearing action, nothing consumes the header on this
             // path, and a bricked orchestrator hides the misconfiguration the
             // guard exists to surface. Every other path rejects below.
-            if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
-                req.path == "/api/health") {
+            if (yuzu::server::health::is_probe_path(req.path)) {
                 if (enforce_pre_auth_body_cap())
                     return httplib::Server::HandlerResponse::Handled;
                 return httplib::Server::HandlerResponse::Unhandled;
@@ -15343,8 +15367,32 @@ private:
                      security_headers.csp.size(), security_headers.https_enabled ? "on" : "off",
                      security_headers.referrer_policy, security_headers.permissions_policy.size());
         spdlog::debug("Resolved Content-Security-Policy: {}", security_headers.csp);
-        web_server_->set_post_routing_handler([this, security_headers](const httplib::Request& req,
-                                                                       httplib::Response& res) {
+        // The ONE spelling of the request counter and its label set (an observability contract):
+        // the main post-routing handler below calls it, and the plain-HTTP redirect listener is
+        // handed the same callable, so a label change reaches both listeners' series (#5906).
+        // The method is normalised through http_method_label: httplib counts requests it rejects
+        // (400) with the raw request-line token, which an unauthenticated peer on the plain port
+        // controls, so the raw value would mint an unbounded series set (#5906, adversarial
+        // review round 3).
+        //
+        // principal_class: bounded actor class (ADR-1005, execution-plan
+        // PR 1.2) — human / agent / none / engine. "engine" is live as of
+        // PR 4.5: principal_class_resolved reads the stash set by the
+        // pre-routing chokepoint from the RESOLVED session, falling back
+        // to presentation-based principal_class_of otherwise. See
+        // principal_class.hpp for the full hybrid-basis contract.
+        auto count_http_request = [this](const httplib::Request& req,
+                                         const httplib::Response& res) {
+            metrics_
+                .counter("yuzu_http_requests_total",
+                         {{"method", std::string(http_method_label(req.method))},
+                          {"status", std::to_string(res.status)},
+                          {"principal_class", std::string(principal_class_resolved(req))}})
+                .increment();
+        };
+        web_server_->set_post_routing_handler([this, security_headers, count_http_request](
+                                                  const httplib::Request& req,
+                                                  httplib::Response& res) {
             // principal_class metric (PR 4.5) — clear the engine-class stash on EVERY
             // exit from this handler, via a guard whose destructor runs AFTER the
             // metric emission below (never clears before the read — cf. the reset
@@ -15400,23 +15448,44 @@ private:
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 
-            // principal_class: bounded actor class (ADR-1005, execution-plan
-            // PR 1.2) — human / agent / none / engine. "engine" is live as of
-            // PR 4.5: principal_class_resolved reads the stash set by the
-            // pre-routing chokepoint from the RESOLVED session, falling back
-            // to presentation-based principal_class_of otherwise. See
-            // principal_class.hpp for the full hybrid-basis contract.
-            metrics_
-                .counter("yuzu_http_requests_total",
-                         {{"method", req.method},
-                          {"status", std::to_string(res.status)},
-                          {"principal_class", std::string(principal_class_resolved(req))}})
-                .increment();
+            count_http_request(req, res);
         });
 
         // -- Extracted route modules ------------------------------------------------
         // Common callback lambdas shared by all extracted route modules.
         HttplibRouteSink inline_sink{*web_server_};
+        // #5906: the HTTP->HTTPS redirect listener is built here, not at listen
+        // time, so register_health_routes can put the four health probes on it.
+        // Its pre-routing handler 301s everything except those probes.
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        if (cfg_.https_enabled && cfg_.https_redirect) {
+            redirect_server_ = std::make_unique<httplib::Server>();
+            // Eager fixed pool, as web_server_ (rationale at its pool: the default dynamic pool
+            // spawns on the accept loop with no handler). Size = httplib's default maximum
+            // (4 x max(8, hw-1), hw = logical CPUs) capped at 64: this port serves 301s and four
+            // probes, so the host's CPU count must not scale it outside kMaxHttpWorkerThreads and
+            // the --http-worker-threads TasksMax guidance. Up to 17 logical CPUs it never binds
+            // (36 at 10); above that the pool is 64 threads, created at boot and resident for
+            // the life of the process. It is not slow-connection resistance: no pool size is
+            // (stop() bounds that wait instead).
+            const std::size_t redirect_pool =
+                std::min<std::size_t>(CPPHTTPLIB_THREAD_POOL_MAX_COUNT, 64);
+            redirect_server_->new_task_queue = [redirect_pool] {
+                return new httplib::ThreadPool(redirect_pool, redirect_pool);
+            };
+            yuzu::server::health::install_plaintext_redirect_pre_routing(
+                *redirect_server_, cfg_.web_address, cfg_.https_port);
+            // Five security headers (no HSTS) + the shared request counter, per
+            // install_plaintext_post_routing's contract; principal_class_resolved reduces to the
+            // presentation class on these workers (no engine-class stash is written here).
+            yuzu::server::health::install_plaintext_post_routing(
+                *redirect_server_,
+                security::HeaderBundle::make(cfg_.csp_extra_sources, /*https_enabled=*/false),
+                count_http_request);
+        }
+#endif
+        if (redirect_server_)
+            redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_);
         auto auth_fn = [this](const httplib::Request& req,
                               httplib::Response& res) -> std::optional<auth::Session> {
             return require_auth(req, res);
@@ -15856,6 +15925,14 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .fleet_read_fn = draw_fleet_read_fn, // HM-2 /fragments/dashboard/health (draw-time)
+                             // #5906: is_running() is set after a successful bind (httplib.h:11268)
+                             // and cleared on return (11269), so a failed bind, pre-accept
+                             // startup and a completed shutdown all read "not serving". No finer
+                             // signal in httplib 0.37.1; web_thread_done_ is set only after the
+                             // drain (caveat: AUTH POSTURE banner, health_routes.hpp).
+                             .plaintext_probe_sink = redirect_sink_.get(),
+                             .main_listener_serving_fn =
+                                 [this] { return web_server_ && web_server_->is_running(); },
                              .cfg = &cfg_,
                              .metrics = &metrics_,
                              .registry = &registry_,
@@ -21398,45 +21475,30 @@ private:
         if (cfg_.https_enabled) {
             listen_port = cfg_.https_port;
 
-            // Start HTTP→HTTPS redirect server
-            // No on_behalf_guard here (ADR-1005): this instance routes nothing —
-            // every request gets a 301 and the re-request hits the guarded main
-            // listener, so this is not a bypass of the pre-routing chokepoint.
-            if (cfg_.https_redirect) {
-                redirect_server_ = std::make_unique<httplib::Server>();
-                auto https_port = cfg_.https_port;
-                auto web_address = cfg_.web_address;
-                redirect_server_->set_pre_routing_handler(
-                    [web_address,
-                     https_port](const httplib::Request& req,
-                                 httplib::Response& res) -> httplib::Server::HandlerResponse {
-                        auto host = req.get_header_value("Host");
-                        // Strip port from host if present
-                        auto colon = host.find(':');
-                        if (colon != std::string::npos) {
-                            host = host.substr(0, colon);
-                        }
-                        if (host.empty())
-                            host = web_address;
-                        auto location =
-                            "https://" + host + ":" + std::to_string(https_port) + req.path;
-                        if (!req.params.empty()) {
-                            location += "?";
-                            bool first = true;
-                            for (const auto& [k, v] : req.params) {
-                                if (!first)
-                                    location += "&";
-                                location += k + "=" + v;
-                                first = false;
-                            }
-                        }
-                        res.set_redirect(location, 301);
-                        return httplib::Server::HandlerResponse::Handled;
-                    });
+            // Start HTTP→HTTPS redirect server (built, and given its four health
+            // probe routes, earlier in this function).
+            // No on_behalf_guard here (ADR-1005): this instance routes ONLY the four
+            // health-probe paths — the recorded ADR-1005 exception (ledger entry
+            // 2026-07-07, amended 2026-10-15), with session resolution bound to none —
+            // and every other request 301s to the guarded main listener
+            // (health::install_plaintext_redirect_pre_routing), so this is not a bypass
+            // of the pre-routing chokepoint.
+            if (redirect_server_) {
                 redirect_thread_ = std::thread([this] {
-                    spdlog::info("HTTP→HTTPS redirect on http://{}:{}/", cfg_.web_address,
-                                 cfg_.web_port);
-                    redirect_server_->listen(cfg_.web_address, cfg_.web_port);
+                    spdlog::info("HTTP→HTTPS redirect on http://{}:{}/ (health probes served "
+                                 "directly)",
+                                 cfg_.web_address, cfg_.web_port);
+                    // listen() returns false on a failed bind or a fatal accept error (and true
+                    // after stop()); the flag below is set either way so stop()'s wait ends.
+                    if (!redirect_server_->listen(cfg_.web_address, cfg_.web_port))
+                        spdlog::error(
+                            "Redirect listener failed to bind or exited with an error on {}:{}",
+                            cfg_.web_address, cfg_.web_port);
+                    {
+                        std::lock_guard<std::mutex> lk(web_thread_done_mtx_);
+                        redirect_thread_done_ = true;
+                    }
+                    web_thread_done_cv_.notify_all();
                 });
             }
         }
@@ -21448,7 +21510,12 @@ private:
             } else {
                 spdlog::info("Web UI available at http://{}:{}/", cfg_.web_address, listen_port);
             }
-            web_server_->listen(cfg_.web_address, listen_port);
+            if (!web_server_->listen(cfg_.web_address, listen_port))
+                spdlog::error("Web listener failed to bind or exited with an error on {}:{}{}",
+                              cfg_.web_address, listen_port,
+                              cfg_.https_enabled && cfg_.https_redirect
+                                  ? "; plain-port probes answer 503 https_listener_not_serving"
+                                  : "");
             // #2703 Gate 7 item 2: listen() returned (every worker drained back
             // into the pool and the pool itself joined — see httplib's
             // ThreadPool::shutdown()), so this thread is about to exit. Signal
@@ -21758,6 +21825,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
         yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
         yuzu::server::capdecls::plugin_action_catalogue_mgmt_posture(),
+        yuzu::server::capdecls::plugin_action_catalogue_shares(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
@@ -21821,7 +21889,14 @@ private:
 
     // HTTPS redirect server
     std::unique_ptr<httplib::Server> redirect_server_;
+    // Route sink over redirect_server_, declared after it so it is destroyed first.
+    // The health-route closures keep this pointer (Deps is copied into them), so it
+    // must outlive start_web_server().
+    std::unique_ptr<HttplibRouteSink> redirect_sink_;
     std::thread redirect_thread_;
+    // #5906: like web_thread_done_ (same mutex and cv), signalled by the redirect thread's body
+    // once listen() returns, so stop()'s one bounded wait covers both listeners.
+    bool redirect_thread_done_{false};
 
     // Certificate hot-reload
     std::unique_ptr<CertReloader> cert_reloader_;

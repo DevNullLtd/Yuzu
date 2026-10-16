@@ -890,15 +890,197 @@ TEST_CASE("schedule routes: a service-scoped token is denied on all 4 routes eve
 // boolean field — used to silently fall through to the "absent" default
 // (true), inverting the request and defeating the disable-always-reachable
 // kill switch (H-01). Pure function, no harness needed.
-TEST_CASE("parse_schedule_enabled: accepts real JSON booleans, not just strings",
+TEST_CASE("parse_schedule_enabled: accepts real JSON booleans and the integers 0 and 1",
           "[server][routes][schedule_routes][guardian-confinement]") {
     CHECK(schedule::parse_schedule_enabled(R"({"enabled":true})") == true);
     CHECK(schedule::parse_schedule_enabled(R"({"enabled":false})") == false); // the inversion bug
-    CHECK(schedule::parse_schedule_enabled(R"({"enabled":"true"})") == true);
+    CHECK(schedule::parse_schedule_enabled(R"({"enabled":1})") == true);
+    CHECK(schedule::parse_schedule_enabled(R"({"enabled":0})") == false); // used to ARM it
+    // The exact strings keep the kill switch reachable for clients that send text.
     CHECK(schedule::parse_schedule_enabled(R"({"enabled":"false"})") == false);
-    CHECK(schedule::parse_schedule_enabled(R"({})") == true);           // missing key -> default
-    CHECK(schedule::parse_schedule_enabled("not json") == true);        // malformed -> default
-    CHECK(schedule::parse_schedule_enabled(R"({"enabled":null})") == true); // non-bool/string -> default
+    CHECK(schedule::parse_schedule_enabled(R"({"enabled":"true"})") == true);
+    CHECK(schedule::parse_schedule_enabled(R"({})") == true);  // missing key -> default
+    CHECK(schedule::parse_schedule_enabled("") == true);       // no body -> default
+    // A whitespace-only body is blank too (like the rotate and enrollment readers), not a 400.
+    for (const char* blank : {"\n", "  ", " \t\r\n"}) {
+        INFO("blank body of " << std::string(blank).size() << " bytes");
+        CHECK(schedule::parse_schedule_enabled(blank) == true);
+    }
+    // Everything else is refused (#4644), never inferred as "arm": any other string (case variants
+    // included), other numbers, null, containers, and a truncated or non-object document.
+    for (const char* bad :
+         {R"({"enabled":"True"})", R"({"enabled":"FALSE"})", R"({"enabled":"0"})",
+          R"({"enabled":""})", R"({"enabled":null})", R"({"enabled":2})", R"({"enabled":-1})",
+          R"({"enabled":1.0})", R"({"enabled":5.5})", R"({"enabled":1e3})",
+          R"({"enabled":4294967297})", R"({"enabled":9223372036854775808})",
+          R"({"enabled":18446744073709551615})", R"({"enabled":[]})", R"({"enabled":{}})",
+          R"({"enabled":fals)", "not json", "[]", "5", "null", R"("x")"}) {
+        INFO(bad);
+        CHECK_FALSE(schedule::parse_schedule_enabled(bad).has_value());
+    }
+}
+
+// #4644: a schedule's numeric fields were read with `body.value(k, int)`, a plain static_cast, so
+// 4294967297 minutes became an EVERY-MINUTE schedule that fires unattended against the fleet, 5.5
+// became 5, and a string or null threw nlohmann's text back. Each is now a strict JSON integer in
+// its documented range, and a 400 creates nothing.
+TEST_CASE("POST /api/schedules: interval_minutes, day_of_week and day_of_month are strict "
+          "integers in range; a bad value creates nothing (#4644)",
+          "[server][routes][schedule_routes][numeric_params][rest][pg]") {
+    ScheduleRouteHarness h;
+    auto headers = h.session_headers_for("sched-op", "ScheduleAndExecute",
+                                         {{"Schedule", "Write"}, {"Execution", "Execute"}});
+
+    struct Field {
+        const char* key;
+        const char* frequency;
+        std::vector<std::string> extra_bad; ///< range violations specific to the field
+    };
+    const std::vector<Field> fields = {
+        // 35791394 = floor(INT32_MAX / 60) is the largest value the advance SQL can multiply by 60.
+        {"interval_minutes", "interval", {"0", "35791395", "2147483647", "2147483648"}},
+        {"day_of_week", "weekly", {"7", "2147483648"}},
+        {"day_of_month", "monthly", {"0", "29", "2147483648"}},
+    };
+    const std::vector<std::string> common_bad = {
+        "4294967297",           "9223372036854775808", "18446744073709551615",
+        "-1",                   "1e3",                 "5.5",
+        "\"7\"",                "\"\"",                 "null",
+        "true",                 "[]",                  "{}"};
+
+    for (const auto& f : fields) {
+        std::vector<std::string> bad = common_bad;
+        bad.insert(bad.end(), f.extra_bad.begin(), f.extra_bad.end());
+        for (const auto& v : bad) {
+            const std::string body = std::string(R"({"name":"s","definition_id":"def-1",)") +
+                                     "\"frequency_type\":\"" + f.frequency + "\",\"" + f.key +
+                                     "\":" + v + "}";
+            INFO(body);
+            auto res = h.sink.dispatch("POST", "/api/schedules", body, "application/json", headers);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.find(f.key) != std::string::npos); // names the offending key
+            CHECK(h.schedule_engine->query_schedules().empty());
+        }
+        // A truncated body is refused too.
+        const std::string truncated = std::string(R"({"name":"s","definition_id":"def-1",)") +
+                                      "\"frequency_type\":\"" + f.frequency + "\",\"" + f.key +
+                                      "\":6";
+        auto res = h.sink.dispatch("POST", "/api/schedules", truncated, "application/json", headers);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.schedule_engine->query_schedules().empty());
+    }
+    CHECK(h.audits.empty()); // every refusal is pre-store and unaudited, like the other 400s
+
+    // The documented values still create, including the boundaries.
+    const std::vector<std::string> ok_bodies = {
+        R"({"name":"a","definition_id":"d","frequency_type":"interval","interval_minutes":1})",
+        R"({"name":"b","definition_id":"d","frequency_type":"interval","interval_minutes":35791394})",
+        R"({"name":"c","definition_id":"d","frequency_type":"weekly","day_of_week":0})",
+        R"({"name":"d","definition_id":"d","frequency_type":"weekly","day_of_week":6})",
+        R"({"name":"e","definition_id":"d","frequency_type":"monthly","day_of_month":1})",
+        R"({"name":"f","definition_id":"d","frequency_type":"monthly","day_of_month":28})",
+        R"({"name":"g","definition_id":"d","frequency_type":"daily"})"};
+    for (const auto& body : ok_bodies) {
+        INFO(body);
+        auto res = h.sink.dispatch("POST", "/api/schedules", body, "application/json", headers);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    auto scheds = h.schedule_engine->query_schedules();
+    CHECK(scheds.size() == ok_bodies.size());
+    for (const auto& sc : scheds) {
+        if (sc.name == "b")
+            CHECK(sc.interval_minutes == 35791394);
+        if (sc.name == "d")
+            CHECK(sc.day_of_week == 6);
+        if (sc.name == "f")
+            CHECK(sc.day_of_month == 28);
+    }
+}
+
+// #4644: `{"enabled":0}` (or any number, "no", null) used to ARM the schedule, since only the
+// exact string "false" disarmed it. A refused value now changes nothing in either direction.
+TEST_CASE("POST /api/schedules/:id/enable: enabled must be a boolean or the integer 0 or 1; a "
+          "refused value arms and changes nothing (#4644)",
+          "[server][routes][schedule_routes][numeric_params][rest][pg]") {
+    ScheduleRouteHarness h;
+    auto headers = h.session_headers_for("sched-owner", "ScheduleEnabler",
+                                         {{"Schedule", "Write"}, {"Execution", "Execute"}});
+
+    const auto make = [&h](bool enabled) {
+        InstructionSchedule sched;
+        sched.name = "nightly-scan";
+        sched.definition_id = "def-1";
+        sched.frequency_type = "daily";
+        sched.enabled = enabled;
+        sched.created_by = "sched-owner";
+        auto created = h.schedule_engine->create_schedule(sched);
+        REQUIRE(created.has_value());
+        return *created;
+    };
+    const auto state = [&h](const std::string& id) {
+        for (const auto& sc : h.schedule_engine->query_schedules())
+            if (sc.id == id)
+                return sc.enabled;
+        FAIL("schedule vanished");
+        return false;
+    };
+
+    const std::vector<std::string> bad = {
+        R"({"enabled":"True"})", R"({"enabled":"FALSE"})", R"({"enabled":"0"})",
+        R"({"enabled":"no"})",   R"({"enabled":""})",      R"({"enabled":null})",
+        R"({"enabled":2})",      R"({"enabled":-1})",      R"({"enabled":1.0})",
+        R"({"enabled":5.5})",    R"({"enabled":1e3})",     R"({"enabled":4294967297})",
+        R"({"enabled":9223372036854775808})", R"({"enabled":18446744073709551615})",
+        R"({"enabled":[]})",     R"({"enabled":{}})",      R"({"enabled":tru)",
+        "not json",              "[]",                     "5"};
+
+    // Armed schedule must stay armed, disarmed must stay disarmed, whatever the refused value.
+    const auto armed = make(true);
+    const auto disarmed = make(false);
+    for (const auto& body : bad) {
+        INFO(body);
+        for (const auto& id : {armed, disarmed}) {
+            auto res = h.sink.dispatch("POST", "/api/schedules/" + id + "/enable", body,
+                                       "application/json", headers);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        CHECK(state(armed) == true);
+        CHECK(state(disarmed) == false);
+    }
+    CHECK(h.audits.empty()); // no enable/disable audit row for a refused request
+
+    // The accepted encodings, both directions.
+    const struct {
+        const char* body;
+        bool want;
+    } good[] = {{R"({"enabled":false})", false}, {R"({"enabled":true})", true},
+                {R"({"enabled":0})", false},     {R"({"enabled":1})", true},
+                {R"({"enabled":"false"})", false}, {R"({"enabled":"true"})", true}};
+    for (const auto& g : good) {
+        INFO(g.body);
+        auto res = h.sink.dispatch("POST", "/api/schedules/" + armed + "/enable", g.body,
+                                   "application/json", headers);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(state(armed) == g.want);
+    }
+
+    // A whitespace-only body is blank (the bare enable action), like the rotate and enrollment
+    // readers, not a 400.
+    for (const char* blank : {"", "\n", "  "}) {
+        auto res = h.sink.dispatch("POST", "/api/schedules/" + disarmed + "/enable", blank,
+                                   "application/json", headers);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(state(disarmed) == true);
+        (void)h.sink.dispatch("POST", "/api/schedules/" + disarmed + "/enable",
+                              R"({"enabled":false})", "application/json", headers);
+        CHECK(state(disarmed) == false);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
