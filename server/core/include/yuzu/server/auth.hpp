@@ -23,10 +23,10 @@ namespace yuzu::server {
 /// Typed failure of the enrollment-token / pending-agent store surface
 /// (WS-6 slice 6.2), shared by `AuthDB` (the store) and `auth::AuthManager`
 /// (which routes every enrollment call to it). Defined here, not in
-/// auth_db.hpp, so this header stays free of store headers. Deliberately
-/// three-valued and distinct from "not found"/"rejected"/"absent", which are
-/// SUCCESSFUL outcomes carried in the value channel: a caller can never read a
-/// store outage as an empty result.
+/// auth_db.hpp, so this header stays free of store headers. Deliberately a
+/// closed set of failures (two outages, two caller-input refusals), distinct from
+/// "not found"/"rejected"/"absent", which are SUCCESSFUL outcomes carried in the
+/// value channel: a caller can never read a store outage as an empty result.
 enum class StoreError : std::uint8_t {
     /// The store could not be reached: pool lease not acquired, OR no AuthDB is
     /// attached to the AuthManager (shutdown / never wired) — fail CLOSED.
@@ -1219,6 +1219,7 @@ public:
     /// the row for an id failing `is_valid_new_agent_id`; an existing row is always
     /// updated as before. A handler passes it because its own charset check reads
     /// the status once, and the row can disappear before this write.
+    /// Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<ConsumeEnrollResult, StoreError>
     consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                        const std::string& hostname, const std::string& os,
@@ -1238,7 +1239,7 @@ public:
     /// analytics event + SSE publish); `false` = a row already existed.
     /// `enforce_new_id_charset`: refuse with `StoreError::CharsetRefused` when this
     /// would CREATE the row for an id failing `is_valid_new_agent_id` (an existing
-    /// row still yields `false`); see `consume_and_enroll`.
+    /// row still yields `false`); see `consume_and_enroll`. Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<bool, StoreError>
     add_pending_agent(const std::string& agent_id, const std::string& hostname,
                       const std::string& os, const std::string& arch,
@@ -1250,7 +1251,7 @@ public:
     /// recorded as the row's `status_changed_by`. `enforce_new_id_charset`: refuse
     /// with `StoreError::CharsetRefused` (rolled back, no row) when this would
     /// CREATE the row for an id failing `is_valid_new_agent_id`; see
-    /// `consume_and_enroll`.
+    /// `consume_and_enroll`. Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<bool, StoreError>
     ensure_enrolled(const std::string& agent_id, const std::string& hostname,
                     const std::string& os, const std::string& arch,

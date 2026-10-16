@@ -1426,7 +1426,9 @@ TEST_CASE("AuthDB kEnrollUpsertSql reports an insert only for a created row (xma
     // survives: a created row is refused under enforce, the same id once it exists is not.
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
-    CHECK_FALSE(h.db.ensure_enrolled(mk_agent("x y"), "system", true).has_value());
+    auto first = h.db.ensure_enrolled(mk_agent("x y"), "system", true);
+    REQUIRE_FALSE(first.has_value());
+    CHECK(first.error() == StoreError::CharsetRefused);
     REQUIRE(h.db.ensure_enrolled(mk_agent("x y"), "system", false).value());
     // Row now exists: every further enforced call is an UPDATE and is never refused.
     for (int i = 0; i < 3; ++i) {

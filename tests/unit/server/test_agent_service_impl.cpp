@@ -1449,6 +1449,49 @@ TEST_CASE("Register increment sites only use the closed reason set, and ServerIm
     }
 }
 
+namespace {
+// Occurrences of `needle` in `src`.
+std::size_t count_occurrences(const std::string& src, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto pos = src.find(needle); pos != std::string::npos; pos = src.find(needle, pos + 1))
+        ++n;
+    return n;
+}
+
+// Occurrences of the argument comment `/*enforce_new_id_charset=*/true` (whitespace tolerant).
+std::size_t count_charset_flag_true(const std::string& src) {
+    static const std::regex re(R"re(/\*\s*enforce_new_id_charset\s*=\s*\*/\s*true\b)re");
+    return static_cast<std::size_t>(std::distance(
+        std::sregex_iterator(src.begin(), src.end(), re), std::sregex_iterator()));
+}
+} // namespace
+
+TEST_CASE("Register and ProxyRegister pass enforce_new_id_charset=true at every row-creating write",
+          "[agent_service][register][agent_id_charset]") {
+    // The flag defaults to false in the store API, so a production door that forgets it would
+    // silently re-create a bad-charset row. Each handler has exactly three row-creating enrollment
+    // writes (token claim, auto-approve, pending queue) and every one passes true.
+    for (const char* file : {"agent_service_impl.cpp", "gateway_service_impl.cpp"}) {
+        INFO("file=" << file);
+        const auto src = read_server_source(file);
+        CHECK(count_occurrences(src, "auth_mgr_.consume_and_enroll(") == 1);
+        CHECK(count_occurrences(src, "auth_mgr_.ensure_enrolled(") == 1);
+        CHECK(count_occurrences(src, "auth_mgr_.add_pending_agent(") == 1);
+        CHECK(count_charset_flag_true(src) == 3);
+    }
+
+    // No other request-path source reaches those writes (auth.cpp holds the wrapper
+    // definitions and is not scanned), so a new registration door is a new line in this list.
+    for (const char* file : {"mcp_server.cpp", "rest_api_v1.cpp", "settings_routes.cpp",
+                             "scim_routes.cpp", "auth_routes.cpp", "server.cpp"}) {
+        INFO("file=" << file);
+        const auto src = read_server_source(file);
+        CHECK(count_occurrences(src, "consume_and_enroll(") == 0);
+        CHECK(count_occurrences(src, "ensure_enrolled(") == 0);
+        CHECK(count_occurrences(src, "add_pending_agent(") == 0);
+    }
+}
+
 TEST_CASE("Register: an agent_id with a control byte the door lets through is counted as "
           "reason=control and logged at warn, not as a store outage",
           "[pg][agent_service][register][failclosed][control_id]") {
@@ -1812,10 +1855,17 @@ VanishingRowOutcome run_with_row_vanishing_before_write(const std::string& dsn,
     std::thread worker([&] { out.status = call(); });
     out.write_was_queued =
         yuzu::test::wait_for_pg_lock_waiter(dsn, "%INSERT INTO auth.pending_agents%");
-    // Release either way so a timeout fails the CHECK instead of hanging the suite.
-    REQUIRE(exec("DELETE FROM auth.pending_agents WHERE agent_id = $1", 1) == PGRES_COMMAND_OK);
-    REQUIRE(exec("COMMIT") == PGRES_COMMAND_OK);
+    // Release the lock whether or not the waiter was seen, so the worker always unblocks. The
+    // worker is joinable from here until join(), and a throwing REQUIRE in that span would
+    // std::terminate the binary, so the statuses are only captured here and asserted after
+    // the join. A failed DELETE aborts the transaction, so COMMIT then rolls it back, which
+    // releases the row lock all the same.
+    const auto delete_status =
+        exec("DELETE FROM auth.pending_agents WHERE agent_id = $1", 1);
+    const auto commit_status = exec("COMMIT");
     worker.join();
+    REQUIRE(delete_status == PGRES_COMMAND_OK);
+    REQUIRE(commit_status == PGRES_COMMAND_OK);
     return out;
 }
 
@@ -1840,10 +1890,16 @@ TEST_CASE("Register and ProxyRegister: a legacy bad-charset row removed after th
     GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
+    // So the enrollment-store degrade counter is observable below.
+    h.auth_mgr.set_metrics_registry(&h.metrics);
     const std::string dsn = h.auth_db.dsn();
     const std::string kCharsetMessage =
         "agent_id may only contain letters, digits, '.', '_', ':' and '-'";
 
+    // The `add_pending` (pending-queue) handler mapping of `CharsetRefused` is deliberately
+    // not driven here: the window it would need is the handler's second status read, and no
+    // row lock can park a handler between two reads. The store-level `add_pending` case in
+    // test_auth_db_pg.cpp pins the refusal itself.
     enum class Path { token, auto_approve };
     for (const bool via_gateway : {false, true}) {
         for (const Path path : {Path::token, Path::auto_approve}) {
@@ -1898,6 +1954,32 @@ TEST_CASE("Register and ProxyRegister: a legacy bad-charset row removed after th
                        {{"reason", "charset"}, {"source", "gateway_proxy"}})
               .value() == 2.0);
     CHECK(count_scalar(dsn, "SELECT count(*) FROM auth.pending_agents") == "0");
+
+    // A charset refusal is caller input, not a store outage: the enrollment-store degrade
+    // counter must not move for either write op these iterations drove.
+    for (const char* op : {"consume", "ensure_enrolled"}) {
+        for (const char* reason : {"no_store", "pool_acquire_timeout", "query_error"}) {
+            INFO("op=" << op << " reason=" << reason);
+            CHECK(h.metrics
+                      .counter("yuzu_auth_enrollment_store_degrade_total",
+                               {{"op", op}, {"reason", reason}})
+                      .value() == 0.0);
+        }
+    }
+}
+
+TEST_CASE("enrollment_store_status: caller-input refusals are INVALID_ARGUMENT, outages UNAVAILABLE",
+          "[agent_service][agent_id_charset][enrollment]") {
+    using yuzu::server::StoreError;
+    using yuzu::server::enrollment_store_status;
+    CHECK(enrollment_store_status(StoreError::InvalidInput).error_code() ==
+          grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK(enrollment_store_status(StoreError::CharsetRefused).error_code() ==
+          grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK(enrollment_store_status(StoreError::Unavailable).error_code() ==
+          grpc::StatusCode::UNAVAILABLE);
+    CHECK(enrollment_store_status(StoreError::QueryFailed).error_code() ==
+          grpc::StatusCode::UNAVAILABLE);
 }
 
 TEST_CASE("is_valid_new_agent_id: the charset table", "[agent_service][agent_id_charset]") {

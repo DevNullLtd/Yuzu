@@ -834,6 +834,7 @@ public:
     /// `Kind::charset_refused`. The Register handlers read the status once and gate
     /// only an absent id, so this closes the window where a legacy row is removed
     /// between that read and this write. It never affects an UPDATE of an existing row.
+    /// Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     std::expected<ConsumeEnrollResult, StoreError>
     consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                        const std::string& hostname, const std::string& os,
@@ -851,6 +852,7 @@ public:
     /// for an id failing `auth::is_valid_new_agent_id` is rolled back and returns
     /// `StoreError::CharsetRefused`; a row that already exists is still `false`.
     /// The caller's own charset check reads once, so the write re-checks at creation.
+    /// Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     std::expected<bool, StoreError> add_pending(const auth::PendingAgent& agent,
                                                 bool enforce_new_id_charset = false);
 
@@ -860,6 +862,7 @@ public:
     /// (default off): an upsert that INSERTS a row for an id failing
     /// `auth::is_valid_new_agent_id` is rolled back and returns
     /// `StoreError::CharsetRefused`; the update of an existing row is unaffected.
+    /// Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     std::expected<bool, StoreError> ensure_enrolled(const auth::PendingAgent& agent,
                                                     const std::string& by,
                                                     bool enforce_new_id_charset = false);
