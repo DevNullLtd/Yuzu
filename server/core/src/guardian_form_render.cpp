@@ -95,10 +95,10 @@ std::string render_param_field(const std::string& type_ns, const std::string& ke
             const auto& d = prop["default"];
             if (d.is_string())
                 placeholder = d.get<std::string>();
+            else if (d.is_number_unsigned()) // before the signed case: is_number_integer() is
+                placeholder = std::to_string(d.get<unsigned long long>()); // true for it too
             else if (d.is_number_integer())
                 placeholder = std::to_string(d.get<long long>());
-            else if (d.is_number_unsigned())
-                placeholder = std::to_string(d.get<unsigned long long>());
         }
         h += "<input id=\"" + ename + "\" name=\"" + ename + "\"";
         h += is_int ? " type=\"number\"" : " type=\"text\"";

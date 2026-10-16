@@ -708,7 +708,7 @@ The ScheduleEngine supports recurring instruction executions with four frequency
 | `daily` | `time_of_day` | Runs once per day at the specified time. |
 | `weekly` | `time_of_day`, `day_of_week` | Runs once per week. `day_of_week`: 0=Sunday through 6=Saturday. |
 | `monthly` | `time_of_day`, `day_of_month` | Runs once per month. `day_of_month`: 1-28 (no 29/30/31 to avoid month-length issues). |
-| `interval` | `interval_minutes` | Runs every N minutes. Minimum: 1 minute. |
+| `interval` | `interval_minutes` | Runs every N minutes. Minimum: 1 minute; maximum: 35791394. |
 
 ### Execution semantics
 
@@ -747,7 +747,7 @@ and `yuzu_schedule_tick_errors_total` counters.
 | `name` | string | Human-readable schedule name. |
 | `definition_id` | string | The instruction definition to execute. |
 | `frequency_type` | string | `daily`, `weekly`, `monthly`, or `interval`. |
-| `interval_minutes` | int | Minutes between executions (for `interval` type). |
+| `interval_minutes` | int | Minutes between executions (for `interval` type), 1-35791394. |
 | `time_of_day` | string | HH:MM format (for `daily`, `weekly`, `monthly`). |
 | `day_of_week` | int | 0-6 (for `weekly`). |
 | `day_of_month` | int | 1-28 (for `monthly`). |

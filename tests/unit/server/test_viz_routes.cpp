@@ -349,6 +349,21 @@ TEST_CASE("REST viz: 400 on non-numeric machines_max", "[viz][routes][cap]") {
     CHECK(h.audit_log[0].detail == "bad_machines_max");
 }
 
+TEST_CASE("REST viz: 400 on machines_max with trailing garbage instead of its numeric prefix "
+          "(#4644)",
+          "[viz][routes][cap]") {
+    VizHarness h({mk_agent("a", "h")});
+    for (const char* bad : {"500abc", "1e3", "0x10", "", "4294967296"}) {
+        INFO(bad);
+        auto res = h.sink.Get(std::string("/api/v1/viz/fleet/topology?machines_max=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto ok = h.sink.Get("/api/v1/viz/fleet/topology?machines_max=500");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
 TEST_CASE("REST viz: 400 on machines_max above ceiling", "[viz][routes][cap]") {
     VizHarness h({mk_agent("a", "h")});
     auto res = h.sink.Get("/api/v1/viz/fleet/topology?machines_max=2000000");

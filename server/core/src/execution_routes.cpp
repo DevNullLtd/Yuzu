@@ -2,6 +2,7 @@
 
 #include "execution_model.hpp" // #2146 A2-R1: shared execution_child_row_json builder
 #include "execution_scope_rules.hpp"
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "execution_tracker.hpp"
 #include "http_route_sink.hpp"
 #include "json_extract.hpp"
@@ -58,7 +59,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             q.status = req.get_param_value("status");
         try {
             if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
         } catch (const std::exception&) {
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid numeric query parameter"),

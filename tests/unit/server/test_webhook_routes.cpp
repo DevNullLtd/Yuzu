@@ -456,6 +456,21 @@ TEST_CASE("REST webhooks[pg]: GET /:id/deliveries empty list", "[rest][webhook][
     CHECK(j["deliveries"].empty());
 }
 
+// #4644: the delivery-list `limit` is ONE base-10 integer or a 400.
+TEST_CASE("REST webhooks[pg]: GET /:id/deliveries rejects a malformed limit",
+          "[rest][webhook][pg][numeric_params]") {
+    WebhookRouteHarness h;
+    for (const char* bad : {"50abc", "0x10", "1e2", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto res = h.sink.Get(std::string("/api/webhooks/1/deliveries?limit=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto ok = h.sink.Get("/api/webhooks/1/deliveries?limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
 TEST_CASE("REST webhooks[pg]: a token caller needs no Origin",
           "[rest][webhook][pg][security]") {
     WebhookRouteHarness h;

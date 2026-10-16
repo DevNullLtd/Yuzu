@@ -466,6 +466,30 @@ TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query
     }
 }
 
+TEST_CASE("openapi_spec_json(): the execution-statistics reads document their degraded-read 503 "
+          "(A4 envelope, retry_after_ms 2000)",
+          "[openapi][execution_statistics]") {
+    const auto& spec_json = yuzu::server::openapi_spec_json();
+    json spec = json::parse(spec_json, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec.contains("paths"));
+
+    for (const char* path : {"/execution-statistics", "/execution-statistics/agents",
+                             "/execution-statistics/definitions", "/statistics"}) {
+        INFO("path: " << path);
+        REQUIRE(spec["paths"].contains(path));
+        const auto& get_op = spec["paths"][path]["get"];
+        REQUIRE(get_op.contains("responses"));
+        REQUIRE(get_op["responses"].contains("503"));
+        const auto& r503 = get_op["responses"]["503"];
+        const std::string desc = r503.value("description", "");
+        CHECK(desc.find("retry_after_ms 2000") != std::string::npos);
+        REQUIRE(r503.contains("content"));
+        CHECK(r503["content"]["application/json"]["schema"]["$ref"] ==
+              "#/components/schemas/A4ErrorEnvelope");
+    }
+}
+
 TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
           "values) resolves to an existing component",
           "[openapi][refs]") {

@@ -627,3 +627,52 @@ TEST_CASE("bell POSTs: a throwing audit function after the attempted row cannot 
     CHECK(res->status == 200); // the change applied; losing the outcome row does not change that
     CHECK(w.store.list_unread().empty());
 }
+
+// #4644: a present-but-malformed `limit`/`offset` used to be swallowed by
+// `catch (...) {}` and the default page served as if it were the one asked for.
+TEST_CASE("GET /api/notifications: a malformed limit or offset is a 400 and valid values unchanged",
+          "[notification_routes][pg][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
+    PgWired w{db.dsn()};
+    NotificationHarness h;
+    h.store = &w.store;
+    h.wire();
+    REQUIRE(w.store.create("info", "t", "m") > 0);
+
+    for (const char* q : {"limit=10abc", "limit=0x10", "limit=1e1", "limit=", "offset=5x",
+                          "offset=-", "limit=99999999999999999999",
+                          // Negative page size/offset: PG rejects a negative LIMIT/OFFSET and
+                          // the store answered an empty list as a valid-looking 200.
+                          "limit=-1", "offset=-1"}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/notifications?") + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("invalid numeric query parameter") != std::string::npos);
+    }
+    auto ok = h.sink.Get("/api/notifications?limit=10&offset=0");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+// `(\d+)` also matches a 21-digit id, which `stoll` rejects by THROWING: the handler answered a
+// 500 (httplib's exception path) for an id that simply cannot name a notification. 404 now.
+TEST_CASE("POST /api/notifications/:id: an id that overflows int64 is a 404 not a 500",
+          "[notification_routes][pg][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
+    PgWired w{db.dsn()};
+    NotificationHarness h;
+    h.store = &w.store;
+    h.wire();
+    REQUIRE(w.store.create("info", "t", "m") > 0);
+    for (const char* tail : {"/read", "/dismiss"}) {
+        INFO(tail);
+        auto res = h.sink.Post(std::string("/api/notifications/99999999999999999999") + tail, "");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+    }
+    // Nothing was mutated by the rejected ids.
+    const auto all = w.store.list_all(/*limit=*/10, /*offset=*/0);
+    REQUIRE(all.size() == 1);
+    CHECK_FALSE(all[0].dismissed);
+}

@@ -378,13 +378,13 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
         where += " AND plugin = $" + std::to_string(++p);
         params.push_back(q.plugin);
     }
-    if (q.since > 0) {
+    if (q.since) {
         where += " AND collected_at >= $" + std::to_string(++p) + "::bigint";
-        params.push_back(std::to_string(q.since));
+        params.push_back(std::to_string(*q.since));
     }
-    if (q.until > 0) {
+    if (q.until) {
         where += " AND collected_at <= $" + std::to_string(++p) + "::bigint";
-        params.push_back(std::to_string(q.until));
+        params.push_back(std::to_string(*q.until));
     }
     // Two separate statements (not one chained `++p` expression): the
     // relative evaluation order of multiple `++p` calls combined via

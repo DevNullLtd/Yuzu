@@ -59,6 +59,8 @@ struct VerifyHarness {
     /// nullopt ⇒ perm_fn always allows and cohort_fn returns a populated
     /// (non-degraded) read; a test flips this to exercise the degrade path.
     bool cohort_degraded{false};
+    /// The `window` the compare asked the cohort store for (-1 = never called).
+    int last_window{-1};
 
     VerifyHarness() {
         auto auth_fn = [](const httplib::Request&,
@@ -78,7 +80,8 @@ struct VerifyHarness {
         };
         AppPerfCohortFn cohort_fn = [this](std::string_view, std::string_view, std::string_view,
                                            std::string_view,
-                                           int) -> std::optional<CohortRead> {
+                                           int window) -> std::optional<CohortRead> {
+            last_window = window;
             if (cohort_degraded)
                 return std::nullopt;
             CohortRead r;
@@ -187,4 +190,60 @@ TEST_CASE("/fragments/auto/verify/drill: gates GuaranteedState:Read and audits "
     REQUIRE(h.audit_calls.size() == 1);
     CHECK(h.audit_calls[0].action == "dex.app_perf.compare.drill");
     CHECK(h.audit_calls[0].action != "dex.app_perf.compare");
+}
+
+// #4644: `window` is a FILTER. `strtol` accepted nothing-but-a-number but the old
+// parse silently fell back to the 7-day default on anything else, so a typo verified a
+// DIFFERENT window than the one the operator asked for. Now: present-but-malformed is the
+// same honest 200 note as this file's other rejections, with nothing computed or audited.
+TEST_CASE("/fragments/auto/verify/run: a malformed window is refused and never defaulted",
+          "[verify_routes][numeric_params]") {
+    for (const char* bad : {"7abc", "0x10", "1e1", "", " 7", "+7", "7.5", "99999999999999999999"}) {
+        VerifyHarness h;
+        auto res = h.sink.Get(run_query() + "&window=" + bad);
+        REQUIRE(res);
+        INFO("window=" << bad);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("whole number of days") != std::string::npos);
+        CHECK(h.audit_calls.empty());
+        CHECK(h.last_window == -1);
+    }
+}
+
+// The DRILL route parses `window` through the same helper but was never exercised with a
+// malformed one (only /run was): same honest 200 note, nothing computed or audited.
+TEST_CASE("/fragments/auto/verify/drill: a malformed window is refused and never defaulted",
+          "[verify_routes][numeric_params]") {
+    for (const char* bad : {"7abc", "0x10", "1e1", "", " 7", "+7", "7.5", "99999999999999999999"}) {
+        VerifyHarness h;
+        auto res = h.sink.Get(drill_query() + "&window=" + bad);
+        REQUIRE(res);
+        INFO("window=" << bad);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("whole number of days") != std::string::npos);
+        CHECK(h.audit_calls.empty());
+        CHECK(h.last_window == -1);
+    }
+}
+
+TEST_CASE("/fragments/auto/verify: a valid window still reaches the cohort store",
+          "[verify_routes][numeric_params]") {
+    {
+        VerifyHarness h;
+        auto res = h.sink.Get(run_query() + "&window=14");
+        REQUIRE(res);
+        CHECK(h.last_window == 14);
+    }
+    {
+        VerifyHarness h; // absent => the documented 7-day default
+        auto res = h.sink.Get(run_query());
+        REQUIRE(res);
+        CHECK(h.last_window == 7);
+    }
+    {
+        VerifyHarness h; // out-of-range INTEGER keeps the documented clamp, it is not malformed
+        auto res = h.sink.Get(drill_query() + "&window=0");
+        REQUIRE(res);
+        CHECK(h.last_window == 1);
+    }
 }
