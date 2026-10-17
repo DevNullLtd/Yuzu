@@ -134,6 +134,24 @@ std::string url_encode(const std::string& s) {
     return out;
 }
 
+// A refused MFA step-up on an htmx form: `step_up_fn_` has already written the refusal (a 401/403/503
+// A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
+// envelope's own `error.message` (never its `remediation`, which for a SAML session points back at
+// a sign-in that cannot help); fall back to a fixed message if the body is not an envelope.
+void toast_step_up_refusal(httplib::Response& res) {
+    std::string message = "MFA step-up required";
+    try {
+        const auto body = nlohmann::json::parse(res.body, nullptr, false);
+        if (body.is_object() && body.contains("error") && body["error"].is_object() &&
+            body["error"].contains("message") && body["error"]["message"].is_string())
+            message = body["error"]["message"].get<std::string>();
+    } catch (...) {
+        // keep the fixed message
+    }
+    const nlohmann::json toast = {{"showToast", {{"message", message}, {"level", "error"}}}};
+    res.set_header("HX-Trigger", toast.dump());
+}
+
 // #4966: the ONE dashboard answer to a last-Administrator refusal (delete AND demote): 409 with
 // the A4 envelope, the HX-Trigger toast, and the `transport="dashboard"` refusal counter. `message`
 // is always a code-authored constant (never caller bytes), so it is safe in the hand-built toast
@@ -5357,9 +5375,23 @@ void SettingsRoutes::register_routes(
                                                  httplib::Response& res) {
         if (!perm_fn_(req, res, "ApiToken", "Write"))
             return;
+        if (!api_token_store_ || !api_token_store_->is_open()) {
+            res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            return;
+        }
         auto session = auth_fn_(req, res);
         if (!session)
             return;
+        // MFA step-up gate, matching POST /api/v1/tokens: issuing a bearer
+        // credential needs fresh MFA proof. Before any parsing or mutation.
+        if (step_up_fn_ && !step_up_fn_(req, res, *session, "POST /api/settings/api-tokens")) {
+            toast_step_up_refusal(res);
+            return;
+        }
 
         auto name = extract_form_value(req.body, "name");
         auto ttl_s = extract_form_value(req.body, "ttl_hours");
@@ -5406,6 +5438,28 @@ void SettingsRoutes::register_routes(
                 }
             } catch (const std::exception&) {
                 res.set_content("<span class=\"feedback-error\">Invalid TTL value.</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+        }
+
+        // An MCP-tier token needs an expiry of at most 90 days. Refuse here, as POST
+        // /api/v1/tokens does, so a plain input error is not reported below as a CSPRNG failure
+        // (503, a false yuzu_secure_random_failure_total increment and a false csprng_unavailable
+        // audit row).
+        if (!mcp_tier.empty()) {
+            if (expires_at <= 0) {
+                res.set_content("<span class=\"feedback-error\">An MCP-tier token needs a TTL "
+                                "(hours, at most 2160).</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+            if (expires_at - now > 90LL * 24 * 3600) {
+                res.set_content("<span class=\"feedback-error\">An MCP-tier token TTL cannot "
+                                "exceed 90 days.</span>",
                                 "text/html; charset=utf-8");
                 return;
             }
@@ -5498,6 +5552,8 @@ void SettingsRoutes::register_routes(
                                      .action = "api_token.create",
                                      .target_type = "ApiToken",
                                      .target_id = name,
+                                     .detail = "mcp_tier=" +
+                                               (mcp_tier.empty() ? std::string("none") : mcp_tier),
                                      .source_ip = req.remote_addr,
                                      .result = "success"});
         }
@@ -5515,9 +5571,24 @@ void SettingsRoutes::register_routes(
                                                            httplib::Response& res) {
         if (!perm_fn_(req, res, "ApiToken", "Delete"))
             return;
+        if (!api_token_store_ || !api_token_store_->is_open()) {
+            res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            return;
+        }
         auto session = auth_fn_(req, res);
         if (!session)
             return;
+        // MFA step-up gate, matching DELETE /api/v1/tokens/{id}; before the
+        // ownership lookup and any mutation.
+        if (step_up_fn_ &&
+            !step_up_fn_(req, res, *session, "DELETE /api/settings/api-tokens/{id}")) {
+            toast_step_up_refusal(res);
+            return;
+        }
         auto token_id = req.matches[1].str();
 
         // Owner-scoped revocation (fixes the sibling IDOR to #222 on
