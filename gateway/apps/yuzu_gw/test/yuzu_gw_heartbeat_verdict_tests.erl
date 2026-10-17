@@ -6,11 +6,11 @@
 %%% The buffer's whole contract is: from either success shape of the
 %%% BatchHeartbeat result, take the listed ids, drop the ones that cannot be
 %%% session ids (counted as verdict_dropped reason malformed), sort and cap
-%%% them, and hand the list to yuzu_gw_upstream:replay_sessions/1 with one
+%%% them, and hand the list to yuzu_gw_upstream:replay_sessions/2 with one
 %%% cast. Error results never feed the verdict path. What the upstream then
 %%% does with the ids is covered in yuzu_gw_registration_replay_tests.
 %%%
-%%% Mocks: yuzu_grpc_client, telemetry, yuzu_gw_upstream (replay_sessions/1 is
+%%% Mocks: yuzu_grpc_client, telemetry, yuzu_gw_upstream (replay_sessions/1,2 are
 %%% recorded). All mocks append to an ETS log from the calling process, so a
 %%% flush_sync/0 reply (or the sys:get_state/1 barrier after a `flush`
 %%% message) proves everything the flush did is already in the log.
@@ -92,6 +92,11 @@ setup() ->
     end,
     meck:new(yuzu_gw_upstream, [passthrough, no_link]),
     meck:expect(yuzu_gw_upstream, replay_sessions, fun(Ids) ->
+        rec({cast, Ids}),
+        ok
+    end),
+    %% The buffer hands the verdict over with its batch facts (#5695).
+    meck:expect(yuzu_gw_upstream, replay_sessions, fun(Ids, _Verdict) ->
         rec({cast, Ids}),
         ok
     end),

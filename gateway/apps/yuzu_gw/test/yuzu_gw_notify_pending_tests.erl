@@ -200,8 +200,8 @@ probe_test_() ->
      fun() -> setup(probe_env([])) end,
      fun cleanup/1,
      [
-      t("probe success closes the breaker, drains the held keys in order and fires the replay",
-        fun probe_success_closes_drains_and_replays/0),
+      t("probe success closes the breaker and drains the held keys in order; nothing is replayed",
+        fun probe_success_closes_and_drains_without_replay/0),
       t("probe error reopens the breaker with doubled backoff and requeues the event at the head",
         fun probe_error_reopens_and_requeues_at_the_head/0),
       t("a probe result after a call path RPC closed the circuit leaves the breaker alone (ok)",
@@ -1182,9 +1182,10 @@ env_key_case(Key, Val, Extra) ->
 %%%===================================================================
 
 %% Twelve keys are held behind an open breaker. half_open sends the head as the
-%% probe; its success closes the breaker, casts the replay, and the held keys
-%% drain first in first out. The replay is observed as its ProxyRegister.
-probe_success_closes_drains_and_replays() ->
+%% probe; its success closes the breaker and the held keys drain first in first
+%% out. Nothing is replayed (#5695: a recovery used to replay every agent; the
+%% bound agent would have been re-proxied).
+probe_success_closes_and_drains_without_replay() ->
     watch(),
     _ = bind_replay_agent(1),
     trip_breaker(),
@@ -1205,10 +1206,10 @@ probe_success_closes_drains_and_replays() ->
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
     ?assertEqual(lists:sort(lists:sublist(Keys, 2, ?INFLIGHT_MAX)),
                  lists:sort([maps:get(agent_id, Req) || {_, Req} <- First])),
-    %% The close started a full replay; it does not wait for the ten notify
-    %% workers in flight. One slot opens and the last held key goes out.
-    receive {proxied, _} -> ok
-    after ?AWAIT_MS -> erlang:error(replay_did_not_run)
+    %% No replay: no ProxyRegister arrives. One slot opens and the last held
+    %% key goes out.
+    receive {proxied, _} -> erlang:error(replay_ran)
+    after 200 -> ok
     end,
     {W, _} = hd(First),
     W ! release,

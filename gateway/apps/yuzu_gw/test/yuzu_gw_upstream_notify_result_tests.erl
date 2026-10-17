@@ -30,8 +30,8 @@ notify_result_test_() ->
      fun cleanup/1,
      [t("failed notifications open the breaker, and results that arrive after it opened do not crash",
         fun failed_notifications_open_the_breaker/0),
-      t("one failed CONNECTED is held again and retried; its success replays the agents",
-        fun a_failed_connected_arms_a_replay_on_the_next_success/0),
+      t("one failed CONNECTED is held again and retried; its success replays nothing",
+        fun a_failed_connected_is_retried_and_replays_nothing/0),
       t("a notification that keeps failing is retried only until the breaker opens, then held",
         fun a_failing_notification_is_retried_until_the_breaker_opens/0),
       t("successful notifications on their own replay nothing",
@@ -63,9 +63,10 @@ failed_notifications_open_the_breaker() ->
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
 
 %% #5695: a failed send is no longer lost. The CONNECTED is held again and
-%% retried at once; the retry succeeds, and a success after a failure is the
-%% reconnect signal that replays every agent the gateway holds.
-a_failed_connected_arms_a_replay_on_the_next_success() ->
+%% retried at once, and the retry succeeds. A success after a failure says the
+%% upstream answers again, not that it lost what it knew: nothing is replayed
+%% (it used to replay every agent the gateway holds).
+a_failed_connected_is_retried_and_replays_nothing() ->
     Agents = register_agents(2),
     Fails = atomics:new(1, []),
     atomics:put(Fails, 1, 1),
@@ -78,10 +79,13 @@ a_failed_connected_arms_a_replay_on_the_next_success() ->
                    end),
     ok = notify(connected, 1),
     ?assertEqual(ok, wait_until(fun() -> notify_count() =:= 2 end)),
-    ?assertEqual(ok, wait_until(fun() -> proxy_register_count() =:= length(Agents) end)),
-    Replayed = proxy_register_requests(),
-    [?assert(lists:member(Req, Replayed)) || {_Id, Req} <- Agents],
-    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
+    %% Two calls to the upstream and 100 ms: a replay the success had started
+    %% (no start jitter here) would have sent its first ProxyRegister by then.
+    _ = yuzu_gw_upstream:circuit_state(),
+    timer:sleep(100),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(0, proxy_register_count()),
+    _ = Agents.
 
 %% The retry is bounded by the breaker: each failure counts, so a notification
 %% the server keeps failing is sent at most the threshold number of times, then

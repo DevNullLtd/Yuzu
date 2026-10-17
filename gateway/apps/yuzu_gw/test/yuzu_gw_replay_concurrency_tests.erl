@@ -1,7 +1,10 @@
 %%%-------------------------------------------------------------------
-%%% @doc Registration replay after the upstream recovered, at fleet scale.
+%%% @doc A full registration replay, at fleet scale.
 %%%
-%%% A recovery replays every agent the registry holds. These tests pin the
+%%% A full replay re-proxies every agent the registry holds (since #5695 it is
+%%% started by a heartbeat verdict that shows the server lost its state, not by a
+%%% breaker recovery; these tests start it with the replay_registrations cast,
+%%% which runs the same walk and workers). They pin the
 %%% properties that make that work at thousands of agents:
 %%%
 %%%   - the replay runs in parallel, bounded by the regulator's replay cap
@@ -162,13 +165,10 @@ register_agents(N, Pad) ->
      end || I <- lists:seq(1, N)],
     ok.
 
-%% One failed call below the trip threshold, then a successful one: the
-%% closed-state recovery that starts a full replay.
+%% Start a full replay (the replay_registrations cast: a recovery no longer
+%% starts one, #5695).
 trigger_recovery() ->
-    ets:insert(?TAB, {fail_next, true}),
-    {error, _} = yuzu_gw_upstream:proxy_register(#{info => #{agent_id => <<"trigger">>}}),
-    {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{agent_id => <<"trigger">>}}),
-    ok.
+    ok = gen_server:cast(yuzu_gw_upstream, replay_registrations).
 
 reset_counters() ->
     ets:insert(?TAB, [{inflight, 0}, {peak, 0}, {replays, 0}, {fail_next, false}]).

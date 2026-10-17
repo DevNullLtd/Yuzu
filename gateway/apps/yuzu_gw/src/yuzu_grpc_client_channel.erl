@@ -283,8 +283,10 @@ do_info({reconnect, Id}, #st{slots = Slots} = State) ->
 do_info(_Other, State) ->
     {noreply, State}.
 
-terminate(_Reason, #st{by_pid = ByPid}) ->
-    _ = [close_conn(P) || P <- maps:keys(ByPid)],
+terminate(_Reason, #st{slots = Slots, by_pid = ByPid}) ->
+    %% The slots' connections and the retired ones still being waited out.
+    _ = [close_conn(P) || #slot{pid = P} <- maps:values(Slots), is_pid(P)],
+    _ = [close_conn(P) || {P, {retired, _}} <- maps:to_list(ByPid)],
     ok.
 
 %% What a crash report or sys:get_status shows of this process: the shape, not

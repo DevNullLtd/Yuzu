@@ -11,7 +11,7 @@
 %%%
 %%% Mocks: yuzu_grpc_client (every request is encoded with the Def the buffer
 %%% passes, so sizes are the real wire sizes), telemetry and
-%%% yuzu_gw_upstream:replay_sessions/1 (both recorded). The log is an ETS
+%%% yuzu_gw_upstream:replay_sessions/1,2 (both recorded). The log is an ETS
 %%% table written from the calling process, so a flush_sync/0 reply (or the
 %%% sys:get_state/1 barrier after a cast) proves everything the buffer did is
 %%% already in it.
@@ -143,6 +143,10 @@ setup() ->
     stop_upstream(),
     meck:new(yuzu_gw_upstream, [passthrough, no_link]),
     meck:expect(yuzu_gw_upstream, replay_sessions, fun(Ids) ->
+        rec({cast, Ids}),
+        ok
+    end),
+    meck:expect(yuzu_gw_upstream, replay_sessions, fun(Ids, _Verdict) ->
         rec({cast, Ids}),
         ok
     end),
