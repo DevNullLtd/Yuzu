@@ -327,7 +327,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        security-guardian-reviewed amendment... not a side effect of a
        routine REST-twin PR." This stands as a standing exception until
        that amendment happens, not a numbered issue with a revisit date. (#4031
-       made the identical call for three REST-only reads: enrollment
+       required a per-route decision and its implementing PR #4176 made the
+       identical call for three REST-only reads: enrollment
        auto-approve-rules, enrollment pending-agents and settings/oidc,
        ledgered as `get.fragments-settings-auto-approve`,
        `get.fragments-settings-pending` and
@@ -335,12 +336,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `twinned`; this change makes them `exception:#520 revisit:2027-04-30`.
        #520 is the closed security issue whose fix drew the MCP-tier
        boundary, not a decision record: the decision of record is
-       `mcp_policy.hpp`'s `tier_allows`, `docs/mcp-server.md` line 21 and
-       `AuthRoutes::require_admin`'s comment. #4031 scoped the per-route
-       decision and its implementing PR #4176 has merged, but the issue is
-       still open and carries no re-confirmation date, so no open item
-       tracks the 2027-04-30 re-confirmation; #5955 covers only its own 13
-       rows. The
+       `mcp_policy.hpp`'s `tier_allows` and the `docs/mcp-server.md` bullet
+       "Server administration surfaces stay REST-only (#520)". #4031 is still
+       open and carries no re-confirmation date, so no open item tracks the
+       2027-04-30 re-confirmation; #5955 covers only its own 13 rows. The
        eight #4028 rows keep their undated legacy form.)
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
@@ -616,13 +615,16 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      twin yet, as temporary exceptions to Decision 4 and Grandfathered
      surface 1 (#5859, #5872, #5873, #5880). The acceptance is recorded in
      review text edited into the owner's own reviews of those four pull
-     requests, dated 2026-10-15 ("Decision recorded (owner, 2026-10-15)" on
-     #5859, #5872 and #5873; "Owner decision (recorded: accepted)" in the
+     requests; the label text is dated 2026-10-15 (review text labelled
+     "Decision recorded (owner, 2026-10-15)" on #5859, #5872 and #5873, though
+     the #5859 review itself was submitted 2026-10-14 UTC; "Owner decision (recorded: accepted)" in the
      approving review of #5880), and restated in the body of #5955 (opened
-     2026-10-16). The ground recorded is that the exception is accepted for
-     now. These are review edits by the owner's account, not a signed
-     decision. The ADR owner has stated that the decision is final and that
-     no independent review of this entry is required.
+     2026-10-16). No ground is recorded beyond "accepted for
+     now". These are review edits by the owner's account, not a signed
+     decision. In the session in which this entry was prepared (2026-10-17)
+     the ADR owner stated that the decision to record this entry as written is
+     final and that no independent review of it is required; the exceptions
+     themselves remain temporary.
      The exception waives only the requirement of a REST v1 and MCP twin for
      13 read fragments in this change. It does not waive, and this entry
      does not assess, the authentication, authorization, audit or
@@ -637,8 +639,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      re-dating, re-pointing or relabelling an existing exception row. A
      revisit date that has passed is not machine-checked (#5955 is the
      reminder). The #520 dating of the #4031 rows (see the #4028 entry) is not
-     part of the 2026-10-15 acceptance. The 17 (when written) older
-     `exception:` rows are undated legacy rows in a size-pinned set: plain
+     part of the 2026-10-15 acceptance. The 17 older
+     `exception:` rows at the time of writing are undated legacy rows in a size-pinned set: plain
      growth is machine-caught, while growth paired with a raise of the pin, a
      swap or a rebind to a row with the same slug is review-only. They are a
      disclosed residual not covered by #5955. The eight `twinned-rest-only`

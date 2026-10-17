@@ -114,7 +114,8 @@ ledger row; a ledger row still claiming a route that no longer exists
 (other than `status: "retire"`); a `twinned` row that lacks either twin, or a
 `twinned*` row whose claimed REST or MCP twin does not actually exist in the
 current extraction (a `resource:<uri>` twin must be a registered MCP
-resource; an object-form `rest_v1_twin` is verified on a row of any status); a duplicate `capability_id`; an `exception:` row without an issue,
+resource; an object-form `rest_v1_twin` is verified on a row of any
+status); a duplicate `capability_id`; an `exception:` row without an issue,
 a real revisit date and a reason (outside the grandfathered set); a
 `capability_id` that is not the one derived from the row's method and path; a
 grandfathered set whose size is not its pinned maximum, or that holds a stale

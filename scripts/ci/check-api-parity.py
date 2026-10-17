@@ -762,11 +762,16 @@ class AnchorError(RuntimeError):
     reported as a named error, never a traceback."""
 
 
+def _why(e):
+    """Short cause text: an OSError's strerror (the path is printed elsewhere)."""
+    return e.strerror if isinstance(e, OSError) and e.strerror else str(e)[:120]
+
+
 def _read_mcp_server_cpp():
     try:
         return MCP_SERVER_CPP.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as e:
-        raise AnchorError(f"cannot read {MCP_SERVER_CPP} ({str(e)[:120]}) - the "
+        raise AnchorError(f"cannot read {MCP_SERVER_CPP} ({_why(e)}) - the "
                           f"file this script scans for kTools[] and kResources[]")
 
 
@@ -895,6 +900,17 @@ def stale_grandfather_errors(rows, grandfathered):
     must still name a NON-strict `exception:` row. This catches growth and
     stale ids; a swap or an extension paired with a MAX raise is review-only."""
     n = len(grandfathered)
+    by_id = {r["capability_id"]: r for r in rows.values()}
+    bad = {}
+    for cid in sorted(grandfathered):
+        row = by_id.get(cid)
+        if row is None or not row["status"].startswith("exception:"):
+            bad[cid] = "no longer names an exception row"
+        elif parse_exception(row["status"]):
+            bad[cid] = "already uses the strict shape"
+    target = n - len(bad)  # the size every message below agrees on
+    fix = ("remove this id and leave GRANDFATHERED_MAX alone" if n > GRANDFATHERED_MAX
+           else f"remove it from the set and lower GRANDFATHERED_MAX to {target} in THIS change")
     errors = []
     if n > GRANDFATHERED_MAX:
         errors.append(f"GRANDFATHERED_LEGACY_EXCEPTIONS grew ({n} ids, "
@@ -903,18 +919,8 @@ def stale_grandfather_errors(rows, grandfathered):
     elif n < GRANDFATHERED_MAX:
         errors.append(f"GRANDFATHERED_LEGACY_EXCEPTIONS has {n} ids, fewer than "
                       f"GRANDFATHERED_MAX {GRANDFATHERED_MAX}: lower "
-                      f"GRANDFATHERED_MAX to {n} in THIS change")
-    by_id = {r["capability_id"]: r for r in rows.values()}
-    fix = ("remove this id and leave GRANDFATHERED_MAX alone" if n > GRANDFATHERED_MAX
-           else f"remove it from the set and lower GRANDFATHERED_MAX to {n - 1} in THIS change")
-    for cid in sorted(grandfathered):
-        row = by_id.get(cid)
-        if row is None or not row["status"].startswith("exception:"):
-            errors.append(f"GRANDFATHERED_LEGACY_EXCEPTIONS id {cid!r} no longer "
-                          f"names an exception row - {fix}")
-        elif parse_exception(row["status"]):
-            errors.append(f"GRANDFATHERED_LEGACY_EXCEPTIONS id {cid!r} already "
-                          f"uses the strict shape - {fix}")
+                      f"GRANDFATHERED_MAX to {target} in THIS change")
+    errors += [f"GRANDFATHERED_LEGACY_EXCEPTIONS id {cid!r} {why} - {fix}" for cid, why in bad.items()]
     return errors
 
 
@@ -959,7 +965,7 @@ def load_ledger(ledger_dir=None):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
         except (ValueError, OSError, RecursionError) as e:  # ValueError: bad JSON/UTF-8, >4300-digit ints
-            errors.append(f"{f}: invalid JSON ({str(e)[:120]})")
+            errors.append(f"{f}: invalid JSON ({_why(e)})")
             continue
         if not isinstance(data, list):
             errors.append(f"{f}: top level must be a JSON array of rows")
@@ -1568,6 +1574,19 @@ def _selftest():
         errs = stale_grandfather_errors({("GET", "/a"): _lrow("legacy.id", "exception:#520")}, gf)
         check(len(errs) == 1 and "lower GRANDFATHERED_MAX to 1 in THIS change" in errs[0],
               f"grandfather: shrink text, got {errs}")
+    # One target size in EVERY message, computed from all stale ids (n - stale), sorted by id.
+    live = {("GET", "/l"): _lrow("l.id", "exception:#520")}
+    for mx, ids_, rows_g, want in ((3, "abc", {}, "0"), (5, "lbc", live, "1"), (5, "lb", live, "1")):
+        sset = frozenset(f"{i}.id" for i in ids_)
+        with _patched(GRANDFATHERED_MAX=mx):
+            errs = stale_grandfather_errors(rows_g, sset)
+        per_id = [e for e in errs if " id '" in e]
+        check(len(per_id) == sum(1 for i in sset if i not in {"l.id"}) and all(
+              f"lower GRANDFATHERED_MAX to {want} in THIS change" in e for e in errs),
+              f"grandfather: every message targets {want} (MAX {mx}, ids {ids_}), got {errs}")
+    with _patched(GRANDFATHERED_MAX=2):
+        errs = stale_grandfather_errors({}, frozenset({"z.id", "a.id"}))
+    check([e.split("'")[1] for e in errs] == ["a.id", "z.id"], f"grandfather: stale ids are reported sorted, got {errs}")
     check(len(GRANDFATHERED_LEGACY_EXCEPTIONS) == GRANDFATHERED_MAX, "constants: the real set matches its pinned size")
 
     # -- row_shape_error: hostile rows never raise ---------------------------
@@ -1643,7 +1662,8 @@ def _selftest():
             errs = ratchet_errors(u, g)
             check(len(errs) == 1 and text in errs[0] and "re-run --render-doc" in errs[0],
                   f"ratchet: ({u},{g}) want {text!r} and the splice hint, got {errs}")
-        check("over-lowered" in ratchet_errors(10, 5)[0], "ratchet: a rise also mentions over-lowering")
+        check("over-lowered" in ratchet_errors(10, 5)[0] and "investigate" in ratchet_errors(10, 5)[0],
+              "ratchet: a planned rise says investigate and mentions over-lowering")
 
     # -- run_check wiring over a temporary ledger (positive control) --------
     def _mk(name, status, **kw):
@@ -1760,7 +1780,7 @@ def _selftest():
         ("untwinned-rise", base_rows, {"patch": {"BASELINE_UNTWINNED": 1}}, ("RATCHET",)),
         ("untwinned-fall", base_rows, {"patch": {"BASELINE_UNTWINNED": 99}}, ("Lower BASELINE_UNTWINNED",)),
         ("unledgered", base_rows, {"tweak": _extra_route}, ("unledgered route GET /fragments/not-in-ledger",)),
-        ("v1-keyed", base_rows + [v1_row], {"tweak": _no_a}, ("keyed on a REST v1 route", "size-pinned")),
+        ("v1-keyed", base_rows + [v1_row], {"tweak": _no_a}, ("keyed on a REST v1 route", "size-pinned", "extending it is review-enforced")),
         ("openapi-missing", base_rows, {"tweak": _unlisted}, ("registered but missing from openapi_spec()",)),
         ("stale-allowlist", base_rows, {"tweak": _no_options}, ("ALLOWLIST_OPENAPI_MISSING entry OPTIONS", "is stale")),
     )
@@ -1778,11 +1798,14 @@ def _selftest():
             if body is not None:
                 cpp.write_bytes(body if isinstance(body, bytes) else body.encode("utf-8"))
             target = cpp if body is not None else Path(dc) / "absent.cpp"
-            expect("cpp-" + label, _drive(base_rows, patch={"MCP_SERVER_CPP": target}, synthetic=False), 1, needle)
+            expect("cpp-" + label, _drive(base_rows, patch={"MCP_SERVER_CPP": target}, synthetic=False), 1, needle,
+                   absent=("[Errno",))
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dm:
+        rest_cpp = Path(dm) / "rest_api_v1.cpp"  # synthetic: the selftest never reads the real tree
+        rest_cpp.write_text('static const std::string spec = R"({"paths":{}})";\n', encoding="utf-8")
         for mode in ("--render-doc", "--dump-json"):
             err = io.StringIO()
-            with _patched(MCP_SERVER_CPP=Path(dm) / "absent.cpp", SERVER_SRC=Path(dm)), \
+            with _patched(MCP_SERVER_CPP=Path(dm) / "absent.cpp", SERVER_SRC=Path(dm), REST_API_V1_CPP=rest_cpp), \
                     contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                 rc_m = main([mode])
             check(rc_m == 1 and "::error::" in err.getvalue() and "cannot read" in err.getvalue()

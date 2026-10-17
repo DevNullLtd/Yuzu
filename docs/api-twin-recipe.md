@@ -598,6 +598,9 @@ see §5 for which chokepoints apply.
     `BASELINE_UNTWINNED`). Twinning or retiring a grandfathered (free-form) exception row removes
     its id from `GRANDFATHERED_LEGACY_EXCEPTIONS` and lowers `GRANDFATHERED_MAX`; converting one to
     the strict shape does the same. A new exception needs a maintainer ruling named in ADR-1005.
+    Re-tagging a `planned:#2146` row as a strict exception lowers `BASELINE_GENERIC_PLANNED` and
+    leaves `BASELINE_UNTWINNED` unchanged; a NEW exception row (a new route) raises
+    `BASELINE_UNTWINNED`.
     Then regenerate the doc block: run `python3 scripts/ci/check-api-parity.py --render-doc` and
     replace the region from the BEGIN line through the END line inclusive, in
     `docs/api-parity-ledger.md`, with its output. A PR that edits a `BASELINE_*` constant (raise or
@@ -608,7 +611,8 @@ see §5 for which chokepoints apply.
     at 16. The fix is to set the constants to the values the checker prints, then re-run
     `--render-doc` and splice the block again. A route rename changes its derived
     `capability_id`: rename the id in the JSON (a grandfathered row that is renamed must be
-    converted to the strict shape, since the set is keyed by id).
+    converted to the strict shape, unless the set is edited, which is review-only, since the set
+    is keyed by id).
 
 ---
 
