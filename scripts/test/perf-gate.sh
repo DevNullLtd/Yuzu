@@ -267,6 +267,7 @@ if [[ "$SCALE_AGENTS" =~ ^[0-9]+$ ]] && (( SCALE_AGENTS > 0 )); then
         rebar3 ct \
             --dir apps/yuzu_gw/test/ct \
             --suite yuzu_gw_scale_SUITE \
+            --verbose \
             >>"$SCALE_LOG_RAW" 2>&1
     ) || SCALE_RC=$?
     echo "perf-gate: scale suite exit=$SCALE_RC" | tee -a "$GATE_LOG"
