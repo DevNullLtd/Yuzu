@@ -21,7 +21,7 @@
 %%%                             the PEM at Path (default deployments point at
 %%%                             the shared-volume default-server.pem). The file
 %%%                             is watched by yuzu_gw_mgmt_pins, NOT read here:
-%%%                             that process re-stats it every
+%%%                             that process re-reads it (content digest) every
 %%%                             mgmt_pin_refresh_ms (default 5 s) and publishes
 %%%                             its SPKI hash, so a rotated server leaf is
 %%%                             pinned within one interval without a gateway

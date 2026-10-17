@@ -1215,7 +1215,7 @@ check_memory_shedding() ->
 
 %% @doc Fail-closed guard: refuse to boot on a {yuzu_gw, mgmt_pin_refresh_ms}
 %% that is set but is not an integer from 100 to 3600000 (ms). It is how often
-%% yuzu_gw_mgmt_pins re-stats the {cert_file, Path} management pins, so it bounds
+%% yuzu_gw_mgmt_pins re-reads the {cert_file, Path} management pins, so it bounds
 %% how long a rotated server leaf is refused (#5696). Unset is valid (5000).
 -spec check_mgmt_pin_refresh() -> ok | {error, bad_mgmt_pin_refresh_ms}.
 check_mgmt_pin_refresh() ->

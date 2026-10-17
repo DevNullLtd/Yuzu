@@ -17,7 +17,7 @@
 %%%   9. yuzu_gw_agent_sup         — simple_one_for_one for agent processes
 %%%  10. yuzu_gw_mgmt_pins         — the management-pin watcher (#5696): resolves the
 %%%      {cert_file, Path} pins in init, so the first management stream finds them,
-%%%      and re-stats them on its own timer; the per-stream check does no file I/O
+%%%      and re-reads them (content digest) on its own timer; the per-stream check does no file I/O
 %%%  11. one yuzu_grpc_listener per {yuzu_gw, grpc_listeners} entry — LAST, so
 %%%      nothing is served before the registry, router and agent supervisor a
 %%%      handler calls exist, and a listener that cannot bind stops the tree
