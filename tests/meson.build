@@ -3509,10 +3509,11 @@ test('access users production wiring lexical gate',
 
 # Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
 # audit store read that returns nullopt for a closed store). Source-text only, so Python.
+# Suite 'docs' for the same reason as the Users page gate above.
 test('access audit production wiring lexical gate',
   _python3_test,
   args: [files('test_access_audit_wiring_lexical.py')],
-  suite: 'server',
+  suite: 'docs',
   timeout: 30,
 )
 
