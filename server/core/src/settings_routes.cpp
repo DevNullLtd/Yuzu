@@ -5703,6 +5703,10 @@ void SettingsRoutes::register_routes(
         auto session = auth_fn_(req, res);
         if (!session)
             return;
+        // MFA step-up gate, matching POST /api/v1/tokens: issuing a bearer
+        // credential needs fresh MFA proof. Before any parsing or mutation.
+        if (step_up_fn_ && !step_up_fn_(req, res, *session, "POST /api/settings/api-tokens"))
+            return;
 
         auto name = extract_form_value(req.body, "name");
         auto ttl_s = extract_form_value(req.body, "ttl_hours");
@@ -5860,6 +5864,11 @@ void SettingsRoutes::register_routes(
             return;
         auto session = auth_fn_(req, res);
         if (!session)
+            return;
+        // MFA step-up gate, matching DELETE /api/v1/tokens/{id}; before the
+        // ownership lookup and any mutation.
+        if (step_up_fn_ &&
+            !step_up_fn_(req, res, *session, "DELETE /api/settings/api-tokens/{id}"))
             return;
         auto token_id = req.matches[1].str();
 

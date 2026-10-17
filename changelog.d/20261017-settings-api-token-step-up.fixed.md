@@ -1,0 +1,1 @@
+- **Dashboard API-token create and revoke apply the same MFA step-up check as the REST token routes.** `POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` now ask for fresh MFA proof wherever `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}` do. The two parity-ledger rows move from `exception` to `twinned`.
