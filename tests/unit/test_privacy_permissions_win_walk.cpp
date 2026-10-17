@@ -2,14 +2,14 @@
  * test_privacy_permissions_win_walk.cpp -- regression locks for the privacy_permissions Windows
  * leg's two injectable seams, on every host:
  *   - privacy_permissions_win_walk.hpp: the ConsentStore walk over a fake RegistryReader;
- *   - privacy_permissions_hive_guard.hpp: the offline-hive file guard over a fake HiveFileProbe.
+ *   - agents/shared/win_hive_file_guard.hpp: the offline-hive file guard over a fake HiveFileProbe.
  * Both headers are windows.h-free, so nothing here touches a real registry, file, process or
  * clock: the fakes are in-memory trees and scripted tables; no case sleeps or waits on a clock
  * (deadline-sensitive cases set `budget.deadline`, or the guard's injected `expired`).
  */
 #include <catch2/catch_test_macros.hpp>
 
-#include "privacy_permissions_hive_guard.hpp"
+#include <win_hive_file_guard.hpp>
 #include "privacy_permissions_win_walk.hpp"
 
 #include <algorithm>

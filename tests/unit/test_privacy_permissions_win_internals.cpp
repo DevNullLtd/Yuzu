@@ -1,8 +1,8 @@
 /**
  * test_privacy_permissions_win_internals.cpp -- TU-inclusion seam over privacy_permissions_win.cpp:
- * its production Win32Registry and Win32HiveFileProbe shells (and the internal-linkage
+ * its production Win32Registry and (via agents/shared/win_hive_file_probe.hpp) Win32HiveFileProbe shells (and the internal-linkage
  * StabilityWatch and with_user_hive wiring) driven through the pure walk and guard headers
- * (privacy_permissions_win_walk.hpp, privacy_permissions_hive_guard.hpp). The pure classifiers
+ * (privacy_permissions_win_walk.hpp, agents/shared/win_hive_file_guard.hpp). The pure classifiers
  * (classify_stability, classify_hive_file, ...) are covered in
  * test_privacy_permissions_parsers.cpp, and the walk and guard logic (the deadline-first order
  * among it) over fakes in test_privacy_permissions_win_walk.cpp; these cases prove the production

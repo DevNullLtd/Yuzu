@@ -364,7 +364,6 @@
       "content/definitions/privacy_permissions.yaml"
     ],
     "plugin": [
-      "agents/plugins/privacy_permissions/src/privacy_permissions_hive_guard.hpp",
       "agents/plugins/privacy_permissions/src/privacy_permissions_legs.hpp",
       "agents/plugins/privacy_permissions/src/privacy_permissions_linux.cpp",
       "agents/plugins/privacy_permissions/src/privacy_permissions_linux_parsers.hpp",
