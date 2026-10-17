@@ -35,7 +35,7 @@ spec:
       - name: username
         type: string
         description: 'The account name of a currently logged-on user. Values: free text.'
-        example: alex
+        example: jsmith
         platforms: [windows, linux, darwin]
       - name: domain
         type: string
@@ -110,7 +110,7 @@ spec:
       - name: username
         type: string
         description: 'The account that owns this session. Values: free text.'
-        example: alex
+        example: jsmith
         platforms: [windows, linux, darwin]
       - name: state
         type: string
@@ -184,7 +184,7 @@ spec:
       - name: username
         type: string
         description: "The local account's username. Values: free text."
-        example: Alex
+        example: jsmith
         platforms: [windows, linux, darwin]
       - name: enabled
         type: bool
@@ -259,7 +259,7 @@ spec:
       - name: member_name
         type: string
         description: 'The name of an account or group belonging to the local admin membership. Values: free text.'
-        example: Alex
+        example: jsmith
         platforms: [windows, linux, darwin]
       - name: member_type
         type: string
@@ -334,7 +334,7 @@ spec:
       - name: member_name
         type: string
         description: 'The account (or nested group, on Windows) belonging to the queried group. Values: free text.'
-        example: Alex
+        example: jsmith
         platforms: [windows, linux, darwin]
       - name: group_name
         type: string
@@ -404,7 +404,7 @@ spec:
       - name: username
         type: string
         description: 'The account with the most login events in the examined history, or "unknown" when none could be determined. Values: free text or "unknown".'
-        example: Alex
+        example: jsmith
         platforms: [windows, linux, darwin]
       - name: login_count
         type: int32
@@ -486,7 +486,7 @@ spec:
       - name: username
         type: string
         description: 'The account named in the record. Values: free text.'
-        example: Alex
+        example: jsmith
         platforms: [windows, linux, darwin]
       - name: event_type
         type: string

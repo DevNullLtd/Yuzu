@@ -603,7 +603,7 @@
     {
       "grant": "None measured: `system_profiler`, `softwareupdate -l`, and the DNS/TCP probes all returned real data unprivileged.",
       "if_refused": "tool spawn/timeout is forwarded via `forward_runner_failure`; a fully-filtered `softwareupdate -l` output returns zero `missing` rows with no explicit refusal marker (see Caveats)",
-      "measured": "2026-09-07, euid 501 (`alex`)",
+      "measured": "2026-09-07, euid 501 (`jsmith`)",
       "os": "macOS",
       "runs_as": "agent daemon, unprivileged"
     },

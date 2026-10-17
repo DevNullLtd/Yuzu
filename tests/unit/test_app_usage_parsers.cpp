@@ -297,12 +297,13 @@ TEST_CASE("run_summary: REAL CAPTURE fixture — 266 distinct executables, order
     for (const auto& r : result->rows)
         rows_text += format_usage_row(r) + "\n";
 
-    // The fixture's usage_daily_user rows carry real local account names
-    // (alex, root, _locationd, _spotlight, ...; see
+    // The fixture's usage_daily_user rows carry local account names
+    // (jsmith, root, _locationd, _spotlight, ...; see
     // usage_daily_user_macos.txt.provenance.txt) — none of that may ever
-    // reach a formatted summary/meta line. "alex" is this host's own real
-    // account, the strongest instance of the leak this test guards against.
-    for (const char* forbidden : {"alex", "_locationd", "_spotlight"}) {
+    // reach a formatted summary/meta line. "jsmith" stands in for the
+    // capturing host's own account (redacted), the strongest instance of the
+    // leak this test guards against.
+    for (const char* forbidden : {"jsmith", "_locationd", "_spotlight"}) {
         INFO("forbidden token: " << forbidden);
         CHECK(meta_line.find(forbidden) == std::string::npos);
         CHECK(rows_text.find(forbidden) == std::string::npos);
@@ -806,10 +807,11 @@ TEST_CASE("negative: REAL CAPTURE fixture summary/last_used output carries no pi
     for (const auto& r : *last_used)
         last_used_text += format_last_used_row(r) + "\n";
 
-    // "alex" is this host's own real account name in the committed
-    // usage_daily_user_macos.txt fixture (see its .provenance.txt) — the
-    // strongest instance of the leak this test guards against.
-    for (const char* forbidden : {"alex", "_locationd", "_spotlight"}) {
+    // "jsmith" stands in for the capturing host's own account name (redacted)
+    // in the committed usage_daily_user_macos.txt fixture (see its
+    // .provenance.txt) — the strongest instance of the leak this test guards
+    // against.
+    for (const char* forbidden : {"jsmith", "_locationd", "_spotlight"}) {
         CHECK(summary_text.find(forbidden) == std::string::npos);
         CHECK(last_used_text.find(forbidden) == std::string::npos);
     }

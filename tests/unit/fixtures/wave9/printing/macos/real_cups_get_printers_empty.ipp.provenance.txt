@@ -2,7 +2,7 @@ status: REAL CAPTURE
 
 host: this Mac (macOS, arm64)
 date: 2026-09-08 (UTC, see `date -u` at capture time)
-identity: id -u = 501 (alex, non-root — no sudo used or required)
+identity: id -u = 501 (jsmith, non-root — no sudo used or required)
 
 request: CUPS-Get-Printers (0x4002), request-id 1, built by
 `build_request.py cups-get-printers`.
@@ -23,3 +23,5 @@ This is a REAL, unprivileged capture against the live `/private/var/run/
 cupsd` socket — no sudo, no queue creation. Captured by `capture.sh`
 Phase A, which any developer or CI leg can re-run to reproduce this file
 byte-for-byte on a host in the same state (no configured queues).
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

@@ -426,6 +426,22 @@ public:
     // original SQLite contract — callers do not currently consume a result).
     void bump_policy_generation();
 
+    /// Optional post-mutation hook (#5513 chaos-F1). Invoked once per successful rule
+    /// create_rule / update_rule / delete_rule, AFTER the mutation committed and AFTER
+    /// the best-effort policy-generation bump was attempted, whether or not that bump
+    /// succeeded (a failed bump leaves the generation unchanged, so a cache keyed by
+    /// generation cannot notice the edit on its own). Contract: called on the MUTATING
+    /// thread with no pool lease and no store lock held; must be cheap and non-blocking
+    /// (it sits on the REST/MCP write path); an exception is caught and logged at warn,
+    /// never propagated (the mutation is already durable); may be empty (the default).
+    /// Set once during single-threaded wiring, before the store is shared; it is not
+    /// synchronised against concurrent mutation. NOT invoked by bump_policy_generation().
+    /// Baseline deploy, delete and a deployed create commit in BaselineStore, which has its own
+    /// hook of the same shape (BaselineStore::set_on_baseline_mutation, to be wired by the
+    /// reconcile wire-up to the same invalidations through one ServerImpl wrapper), so they
+    /// are covered before the caller's own bump and fan-out run.
+    void set_on_rule_mutation(std::function<void()> hook);
+
     // Observability — lock-free cumulative counters for Prometheus scraping.
     uint64_t events_written_total() const noexcept { return events_written_.load(); }
     uint64_t events_reaped_total() const noexcept { return events_reaped_.load(); }
@@ -460,6 +476,10 @@ private:
     int retention_days_;
     std::function<int64_t()> now_fn_; // test seam only; see ctor doc
     yuzu::MetricsRegistry* metrics_{nullptr};
+    std::function<void()> on_rule_mutation_; // see set_on_rule_mutation()
+
+    void notify_rule_mutation() noexcept;
+
     mutable std::atomic<int> apps_reads_in_flight_{0};
     std::atomic<int> apps_read_budget_{kDexAppsConcurrentReads};
 
