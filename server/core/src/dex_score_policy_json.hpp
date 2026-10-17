@@ -6,13 +6,14 @@
  * canonical text, its revision token, and the policy in force for a stored text.
  *
  * Header-only; nlohmann::json and the standard library plus the pure DEX model
- * headers. No I/O, no clock, no store.
+ * headers and the shared log_token helper. No I/O, no clock, no store.
  *
  * ONE DOCUMENT, ONE KEY, ONE WRITER. The whole policy is a single JSON document
- * stored under the runtime-config key kDexScorePolicyKey. It is written only by
- * the policy writer (validate, persist the canonical text); the generic
- * runtime-config write refuses the key, so no other path can leave the document
- * half-edited. Every server instance reads the same row.
+ * stored under the runtime-config key kDexScorePolicyKey. It is to be written
+ * only by the policy writer (a later change: validate, persist the canonical
+ * text); the generic runtime-config write already refuses the key, so no other
+ * path can leave the document half-edited. Every server instance reads the same
+ * row.
  *
  * NOT part of the document: the cohort floor and the statistics. They are fixed
  * constants of the score, not settings.
@@ -24,7 +25,8 @@
  *   - store unreadable      -> not decided here; the provider serves the last
  *                              good policy for a bounded time, then refuses.
  *
- * Wire shape (every key optional on read; unknown keys are refused):
+ * Wire shape (every key optional on read except an override's "image"; unknown
+ * keys are refused):
  *   { "tiers":   { "edges": {excellent, good, fair},
  *                  "names": {excellent, good, fair, poor} },
  *     "weights": { breadth, crashes, hangs, regression },
@@ -33,19 +35,28 @@
  *                      "weights": {..} } ] }
  * An override sets only the fields it names; the rest inherit the global policy.
  * Numbers must be JSON numbers (the string "90" is refused). Poor's lower edge
- * is fixed at 0 and is not part of the document.
+ * is fixed at 0 and is not part of the document. The `tiers` block of an Apps
+ * response is a read-model projection (tiers.<tier>.{edge,name}), not this stored
+ * shape.
+ *
+ * Bounded text: a stored text over kDexScorePolicyMaxBytes is refused without being
+ * parsed, and the only caller-controlled text a fault can carry is an unknown key,
+ * which is neutralised and capped at yuzu::kGuardianLogIdMaxBytes; every other fault
+ * string is a literal of ours plus an index that the size cap bounds.
  */
 
 #include "dex_read_model.hpp"
 #include "dex_score_policy.hpp"
 
 #include <nlohmann/json.hpp>
+#include <yuzu/log_token.hpp> // log_key_token: neutralise and cap document text
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <expected>
+#include <format>
 #include <initializer_list>
 #include <optional>
 #include <string>
@@ -58,6 +69,9 @@ namespace yuzu::server {
 inline constexpr std::string_view kDexScorePolicyKey = "dex_score_policy";
 /// Revision reported when no document is stored.
 inline constexpr std::string_view kDexScorePolicyDefaultRevision = "default";
+/// Largest stored text that is parsed. A legitimate document is about 100 KB at the
+/// override limit; anything larger is refused unread.
+inline constexpr std::size_t kDexScorePolicyMaxBytes = 256 * 1024;
 
 /// A document that is not the expected shape. `field` is the dotted path of the
 /// offending value (for example "overrides[2].weights.crashes"), "document" for
@@ -76,13 +90,15 @@ using Err = DexPolicyParseError;
     return path.empty() ? std::string(key) : std::string(path) + "." + std::string(key);
 }
 
-/// A key not in `known` is refused with its own path.
+/// A key not in `known` is refused with its own path. The key is document text, so it
+/// is neutralised (control bytes folded) and capped before it reaches a fault, which
+/// is logged and returned on every Apps response.
 [[nodiscard]] inline std::optional<Err>
 unknown_key(const json& o, std::string_view path,
             std::initializer_list<std::string_view> known) {
     for (auto it = o.begin(); it != o.end(); ++it)
         if (std::find(known.begin(), known.end(), std::string_view(it.key())) == known.end())
-            return Err{join(path, it.key()), "unknown key"};
+            return Err{join(path, yuzu::log_key_token(it.key())), "unknown key"};
     return std::nullopt;
 }
 
@@ -182,9 +198,7 @@ template <class T>
         h ^= c;
         h *= 1099511628211ull;
     }
-    char buf[17];
-    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
-    return buf;
+    return std::format("{:016x}", h);
 }
 
 } // namespace dex_score_policy_json_detail
@@ -359,6 +373,11 @@ dex_policy_in_force_from_stored(const std::optional<std::string>& stored) {
     if (!stored || stored->empty())
         return out;
     out.revision = dex_score_policy_revision(*stored);
+    if (stored->size() > kDexScorePolicyMaxBytes) {
+        out.fault = "oversized at document: more than " +
+                    std::to_string(kDexScorePolicyMaxBytes) + " bytes";
+        return out;
+    }
     const auto doc = nlohmann::json::parse(*stored, nullptr, /*allow_exceptions=*/false);
     if (doc.is_discarded()) {
         out.fault = "unparseable at document: not valid JSON";

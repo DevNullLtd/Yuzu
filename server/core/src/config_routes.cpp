@@ -90,33 +90,11 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         if (!deps.perm_fn(req, res, "Infrastructure", "Write"))
             return;
 
-        // The score policy is one document with its own writer, which validates it
-        // whole; a generic single-value write could leave it half-edited. Refused
-        // before the store gate (the answer does not depend on the store) and with
-        // no audit row, like the unknown-key refusal below.
-        if (req.matches[1].str() == kDexScorePolicyKey) {
-            res.status = 400;
-            res.set_content(
-                detail::a4_error(res, "dex_score_policy is written only through "
-                                      "PUT /api/v1/dex/score-policy",
-                                 detail::A4ErrorOpts{
-                                     .remediation = "send the whole policy document to "
-                                                    "PUT /api/v1/dex/score-policy with If-Match"}),
-                "application/json");
-            return;
-        }
-        if (!deps.runtime_config_store || !deps.runtime_config_store->is_open()) {
-            res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"runtime config store unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
-            return;
-        }
-
         // Same-site gate for the cookie-authorised write the General page calls (API, MCP and
         // engine token callers are exempt). After the permission gate, so an unauthorised caller
-        // still gets the 403 it always did, and before the body is read. auth_fn writes its own
-        // 401 when there is no session.
+        // still gets the 403 it always did, and before any refusal or the body is read, so a
+        // cross-site write is always audited as `csrf.denied`. auth_fn writes its own 401 when
+        // there is no session.
         auto session = deps.auth_fn(req, res);
         if (!session)
             return;
@@ -128,6 +106,30 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
                                             "config", "cross-site or header-less browser write refused");
             res.status = 403;
             res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+            return;
+        }
+
+        // The score policy is one document with its own writer, which validates it
+        // whole; a generic single-value write could leave it half-edited. Refused
+        // before the store gate (the answer does not depend on the store) and with
+        // no audit row, like the unknown-key refusal below.
+        if (req.matches[1].str() == kDexScorePolicyKey) {
+            res.status = 400;
+            res.set_content(
+                detail::a4_error(res, "dex_score_policy is written only through "
+                                      "PUT /api/v1/dex/score-policy",
+                                 detail::A4ErrorOpts{
+                                     .remediation = "send the whole policy document to "
+                                                    "PUT /api/v1/dex/score-policy with If-Match "
+                                                    "(not yet available in this release)"}),
+                "application/json");
+            return;
+        }
+        if (!deps.runtime_config_store || !deps.runtime_config_store->is_open()) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"runtime config store unavailable"},"meta":{"api_version":"v1"}})",
+                "application/json");
             return;
         }
 

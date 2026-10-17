@@ -134,6 +134,26 @@ TEST_CASE("DexApi: null store is the honest degrade, never a throw", "[pg][dex_a
     CHECK(api->apps("7d").degraded); // a null store is a degrade, never an empty healthy list
 }
 
+// An unavailable policy answers before the fleet snapshot is taken (no wasted work). No
+// store is needed: the policy branch decides, so this runs in the non-Postgres suite.
+TEST_CASE("DexApi: apps with an unavailable policy never takes the fleet snapshot",
+          "[dex][dex_api]") {
+    int fleet_calls = 0;
+    auto api = make_local_dex_api(
+        /*store=*/nullptr,
+        [&fleet_calls] {
+            ++fleet_calls;
+            return yuzu::server::DexFleet{};
+        },
+        []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+            return std::unexpected(std::string("store down"));
+        });
+    const auto m = api->apps("7d");
+    CHECK(m.degraded);
+    CHECK(m.degraded_reason == "score_policy_unavailable");
+    CHECK(fleet_calls == 0);
+}
+
 TEST_CASE("DexApi: signals/scope/signal_detail match the direct store reads", "[pg][dex_api]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -490,7 +510,7 @@ TEST_CASE("DexApi: apps caps versions at 20 and flags it", "[pg][dex][apps_model
 // override; a stored document that is invalid scores under the shipped defaults
 // and says so; an unreadable policy degrades the whole read with the store open,
 // so the policy branch (not the null-store one) decides.
-TEST_CASE("DexApi: apps uses the injected score policy, and an unreadable one degrades",
+TEST_CASE("DexApi: apps uses the injected score policy and an unreadable one degrades",
           "[pg][dex][apps_model]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

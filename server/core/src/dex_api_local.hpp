@@ -67,6 +67,7 @@ using FleetFn = std::function<DexFleet()>;
 /// the document text, nothing stored is `nullopt`, and a failed read is an error.
 /// Named here, not inline in server.cpp, so a test can run the production mapping.
 /// `store` is borrowed by reference and MUST outlive the returned function.
-[[nodiscard]] DexScorePolicyProvider::ReadFn dex_score_policy_store_reader(RuntimeConfigStore& store);
+[[nodiscard]] DexScorePolicyProvider::ReadFn
+dex_score_policy_store_reader(RuntimeConfigStore& store);
 
 } // namespace yuzu::server

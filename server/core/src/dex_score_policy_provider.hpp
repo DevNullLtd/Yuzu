@@ -6,8 +6,10 @@
  * and an injected millisecond clock.
  *
  * Every server instance reads the same stored document through its own
- * provider, so a change reaches all of them within kDexPolicyRefreshMs without
- * any process-local push. The provider owns the failure direction:
+ * provider, so a change typically reaches all of them within kDexPolicyRefreshMs
+ * without any process-local push (an instance refreshes at most once per interval,
+ * and only while it serves requests; the policy in use is up to kDexPolicyStaleCapMs
+ * old while the store is unreadable). The provider owns the failure direction:
  *   - a good read (including "nothing stored", which is the shipped defaults)
  *     is cached for kDexPolicyRefreshMs, counted from the moment the read
  *     COMPLETED (the clock is sampled after the read: a slow good read is
@@ -18,10 +20,14 @@
  *     kDexPolicyStaleCapMs, and past that returns an error, so the caller
  *     degrades instead of scoring under a guess;
  *   - a failed read before any good read is an error at once;
- *   - the store is read by one caller at a time, outside the lock: a caller
- *     arriving mid-refresh is served the last good policy while it is within
- *     the cap, or an error when there is none within the cap, and never waits
- *     on the read (the Apps read answers its typed 503 with retry_after_ms 2000).
+ *   - the store is read by one caller at a time, and the stored text is parsed
+ *     and validated, both outside the lock: a caller arriving mid-refresh is
+ *     served the last good policy while it is within the cap, or an error when
+ *     there is none within the cap, and never waits on the read (the Apps read
+ *     answers its typed 503 with retry_after_ms 2000);
+ *   - the single-flight flag is released by a scope guard on every exit from
+ *     current(), an exception included, so no failure can leave the refresh
+ *     wedged.
  *
  * No clock or store is touched except through the injected functions, so the
  * behaviour is testable without sleeping.
@@ -71,24 +77,39 @@ public:
         if (refreshing_) {
             if (have_ && now - last_ok_ms_ <= kDexPolicyStaleCapMs)
                 return cached_;
-            return std::unexpected(std::string("score policy refresh in progress, no usable policy"));
+            return std::unexpected(
+                std::string("score policy refresh in progress, no usable policy"));
         }
         refreshing_ = true;
-        lk.unlock(); // the store read runs unlocked: no caller queues behind it
-        auto r = read_guarded();
+        // The flag is released on EVERY exit from here, an exception included (a handler
+        // building its message, the clock): it is the only owner, so nothing can leave it set.
+        // A mutex that cannot be re-taken terminates the process: a crash, never a wedge.
+        struct ClearRefreshing {
+            std::unique_lock<std::mutex>& lk;
+            bool& flag;
+            ~ClearRefreshing() {
+                if (!lk.owns_lock())
+                    lk.lock();
+                flag = false;
+            }
+        } clear{lk, refreshing_};
+        lk.unlock(); // the store read and the parse run unlocked: no caller queues behind them
+        auto r = read_and_resolve();
         lk.lock();
-        refreshing_ = false;
         return apply_locked(std::move(r), clock_());
     }
 
 private:
-    // A throw from the injected read is a failed read, so refreshing_ is cleared on every
-    // path the read can take. Not guarded: a bad_alloc building the error string below,
-    // which would leave refreshing_ set; a heap that cannot spare that string cannot
-    // serve the Apps payload either, and the instance restart is the recovery for both.
-    std::expected<std::optional<std::string>, std::string> read_guarded() {
+    // The read and the resolve of the stored text (parse, validate, hash) run outside the
+    // lock. A throw from either is a failed read. An exception that escapes this function
+    // (the handlers allocate) leaves current() through the guard above, which releases the
+    // single-flight flag.
+    std::expected<DexPolicyInForce, std::string> read_and_resolve() {
         try {
-            return read_();
+            auto r = read_();
+            if (!r)
+                return std::unexpected(std::move(r.error()));
+            return dex_policy_in_force_from_stored(*r);
         } catch (const std::exception& e) {
             return std::unexpected(std::string("read threw: ") + e.what());
         } catch (...) {
@@ -97,15 +118,20 @@ private:
     }
 
     // `now` is sampled AFTER the read: a slow failed read counts against the cap, and a
-    // slow good read is stamped at its completion, not its start.
+    // slow good read is stamped at its completion, not its start. Only state, stamps and
+    // log lines are touched under the lock.
     std::expected<DexPolicyInForce, std::string>
-    apply_locked(std::expected<std::optional<std::string>, std::string> r, std::int64_t now) {
+    apply_locked(std::expected<DexPolicyInForce, std::string> r, std::int64_t now) {
         if (r) {
-            cached_ = dex_policy_in_force_from_stored(*r);
-            if (!cached_.fault.empty() && cached_.fault != logged_fault_)
-                spdlog::warn("DEX score policy refused, shipped defaults in force: {}",
-                             cached_.fault);
-            logged_fault_ = cached_.fault;
+            if (!r->fault.empty() && r->fault != logged_fault_)
+                spdlog::warn("DEX score policy refused, shipped defaults in force: {}", r->fault);
+            logged_fault_ = r->fault;
+            if (have_ && cached_.revision != r->revision)
+                spdlog::info("DEX score policy changed: revision {} -> {} (source {})",
+                             cached_.revision, r->revision, r->source);
+            if (outage_logged_)
+                spdlog::info("DEX score policy store readable again");
+            cached_ = std::move(*r);
             last_ok_ms_ = now;
             have_ = true;
             outage_logged_ = false;

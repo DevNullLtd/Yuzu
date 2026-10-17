@@ -2804,7 +2804,7 @@ TEST_CASE("REST dex/apps: a degraded store read -> 503 with retry_after_ms, neve
     CHECK(res->body.find("\"apps\"") == std::string::npos);
 }
 
-TEST_CASE("REST dex/apps: an unreadable score policy -> 503 naming the reason, never an empty list",
+TEST_CASE("REST dex/apps: an unreadable score policy -> 503 naming the reason and never an empty list",
           "[pg][rest][dex][apps][degraded]") {
     RestGsHarness h;
     h.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
@@ -2816,6 +2816,25 @@ TEST_CASE("REST dex/apps: an unreadable score policy -> 503 naming the reason, n
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["error"]["code"] == 503);
     CHECK(j["error"]["message"] == "DEX store read degraded (score_policy_unavailable)");
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
+}
+
+// The builder's own re-check (defence in depth behind the provider, which hands over only
+// validated policies): a policy that fails validation is refused, never scored under.
+TEST_CASE("REST dex/apps: a policy that fails validation is a 503 naming score_policy_invalid",
+          "[pg][rest][dex][apps][degraded]") {
+    RestGsHarness h;
+    h.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        yuzu::server::DexPolicyInForce f;
+        f.policy.tiers.edges.good = f.policy.tiers.edges.excellent; // edges must descend
+        return f;
+    };
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["message"] == "DEX store read degraded (score_policy_invalid)");
     CHECK(j["error"]["retry_after_ms"] == 2000);
     CHECK(res->body.find("\"apps\"") == std::string::npos);
 }

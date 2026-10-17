@@ -10,9 +10,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <string>
+#include <yuzu/log_token.hpp>
 
 using namespace yuzu::server;
 using nlohmann::json;
@@ -24,6 +26,21 @@ std::string refused_field(const std::string& text) {
     const auto r = dex_score_policy_from_json(json::parse(text));
     REQUIRE_FALSE(r);
     return r.error().field;
+}
+
+// A parse that must fail: returns the message it gives for the path.
+std::string refused_message(const std::string& text) {
+    const auto r = dex_score_policy_from_json(json::parse(text));
+    REQUIRE_FALSE(r);
+    return r.error().message;
+}
+
+// {"overrides":[{"image":"app0.exe"}, ...]} with `n` entries.
+std::string document_with_overrides(int n) {
+    json arr = json::array();
+    for (int i = 0; i < n; ++i)
+        arr.push_back({{"image", "app" + std::to_string(i) + ".exe"}});
+    return json{{"overrides", std::move(arr)}}.dump();
 }
 
 constexpr std::array<DexPolicyFault, 10> kAllFaults = {
@@ -94,7 +111,7 @@ TEST_CASE("policy json: an unknown key is refused with its exact field path", "[
     CHECK(refused_field(R"({"overrides":[{"image":"a.exe","extra":1}]})") == "overrides[0].extra");
 }
 
-TEST_CASE("policy json: a wrong type is refused with its field path, nothing partially parsed",
+TEST_CASE("policy json: a wrong type is refused with its field path and nothing partially parsed",
           "[dex][policy_json]") {
     CHECK(refused_field(R"({"tiers":{"edges":{"excellent":"90"}}})") == "tiers.edges.excellent");
     CHECK(refused_field(R"({"weights":{"breadth":null}})") == "weights.breadth");
@@ -123,7 +140,7 @@ TEST_CASE("policy json: an override image is ASCII-folded before validation", "[
     CHECK_FALSE(dex_score_policy_fault(*r));
 }
 
-TEST_CASE("policy json: revision is a stable 16-hex content hash, default only when nothing stored",
+TEST_CASE("policy json: revision is a stable 16-hex content hash and default only when nothing stored",
           "[dex][policy_json]") {
     const std::string text = dex_score_policy_canonical(dex_default_score_policy());
     const std::string r1 = dex_score_policy_revision(text);
@@ -140,7 +157,7 @@ TEST_CASE("policy json: revision is a stable 16-hex content hash, default only w
 }
 
 TEST_CASE("policy json: in force resolution", "[dex][policy_json]") {
-    SECTION("nothing stored, or an empty string, is the defaults with no fault") {
+    SECTION("nothing stored or an empty string is the defaults with no fault") {
         const std::optional<std::string> stored_cases[] = {std::nullopt, std::string()};
         for (const auto& stored : stored_cases) {
             const auto f = dex_policy_in_force_from_stored(stored);
@@ -184,6 +201,96 @@ TEST_CASE("policy json: in force resolution", "[dex][policy_json]") {
         CHECK(f.policy.tiers.edges.excellent == 95.0);
         CHECK(f.policy.tiers.names[0] == "Great");
     }
+}
+
+TEST_CASE("policy json: the strict arms the parser must keep refusing", "[dex][policy_json]") {
+    // Poor's lower edge is fixed at 0 and is not a document field.
+    CHECK(refused_field(R"({"tiers":{"edges":{"poor":0}}})") == "tiers.edges.poor");
+    CHECK(refused_field(R"({"tiers":{"names":{"bogus":"x"}}})") == "tiers.names.bogus");
+    CHECK(refused_field(R"({"overrides":[{"image":"a.exe","tiers":{"bogus":1}}]})") ==
+          "overrides[0].tiers.bogus");
+    CHECK(refused_field(R"({"overrides":[{"image":"a.exe","tiers":{"edges":{"poor":0}}}]})") ==
+          "overrides[0].tiers.edges.poor");
+    CHECK(refused_field(R"({"overrides":[{"image":"a.exe","tiers":5}]})") == "overrides[0].tiers");
+    CHECK(refused_message(R"({"overrides":[{"image":"a.exe","tiers":5}]})") == "must be an object");
+    CHECK(refused_field(R"({"overrides":[{"image":"a.exe","weights":[]}]})") ==
+          "overrides[0].weights");
+    CHECK(refused_message(R"({"overrides":[{"image":"a.exe","weights":[]}]})") ==
+          "must be an object");
+    CHECK(refused_field(R"({"overrides":null})") == "overrides");
+    CHECK(refused_field("null") == "document");
+}
+
+TEST_CASE("policy json: hostile numbers and shapes in a stored text", "[dex][policy_json]") {
+    // Not JSON numbers at all: the text is unparseable.
+    for (const char* n : {"NaN", "Infinity", "1e999"}) {
+        const auto f = dex_policy_in_force_from_stored(
+            std::string(R"({"tiers":{"edges":{"excellent":)") + n + "}}}");
+        INFO(n);
+        CHECK(f.source == "default");
+        CHECK(f.fault == "unparseable at document: not valid JSON");
+    }
+    // A huge but finite edge parses and then fails the validator, never half-applied.
+    const auto big = dex_policy_in_force_from_stored(
+        std::string(R"({"tiers":{"edges":{"excellent":1e308}}})"));
+    CHECK(big.source == "default");
+    CHECK(big.fault == "edge_out_of_range at tiers.edges");
+    // An empty overrides array is a valid document; the last of two equal keys wins.
+    const auto empty = dex_policy_in_force_from_stored(std::string(R"({"overrides":[]})"));
+    CHECK(empty.source == "custom");
+    const auto dup =
+        dex_score_policy_from_json(json::parse(R"({"weights":{"crashes":1,"crashes":2}})"));
+    REQUIRE(dup);
+    CHECK(dup->weights.crashes == 2.0);
+}
+
+TEST_CASE("policy json: 200 overrides are accepted and 201 are refused", "[dex][policy_json]") {
+    const auto at_limit = dex_policy_in_force_from_stored(document_with_overrides(200));
+    CHECK(at_limit.source == "custom");
+    CHECK(at_limit.fault.empty());
+    CHECK(at_limit.policy.overrides.size() == 200);
+    const auto over = dex_policy_in_force_from_stored(document_with_overrides(201));
+    CHECK(over.source == "default");
+    CHECK(over.fault == "too_many_overrides at overrides");
+}
+
+TEST_CASE("policy json: a stored text over the size cap is refused without being parsed",
+          "[dex][policy_json]") {
+    // Junk that would say "unparseable" if it were parsed: the oversized fault proves it was not.
+    const std::string junk(kDexScorePolicyMaxBytes + 1, 'x');
+    const auto f = dex_policy_in_force_from_stored(junk);
+    CHECK(f.source == "default");
+    CHECK(f.fault == "oversized at document: more than 262144 bytes");
+    CHECK(f.revision == dex_score_policy_revision(junk));
+    CHECK(f.policy.overrides.empty());
+    // At exactly the cap the text is still read: a valid document padded with spaces is custom.
+    std::string padded = "{}";
+    padded.resize(kDexScorePolicyMaxBytes, ' ');
+    const auto at_cap = dex_policy_in_force_from_stored(padded);
+    CHECK(at_cap.source == "custom");
+    CHECK(at_cap.fault.empty());
+}
+
+TEST_CASE("policy json: an unknown key is neutralised and capped in its field path",
+          "[dex][policy_json]") {
+    const auto control_free = [](const std::string& s) {
+        return std::none_of(s.begin(), s.end(),
+                            [](unsigned char c) { return c < 0x20 || c == 0x7F; });
+    };
+    json with_newline = json::object();
+    with_newline["bad\nkey\r\x1b[31m"] = 1;
+    const std::string folded = refused_field(with_newline.dump());
+    CHECK(control_free(folded));
+    CHECK(folded.starts_with("bad_key"));
+
+    json long_key = json::object();
+    long_key[std::string(1000, 'k')] = 1;
+    const std::string capped = refused_field(long_key.dump());
+    CHECK(capped.size() <= yuzu::kGuardianLogIdMaxBytes);
+    // The fault that reaches the log and the response carries the same bounded text.
+    const auto f = dex_policy_in_force_from_stored(long_key.dump());
+    CHECK(f.fault.size() < 2 * yuzu::kGuardianLogIdMaxBytes);
+    CHECK(control_free(f.fault));
 }
 
 TEST_CASE("policy json: every validator fault maps to a field path", "[dex][policy_json]") {

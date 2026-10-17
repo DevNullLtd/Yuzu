@@ -186,6 +186,14 @@ struct DexAppsModel {
     std::string degraded_reason;
 };
 
+/// The message of the 503 / MCP error for a degraded Apps read: the generic text, with
+/// the reason token appended when the model carries one ("score_policy_unavailable",
+/// "score_policy_invalid"). One copy for the REST and MCP handlers.
+[[nodiscard]] inline std::string dex_degraded_message(const DexAppsModel& m) {
+    return m.degraded_reason.empty() ? std::string("DEX store read degraded")
+                                     : "DEX store read degraded (" + m.degraded_reason + ")";
+}
+
 /// PURE assembly of the Apps model from grouped store rows. OWNS the published
 /// order: applications by crashes+hangs DESC then subject ASC (membership at the
 /// top-N cut is the store's: most devices affected first); each

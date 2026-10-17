@@ -17740,11 +17740,7 @@ void RestApiV1::register_routes(
         // empty or perfect list.
         if (model.degraded) {
             res.status = 503;
-            const std::string message =
-                model.degraded_reason.empty()
-                    ? std::string("DEX store read degraded")
-                    : "DEX store read degraded (" + model.degraded_reason + ")";
-            res.set_content(detail::error_json_a4(503, message, cid,
+            res.set_content(detail::error_json_a4(503, dex_degraded_message(model), cid,
                                                   /*retry_after_ms=*/2000,
                                                   "the DEX application-stability read could not be "
                                                   "completed; retry shortly"),

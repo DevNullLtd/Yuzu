@@ -247,7 +247,10 @@ json figures_json(const DexStabilityFigures& f) {
 }
 
 // The policy block. Poor's lower edge is fixed at 0 by the score and is shown
-// as 0.0 for completeness; it is not a stored field.
+// as 0.0 for completeness; it is not a stored field. This `tiers` shape
+// (tiers.<tier>.{edge,name}) is a read-model projection, not the stored document
+// shape (tiers.edges.*, tiers.names.*): the global tiers only, with no weights and
+// no per-application override values.
 json policy_json(const DexPolicyInForce& p) {
     const auto& t = p.policy.tiers;
     json tiers{{"excellent", {{"edge", t.edges.excellent}, {"name", t.names[0]}}},
@@ -264,7 +267,8 @@ json policy_json(const DexPolicyInForce& p) {
 
 DexAppsModel dex_apps_model_from_rows(const std::string& window,
                                       const std::vector<DexAppStabilityRow>& rows,
-                                      std::optional<int64_t> population, const DexPolicyInForce& policy) {
+                                      std::optional<int64_t> population,
+                                      const DexPolicyInForce& policy) {
     DexAppsModel m;
     m.window = window;
     m.population = population;

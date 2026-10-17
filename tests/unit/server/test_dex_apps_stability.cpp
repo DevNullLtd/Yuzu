@@ -218,6 +218,7 @@ TEST_CASE("apps model: a per-image override changes one application's band only"
         {total_row("Strict.EXE", 12, 3, 7, 10, 3), total_row("plain.exe", 12, 3, 7, 10, 3, 1),
          version_row("Strict.EXE", "1.0", 12, 3, 7)},
         50, in_force);
+    REQUIRE(m.apps.size() == 2); // the loops below must have both applications to check
     for (const auto& a : m.apps) {
         REQUIRE(a.figures.score.band);
         if (a.subject == "Strict.EXE") {
@@ -233,6 +234,7 @@ TEST_CASE("apps model: a per-image override changes one application's band only"
     // The profile marker is on the application row; its versions inherit it and
     // carry no marker of their own.
     const auto j = nlohmann::json::parse(dex_apps_json(m));
+    REQUIRE(j["apps"].size() == 2);
     for (const auto& a : j["apps"]) {
         CHECK(a["profile"] == (a["subject"] == "Strict.EXE" ? "override" : "default"));
         for (const auto& v : a["versions"])
@@ -240,7 +242,7 @@ TEST_CASE("apps model: a per-image override changes one application's band only"
     }
 }
 
-TEST_CASE("apps json: a custom policy's source, revision and fault appear verbatim",
+TEST_CASE("apps json: a custom policy's source and revision and fault appear verbatim",
           "[dex][apps_model]") {
     DexPolicyInForce f;
     f.policy.tiers.edges.excellent = 95.0;

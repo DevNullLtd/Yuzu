@@ -8518,6 +8518,34 @@ TEST_CASE("MCP DEX: list_dex_apps names an unreadable score policy in its error"
     CHECK(ts.audit_details.back().find("(score_policy_unavailable)") != std::string::npos);
 }
 
+// The builder's own re-check (defence in depth behind the provider): a policy that fails
+// validation is refused with its own reason token, never scored under.
+TEST_CASE("MCP DEX: list_dex_apps names a policy that fails validation in its error",
+          "[pg][mcp][integration][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        yuzu::server::DexPolicyInForce f;
+        f.policy.tiers.edges.good = f.policy.tiers.edges.excellent; // edges must descend
+        return f;
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":982,"params":{"name":"list_dex_apps","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("(score_policy_invalid)") !=
+          std::string::npos);
+    CHECK(ts.audit_log.back() == "mcp.list_dex_apps|failure");
+    CHECK(ts.audit_details.back().find("(score_policy_invalid)") != std::string::npos);
+}
+
 TEST_CASE("MCP DEX: get_dex_catalogue_group returns the family drill, unknown family -> "
           "invalid params",
           "[pg][mcp][integration][dex]") {
@@ -8665,11 +8693,11 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         const auto& tiers = policy["properties"]["tiers"];
         CHECK(tiers["required"] == nlohmann::json::array({"excellent", "good", "fair", "poor"}));
         for (const char* tier : {"excellent", "good", "fair", "poor"}) {
-            const auto& t = tiers["properties"][tier];
-            CHECK(t["type"] == "object");
-            CHECK(t["required"] == nlohmann::json::array({"edge", "name"}));
-            CHECK(t["properties"]["edge"]["type"] == "number");
-            CHECK(t["properties"]["name"]["type"] == "string");
+            const auto& tier_schema = tiers["properties"][tier];
+            CHECK(tier_schema["type"] == "object");
+            CHECK(tier_schema["required"] == nlohmann::json::array({"edge", "name"}));
+            CHECK(tier_schema["properties"]["edge"]["type"] == "number");
+            CHECK(tier_schema["properties"]["name"]["type"] == "string");
         }
         CHECK(out["properties"]["population"]["type"] == nlohmann::json::array({"integer", "null"}));
         CHECK(out["properties"]["apps_total"]["type"] == "integer");

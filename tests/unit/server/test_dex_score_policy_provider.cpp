@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <future>
 #include <memory>
@@ -77,6 +78,22 @@ struct ParkedRead {
     }
 };
 
+// How long a test waits on a parked read before it calls the behaviour a regression.
+constexpr auto kParkedWait = std::chrono::seconds(10);
+
+// p.current() on its own thread with a bounded wait: a mid-refresh caller that waits on the
+// parked read fails here instead of hanging the shard to its timeout. On a timeout the parked
+// read is released first, so the call can finish and the future's destructor returns.
+std::expected<DexPolicyInForce, std::string> current_bounded(DexScorePolicyProvider& p,
+                                                             ParkedRead& pr) {
+    auto fut = std::async(std::launch::async, [&p] { return p.current(); });
+    if (fut.wait_for(kParkedWait) != std::future_status::ready) {
+        pr.release();
+        FAIL("a mid-refresh current() waited on the parked store read");
+    }
+    return fut.get();
+}
+
 std::string doc_with_excellent(double e) {
     DexScorePolicy p;
     p.tiers.edges.excellent = e;
@@ -124,7 +141,7 @@ TEST_CASE("policy provider: two instances over one document converge within the 
     CHECK(va->revision == vb->revision);
 }
 
-TEST_CASE("policy provider: an outage serves the last good policy, then refuses past the cap",
+TEST_CASE("policy provider: an outage serves the last good policy then refuses past the cap",
           "[dex][policy_provider]") {
     Fixture f;
     f.doc = doc_with_excellent(95.0);
@@ -168,10 +185,11 @@ TEST_CASE("policy provider: a success during an outage resets the staleness wind
     CHECK_FALSE(p.current());
 }
 
-TEST_CASE("policy provider: a read failure before any success is an error, never a guess",
+TEST_CASE("policy provider: a read failure before any success is an error and never a guess",
           "[dex][policy_provider]") {
     Fixture f;
     f.down = true;
+    f.now = 100; // inside the staleness cap from time zero: only "no good read yet" refuses
     int reads = 0;
     DexScorePolicyProvider p(f.reader(&reads), f.clock());
     const auto r = p.current();
@@ -199,7 +217,7 @@ TEST_CASE("policy provider: nothing stored is a good read that survives a later 
     CHECK(lkg->revision == "default");
 }
 
-TEST_CASE("policy provider: a stored invalid document is the defaults with a fault, never an error",
+TEST_CASE("policy provider: a stored invalid document is the defaults with a fault and never an error",
           "[dex][policy_provider]") {
     Fixture f;
     f.doc = R"({"overrides":[{"image":"a.exe"},{"image":"a.exe"}]})";
@@ -221,6 +239,7 @@ TEST_CASE("policy provider: a stored invalid document is the defaults with a fau
 TEST_CASE("policy provider: a caller arriving mid-refresh with no policy yet fails at once",
           "[dex][policy_provider]") {
     Fixture f;
+    f.now = 100; // inside the staleness cap from time zero: only "no good read yet" refuses
     ParkedRead pr(f);
     pr.armed = true;
     DexScorePolicyProvider p(pr.fn(), f.clock());
@@ -231,10 +250,10 @@ TEST_CASE("policy provider: a caller arriving mid-refresh with no policy yet fai
         if (a.joinable())
             a.join();
     }};
-    pr.entered.wait();
+    REQUIRE(pr.entered.wait_for(kParkedWait) == std::future_status::ready);
 
     // The reader is still parked: this call must return without waiting on it.
-    const auto mid = p.current();
+    const auto mid = current_bounded(p, pr);
     CHECK_FALSE(mid);
     if (!mid)
         CHECK(mid.error().find("refresh in progress") != std::string::npos);
@@ -263,18 +282,18 @@ TEST_CASE("policy provider: a caller arriving mid-refresh is served the last goo
         if (a.joinable())
             a.join();
     }};
-    pr.entered.wait();
+    REQUIRE(pr.entered.wait_for(kParkedWait) == std::future_status::ready);
 
-    const auto lkg = p.current();
+    const auto lkg = current_bounded(p, pr);
     CHECK(lkg.has_value());
     if (lkg) {
         CHECK(lkg->source == "custom");
         CHECK(lkg->policy.tiers.edges.excellent == 95.0);
     }
     f.now += 54000; // exactly 60 s since the last good read: still inside the cap
-    CHECK(p.current().has_value());
+    CHECK(current_bounded(p, pr).has_value());
     f.now += 1; // past the cap: the last good policy is no longer served
-    const auto gone = p.current();
+    const auto gone = current_bounded(p, pr);
     CHECK_FALSE(gone);
     if (!gone)
         CHECK(gone.error().find("refresh in progress") != std::string::npos);
@@ -356,7 +375,31 @@ TEST_CASE("policy provider: a non-std throw from the read takes the same failed-
     CHECK(reads == 5);
 }
 
-TEST_CASE("policy provider: a slow good read is stamped when it completes, not when it starts",
+// The flag is released by a scope guard on every exit, so an exception that is NOT a failed
+// read (here the clock sampled after the unlocked read) leaves no wedged refresh behind. The
+// first sample is the entry of current(), the second is the one under the re-taken lock.
+TEST_CASE("policy provider: an exception after the unlocked read still releases the refresh flag",
+          "[dex][policy_provider]") {
+    Fixture f;
+    int reads = 0;
+    int samples = 0;
+    bool boom = true;
+    DexScorePolicyProvider p(f.reader(&reads), [&]() -> std::int64_t {
+        if (boom && ++samples == 2)
+            throw std::runtime_error("clock exploded");
+        return f.now;
+    });
+    CHECK_THROWS_AS(p.current(), std::runtime_error);
+    CHECK(reads == 1);
+
+    boom = false; // the flag was released: this call refreshes at once
+    const auto v = p.current();
+    REQUIRE(v.has_value()); // not "refresh in progress", and no wait for the staleness cap
+    CHECK(v->source == "default");
+    CHECK(reads == 2);
+}
+
+TEST_CASE("policy provider: a slow good read is stamped when it completes and not when it starts",
           "[dex][policy_provider]") {
     Fixture f;
     f.doc = doc_with_excellent(95.0);
@@ -416,11 +459,11 @@ TEST_CASE("policy provider: the time a failed read takes counts against the stal
     fail = true;
     f.now = t0 + 59000; // each section is one forward-only schedule from here
 
-    SECTION("a refresh starting at t0+59 s whose failure lands 1 s later, at the cap: served") {
+    SECTION("a refresh starting at t0+59 s whose failure lands 1 s later at the cap: served") {
         read_takes_ms = 1000;
         CHECK(p.current().has_value());
     }
-    SECTION("the same refresh failing 10 s later, at t0+69 s: past the cap, refused") {
+    SECTION("the same refresh failing 10 s later at t0+69 s: past the cap and refused") {
         read_takes_ms = 10000;
         const auto gone = p.current();
         REQUIRE_FALSE(gone);

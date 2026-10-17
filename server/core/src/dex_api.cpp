@@ -4,6 +4,7 @@
 #include "dex_read_model.hpp"    // the pure model structs
 #include "dex_window.hpp"     // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (PURE)
 #include "guaranteed_state_store.hpp" // the builder-less signal reads
+#include "refusal_log_throttle.hpp"    // bounds the policy-unavailable warning
 #include "runtime_config_store.hpp"    // dex_score_policy_store_reader
 
 #include <spdlog/spdlog.h>
@@ -59,6 +60,26 @@ public:
     }
 
     [[nodiscard]] DexAppsModel apps(const std::string& window) const override {
+        // The policy first: an unavailable policy answers without a fleet snapshot, and a
+        // policy read that stalls cannot leave a stale snapshot behind it.
+        DexPolicyInForce in_force; // empty policy_fn_: the shipped defaults
+        if (policy_fn_) {
+            auto p = policy_fn_();
+            if (!p) {
+                // One line per interval, not per request: an unreadable store would
+                // otherwise write one warning for every Apps read.
+                if (policy_warn_throttle_.should_warn("score_policy_unavailable"))
+                    spdlog::warn("DexApi::apps: score policy unavailable: {}", p.error());
+                else
+                    spdlog::debug("DexApi::apps: score policy unavailable: {}", p.error());
+                DexAppsModel m;
+                m.window = window;
+                m.degraded = true;
+                m.degraded_reason = "score_policy_unavailable";
+                return m;
+            }
+            in_force = std::move(*p);
+        }
         // Absent FleetFn = unknown population (nullopt), not zero. The population
         // is the connected Windows agents' own ids, so the store draws the share
         // numerators from the same set it is divided by.
@@ -69,19 +90,6 @@ public:
             for (auto& [id, os] : snapshot.connected_agents)
                 if (os == "windows")
                     online->push_back(std::move(id));
-        }
-        DexPolicyInForce in_force; // empty policy_fn_: the shipped defaults
-        if (policy_fn_) {
-            auto p = policy_fn_();
-            if (!p) {
-                spdlog::warn("DexApi::apps: score policy unavailable: {}", p.error());
-                DexAppsModel m;
-                m.window = window;
-                m.degraded = true;
-                m.degraded_reason = "score_policy_unavailable";
-                return m;
-            }
-            in_force = std::move(*p);
         }
         return build_dex_apps_model(store_, window, since_of(window), online, in_force);
     }
@@ -158,6 +166,7 @@ private:
     GuaranteedStateStore* store_; ///< nullable — builders degrade; builder-less reads guard
     FleetFn fleet_fn_;
     DexScorePolicyFn policy_fn_;
+    mutable RefusalLogThrottle policy_warn_throttle_; ///< bounds the policy-unavailable warning
 };
 
 std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store, FleetFn fleet_fn,

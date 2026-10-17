@@ -175,7 +175,7 @@ TEST_CASE("config_routes: PUT /api/config/:key gates on Infrastructure:Write",
 // refusal does not depend on the store, so a null store reaches it (a 503 here would mean
 // the refusal sits behind the store gate).
 TEST_CASE("config_routes: PUT /api/config/dex_score_policy is refused with a typed 400 naming "
-          "the policy route, no audit row",
+          "the policy route with no audit row",
           "[server][routes][config_routes]") {
     MockHarness h;
     h.wire();
@@ -191,6 +191,32 @@ TEST_CASE("config_routes: PUT /api/config/dex_score_policy is refused with a typ
     // The permission gate still runs first.
     REQUIRE(h.perm_calls.size() == 1);
     CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Infrastructure", "Write"});
+}
+
+// The same-site gate runs before the governed-key refusal, so a cross-site browser write to
+// the key is audited as csrf.denied instead of getting a bare 400 (with a null store, and so
+// without reaching the store gate either).
+TEST_CASE("config_routes: a cross-site cookie PUT to dex_score_policy is a 403 with csrf.denied",
+          "[server][routes][config_routes][security]") {
+    MockHarness h;
+    h.auth_source = "local"; // a cookie session
+    h.wire();
+    const std::string path = "/api/config/dex_score_policy";
+
+    auto cross = h.sink.dispatch("PUT", path, R"({"value":"{}"})", "application/json",
+                                 {{"Host", "yuzu.example"}, {"Origin", "https://evil.example"}});
+    REQUIRE(cross);
+    CHECK(cross->status == 403);
+    CHECK(body(cross->body)["error"]["message"] == "cross-site request refused");
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "csrf.denied");
+
+    // A same-site cookie write reaches the typed 400, and writes no further audit row.
+    auto same = h.sink.dispatch("PUT", path, R"({"value":"{}"})", "application/json",
+                                {{"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}});
+    REQUIRE(same);
+    CHECK(same->status == 400);
+    CHECK(h.audits.size() == 1);
 }
 
 TEST_CASE("config_routes: a perm_fn denial 403s on both routes before the store is touched, "

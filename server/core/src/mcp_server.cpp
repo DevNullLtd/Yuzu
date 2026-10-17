@@ -16246,10 +16246,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // A failed read or an invalid score policy is an error, never
                 // an empty or perfect list (matches the REST 503, reason included).
                 if (model.degraded) {
-                    const std::string message =
-                        model.degraded_reason.empty()
-                            ? std::string("DEX store read degraded")
-                            : "DEX store read degraded (" + model.degraded_reason + ")";
+                    const std::string message = dex_degraded_message(model);
                     mcp_audit("failure", message);
                     res.set_content(
                         a4_error(kInternalError, message, "retry shortly",

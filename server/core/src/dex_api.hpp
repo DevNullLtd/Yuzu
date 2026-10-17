@@ -136,8 +136,8 @@ public:
 
     /// GET /api/v1/dex/apps — app-centric stability list (no per-agent identity),
     /// per application and per version. `degraded` = null store, failed read,
-    /// invalid score policy or unreadable stored policy: the handler must refuse it, never render it as an
-    /// empty or perfect list.
+    /// invalid score policy or unreadable stored policy: the handler must refuse
+    /// it, never render it as an empty or perfect list.
     [[nodiscard]] virtual DexAppsModel apps(const std::string& window) const = 0;
 
     /// GET /api/v1/dex/catalogue?os=&window= — the Catalogue View 1 family

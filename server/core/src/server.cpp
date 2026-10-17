@@ -22313,9 +22313,12 @@ private:
     std::unique_ptr<pg::SecretCodec> runtime_config_secret_codec_;
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
     /// Score policy read-through (dex_score_policy_provider.hpp). Its read function
-    /// borrows runtime_config_store_ by reference: the web thread (the only
-    /// caller, via the DexApi) is joined by web_server_->stop() before the store is
-    /// reset, so the borrow never outlives the store. Declared after the store.
+    /// borrows runtime_config_store_ by reference, and the DexApi closures held by
+    /// rest_api_v1_ and mcp_server_ (declared above the store) keep a copy of this
+    /// pointer, so the provider can outlive the store as an object. The borrow is safe
+    /// because it is never CALLED after the store is gone: web_server_->stop() signals
+    /// the web thread and web_thread_ is joined in stop() (or the process exits), and
+    /// the store is reset only after that, so no call can happen in between.
     std::shared_ptr<DexScorePolicyProvider> dex_score_policy_provider_;
     std::unique_ptr<CustomPropertiesStore> custom_properties_store_;
     std::unique_ptr<WorkflowEngine> workflow_engine_;
