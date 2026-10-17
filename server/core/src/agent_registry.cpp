@@ -18,6 +18,7 @@
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
 #include "tar_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
@@ -26,6 +27,8 @@
 #include "service_scope_policy.hpp" // authz::is_service_tag_key — #3295
 #include "tag_store.hpp"
 #include "web_utils.hpp"
+
+#include <yuzu/log_token.hpp>
 
 namespace yuzu::server::detail {
 
@@ -57,6 +60,19 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     session->os = info.platform().os();
     session->arch = info.platform().arch();
     session->agent_version = info.agent_version();
+    // Every spdlog call in THIS function prints the claimed id (via safe_agent_id) and any
+    // agent-supplied free text (tag key, hostname) or store error text neutralised (CWE-117; the
+    // hostname takes the closed-set id fold, the tag key and store error text the key-token fold);
+    // the gateway path reaches here without the direct path's token checks. Both callers read
+    // the enrollment status first (get_pending_status) and return on error; AuthDB refuses any
+    // id with a control byte or ',' there (agent_id_ok). The agent registry's other log lines
+    // that print a session-table id (removal, rollback, session-timeout, sweep and
+    // dispatch-routing lines), and the enrollment store's own agent-id log lines in auth_db.cpp
+    // (the admin-denied warnings and the consumed, added-to-pending, approved, denied and
+    // removed-from-queue lines) and the server's command-forward, asset-tag push and quarantine
+    // dispatch-denied lines in server.cpp, print it as stored: it carries no control byte, but
+    // space and '=' are not neutralised there, so those lines are not wrapped.
+    const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
     // Ingest filter (#3295): validated and non-service, mirroring TagStore's
     // own sync_agent_tags gate (tag_store.cpp) so a service claim or an
     // oversized/malformed key never reaches scope-DSL evaluation via the
@@ -65,7 +81,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (authz::is_service_tag_key(k)) {
             spdlog::info("AgentRegistry::register_agent({}): dropping self-reported "
                          "'service' tag from session scopable_tags (#3295)",
-                         info.agent_id());
+                         safe_agent_id);
             // Gate 6 hardening: the store-side purge (tag_store.cpp,
             // sync_agent_tags) has yuzu_server_tag_store_agent_service_purge_total;
             // this session-level drop is the ONLY signal for a gateway-proxied
@@ -78,7 +94,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (!TagStore::validate_key(k) || !TagStore::validate_value(v)) {
             spdlog::info("AgentRegistry::register_agent({}): dropping invalid scopable_tag "
                          "'{}' at ingest",
-                         info.agent_id(), k);
+                         safe_agent_id, ::yuzu::log_key_token(k));
             continue;
         }
         session->scopable_tags[k] = v;
@@ -141,7 +157,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (!revoked) {
             spdlog::error("AgentRegistry::register_agent: device token revoke-by-device failed "
                           "for '{}', refusing registration: {}",
-                          info.agent_id(), revoked.error());
+                          safe_agent_id, ::yuzu::log_key_token(revoked.error()));
             metrics_
                 .counter("yuzu_agents_registration_refused_total",
                          {{"reason", "device_token_revoke_failed"}})
@@ -183,7 +199,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
             spdlog::warn("AgentRegistry::register_agent: superseded by a concurrent "
                          "registration for '{}', not installing (this call's revoke already "
                          "committed)",
-                         info.agent_id());
+                         safe_agent_id);
             metrics_
                 .counter("yuzu_agents_registration_refused_total",
                          {{"reason", "superseded_by_concurrent_registration"}})
@@ -197,8 +213,11 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     metrics_.counter("yuzu_agents_registered_total").increment();
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
     bus_.publish("agent-online", info.agent_id());
-    spdlog::info("Agent registered: id={}, hostname={}, plugins={}", info.agent_id(),
-                 info.hostname(), info.plugins_size());
+    // The hostname is agent-supplied and sits between two genuine `key=value` tokens, so it takes
+    // the closed-set id fold (space, '=', ',' and every non-ASCII byte become '_'): a hostname such
+    // as `x' plugins=0 id=victim '` cannot close the quote and add a same-line token.
+    spdlog::info("Agent registered: id={}, hostname='{}', plugins={}", safe_agent_id,
+                 ::yuzu::log_id_token(info.hostname()), info.plugins_size());
     return session;
 }
 
@@ -683,7 +702,8 @@ bool gateway_capability_missing(const AgentSession& session, yuzu::MetricsRegist
         .increment();
     spdlog::warn("send_to: refusing to route a dispatch-tagged command to agent {} via gateway "
                  "node '{}' — gateway has not advertised '{}'",
-                 agent_id, session.gateway_node, kGatewayWireCapabilityDispatchTagV1);
+                 agent_id, onbehalf::sanitize_for_log(session.gateway_node, 64),
+                 kGatewayWireCapabilityDispatchTagV1);
     return true;
 }
 
@@ -1064,11 +1084,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // pkg_inventory
         {"pkg_inventory.managers",
          "List package managers present on the host with manager-level config facts "
-         "(macOS Homebrew prefixes with tap/formula/cask counts; read-only, no subprocess; "
-         "macOS only today, Linux and Windows report unsupported)"},
+         "(macOS Homebrew prefixes; Linux dpkg/apt/rpm/dnf/pacman/apk/snap/flatpak presence "
+         "with apt/snap/flatpak counts; read-only, no subprocess; Windows planned)"},
         {"pkg_inventory.packages",
-         "List macOS Homebrew formulae and casks by name, version and kind (macOS only "
-         "today; the Linux package roster is owned by installed_apps)"},
+         "List macOS Homebrew formulae and casks by name, version and kind (macOS only; "
+         "Linux unsupported by design; installed_apps owns the roster)"},
+        {"pkg_inventory.store_packages",
+         "List installed snaps and flatpak apps/runtimes from the system store (Linux; "
+         "read-only, no subprocess; macOS unsupported by design, Windows planned)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture

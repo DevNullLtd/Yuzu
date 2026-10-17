@@ -34,6 +34,7 @@ using yuzu::agent::installed_software_canonical_blob;
 using yuzu::agent::make_installed_software_source;
 using yuzu::agent::parse_pkg_inventory_managers_output;
 using yuzu::agent::parse_pkg_inventory_packages_output;
+using yuzu::agent::parse_pkg_inventory_store_packages_output;
 using yuzu::agent::parse_windows_optional_features_output;
 using yuzu::agent::parse_installed_apps_output;
 using yuzu::agent::sha256_hex;
@@ -1280,7 +1281,7 @@ int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /
 }
 
 const char* const kFakeIaActions[] = {"list_inventory", nullptr};
-const char* const kFakePkgActions[] = {"managers", "packages", nullptr};
+const char* const kFakePkgActions[] = {"managers", "packages", "store_packages", nullptr};
 const char* const kFakeWofActions[] = {"list", nullptr};
 
 #define YUZU_FAKE_DESC(var, plugin_name, actions, idx)                                            \
@@ -1313,6 +1314,8 @@ void fake_mac() {
         capture_section("installed_apps", "macos.txt", "list_inventory");
     g_fake[1].out["managers"] = capture_section("pkg_inventory", "macos.txt", "managers");
     g_fake[1].out["packages"] = capture_section("pkg_inventory", "macos.txt", "packages");
+    g_fake[1].out["store_packages"] =
+        capture_section("pkg_inventory", "macos.txt", "store_packages");
     g_fake[2].out["list"] = yuzu::wof::format_unsupported_row("list", "macos:dism:unsupported") + "\n";
 }
 
@@ -1324,6 +1327,8 @@ void fake_windows() {
         pkg::unsupported_status_row("managers", "windows:planned") + "\n";
     g_fake[1].out["packages"] =
         pkg::unsupported_status_row("packages", "windows:planned") + "\n";
+    g_fake[1].out["store_packages"] =
+        pkg::unsupported_status_row("store_packages", "windows:planned") + "\n";
     g_fake[2].out["list"] = capture_section("windows_optional_features", "windows.txt", "list");
 }
 
@@ -1441,7 +1446,7 @@ TEST_CASE("pkg_inventory packages adapter: real macOS capture", "[sync][parse][a
     const auto r = parse_pkg_inventory_packages_output(
         capture_section("pkg_inventory", "macos.txt", "packages"));
     REQUIRE(r.status == Status::ok);
-    REQUIRE(r.entries.size() == 66);
+    REQUIRE(r.entries.size() == 70);
     CHECK(r.entries[0].name == "actionlint");
     CHECK(r.entries[0].version == "1.7.12");
     CHECK(r.entries[0].kind == "pkg");
@@ -1557,15 +1562,192 @@ TEST_CASE("pkg_inventory adapters: status grammar", "[sync][parse][adapter]") {
     }
 }
 
-TEST_CASE("pkg_inventory adapters: Linux sample is unsupported", "[sync][parse][adapter]") {
+TEST_CASE("pkg_inventory adapters: the Linux sample (a toolchain container with no snapd or flatpak)",
+          "[sync][parse][adapter]") {
+    // managers: supported, with present dpkg/apt rows that map to nothing.
     const auto m = parse_pkg_inventory_managers_output(
         capture_section("pkg_inventory", "linux.txt", "managers"));
-    CHECK(m.status == Status::unsupported);
+    CHECK(m.status == Status::ok);
     CHECK(m.entries.empty());
+    // packages: unsupported by design (installed_apps owns the Linux roster).
     const auto p = parse_pkg_inventory_packages_output(
         capture_section("pkg_inventory", "linux.txt", "packages"));
     CHECK(p.status == Status::unsupported);
     CHECK(p.entries.empty());
+    // store_packages: supported, zero rows (the container has neither snapd nor flatpak).
+    const auto s = parse_pkg_inventory_store_packages_output(
+        capture_section("pkg_inventory", "linux.txt", "store_packages"));
+    CHECK(s.status == Status::ok);
+    CHECK(s.entries.empty());
+}
+
+namespace {
+// Capture values (tests/unit/fixtures/wave10/pkg_inventory/linux/provenance.txt) through the
+// real row emitter.
+const char* const kCalcCommit = "00516a24d410ad62ed3e955fa5deb5af221ab6b181ed5549103f3670d10d2fca";
+
+std::string snap_store_row(std::string_view id, std::string_view version, std::string_view kind,
+                           std::string_view rev, pkg::StoreState state = pkg::StoreState::active) {
+    return pkg::format_store_row(pkg::Store::snap, id, version, kind, rev, "", "", state);
+}
+std::string flatpak_store_row(std::string_view id, std::string_view kind, std::string_view commit,
+                              pkg::StoreState state = pkg::StoreState::active) {
+    return pkg::format_store_row(pkg::Store::flatpak, id, "", kind, commit, "x86_64", "stable", state);
+}
+} // namespace
+
+TEST_CASE("pkg_inventory store_packages adapter: active rows map, the rest are seen but unmapped",
+          "[sync][parse][adapter]") {
+    const auto r = parse_pkg_inventory_store_packages_output(
+        nl({supported_status("store_packages"),
+            snap_store_row("btop", "1.4.7", "app", "1073"),
+            snap_store_row("core24", "20260824", "base", "2124"),
+            flatpak_store_row("org.gnome.Calculator", "app", kCalcCommit),
+            flatpak_store_row("org.gnome.Platform", "runtime", kCalcCommit),
+            // A degraded ACTIVE row (unreadable snap.yaml): still collected, version honest-empty.
+            snap_store_row("jq", "", "unknown", "6"),
+            // Present on disk but not installed software.
+            snap_store_row("oldsnap", "1.0", "app", "1", pkg::StoreState::inactive),
+            snap_store_row("mystery", "1.0", "app", "1", pkg::StoreState::unknown),
+            // Not nine tokens, and an unknown store token: dropped.
+            "package|snap|short|1.0|app|1|-|active",
+            "package|apt|x|1.0|app|1|-|-|active"}));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 5);
+    CHECK(r.reason.empty());
+
+    CHECK(r.entries[0].name == "btop");
+    CHECK(r.entries[0].version == "1.4.7");
+    CHECK(r.entries[0].release == "1073");
+    CHECK(r.entries[0].kind == "app");
+    CHECK(r.entries[0].ecosystem == "snap");
+    CHECK(r.entries[0].arch.empty());
+    CHECK(r.entries[1].kind == "pkg"); // base, not app
+    CHECK(r.entries[1].version == "20260824");
+
+    CHECK(r.entries[2].name == "org.gnome.Calculator");
+    CHECK(r.entries[2].ecosystem == "flatpak");
+    CHECK(r.entries[2].kind == "app");
+    CHECK(r.entries[2].version.empty()); // the branch is a ref, not a version
+    CHECK(r.entries[2].release == kCalcCommit);
+    CHECK(r.entries[2].arch == "x86_64");
+    CHECK(r.entries[3].kind == "pkg"); // a runtime
+
+    CHECK(r.entries[4].name == "jq");
+    CHECK(r.entries[4].version.empty());
+    CHECK(r.entries[4].kind == "pkg");
+    CHECK(r.entries[4].release == "6");
+    for (const auto& e : r.entries) CHECK(e.source.empty()); // the collector stamps source
+}
+
+TEST_CASE("pkg_inventory store_packages adapter: an over-wide row is dropped, never truncated",
+          "[sync][parse][adapter]") {
+    // MUTATION: split_tokens(line, 9) truncates a 10-token row to a valid nine-token one and
+    // maps it with its extra column silently lost.
+    const std::string good = snap_store_row("btop", "1.4.7", "app", "1073");
+    for (const std::string extra : {"|x", "|x|y"}) {
+        const auto r = parse_pkg_inventory_store_packages_output(
+            nl({supported_status("store_packages"), good + extra}));
+        CHECK(r.status == Status::ok);
+        CHECK(r.entries.empty());
+    }
+    const auto ok = parse_pkg_inventory_store_packages_output(
+        nl({supported_status("store_packages"), good}));
+    CHECK(ok.entries.size() == 1);
+}
+
+TEST_CASE("pkg_inventory store_packages adapter: status grammar", "[sync][parse][adapter]") {
+    const std::string row = snap_store_row("btop", "1.4.7", "app", "1073");
+    SECTION("constrained fails (a partial roster would delete stored rows)") {
+        const auto r = parse_pkg_inventory_store_packages_output(
+            nl({pkg::format_status_row("store_packages", pkg::StatusLevel::constrained,
+                                       "linux:flatpak_app:permission_denied"),
+                row}));
+        CHECK(r.status == Status::failed);
+        CHECK(r.reason == "linux:flatpak_app:permission_denied");
+    }
+    SECTION("unsupported") {
+        const auto r = parse_pkg_inventory_store_packages_output(
+            nl({pkg::unsupported_status_row("store_packages", "macos:owned_by_installed_apps")}));
+        CHECK(r.status == Status::unsupported);
+        CHECK(r.entries.empty());
+    }
+    SECTION("a status row for another action, no status row, empty input") {
+        CHECK(parse_pkg_inventory_store_packages_output(nl({supported_status("packages"), row}))
+                  .status == Status::failed);
+        CHECK(parse_pkg_inventory_store_packages_output(nl({row})).status == Status::failed);
+        CHECK(parse_pkg_inventory_store_packages_output("").status == Status::failed);
+    }
+    SECTION("supported with zero rows is a legitimate answer") {
+        const auto r = parse_pkg_inventory_store_packages_output(nl({supported_status("store_packages")}));
+        CHECK(r.status == Status::ok);
+        CHECK(r.entries.empty());
+    }
+}
+
+TEST_CASE("pkg_inventory managers adapter: a constrained answer that names a present manager keeps "
+          "the cycle even when the row maps to nothing",
+          "[sync][parse][adapter]") {
+    // The first constrained Linux `managers` answer carries dpkg/apt rows, which map to no
+    // installed_software entry. MUTATION: counting MAPPED entries (the old `entries.empty()`
+    // rule) instead of present rows fails the first section and skips every Linux cycle.
+    const std::string token = "linux:apt_sources_d:permission_denied";
+    const auto constrained = pkg::format_status_row("managers", pkg::StatusLevel::constrained, token);
+    SECTION("an unmapped present row: ok, zero entries, reason = the token") {
+        const auto r = parse_pkg_inventory_managers_output(
+            nl({constrained, pkg::format_manager_row(pkg::Manager::dpkg, pkg::Presence::present, "",
+                                                     "", "-", "")}));
+        CHECK(r.status == Status::ok);
+        CHECK(r.entries.empty());
+        CHECK(r.reason == token);
+    }
+    SECTION("zero data rows still fails") {
+        CHECK(parse_pkg_inventory_managers_output(nl({constrained})).status == Status::failed);
+    }
+    SECTION("only an unavailable row still fails") {
+        CHECK(parse_pkg_inventory_managers_output(
+                  nl({constrained, pkg::format_manager_row(pkg::Manager::homebrew,
+                                                           pkg::Presence::unavailable, "",
+                                                           "/usr/local", "-", token)}))
+                  .status == Status::failed);
+    }
+}
+
+TEST_CASE("collector: Linux store_packages rows are collected, and a degraded row does not skip the cycle",
+          "[sync][collector]") {
+    fake_mac();
+    // A Linux-shaped pkg_inventory answer layered on the Mac fakes: supported status, active
+    // capture-valued rows, PLUS one degraded ACTIVE row (version `-`, kind unknown) under a
+    // SUPPORTED status. MUTATION: a status token on the degraded row makes the adapter fail it
+    // and skips the whole report.
+    g_fake[1].out["store_packages"] =
+        nl({supported_status("store_packages"), snap_store_row("btop", "1.4.7", "app", "1073"),
+            snap_store_row("jq", "", "unknown", "6"),
+            flatpak_store_row("org.gnome.Calculator", "app", kCalcCommit)});
+    const auto got = collect_with(all_plugins());
+    REQUIRE(got.has_value());
+    const auto recs = records_of(got->first);
+    CHECK(recs.size() == 393 + 70 + 1 + 3);
+    std::map<std::string, std::string> eco_by_name;
+    std::size_t store = 0;
+    for (const auto& rec : recs) {
+        const auto f = fields_of(rec);
+        REQUIRE(f.size() == 16);
+        if (f[15] != "pkg_inventory.store_packages") continue;
+        ++store;
+        eco_by_name[f[0]] = f[5];
+    }
+    CHECK(store == 3);
+    CHECK(eco_by_name["btop"] == "snap");
+    CHECK(eco_by_name["jq"] == "snap");
+    CHECK(eco_by_name["org.gnome.Calculator"] == "flatpak");
+
+    // A constrained store_packages answer (an incomplete LIST) skips the cycle: nothing is deleted.
+    g_fake[1].out["store_packages"] = nl(
+        {pkg::format_status_row("store_packages", pkg::StatusLevel::constrained,
+                                "linux:snapd_snaps:permission_denied"),
+         snap_store_row("btop", "1.4.7", "app", "1073")});
+    CHECK_FALSE(collect_with(all_plugins()).has_value());
 }
 
 TEST_CASE("windows_optional_features adapter: real capture keeps every feature with its state",
@@ -1660,7 +1842,7 @@ TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence
     const auto got = collect_with(all_plugins());
     REQUIRE(got.has_value());
     const auto recs = records_of(got->first);
-    CHECK(recs.size() == 393 + 66 + 1);
+    CHECK(recs.size() == 393 + 70 + 1);
     const std::set<std::string> sources = {"installed_apps.list_inventory",
                                            "pkg_inventory.packages", "pkg_inventory.managers"};
     std::vector<SwEntry> parsed;
@@ -1690,7 +1872,7 @@ TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence
         parsed.push_back(std::move(e));
     }
     CHECK(per_source["installed_apps.list_inventory"] == 393);
-    CHECK(per_source["pkg_inventory.packages"] == 66);
+    CHECK(per_source["pkg_inventory.packages"] == 70);
     CHECK(per_source["pkg_inventory.managers"] == 1);
     CHECK(installed_software_canonical_blob(parsed) == got->first); // sorted, stable
     CHECK(got->second == sha256_hex(got->first));
@@ -1868,7 +2050,7 @@ TEST_CASE("collector: constrained managers keeps a present row", "[sync][collect
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         const auto recs = records_of(got->first);
-        CHECK(recs.size() == 393 + 66 + 1);
+        CHECK(recs.size() == 393 + 70 + 1);
         std::size_t managers = 0;
         for (const auto& rec : recs)
             if (fields_of(rec)[15] == "pkg_inventory.managers")
@@ -1920,7 +2102,7 @@ TEST_CASE("collector: typed completeness - FULL collected; an opted-in PARTIAL a
         g_fake[2].result_status["list"] = {YUZU_RESULT_STATUS_UNAVAILABLE, kPartial, "r"};
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
-        CHECK(records_of(got->first).size() == 393 + 66 + 1);
+        CHECK(records_of(got->first).size() == 393 + 70 + 1);
     }
 }
 

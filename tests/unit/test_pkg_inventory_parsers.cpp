@@ -116,10 +116,10 @@ TEST_CASE("pkg_inventory: tokens are wellformed and the fixed ones match the wir
     CHECK_FALSE(is_wellformed_token("linux:a::b"));
     CHECK_FALSE(is_wellformed_token("linux:Upper"));
     CHECK(pi::kTokenLinuxPackagesOwned == "linux:owned_by_installed_apps");
-    CHECK(pi::kTokenLinuxPlanned == "linux:planned");
+    CHECK(pi::kTokenMacosStoreOwned == "macos:owned_by_installed_apps");
     CHECK(pi::kTokenWindowsPlanned == "windows:planned");
     CHECK(is_wellformed_token(pi::kTokenLinuxPackagesOwned));
-    CHECK(is_wellformed_token(pi::kTokenLinuxPlanned));
+    CHECK(is_wellformed_token(pi::kTokenMacosStoreOwned));
     CHECK(is_wellformed_token(pi::kTokenWindowsPlanned));
     CHECK(pi::make_token("linux", "apt_sources_d", "entry_cap") == "linux:apt_sources_d:entry_cap");
     CHECK(is_wellformed_token(pi::make_token("macos", "homebrew_taps", "io_error")));
@@ -155,8 +155,8 @@ TEST_CASE("pkg_inventory: status row is supported+dash when nothing failed, cons
 
     CHECK(pi::unsupported_status_row("packages", pi::kTokenLinuxPackagesOwned) ==
           "status|packages|unsupported|linux:owned_by_installed_apps");
-    CHECK(pi::unsupported_status_row("managers", pi::kTokenLinuxPlanned) ==
-          "status|managers|unsupported|linux:planned");
+    CHECK(pi::unsupported_status_row("store_packages", pi::kTokenMacosStoreOwned) ==
+          "status|store_packages|unsupported|macos:owned_by_installed_apps");
     CHECK(pi::unsupported_status_row("managers", pi::kTokenWindowsPlanned) ==
           "status|managers|unsupported|windows:planned");
 }
@@ -259,9 +259,8 @@ TEST_CASE("pkg_inventory: production resource-bound defaults are pinned",
 
 TEST_CASE("pkg_inventory: the manager wire names are a pinned vocabulary",
           "[pkg_inventory][parsers][names]") {
-    // The header calls these a wire contract and the definition lists every value,
-    // although only `homebrew` is emitted today (the Linux leg follows). Pin all
-    // seven so the follow-up PR cannot rename one silently.
+    // The header calls these a wire contract and the definition lists every value.
+    // Pin all nine so none can be renamed silently.
     CHECK(pi::manager_name(pi::Manager::dpkg) == "dpkg");
     CHECK(pi::manager_name(pi::Manager::apt) == "apt");
     CHECK(pi::manager_name(pi::Manager::rpm) == "rpm");
@@ -269,6 +268,119 @@ TEST_CASE("pkg_inventory: the manager wire names are a pinned vocabulary",
     CHECK(pi::manager_name(pi::Manager::pacman) == "pacman");
     CHECK(pi::manager_name(pi::Manager::apk) == "apk");
     CHECK(pi::manager_name(pi::Manager::homebrew) == "homebrew");
+    CHECK(pi::manager_name(pi::Manager::snap) == "snap");
+    CHECK(pi::manager_name(pi::Manager::flatpak) == "flatpak");
+}
+
+// ── pure: store_packages row, snap grammar, flatpak commit ───────────────
+
+TEST_CASE("pkg_inventory: store names and state tokens are pinned", "[pkg_inventory][parsers][store]") {
+    CHECK(pi::store_name(pi::Store::snap) == "snap");
+    CHECK(pi::store_name(pi::Store::flatpak) == "flatpak");
+    CHECK(pi::store_state_token(pi::StoreState::active) == "active");
+    CHECK(pi::store_state_token(pi::StoreState::inactive) == "inactive");
+    CHECK(pi::store_state_token(pi::StoreState::unknown) == "unknown");
+}
+
+TEST_CASE("pkg_inventory: format_store_row writes nine columns, `-` for empties, escapes free fields",
+          "[pkg_inventory][parsers][store]") {
+    CHECK(pi::format_store_row(pi::Store::snap, "btop", "1.4.7", "app", "1073", "", "",
+                               pi::StoreState::active) == "package|snap|btop|1.4.7|app|1073|-|-|active");
+    CHECK(pi::format_store_row(pi::Store::flatpak, "org.gnome.Platform", "", "runtime", "abc",
+                               "x86_64", "51", pi::StoreState::inactive) ==
+          "package|flatpak|org.gnome.Platform|-|runtime|abc|x86_64|51|inactive");
+    CHECK(pi::format_store_row(pi::Store::snap, "", "", "unknown", "", "", "",
+                               pi::StoreState::unknown) == "package|snap|-|-|unknown|-|-|-|unknown");
+    // MUTATION: emitting id raw (outside safe_output_field) lets a pipe shift a column.
+    const auto hostile = pi::format_store_row(pi::Store::snap, "a|b", "1\\", "app", "1", "", "",
+                                              pi::StoreState::active);
+    CHECK(hostile.find("a|b") == std::string::npos);
+    CHECK(hostile.rfind("package|snap|a\\|b|", 0) == 0);
+}
+
+TEST_CASE("pkg_inventory: parse_snap_file_name follows snapd's instance-name grammar",
+          "[pkg_inventory][parsers][store]") {
+    auto expect = [](std::string_view file, std::string_view name, std::string_view rev) {
+        const auto f = pi::parse_snap_file_name(file);
+        INFO(file);
+        REQUIRE(f.has_value());
+        CHECK(f->name == name);
+        CHECK(f->revision == rev);
+    };
+    expect("btop_1073.snap", "btop", "1073");
+    expect("core24_2124.snap", "core24", "2124");
+    expect("core_17292.snap", "core", "17292");
+    expect("hello-world_29.snap", "hello-world", "29");
+    expect("jq_6.snap", "jq", "6");
+    expect("snapd_28254.snap", "snapd", "28254");
+    expect("jq_foo_7.snap", "jq_foo", "7"); // parallel instance: split at the LAST `_`
+    expect("jq_x12.snap", "jq", "x12");
+    for (const std::string_view bad :
+         {"partial", "README", "foo.snap", "Foo_1.snap", "-a_1.snap", "a--b_1.snap", "a-_1.snap",
+          "1234_1.snap", "a_1.snap", "btop_.snap", "btop_1.txt", ".snap", "_1.snap",
+          "btop_12345678901.snap", "btop_1x.snap"}) {
+        INFO(bad);
+        CHECK_FALSE(pi::parse_snap_file_name(bad).has_value());
+    }
+    CHECK_FALSE(pi::parse_snap_file_name(std::string(41, 'a') + "_1.snap").has_value());
+    CHECK(pi::parse_snap_file_name(std::string(40, 'a') + "_1.snap").has_value());
+}
+
+TEST_CASE("pkg_inventory: snap_yaml_top_level_value reads one-line scalars only",
+          "[pkg_inventory][parsers][store]") {
+    using pi::snap_yaml_top_level_value;
+    CHECK(snap_yaml_top_level_value("name: jq\nversion: 1.5+dfsg-1\n", "version") == "1.5+dfsg-1");
+    CHECK(snap_yaml_top_level_value("version: '20260824'\ntype: base\n", "version") == "20260824");
+    CHECK(snap_yaml_top_level_value("version: \"6.4\"\n", "version") == "6.4");
+    CHECK(snap_yaml_top_level_value("version: 2.77.1\r\ntype: snapd\r\n", "type") == "snapd");
+    // An indented key under `apps:` is not a hit.
+    CHECK_FALSE(snap_yaml_top_level_value("apps:\n  version: 9\n", "version").has_value());
+    CHECK_FALSE(snap_yaml_top_level_value("version:\n", "version").has_value());
+    CHECK_FALSE(snap_yaml_top_level_value("version:   \n", "version").has_value());
+    CHECK_FALSE(snap_yaml_top_level_value("name: x\n", "version").has_value());
+    // MUTATION: dropping the comment strip makes a commented plain scalar fail the version grammar.
+    CHECK(snap_yaml_top_level_value("version: 1.0  # bump\n", "version") == "1.0");
+    CHECK(snap_yaml_top_level_value("version: 1.0\t#c\n", "version") == "1.0");
+    CHECK(snap_yaml_top_level_value("version: 1.0#frag\n", "version") == "1.0#frag"); // no leading space
+    CHECK_FALSE(snap_yaml_top_level_value("version: # nothing\n", "version").has_value());
+    // A `#` inside quotes is not a comment; an unterminated quote is nullopt.
+    CHECK(snap_yaml_top_level_value("version: '1.0 # not a comment'\n", "version") ==
+          "1.0 # not a comment");
+    CHECK_FALSE(snap_yaml_top_level_value("version: \"unterminated\n", "version").has_value());
+    // Block and flow scalars are not representable on one line.
+    for (const char* v : {"version: >-\n", "version: |\n", "version: [1]\n", "version: {a: 1}\n"})
+        CHECK_FALSE(snap_yaml_top_level_value(v, "version").has_value());
+}
+
+TEST_CASE("pkg_inventory: snap_kind_token is a closed vocabulary", "[pkg_inventory][parsers][store]") {
+    for (const std::string_view t : {"gadget", "kernel", "base", "snapd", "os", "app"})
+        CHECK(pi::snap_kind_token(t) == t);
+    CHECK(pi::snap_kind_token(std::string_view{"application"}) == "app");
+    CHECK(pi::snap_kind_token(std::nullopt) == "app"); // snapd's default
+    CHECK(pi::snap_kind_token(std::string_view{"evil|x"}) == "other");
+    CHECK(pi::snap_kind_token(std::string_view{"BASE"}) == "other");
+}
+
+TEST_CASE("pkg_inventory: snap_version_ok is snapd's isValidVersion", "[pkg_inventory][parsers][store]") {
+    for (const std::string_view v : {"1.4.7", "16-2.61.4-20260225", "20260824", "6.4", "1.5+dfsg-1",
+                                     "2.77.1", "1.0+", "a~", "1", "a"})
+        CHECK(pi::snap_version_ok(v));
+    CHECK(pi::snap_version_ok(std::string(32, '1')));
+    CHECK_FALSE(pi::snap_version_ok(std::string(33, '1')));
+    // MUTATION: dropping the trailing-character rule accepts `1.`.
+    for (const std::string_view v : {"", "1.0|x", "-1", "1.", ".1", "1.0-", "1 0", "\xc3\xa9"})
+        CHECK_FALSE(pi::snap_version_ok(v));
+    CHECK_FALSE(pi::snap_version_ok(std::string_view{"1\0" "0", 3}));
+}
+
+TEST_CASE("pkg_inventory: is_hex64 accepts exactly 64 lowercase hex digits",
+          "[pkg_inventory][parsers][store]") {
+    CHECK(pi::is_hex64("00516a24d410ad62ed3e955fa5deb5af221ab6b181ed5549103f3670d10d2fca"));
+    CHECK(pi::is_hex64(std::string(64, '0')));
+    CHECK_FALSE(pi::is_hex64(std::string(63, 'a')));
+    CHECK_FALSE(pi::is_hex64(std::string(65, 'a')));
+    CHECK_FALSE(pi::is_hex64(std::string(64, 'A')));
+    CHECK_FALSE(pi::is_hex64(std::string(63, 'a') + "g"));
 }
 
 // ── pure: Homebrew directory-name validation ─────────────────────────────
