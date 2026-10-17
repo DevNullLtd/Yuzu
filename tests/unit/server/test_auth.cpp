@@ -2154,6 +2154,8 @@ TEST_CASE("enrollment/pending methods fail CLOSED with no AuthDB attached",
     CHECK(unavailable(mgr.remove_pending_agent("a")));
     CHECK(yuzu::server::is_store_unavailable(StoreError::Unavailable));
     CHECK_FALSE(yuzu::server::is_store_unavailable(StoreError::InvalidInput));
+    CHECK_FALSE(yuzu::server::is_store_unavailable(StoreError::CharsetRefused));
+    CHECK(yuzu::server::is_store_unavailable(StoreError::QueryFailed));
 }
 
 TEST_CASE("enrollment store failures are counted in yuzu_auth_enrollment_store_degrade_total",

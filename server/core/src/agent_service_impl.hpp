@@ -3,6 +3,7 @@
 /// @file agent_service_impl.hpp
 /// gRPC AgentService implementation: Register, Heartbeat, Subscribe, OTA updates.
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -34,8 +35,32 @@
 #include "principal_quota.hpp"
 #include "rate_limiter.hpp"
 
-// Forward declarations to avoid pulling in full store headers
 namespace yuzu::server {
+
+/// The closed `reason` label set of `yuzu_register_invalid_agent_id_total`. Register and
+/// ProxyRegister emit exactly these four (the latter with an extra `source="gateway_proxy"`
+/// label); ServerImpl pre-seeds every combination to 0 from this one list.
+inline constexpr std::array<const char*, 4> kRegisterInvalidAgentIdReasons = {
+    "length", "nul", "control", "charset"};
+
+/// Describe `yuzu_register_invalid_agent_id_total` and create every closed-set series at 0
+/// (the direct Register series carries only `reason`; the gateway path adds
+/// source="gateway_proxy"), per docs/observability-conventions.md so absent() alerts stay
+/// meaningful. ServerImpl calls this once at construction; the unit test calls the same function.
+inline void seed_register_invalid_agent_id_series(yuzu::MetricsRegistry& metrics) {
+    metrics.describe("yuzu_register_invalid_agent_id_total",
+                     "Register/ProxyRegister requests refused because of the shape of "
+                     "the agent id (reason: length/nul/control/charset; source "
+                     "gateway_proxy for the gateway path)",
+                     "counter");
+    for (auto reason : kRegisterInvalidAgentIdReasons) {
+        metrics.counter("yuzu_register_invalid_agent_id_total", {{"reason", reason}});
+        metrics.counter("yuzu_register_invalid_agent_id_total",
+                        {{"reason", reason}, {"source", "gateway_proxy"}});
+    }
+}
+
+// Forward declarations to avoid pulling in full store headers
 class ResponseStore;
 class TagStore;
 class AnalyticsEventStore;

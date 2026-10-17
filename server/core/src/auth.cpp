@@ -2641,7 +2641,7 @@ std::expected<R, StoreError> AuthManager::enrollment_store_call(const char* op, 
         return std::unexpected(StoreError::Unavailable);
     }
     std::expected<R, StoreError> r = std::forward<Fn>(fn)(*db);
-    if (!r && r.error() != StoreError::InvalidInput) {
+    if (!r && r.error() != StoreError::InvalidInput && r.error() != StoreError::CharsetRefused) {
         note_enrollment_store_degrade(op, r.error() == StoreError::Unavailable
                                               ? "pool_acquire_timeout"
                                               : "query_error");
@@ -2661,10 +2661,12 @@ AuthManager::create_enrollment_token(const std::string& label, int max_uses,
 std::expected<ConsumeEnrollResult, StoreError>
 AuthManager::consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                                 const std::string& hostname, const std::string& os,
-                                const std::string& arch, const std::string& agent_version) {
+                                const std::string& arch, const std::string& agent_version,
+                                bool enforce_new_id_charset) {
     return enrollment_store_call<ConsumeEnrollResult>(
         "consume", [&](yuzu::server::AuthDB& db) {
-            return db.consume_and_enroll(raw_token, agent_id, hostname, os, arch, agent_version);
+            return db.consume_and_enroll(raw_token, agent_id, hostname, os, arch, agent_version,
+                                         enforce_new_id_charset);
         });
 }
 
@@ -2708,18 +2710,21 @@ PendingAgent make_pending(const std::string& agent_id, const std::string& hostna
 std::expected<bool, StoreError>
 AuthManager::add_pending_agent(const std::string& agent_id, const std::string& hostname,
                                const std::string& os, const std::string& arch,
-                               const std::string& agent_version) {
+                               const std::string& agent_version, bool enforce_new_id_charset) {
     return enrollment_store_call<bool>("add_pending", [&](yuzu::server::AuthDB& db) {
-        return db.add_pending(make_pending(agent_id, hostname, os, arch, agent_version));
+        return db.add_pending(make_pending(agent_id, hostname, os, arch, agent_version),
+                              enforce_new_id_charset);
     });
 }
 
 std::expected<bool, StoreError>
 AuthManager::ensure_enrolled(const std::string& agent_id, const std::string& hostname,
                              const std::string& os, const std::string& arch,
-                             const std::string& agent_version, const std::string& by) {
+                             const std::string& agent_version, const std::string& by,
+                             bool enforce_new_id_charset) {
     return enrollment_store_call<bool>("ensure_enrolled", [&](yuzu::server::AuthDB& db) {
-        return db.ensure_enrolled(make_pending(agent_id, hostname, os, arch, agent_version), by);
+        return db.ensure_enrolled(make_pending(agent_id, hostname, os, arch, agent_version), by,
+                                  enforce_new_id_charset);
     });
 }
 
