@@ -27,6 +27,7 @@
 #include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
+#include "oidc_writer_gate.hpp" // writer priority for the OIDC lock (#5692 UP-13)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
@@ -2943,6 +2944,7 @@ std::string SettingsRoutes::render_directory_fragment() {
     bool snap_secret_set = false; // the secret itself is never copied into this render
     bool snap_skip_tls_verify = false;
     {
+        yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
         std::shared_lock oidc_lock(*oidc_mu_);
         snap_issuer = cfg_->oidc_issuer;
         snap_client_id = cfg_->oidc_client_id;
@@ -4726,7 +4728,10 @@ void SettingsRoutes::register_routes(
         // the save lock is released; it is destroyed by the first later retirement or drain once
         // its last in-flight request has finished (releasing the last lease does not destroy it).
         {
+            // Writer priority (UP-13): readers wait at the gate while this save asks for the lock.
+            yuzu::server::oidc::OidcWriterGate::Ticket writer_ticket;
             std::unique_lock lock(*oidc_mu_);
+            writer_ticket.release(); // owned: readers may queue on the lock again
             cfg_->oidc_issuer = issuer;
             cfg_->oidc_client_id = client_id;
             cfg_->oidc_client_secret = effective_secret;
@@ -4822,6 +4827,7 @@ void SettingsRoutes::register_routes(
         std::string nat64_text;     // OS-level NAT64 declaration; never read from the form
         std::string saved_issuer;
         {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
             std::shared_lock lock(*oidc_mu_);
             saved_skip_tls = cfg_->oidc_skip_tls_verify;
             allow_private = cfg_->oidc_allow_private_networks;

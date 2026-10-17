@@ -1,4 +1,5 @@
 #include "auth_routes.hpp"
+#include "oidc_writer_gate.hpp"
 
 #include <yuzu/log_token.hpp> // log_key_token: the IdP callback error parameters in a log line
 #include <yuzu/metrics.hpp>
@@ -2036,6 +2037,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (req.has_param("next"))
             v.next = home_ui::screen_by_key(req.get_param_value("next"));
         {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
             std::shared_lock oidc_lock(oidc_mu_);
             if (oidc_provider_ && oidc_provider_->is_enabled())
                 v.sso_href = "/auth/oidc/start";
@@ -3439,6 +3441,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         oidc::OidcProvider::Lease provider;
         std::string redirect_uri;
         {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
             std::shared_lock oidc_lock(oidc_mu_);
             if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
                 res.status = 404;
@@ -3485,6 +3488,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         std::string admin_group_setting;
         std::string scim_link_claim_setting;
         {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
             std::shared_lock oidc_lock(oidc_mu_);
             if (!oidc_provider_) {
                 res.status = 404;
@@ -3569,6 +3573,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // after the second check is ordered after this sign-in.
         bool superseded = false;
         if (result) {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
             std::shared_lock oidc_lock(oidc_mu_);
             superseded = oidc_provider_.get() != provider.get();
         }
@@ -3900,6 +3905,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         {
             bool superseded_after_mint = false;
             {
+                yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
                 std::shared_lock oidc_lock(oidc_mu_);
                 superseded_after_mint = oidc_provider_.get() != provider.get();
             }

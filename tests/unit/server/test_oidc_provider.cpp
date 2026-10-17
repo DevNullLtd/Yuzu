@@ -6,6 +6,7 @@
  */
 
 #include "oidc_provider.hpp"
+#include "oidc_writer_gate.hpp"
 #include "test_oidc_mock_idp.hpp"
 
 #include "../test_log_capture.hpp"
@@ -150,6 +151,97 @@ TEST_CASE("OIDC lease: retire() returns at once and destroys the provider after 
     // The next retirement sweeps: both providers are idle now, so both are destroyed.
     OidcProvider::retire(lease_test_provider());
     CHECK(OidcProvider::retired_count_for_test() == 0);
+}
+
+TEST_CASE("OIDC writer gate: a reader arriving while a save waits blocks until the save owns the "
+          "lock; with no save waiting it passes at once",
+          "[oidc][oidc_lease][oidc_gate]") {
+    yuzu::server::oidc::OidcWriterGate gate; // a private gate: no interference from other tests
+    gate.reader_pass();                      // no writer waiting: returns at once
+    REQUIRE(gate.waiting_for_test() == 0);
+
+    std::atomic<bool> passed{false};
+    std::unique_ptr<yuzu::server::oidc::OidcWriterGate::Ticket> ticket =
+        std::make_unique<yuzu::server::oidc::OidcWriterGate::Ticket>(gate);
+    REQUIRE(gate.waiting_for_test() == 1);
+    std::thread reader([&] {
+        gate.reader_pass();
+        passed = true;
+    });
+    // Declared after `reader`: runs first on any exit, so a failing REQUIRE cannot leave the
+    // thread blocked at the gate while the join waits.
+    struct ReleaseAndJoin {
+        std::unique_ptr<yuzu::server::oidc::OidcWriterGate::Ticket>& t;
+        std::thread& th;
+        ~ReleaseAndJoin() {
+            t.reset();
+            if (th.joinable())
+                th.join();
+        }
+    } release_and_join{ticket, reader};
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_FALSE(passed.load()); // held at the gate while the writer waits
+    ticket.reset();             // the writer owns the lock now
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!passed.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    CHECK(passed.load());
+    CHECK(gate.waiting_for_test() == 0);
+
+    // Two writers: the count follows each ticket, and release is idempotent.
+    {
+        yuzu::server::oidc::OidcWriterGate::Ticket a(gate);
+        yuzu::server::oidc::OidcWriterGate::Ticket b(gate);
+        CHECK(gate.waiting_for_test() == 2);
+        a.release();
+        CHECK(gate.waiting_for_test() == 1);
+        a.release();
+        CHECK(gate.waiting_for_test() == 1);
+    }
+    CHECK(gate.waiting_for_test() == 0);
+}
+
+TEST_CASE("OIDC writer gate: a writer is admitted although readers overlap without a gap",
+          "[oidc][oidc_lease][oidc_gate]") {
+    // 16 readers re-take the shared lock back to back for the whole test (hold ~5 us). On glibc's
+    // reader-preferring rwlock a writer without the gate can be kept out for seconds when the
+    // readers overlap enough (not on a small host, where the readers share few cores), so this
+    // case pins the gated outcome and the deterministic case above pins the mechanism.
+    yuzu::server::oidc::OidcWriterGate gate;
+    std::shared_mutex mu;
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> readers;
+    struct StopAndJoin {
+        std::atomic<bool>& stop;
+        std::vector<std::thread>& ts;
+        ~StopAndJoin() {
+            stop = true;
+            for (auto& t : ts)
+                if (t.joinable())
+                    t.join();
+        }
+    } stop_and_join{stop, readers};
+    for (int i = 0; i < 16; ++i)
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                gate.reader_pass();
+                std::shared_lock lock(mu);
+                const auto t = std::chrono::steady_clock::now();
+                while (std::chrono::steady_clock::now() - t < std::chrono::microseconds(5)) {
+                }
+            }
+        });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    for (int i = 0; i < 20; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            yuzu::server::oidc::OidcWriterGate::Ticket ticket(gate);
+            std::unique_lock lock(mu);
+            ticket.release();
+        }
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 TEST_CASE("OIDC lease: the retirement list is bounded", "[oidc][oidc_lease]") {
