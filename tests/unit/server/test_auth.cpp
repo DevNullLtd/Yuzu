@@ -17,6 +17,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -1870,7 +1871,7 @@ TEST_CASE("consume_and_enroll: an admin-denied agent is refused and the use is r
     EnrollFixture f;
     auto t = mint(f.mgr, "once", 1, std::chrono::hours(1));
     REQUIRE(f.mgr.add_pending_agent("evil", "h", "linux", "x86_64", "0.1.0").value());
-    REQUIRE(f.mgr.deny_pending_agent("evil", "admin").value());
+    REQUIRE(f.mgr.deny_pending_agent("evil", "admin").value() == PendingTransitionOutcome::changed);
 
     auto r = consume(f.mgr, t.raw_token, "evil");
     REQUIRE(r.has_value());
@@ -1978,7 +1979,7 @@ TEST_CASE("enrollment state survives AuthManager re-construction over the same P
         REQUIRE(claim->kind == ConsumeEnrollResult::Kind::enrolled);
         REQUIRE(mgr_a.add_pending_agent("queued", "h", "linux", "x86_64", "0.1.0").value());
         REQUIRE(mgr_a.add_pending_agent("refused", "h", "linux", "x86_64", "0.1.0").value());
-        REQUIRE(mgr_a.deny_pending_agent("refused", "admin").value());
+        REQUIRE(mgr_a.deny_pending_agent("refused", "admin").value() == PendingTransitionOutcome::changed);
     }
     AuthManager mgr_b;
     mgr_b.set_auth_db(db.get());
@@ -2010,18 +2011,74 @@ TEST_CASE("pending agent lifecycle", "[auth][pending][pg]") {
     REQUIRE(status->has_value());
     REQUIRE(**status == PendingStatus::pending);
 
-    REQUIRE(f.mgr.approve_pending_agent("agent-1", "alice").value());
+    REQUIRE(f.mgr.approve_pending_agent("agent-1", "alice").value() == PendingTransitionOutcome::changed);
     status = f.mgr.get_pending_status("agent-1");
     REQUIRE(status.has_value());
     REQUIRE(status->has_value());
     REQUIRE(**status == PendingStatus::approved);
-    CHECK_FALSE(f.mgr.approve_pending_agent("ghost", "alice").value());
+    CHECK(f.mgr.approve_pending_agent("ghost", "alice").value() == PendingTransitionOutcome::not_found);
+}
+
+// The store hands back epoch milliseconds. The legacy .cfg import allows an expiry to year 9999
+// (253402300799000 ms); a bare time_point{milliseconds{ms}} wraps negative for it on a clock that
+// counts nanoseconds in an int64 (libstdc++, limit about year 2262), so the token read back as
+// Expired while the SQL consume path still accepted it. The conversion saturates instead.
+TEST_CASE("epoch_ms_to_time_point saturates instead of wrapping", "[auth][enrollment]") {
+    using Clock = std::chrono::system_clock;
+    using std::chrono::duration_cast;
+    using std::chrono::milliseconds;
+    constexpr auto kMax = (std::numeric_limits<std::int64_t>::max)();
+    constexpr auto kMin = (std::numeric_limits<std::int64_t>::min)();
+
+    // Exact where the clock can hold it.
+    CHECK(epoch_ms_to_time_point(0) == Clock::time_point{});
+    CHECK(duration_cast<milliseconds>(epoch_ms_to_time_point(1'800'000'000'000).time_since_epoch())
+              .count() == 1'800'000'000'000);
+    CHECK(duration_cast<milliseconds>(epoch_ms_to_time_point(-86'400'000).time_since_epoch())
+              .count() == -86'400'000);
+
+    // The exact edges, derived from the clock so they hold on every tick size: the limit
+    // converts exactly, one millisecond past it saturates, and the same on the negative side.
+    // (lim is the number of whole milliseconds the clock holds, so lim + 1 and -lim - 1 cannot
+    // overflow the int64 for any clock coarser than a nanosecond.)
+    constexpr std::int64_t lim =
+        duration_cast<milliseconds>((Clock::duration::max)()).count();
+    static_assert(lim < kMax - 1 && lim > 0);
+    CHECK(duration_cast<milliseconds>(epoch_ms_to_time_point(lim).time_since_epoch()).count() ==
+          lim);
+    CHECK(epoch_ms_to_time_point(lim + 1) == (Clock::time_point::max)());
+    CHECK(duration_cast<milliseconds>(epoch_ms_to_time_point(-lim).time_since_epoch()).count() ==
+          -lim);
+    CHECK(epoch_ms_to_time_point(-lim - 1) == (Clock::time_point::min)());
+
+    // Far past the range: the max / min sentinel, never a negative or a wrapped value.
+    CHECK(epoch_ms_to_time_point(kMax) == (Clock::time_point::max)());
+    CHECK(epoch_ms_to_time_point(kMin) == (Clock::time_point::min)());
+
+    // Year 9999 (253402300799000 ms) and year 2286 (9999999999000 ms): whatever the clock's tick,
+    // the result is either that exact instant or the max sentinel, and in every case it is
+    // still in the future. It is never a wrapped, past instant.
+    for (const std::int64_t ms : {std::int64_t{253'402'300'799'000}, std::int64_t{9'999'999'999'000}}) {
+        INFO("ms=" << ms);
+        const auto tp = epoch_ms_to_time_point(ms);
+        CHECK(tp > Clock::now());
+        CHECK((tp == (Clock::time_point::max)() ||
+               duration_cast<milliseconds>(tp.time_since_epoch()).count() == ms));
+    }
+    // Monotonic across the saturation edge: a later input is never an earlier instant.
+    std::int64_t prev_ms = 1'000'000'000'000;
+    auto prev = epoch_ms_to_time_point(prev_ms);
+    for (std::int64_t ms = prev_ms; ms <= kMax / 3; ms *= 3) {
+        const auto tp = epoch_ms_to_time_point(ms);
+        CHECK(tp >= prev);
+        prev = tp;
+    }
 }
 
 TEST_CASE("deny pending agent", "[auth][pending][pg]") {
     EnrollFixture f;
     f.mgr.add_pending_agent("agent-2", "host2", "windows", "x86_64", "0.1.0").value();
-    REQUIRE(f.mgr.deny_pending_agent("agent-2", "bob").value());
+    REQUIRE(f.mgr.deny_pending_agent("agent-2", "bob").value() == PendingTransitionOutcome::changed);
     auto status = f.mgr.get_pending_status("agent-2");
     REQUIRE(status.has_value());
     REQUIRE(status->has_value());
@@ -2044,7 +2101,7 @@ TEST_CASE("remove pending agent", "[auth][pending][pg]") {
 TEST_CASE("remove pending agent refuses a denied or approved row", "[auth][pending][pg]") {
     EnrollFixture f;
     f.mgr.add_pending_agent("agent-4", "host4", "linux", "arm64", "0.1.0").value();
-    REQUIRE(f.mgr.deny_pending_agent("agent-4", "alice").value());
+    REQUIRE(f.mgr.deny_pending_agent("agent-4", "alice").value() == PendingTransitionOutcome::changed);
     // Removing the DENIED row is refused — the denial holds (governance
     // Finding 1: it would otherwise delete the guard kEnrollUpsertSql's
     // `WHERE status <> 'denied'` depends on, with no audit trail).
@@ -2055,7 +2112,7 @@ TEST_CASE("remove pending agent refuses a denied or approved row", "[auth][pendi
     REQUIRE(**status == PendingStatus::denied);
 
     f.mgr.add_pending_agent("agent-5", "host5", "linux", "arm64", "0.1.0").value();
-    REQUIRE(f.mgr.approve_pending_agent("agent-5", "alice").value());
+    REQUIRE(f.mgr.approve_pending_agent("agent-5", "alice").value() == PendingTransitionOutcome::changed);
     // Removing the APPROVED row is refused too — no silent deregistration.
     REQUIRE(f.mgr.remove_pending_agent("agent-5").value() == RemovePendingOutcome::wrong_status);
     status = f.mgr.get_pending_status("agent-5");

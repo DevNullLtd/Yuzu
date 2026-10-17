@@ -71,6 +71,10 @@ constexpr NavItem kPosture[] = {
      .icon = "M3 12a9 9 0 109-9 M3 4v5h5 M12 7v5l3 2"},
 };
 constexpr NavItem kEstate[] = {
+    {.key = "groups",
+     .label = "Groups and enrolment",
+     .href = "/groups",
+     .icon = "M3 4h18v12H3z M8 20h8 M12 16v4"},
     {.key = "hardware",
      .label = "Hardware",
      .href = "/hardware",

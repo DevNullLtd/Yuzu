@@ -158,6 +158,7 @@
 #include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
+#include "groups_routes.hpp" // Groups and enrolment page (Phase 2 UI): /groups + its script
 #include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
@@ -15526,6 +15527,11 @@ private:
             .registry = &registry_,
         });
 
+        // Groups and enrolment page (Phase 2 UI): GET /groups and its script. The page's
+        // panels are the existing /fragments/settings/{tokens,pending,auto-approve}.
+        yuzu::server::groups::register_groups_routes(
+            inline_sink, yuzu::server::groups::Deps{.auth_fn = auth_fn});
+
         // #2542 follow-up: 7 dashboard/API routes with no single owning store
         // (/api/me, /api/agents, /api/audit, /api/export/json-to-csv,
         // /api/scope/validate, /api/analytics/{status,recent}), extracted
@@ -16489,6 +16495,14 @@ private:
                    const std::string& result, const std::string& target_type,
                    const std::string& target_id, const std::string& detail) -> bool {
                 return audit_log(req, action, result, target_type, target_id, detail);
+            });
+        // The three auto-loading enrolment GET fragments (Settings panels and the Groups page)
+        // use the quiet admin probe, as the Users page does: a non-administrator's page view
+        // must not write an auth.admin_required row per panel. Mutating routes keep the loud
+        // require_admin bound above. Wired before the listener starts.
+        settings_routes_->set_read_admin_fn(
+            [this](const httplib::Request& req, httplib::Response& res) {
+                return auth_routes_->probe_admin(req, res);
             });
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).

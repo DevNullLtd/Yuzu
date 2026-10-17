@@ -312,6 +312,20 @@ yuzu_device_data_js_embed = custom_target(
   ],
 )
 
+# Groups and enrolment page: client glue for /groups. Symbol: kYuzuGroupsJs (std::string).
+yuzu_groups_js_embed = custom_target(
+  'yuzu_groups_js_bundle',
+  input: 'static/yuzu-groups.js',
+  output: 'yuzu_groups_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuGroupsJs',
+  ],
+)
+
 cytoscape_js_embed = custom_target(
   'cytoscape_js_bundle',
   input: 'static/cytoscape.min.js',
@@ -511,6 +525,7 @@ yuzu_server_core_lib = static_library(
    yuzu_dialog_js_embed, yuzu_integrations_js_embed,
    yuzu_integrations_sync_js_embed, yuzu_operate_extras_js_embed,
    yuzu_estate_js_embed, yuzu_device_data_js_embed,
+   yuzu_groups_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -536,6 +551,9 @@ yuzu_server_core_lib = static_library(
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
+    'src/enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
+    'src/groups_ui.cpp', # Groups and enrolment page: the page template
+    'src/groups_routes.cpp', # Groups and enrolment page: /groups + static glue
     'src/integrations_render.cpp', # System Integrations: pure MCP/Gateway panels + MCP form parser
     'src/integrations_routes.cpp',
     'src/integrations_ui.cpp',
