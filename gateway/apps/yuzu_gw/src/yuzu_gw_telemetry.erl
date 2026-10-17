@@ -1391,7 +1391,8 @@ metric_specs() ->
             {labels, [outcome]},
             {help, "Refused stream-status notices that stopped waiting for a resend, by "
                    "outcome: acknowledged (a resend was recorded), superseded (a newer "
-                   "notice for the session replaced it), session_gone (a connected "
+                   "notice for the session replaced it, or a restarted owner presented "
+                   "the session again), session_gone (a connected "
                    "notice whose session ended at the gateway), lost (given up, counted "
                    "in yuzu_gw_upstream_notify_lost_total)"}]}
     ].

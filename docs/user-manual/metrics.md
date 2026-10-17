@@ -108,7 +108,7 @@ Notification" and "Planned stop".
 | `yuzu_gw_upstream_notify_pending_max` | gauge | The held-notification cap in force (`notify_pending_max`) |
 | `yuzu_gw_upstream_notify_unacknowledged_total{event}` | counter | Notifications the server answered with `acknowledged=false`, by `event` (`connected`, `disconnected`): it did not record them, so the gateway holds them and sends them again with backoff. Each answer counts, a resend's included (NOTIFY-ACK; gateway manual, "When the server does not record a notification") |
 | `yuzu_gw_upstream_notify_unacked_keys` | gauge | Refused notifications the gateway still holds to send again, one per agent session. Above 0 for 10 minutes fires `YuzuGatewayNotifyUnacknowledged` |
-| `yuzu_gw_upstream_notify_unacked_ended_total{outcome}` | counter | Refused notifications that stopped waiting for a resend, by `outcome`: `acknowledged` (a resend was recorded), `superseded` (a newer notification for the session replaced it), `session_gone` (a `CONNECTED` whose session ended at the gateway), `lost` (given up; the loss is in `yuzu_gw_upstream_notify_lost_total`) |
+| `yuzu_gw_upstream_notify_unacked_ended_total{outcome}` | counter | Refused notifications that stopped waiting for a resend, by `outcome`: `acknowledged` (a resend was recorded), `superseded` (a newer notification for the session replaced it, or a restarted owner presented the session again), `session_gone` (a `CONNECTED` whose session ended at the gateway), `lost` (given up; the loss is in `yuzu_gw_upstream_notify_lost_total`) |
 
 `yuzu_gw_registration_replay_triggered_total{trigger}` gained the values
 `notify_loss` (a full replay started because a held `CONNECTED` was lost),

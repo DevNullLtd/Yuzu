@@ -4251,7 +4251,11 @@ avoid it (#5695):
    process that watches its owner; after an abnormal owner exit it waits up to
    5 s for the restarted owner to re-attach, and ends the stream otherwise. If
    the stream is still open, the restarted owner re-attaches, waits until the
-   `DISCONNECTED` has reached the server (or been counted lost), registers the
+   `DISCONNECTED` has reached the server (or been refused, or counted lost; a
+   refused one is not sent again: its resend, and any resend of the
+   predecessor's refused notices, is cancelled and counted
+   `yuzu_gw_upstream_notify_unacked_ended_total{outcome="superseded"}`, so none
+   reaches the server after the next step), registers the
    session again in the routing table, presents the same session to the server
    again (a `ProxyRegister` carrying the session id, as a registration replay
    does), and announces `CONNECTED` for it with the same stream home id. The

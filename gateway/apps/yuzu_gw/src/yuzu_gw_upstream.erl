@@ -206,6 +206,10 @@
 %%%     DISCONNECTED after a refused CONNECTED is sent, the CONNECTED never
 %%%     again). A resend in flight is waited for (per-key order), and its
 %%%     result is dropped.
+%%%   - A restarted agent owner's notify_settled/4 waits for a resend of its key
+%%%     in flight and cancels one still waiting (superseded) before it answers:
+%%%     the owner presents the session to the server again next, and a resend
+%%%     of the predecessor's refused DISCONNECTED must not follow that.
 %%%   - A CONNECTED is resent only while this node still holds its session
 %%%     (yuzu_gw_registry:lookup_local_session/1, read when the backoff ends;
 %%%     a registry that is not running does not stop it). It has no time limit:
@@ -801,7 +805,11 @@ notify_stream_status(AgentId, SessionId, Event, PeerAddr, StreamHomeId) ->
 %% SessionId, StreamHomeId} has no event held and no send in flight: the
 %% message is `{Ack, notify_settled}'. Cast after a notify_stream_status/5 from
 %% the same process, it answers once that notice is retired (sent, or counted
-%% lost); for a key with nothing pending it answers at once. Nothing answers if
+%% lost); for a key with nothing pending it answers at once. A resend of a
+%% refused notice (NOTIFY-ACK) in flight keeps the key unsettled; a refused
+%% notice still waiting for its resend is cancelled (superseded) when it
+%% answers, so nothing of the key is sent after it but what the caller sends
+%% next (see release_settled/1). Nothing answers if
 %% this process stops first: the caller bounds its own wait (OWNER-RESTART,
 %% #5695; see yuzu_gw_agent's recovering state).
 -spec notify_settled(binary(), binary() | undefined, binary(), reference() | pid()) -> ok.
@@ -1501,7 +1509,11 @@ handle_cast(replay_registrations, State) ->
     {noreply, start_full_replay(manual, State)};
 
 handle_cast({notify_settled, Key, Ack}, #state{settle_waiters = W} = State) ->
-    {noreply, release_settled(State#state{settle_waiters = W#{Key => [Ack | maps:get(Key, W, [])]}})};
+    Before = notify_counts(State),
+    %% release_settled/1 can cancel a retry-set entry: report the gauge.
+    {noreply, report_notify_counts(
+                Before,
+                release_settled(State#state{settle_waiters = W#{Key => [Ack | maps:get(Key, W, [])]}}))};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -2723,6 +2735,14 @@ next_unacked_delay(Prev, Base, Max) ->
 %% its session (a session that ended or was replaced has nothing to announce;
 %% its DISCONNECTED normally cancelled the entry already). A registry that is
 %% not running does not stop it: that is not evidence the session is gone.
+%%
+%% While a crashed agent owner is restarted (OWNER-RESTART) its registry row is
+%% briefly absent: the predecessor's DOWN removed it and the successor has not
+%% recovered it yet. A CONNECTED that becomes due then ends as session_gone.
+%% That is harmless: the successor sends the session's DISCONNECTED, and on
+%% recovery a fresh CONNECTED of its own (yuzu_gw_agent:try_recover/2), so the
+%% dropped resend would have been superseded anyway; if recovery fails the
+%% session has ended and there is nothing to announce.
 -spec unacked_due(yuzu_gw_notify_queue:key(), unacked(), #state{}) -> #state{}.
 unacked_due({AgentId, SessionId, _Home} = Key, #{class := Class} = Entry,
             #state{notify_unacked = U, notify_unacked_ready = Q} = State) ->
@@ -2990,15 +3010,31 @@ settle(State) ->
     release_settled(maybe_end_flush(pump_replay(drain(State)))).
 
 %% Answer every notify_settled/4 waiter whose key has no event held and no send
-%% in flight (the half_open probe is in notify_pids too). O(waiters x sends in
-%% flight); there are waiters only while restarted agent owners recover.
+%% in flight (the half_open probe and every NOTIFY-ACK resend are in notify_pids
+%% too). O(waiters x sends in flight); there are waiters only while restarted
+%% agent owners recover.
+%%
+%% A settled key may still have a retry-set entry: a refused notice waiting for
+%% its backoff, or due and queued (an entry given back to the pending store is
+%% held, one being resent is in flight, so neither settles). It is cancelled
+%% here, counted superseded, before the waiter is answered: the waiter's next
+%% step presents the session to the server again (yuzu_gw_agent:try_recover/2),
+%% and a resend of the predecessor's refused DISCONNECTED landing after that
+%% would remove the session just recovered. A refused CONNECTED of the
+%% predecessor is normally superseded already by the DISCONNECTED the successor
+%% sent before it asked; either way none of the predecessor's notices is sent
+%% after the successor's own. If the recovery then fails, what is lost is the
+%% resend of a DISCONNECTED the server answered unknown_session: its route row,
+%% if any, stops being routable when its lease runs out, as when the resend
+%% window ends.
 release_settled(#state{settle_waiters = W} = State) when map_size(W) =:= 0 ->
     State;
 release_settled(#state{settle_waiters = W, notify_pending = Pending, notify_pids = Pids} = State) ->
     Settled = [K || K <- maps:keys(W), not yuzu_gw_notify_queue:is_held(K, Pending),
                     not key_in_flight(K, Pids)],
+    State1 = lists:foldl(fun cancel_unacked/2, State, Settled),
     [[Ack ! {Ack, notify_settled} || Ack <- maps:get(K, W)] || K <- Settled],
-    State#state{settle_waiters = maps:without(Settled, W)}.
+    State1#state{settle_waiters = maps:without(Settled, W)}.
 
 %% Start replay workers while there is work and room:
 %%   - fewer workers than the replay cap (upstream_replay_concurrency, the

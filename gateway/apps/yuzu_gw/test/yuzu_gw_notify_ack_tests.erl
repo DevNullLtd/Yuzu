@@ -84,6 +84,24 @@ planned_stop_test_() ->
         "refused CONNECTED",
         fun a_planned_stop_sends_refused_disconnected_not_connected/0)]}.
 
+%% A restarted agent owner (OWNER-RESTART) waits on notify_settled/4 before it
+%% presents its predecessor's session to the server again. The retry set must
+%% not let a refused notice of that session follow the re-registration.
+%% Backoff 100 ms, so a refused notice waits in its timer when the settle is
+%% asked and becomes due while the (slow) re-registration is at the server.
+owner_restart_settle_test_() ->
+    {foreach,
+     fun() -> setup(#{notify_unacked_retry_base_ms => 100,
+                      notify_unacked_retry_max_ms => 100}) end,
+     fun cleanup/1,
+     [t("a settle cancels a waiting refused DISCONNECTED: none reaches the server after "
+        "the re-registration",
+        fun a_settle_cancels_a_waiting_disconnected_retry/0),
+      t("a settle waits for a resend in flight, then cancels it if it is refused again",
+        fun a_settle_waits_for_an_inflight_resend/0),
+      t("a predecessor's refused CONNECTED is never resent after the successor's notices",
+        fun a_predecessor_connected_retry_never_follows_the_successor/0)]}.
+
 t(Name, Fun) -> {timeout, 60, {Name, Fun}}.
 
 %%--------------------------------------------------------------------
@@ -300,6 +318,95 @@ a_planned_stop_sends_refused_disconnected_not_connected() ->
     ?assertEqual(1, event_count([yuzu, gw, upstream, notify_lost],
                                 #{event => connected, reason => shutdown})).
 
+%% The successor's sequence (yuzu_gw_agent:try_recover/2) driven directly: the
+%% predecessor session's DISCONNECTED is refused and waits for its resend; the
+%% successor's settle is answered, it re-registers (slow at the server) and
+%% casts CONNECTED. No DISCONNECTED may reach the server after the
+%% re-registration started: it would remove the session just presented again.
+a_settle_cancels_a_waiting_disconnected_retry() ->
+    [{Id, Sess}] = register_agents(<<"settle-wait">>, 1),
+    Refusals = counter(1),
+    answer_owner(fun(#{event := 'DISCONNECTED'}) ->
+                         case take(Refusals) of true -> unacked; false -> ok end;
+                    (#{event := 'CONNECTED'}) -> ok
+                 end),
+    ok = notify(Id, Sess, disconnected),
+    ?assertEqual(ok, wait_until(fun() -> length(notices(Id)) =:= 1 andalso settled() end)),
+    ?assertMatch(#{status := {waiting, _}}, unacked_entry(Id, Sess)),
+    ok = await_settled(Id, Sess),
+    ?assertEqual(none, unacked_entry(Id, Sess)),
+    {ok, _} = yuzu_gw_upstream:reregister_session(register_req(Id), Sess, #{}),
+    ok = notify(Id, Sess, connected),
+    ?assertEqual(ok, wait_until(fun() -> lists:keymember(connected, 2, notices(Id)) end)),
+    timer:sleep(5 * 100),
+    ?assertEqual([{disconnected, unacked}, {reregister, ok}, {connected, ok}],
+                 [{E, A} || {_, E, A} <- notices(Id)]),
+    ?assertEqual(1, event_count([yuzu, gw, upstream, notify_unacked_ended],
+                                #{outcome => superseded})),
+    ?assertEqual(0, map_size(up_field(notify_unacked))),
+    ?assertEqual(0, last_unacked_gauge()).
+
+%% A resend in flight when the settle is asked keeps the key unsettled; refused
+%% again, it is not put back to wait: the settle cancels it and answers.
+a_settle_waits_for_an_inflight_resend() ->
+    [{Id, Sess}] = register_agents(<<"settle-inflight">>, 1),
+    Test = self(),
+    Calls = counter(0),
+    answer_owner(fun(#{event := 'DISCONNECTED'}) ->
+                         case bump(Calls) of
+                             1 -> unacked;
+                             2 -> Test ! {blocked, self(), Id},
+                                  receive {release, R} -> R after 20000 -> ok end;
+                             _ -> ok
+                         end;
+                    (#{event := 'CONNECTED'}) -> ok
+                 end),
+    ok = notify(Id, Sess, disconnected),
+    W = blocked(Id),
+    Alias = alias([reply]),
+    ok = yuzu_gw_upstream:notify_settled(Id, Sess, <<"home">>, Alias),
+    receive {Alias, notify_settled} -> error(settled_with_a_resend_in_flight)
+    after 300 -> ok
+    end,
+    W ! {release, unacked},
+    receive {Alias, notify_settled} -> ok
+    after ?WAIT_MS -> error(never_settled)
+    end,
+    ?assertEqual(none, unacked_entry(Id, Sess)),
+    {ok, _} = yuzu_gw_upstream:reregister_session(register_req(Id), Sess, #{}),
+    ok = notify(Id, Sess, connected),
+    ?assertEqual(ok, wait_until(fun() -> lists:keymember(connected, 2, notices(Id)) end)),
+    timer:sleep(5 * 100),
+    ?assertEqual([{disconnected, unacked}, {disconnected, unacked}, {reregister, ok},
+                  {connected, ok}],
+                 [{E, A} || {_, E, A} <- notices(Id)]),
+    ?assertEqual(1, event_count([yuzu, gw, upstream, notify_unacked_ended],
+                                #{outcome => superseded})),
+    ?assertEqual(0, map_size(up_field(notify_unacked))).
+
+%% The predecessor's CONNECTED was refused and waits for its resend; the
+%% successor sends the session's DISCONNECTED, settles, re-registers and sends
+%% CONNECTED. The predecessor's CONNECTED is never sent again after any of it.
+a_predecessor_connected_retry_never_follows_the_successor() ->
+    [{Id, Sess}] = register_agents(<<"settle-conn">>, 1),
+    Refusals = counter(1),
+    answer_owner(fun(#{event := 'CONNECTED'}) ->
+                         case take(Refusals) of true -> unacked; false -> ok end;
+                    (#{event := 'DISCONNECTED'}) -> ok
+                 end),
+    ok = notify(Id, Sess, connected),
+    ?assertEqual(ok, wait_until(fun() -> length(notices(Id)) =:= 1 andalso settled() end)),
+    ?assertMatch(#{status := {waiting, _}}, unacked_entry(Id, Sess)),
+    ok = notify(Id, Sess, disconnected),
+    ok = await_settled(Id, Sess),
+    {ok, _} = yuzu_gw_upstream:reregister_session(register_req(Id), Sess, #{}),
+    ok = notify(Id, Sess, connected),
+    ?assertEqual(ok, wait_until(fun() -> length(notices(Id)) =:= 4 end)),
+    timer:sleep(5 * 100),
+    ?assertEqual([{connected, unacked}, {disconnected, ok}, {reregister, ok}, {connected, ok}],
+                 [{E, A} || {_, E, A} <- notices(Id)]),
+    ?assertEqual(0, map_size(up_field(notify_unacked))).
+
 %%--------------------------------------------------------------------
 %% Fixture
 %%--------------------------------------------------------------------
@@ -364,34 +471,72 @@ cleanup({UpPid, Keys, Stamp}) ->
 %% answered OK.
 answer(Answer) ->
     meck:expect(yuzu_grpc_client, unary,
-                fun(_Meta, Path, Req, _Def, _Opts) ->
+                fun(Meta, Path, Req, Def, Opts) ->
+                        notify_answer(Answer, Meta, Path, Req, Def, Opts)
+                end).
+
+notify_answer(Answer, _Meta, Path, Req, _Def, _Opts) ->
+    case lists:last(binary:split(Path, <<"/">>, [global])) of
+        <<"NotifyStreamStatus">> ->
+            A = Answer(Req),
+            Event = case maps:get(event, Req) of
+                        'CONNECTED' -> connected;
+                        'DISCONNECTED' -> disconnected
+                    end,
+            Short = case A of
+                        ok -> ok;
+                        unacked -> unacked;
+                        _ -> error
+                    end,
+            catch ets:insert(?CALLS, {erlang:unique_integer([monotonic]),
+                                      maps:get(agent_id, Req), Event, Short}),
+            case A of
+                ok -> {ok, #{acknowledged => true}, #{}};
+                unacked -> {ok, #{acknowledged => false}, #{}};
+                {error, Reason} -> {error, Reason}
+            end;
+        _ ->
+            {ok, #{accepted => true}, #{}}
+    end.
+
+%% answer/1, and a ProxyRegister is recorded too ({Seq, AgentId, reregister,
+%% ok}) when it arrives, then answered after 300 ms (a slow re-registration:
+%% a resend that becomes due meanwhile would be sent during it).
+answer_owner(Answer) ->
+    meck:expect(yuzu_grpc_client, unary,
+                fun(Meta, Path, Req, Def, Opts) ->
                         case lists:last(binary:split(Path, <<"/">>, [global])) of
-                            <<"NotifyStreamStatus">> ->
-                                A = Answer(Req),
-                                Event = case maps:get(event, Req) of
-                                            'CONNECTED' -> connected;
-                                            'DISCONNECTED' -> disconnected
-                                        end,
-                                Short = case A of
-                                            ok -> ok;
-                                            unacked -> unacked;
-                                            _ -> error
-                                        end,
+                            <<"ProxyRegister">> ->
+                                AgentId = maps:get(agent_id, maps:get(info, Req, #{}), undefined),
                                 catch ets:insert(?CALLS, {erlang:unique_integer([monotonic]),
-                                                          maps:get(agent_id, Req), Event, Short}),
-                                case A of
-                                    ok -> {ok, #{acknowledged => true}, #{}};
-                                    unacked -> {ok, #{acknowledged => false}, #{}};
-                                    {error, Reason} -> {error, Reason}
-                                end;
+                                                          AgentId, reregister, ok}),
+                                timer:sleep(300),
+                                {ok, #{accepted => true}, #{}};
                             _ ->
-                                {ok, #{accepted => true}, #{}}
+                                notify_answer(Answer, Meta, Path, Req, Def, Opts)
                         end
                 end).
 
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
+
+%% The successor's wait (yuzu_gw_agent:await_settled/1).
+await_settled(Id, Sess) ->
+    Alias = alias([reply]),
+    ok = yuzu_gw_upstream:notify_settled(Id, Sess, <<"home">>, Alias),
+    receive {Alias, notify_settled} -> ok
+    after ?WAIT_MS -> unalias(Alias), {error, never_settled}
+    end.
+
+%% The retry-set entry of the key notify/3 uses, or `none'.
+unacked_entry(Id, Sess) ->
+    maps:get({Id, Sess, <<"home">>}, up_field(notify_unacked), none).
+
+register_req(Id) ->
+    #{info => #{agent_id => Id, hostname => <<"host">>, plugins => [#{name => <<"svc">>}]},
+      enrollment_token => <<"enroll-", Id/binary>>}.
+
 
 notify(AgentId, SessionId, Event) ->
     yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, Event, <<"203.0.113.9">>,

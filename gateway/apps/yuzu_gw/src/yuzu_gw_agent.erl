@@ -835,7 +835,11 @@ code_change(_OldVsn, State, #data{pending = Pending} = Data, _Extra) ->
                            (_CmdId, Entry) ->
                                 Entry
                         end, Pending),
-    {ok, State, Data#data{pending = Pending2}}.
+    {ok, State, Data#data{pending = Pending2}};
+code_change(_OldVsn, State, Data, _Extra) ->
+    %% Anything else (a restarted owner's {recover, Key, Predecessor} before its
+    %% first event) is kept as it is: an upgrade must not crash the owner.
+    {ok, State, Data}.
 
 %% What OTP prints for this process in a terminate or crash report and in
 %% sys:get_status/1: the data without the stored RegisterRequest, which holds
