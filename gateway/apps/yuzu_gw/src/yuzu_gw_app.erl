@@ -13,6 +13,10 @@
 
 -export([start/2, prep_stop/1, stop/1]).
 
+%% The pid of the Prometheus endpoint's inets httpd service, from start to
+%% stop (stop_metrics_httpd/0).
+-define(METRICS_HTTPD, {?MODULE, metrics_httpd}).
+
 %% The planned stop's budget (prep_stop/1): shutdown_flush_budget_ms.
 -define(DEFAULT_FLUSH_BUDGET_MS, 20000).
 -define(MAX_FLUSH_BUDGET_MS, 600000).
@@ -121,7 +125,8 @@ do_start_services() ->
     %% Start Prometheus HTTP exporter for /metrics endpoint.
     Port = application:get_env(yuzu_gw, prometheus_port, 9568),
     application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
-    {ok, _} = prometheus_httpd:start(),
+    {ok, Httpd} = prometheus_httpd:start(),
+    persistent_term:put(?METRICS_HTTPD, Httpd),
     logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
     logger:info("Heartbeat admission is connection-bound: a heartbeat is "
                 "admitted only on the connection that opened its session"),
@@ -137,6 +142,7 @@ do_start_services() ->
         {ok, _} = Started -> Started;
         Other             -> ok = yuzu_gw_conn_watch:remove(),
                              ok = yuzu_gw_crash_redact:remove(),
+                             ok = stop_metrics_httpd(),
                              Other
     end.
 
@@ -295,12 +301,37 @@ prep_stop(State) ->
 
 stop(_State) ->
     %% The supervision tree is already down: the drain happened in prep_stop/1.
+    %% The metrics endpoint served until now; it is stopped here, before the
+    %% application master kills what is left of the application (see
+    %% stop_metrics_httpd/0).
+    ok = stop_metrics_httpd(),
     %% The filter outlives the supervision tree, so the upstream's shutdown
     %% reports are redacted too.
     ok = yuzu_gw_crash_redact:remove(),
     ok = yuzu_gw_conn_watch:remove(),
     logger:info("Gateway shutdown complete"),
     ok.
+
+%% Stop the Prometheus endpoint (an inets httpd service, outside the
+%% supervision tree). It must stop before this application does: inets keeps the
+%% service under its own supervisor, but its listen-socket owner is a plain
+%% process spawned by prometheus_httpd:start/0's caller, which is this
+%% application's start, so it carries this application's group leader. On a stop
+%% the application master kills every such process; the service's acceptor,
+%% linked to the owner, was killed with it, and every restart of the acceptor
+%% failed to link to the dead owner (noproc): about 20 crash reports and as many
+%% supervisor reports at every stop, until inets gave the service up. Stopped
+%% here, the acceptor ends with `shutdown' and the owner, which traps exits,
+%% ends with it. A failure to stop it is ignored: the stop goes on.
+stop_metrics_httpd() ->
+    case persistent_term:get(?METRICS_HTTPD, undefined) of
+        undefined ->
+            ok;
+        Pid ->
+            _ = persistent_term:erase(?METRICS_HTTPD),
+            _ = (catch inets:stop(httpd, Pid)),
+            ok
+    end.
 
 %% Run Fun, turning an exit or error into `skipped': a step of a stop whose
 %% process is gone is skipped, not fatal (an exception here would stop the

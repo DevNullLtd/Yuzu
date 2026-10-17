@@ -18,6 +18,9 @@
 
 -export([start/1, stop/0, report/0, reset_hwm/0, sched_mark/0, sched_report/0,
          memory/0, mailboxes/0, singletons/0, footprint/1]).
+%% Crash and supervisor reports logged in this node (planned_stop counts them).
+-export([count_crash_reports/0, crash_reports/0]).
+-export([log/2]).  %% logger handler callback
 -export([init/1]).
 
 -define(NAME, yuzu_gw_scale_probe).
@@ -30,6 +33,29 @@ singletons() ->
      yuzu_gw_agent_sup, yuzu_gw_sup,
      yuzu_gw_heartbeat_buffer, yuzu_gw_upstream_pressure, yuzu_gw, default_channel,
      yuzu_gw_gauge, yuzu_gw_health, logger].
+
+%% @doc Count, from now on, every crash report (a process that died with an
+%% exception, proc_lib) and every supervisor report (a child that died or
+%% failed to start) logged in this node; read with crash_reports/0. A logger
+%% handler with a counter of its own, so it outlives any process.
+-spec count_crash_reports() -> ok.
+count_crash_reports() ->
+    C = counters:new(1, [write_concurrency]),
+    persistent_term:put({?MODULE, crash_reports}, C),
+    _ = logger:remove_handler(yuzu_gw_scale_crash_count),
+    ok = logger:add_handler(yuzu_gw_scale_crash_count, ?MODULE,
+                            #{level => error, config => #{counter => C}}).
+
+-spec crash_reports() -> non_neg_integer().
+crash_reports() ->
+    counters:get(persistent_term:get({?MODULE, crash_reports}), 1).
+
+log(#{msg := {report, #{label := {proc_lib, crash}}}}, #{config := #{counter := C}}) ->
+    counters:add(C, 1, 1);
+log(#{msg := {report, #{label := {supervisor, _}}}}, #{config := #{counter := C}}) ->
+    counters:add(C, 1, 1);
+log(_Event, _Config) ->
+    ok.
 
 -spec start(pos_integer()) -> ok.
 start(IntervalMs) ->

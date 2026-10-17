@@ -13,3 +13,7 @@
   The scale suite gains an `upstream_conn_loss` case: at 5,000 agents the server
   got 5,500 replayed registrations and 5,500 repeated `CONNECTED` notices before,
   none after.
+- **A planned gateway stop no longer logs crash reports.** The Prometheus
+  endpoint is stopped at the end of the stop instead of being killed by the
+  application master's clean-up, which made its inets acceptor fail to restart
+  about 20 times (67 crash and supervisor reports at 500 agents, now none).

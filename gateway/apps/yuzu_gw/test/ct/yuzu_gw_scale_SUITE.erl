@@ -347,6 +347,7 @@ planned_stop(Config) ->
     PreProbe = probe_report(Config),
     _ = mark(Config),
     #{peer := GwPeer} = ?config(gw, Config),
+    ok = ?PEER:call(GwPeer, ?PROBE, count_crash_reports, []),
     T0 = erlang:system_time(millisecond),
     StopResult = ?PEER:call(GwPeer, application, stop, [yuzu_gw], 600000),
     StopMs = erlang:system_time(millisecond) - T0,
@@ -355,6 +356,7 @@ planned_stop(Config) ->
     StopSched = probe_call(Config, sched_report, []),
     %% Anything still on its way when stop returned has had 2 s to land.
     timer:sleep(2000),
+    CrashReports = ?PEER:call(GwPeer, ?PROBE, crash_reports, []),
     Notices = up_call(Config, notices, []),
     Set = sets:from_list(Sessions, [{version, 2}]),
     Received = sets:size(sets:from_list([S || {_, S, disconnected, _} <- Notices,
@@ -365,6 +367,7 @@ planned_stop(Config) ->
           sessions => length(Sessions),
           disconnected_received => Received,
           disconnected_lost => length(Sessions) - Received,
+          crash_reports_during_stop => CrashReports,
           gateway => #{probe_before_stop => PreProbe, probe_during_stop => StopProbe,
                        scheduler_during_stop => StopSched}},
     finish(planned_stop, Config, R).
@@ -481,7 +484,9 @@ invariants(gateway_crash, R) ->
          "the server holds a CONNECTED notice for every live session")];
 invariants(planned_stop, R) ->
     [inv(no_lost_disconnected, maps:get(disconnected_lost, R) =:= 0,
-         "the server received a DISCONNECTED notice for every session on a planned stop")];
+         "the server received a DISCONNECTED notice for every session on a planned stop"),
+     inv(no_crash_reports_on_stop, maps:get(crash_reports_during_stop, R) =:= 0,
+         "the gateway node logged no crash or supervisor report during the planned stop")];
 invariants(upstream_conn_loss, R) ->
     #{register := Reg, convergence := Conv} = R,
     [inv(connection_closed, maps:get(connections_closed, R) >= 1,

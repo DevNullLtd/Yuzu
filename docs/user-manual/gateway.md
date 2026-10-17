@@ -3984,6 +3984,14 @@ stop`, `systemctl stop`) tells the server about every session the gateway gives 
    flush deadline`); a failed send is not retried. Later notifications are
    counted, not sent.
 
+The `/metrics` endpoint keeps answering through the drain and the shutdown of
+the processes, and is stopped last (`yuzu_gw_app:stop/1`). Before #5695 it was
+left to the application master's final clean-up, which killed the process that
+owns its listening socket under it, and every stop logged about 20 crash
+reports and as many supervisor reports from the inets `httpd_acceptor`
+(`noproc` on `link`); the scale suite's `planned_stop` case counted 67 at 500
+agents, and counts 0 now (it fails on any).
+
 Measured with a mocked server: 100 sessions, 100 `DISCONNECTED` notices delivered
 before `application:stop/1` returned (0 before #5695: the drain ran after the
 processes were gone); with a server that never answers, the stop returned 1.5 s

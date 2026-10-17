@@ -130,7 +130,7 @@ Each case also checks invariants that involve no timing:
 | `ramp`, `storm` | every first `Register` succeeds; every agent registers within the budget; more than one `ProxyRegister` is in flight at the server at some point; no `ProxyRegister` creates a session at the server for an attempt that failed ("wasted" above); the server holds a `CONNECTED` for every live session; every singleton mailbox is back to 0 |
 | `server_crash` | every held session is replayed; more than one replay is in flight at some point; every `DISCONNECTED` raised during the outage reaches the server; the new server holds a `CONNECTED` for every live session |
 | `gateway_crash` | every agent registers again; no `Register` to the new gateway fails; the server holds a `CONNECTED` for every live session |
-| `planned_stop` | the server receives a `DISCONNECTED` for every session |
+| `planned_stop` | the server receives a `DISCONNECTED` for every session; the gateway node logs no crash or supervisor report during the stop |
 | `fanout` | every command is answered; the management connection is never closed; no agent loses its session |
 | `upstream_conn_loss` | the server closed at least one connection; the circuit breaker never opened; no registration was replayed; at most 10 sessions got a second `CONNECTED` (the notifications in flight when the connection went are sent again, their answers were lost with it); every agent registers within the budget; the server holds a `CONNECTED` for every live session |
 
@@ -355,3 +355,15 @@ calls were on the closed connection retry by their own rule (2 s), which is the
 2.3 s. A real server restart still replays everyone: `server_crash` after the
 change replayed all 450 held sessions in 6.8 s at 500 agents and all 4,500 in
 13.2 s at 5,000 (13.3 s before it), 24 in flight, no `DISCONNECTED` lost.
+
+## Crash reports on a planned stop
+
+A planned stop logged about 20 crash reports from the inets `httpd_acceptor`
+behind the Prometheus endpoint (`noproc` on `link`), each with a supervisor
+report. It predates PR #5695 (`yuzu_gw_app` starts the endpoint the same way on
+`dev`): the application master killed the endpoint's listen-socket owner, which
+carries the gateway application's group leader, and the acceptor's restarts
+could not link to it. The `planned_stop` case now counts crash and supervisor
+reports logged in the gateway node during the stop and fails on any: 67 at 500
+agents before the fix (the endpoint is now stopped in `yuzu_gw_app:stop/1`), 0
+after.
