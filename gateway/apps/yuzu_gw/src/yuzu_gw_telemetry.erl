@@ -11,6 +11,7 @@
 -module(yuzu_gw_telemetry).
 
 -export([setup/0, handle_event/4]).
+-export([metric_specs/0, declared_metrics/0]).
 -export([mgmt_auth_reject_reasons/0, heartbeat_reject_reasons/0,
          origin_ignored_labels/0, dropped_data_reasons/0,
          upstream_dropped_rpcs/0]).
@@ -615,43 +616,514 @@ dropped_data_reasons() ->
 %% answers a bare inets HTTP 500 for the whole registry, not just the one
 %% metric. yuzu_gw_telemetry_tests:metrics_scrape_renders_test_/0 renders the
 %% real registry through the real formatter to catch this.
+%%
+%% @doc Every metric the gateway declares, as {Type, Spec}: the single list
+%% declare_metrics/0 declares and declared_metrics/0 names. A metric declared
+%% anywhere else is not one of the gateway's.
+-spec metric_specs() -> [{counter | gauge | histogram, list()}].
+metric_specs() ->
+    Buckets = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 10000],
+    [
+        %% Counters
+        {counter, [
+            {name, yuzu_gw_agents_connected_total},
+            {labels, [node]},
+            {help, "Total agent connections accepted"}]},
+        {counter, [
+            {name, yuzu_gw_agents_disconnected_total},
+            {labels, [node]},
+            {help, "Total agent disconnections"}]},
+        {counter, [
+            {name, yuzu_gw_commands_dispatched_total},
+            {labels, [plugin]},
+            {help, "Total commands dispatched to agents"}]},
+        {counter, [
+            {name, yuzu_gw_commands_timed_out_total},
+            {labels, []},
+            {help, "Total commands that timed out"}]},
+        {counter, [
+            {name, yuzu_gw_commands_dropped_backpressure_total},
+            {labels, []},
+            {help, "Total commands dropped due to backpressure"}]},
+        {counter, [
+            {name, yuzu_gw_stream_write_errors_total},
+            {labels, []},
+            {help, "Total gRPC stream write errors"}]},
+        {counter, [
+            {name, yuzu_gw_upstream_rpc_errors_total},
+            {labels, [rpc_name, code]},
+            {help, "Upstream RPC errors by method and status code. code is a gRPC "
+                   "status (a binary digit string), a transport error reason, "
+                   "exception (an exception out of the client or transport) or "
+                   "encode (the request could not be encoded in this gateway, so it "
+                   "never left it; the breaker is not touched). encode and exception "
+                   "are pre-seeded at 0 for each RPC name that can emit them; a "
+                   "sustained encode increase is a systematic local fault that "
+                   "leaves the breaker closed and /readyz ready"}]},
+        {counter, [
+            {name, yuzu_gw_register_refused_total},
+            {labels, [reason]},
+            {help, "Registers the gateway edge refused itself before any upstream "
+                   "call (the agent id is empty, missing, not a binary or longer "
+                   "than 256 bytes), answered INVALID_ARGUMENT. The label reason has "
+                   "the closed set agent_id_length, plus unknown for any other value, "
+                   "which the gateway does not emit today. These refusals never "
+                   "reach the circuit breaker or yuzu_gw_upstream_rpc_errors_total."}]},
+        {counter, [
+            {name, yuzu_gw_upstream_tls_handshake_failures_total},
+            {labels, [rpc_name, kind]},
+            {help, "Upstream TLS handshake failures (cert expiry / CA rotation / "
+                   "wrong-SAN / unreadable cert) - distinct from a generic RPC error "
+                   "so a broken gateway cert is not mistaken for 'server down'"}]},
+        {counter, [
+            {name, yuzu_gw_upstream_circuit_transitions_total},
+            {labels, [state]},
+            {help, "Circuit breaker state transitions (closed, open, half_open)"}]},
+        {counter, [
+            {name, yuzu_gw_cluster_events_total},
+            {labels, [event, node]},
+            {help, "Cluster membership events"}]},
+        {counter, [
+            {name, yuzu_gw_cluster_rebalanced_agents_total},
+            {labels, []},
+            {help, "Total agents moved during rebalancing"}]},
+        {counter, [
+            {name, yuzu_gw_cluster_connect_failures_total},
+            {labels, []},
+            {help, "Total net_kernel:connect_node/1 failures from the cluster "
+                   "discovery redial loop (#4555) - a sustained non-zero rate "
+                   "alongside a resolved/connected gap most often means a "
+                   "distribution-cookie mismatch across replicas"}]},
+        {counter, [
+            {name, yuzu_gw_cluster_address_cap_exceeded_total},
+            {labels, []},
+            {help, "Total times the cluster discovery redial loop's lifetime "
+                   "distinct-address cap (1024) refused to atomize a "
+                   "never-before-seen address (#4555 review round 2) - any "
+                   "non-zero value means the seed DNS name is returning an "
+                   "unexpectedly large or rotating/hostile answer set and "
+                   "should be investigated immediately, not just noted"}]},
+        {counter, [
+            {name, yuzu_gw_registration_replay_total},
+            {labels, []},
+            {help, "Total registration replay attempts by the drip, any outcome"}]},
+        {counter, [
+            {name, yuzu_gw_upstream_notify_dropped_total},
+            {labels, [reason]},
+            {help, "Stream-status (CONNECTED/DISCONNECTED) notifications lost at "
+                   "admission because the pending store was at its cap: a new key is "
+                   "admitted only while the held keys plus the key of a half_open "
+                   "probe in flight stay below notify_pending_max. The label reason "
+                   "has the closed set "
+                   "at_capacity, plus unknown for any other value, which the "
+                   "gateway does not emit today (the circuit_open value is no longer "
+                   "emitted: a notification arriving while the breaker is not closed "
+                   "is held). It does not count delivery loss after admission (worker failure, "
+                   "gateway shutdown). A sustained non-zero rate means agents are "
+                   "converging their gateway_node placement slower than expected, or "
+                   "not at all, during a connect burst or recovery replay."}]},
+        {counter, [
+            {name, yuzu_gw_upstream_notify_coalesced_total},
+            {labels, []},
+            {help, "Held stream-status notifications replaced by a newer event for "
+                   "the same agent session and stream home, or a failed probe "
+                   "notification superseded by one"}]},
+        {counter, [
+            {name, yuzu_gw_guardian_forward_accepted_total},
+            {labels, []},
+            {help, "Guardian drift-event forwards accepted for upstream delivery "
+                   "(denominator for the forward drop-rate)"}]},
+        {counter, [
+            {name, yuzu_gw_guardian_forward_dropped_total},
+            {labels, [reason]},
+            {help, "Guardian drift-event forwards dropped before delivery "
+                   "(reason: circuit_open | at_capacity). Best-effort; durable "
+                   "buffering is Guardian A3."}]},
+        {counter, [
+            {name, yuzu_gw_mgmt_auth_rejected_total},
+            {labels, [reason]},
+            {help, "Mgmt-plane (:50063) peers rejected by the #1422 SPKI peer pin, "
+                   "by reason atom (closed set; no certificate contents). Sustained "
+                   "non-zero = probing by a CA-cert holder, or a misrotated pin "
+                   "killing server command forwarding"}]},
+        {counter, [
+            {name, yuzu_gw_heartbeat_rejected_total},
+            {labels, [reason]},
+            {help, "Agent Heartbeat calls rejected before queueing because no "
+                   "usable session binding exists, by reason (closed set: "
+                   "unknown_session = not held by this node, no_connection = "
+                   "no connection key to compare, registry_unavailable = the "
+                   "session index does not exist). The agent re-registers on the "
+                   "NOT_FOUND answer when its build includes the reconnect fix "
+                   "(see the gateway manual); older agents only log it. A held "
+                   "session whose heartbeat arrived on "
+                   "a different connection is counted in "
+                   "yuzu_gw_heartbeat_session_mismatch_total instead"}]},
+        {counter, [
+            {name, yuzu_gw_heartbeat_session_mismatch_total},
+            {labels, [event]},
+            {help, "Agent Heartbeat calls rejected because the session is held by "
+                   "this node but the call arrived on a different connection than "
+                   "the one that opened it. Also rises when an HTTP/2 proxy "
+                   "between agents and the gateway spreads one agent's calls over "
+                   "several connections. A rise of one per affected agent is "
+                   "expected when an agent's connection is replaced while its "
+                   "session is still held (observed with an injected GOAWAY, a "
+                   "test-only trigger; not observed with an abrupt close or a "
+                   "gateway restart). "
+                   "Carries event=security for SIEM routing"}]},
+        {counter, [
+            {name, yuzu_gw_grpc_origin_ignored_total},
+            {labels, [mode, reason]},
+            {help, "gRPC calls on a listener configured as behind a proxy whose "
+                   "claimed client address was not used, by origin mode "
+                   "(proxy_protocol, forwarded_for) and reason (untrusted_source = "
+                   "the TCP peer is not one of the listener's trusted proxies, so "
+                   "the claim was ignored and the call attributed to the peer; "
+                   "no_claim = a trusted proxy sent no claim on the call, such as a "
+                   "PROXY LOCAL header or no x-forwarded-for header; bad_claim = the "
+                   "claim is not a bare IP address, is over 64 bytes, or has fewer "
+                   "than trusted_hops + 1 entries; for these two the call carries no "
+                   "observed address). Calls are served either way. "
+                   "A steady untrusted_source rate means the listener is reachable "
+                   "without going through the proxy"}]},
+        {counter, [
+            {name, yuzu_gw_grpc_dropped_data_bytes_total},
+            {labels, [reason]},
+            {help, "Request bytes the gRPC layer discarded because the call could "
+                   "not use them, by reason (extra_request_data = a second message "
+                   "on a unary or server-streaming call, stream_ended = DATA that "
+                   "arrived after a status was sent, including on a refused call). "
+                   "The handler is never run for these bytes"}]},
+        {counter, [
+            {name, yuzu_gw_grpc_recv_timeout_total},
+            {labels, []},
+            {help, "Unary or server-streaming streams aborted DEADLINE_EXCEEDED "
+                   "because the peer buffered the request past "
+                   "limits.request_timeout_ms without completing it. A sustained "
+                   "non-zero rate on the agent edge is a peer opening streams and "
+                   "stalling them half-sent"}]},
+        {counter, [
+            {name, yuzu_gw_grpc_connection_killed_total},
+            {labels, [reason]},
+            {help, "Connections the VM killed for passing their per-connection "
+                   "memory ceiling (limits.max_connection_memory_bytes, a "
+                   "max_heap_size on the Cowboy connection process counting shared "
+                   "binaries). reason=max_heap_size. A sustained non-zero rate on "
+                   "the agent edge is a peer flooding half-finished requests"}]},
+        {gauge, [
+            {name, yuzu_gw_memory_shedding_active},
+            {labels, []},
+            {help, "1 while the gateway is shedding load (the agent listener(s) are "
+                   "suspended in Ranch because erlang:memory(total) passed the "
+                   "high-water mark); 0 otherwise. The management listener is never "
+                   "suspended"}]},
+        {counter, [
+            {name, yuzu_gw_memory_shedding_suspensions_total},
+            {labels, []},
+            {help, "Times the gateway began shedding load (suspended its agent "
+                   "listener(s) on crossing the high-water mark). A rising count "
+                   "means the node is repeatedly hitting its memory high-water mark"}]},
+        {counter, [
+            {name, yuzu_gw_upstream_calls_dropped_total},
+            {labels, [rpc_name]},
+            {help, "Proxied upstream calls not sent because the caller's deadline "
+                   "passed while it waited for a permit, or left too little time "
+                   "to make the call, by rpc_name (register, inventory)"}]},
+        {counter, [
+            {name, yuzu_gw_upstream_backpressure_seconds_total},
+            {labels, []},
+            {help, "Seconds during which the path to the server was backed up: at "
+                   "least one lane saturated (a live Register or inventory report "
+                   "waiting for a permit, all 10 stream-status notification slots "
+                   "held, or all 50 Guardian forward slots held). rate() of "
+                   "this is the backpressure duty cycle, 0 to 1. Sampled every "
+                   "100 ms"}]},
+        {counter, [
+            {name, yuzu_gw_upstream_lane_saturated_seconds_total},
+            {labels, [lane]},
+            {help, "Seconds each lane (permits, notify, guardian) was saturated. The "
+                   "lanes overlap: do not add them, use "
+                   "yuzu_gw_upstream_backpressure_seconds_total for the whole"}]},
+        {counter, [
+            {name, yuzu_gw_registration_replay_triggered_total},
+            {labels, [trigger]},
+            {help, "Registration replays started, by trigger (breaker = the upstream "
+                   "recovered from failures, replaying every agent this node holds; "
+                   "heartbeat = the server's heartbeat verdict listed sessions it does "
+                   "not know, replaying only those; notify_loss = a held CONNECTED "
+                   "notification was lost, replaying every agent so each re-sends it)"}]},
+        {counter, [
+            {name, yuzu_gw_heartbeat_unknown_truncated_total},
+            {labels, []},
+            {help, "BatchHeartbeat responses whose list of unknown sessions the "
+                   "server truncated. Sessions beyond the cap may be reported again by "
+                   "later heartbeats"}]},
+        {counter, [
+            {name, yuzu_gw_heartbeat_verdict_dropped_total},
+            {labels, [reason]},
+            {help, "Session ids named by a heartbeat verdict that were not queued "
+                   "for replay, by reason (malformed = not a usable session id, "
+                   "not_local = this node does not hold the session, circuit_open = "
+                   "the upstream circuit breaker is open, queue_full = the replay "
+                   "queue is at its cap, or the upstream process already holds more "
+                   "than 100 unhandled messages so the ids were not handed to it). "
+                   "Ids already queued or replayed within the session guard window "
+                   "are not counted"}]},
+        {counter, [
+            {name, yuzu_gw_heartbeat_buffer_dropped_total},
+            {labels, [reason]},
+            {help, "Heartbeat data the gateway buffer gave up to stay bounded or to "
+                   "keep flushing, by reason (buffer_full = a "
+                   "heartbeat or whole session dropped because the session count or "
+                   "byte cap was reached, snapshot_oversize = one fleet snapshot "
+                   "larger than a request chunk was dropped and the heartbeat kept, "
+                   "snapshot_evicted = the oldest fleet snapshot was dropped to fit "
+                   "the byte cap and the heartbeat kept, heartbeat_oversize = the "
+                   "status tags of a heartbeat that had more than 512 tags or was "
+                   "larger than a request chunk were dropped and the heartbeat kept, "
+                   "heartbeat_invalid = a status tag with invalid UTF-8 was repaired "
+                   "with replacement characters, chunk_rejected = a single heartbeat the "
+                   "server rejected with a non-transient status was dropped)"}]},
+        {counter, [
+            {name, yuzu_gw_heartbeat_coalesced_total},
+            {labels, []},
+            {help, "Heartbeats merged into the already buffered heartbeat of the "
+                   "same session before a flush (the buffer keeps one per session)"}]},
+        {counter, [
+            {name, yuzu_gw_session_limit_rejected_total},
+            {labels, []},
+            {help, "Registrations refused because one connection already holds the "
+                   "configured number of agent sessions"}]},
+        {counter, [
+            {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
+            {labels, []},
+            {help, "Mgmt-plane auth attempts during which >=1 configured "
+                   "mgmt_peer_pins entry failed to resolve (typo'd fingerprint, "
+                   "unreadable cert file) - the pre-staged-rotation-typo signal"}]},
+        %% Histograms
+        {histogram, [
+            {name, yuzu_gw_agent_session_duration_ms},
+            {labels, [node]},
+            {buckets, [1000, 10000, 60000, 300000, 3600000]},
+            {help, "Agent session duration in milliseconds"}]},
+        {histogram, [
+            {name, yuzu_gw_command_duration_ms},
+            {labels, [plugin, status]},
+            {buckets, Buckets},
+            {help, "Command execution duration in milliseconds"}]},
+        {histogram, [
+            {name, yuzu_gw_upstream_rpc_duration_ms},
+            {labels, [rpc_name]},
+            {buckets, Buckets},
+            {help, "Upstream C++ server RPC latency in milliseconds"}]},
+        {histogram, [
+            {name, yuzu_gw_fanout_target_count},
+            {labels, []},
+            {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
+            {help, "Number of agents targeted per command fanout"}]},
+        {histogram, [
+            {name, yuzu_gw_fanout_dispatched_count},
+            {labels, []},
+            {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
+            {help, "Number of agents actually dispatched per fanout"}]},
+        {histogram, [
+            {name, yuzu_gw_fanout_skipped_count},
+            {labels, []},
+            {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
+            {help, "Number of agents skipped (not connected) per fanout"}]},
+        {histogram, [
+            {name, yuzu_gw_fanout_remote_dispatched_count},
+            {labels, []},
+            {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
+            {help, "Number of agents dispatched to a DIFFERENT node than the "
+                   "dispatching one per fanout (HA WS-4 4.3a cross-node routing "
+                   "- counts a cast SEND, not a confirmed delivery; see #4555)"}]},
+
+        %% Gauges
+        {gauge, [
+            {name, yuzu_gw_agents_current},
+            {labels, [node]},
+            {help, "Current number of connected agents"}]},
+        {histogram, [
+            {name, yuzu_gw_stream_queue_len_distribution},
+            {labels, []},
+            {buckets, [10, 100, 500, 1000, 5000]},
+            {help, "Distribution of stream handler mailbox queue lengths at backpressure events"}]},
+        {gauge, [
+            {name, yuzu_gw_beam_process_count},
+            {labels, [node]},
+            {help, "BEAM VM process count"}]},
+        {gauge, [
+            {name, yuzu_gw_beam_memory_bytes},
+            {labels, [node, type]},
+            {help, "BEAM VM memory usage by type"}]},
+        {gauge, [
+            {name, yuzu_gw_beam_scheduler_util},
+            {labels, [node]},
+            {help, "BEAM scheduler utilization (weighted average)"}]},
+        {gauge, [
+            {name, yuzu_gw_upstream_backpressure_duty_cycle},
+            {labels, []},
+            {help, "Share of the last 60 s during which the path to the server was "
+                   "backed up (0 to 1; see yuzu_gw_upstream_backpressure_seconds_total). "
+                   "Reads low for the first minute after a start"}]},
+        {gauge, [
+            {name, yuzu_gw_upstream_slow},
+            {labels, []},
+            {help, "1 when yuzu_gw_upstream_backpressure_duty_cycle is 0.5 or more: "
+                   "the server answered slower than work arrived for at least half of "
+                   "the last minute. 0 otherwise. Not a readiness input"}]},
+        {gauge, [
+            {name, yuzu_gw_registration_replay_queue_depth},
+            {labels, [node]},
+            {help, "Agents still queued for registration replay (0 = idle; "
+                   "a persistently non-zero value indicates a replay storm)"}]},
+        {gauge, [
+            {name, yuzu_gw_upstream_notify_pending},
+            {labels, [node]},
+            {help, "Stream-status notifications held because the in-flight limit is "
+                   "reached or the upstream circuit breaker is not closed; drained "
+                   "first in first out (0 = nothing held). The key of a half_open "
+                   "probe in flight is not counted here, unless a newer "
+                   "notification for the same key has since been held, and the "
+                   "key still counts toward the notify_pending_max cap"}]},
+        {gauge, [
+            {name, yuzu_gw_upstream_notify_inflight},
+            {labels, [node]},
+            {help, "NotifyStreamStatus workers tracked by this gateway process (at "
+                   "most 10)"}]},
+        %% {duration_unit, false} on both _seconds gauges below: the prometheus
+        %% library otherwise reads the suffix as a duration unit and scales every
+        %% value set from native time units (a Unix time would render as about 1.76).
+        {gauge, [
+            {name, yuzu_gw_mgmt_pin_rotated_timestamp_seconds},
+            {labels, []},
+            {duration_unit, false},
+            {help, "Unix time (seconds) at which the management pin watcher last saw a "
+                   "pinned {cert_file, Path} certificate change to a different key; 0 "
+                   "until the first such change in this process. Not set by the first "
+                   "read at start or by a rewrite of the same key"}]},
+        {gauge, [
+            {name, yuzu_gw_cert_expiry_timestamp_seconds},
+            {labels, [role, name]},
+            {duration_unit, false},
+            {help, "notAfter (Unix seconds) of a certificate file the gateway is "
+                   "configured with; for a file holding several certificates, the "
+                   "earliest. role: listener | listener_ca | upstream_client | "
+                   "upstream_ca | mgmt_peer_pin. If the file stops being readable the "
+                   "last value read is kept (see yuzu_gw_cert_file_readable)"}]},
+        {gauge, [
+            {name, yuzu_gw_cert_file_readable},
+            {labels, [role, name]},
+            {help, "1 when the latest read of every certificate file under this role "
+                   "and name parsed as PEM certificates, 0 when a stat, read or parse "
+                   "failed (for mgmt_peer_pin the key last read stays pinned). "
+                   "Checked every mgmt_pin_refresh_ms"}]},
+        {gauge, [
+            {name, yuzu_gw_cluster_peers_resolved},
+            {labels, [node]},
+            {help, "Peer addresses found by the cluster discovery redial loop's "
+                   "most recent tick (#4555) - 0 means the seed name/list "
+                   "resolved nothing, which is expected for a genuinely "
+                   "single-node deployment"}]},
+        {gauge, [
+            {name, yuzu_gw_cluster_peers_connected},
+            {labels, [node]},
+            {help, "Distribution-connected peer nodes (length(nodes())) as of "
+                   "the cluster discovery redial loop's most recent tick "
+                   "(#4555) - compare against peers_resolved to distinguish a "
+                   "wrong seed name (resolved=0) from a partial mesh (resolved "
+                   "> connected > 0, most often a cookie mismatch)"}]},
+
+        %% ── UPSTREAM workstream (#5695) ────────────────────────────────────────
+        %% Proxied-call permits (yuzu_gw_upstream_regulator), registration replay,
+        %% held stream-status notifications. Every series is created at 0 here.
+        {gauge, [
+            {name, yuzu_gw_upstream_permits_held},
+            {labels, [class]},
+            {help, "Upstream call permits held now, by class: register (a live "
+                   "ProxyRegister), replay (a registration replay), inventory (a "
+                   "ProxyInventory). register and replay share one pool"}]},
+        {gauge, [
+            {name, yuzu_gw_upstream_permits_waiting},
+            {labels, [class]},
+            {help, "Callers waiting for an upstream call permit now, by class. Non-zero "
+                   "for register or inventory means every permit of the pool is held"}]},
+        {gauge, [
+            {name, yuzu_gw_upstream_permit_limit},
+            {labels, [class]},
+            {help, "Configured upstream call permits, by class (replay is the most of "
+                   "the register pool a replay may hold)"}]},
+        {counter, [
+            {name, yuzu_gw_upstream_permit_refused_total},
+            {labels, [class, reason]},
+            {help, "Upstream call permits refused, by class and reason: queue_full (the "
+                   "wait queue was full), deadline (the caller's deadline passed first), "
+                   "stopping (planned stop). The agent is told UNAVAILABLE and retries"}]},
+        {histogram, [
+            {name, yuzu_gw_upstream_permit_wait_seconds},
+            {labels, [class]},
+            {duration_unit, false},
+            {buckets, [0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]},
+            {help, "Seconds a granted upstream call permit was waited for, by class"}]},
+        {counter, [
+            {name, yuzu_gw_registration_replay_outcomes_total},
+            {labels, [outcome]},
+            {help, "Registration replay entries by outcome: adopted, superseded, "
+                   "rejected (accepted=false), failed, skipped (gone, re-registered, "
+                   "no stored request, or replayed within the guard window), aborted "
+                   "(dropped when the breaker opened or the registry went away)"}]},
+        {gauge, [
+            {name, yuzu_gw_registration_replay_last_duration_seconds},
+            {labels, []},
+            {duration_unit, false},
+            {help, "Seconds the last finished registration replay took, from its first "
+                   "entry to its last result (0 until one finished)"}]},
+        {counter, [
+            {name, yuzu_gw_upstream_notify_lost_total},
+            {labels, [event, reason]},
+            {help, "Stream-status notifications lost, by event (connected, "
+                   "disconnected) and reason: at_capacity (not admitted, the held store "
+                   "was full), evicted (a held connected notification evicted to admit "
+                   "a disconnected one; a full registration replay re-sends it), "
+                   "rejected (the server answered that the notification itself was "
+                   "wrong, or it could not be encoded), crashed (the send's worker "
+                   "died before it reported), shutdown (still held or in flight when "
+                   "a planned stop's flush ended)"}]},
+        {counter, [
+            {name, yuzu_gw_upstream_notify_requeued_total},
+            {labels, []},
+            {help, "Stream-status notifications whose send failed and that were held "
+                   "again to be retried"}]},
+        {gauge, [
+            {name, yuzu_gw_upstream_notify_pending_hwm},
+            {labels, []},
+            {help, "Most stream-status notifications held at once over the last one to "
+                   "two minutes (kept by the upstream process, so a spike between "
+                   "scrapes is seen)"}]},
+        {gauge, [
+            {name, yuzu_gw_upstream_notify_pending_max},
+            {labels, []},
+            {help, "The held stream-status notification cap in force "
+                   "(notify_pending_max)"}]}
+    ].
+
+%% @doc The names of every metric metric_specs/0 declares.
+-spec declared_metrics() -> [atom()].
+declared_metrics() ->
+    [proplists:get_value(name, Spec) || {_Type, Spec} <- metric_specs()].
+
 declare_metrics() ->
-    %% Counters
-    prometheus_counter:declare([
-        {name, yuzu_gw_agents_connected_total},
-        {labels, [node]},
-        {help, "Total agent connections accepted"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_agents_disconnected_total},
-        {labels, [node]},
-        {help, "Total agent disconnections"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_commands_dispatched_total},
-        {labels, [plugin]},
-        {help, "Total commands dispatched to agents"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_commands_timed_out_total},
-        {labels, []},
-        {help, "Total commands that timed out"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_commands_dropped_backpressure_total},
-        {labels, []},
-        {help, "Total commands dropped due to backpressure"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_stream_write_errors_total},
-        {labels, []},
-        {help, "Total gRPC stream write errors"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_rpc_errors_total},
-        {labels, [rpc_name, code]},
-        {help, "Upstream RPC errors by method and status code. code is a gRPC "
-               "status (a binary digit string), a transport error reason, "
-               "exception (an exception out of the client or transport) or "
-               "encode (the request could not be encoded in this gateway, so it "
-               "never left it; the breaker is not touched). encode and exception "
-               "are pre-seeded at 0 for each RPC name that can emit them; a "
-               "sustained encode increase is a systematic local fault that "
-               "leaves the breaker closed and /readyz ready"}]),
+    [declare(Type, Spec) || {Type, Spec} <- metric_specs()],
+    seed_metrics().
+
+declare(counter, Spec)   -> prometheus_counter:declare(Spec);
+declare(gauge, Spec)     -> prometheus_gauge:declare(Spec);
+declare(histogram, Spec) -> prometheus_histogram:declare(Spec).
+
+%% Series created at start, after every metric is declared.
+seed_metrics() ->
     %% A series that first appears already at 1 is invisible to increase(), so
     %% the two codes a gateway fault produces (no server answer, so no status
     %% code) start at 0. The RPC names are the do_rpc/3 tags of yuzu_gw_upstream
@@ -666,27 +1138,8 @@ declare_metrics() ->
                                          <<"notify_stream">>, <<"guardian">>],
                                    C <- [<<"encode">>, <<"exception">>]]
                         ++ [{<<"batch_heartbeat">>, <<"exception">>}]],
-    prometheus_counter:declare([
-        {name, yuzu_gw_register_refused_total},
-        {labels, [reason]},
-        {help, "Registers the gateway edge refused itself before any upstream "
-               "call (the agent id is empty, missing, not a binary or longer "
-               "than 256 bytes), answered INVALID_ARGUMENT. The label reason has "
-               "the closed set agent_id_length, plus unknown for any other value, "
-               "which the gateway does not emit today. These refusals never "
-               "reach the circuit breaker or yuzu_gw_upstream_rpc_errors_total."}]),
     [prometheus_counter:inc(yuzu_gw_register_refused_total, [R], 0)
      || R <- [<<"agent_id_length">>, <<"unknown">>]],
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_tls_handshake_failures_total},
-        {labels, [rpc_name, kind]},
-        {help, "Upstream TLS handshake failures (cert expiry / CA rotation / "
-               "wrong-SAN / unreadable cert) - distinct from a generic RPC error "
-               "so a broken gateway cert is not mistaken for 'server down'"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_circuit_transitions_total},
-        {labels, [state]},
-        {help, "Circuit breaker state transitions (closed, open, half_open)"}]),
     %% A series that first appears already at 1 is invisible to increase(), so
     %% without these the FIRST open of a gateway process never raised
     %% YuzuGatewayUpstreamCircuitOpened -- and a crash-looping gateway opens
@@ -695,77 +1148,10 @@ declare_metrics() ->
     %% circuit_half_open timer, on_success/1 from half_open).
     [prometheus_counter:inc(yuzu_gw_upstream_circuit_transitions_total, [S], 0)
      || S <- [<<"closed">>, <<"open">>, <<"half_open">>]],
-    prometheus_counter:declare([
-        {name, yuzu_gw_cluster_events_total},
-        {labels, [event, node]},
-        {help, "Cluster membership events"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_cluster_rebalanced_agents_total},
-        {labels, []},
-        {help, "Total agents moved during rebalancing"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_cluster_connect_failures_total},
-        {labels, []},
-        {help, "Total net_kernel:connect_node/1 failures from the cluster "
-               "discovery redial loop (#4555) - a sustained non-zero rate "
-               "alongside a resolved/connected gap most often means a "
-               "distribution-cookie mismatch across replicas"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_cluster_address_cap_exceeded_total},
-        {labels, []},
-        {help, "Total times the cluster discovery redial loop's lifetime "
-               "distinct-address cap (1024) refused to atomize a "
-               "never-before-seen address (#4555 review round 2) - any "
-               "non-zero value means the seed DNS name is returning an "
-               "unexpectedly large or rotating/hostile answer set and "
-               "should be investigated immediately, not just noted"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_registration_replay_total},
-        {labels, []},
-        {help, "Total registration replay attempts by the drip, any outcome"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_notify_dropped_total},
-        {labels, [reason]},
-        {help, "Stream-status (CONNECTED/DISCONNECTED) notifications lost at "
-               "admission because the pending store was at its cap: a new key is "
-               "admitted only while the held keys plus the key of a half_open "
-               "probe in flight stay below notify_pending_max. The label reason "
-               "has the closed set "
-               "at_capacity, plus unknown for any other value, which the "
-               "gateway does not emit today (the circuit_open value is no longer "
-               "emitted: a notification arriving while the breaker is not closed "
-               "is held). It does not count delivery loss after admission (worker failure, "
-               "gateway shutdown). A sustained non-zero rate means agents are "
-               "converging their gateway_node placement slower than expected, or "
-               "not at all, during a connect burst or recovery replay."}]),
     %% A series that first appears already at 1 is invisible to increase().
     [prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total, [R], 0)
      || R <- [<<"at_capacity">>, <<"unknown">>]],
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_notify_coalesced_total},
-        {labels, []},
-        {help, "Held stream-status notifications replaced by a newer event for "
-               "the same agent session and stream home, or a failed probe "
-               "notification superseded by one"}]),
     prometheus_counter:inc(yuzu_gw_upstream_notify_coalesced_total, [], 0),
-    prometheus_counter:declare([
-        {name, yuzu_gw_guardian_forward_accepted_total},
-        {labels, []},
-        {help, "Guardian drift-event forwards accepted for upstream delivery "
-               "(denominator for the forward drop-rate)"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_guardian_forward_dropped_total},
-        {labels, [reason]},
-        {help, "Guardian drift-event forwards dropped before delivery "
-               "(reason: circuit_open | at_capacity). Best-effort; durable "
-               "buffering is Guardian A3."}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_mgmt_auth_rejected_total},
-        {labels, [reason]},
-        {help, "Mgmt-plane (:50063) peers rejected by the #1422 SPKI peer pin, "
-               "by reason atom (closed set; no certificate contents). Sustained "
-               "non-zero = probing by a CA-cert holder, or a misrotated pin "
-               "killing server command forwarding"}]),
     %% Create every rejection-reason series at 0 now. A series that first
     %% appears already at 1 is invisible to increase(), so without this the
     %% FIRST rejection per reason (after the first scrape) never raised the
@@ -774,32 +1160,6 @@ declare_metrics() ->
     [prometheus_counter:inc(yuzu_gw_mgmt_auth_rejected_total,
                             [atom_to_binary(R, utf8)], 0)
      || R <- mgmt_auth_reject_reasons()],
-    prometheus_counter:declare([
-        {name, yuzu_gw_heartbeat_rejected_total},
-        {labels, [reason]},
-        {help, "Agent Heartbeat calls rejected before queueing because no "
-               "usable session binding exists, by reason (closed set: "
-               "unknown_session = not held by this node, no_connection = "
-               "no connection key to compare, registry_unavailable = the "
-               "session index does not exist). The agent re-registers on the "
-               "NOT_FOUND answer when its build includes the reconnect fix "
-               "(see the gateway manual); older agents only log it. A held "
-               "session whose heartbeat arrived on "
-               "a different connection is counted in "
-               "yuzu_gw_heartbeat_session_mismatch_total instead"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_heartbeat_session_mismatch_total},
-        {labels, [event]},
-        {help, "Agent Heartbeat calls rejected because the session is held by "
-               "this node but the call arrived on a different connection than "
-               "the one that opened it. Also rises when an HTTP/2 proxy "
-               "between agents and the gateway spreads one agent's calls over "
-               "several connections. A rise of one per affected agent is "
-               "expected when an agent's connection is replaced while its "
-               "session is still held (observed with an injected GOAWAY, a "
-               "test-only trigger; not observed with an abrupt close or a "
-               "gateway restart). "
-               "Carries event=security for SIEM routing"}]),
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
     [prometheus_counter:inc(yuzu_gw_heartbeat_rejected_total,
@@ -807,380 +1167,43 @@ declare_metrics() ->
      || R <- heartbeat_reject_reasons()],
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
                            [<<"security">>], 0),
-    prometheus_counter:declare([
-        {name, yuzu_gw_grpc_origin_ignored_total},
-        {labels, [mode, reason]},
-        {help, "gRPC calls on a listener configured as behind a proxy whose "
-               "claimed client address was not used, by origin mode "
-               "(proxy_protocol, forwarded_for) and reason (untrusted_source = "
-               "the TCP peer is not one of the listener's trusted proxies, so "
-               "the claim was ignored and the call attributed to the peer; "
-               "no_claim = a trusted proxy sent no claim on the call, such as a "
-               "PROXY LOCAL header or no x-forwarded-for header; bad_claim = the "
-               "claim is not a bare IP address, is over 64 bytes, or has fewer "
-               "than trusted_hops + 1 entries; for these two the call carries no "
-               "observed address). Calls are served either way. "
-               "A steady untrusted_source rate means the listener is reachable "
-               "without going through the proxy"}]),
     [prometheus_counter:inc(yuzu_gw_grpc_origin_ignored_total,
                             [atom_to_binary(M, utf8), atom_to_binary(R, utf8)], 0)
      || {M, R} <- origin_ignored_labels()],
-    prometheus_counter:declare([
-        {name, yuzu_gw_grpc_dropped_data_bytes_total},
-        {labels, [reason]},
-        {help, "Request bytes the gRPC layer discarded because the call could "
-               "not use them, by reason (extra_request_data = a second message "
-               "on a unary or server-streaming call, stream_ended = DATA that "
-               "arrived after a status was sent, including on a refused call). "
-               "The handler is never run for these bytes"}]),
     [prometheus_counter:inc(yuzu_gw_grpc_dropped_data_bytes_total,
                             [atom_to_binary(R, utf8)], 0)
      || R <- dropped_data_reasons()],
-    prometheus_counter:declare([
-        {name, yuzu_gw_grpc_recv_timeout_total},
-        {labels, []},
-        {help, "Unary or server-streaming streams aborted DEADLINE_EXCEEDED "
-               "because the peer buffered the request past "
-               "limits.request_timeout_ms without completing it. A sustained "
-               "non-zero rate on the agent edge is a peer opening streams and "
-               "stalling them half-sent"}]),
     prometheus_counter:inc(yuzu_gw_grpc_recv_timeout_total, [], 0),
-    prometheus_counter:declare([
-        {name, yuzu_gw_grpc_connection_killed_total},
-        {labels, [reason]},
-        {help, "Connections the VM killed for passing their per-connection "
-               "memory ceiling (limits.max_connection_memory_bytes, a "
-               "max_heap_size on the Cowboy connection process counting shared "
-               "binaries). reason=max_heap_size. A sustained non-zero rate on "
-               "the agent edge is a peer flooding half-finished requests"}]),
     prometheus_counter:inc(yuzu_gw_grpc_connection_killed_total, [<<"max_heap_size">>], 0),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_memory_shedding_active},
-        {labels, []},
-        {help, "1 while the gateway is shedding load (the agent listener(s) are "
-               "suspended in Ranch because erlang:memory(total) passed the "
-               "high-water mark); 0 otherwise. The management listener is never "
-               "suspended"}]),
     prometheus_gauge:set(yuzu_gw_memory_shedding_active, [], 0),
-    prometheus_counter:declare([
-        {name, yuzu_gw_memory_shedding_suspensions_total},
-        {labels, []},
-        {help, "Times the gateway began shedding load (suspended its agent "
-               "listener(s) on crossing the high-water mark). A rising count "
-               "means the node is repeatedly hitting its memory high-water mark"}]),
     prometheus_counter:inc(yuzu_gw_memory_shedding_suspensions_total, [], 0),
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_calls_dropped_total},
-        {labels, [rpc_name]},
-        {help, "Proxied upstream calls not sent because the caller's deadline "
-               "passed while it waited for a permit, or left too little time "
-               "to make the call, by rpc_name (register, inventory)"}]),
     [prometheus_counter:inc(yuzu_gw_upstream_calls_dropped_total,
                             [atom_to_binary(R, utf8)], 0)
      || R <- upstream_dropped_rpcs()],
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_backpressure_seconds_total},
-        {labels, []},
-        {help, "Seconds during which the path to the server was backed up: at "
-               "least one lane saturated (a live Register or inventory report "
-               "waiting for a permit, all 10 stream-status notification slots "
-               "held, or all 50 Guardian forward slots held). rate() of "
-               "this is the backpressure duty cycle, 0 to 1. Sampled every "
-               "100 ms"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_lane_saturated_seconds_total},
-        {labels, [lane]},
-        {help, "Seconds each lane (permits, notify, guardian) was saturated. The "
-               "lanes overlap: do not add them, use "
-               "yuzu_gw_upstream_backpressure_seconds_total for the whole"}]),
     [prometheus_counter:inc(yuzu_gw_upstream_lane_saturated_seconds_total,
                             [atom_to_binary(L, utf8)], 0)
      || L <- yuzu_gw_upstream_pressure:lanes()],
     prometheus_counter:inc(yuzu_gw_upstream_backpressure_seconds_total, [], 0),
-    prometheus_counter:declare([
-        {name, yuzu_gw_registration_replay_triggered_total},
-        {labels, [trigger]},
-        {help, "Registration replays started, by trigger (breaker = the upstream "
-               "recovered from failures, replaying every agent this node holds; "
-               "heartbeat = the server's heartbeat verdict listed sessions it does "
-               "not know, replaying only those; notify_loss = a held CONNECTED "
-               "notification was lost, replaying every agent so each re-sends it)"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_heartbeat_unknown_truncated_total},
-        {labels, []},
-        {help, "BatchHeartbeat responses whose list of unknown sessions the "
-               "server truncated. Sessions beyond the cap may be reported again by "
-               "later heartbeats"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_heartbeat_verdict_dropped_total},
-        {labels, [reason]},
-        {help, "Session ids named by a heartbeat verdict that were not queued "
-               "for replay, by reason (malformed = not a usable session id, "
-               "not_local = this node does not hold the session, circuit_open = "
-               "the upstream circuit breaker is open, queue_full = the replay "
-               "queue is at its cap, or the upstream process already holds more "
-               "than 100 unhandled messages so the ids were not handed to it). "
-               "Ids already queued or replayed within the session guard window "
-               "are not counted"}]),
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
     [prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total, [T], 0)
      || T <- [<<"breaker">>, <<"heartbeat">>, <<"notify_loss">>]],
     [prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total, [R], 0)
      || R <- [<<"malformed">>, <<"not_local">>, <<"circuit_open">>, <<"queue_full">>]],
-    prometheus_counter:declare([
-        {name, yuzu_gw_heartbeat_buffer_dropped_total},
-        {labels, [reason]},
-        {help, "Heartbeat data the gateway buffer gave up to stay bounded or to "
-               "keep flushing, by reason (buffer_full = a "
-               "heartbeat or whole session dropped because the session count or "
-               "byte cap was reached, snapshot_oversize = one fleet snapshot "
-               "larger than a request chunk was dropped and the heartbeat kept, "
-               "snapshot_evicted = the oldest fleet snapshot was dropped to fit "
-               "the byte cap and the heartbeat kept, heartbeat_oversize = the "
-               "status tags of a heartbeat that had more than 512 tags or was "
-               "larger than a request chunk were dropped and the heartbeat kept, "
-               "heartbeat_invalid = a status tag with invalid UTF-8 was repaired "
-               "with replacement characters, chunk_rejected = a single heartbeat the "
-               "server rejected with a non-transient status was dropped)"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_heartbeat_coalesced_total},
-        {labels, []},
-        {help, "Heartbeats merged into the already buffered heartbeat of the "
-               "same session before a flush (the buffer keeps one per session)"}]),
     [prometheus_counter:inc(yuzu_gw_heartbeat_buffer_dropped_total, [R], 0)
      || R <- [<<"buffer_full">>, <<"snapshot_oversize">>, <<"snapshot_evicted">>,
               <<"heartbeat_oversize">>, <<"heartbeat_invalid">>,
               <<"chunk_rejected">>]],
     prometheus_counter:inc(yuzu_gw_heartbeat_coalesced_total, [], 0),
-    prometheus_counter:declare([
-        {name, yuzu_gw_session_limit_rejected_total},
-        {labels, []},
-        {help, "Registrations refused because one connection already holds the "
-               "configured number of agent sessions"}]),
     prometheus_counter:inc(yuzu_gw_session_limit_rejected_total, [], 0),
-    prometheus_counter:declare([
-        {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
-        {labels, []},
-        {help, "Mgmt-plane auth attempts during which >=1 configured "
-               "mgmt_peer_pins entry failed to resolve (typo'd fingerprint, "
-               "unreadable cert file) - the pre-staged-rotation-typo signal"}]),
-
-    %% Histograms
-    Buckets = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 10000],
-    prometheus_histogram:declare([
-        {name, yuzu_gw_agent_session_duration_ms},
-        {labels, [node]},
-        {buckets, [1000, 10000, 60000, 300000, 3600000]},
-        {help, "Agent session duration in milliseconds"}]),
-    prometheus_histogram:declare([
-        {name, yuzu_gw_command_duration_ms},
-        {labels, [plugin, status]},
-        {buckets, Buckets},
-        {help, "Command execution duration in milliseconds"}]),
-    prometheus_histogram:declare([
-        {name, yuzu_gw_upstream_rpc_duration_ms},
-        {labels, [rpc_name]},
-        {buckets, Buckets},
-        {help, "Upstream C++ server RPC latency in milliseconds"}]),
-    prometheus_histogram:declare([
-        {name, yuzu_gw_fanout_target_count},
-        {labels, []},
-        {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
-        {help, "Number of agents targeted per command fanout"}]),
-    prometheus_histogram:declare([
-        {name, yuzu_gw_fanout_dispatched_count},
-        {labels, []},
-        {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
-        {help, "Number of agents actually dispatched per fanout"}]),
-    prometheus_histogram:declare([
-        {name, yuzu_gw_fanout_skipped_count},
-        {labels, []},
-        {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
-        {help, "Number of agents skipped (not connected) per fanout"}]),
-    prometheus_histogram:declare([
-        {name, yuzu_gw_fanout_remote_dispatched_count},
-        {labels, []},
-        {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
-        {help, "Number of agents dispatched to a DIFFERENT node than the "
-               "dispatching one per fanout (HA WS-4 4.3a cross-node routing "
-               "- counts a cast SEND, not a confirmed delivery; see #4555)"}]),
-
-    %% Gauges
-    prometheus_gauge:declare([
-        {name, yuzu_gw_agents_current},
-        {labels, [node]},
-        {help, "Current number of connected agents"}]),
-    prometheus_histogram:declare([
-        {name, yuzu_gw_stream_queue_len_distribution},
-        {labels, []},
-        {buckets, [10, 100, 500, 1000, 5000]},
-        {help, "Distribution of stream handler mailbox queue lengths at backpressure events"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_beam_process_count},
-        {labels, [node]},
-        {help, "BEAM VM process count"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_beam_memory_bytes},
-        {labels, [node, type]},
-        {help, "BEAM VM memory usage by type"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_beam_scheduler_util},
-        {labels, [node]},
-        {help, "BEAM scheduler utilization (weighted average)"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_upstream_backpressure_duty_cycle},
-        {labels, []},
-        {help, "Share of the last 60 s during which the path to the server was "
-               "backed up (0 to 1; see yuzu_gw_upstream_backpressure_seconds_total). "
-               "Reads low for the first minute after a start"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_upstream_slow},
-        {labels, []},
-        {help, "1 when yuzu_gw_upstream_backpressure_duty_cycle is 0.5 or more: "
-               "the server answered slower than work arrived for at least half of "
-               "the last minute. 0 otherwise. Not a readiness input"}]),
     %% Present from the first scrape, before the sampler's first event.
     prometheus_gauge:set(yuzu_gw_upstream_backpressure_duty_cycle, [], 0.0),
     prometheus_gauge:set(yuzu_gw_upstream_slow, [], 0),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_registration_replay_queue_depth},
-        {labels, [node]},
-        {help, "Agents still queued for registration replay (0 = idle; "
-               "a persistently non-zero value indicates a replay storm)"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_upstream_notify_pending},
-        {labels, [node]},
-        {help, "Stream-status notifications held because the in-flight limit is "
-               "reached or the upstream circuit breaker is not closed; drained "
-               "first in first out (0 = nothing held). The key of a half_open "
-               "probe in flight is not counted here, unless a newer "
-               "notification for the same key has since been held, and the "
-               "key still counts toward the notify_pending_max cap"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_upstream_notify_inflight},
-        {labels, [node]},
-        {help, "NotifyStreamStatus workers tracked by this gateway process (at "
-               "most 10)"}]),
-    %% {duration_unit, false} on both _seconds gauges below: the prometheus
-    %% library otherwise reads the suffix as a duration unit and scales every
-    %% value set from native time units (a Unix time would render as about 1.76).
-    prometheus_gauge:declare([
-        {name, yuzu_gw_mgmt_pin_rotated_timestamp_seconds},
-        {labels, []},
-        {duration_unit, false},
-        {help, "Unix time (seconds) at which the management pin watcher last saw a "
-               "pinned {cert_file, Path} certificate change to a different key; 0 "
-               "until the first such change in this process. Not set by the first "
-               "read at start or by a rewrite of the same key"}]),
     %% 0 = no rotation observed: the pin_mismatch alert is then not suppressed.
     prometheus_gauge:set(yuzu_gw_mgmt_pin_rotated_timestamp_seconds, [], 0),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_cert_expiry_timestamp_seconds},
-        {labels, [role, name]},
-        {duration_unit, false},
-        {help, "notAfter (Unix seconds) of a certificate file the gateway is "
-               "configured with; for a file holding several certificates, the "
-               "earliest. role: listener | listener_ca | upstream_client | "
-               "upstream_ca | mgmt_peer_pin. If the file stops being readable the "
-               "last value read is kept (see yuzu_gw_cert_file_readable)"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_cert_file_readable},
-        {labels, [role, name]},
-        {help, "1 when the latest read of every certificate file under this role "
-               "and name parsed as PEM certificates, 0 when a stat, read or parse "
-               "failed (for mgmt_peer_pin the key last read stays pinned). "
-               "Checked every mgmt_pin_refresh_ms"}]),
     %% Series at 0 from startup, before yuzu_gw_upstream:init/1 has reported.
     prometheus_gauge:set(yuzu_gw_upstream_notify_pending, [node()], 0),
     prometheus_gauge:set(yuzu_gw_upstream_notify_inflight, [node()], 0),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_cluster_peers_resolved},
-        {labels, [node]},
-        {help, "Peer addresses found by the cluster discovery redial loop's "
-               "most recent tick (#4555) - 0 means the seed name/list "
-               "resolved nothing, which is expected for a genuinely "
-               "single-node deployment"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_cluster_peers_connected},
-        {labels, [node]},
-        {help, "Distribution-connected peer nodes (length(nodes())) as of "
-               "the cluster discovery redial loop's most recent tick "
-               "(#4555) - compare against peers_resolved to distinguish a "
-               "wrong seed name (resolved=0) from a partial mesh (resolved "
-               "> connected > 0, most often a cookie mismatch)"}]),
-
-    %% ── UPSTREAM workstream (#5695) ────────────────────────────────────────
-    %% Proxied-call permits (yuzu_gw_upstream_regulator), registration replay,
-    %% held stream-status notifications. Every series is created at 0 here.
-    prometheus_gauge:declare([
-        {name, yuzu_gw_upstream_permits_held},
-        {labels, [class]},
-        {help, "Upstream call permits held now, by class: register (a live "
-               "ProxyRegister), replay (a registration replay), inventory (a "
-               "ProxyInventory). register and replay share one pool"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_upstream_permits_waiting},
-        {labels, [class]},
-        {help, "Callers waiting for an upstream call permit now, by class. Non-zero "
-               "for register or inventory means every permit of the pool is held"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_upstream_permit_limit},
-        {labels, [class]},
-        {help, "Configured upstream call permits, by class (replay is the most of "
-               "the register pool a replay may hold)"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_permit_refused_total},
-        {labels, [class, reason]},
-        {help, "Upstream call permits refused, by class and reason: queue_full (the "
-               "wait queue was full), deadline (the caller's deadline passed first), "
-               "stopping (planned stop). The agent is told UNAVAILABLE and retries"}]),
-    prometheus_histogram:declare([
-        {name, yuzu_gw_upstream_permit_wait_seconds},
-        {labels, [class]},
-        {duration_unit, false},
-        {buckets, [0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]},
-        {help, "Seconds a granted upstream call permit was waited for, by class"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_registration_replay_outcomes_total},
-        {labels, [outcome]},
-        {help, "Registration replay entries by outcome: adopted, superseded, "
-               "rejected (accepted=false), failed, skipped (gone, re-registered, "
-               "no stored request, or replayed within the guard window), aborted "
-               "(dropped when the breaker opened or the registry went away)"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_registration_replay_last_duration_seconds},
-        {labels, []},
-        {duration_unit, false},
-        {help, "Seconds the last finished registration replay took, from its first "
-               "entry to its last result (0 until one finished)"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_notify_lost_total},
-        {labels, [event, reason]},
-        {help, "Stream-status notifications lost, by event (connected, "
-               "disconnected) and reason: at_capacity (not admitted, the held store "
-               "was full), evicted (a held connected notification evicted to admit "
-               "a disconnected one; a full registration replay re-sends it), "
-               "rejected (the server answered that the notification itself was "
-               "wrong, or it could not be encoded), crashed (the send's worker "
-               "died before it reported), shutdown (still held or in flight when "
-               "a planned stop's flush ended)"}]),
-    prometheus_counter:declare([
-        {name, yuzu_gw_upstream_notify_requeued_total},
-        {labels, []},
-        {help, "Stream-status notifications whose send failed and that were held "
-               "again to be retried"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_upstream_notify_pending_hwm},
-        {labels, []},
-        {help, "Most stream-status notifications held at once over the last one to "
-               "two minutes (kept by the upstream process, so a spike between "
-               "scrapes is seen)"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_upstream_notify_pending_max},
-        {labels, []},
-        {help, "The held stream-status notification cap in force "
-               "(notify_pending_max)"}]),
     [begin
          prometheus_gauge:set(yuzu_gw_upstream_permits_held, [C], 0),
          prometheus_gauge:set(yuzu_gw_upstream_permits_waiting, [C], 0),
