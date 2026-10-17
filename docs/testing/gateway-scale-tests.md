@@ -252,4 +252,13 @@ Across every case and both sizes:
 - On the macOS host the gateway logged `gateway memory shedding is inactive:
   system_memory_unknown`, so the shedder took no part.
 
-The 25,000 size was not run for this baseline.
+At 25,000 agents only the `fanout` case was run (18 min, half the agents on the
+`::1` listener). Its setup phase, which registers every agent with the server
+answering at once, did not finish: 12,028 agents were live when the wait ended
+at 930 s, and agents kept losing their sessions and registering again. The
+agent supervisor's mailbox peaked at 342,953 messages and the upstream's at
+13,788; the gateway node held 28 GB (25 GB of it process heap) in 67,438
+processes, with weighted scheduler utilisation 0.145. Of the 11,800 commands
+sent to the agents live at that point, 6,150 were answered; 5,650 ended with
+no answer, and 13,942 agent sessions ended during the fan-out. The management
+connection stayed up.
