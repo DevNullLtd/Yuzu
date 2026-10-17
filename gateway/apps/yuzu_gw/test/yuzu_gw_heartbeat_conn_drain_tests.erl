@@ -511,7 +511,7 @@ setup() ->
     ok = meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     ok = meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          N = integer_to_binary(erlang:unique_integer([positive])),
                          {ok, #{session_id => <<"drain-session-", Id/binary, "-", N/binary>>}}
                      end),

@@ -11,7 +11,11 @@
 -module(yuzu_gw_app).
 -behaviour(application).
 
--export([start/2, stop/1]).
+-export([start/2, prep_stop/1, stop/1]).
+
+%% The planned stop's budget (prep_stop/1): shutdown_flush_budget_ms.
+-define(DEFAULT_FLUSH_BUDGET_MS, 20000).
+-define(MAX_FLUSH_BUDGET_MS, 600000).
 -export([apply_env_overrides/0, evaluate_cookie/3]).  %% exported for testing
 -export([client_has_https/1, client_tls_posture/1, listeners_have_tls/1]). %% for testing
 -export([client_all_present_client_cert/1, client_tls_weakest/1, client_has_unverified/1, client_mixed_channels/1]). %% for testing
@@ -236,62 +240,168 @@ evaluate_cookie(_Node, Cookie, Allow) ->
             ok
     end.
 
-stop(_State) ->
-    logger:info("Gateway shutting down — entering drain phase"),
-
-    %% 1. Stop accepting new commands via the router.
+%% @doc Planned stop, before the supervision tree goes (#5695). OTP calls this
+%% while every process is still alive; stop/1 runs after the tree is gone, so
+%% nothing that needs a process can happen there. Within one budget,
+%% shutdown_flush_budget_ms (default 20000, valid 0..600000):
+%%   1. The upstream stops taking work (yuzu_gw_upstream:begin_stop/0):
+%%      proxied Registers and inventory reports are refused UNAVAILABLE, so
+%%      agents go to another gateway; no registration replay runs.
+%%   2. No new agent connection: the memory shedder is stopped (it could
+%%      resume a listener) and every agent listener is suspended (Ranch keeps
+%%      the established connections). The router stops taking commands.
+%%   3. In-flight commands get min(3 s, 30% of the budget) to finish.
+%%   4. Every local session is ended through its own agent process
+%%      (yuzu_gw_agent:disconnect/1), which closes its stream and casts the
+%%      DISCONNECTED notice with the session's own stream_home_id (the server
+%%      matches a DISCONNECTED to the placement by it, and it lives only in the
+%%      agent process, not in the registry table), up to min(5 s, 40% of the
+%%      budget) for them to finish.
+%%   5. The heartbeat buffer is flushed.
+%%   6. The upstream sends every held notification as a last gasp, whatever
+%%      the breaker state, until none is left or the budget ends
+%%      (yuzu_gw_upstream:last_gasp/1); what is left is counted and logged.
+%% Each step is skipped when its process is not running. A kill -9, or a stop
+%% that outlasts the container's or unit's stop timeout, gives no last gasp:
+%% the server then keeps those sessions until the agents register again. The
+%% compose files and the systemd unit give the stop 40 s, the budget plus the
+%% tree's own shutdown (docs/user-manual/gateway.md, "Planned stop").
+prep_stop(State) ->
+    Budget = yuzu_gw_env:env_int(shutdown_flush_budget_ms, ?DEFAULT_FLUSH_BUDGET_MS, 0,
+                                 ?MAX_FLUSH_BUDGET_MS),
+    T0 = erlang:monotonic_time(millisecond),
+    Deadline = T0 + Budget,
+    logger:info("Gateway stopping: ending agent sessions and sending their DISCONNECTED "
+                "notices to the server (budget ~b ms)", [Budget]),
+    _ = safely(fun yuzu_gw_upstream:begin_stop/0),
+    _ = safely(fun() -> supervisor:terminate_child(yuzu_gw_sup, yuzu_gw_memory_shedder) end),
+    [safely(fun() -> ranch:suspend_listener(Ref) end) || Ref <- agent_listener_refs()],
     case whereis(yuzu_gw_router) of
         undefined -> ok;
-        RouterPid ->
-            logger:info("Notifying router to stop accepting new commands"),
-            RouterPid ! drain,
+        RouterPid -> RouterPid ! drain
+    end,
+    drain_pending(min(T0 + min(3000, Budget * 3 div 10), Deadline)),
+    end_sessions(min(erlang:monotonic_time(millisecond) + min(5000, Budget * 4 div 10),
+                     Deadline)),
+    _ = safely(fun yuzu_gw_heartbeat_buffer:flush_sync/0),
+    case safely(fun() -> yuzu_gw_upstream:last_gasp(Deadline) end) of
+        #{sent := Sent, left := Left} ->
+            logger:info("Gateway stop: ~b notice(s) sent upstream, ~b left, in ~b ms",
+                        [Sent, Left, erlang:monotonic_time(millisecond) - T0]);
+        _ ->
             ok
     end,
+    State.
 
-    %% 2. Wait for in-flight commands to complete (up to 10 seconds).
-    DrainDeadline = erlang:monotonic_time(second) + 10,
-    drain_pending(DrainDeadline),
-
-    %% 3. Flush heartbeat buffer synchronously.
-    logger:info("Flushing heartbeat buffer"),
-    try yuzu_gw_heartbeat_buffer:flush_sync()
-    catch _:_ ->
-        %% flush_sync failed (process already down) — allow brief drain.
-        timer:sleep(500)
-    end,
-
-    %% The filter outlives the supervision tree (already down by now), so the
-    %% upstream's shutdown reports are redacted too.
+stop(_State) ->
+    %% The supervision tree is already down: the drain happened in prep_stop/1.
+    %% The filter outlives the supervision tree, so the upstream's shutdown
+    %% reports are redacted too.
     ok = yuzu_gw_crash_redact:remove(),
     ok = yuzu_gw_conn_watch:remove(),
     logger:info("Gateway shutdown complete"),
     ok.
 
-%% @private Wait for pending commands to drain or until deadline.
+%% Run Fun, turning an exit or error into `skipped': a step of a stop whose
+%% process is gone is skipped, not fatal (an exception here would stop the
+%% application master from stopping the tree).
+safely(Fun) ->
+    try Fun()
+    catch _:_ -> skipped
+    end.
+
+%% The Ranch refs of the listeners that route the agent service (never the
+%% management listener, which stays up while the stop drains commands).
+agent_listener_refs() ->
+    case application:get_env(yuzu_gw, grpc_listeners, []) of
+        Listeners when is_list(Listeners) ->
+            [{yuzu_grpc, maps:get(name, E)}
+             || E <- Listeners, is_map(E), maps:is_key(name, E),
+                yuzu_grpc_listener:routes_agent(E)];
+        _ ->
+            []
+    end.
+
+%% The agent processes of this node: the registry's routing table, filtered to
+%% real yuzu_gw_agent processes ([] once the registry, and with it the table,
+%% is down).
+local_agent_pids() ->
+    lists:usort(yuzu_gw_registry:local_agent_pids()).
+
+%% @private Wait for pending commands to drain or until Deadline (monotonic
+%% ms). Each agent is asked with a short timeout; the walk stops at the deadline.
 drain_pending(Deadline) ->
-    Now = erlang:monotonic_time(second),
-    case Now >= Deadline of
+    case erlang:monotonic_time(millisecond) >= Deadline of
         true ->
-            logger:warning("Drain deadline reached — proceeding with shutdown");
+            ok;
         false ->
-            %% Check if any agent processes still have pending commands. The
-            %% registry's routing table names them (the `all_agents' pg group
-            %% this used to read is gone); [] once the registry, and with it
-            %% the table, is down.
-            Agents = yuzu_gw_registry:local_agent_pids(),
             HasPending = lists:any(fun(Pid) ->
-                try gen_statem:call(Pid, pending_count, 1000) > 0
-                catch _:_ -> false
-                end
-            end, Agents),
+                                       erlang:monotonic_time(millisecond) < Deadline andalso
+                                       (try gen_statem:call(Pid, pending_count, 200) > 0
+                                        catch _:_ -> false
+                                        end)
+                                   end, local_agent_pids()),
             case HasPending of
                 false ->
-                    logger:info("All in-flight commands drained");
+                    ok;
                 true ->
-                    logger:info("Draining: waiting for in-flight commands..."),
-                    timer:sleep(1000),
+                    logger:info("Gateway stop: waiting for in-flight commands"),
+                    timer:sleep(min(200, max(0, Deadline - erlang:monotonic_time(millisecond)))),
                     drain_pending(Deadline)
             end
+    end.
+
+%% @private End every local session through its agent process and wait, until
+%% Deadline, for the processes to finish (each casts its DISCONNECTED before it
+%% exits). One that is still running at the deadline is left to the tree.
+%%
+%% The agents are the routing table's AND the agent supervisor's children: an
+%% agent still inside its registry call (the `registering' state) is not in the
+%% table yet, and ending only the table's agents would let it register, announce
+%% CONNECTED and never send its DISCONNECTED. It postpones the disconnect until
+%% its registration is done, then ends like the others. A second pass ends any
+%% agent started meanwhile (a Subscribe for a session registered just before the
+%% stop); at most three passes.
+end_sessions(Deadline) ->
+    {Ended, Left} = end_sessions(Deadline, #{}, 3),
+    case Left of
+        0 -> logger:info("Gateway stop: ended ~b agent session(s)", [Ended]);
+        _ -> logger:warning("Gateway stop: ~b of ~b agent session(s) had not ended by the "
+                            "deadline", [Left, Ended])
+    end.
+
+end_sessions(_Deadline, Seen, 0) ->
+    {map_size(Seen), 0};
+end_sessions(Deadline, Seen, Passes) ->
+    case [P || P <- agent_pids(), not is_map_key(P, Seen)] of
+        [] ->
+            {map_size(Seen), 0};
+        Pids ->
+            Mons = [{erlang:monitor(process, P), P} || P <- Pids],
+            [yuzu_gw_agent:disconnect(P) || P <- Pids],
+            Seen1 = maps:merge(Seen, maps:from_keys(Pids, true)),
+            case await_down(maps:from_list(Mons), Deadline) of
+                0    -> end_sessions(Deadline, Seen1, Passes - 1);
+                Left -> {map_size(Seen1), Left}
+            end
+    end.
+
+agent_pids() ->
+    Children = try supervisor:which_children(yuzu_gw_agent_sup)
+               catch _:_ -> []
+               end,
+    lists:usort(local_agent_pids() ++ [P || {_, P, _, _} <- Children, is_pid(P)]).
+
+await_down(Mons, _Deadline) when map_size(Mons) =:= 0 ->
+    0;
+await_down(Mons, Deadline) ->
+    Wait = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {'DOWN', Ref, process, _, _} when is_map_key(Ref, Mons) ->
+            await_down(maps:remove(Ref, Mons), Deadline)
+    after Wait ->
+        [erlang:demonitor(R, [flush]) || R <- maps:keys(Mons)],
+        map_size(Mons)
     end.
 
 %%--------------------------------------------------------------------

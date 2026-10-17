@@ -44,6 +44,9 @@
 %% must not count against the circuit breaker. A change to the server's constant
 %% must change this one.
 -define(MAX_AGENT_ID_BYTES, 256).
+%% The proxied-call refusals answered UNAVAILABLE (see retryable_error/2).
+-define(RETRYABLE(Reason), (Reason =:= circuit_open orelse Reason =:= overloaded orelse
+                            Reason =:= deadline orelse Reason =:= stopping)).
 
 %%--------------------------------------------------------------------
 %% Register — proxy to C++ server
@@ -148,7 +151,7 @@ origin_text(Ctx) ->
     end.
 
 register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
-    case yuzu_gw_upstream:proxy_register(RegisterReq) of
+    case yuzu_gw_upstream:proxy_register(RegisterReq, upstream_opts(Ctx)) of
         {ok, Response} when is_map(Response) ->
             %% Stash the session_id and agent_info; the agent process is
             %% created when Subscribe arrives (matched by session_id).
@@ -202,6 +205,9 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
               register_failed, "Upstream Register failed: answer is not a response message", []),
             {grpc_error, {?GRPC_STATUS_INTERNAL,
                           <<"Upstream registration failed: malformed response">>}};
+
+        {error, Reason} when ?RETRYABLE(Reason) ->
+            retryable_error(<<"Registration">>, Reason);
 
         {error, Reason} ->
             yuzu_gw_safe_call:warn_limited(register_failed,
@@ -394,9 +400,11 @@ execute_command(_CommandReq, _Stream) ->
 %%--------------------------------------------------------------------
 
 report_inventory(Ctx, InventoryReport) ->
-    case yuzu_gw_upstream:proxy_inventory(InventoryReport) of
+    case yuzu_gw_upstream:proxy_inventory(InventoryReport, upstream_opts(Ctx)) of
         {ok, Response} ->
             {ok, Response, Ctx};
+        {error, Reason} when ?RETRYABLE(Reason) ->
+            retryable_error(<<"Inventory report">>, Reason);
         {error, Reason} ->
             yuzu_gw_safe_call:warn_limited(inventory_failed,
                                            "Upstream ReportInventory failed: ~p", [Reason]),
@@ -408,6 +416,39 @@ report_inventory(Ctx, InventoryReport) ->
 %%--------------------------------------------------------------------
 %% Internal
 %%--------------------------------------------------------------------
+
+%% The options of a proxied call: the handler's deadline, so the call upstream,
+%% and any wait for a permit before it, ends before the agent stops waiting. The
+%% stream handler ends the handler at yuzu_grpc_stream_h:deadline_ms/1 of the
+%% agent's grpc-timeout, counted from when it armed the timer; counting from now
+%% instead leans late by the request-receive time, which the upstream's own
+%% margin (DEADLINE_MARGIN_MS) covers. No usable header: the upstream's default
+%% budget applies.
+upstream_opts(Ctx) ->
+    case yuzu_grpc_frame:parse_timeout(maps:get(<<"grpc-timeout">>, yuzu_grpc:headers(Ctx),
+                                                undefined)) of
+        {ok, Ms} -> #{deadline => erlang:monotonic_time(millisecond)
+                                  + yuzu_grpc_stream_h:deadline_ms(Ms)};
+        _        -> #{}
+    end.
+
+%% A refusal that means "try again later", answered UNAVAILABLE (the retryable
+%% gRPC status the agent backs off on) with a fixed message per reason:
+%%   circuit_open  the server is unreachable (the breaker is open)
+%%   overloaded    every permit is held and the wait queue is full
+%%   deadline      the agent's deadline passed while it waited for a permit
+%%   stopping      this gateway is stopping (planned)
+%% Not logged per request: the regulator counts them
+%% (yuzu_gw_upstream_permit_refused_total) and the breaker logs its own moves.
+retryable_error(What, Reason) ->
+    Why = case Reason of
+              circuit_open -> <<"the server is unreachable">>;
+              overloaded   -> <<"the gateway is busy">>;
+              deadline     -> <<"the gateway could not reach the server in time">>;
+              stopping     -> <<"the gateway is stopping">>
+          end,
+    {grpc_error, {?GRPC_STATUS_UNAVAILABLE, <<What/binary, " not forwarded: ", Why/binary,
+                                              "; retry">>}}.
 
 %% The answer to a session refused by the per-connection quota: UNAVAILABLE, the
 %% retryable status (the agent backs off and registers again; the quota frees as

@@ -4,8 +4,9 @@
 %%% yuzu_gw_upstream.
 %%%
 %%% The scenario is a real one. The real upstream runs under a supervisor and
-%%% is suspended; three proxy_register calls, each carrying one credential
-%%% marker, are queued in its mailbox behind a fourth that makes it crash (its
+%%% is suspended; three proxy_register call messages, each carrying one
+%%% credential marker, are queued in its mailbox behind a fourth that makes it
+%%% crash (its
 %%% state is replaced by a term no clause matches, and the state itself carries
 %%% a marker that lands in the stacktrace frame arguments). That crash does NOT
 %%% go through format_status/1 for the mailbox, the exception line, the
@@ -17,6 +18,11 @@
 %%% A positive control runs the same scenario without the filter and requires
 %%% the markers to appear, so the clean result cannot be an artefact of the
 %%% harness. Events of other processes must pass through unchanged.
+%%%
+%%% proxy_register/2 no longer calls into the upstream (the RPC runs in the
+%%% caller, under a permit), so the call messages are sent raw, in the shape a
+%%% call used to arrive in: the filter still keys on that shape, which an older
+%%% caller during a hot upgrade, or a misdirected call, can still put there.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_crash_redact_tests).
@@ -87,7 +93,7 @@ crash_is_redacted_through_the_installed_filter() ->
     [Crash] = by_label(Events, {proc_lib, crash}),
     CrashText = formatted(Crash),
     %% The diagnosis survives: what failed, where, and how much was queued.
-    ?assert(contains(CrashText, <<"check_circuit">>)),
+    ?assert(contains(CrashText, <<"notify_counts">>)),
     ?assert(contains(CrashText, <<"function_clause">>)),
     ?assert(contains(CrashText, <<"{redacted,3}">>)).
 
@@ -110,7 +116,7 @@ filter_rewrites_only_upstream_reports() ->
     %% The reason of the supervisor report keeps its atoms and frame arities.
     [Sup] = by_label(Out, {supervisor, child_terminated}),
     SupText = formatted(Sup),
-    ?assert(contains(SupText, <<"check_circuit">>)),
+    ?assert(contains(SupText, <<"notify_counts">>)),
     %% A sibling child of the same supervisor, an unrelated crash, and plain
     %% events are not touched.
     Others = crash_other(),
@@ -184,17 +190,21 @@ crash_upstream() ->
                                                start => {yuzu_gw_upstream, start_link, []},
                                                restart => temporary}),
     ok = sys:suspend(Pid),
-    %% The first caller is the one the crash happens on; the other three stay
-    %% queued. Each is queued before the next is sent, so the order is fixed.
-    Reqs = [#{enrollment_token => ?M_LAST},
-            #{enrollment_token => ?M_TOKEN},
+    %% The first message is the one the crash happens on: a verdict whose
+    %% session id is a marker (handled against the garbage state, it crashes in
+    %% notify_counts/1, with the ids in the last message); the three
+    %% call messages stay queued. Each is queued before the next is sent, so
+    %% the order is fixed.
+    Pid ! {'$gen_cast', {replay_sessions, [?M_LAST]}},
+    wait_queue_len(Pid, 1),
+    Reqs = [#{enrollment_token => ?M_TOKEN},
             #{csr_pem => ?M_CSR},
             #{machine_certificate => ?M_CERT}],
     lists:foldl(fun(Req, N) ->
-                    spawn(fun() -> catch yuzu_gw_upstream:proxy_register(Req) end),
+                    Pid ! {'$gen_call', {self(), make_ref()}, {proxy_register, Req}},
                     wait_queue_len(Pid, N),
                     N + 1
-                end, 1, Reqs),
+                end, 2, Reqs),
     _ = sys:replace_state(Pid, fun(_) -> {garbage, ?M_STATE} end),
     ok = sys:resume(Pid),
     collect([{proc_lib, crash}, {gen_server, terminate}, {supervisor, child_terminated}]).

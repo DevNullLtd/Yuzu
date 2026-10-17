@@ -33,7 +33,7 @@ readyz_breaker_test_() ->
     {foreach,
      fun setup/0,
      fun cleanup/1,
-     [{"readyz reports the closed breaker at once while the upstream is inside a slow RPC",
+     [{"readyz reports the closed breaker at once while proxied calls are slow and the upstream is busy",
        {timeout, 30, fun readyz_answers_while_the_upstream_is_in_a_slow_rpc/0}},
       {"the published breaker state equals the process's own through every transition",
        {timeout, 60, fun published_state_follows_every_transition/0}}]}.
@@ -50,14 +50,21 @@ readyz_answers_while_the_upstream_is_in_a_slow_rpc() ->
     server_answers(fun(_) -> block end),
     First = spawn_register(<<"slow-1">>),
     Worker = await_rpc(<<"ProxyRegister">>),
-    %% The RPC runs in the upstream process itself, not in a worker.
-    ?assertEqual(whereis(yuzu_gw_upstream), Worker),
+    %% The RPC runs in the caller's process, not in the upstream process.
+    ?assertEqual(First, Worker),
+    ?assertNotEqual(whereis(yuzu_gw_upstream), Worker),
+    %% A second slow call alongside it, and the upstream process itself held
+    %% busy (suspended, its mailbox growing): /readyz reads the published
+    %% breaker state and answers at once.
     Second = spawn_register(<<"slow-2">>),
-    await_queued(Worker, 1),
+    Worker2 = await_rpc(<<"ProxyRegister">>),
+    Up = whereis(yuzu_gw_upstream),
+    ok = sys:suspend(Up),
+    gen_server:cast(Up, nothing),
     {Micros, {Status, Body}} = timer:tc(fun() -> http_get(Port, "/readyz") end),
+    ok = sys:resume(Up),
     Worker ! go,
-    ?assertEqual(Worker, await_rpc(<<"ProxyRegister">>)),
-    Worker ! go,
+    Worker2 ! go,
     await_reply(First),
     await_reply(Second),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
@@ -114,14 +121,16 @@ published_state_follows_every_transition() ->
     ?assertEqual(0, rpc_count(<<"ProxyRegister">>)),
     same(open),
 
-    %% half_open -> closed by the notification probe: the notification held while
-    %% the breaker was open is sent when it half-opens, and succeeds.
+    %% half_open -> closed by the notification probe: the notifications held
+    %% while the breaker was open (the two that failed, given back, #5695, and a
+    %% third) are sent when it half-opens: the head as the probe, which
+    %% succeeds and closes it, then the other two.
     notify(3),
     meck:reset(yuzu_grpc_client),
     server_answers(fun(_) -> ok end),
     half_open(),
     await_state(closed),
-    ?assertEqual(1, rpc_count(<<"NotifyStreamStatus">>)),
+    ?assertEqual(ok, wait_until(fun() -> rpc_count(<<"NotifyStreamStatus">>) =:= 3 end)),
     ?assertEqual(0, rpc_count(<<"ProxyRegister">>)),
     same(closed),
 
@@ -264,9 +273,12 @@ trip() ->
     [{error, _} = yuzu_gw_upstream:proxy_register(req(<<"trip">>)) || _ <- [1, 2]],
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
 
-%% The message the reset timer sends (the timer itself is out of reach).
+%% The message the reset timer sends (the timer itself is out of reach). The
+%% call after it is answered after the message is handled: a proxied call reads
+%% the published breaker state without a call, so it must not race the message.
 half_open() ->
     whereis(yuzu_gw_upstream) ! circuit_half_open,
+    _ = yuzu_gw_upstream:circuit_state(),
     ok.
 
 await_state(State) ->
@@ -320,12 +332,6 @@ await_reply(Pid) ->
 %% The pid of the process the mocked RPC of this method is blocked in.
 await_rpc(Method) ->
     receive {rpc, Method, Pid} -> Pid after ?WAIT_MS -> error({no_rpc, Method}) end.
-
-await_queued(Pid, N) ->
-    ok = wait_until(fun() ->
-                            {message_queue_len, L} = process_info(Pid, message_queue_len),
-                            L >= N
-                    end).
 
 take_dummies() ->
     Pids = persistent_term:get({?MODULE, dummies}, []),

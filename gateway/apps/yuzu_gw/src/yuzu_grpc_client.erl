@@ -52,7 +52,10 @@
 %% @doc One unary call. `Metadata' is sent as request headers (lowercase
 %% names; see metadata_headers/1 for what is refused). Options: `channel'
 %% (default `default_channel'), `timeout' in ms for the whole call, connection
-%% wait included (default 5000).
+%% wait included (default 5000); what is left of it when the request goes out
+%% is sent as the `grpc-timeout' header, unless `send_timeout' is false (then
+%% only this client enforces it: the tests of the client's own give-up path use
+%% that, since a server that honours grpc-timeout ends the call first).
 -spec unary(map(), binary(), term(), def(), map()) -> result().
 unary(Metadata, Path, Request, #{marshal := Marshal, unmarshal := Unmarshal}, Options)
   when is_map(Metadata), is_binary(Path), is_map(Options) ->
@@ -67,7 +70,12 @@ unary(Metadata, Path, Request, #{marshal := Marshal, unmarshal := Unmarshal}, Op
             case yuzu_grpc_client_channel:pick(Channel, remaining(Deadline)) of
                 {ok, Conn} ->
                     Max = yuzu_grpc_client_channel:max_receive(Channel),
-                    call(Conn, Path, Extra, Body, Unmarshal, Max, Deadline);
+                    Extra1 = case maps:get(send_timeout, Options, true) of
+                                 false -> Extra;
+                                 _     -> [{<<"grpc-timeout">>,
+                                            timeout_header(remaining(Deadline))} | Extra]
+                             end,
+                    call(Conn, Path, Extra1, Body, Unmarshal, Max, Deadline);
                 {error, _} = Error ->
                     Error
             end
@@ -110,6 +118,8 @@ reserved(Key) -> lists:member(Key, [<<"content-type">>, <<"te">>, <<"user-agent"
 %%--------------------------------------------------------------------
 
 call(Conn, Path, Extra, Body, Unmarshal, Max, Deadline) ->
+    %% Extra carries grpc-timeout (unary/5): what is left of the call's timeout,
+    %% so the server can stop working on a call this client no longer waits for.
     Headers = [{<<"content-type">>, <<"application/grpc">>},
                {<<"te">>, <<"trailers">>},
                {<<"user-agent">>, ?USER_AGENT}
@@ -204,6 +214,11 @@ message(Data, Meta, Unmarshal) ->
 
 remaining(Deadline) ->
     max(0, Deadline - erlang:monotonic_time(millisecond)).
+
+%% A grpc-timeout value: at most eight digits, so milliseconds up to 99999999
+%% (about 27 hours) and seconds beyond. At least 1 ms.
+timeout_header(Ms) when Ms =< 99999999 -> <<(integer_to_binary(max(1, Ms)))/binary, "m">>;
+timeout_header(Ms) -> <<(integer_to_binary(min(99999999, Ms div 1000)))/binary, "S">>.
 
 to_map(Headers) ->
     maps:from_list([{K, V} || {K, V} <- Headers, is_binary(K), is_binary(V),

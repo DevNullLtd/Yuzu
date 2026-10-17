@@ -18,6 +18,11 @@ Group=yuzu-gw
 ExecStart=/opt/yuzu_gw/bin/yuzu_gw foreground
 Restart=on-failure
 RestartSec=5
+# Planned stop: on SIGTERM the gateway ends its agent sessions and sends their
+# DISCONNECTED notices to the server within shutdown_flush_budget_ms (default
+# 20 s), then stops its processes. 40 s covers that with margin; raise the two
+# together (docs/user-manual/gateway.md, "Planned stop").
+TimeoutStopSec=40
 # Surface the gateway's own log lines (incl. the #659 cookie boot-guard refusal)
 # under a clean journal tag so the cause isn't buried by OTP crash reports +
 # StartLimitBurst: `journalctl -t yuzu-gateway`.
