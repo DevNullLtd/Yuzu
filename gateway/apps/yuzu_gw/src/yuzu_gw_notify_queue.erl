@@ -35,6 +35,8 @@
 %%%   key is inserted at the head. It is not bounded by the cap; the caller's
 %%%   `Reserved' slots are what guarantee it fits.
 %%% - `peek_key/1' names the key `take/1' would return, without taking it.
+%%% - `is_held/2' says whether a key is held (the caller's retry set for
+%%%   notices the server did not acknowledge asks it, #5695).
 %%%
 %%% Internally a `queue' of {Seq, Key} in take order, a `queue' of {Seq, Key}
 %%% of the `connected' entries in eviction order, and a map Key => {Seq, Class,
@@ -46,8 +48,8 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_notify_queue).
 
--export([new/1, put/4, put/5, push_front/3, push_front/4, take/1, peek_key/1, size/1,
-         cap/1, set_cap/2, to_list/1]).
+-export([new/1, put/4, put/5, push_front/3, push_front/4, take/1, peek_key/1, is_held/2,
+         size/1, cap/1, set_cap/2, to_list/1]).
 
 -export_type([t/0, key/0, event/0, class/0]).
 
@@ -152,6 +154,11 @@ peek_key(#nq{keys = Keys, events = Events} = Q) ->
                 _ -> peek_key(Q#nq{keys = queue:drop(Keys)})
             end
     end.
+
+%% @doc Whether an event is held for Key. O(1).
+-spec is_held(key(), t()) -> boolean().
+is_held(Key, #nq{events = Events}) ->
+    maps:is_key(Key, Events).
 
 %% @doc Number of keys held.
 -spec size(t()) -> non_neg_integer().

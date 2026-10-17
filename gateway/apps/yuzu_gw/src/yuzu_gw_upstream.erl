@@ -124,7 +124,9 @@
 %%% The half_open probe (#4632):
 %%%   Held entries are not sent while the breaker is open. When it goes half_open
 %%%   (and when work first arrives while it is half_open) the HEAD held entry is
-%%%   sent as the probe, and the breaker is driven by its result. Without it a
+%%%   sent as the probe (when nothing is held, a due resend of a notice the
+%%%   server refused, see NOTIFY-ACK below), and the breaker is driven by its
+%%%   result. Without it a
 %%%   held entry could wait forever after the server recovered: a disconnected
 %%%   session sends no heartbeat, and a known session needs no verdict. Only one
 %%%   probe is out at a time, it counts in the ten worker budget, and while the
@@ -151,6 +153,88 @@
 %%%       first, and a result is always delivered before the 'DOWN' of its
 %%%       sender.
 %%%   Ordinary workers never report to the breaker.
+%%%
+%%% Notices the server did not acknowledge (#5695, NOTIFY-ACK):
+%%%   The server answers NotifyStreamStatus with gRPC OK and a StreamStatusAck;
+%%%   `acknowledged = false' means it did NOT record the notice. The gateway
+%%%   used to take every OK as delivered: a server that refused CONNECTED for a
+%%%   minute left every agent that connected in that minute unknown to it for
+%%%   good (the heartbeat verdict lists only sessions the server does not know,
+%%%   and it knew these). Read from server/core/src/gateway_service_impl.cpp
+%%%   (NotifyStreamStatus), every `false' answer and what it means (each logs a
+%%%   WARN line on the server, quoted, and counts in
+%%%   yuzu_server_gateway_route_desync_total under the reason named):
+%%%     - CONNECTED, the route directory read failed and this replica holds no
+%%%       matching local session ("CONNECTED for session ... refused -- the
+%%%       directory read degraded and this replica holds no matching local
+%%%       session", connected_unverified): TRANSIENT, the route store is
+%%%       degraded; the same notice is accepted once it reads again.
+%%%     - CONNECTED or DISCONNECTED, the session is in neither the directory nor
+%%%       this replica's session map ("unknown session ... for agent ...",
+%%%       unknown_session): DEFINITIVE for that session (a server that lost its
+%%%       state, or never saw the registration). For a live CONNECTED the
+%%%       heartbeat verdict names the session and the targeted replay
+%%%       re-registers it, which re-announces under the same key.
+%%%     - CONNECTED, the directory names another session ("... but the directory
+%%%       names a different session -- rejecting") or the registry holds a newer
+%%%       one ("... is no longer the currently-installed session -- rejecting the
+%%%       publish"), stale_connected_session: DEFINITIVE, a newer registration
+%%%       owns the agent, and this session normally ends at the gateway soon.
+%%%     - CONNECTED, the session is bound to another cluster ("... claims
+%%%       cluster_id ..., which differs from this agent's already-bound cluster
+%%%       affinity -- REFUSING ...", cluster_affinity_violation): DEFINITIVE
+%%%       until the configuration changes.
+%%%     - an event that is neither (never sent by this gateway).
+%%%   A failed directory WRITE (announce_connected) is answered true today
+%%%   (fail-open); a server change in review (#5961) answers it UNAVAILABLE,
+%%%   which this gateway retries as a failed send, and keeps `false' for a
+%%%   definitive refusal of a session that is not placed. The answer carries no
+%%%   reason, so every `false' is handled the same way: not delivered.
+%%%   - The attempt settles as not delivered and the notice is kept, under its
+%%%     key, in a retry set beside the pending store, to be sent again after a
+%%%     backoff: decorrelated jitter, delay = min(Max, uniform(Base, 3 x the
+%%%     previous delay)), Base notify_unacked_retry_base_ms (1000), Max
+%%%     notify_unacked_retry_max_ms (60000). The first resend comes 1 to 3 s
+%%%     after the refusal; the delay averages about 34 s at steady state
+%%%     (simulated), so 5,000 refused keys cost about 150 resends a second.
+%%%   - Neither a failure nor a success for the breaker (record_result/2): the
+%%%     server answered, so it is not failing, and it recorded nothing, so this
+%%%     is no proof of recovery. A refused half_open probe leaves the breaker
+%%%     half_open and the next entry is probed. The generation fence on a
+%%%     worker's result (Gate 8 #4) is unchanged.
+%%%   - Latest wins: a newer event for the key cancels the resend (a
+%%%     DISCONNECTED after a refused CONNECTED is sent, the CONNECTED never
+%%%     again). A resend in flight is waited for (per-key order), and its
+%%%     result is dropped.
+%%%   - A CONNECTED is resent only while this node still holds its session
+%%%     (yuzu_gw_registry:lookup_local_session/1, read when the backoff ends;
+%%%     a registry that is not running does not stop it). It has no time limit:
+%%%     a live session the server does not record is the failure this exists
+%%%     for, and the alert names it.
+%%%   - A DISCONNECTED is resent for at most notify_unacked_disconnected_window_ms
+%%%     (120000) after its first refusal, then counted lost (unacknowledged).
+%%%     The only `false' a DISCONNECTED gets is unknown_session: harmless when
+%%%     the server never knew the session or already removed it; otherwise (a
+%%%     replica that could not read the directory) the route row it would have
+%%%     removed stops being routable when its 90 s lease runs out, so a resend
+%%%     after that changes nothing.
+%%%   - Bounded: resends take at most ?MAX_UNACKED_INFLIGHT (5) of the ten
+%%%     notify slots, and the pending store is drained first on every pass, so
+%%%     a fresh CONNECTED or DISCONNECTED always has at least five slots and
+%%%     the first one free. One entry per key; at most notify_pending_max
+%%%     entries (a refusal past that is lost, unacknowledged). When nothing is
+%%%     held, a due resend is the half_open probe. A resend that fails (a
+%%%     transport error) is given back to the pending store like any failed send.
+%%%   - Planned stop: when the last gasp begins, a refused CONNECTED still
+%%%     waiting is dropped (lost, shutdown: the session ends with the stop) and
+%%%     a refused DISCONNECTED still waiting goes to the head of the pending
+%%%     store and is sent; a refusal during the last gasp is not resent (lost,
+%%%     unacknowledged).
+%%%   - Counted in yuzu_gw_upstream_notify_unacknowledged_total{event} (every
+%%%     `false'), yuzu_gw_upstream_notify_unacked_keys (entries waiting) and
+%%%     yuzu_gw_upstream_notify_unacked_ended_total{outcome}; a WARN (at most one
+%%%     a second, warn_limited notify_unacknowledged) names the agent. The retry
+%%%     set is volatile, like the pending store.
 %%%
 %%% Includes a circuit breaker to prevent cascading failures when the
 %%% upstream server is unreachable. States:
@@ -258,7 +342,13 @@
 %%%   notify_pending_max                  - most stream-status notification keys
 %%%                                          held while they cannot be sent
 %%%                                          (default 10000, valid 1..1000000)
-%%   cluster_id                          — this gateway's trust-zone/region id,
+%%%   notify_unacked_retry_base_ms        - first backoff of a notice the server
+%%%                                          refused (default 1000, valid 10..60000)
+%%%   notify_unacked_retry_max_ms         - longest backoff (default 60000, valid
+%%%                                          100..3600000, raised to the base)
+%%%   notify_unacked_disconnected_window_ms - how long a refused DISCONNECTED is
+%%%                                          resent (default 120000, valid 0..3600000)
+%%   cluster_id                         — this gateway's trust-zone/region id,
 %%                                          stamped on every StreamStatusNotification
 %%                                          (default <<"default">>; ADR-2002 §7)
 %%% @end
@@ -397,6 +487,30 @@
 %% first. A lost connection's calls all end within one RPC timeout of the loss,
 %% and the channel has a handful of connections, so a short list is enough.
 -define(MAX_LOST_CONNS, 16).
+%% NOTIFY-ACK (#5695): notices the server answered acknowledged=false (see
+%% "Notices the server did not acknowledge" in the module doc). The backoff is
+%% decorrelated jitter, delay = min(Max, uniform(Base, 3 x the previous delay)):
+%% Base 1 s, so the first resend comes 1 to 3 s after the refusal (a degraded
+%% route store usually recovers within seconds); Max 60 s, so a server that
+%% starts accepting again has every refused notice within about a minute, and
+%% 5,000 refused keys cost about 150 resends a second at steady state (the mean
+%% delay is about 34 s, simulated). Base 10 ms to 60 s, Max 100 ms to 1 h
+%% (raised to Base when below it).
+-define(DEFAULT_UNACKED_BASE_MS, 1000).
+-define(MIN_UNACKED_BASE_MS, 10).
+-define(MAX_UNACKED_BASE_MS, 60000).
+-define(DEFAULT_UNACKED_MAX_MS, 60000).
+-define(MIN_UNACKED_MAX_MS, 100).
+-define(MAX_UNACKED_MAX_MS, 3600000).
+%% How long a refused DISCONNECTED is resent after its first refusal: past the
+%% server's 90 s route lease (kGatewayRouteLeaseTtlSecs) the row a missed
+%% DISCONNECTED would have removed is no longer routable anyway, so a resend
+%% changes nothing. 0 (never resent) to 1 h.
+-define(DEFAULT_UNACKED_DISC_WINDOW_MS, 120000).
+-define(MAX_UNACKED_DISC_WINDOW_MS, 3600000).
+%% The most resends in flight at once: half the notify lane, so fresh notices
+%% always have the other half (and are drained first on every pass).
+-define(MAX_UNACKED_INFLIGHT, (?MAX_NOTIFY_INFLIGHT div 2)).
 
 %% The lock-free cell: an `atomics' array behind a persistent_term, written only
 %% by this process and read by anyone. It exists because everything else this
@@ -472,6 +586,26 @@
 %% What do_rpc returns. A local_error is an exception raised by the request
 %% encoder in this process: the request never left the gateway.
 -type rpc_result() :: {ok, term()} | {error, term()} | {local_error, {atom(), term()}}.
+%% What a notification worker reports: an rpc_result, with an OK answer of
+%% acknowledged=false told apart as `unacknowledged' (ack_result/1): the
+%% server answered but did not record the notice.
+-type notify_result() :: rpc_result() | unacknowledged.
+
+%% A notice the server answered acknowledged=false, held for a resend (NOTIFY-ACK).
+%%   status  {waiting, TimerRef}  the backoff runs ({timeout, TimerRef,
+%%                                {notify_unacked_due, Key}} ends it);
+%%           ready                due, queued in notify_unacked_ready;
+%%           inflight             a resend (or a send from the pending store) is
+%%                                out, and its result decides;
+%%           held                 a resend failed (a transport error) and was
+%%                                given back to the pending store, which sends it.
+%%   delay   the last backoff delay (ms), the next one is derived from it.
+%%   first   when the server first refused this event (monotonic ms).
+-type unacked() :: #{event  := yuzu_gw_notify_queue:event(),
+                     class  := connected | disconnected,
+                     delay  := pos_integer(),
+                     first  := integer(),
+                     status := {waiting, reference()} | ready | inflight | held}.
 
 %% {AgentId, SessionId, stored RegisterRequest | walk}. A verdict entry carries
 %% the request it was resolved with; a walk entry carries `walk' and its worker
@@ -580,7 +714,22 @@
     %% which cluster owns an agent's live stream. Read once at init; a
     %% pre-WS-4 build has no such config and the env default (<<"default">>)
     %% keeps a single-cluster deployment's id stable and non-empty.
-    cluster_id      :: binary()
+    cluster_id      :: binary(),
+    %% NOTIFY-ACK (#5695): the retry set of notices the server answered
+    %% acknowledged=false, by store key (at most one entry per key, at most
+    %% notify_pending_max entries); the keys whose backoff ended, in order (an
+    %% entry no longer `ready' is skipped when popped); the resend workers in
+    %% flight (at most ?MAX_UNACKED_INFLIGHT); the keys whose resend in flight a
+    %% newer event superseded (its result is dropped); the size last reported
+    %% on the gauge; and the backoff settings.
+    notify_unacked = #{} :: #{yuzu_gw_notify_queue:key() => unacked()},
+    notify_unacked_ready = queue:new() :: queue:queue(yuzu_gw_notify_queue:key()),
+    notify_unacked_pids = #{} :: #{pid() => yuzu_gw_notify_queue:key()},
+    notify_unacked_cancelled = #{} :: #{yuzu_gw_notify_queue:key() => true},
+    notify_unacked_reported = 0 :: non_neg_integer(),
+    unacked_base_ms = ?DEFAULT_UNACKED_BASE_MS :: pos_integer(),
+    unacked_max_ms = ?DEFAULT_UNACKED_MAX_MS :: pos_integer(),
+    unacked_disc_window_ms = ?DEFAULT_UNACKED_DISC_WINDOW_MS :: non_neg_integer()
 }).
 
 %%%===================================================================
@@ -1005,12 +1154,22 @@ init_state(ClusterId) ->
                                        ?DEFAULT_NOTIFY_PROBE_TIMEOUT_MS,
                                        ?MIN_NOTIFY_PROBE_TIMEOUT_MS,
                                        ?MAX_NOTIFY_PROBE_TIMEOUT_MS),
+    UnackedBase = yuzu_gw_env:env_int(notify_unacked_retry_base_ms, ?DEFAULT_UNACKED_BASE_MS,
+                                      ?MIN_UNACKED_BASE_MS, ?MAX_UNACKED_BASE_MS),
+    UnackedMax = max(UnackedBase,
+                     yuzu_gw_env:env_int(notify_unacked_retry_max_ms, ?DEFAULT_UNACKED_MAX_MS,
+                                         ?MIN_UNACKED_MAX_MS, ?MAX_UNACKED_MAX_MS)),
+    UnackedWindow = yuzu_gw_env:env_int(notify_unacked_disconnected_window_ms,
+                                        ?DEFAULT_UNACKED_DISC_WINDOW_MS, 0,
+                                        ?MAX_UNACKED_DISC_WINDOW_MS),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
                 "replay_start_jitter=~bms, replay_session_guard=~bms, replay_queue_max=~b, "
-                "notify_pending_max=~b, notify_probe_timeout=~bms, cluster_id=~ts)",
+                "notify_pending_max=~b, notify_probe_timeout=~bms, cluster_id=~ts, "
+                "unacknowledged notice resend=~b..~bms, disconnected window=~bms)",
                 [Threshold, BaseTimeout, ReplayJitter, SessionGuard, QueueMax,
-                 NotifyPendingMax, ProbeTimeout, ClusterId]),
+                 NotifyPendingMax, ProbeTimeout, ClusterId, UnackedBase, UnackedMax,
+                 UnackedWindow]),
 
     %% A restarted instance counts only its own workers, so the gauges start
     %% from zero here (workers of an earlier instance are unlinked and uncounted).
@@ -1043,10 +1202,14 @@ init_state(ClusterId) ->
         session_guard_ms = SessionGuard,
         replay_queue_max = QueueMax,
         guardian_pids   = #{},
-        cluster_id      = ClusterId
+        cluster_id      = ClusterId,
+        unacked_base_ms = UnackedBase,
+        unacked_max_ms  = UnackedMax,
+        unacked_disc_window_ms = UnackedWindow
     },
     publish_breaker(State#state.cb_state, State#state.cb_gen),
     emit_notify_held(State),
+    emit_unacked_keys(0),
     erlang:send_after(?NOTIFY_HWM_TICK_MS, self(), notify_hwm_tick),
     {ok, State}.
 
@@ -1102,7 +1265,7 @@ handle_call({last_gasp, Deadline}, From, #state{mode = Mode} = State)
     cell_put(?CELL_NOTIFY_LIMIT, ?STOP_NOTIFY_INFLIGHT),
     State1 = State#state{mode = flushing, flush_from = From, flush_deadline = Deadline,
                          flush_timer = Timer, flush_sent = 0},
-    {noreply, report_notify_counts(Before, settle(State1))};
+    {noreply, report_notify_counts(Before, settle(flush_unacked(State1)))};
 handle_call({last_gasp, _Deadline}, _From, State) ->
     {reply, #{sent => 0, left => 0}, State};
 
@@ -1117,8 +1280,8 @@ handle_cast({notify_stream_status, AgentId, _SessionId, Event, _PeerAddr, _Home}
     emit_notify_lost(Event, shutdown, 1),
     {noreply, State};
 handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamHomeId},
-            #state{notify_pending = Pending, cluster_id = ClusterId} = State) ->
-    Before = notify_counts(State),
+            #state{cluster_id = ClusterId} = State0) ->
+    Before = notify_counts(State0),
     %% The peer address is the one the gateway decided when the agent registered
     %% (yuzu_gw_agent_service:register_checked/2: the TCP peer, or the address a
     %% trusted proxy vouched for, formatted by yuzu_grpc_origin; `unknown' when
@@ -1157,6 +1320,10 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamH
     %% CONNECTED followed by a DISCONNECTED for one session sends only the
     %% DISCONNECTED); two sessions of one agent are two keys.
     Key = {AgentId, maps:get(session_id, Notification), StreamHomeId},
+    %% NOTIFY-ACK: a newer event for the key supersedes a notice the server
+    %% refused and that waits for a resend (a resend in flight is waited for, by
+    %% per-key order, and its result is then dropped).
+    #state{notify_pending = Pending} = State = cancel_unacked(Key, State0),
     %% Every send in flight (the half_open probe included) may come back to be
     %% held again (a failure is requeued), so each holds a slot back, except one
     %% for this very key: a newer event for it replaces what comes back
@@ -1171,7 +1338,7 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamH
                 telemetry:execute([yuzu, gw, upstream, notify_coalesced],
                                   #{count => 1}, #{}),
                 State#state{notify_pending = Pending1};
-            {{evicted, {EvAgent, _, _}, _EvEvent}, Pending1} ->
+            {{evicted, {EvAgent, _, _} = EvKey, _EvEvent}, Pending1} ->
                 %% #5695 drop policy: the store is full and this is a
                 %% DISCONNECTED, so the oldest held CONNECTED made room. A lost
                 %% CONNECTED is put right by a full registration replay, armed
@@ -1179,7 +1346,8 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamH
                 logger:debug("Held CONNECTED for ~s evicted to hold a DISCONNECTED "
                              "(pending store full)", [yuzu_gw_env:log_text(EvAgent)]),
                 emit_notify_lost(connected, evicted, 1),
-                note_held(State#state{notify_pending = Pending1, heal_replay = true});
+                note_held(drop_held_unacked(EvKey, State#state{notify_pending = Pending1,
+                                                               heal_replay = true}));
             {full, _Unchanged} ->
                 %% HA WS-4 4.4 review fix (F2): a drop is never invisible.
                 %% Admission loss: admitting the key would bring the held keys
@@ -1432,8 +1600,10 @@ handle_info({notify_probe_timeout, _Pid, _Gen}, State) ->
 %% sending it again would be answered the same way); any other failure gives it
 %% back at the head of the store, whatever the breaker state (#5695: a failed
 %% send used to be neither requeued nor counted), unless a newer event for the
-%% key is held meanwhile (then that one wins, counted as coalesced). The slot
-%% is freed by the worker's 'DOWN'.
+%% key is held meanwhile (then that one wins, counted as coalesced). An OK
+%% answer with acknowledged=false (`unacknowledged') is not delivered: the
+%% notice goes to the retry set (settle_unacked/5). The slot is freed by the
+%% worker's 'DOWN'.
 %%
 %% The breaker: it counts like a call made from this process, but only while
 %% closed AND under the generation the worker was started in (as a proxied
@@ -1443,8 +1613,9 @@ handle_info({notify_probe_timeout, _Pid, _Gen}, State) ->
 %% before an open/half_open/closed cycle must not count against the recovered
 %% circuit), and the half_open probe (notify_probe_result, resolved by
 %% generation), not a late answer, decides when it closes. record_result/2 has
-%% no clause for an open breaker. The notice itself is settled the same way
-%% whatever its generation.
+%% no clause for an open breaker, and leaves the breaker as it is for an
+%% `unacknowledged' answer. The notice itself is settled the same way whatever
+%% its generation.
 handle_info({notify_result, Pid, Result}, #state{notify_pids = Pids} = State) ->
     Before = notify_counts(State),
     case maps:find(Pid, Pids) of
@@ -1483,13 +1654,30 @@ handle_info({'DOWN', _MonRef, process, Pid, _Reason},
     %% refilled from the pending store at once, and a replay held back for notify
     %% headroom may continue.
     Before = notify_counts(State),
-    case maps:find(Pid, Pids) of
-        {ok, {_Key, Class, _Event, _Gen}} -> emit_notify_lost(Class, crashed, 1);
-        _ -> ok
-    end,
-    State1 = State#state{notify_pids = maps:remove(Pid, Pids),
-                         guardian_pids = maps:remove(Pid, GPids)},
+    State0 = case maps:find(Pid, Pids) of
+                 {ok, {Key, Class, _Event, _Gen}} ->
+                     emit_notify_lost(Class, crashed, 1),
+                     {Retry, S} = take_unacked_attempt(Key, State),
+                     retry_ended(Retry, lost),
+                     S;
+                 _ ->
+                     State
+             end,
+    State1 = forget_unacked_pid(Pid, State0#state{notify_pids = maps:remove(Pid, Pids),
+                                                  guardian_pids = maps:remove(Pid, GPids)}),
     {noreply, report_notify_counts(Before, settle(State1))};
+
+%% NOTIFY-ACK: the backoff of a refused notice ended. Only the timer the entry
+%% still waits on counts (a cancelled or re-armed entry ignores an old one).
+handle_info({timeout, TRef, {notify_unacked_due, Key}}, #state{notify_unacked = U} = State) ->
+    case maps:find(Key, U) of
+        {ok, #{status := {waiting, TRef}} = Entry} ->
+            Before = notify_counts(State),
+            State1 = unacked_due(Key, Entry, State),
+            {noreply, report_notify_counts(Before, settle(State1))};
+        _ ->
+            {noreply, State}
+    end;
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -1674,16 +1862,17 @@ replay_outcome(registry_unavailable, SessionId, _Gen, #state{recent_replays = Re
     State1 = State#state{recent_replays = maps:remove(SessionId, Recent)},
     abort_replay("registry unavailable", State1).
 
-terminate(_Reason, #state{notify_pending = Pending, notify_pids = Pids}) ->
-    %% Whatever is still held or in flight goes with this process. A planned
-    %% stop has flushed it already (last_gasp/1); a crash or a shutdown without
-    %% one loses it: counted, and named in one line, never sent from here (the
-    %% supervisor gives this callback 5 s, no place for RPCs).
+terminate(_Reason, #state{notify_pending = Pending, notify_pids = Pids} = State) ->
+    %% Whatever is still held, in flight or waiting for a resend goes with this
+    %% process. A planned stop has flushed it already (last_gasp/1); a crash or a
+    %% shutdown without one loses it: counted, and named in one line, never sent
+    %% from here (the supervisor gives this callback 5 s, no place for RPCs).
     Held = held_by_class(Pending),
     InFlight = [C || {_K, C, _E, _G} <- maps:values(Pids)],
     [emit_notify_lost(C, shutdown, N) || {C, N} <- Held],
     [emit_notify_lost(C, shutdown, 1) || C <- InFlight],
-    case lists:sum([N || {_, N} <- Held]) + length(InFlight) of
+    Unacked = drop_unacked(State),
+    case lists:sum([N || {_, N} <- Held]) + length(InFlight) + Unacked of
         0 -> ok;
         Lost -> logger:warning("Upstream client stopping with ~b stream-status notification(s) "
                                "not sent", [Lost])
@@ -1776,12 +1965,23 @@ format_status(Status) ->
 
 redact_state(#state{replay_queue = Queue, recent_replays = Recent,
                     notify_pending = Pending, notify_probe = Probe, notify_pids = NPids,
-                    replay_pids = RPids, replay_walk = Walk} = State)
-  when is_list(Queue), is_map(Recent), is_map(RPids), is_map(NPids) ->
+                    replay_pids = RPids, replay_walk = Walk,
+                    notify_unacked = U, notify_unacked_ready = UReady,
+                    notify_unacked_pids = UPids, notify_unacked_cancelled = UCancelled} = State)
+  when is_list(Queue), is_map(Recent), is_map(RPids), is_map(NPids),
+       is_map(U), is_map(UPids), is_map(UCancelled) ->
     Fields = maps:from_list(lists:zip(record_info(fields, state),
                                       tl(tuple_to_list(State)))),
+    %% The retry set holds held events (session ids, peer addresses) and keys:
+    %% sizes only, like the pending store.
     (maps:without([replay_queue, recent_replays, notify_pending, notify_probe,
-                   replay_pids, replay_walk, notify_pids], Fields))#{
+                   replay_pids, replay_walk, notify_pids, notify_unacked,
+                   notify_unacked_ready, notify_unacked_pids, notify_unacked_cancelled],
+                  Fields))#{
+        notify_unacked_len => map_size(U),
+        notify_unacked_ready_len => queue_len(UReady),
+        notify_unacked_inflight => map_size(UPids),
+        notify_unacked_cancelled_len => map_size(UCancelled),
         notify_inflight => map_size(NPids),
         replay_queue_len => length(Queue),
         replay_inflight => map_size(RPids),
@@ -1797,6 +1997,12 @@ redact_state(_Other) ->
 %% callback stays total.
 notify_pending_len(Pending) ->
     try yuzu_gw_notify_queue:size(Pending)
+    catch error:_ -> '$redacted'
+    end.
+
+%% The length of a queue, or '$redacted' for a value that is not one.
+queue_len(Q) ->
+    try queue:len(Q)
     catch error:_ -> '$redacted'
     end.
 
@@ -1906,6 +2112,12 @@ record_result({error, _}, State) ->
 record_result({local_error, _}, State) ->
     %% The request could not be encoded here and never left the gateway: not a
     %% fact about the upstream, so neither a success nor a failure.
+    State;
+record_result(unacknowledged, State) ->
+    %% NOTIFY-ACK: the server answered a notification acknowledged=false. It
+    %% answered, so it is not failing; it did not record the notice, so this is
+    %% no proof of recovery either (it must not wipe out real failures, nor
+    %% close a half_open breaker): the state is untouched.
     State.
 
 %% @doc A success: the consecutive failures are over. Nothing is replayed (see
@@ -1993,12 +2205,14 @@ peer_addr_size(Addr) when is_binary(Addr) -> byte_size(Addr);
 peer_addr_size(_Addr) -> 0.
 
 %% @doc Send held notifications, first in first out, subject to the breaker.
-%% Closed: drain up to the notify budget. Open: nothing is sent, every entry
-%% stays held. Half_open: only the single generation-aware probe is sent (the
-%% head held entry, one at a time) and every other entry stays held until the
-%% probe resolves. Called at the end of every handler that can free a slot,
-%% close the breaker or add an entry, so there is one send path and a new
-%% arrival never overtakes a held one.
+%% Closed: drain up to the notify budget, the pending store first, then the
+%% resends of refused notices into the slots left (at most
+%% ?MAX_UNACKED_INFLIGHT of them). Open: nothing is sent, every entry stays
+%% held. Half_open: only the single generation-aware probe is sent (the head
+%% held entry, or a due resend when nothing is held, one at a time) and every
+%% other entry stays held until the probe resolves. Called at the end of every
+%% handler that can free a slot, close the breaker or add an entry, so there is
+%% one send path and a new arrival never overtakes a held one.
 -spec drain(#state{}) -> #state{}.
 drain(#state{mode = flushed} = State) ->
     State;
@@ -2007,8 +2221,28 @@ drain(#state{mode = flushing, cb_state = CbState} = State) when CbState =/= clos
     %% The breaker is not consulted or moved (count_flushed/2).
     Drained = drain(State#state{cb_state = closed}),
     Drained#state{cb_state = CbState};
-drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
-             cb_gen = Gen} = State) ->
+drain(#state{cb_state = closed} = State) ->
+    drain_unacked(drain_fresh(State));
+drain(#state{cb_state = half_open, notify_probe = undefined, notify_pids = Pids,
+             notify_pending = Pending} = State)
+        when map_size(Pids) < ?MAX_NOTIFY_INFLIGHT ->
+    case yuzu_gw_notify_queue:take(Pending) of
+        empty ->
+            %% Nothing held: a due resend is the probe, so a breaker that
+            %% half-opened with only refused notices waiting is still decided.
+            case take_ready_unacked(State) of
+                {none, State1}            -> State1;
+                {Key, Event, State1} -> start_probe(Key, Event, true, State1)
+            end;
+        {Key, Event, Pending1} ->
+            start_probe(Key, Event, false,
+                        mark_unacked_taken(Key, State#state{notify_pending = Pending1}))
+    end;
+drain(State) ->
+    State.
+
+%% The closed drain of the pending store, up to the notify budget.
+drain_fresh(#state{notify_pids = Pids, notify_pending = Pending} = State) ->
     case map_size(Pids) < notify_limit_now(State) of
         false ->
             State;
@@ -2024,65 +2258,91 @@ drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
                         true ->
                             State#state{notify_pending = Pending0};
                         false ->
-                            {Key, {AgentId, Notification} = Ev, Pending1} =
-                                yuzu_gw_notify_queue:take(Pending0),
-                            Server = self(),
-                            Timeout = notify_rpc_timeout(State),
-                            {Pid, _MonRef} = spawn_monitor(fun() ->
-                                Result = do_rpc('NotifyStreamStatus', Notification,
-                                                notify_stream, #{}, Timeout),
-                                case public_result(Result) of
-                                    {ok, _} -> ok;
-                                    {error, Reason} ->
-                                        logger:warning("Failed to notify stream status for ~s: ~p",
-                                                       [yuzu_gw_env:log_text(AgentId), Reason])
-                                end,
-                                %% Sent before the worker exits, so it reaches this
-                                %% process ahead of the 'DOWN' that frees the slot.
-                                Server ! {notify_result, self(), Result}
-                            end),
-                            drain(State#state{notify_pending = Pending1,
-                                              notify_pids = Pids#{Pid => {Key, class_of(Notification), Ev, Gen}}})
+                            {Key, Ev, Pending1} = yuzu_gw_notify_queue:take(Pending0),
+                            State1 = mark_unacked_taken(Key, State#state{notify_pending = Pending1}),
+                            {_Pid, State2} = spawn_notify(Key, Ev, State1),
+                            drain_fresh(State2)
                     end
             end
-    end;
-drain(#state{cb_state = half_open, notify_probe = undefined, notify_pids = Pids,
-             notify_pending = Pending, cb_gen = Gen,
-             notify_probe_timeout_ms = ProbeTimeout} = State)
-        when map_size(Pids) < ?MAX_NOTIFY_INFLIGHT ->
-    case yuzu_gw_notify_queue:take(Pending) of
-        empty ->
+    end.
+
+%% NOTIFY-ACK: the due resends, into the slots the pending store left, at most
+%% ?MAX_UNACKED_INFLIGHT in flight. Not during a planned stop's last gasp
+%% (flush_unacked/1 has dealt with the retry set by then).
+drain_unacked(#state{mode = flushing} = State) ->
+    State;
+drain_unacked(#state{notify_pids = Pids, notify_unacked_pids = UPids} = State) ->
+    case map_size(Pids) < notify_limit_now(State) andalso
+         map_size(UPids) < ?MAX_UNACKED_INFLIGHT of
+        false ->
             State;
-        {Key, {AgentId, Notification} = Event, Pending1} ->
-            %% The probe: the head held entry, sent on a monitored worker like
-            %% any other, but it reports its result to this process (send before
-            %% exit, so the result reaches the mailbox before the 'DOWN'). The
-            %% message carries the result only, never the event.
-            Server = self(),
-            {Pid, MonRef} = spawn_monitor(fun() ->
-                Result = do_rpc('NotifyStreamStatus', Notification, notify_stream),
-                case Result of
-                    {ok, _} -> ok;
-                    {error, Reason} ->
-                        logger:warning("Failed to notify stream status for ~s: ~p",
-                                       [yuzu_gw_env:log_text(AgentId), Reason]);
-                    {local_error, _} ->
-                        %% Logged once, by resolve_probe/3, when it evicts the event.
-                        ok
-                end,
-                Server ! {notify_probe_result, self(), Gen, Result}
-            end),
-            %% The gateway's own deadline for the probe (the client's bounds are
-            %% library defaults an endpoint setting can remove): resolved or
-            %% cancelled with the probe, see handle_info({notify_probe_timeout, ...}).
-            Timer = erlang:send_after(ProbeTimeout, Server, {notify_probe_timeout, Pid, Gen}),
-            State#state{notify_pending = Pending1,
-                        notify_pids = Pids#{Pid => {Key, class_of(Notification), Event, Gen}},
-                        notify_probe = #{pid => Pid, mref => MonRef, timer => Timer,
-                                         gen => Gen, key => Key, event => Event}}
-    end;
-drain(State) ->
-    State.
+        true ->
+            case take_ready_unacked(State) of
+                {none, State1} ->
+                    State1;
+                {Key, Ev, State1} ->
+                    {Pid, State2} = spawn_notify(Key, Ev, State1),
+                    drain_unacked(State2#state{notify_unacked_pids = UPids#{Pid => Key}})
+            end
+    end.
+
+%% One notification send on its own monitored worker. The result goes to this
+%% process before the worker exits, so it is in the mailbox ahead of the 'DOWN'
+%% that frees the slot.
+spawn_notify(Key, {AgentId, Notification} = Ev, #state{notify_pids = Pids, cb_gen = Gen} = State) ->
+    Server = self(),
+    Timeout = notify_rpc_timeout(State),
+    {Pid, _MonRef} = spawn_monitor(fun() ->
+        Result = ack_result(do_rpc('NotifyStreamStatus', Notification, notify_stream, #{},
+                                   Timeout)),
+        log_notify_result(AgentId, Result),
+        Server ! {notify_result, self(), Result}
+    end),
+    {Pid, State#state{notify_pids = Pids#{Pid => {Key, class_of(Notification), Ev, Gen}}}}.
+
+%% The half_open probe: the head held entry (or a due resend), sent on a
+%% monitored worker like any other, but it reports its result to this process
+%% (send before exit, so the result reaches the mailbox before the 'DOWN'). The
+%% message carries the result only, never the event.
+start_probe(Key, {AgentId, Notification} = Event, IsResend,
+            #state{notify_pids = Pids, notify_unacked_pids = UPids, cb_gen = Gen,
+                   notify_probe_timeout_ms = ProbeTimeout} = State) ->
+    Server = self(),
+    {Pid, MonRef} = spawn_monitor(fun() ->
+        Result = ack_result(do_rpc('NotifyStreamStatus', Notification, notify_stream)),
+        case Result of
+            {local_error, _} ->
+                %% Logged once, by resolve_probe/3, when it evicts the event.
+                ok;
+            _ ->
+                log_notify_result(AgentId, Result)
+        end,
+        Server ! {notify_probe_result, self(), Gen, Result}
+    end),
+    %% The gateway's own deadline for the probe (the client's bounds are
+    %% library defaults an endpoint setting can remove): resolved or
+    %% cancelled with the probe, see handle_info({notify_probe_timeout, ...}).
+    Timer = erlang:send_after(ProbeTimeout, Server, {notify_probe_timeout, Pid, Gen}),
+    UPids1 = case IsResend of
+                 true  -> UPids#{Pid => Key};
+                 false -> UPids
+             end,
+    State#state{notify_pids = Pids#{Pid => {Key, class_of(Notification), Event, Gen}},
+                notify_unacked_pids = UPids1,
+                notify_probe = #{pid => Pid, mref => MonRef, timer => Timer,
+                                 gen => Gen, key => Key, event => Event}}.
+
+%% The warning a failed notification worker logs (a refusal is logged by this
+%% process, rate limited, see settle_unacked/5).
+log_notify_result(_AgentId, unacknowledged) ->
+    ok;
+log_notify_result(AgentId, Result) ->
+    case public_result(Result) of
+        {ok, _} -> ok;
+        {error, Reason} ->
+            logger:warning("Failed to notify stream status for ~s: ~p",
+                           [yuzu_gw_env:log_text(AgentId), Reason])
+    end.
 
 %% @doc Retire the probe attempt: clear the record and free its slot, decide the
 %% event, then (separately) decide the breaker. Called once per probe, by the
@@ -2090,7 +2350,8 @@ drain(State) ->
 %%
 %% The event: ok retires it; an error gives it back at the head of the store
 %% (the reserved slot guarantees it fits; a newer event for the same key wins and
-%% the old one is dropped and counted).
+%% the old one is dropped and counted); an acknowledged=false answer sends it to
+%% the retry set (NOTIFY-ACK), like any refused send.
 %%
 %% A local encode exception ({local_error, _}) evicts the event instead and
 %% leaves the breaker untouched (the first clause).
@@ -2098,11 +2359,13 @@ drain(State) ->
 %% The breaker: moved only when it is still half_open AND Gen is the generation
 %% now current. In any other state the result is stale (a call path RPC closed or
 %% reopened the breaker meanwhile, or it went half_open again): the breaker is
-%% not touched, and on_success/on_failure have no clause for an open breaker.
--spec resolve_probe(non_neg_integer(), rpc_result(), #state{}) -> #state{}.
+%% not touched, and on_success/on_failure have no clause for an open breaker. A
+%% refusal does not move it either (record_result/2): the breaker stays
+%% half_open, and the next held entry (or due resend) is probed at once.
+-spec resolve_probe(non_neg_integer(), notify_result(), #state{}) -> #state{}.
 resolve_probe(_Gen, {local_error, {Class, Why}},
               #state{notify_probe = #{pid := Pid, mref := MonRef, timer := Timer,
-                                      event := {AgentId, Notification}},
+                                      key := Key, event := {AgentId, Notification}},
                      notify_pids = Pids} = State) ->
     %% The head held entry could not be encoded here, and the same payload fails
     %% the same way on every probe: requeueing it would reopen the breaker for
@@ -2114,11 +2377,11 @@ resolve_probe(_Gen, {local_error, {Class, Why}},
     logger:warning("Evicted held stream status notification for ~s: it cannot be "
                    "encoded (~p:~p); the circuit breaker is not affected",
                    [yuzu_gw_env:log_text(AgentId), Class, Why]),
-    State#state{notify_probe = undefined,
-                notify_pids = maps:remove(Pid, Pids)};
+    retire_probe_event(Pid, Key, lost, State#state{notify_probe = undefined,
+                                                    notify_pids = maps:remove(Pid, Pids)});
 resolve_probe(_Gen, {error, {Status, _Message}},
               #state{notify_probe = #{pid := Pid, mref := MonRef, timer := Timer,
-                                      event := {_AgentId, Notification}},
+                                      key := Key, event := {_AgentId, Notification}},
                      notify_pids = Pids} = State) when ?IS_REQUEST_FAULT(Status) ->
     %% The server answered that this notification itself was wrong. Requeueing it
     %% would be answered the same way by every probe, for ever (the breaker is
@@ -2127,36 +2390,46 @@ resolve_probe(_Gen, {error, {Status, _Message}},
     %% breaker is left as it is, as for a local encode exception.
     retire_probe(MonRef, Timer),
     emit_notify_lost(class_of(Notification), rejected, 1),
-    State#state{notify_probe = undefined,
-                notify_pids = maps:remove(Pid, Pids)};
+    retire_probe_event(Pid, Key, lost, State#state{notify_probe = undefined,
+                                                    notify_pids = maps:remove(Pid, Pids)});
 resolve_probe(Gen, Result,
               #state{notify_probe = #{pid := Pid, mref := MonRef, timer := Timer,
                                       key := Key, event := Event},
-                     notify_pids = Pids, notify_pending = Pending,
-                     cb_state = CbState, cb_gen = CbGen} = State) ->
+                     notify_pids = Pids} = State) ->
     retire_probe(MonRef, Timer),
-    Pending1 =
+    State0 = forget_unacked_pid(Pid, State#state{notify_probe = undefined,
+                                                 notify_pids = maps:remove(Pid, Pids)}),
+    {Retry, State1} = take_unacked_attempt(Key, State0),
+    Class = class_of(element(2, Event)),
+    State2 =
         case Result of
             {ok, _} ->
-                Pending;
+                retry_ended(Retry, acknowledged),
+                State1;
+            unacknowledged ->
+                settle_unacked(Retry, Key, Class, Event, State1);
             {error, _} ->
-                case yuzu_gw_notify_queue:push_front(Key, Event, class_of(element(2, Event)),
-                                                     Pending) of
+                #state{notify_pending = Pending} = State1,
+                case yuzu_gw_notify_queue:push_front(Key, Event, Class, Pending) of
                     {inserted, Q} ->
-                        Q;
+                        hold_unacked(Retry, Key, State1#state{notify_pending = Q});
                     {superseded, Q} ->
                         telemetry:execute([yuzu, gw, upstream, notify_coalesced],
                                           #{count => 1}, #{}),
-                        Q
+                        State1#state{notify_pending = Q}
                 end
         end,
-    State1 = State#state{notify_probe = undefined,
-                         notify_pids = maps:remove(Pid, Pids),
-                         notify_pending = Pending1},
+    #state{cb_state = CbState, cb_gen = CbGen} = State2,
     case CbState =:= half_open andalso Gen =:= CbGen of
-        true  -> record_result(Result, State1);
-        false -> State1
+        true  -> record_result(Result, State2);
+        false -> State2
     end.
+
+%% A retired probe's event: its resend slot and retry-set entry go too.
+retire_probe_event(Pid, Key, Outcome, State) ->
+    {Retry, State1} = take_unacked_attempt(Key, forget_unacked_pid(Pid, State)),
+    retry_ended(Retry, Outcome),
+    State1.
 
 %% @doc The probe is over: drop its monitor (and any 'DOWN' already delivered)
 %% and its deadline timer. A timeout message that was already delivered is
@@ -2167,30 +2440,332 @@ retire_probe(MonRef, Timer) ->
     _ = erlang:cancel_timer(Timer),
     ok.
 
-%% @doc Decide a finished send's event (see the notify_result clause).
-settle_notify(_Key, _Class, _Event, {ok, _}, State) ->
+%% @doc Decide a finished send's event (see the notify_result clause). A send
+%% that was a resend of a refused notice (or one the retry set gave back to the
+%% pending store) settles its retry-set entry too.
+-spec settle_notify(yuzu_gw_notify_queue:key(), connected | disconnected,
+                    yuzu_gw_notify_queue:event(), notify_result(), #state{}) -> #state{}.
+settle_notify(Key, Class, Event, Result, State0) ->
+    {Retry, State} = take_unacked_attempt(Key, State0),
+    settle_notify(Retry, Key, Class, Event, Result, State).
+
+settle_notify(Retry, _Key, _Class, _Event, {ok, _}, State) ->
+    retry_ended(Retry, acknowledged),
     State;
-settle_notify(_Key, Class, _Event, {local_error, _}, State) ->
+settle_notify(Retry, Key, Class, Event, unacknowledged, State) ->
+    settle_unacked(Retry, Key, Class, Event, State);
+settle_notify(Retry, _Key, Class, _Event, {local_error, _}, State) ->
     emit_notify_lost(Class, rejected, 1),
+    retry_ended(Retry, lost),
     State;
-settle_notify(_Key, Class, _Event, {error, {Status, _Message}}, State)
+settle_notify(Retry, _Key, Class, _Event, {error, {Status, _Message}}, State)
   when ?IS_REQUEST_FAULT(Status) ->
     emit_notify_lost(Class, rejected, 1),
+    retry_ended(Retry, lost),
     State;
-settle_notify(_Key, Class, _Event, {error, _}, #state{mode = flushing} = State) ->
+settle_notify(Retry, _Key, Class, _Event, {error, _}, #state{mode = flushing} = State) ->
     %% The last gasp does not retry: a failure is a notice the server will not
     %% get from this gateway.
     emit_notify_lost(Class, shutdown, 1),
+    retry_ended(Retry, lost),
     State;
-settle_notify(Key, Class, Event, {error, _}, #state{notify_pending = Pending} = State) ->
+settle_notify(Retry, Key, Class, Event, {error, _}, #state{notify_pending = Pending} = State) ->
     case yuzu_gw_notify_queue:push_front(Key, Event, Class, Pending) of
         {inserted, Pending1} ->
             telemetry:execute([yuzu, gw, upstream, notify_requeued], #{count => 1}, #{}),
-            note_held(State#state{notify_pending = Pending1});
+            hold_unacked(Retry, Key, note_held(State#state{notify_pending = Pending1}));
         {superseded, Pending1} ->
             telemetry:execute([yuzu, gw, upstream, notify_coalesced], #{count => 1}, #{}),
+            retry_ended(Retry, superseded),
             State#state{notify_pending = Pending1}
     end.
+
+%%%===================================================================
+%%% Notices the server did not acknowledge (NOTIFY-ACK, #5695)
+%%%===================================================================
+
+%% @doc A worker's result, with an OK answer of acknowledged=false told apart:
+%% the server answered, but did not record the notice. Only an explicit `false'
+%% counts (a decoded StreamStatusAck always carries the field; an OK without a
+%% decoded map is not a refusal).
+-spec ack_result(rpc_result()) -> notify_result().
+ack_result({ok, #{acknowledged := false}}) -> unacknowledged;
+ack_result(Result) -> Result.
+
+%% @doc A fresh event for Key supersedes its retry-set entry: a waiting or due
+%% resend is cancelled, one given back to the pending store is replaced there by
+%% the caller's put, and one in flight is remembered as cancelled, so its result
+%% is dropped (per-key order keeps the fresh event behind it).
+-spec cancel_unacked(yuzu_gw_notify_queue:key(), #state{}) -> #state{}.
+cancel_unacked(Key, #state{notify_unacked = U, notify_unacked_cancelled = C} = State) ->
+    case maps:take(Key, U) of
+        error ->
+            State;
+        {#{status := inflight}, U1} ->
+            emit_unacked_ended(superseded),
+            State#state{notify_unacked = U1, notify_unacked_cancelled = C#{Key => true}};
+        {#{status := Status}, U1} ->
+            cancel_unacked_timer(Status),
+            emit_unacked_ended(superseded),
+            State#state{notify_unacked = U1}
+    end.
+
+cancel_unacked_timer({waiting, TRef}) ->
+    _ = erlang:cancel_timer(TRef),
+    ok;
+cancel_unacked_timer(_Status) ->
+    ok.
+
+%% @doc The pending store evicted Key's event: an entry that had given it back
+%% to the store has nothing left to send.
+-spec drop_held_unacked(yuzu_gw_notify_queue:key(), #state{}) -> #state{}.
+drop_held_unacked(Key, #state{notify_unacked = U} = State) ->
+    case maps:find(Key, U) of
+        {ok, #{status := held}} ->
+            emit_unacked_ended(lost),
+            State#state{notify_unacked = maps:remove(Key, U)};
+        _ ->
+            State
+    end.
+
+%% @doc Key's event was taken from the pending store to be sent: an entry that
+%% had given it back there is in flight again.
+-spec mark_unacked_taken(yuzu_gw_notify_queue:key(), #state{}) -> #state{}.
+mark_unacked_taken(Key, #state{notify_unacked = U} = State) ->
+    case maps:find(Key, U) of
+        {ok, #{status := held} = Entry} ->
+            State#state{notify_unacked = U#{Key := Entry#{status := inflight}}};
+        _ ->
+            State
+    end.
+
+%% @doc A send for Key resolved (a result, or its worker died): what the retry
+%% set knew of it. `none': a first send; `cancelled': a resend a newer event
+%% superseded; `{retry, Entry}': a resend, its entry removed (the caller puts
+%% it back if it is still owed).
+-spec take_unacked_attempt(yuzu_gw_notify_queue:key(), #state{}) ->
+          {none | cancelled | {retry, unacked()}, #state{}}.
+take_unacked_attempt(Key, #state{notify_unacked = U, notify_unacked_cancelled = C} = State) ->
+    case maps:take(Key, C) of
+        {true, C1} ->
+            {cancelled, State#state{notify_unacked_cancelled = C1}};
+        error ->
+            case maps:find(Key, U) of
+                {ok, #{status := inflight} = Entry} ->
+                    {{retry, Entry}, State#state{notify_unacked = maps:remove(Key, U)}};
+                _ ->
+                    {none, State}
+            end
+    end.
+
+%% How a resend's entry ended, counted once per entry (a cancelled one was
+%% counted when it was cancelled).
+retry_ended({retry, _Entry}, Outcome) -> emit_unacked_ended(Outcome);
+retry_ended(_NoneOrCancelled, _Outcome) -> ok.
+
+%% A failed resend was given back to the pending store: its entry is kept (as
+%% `held'), so the backoff goes on from where it was if it is refused again.
+hold_unacked({retry, Entry}, Key, #state{notify_unacked = U} = State) ->
+    State#state{notify_unacked = U#{Key => Entry#{status := held}}};
+hold_unacked(_NoneOrCancelled, _Key, State) ->
+    State.
+
+%% A notify worker is done: its resend slot is free.
+forget_unacked_pid(Pid, #state{notify_unacked_pids = UPids} = State) ->
+    State#state{notify_unacked_pids = maps:remove(Pid, UPids)}.
+
+%% @doc The server answered acknowledged=false: the notice was not delivered.
+%% Counted, then held for a resend after a backoff, unless
+%%   - a newer event for the key superseded it (dropped);
+%%   - a planned stop's last gasp is running (lost, `unacknowledged');
+%%   - it is a DISCONNECTED first refused more than the window ago (lost);
+%%   - the retry set is full (notify_pending_max entries; lost).
+%% A CONNECTED has no window: it is resent while this node holds its session
+%% (unacked_due/3). The breaker is not touched (record_result/2).
+-spec settle_unacked(none | cancelled | {retry, unacked()}, yuzu_gw_notify_queue:key(),
+                     connected | disconnected, yuzu_gw_notify_queue:event(), #state{}) ->
+          #state{}.
+settle_unacked(Retry, Key, Class, Event, State) ->
+    telemetry:execute([yuzu, gw, upstream, notify_unacknowledged], #{count => 1},
+                      #{event => Class}),
+    settle_unacked1(Retry, Key, Class, Event, State).
+
+settle_unacked1(cancelled, _Key, _Class, _Event, State) ->
+    State;
+settle_unacked1(Retry, _Key, Class, {AgentId, _}, #state{mode = flushing} = State) ->
+    yuzu_gw_safe_call:warn_limited(notify_unacknowledged,
+                                   "Server did not record the ~s stream status notice for ~s "
+                                   "(acknowledged=false) during the planned-stop flush; not "
+                                   "sent again", [Class, yuzu_gw_env:log_text(AgentId)]),
+    emit_notify_lost(Class, unacknowledged, 1),
+    retry_ended(Retry, lost),
+    State;
+settle_unacked1(Retry, Key, Class, {AgentId, _} = Event,
+                #state{notify_pending = Pending, notify_unacked = U,
+                       notify_pending_max = Cap, unacked_base_ms = Base, unacked_max_ms = Max,
+                       unacked_disc_window_ms = Window} = State) ->
+    Now = erlang:monotonic_time(millisecond),
+    {First, Prev} = case Retry of
+                        {retry, #{first := F, delay := D}} -> {F, D};
+                        none -> {Now, undefined}
+                    end,
+    Over = Class =:= disconnected andalso Now - First >= Window,
+    Full = Retry =:= none andalso map_size(U) >= Cap,
+    case yuzu_gw_notify_queue:is_held(Key, Pending) of
+        true ->
+            %% A newer event for the key is held already (it would have cancelled
+            %% this entry; kept for safety): it wins.
+            retry_ended(Retry, superseded),
+            State;
+        false when Over; Full ->
+            yuzu_gw_safe_call:warn_limited(notify_unacknowledged,
+                                           "Server did not record the ~s stream status notice for "
+                                           "~s (acknowledged=false); giving up after ~b ms (~s)",
+                                           [Class, yuzu_gw_env:log_text(AgentId), Now - First,
+                                            case Over of
+                                                true -> "the disconnected window passed";
+                                                false -> "the retry set is full"
+                                            end]),
+            emit_notify_lost(Class, unacknowledged, 1),
+            retry_ended(Retry, lost),
+            State;
+        false ->
+            Delay = next_unacked_delay(Prev, Base, Max),
+            TRef = erlang:start_timer(Delay, self(), {notify_unacked_due, Key}),
+            yuzu_gw_safe_call:warn_limited(notify_unacknowledged,
+                                           "Server did not record the ~s stream status notice for "
+                                           "~s (acknowledged=false); sending it again in ~b ms",
+                                           [Class, yuzu_gw_env:log_text(AgentId), Delay]),
+            State#state{notify_unacked = U#{Key => #{event => Event, class => Class,
+                                                     delay => Delay, first => First,
+                                                     status => {waiting, TRef}}}}
+    end.
+
+%% @doc The next backoff delay: decorrelated jitter, min(Max, uniform(Base,
+%% 3 x Prev)), from Base for the first refusal.
+-spec next_unacked_delay(undefined | pos_integer(), pos_integer(), pos_integer()) ->
+          pos_integer().
+next_unacked_delay(undefined, Base, Max) ->
+    next_unacked_delay(Base, Base, Max);
+next_unacked_delay(Prev, Base, Max) ->
+    Hi = max(Base, 3 * Prev),
+    min(Max, Base + rand:uniform(Hi - Base + 1) - 1).
+
+%% @doc A backoff ended. A CONNECTED is resent only while this node still holds
+%% its session (a session that ended or was replaced has nothing to announce;
+%% its DISCONNECTED normally cancelled the entry already). A registry that is
+%% not running does not stop it: that is not evidence the session is gone.
+-spec unacked_due(yuzu_gw_notify_queue:key(), unacked(), #state{}) -> #state{}.
+unacked_due({AgentId, SessionId, _Home} = Key, #{class := Class} = Entry,
+            #state{notify_unacked = U, notify_unacked_ready = Q} = State) ->
+    Held = Class =:= disconnected orelse
+           case yuzu_gw_registry:lookup_local_session(AgentId) of
+               {ok, {_Pid, S}} -> ensure_binary(S) =:= SessionId;
+               error -> false;
+               {error, unavailable} -> true
+           end,
+    case Held of
+        true ->
+            Q1 = queue:in(Key, Q),
+            Q2 = case queue:len(Q1) > 2 * map_size(U) + 64 of
+                     true  -> queue:filter(fun(K) -> is_ready_unacked(K, U) end, Q1);
+                     false -> Q1
+                 end,
+            State#state{notify_unacked = U#{Key := Entry#{status := ready}},
+                        notify_unacked_ready = Q2};
+        false ->
+            emit_unacked_ended(session_gone),
+            State#state{notify_unacked = maps:remove(Key, U)}
+    end.
+
+is_ready_unacked(Key, U) ->
+    case maps:find(Key, U) of
+        {ok, #{status := ready}} -> true;
+        _ -> false
+    end.
+
+%% @doc The next due resend, marked in flight, or `none'. Keys that are no
+%% longer due (cancelled or re-armed since they were queued) are skipped. A key
+%% with a send in flight cannot be due (its entry would be `inflight'); one is
+%% left queued, for safety.
+-spec take_ready_unacked(#state{}) ->
+          {none, #state{}} | {yuzu_gw_notify_queue:key(), yuzu_gw_notify_queue:event(), #state{}}.
+take_ready_unacked(#state{notify_unacked = U, notify_unacked_ready = Q,
+                          notify_pids = Pids} = State) ->
+    case queue:out(Q) of
+        {empty, _} ->
+            {none, State};
+        {{value, Key}, Q1} ->
+            case maps:find(Key, U) of
+                {ok, #{status := ready, event := Event} = Entry} ->
+                    case key_in_flight(Key, Pids) of
+                        false ->
+                            {Key, Event,
+                             State#state{notify_unacked = U#{Key := Entry#{status := inflight}},
+                                         notify_unacked_ready = Q1}};
+                        true ->
+                            {none, State}
+                    end;
+                _ ->
+                    take_ready_unacked(State#state{notify_unacked_ready = Q1})
+            end
+    end.
+
+%% @doc A planned stop's last gasp begins. A refused CONNECTED that waits for a
+%% resend is dropped (the session ends with the stop; counted lost, shutdown).
+%% A refused DISCONNECTED that waits is put at the head of the pending store and
+%% sent with the rest (a stale CONNECTED left at the server is the worse
+%% outcome). Entries in flight or given back to the store stay: their results
+%% settle them, and nothing is resent from here on.
+-spec flush_unacked(#state{}) -> #state{}.
+flush_unacked(#state{notify_unacked = U} = State) ->
+    State1 = maps:fold(fun flush_unacked_entry/3, State, U),
+    State1#state{notify_unacked_ready = queue:new()}.
+
+flush_unacked_entry(_Key, #{status := Status}, State) when Status =:= inflight;
+                                                           Status =:= held ->
+    State;
+flush_unacked_entry(Key, #{status := Status, class := connected},
+                    #state{notify_unacked = U} = State) ->
+    cancel_unacked_timer(Status),
+    emit_notify_lost(connected, shutdown, 1),
+    emit_unacked_ended(lost),
+    State#state{notify_unacked = maps:remove(Key, U)};
+flush_unacked_entry(Key, #{status := Status, class := disconnected, event := Event} = Entry,
+                    #state{notify_unacked = U, notify_pending = Pending} = State) ->
+    cancel_unacked_timer(Status),
+    case yuzu_gw_notify_queue:push_front(Key, Event, disconnected, Pending) of
+        {inserted, Pending1} ->
+            note_held(State#state{notify_unacked = U#{Key := Entry#{status := held}},
+                                  notify_pending = Pending1});
+        {superseded, Pending1} ->
+            emit_unacked_ended(superseded),
+            State#state{notify_unacked = maps:remove(Key, U), notify_pending = Pending1}
+    end.
+
+%% @doc The retry set is dropped with the process or the end of a flush. What
+%% only it holds (entries waiting or due) is counted lost (shutdown) here, by
+%% class; entries in flight or given back to the store are counted with those.
+-spec drop_unacked(#state{}) -> non_neg_integer().
+drop_unacked(#state{notify_unacked = U}) ->
+    maps:fold(fun(_Key, #{status := Status, class := Class}, N) ->
+                      emit_unacked_ended(lost),
+                      case Status of
+                          S when S =:= inflight; S =:= held ->
+                              N;
+                          _ ->
+                              cancel_unacked_timer(Status),
+                              emit_notify_lost(Class, shutdown, 1),
+                              N + 1
+                      end
+              end, 0, U).
+
+emit_unacked_keys(N) ->
+    telemetry:execute([yuzu, gw, upstream, notify_unacked], #{keys => N}, #{}).
+
+emit_unacked_ended(Outcome) ->
+    telemetry:execute([yuzu, gw, upstream, notify_unacked_ended], #{count => 1},
+                      #{outcome => Outcome}).
 
 %% The slots held back for Key's admission: one per send in flight whose event
 %% may come back (not yet resolved), except one for Key itself.
@@ -2236,7 +2811,7 @@ end_flush(#state{flush_from = From, flush_timer = Timer, flush_sent = Sent,
     _ = erlang:cancel_timer(Timer),
     Held = held_by_class(Pending),
     InFlight = [C || {_K, C, _E, _G} <- maps:values(Pids)],
-    Left = lists:sum([N || {_, N} <- Held]) + length(InFlight),
+    Left = lists:sum([N || {_, N} <- Held]) + length(InFlight) + drop_unacked(State),
     [emit_notify_lost(C, shutdown, N) || {C, N} <- Held],
     [emit_notify_lost(C, shutdown, 1) || C <- InFlight],
     case Left of
@@ -2251,7 +2826,9 @@ end_flush(#state{flush_from = From, flush_timer = Timer, flush_sent = Sent,
     Resolved = maps:map(fun(_Pid, _V) -> resolved end, Pids),
     State#state{mode = flushed, flush_from = undefined, flush_timer = undefined,
                 notify_pids = Resolved,
-                notify_pending = yuzu_gw_notify_queue:new(yuzu_gw_notify_queue:cap(Pending))}.
+                notify_pending = yuzu_gw_notify_queue:new(yuzu_gw_notify_queue:cap(Pending)),
+                notify_unacked = #{}, notify_unacked_ready = queue:new(),
+                notify_unacked_pids = #{}, notify_unacked_cancelled = #{}}.
 
 %% Held events by class, read once at the end of a flush or in terminate/2.
 held_by_class(Pending) ->
@@ -2312,7 +2889,9 @@ notify_counts(#state{notify_pending = Pending, notify_pids = Pids}) ->
 %% @doc Report the gauges once per handler, and only when the handler changed
 %% either number. Before is notify_counts/1 taken at the top of the handler.
 -spec report_notify_counts({non_neg_integer(), non_neg_integer()}, #state{}) -> #state{}.
-report_notify_counts(Before, #state{notify_pids = Pids, guardian_pids = GPids} = State) ->
+report_notify_counts(Before, #state{notify_pids = Pids, guardian_pids = GPids,
+                                    notify_unacked = U,
+                                    notify_unacked_reported = Reported} = State) ->
     %% The lane figures the pressure sampler reads (lane_snapshot/0) follow the
     %% worker sets, which only the handlers that end here change.
     cell_put(?CELL_NOTIFY, map_size(Pids)),
@@ -2321,7 +2900,12 @@ report_notify_counts(Before, #state{notify_pids = Pids, guardian_pids = GPids} =
         Before                  -> ok;
         {Pending, Inflight}     -> emit_notify_queue(Pending, Inflight)
     end,
-    State.
+    %% NOTIFY-ACK: the keys awaiting a resend, reported when it changed.
+    case map_size(U) of
+        Reported -> State;
+        Keys     -> emit_unacked_keys(Keys),
+                    State#state{notify_unacked_reported = Keys}
+    end.
 
 emit_notify_queue(Pending, Inflight) ->
     telemetry:execute([yuzu, gw, upstream, notify_queue],
