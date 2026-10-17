@@ -50,18 +50,25 @@
 #include "test_offload_target_store_pg_helper.hpp"
 #include "test_webhook_store_pg_helper.hpp"
 #include "typed_inventory_sources.hpp"
+#include "update_registry.hpp"
 #include "webhook_store.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <random>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -69,6 +76,7 @@
 #include <vector>
 
 using yuzu::server::AuditStore;
+using yuzu::server::kRegisterInvalidAgentIdReasons;
 using yuzu::server::NotificationStore;
 using yuzu::server::OffloadAuthType;
 using yuzu::server::OffloadTargetStore;
@@ -1171,6 +1179,537 @@ TEST_CASE("Register: rejects empty agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-
     CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == 1.0);
 }
 
+TEST_CASE("Register: rejects an agent_id with an embedded NUL with INVALID_ARGUMENT",
+          "[pg][agent_service][register][failclosed]") {
+    // libpq text binds are NUL-terminated C strings, so an id containing a NUL byte is refused
+    // at the door with its own metric reason, and the length reason must NOT tick (a NUL id is
+    // within the length bound).
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(std::string("agent-a\0x", 9));
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", yuzu::Labels{{"reason", "nul"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_register_invalid_agent_id_total", yuzu::Labels{{"reason", "length"}})
+              .value() == 0.0);
+}
+
+TEST_CASE("ProxyRegister: rejects an agent_id with an embedded NUL with INVALID_ARGUMENT",
+          "[pg][agent_service][register][gateway][failclosed]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(std::string("agent-a\0x", 9));
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    yuzu::Labels labels{{"reason", "nul"}, {"source", "gateway_proxy"}};
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == 1.0);
+    CHECK(h.registry.trusted_gateway_peer_count() == 0);
+}
+
+TEST_CASE("Register: logs a claimed agent_id with control bytes neutralised",
+          "[pg][agent_service][register][failclosed]") {
+    // The enrollment store rejects control bytes in an agent_id only after the claimed id has
+    // reached Register, so the lines Register writes first must print it neutralised, never raw.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent x=1\nfake");
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    yuzu::test::LogCapture cap;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+    cap.stop();
+
+    CHECK_FALSE(status.ok());
+    CHECK(cap.text().find("agent_id refused by the enrollment store (control byte or ',') for "
+                          "agent agent_x_1_fake") != std::string::npos);
+    CHECK(cap.text().find("agent x=1") == std::string::npos);
+}
+
+TEST_CASE("ProxyRegister: logs a claimed agent_id with control bytes neutralised",
+          "[pg][agent_service][register][gateway][failclosed]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent x=1\nfake");
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    yuzu::test::LogCapture cap;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+    cap.stop();
+
+    CHECK_FALSE(status.ok());
+    CHECK(cap.text().find("agent_id refused by the enrollment store (control byte or ',') for "
+                          "agent agent_x_1_fake") != std::string::npos);
+    CHECK(cap.text().find("agent x=1") == std::string::npos);
+}
+
+namespace {
+
+apb::RegisterRequest make_register_request(const std::string& agent_id) {
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(agent_id);
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    return req;
+}
+
+double invalid_id_count(yuzu::MetricsRegistry& m, const char* reason, bool gateway) {
+    yuzu::Labels labels{{"reason", reason}};
+    if (gateway)
+        labels.emplace_back("source", "gateway_proxy");
+    return m.counter("yuzu_register_invalid_agent_id_total", labels).value();
+}
+
+} // namespace
+
+// The length, NUL and charset refusals name the claimed id, neutralised, so an operator can tell
+// which agent was refused; the raw form (space, '=', NUL) must never reach the line.
+TEST_CASE("Register: the length, NUL and charset refusals log the claimed id neutralised",
+          "[pg][agent_service][register][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    struct Shape {
+        std::string id;
+        std::string line;   // the refusal text that must appear
+        std::string folded; // the neutralised id that must follow it
+        std::string raw;    // a raw fragment that must not appear
+    };
+    const std::vector<Shape> shapes{
+        {"x y=" + std::string(300, 'A'), "agent_id length 304 (max 256, empty disallowed) for agent ",
+         "x_y_AAAA", "x y="},
+        {std::string("agent a\0x=1", 11), "agent_id contains an embedded NUL for agent ",
+         "agent_a_x_1", "x=1"},
+        {"agent a=1", "characters outside [A-Za-z0-9._:-] (or is only dots) for agent ",
+         "agent_a_1", "a=1"},
+    };
+    for (const auto& sh : shapes) {
+        INFO("line=" << sh.line);
+        auto req = make_register_request(sh.id);
+        apb::RegisterResponse resp;
+        yuzu::test::LogCapture cap;
+        auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+        cap.stop();
+        CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+        CHECK(cap.text().find("Register rejected: ") != std::string::npos);
+        CHECK(cap.text().find(sh.line + sh.folded) != std::string::npos);
+        CHECK(cap.text().find(sh.raw) == std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(cap.text()) == 0);
+    }
+}
+
+TEST_CASE("ProxyRegister: the length, NUL and charset refusals log the claimed id neutralised",
+          "[pg][agent_service][register][gateway][failclosed]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    struct Shape {
+        std::string id;
+        std::string line;
+        std::string folded;
+        std::string raw;
+    };
+    const std::vector<Shape> shapes{
+        {"x y=" + std::string(300, 'A'),
+         "agent_id length 304 (max 256, empty disallowed) for agent ", "x_y_AAAA", "x y="},
+        {std::string("agent a\0x=1", 11), "agent_id contains an embedded NUL for agent ",
+         "agent_a_x_1", "x=1"},
+        {"agent a=1", "characters outside [A-Za-z0-9._:-] (or is only dots) for agent ",
+         "agent_a_1", "a=1"},
+    };
+    for (const auto& sh : shapes) {
+        INFO("line=" << sh.line);
+        auto req = make_register_request(sh.id);
+        apb::RegisterResponse resp;
+        yuzu::test::LogCapture cap;
+        auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+        cap.stop();
+        CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+        CHECK(cap.text().find("ProxyRegister rejected: ") != std::string::npos);
+        CHECK(cap.text().find(sh.line + sh.folded) != std::string::npos);
+        CHECK(cap.text().find(sh.raw) == std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(cap.text()) == 0);
+    }
+}
+
+TEST_CASE("kRegisterInvalidAgentIdReasons is the closed reason set the seed function creates, "
+          "idempotently",
+          "[agent_service][register][metrics]") {
+    // This proves only that the seed function creates exactly the documented reason set (direct
+    // and gateway_proxy series, all at 0, with HELP/TYPE) and that seeding twice is harmless. It
+    // does not look at the increment sites: the "Register increment sites only use the closed
+    // reason set" case below reads their source text for that.
+    const std::vector<std::string> expected{"length", "nul", "control", "charset"};
+    const std::vector<std::string> actual(kRegisterInvalidAgentIdReasons.begin(),
+                                          kRegisterInvalidAgentIdReasons.end());
+    CHECK(actual == expected);
+
+    // The REAL seed function ServerImpl calls at construction: a pre-seeded series reads 0 and is
+    // the same series a later rejection increments, and the family carries its HELP/TYPE lines.
+    yuzu::MetricsRegistry m;
+    yuzu::server::seed_register_invalid_agent_id_series(m);
+    const auto text = m.serialize();
+    CHECK(text.find("# HELP yuzu_register_invalid_agent_id_total ") != std::string::npos);
+    CHECK(text.find("# TYPE yuzu_register_invalid_agent_id_total counter") != std::string::npos);
+    for (const auto& reason : expected) {
+        CHECK(text.find("yuzu_register_invalid_agent_id_total{reason=\"" + reason + "\"} 0") !=
+              std::string::npos);
+        CHECK(text.find("yuzu_register_invalid_agent_id_total{reason=\"" + reason +
+                        "\",source=\"gateway_proxy\"} 0") != std::string::npos);
+    }
+
+    // Idempotent: a second seed neither throws nor changes the exposition.
+    yuzu::server::seed_register_invalid_agent_id_series(m);
+    CHECK(m.serialize() == text);
+}
+
+namespace {
+std::string read_server_source(const char* name) {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / name, std::ios::binary);
+    REQUIRE(in.is_open());
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// Every `"reason", "<x>"` literal passed to yuzu_register_invalid_agent_id_total in `src`.
+// Tolerant of whitespace and line breaks between the tokens.
+std::vector<std::string> register_invalid_id_reasons(const std::string& src) {
+    static const std::regex re(
+        R"re(yuzu_register_invalid_agent_id_total"\s*,\s*\{\{\s*"reason"\s*,\s*"([^"]*)")re");
+    std::vector<std::string> out;
+    for (std::sregex_iterator it(src.begin(), src.end(), re), end; it != end; ++it)
+        out.push_back((*it)[1].str());
+    return out;
+}
+} // namespace
+
+TEST_CASE("Register increment sites only use the closed reason set, and ServerImpl still seeds it",
+          "[agent_service][register][metrics]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    // Wiring pin: the seed function above is only useful while server.cpp still calls it.
+    // The pin is the exact call spelling, counted after every `/* ... */` block and every `//`
+    // line remainder is removed in one left-to-right pass (whichever comment opener comes first
+    // wins, so a `/*` inside a line comment opens nothing), so a commented-out call, a trailing
+    // comment and a prose mention in a block or line comment do not satisfy it. The call text
+    // contains no quote or slash, so a plain strip is enough. The limits: the strip is not
+    // string-literal aware (a `//` or `/*` inside a string literal removes text that is code),
+    // and it does not see preprocessor exclusion (`#if 0`), so a call inside a disabled region
+    // still counts. The first limit already applies to server.cpp: the literal "/scim/v2/*" near
+    // the SCIM request counter opens a phantom block comment that removes a stretch of real code
+    // after it, so a duplicate call placed there would not be counted (the pin around the real
+    // call, which is far from that stretch, is unaffected).
+    {
+        const std::string raw_src = read_server_source("server.cpp");
+        std::string server_src;
+        server_src.reserve(raw_src.size());
+        for (std::size_t i = 0; i < raw_src.size();) {
+            if (raw_src.compare(i, 2, "/*") == 0) {
+                const auto close = raw_src.find("*/", i + 2);
+                if (close == std::string::npos)
+                    break;
+                i = close + 2;
+                server_src += ' ';
+            } else if (raw_src.compare(i, 2, "//") == 0) {
+                const auto eol = raw_src.find('\n', i);
+                if (eol == std::string::npos)
+                    break;
+                i = eol;
+            } else {
+                server_src += raw_src[i++];
+            }
+        }
+        const std::string call = "seed_register_invalid_agent_id_series(metrics_)";
+        std::size_t live_calls = 0;
+        for (auto pos = server_src.find(call); pos != std::string::npos;
+             pos = server_src.find(call, pos + 1))
+            ++live_calls;
+        CHECK(live_calls == 1);
+    }
+
+    // A reason literal added at an increment site without being added to
+    // kRegisterInvalidAgentIdReasons would be absent from a healthy scrape.
+    for (const char* file : {"agent_service_impl.cpp", "gateway_service_impl.cpp"}) {
+        INFO("file=" << file);
+        const auto reasons = register_invalid_id_reasons(read_server_source(file));
+        // Floor: the regex must still see the four increment sites, or this passes vacuously.
+        CHECK(reasons.size() >= kRegisterInvalidAgentIdReasons.size());
+        for (const auto& r : reasons) {
+            INFO("reason=" << r);
+            CHECK(std::find(kRegisterInvalidAgentIdReasons.begin(),
+                            kRegisterInvalidAgentIdReasons.end(),
+                            r) != kRegisterInvalidAgentIdReasons.end());
+        }
+    }
+}
+
+namespace {
+// Occurrences of `needle` in `src`.
+std::size_t count_occurrences(const std::string& src, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto pos = src.find(needle); pos != std::string::npos; pos = src.find(needle, pos + 1))
+        ++n;
+    return n;
+}
+
+// Occurrences of the argument comment `/*enforce_new_id_charset=*/true` (whitespace tolerant).
+std::size_t count_charset_flag_true(const std::string& src) {
+    static const std::regex re(R"re(/\*\s*enforce_new_id_charset\s*=\s*\*/\s*true\b)re");
+    return static_cast<std::size_t>(std::distance(
+        std::sregex_iterator(src.begin(), src.end(), re), std::sregex_iterator()));
+}
+} // namespace
+
+TEST_CASE("Register and ProxyRegister pass enforce_new_id_charset=true at every row-creating write",
+          "[agent_service][register][agent_id_charset]") {
+    // The flag defaults to false in the store API, so a production door that forgets it would
+    // silently re-create a bad-charset row. Each handler has exactly three row-creating enrollment
+    // writes (token claim, auto-approve, pending queue) and every one passes true.
+    for (const char* file : {"agent_service_impl.cpp", "gateway_service_impl.cpp"}) {
+        INFO("file=" << file);
+        const auto src = read_server_source(file);
+        CHECK(count_occurrences(src, "auth_mgr_.consume_and_enroll(") == 1);
+        CHECK(count_occurrences(src, "auth_mgr_.ensure_enrolled(") == 1);
+        CHECK(count_occurrences(src, "auth_mgr_.add_pending_agent(") == 1);
+        // The store's own spelling of the pending-queue write: a handler never calls it directly.
+        CHECK(count_occurrences(src, "add_pending(") == 0);
+        CHECK(count_charset_flag_true(src) == 3);
+    }
+
+    // No other source under server/core/src reaches those writes. The two handlers above are the
+    // only callers; auth.cpp and auth_db.cpp hold the wrapper and store definitions (the headers
+    // that declare them live under server/core/include, outside this tree). The walk is recursive
+    // over .cpp, .hpp and .h, so a new registration door in a new file or a subdirectory such as
+    // pg/ fails here instead of needing someone to extend a list. The count is of raw text, with
+    // no comment or literal handling: a hand-written lexer can desynchronise (an odd quote in a raw
+    // string or a preprocessor line) and then HIDE a real call, which is the wrong direction for a
+    // guard. A name mentioned in a comment therefore also fails; exclude that file by name above
+    // with a one-line reason.
+    std::size_t scanned = 0;
+    std::size_t scanned_in_subdir = 0;
+    std::size_t scanned_headers = 0;
+    const std::filesystem::path root{YUZU_SERVER_SRC_DIR};
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        if (!entry.is_regular_file())
+            continue;
+        const auto ext = entry.path().extension().string();
+        if (ext != ".cpp" && ext != ".hpp" && ext != ".h")
+            continue;
+        const auto rel = entry.path().lexically_relative(root).generic_string();
+        if (rel == "agent_service_impl.cpp" || rel == "gateway_service_impl.cpp" ||
+            rel == "auth.cpp" || rel == "auth_db.cpp")
+            continue;
+        INFO("file=" << rel);
+        const auto src = read_server_source(rel.c_str());
+        CHECK(count_occurrences(src, "consume_and_enroll(") == 0);
+        CHECK(count_occurrences(src, "ensure_enrolled(") == 0);
+        CHECK(count_occurrences(src, "add_pending_agent(") == 0);
+        // The AuthDB method spelling of the same write (the only definition and the only call are
+        // in the two excluded files; no other file under server/core/src mentions it).
+        CHECK(count_occurrences(src, "add_pending(") == 0);
+        ++scanned;
+        if (rel.find('/') != std::string::npos)
+            ++scanned_in_subdir;
+        if (ext != ".cpp")
+            ++scanned_headers;
+    }
+    // Guard against a wrong directory or an empty glob passing vacuously. The tree held about 809
+    // scanned files when this was written (the floor sits well below that), and the walk must
+    // have reached both a subdirectory and a header.
+    CHECK(scanned > 450);
+    CHECK(scanned_in_subdir > 0);
+    CHECK(scanned_headers > 0);
+}
+
+TEST_CASE("Register: an agent_id with a control byte the door lets through is counted as "
+          "reason=control and logged at warn, not as a store outage",
+          "[pg][agent_service][register][failclosed][control_id]") {
+    // A control byte other than NUL passes the door (length ok, no NUL) and is refused by the
+    // enrollment store's id check (StoreError::InvalidInput). That is caller input, so it must
+    // not read as a store failure: warn level, its own metric reason, same INVALID_ARGUMENT.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    auto req = make_register_request("a\tb");
+    apb::RegisterResponse resp;
+    yuzu::test::LogCapture cap;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+    cap.stop();
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK(status.error_message() == "invalid enrollment request");
+    CHECK(invalid_id_count(h.metrics, "control", false) == 1.0);
+    CHECK(invalid_id_count(h.metrics, "length", false) == 0.0);
+    CHECK(invalid_id_count(h.metrics, "nul", false) == 0.0);
+    CHECK(invalid_id_count(h.metrics, "charset", false) == 0.0);
+    const std::string text = cap.text();
+    CHECK(text.find("[warning] Register rejected: agent_id refused by the enrollment store") !=
+          std::string::npos);
+    CHECK(text.find("status read failed") == std::string::npos);
+    CHECK(text.find("[error]") == std::string::npos);
+    CHECK(text.find('\t') == std::string::npos);
+}
+
+TEST_CASE("ProxyRegister: an agent_id with a control byte the door lets through is counted as "
+          "reason=control and logged at warn, not as a store outage",
+          "[pg][agent_service][register][gateway][failclosed][control_id]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    auto req = make_register_request("a\tb");
+    apb::RegisterResponse resp;
+    yuzu::test::LogCapture cap;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+    cap.stop();
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK(status.error_message() == "invalid enrollment request");
+    CHECK(invalid_id_count(h.metrics, "control", true) == 1.0);
+    CHECK(invalid_id_count(h.metrics, "length", true) == 0.0);
+    CHECK(invalid_id_count(h.metrics, "nul", true) == 0.0);
+    CHECK(invalid_id_count(h.metrics, "charset", true) == 0.0);
+    // The direct-Register series (no source label) did not move.
+    CHECK(invalid_id_count(h.metrics, "control", false) == 0.0);
+    const std::string text = cap.text();
+    CHECK(text.find("[warning] [gateway] ProxyRegister rejected: agent_id refused by the "
+                    "enrollment store") != std::string::npos);
+    CHECK(text.find("status read failed") == std::string::npos);
+    CHECK(text.find("[error]") == std::string::npos);
+    CHECK(text.find('\t') == std::string::npos);
+    CHECK(h.registry.trusted_gateway_peer_count() == 0);
+}
+
+TEST_CASE("Register and ProxyRegister: a genuine enrollment store failure still logs the "
+          "error-level status read failure and moves no invalid-id series",
+          "[pg][agent_service][register][gateway][failclosed][control_id]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    // No store attached: get_pending_status fails with StoreError::Unavailable (not InvalidInput).
+    h.auth_mgr.set_auth_db(nullptr);
+
+    auto req = make_register_request("good-agent-1");
+    apb::RegisterResponse resp;
+    yuzu::test::LogCapture cap;
+    auto direct = h.svc.Register(/*context=*/nullptr, &req, &resp);
+    auto proxied = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+    cap.stop();
+
+    CHECK(direct.error_code() == grpc::StatusCode::UNAVAILABLE);
+    CHECK(proxied.error_code() == grpc::StatusCode::UNAVAILABLE);
+    const std::string text = cap.text();
+    CHECK(text.find("[error] Register: enrollment status read failed for agent good-agent-1") !=
+          std::string::npos);
+    CHECK(text.find("[error] [gateway] Register: enrollment status read failed for agent "
+                    "good-agent-1") != std::string::npos);
+    CHECK(text.find("refused by the enrollment store") == std::string::npos);
+    for (const char* reason : {"control", "length", "nul", "charset"}) {
+        INFO("reason=" << reason);
+        CHECK(invalid_id_count(h.metrics, reason, false) == 0.0);
+        CHECK(invalid_id_count(h.metrics, reason, true) == 0.0);
+    }
+}
+
+TEST_CASE("CheckForUpdate: logs a claimed agent_id and version with control bytes neutralised",
+          "[pg][agent_service][ota][failclosed]") {
+    // With the positive-identity gate off (the default) the agent_id on an OTA request is whatever
+    // the caller sent, so the success-path line must print it neutralised, never raw.
+    // DownloadUpdate's matching line is a server-streaming handler that cannot be driven without a
+    // live gRPC server (see test_ota_download_bound.cpp), so it is held by the log-injection
+    // tripwire instead.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    yuzu::test::TempDir update_dir{"yuzu_test_agent_service_ota-"};
+    std::filesystem::create_directories(update_dir.path);
+    yuzu::server::UpdateRegistry reg{pool, update_dir.path};
+    REQUIRE(reg.is_open());
+
+    yuzu::server::UpdatePackage pkg;
+    pkg.platform = "linux";
+    pkg.arch = "x86_64";
+    pkg.version = "9.9.9";
+    pkg.sha256 = "aabbccdd";
+    pkg.filename = "yuzu-agent-9.9.9-x86_64-linux";
+    pkg.mandatory = false;
+    pkg.rollout_pct = 100;
+    pkg.uploaded_at = "2025-01-01T00:00:00Z";
+    pkg.file_size = 1024;
+    REQUIRE(reg.upsert_package(pkg));
+    h.svc.set_update_registry(&reg);
+
+    apb::CheckForUpdateRequest req;
+    req.set_agent_id("agent x=1\nfake");
+    req.set_current_version("0.0.1 ver=2\nfake");
+    req.mutable_platform()->set_os("linux");
+    req.mutable_platform()->set_arch("x86_64");
+
+    apb::CheckForUpdateResponse resp;
+    grpc::ServerContext ctx;
+    yuzu::test::LogCapture cap;
+    auto status = h.svc.CheckForUpdate(&ctx, &req, &resp);
+    cap.stop();
+    // `reg` is destroyed before `h.svc`, which holds a raw pointer to it.
+    h.svc.set_update_registry(nullptr);
+
+    REQUIRE(status.ok());
+    CHECK(resp.update_available());
+    CHECK(cap.text().find("CheckForUpdate: agent agent_x_1_fake v0.0.1_ver_2_fake -> v9.9.9") !=
+          std::string::npos);
+    CHECK(cap.text().find("agent x=1") == std::string::npos);
+}
+
 TEST_CASE("ProxyRegister: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-H1)",
           "[pg][agent_service][register][gateway][w1_4_r2][up_h1]") {
     // Mirror of the direct-Register path. ProxyRegister carries the same
@@ -1352,6 +1891,181 @@ TEST_CASE("ProxyRegister: the same charset gate, new ids only, with the gateway_
     apb::RegisterResponse resp;
     CHECK(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
     CHECK(resp.accepted());
+}
+
+// ── charset gate vs a legacy row that vanishes between the handler's read and its write ──
+//
+// The handler reads the status once and gates only an ABSENT id. A legacy bad-charset row
+// that exists at that read and is gone at the write would otherwise be re-created by the
+// row-creating write. The race is made deterministic with a row lock: a side connection locks
+// the legacy row (a plain status read is MVCC and still sees it), the handler's write queues on
+// that lock, and only then does the side connection delete the row and commit, so the write
+// finds no row and takes its INSERT arm.
+namespace {
+
+struct VanishingRowOutcome {
+    grpc::Status status;
+    bool write_was_queued{false};
+};
+
+template <class Call>
+VanishingRowOutcome run_with_row_vanishing_before_write(const std::string& dsn,
+                                                        const std::string& agent_id, Call&& call) {
+    yuzu::server::pg::PgConn side{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(side.get()) == CONNECTION_OK);
+    const char* params[1] = {agent_id.c_str()};
+    auto exec = [&](const char* sql, int n = 0) {
+        yuzu::server::pg::PgResult r{
+            PQexecParams(side.get(), sql, n, nullptr, n ? params : nullptr, nullptr, nullptr, 0)};
+        return r.status();
+    };
+    REQUIRE(exec("BEGIN") == PGRES_COMMAND_OK);
+    REQUIRE(exec("SELECT 1 FROM auth.pending_agents WHERE agent_id = $1 FOR UPDATE", 1) ==
+            PGRES_TUPLES_OK);
+
+    VanishingRowOutcome out;
+    std::thread worker([&] { out.status = call(); });
+    // If anything below throws before the explicit join (only an allocation failure can), the
+    // worker is still parked on the row lock this side connection holds, so release the lock
+    // first and then join; a bare joinable std::thread destructor would std::terminate.
+    struct JoinOnExit {
+        std::thread& t;
+        PGconn* c;
+        ~JoinOnExit() {
+            if (t.joinable()) {
+                yuzu::server::pg::PgResult rollback{PQexec(c, "ROLLBACK")};
+                t.join();
+            }
+        }
+    } join_on_exit{worker, side.get()};
+    out.write_was_queued =
+        yuzu::test::wait_for_pg_lock_waiter(dsn, "%INSERT INTO auth.pending_agents%");
+    // Release the lock whether or not the waiter was seen, so the worker always unblocks. The
+    // worker is joinable from here until join(), and a throwing REQUIRE in that span would
+    // std::terminate the binary, so the statuses are only captured here and asserted after
+    // the join. A failed DELETE aborts the transaction, so COMMIT then rolls it back, which
+    // releases the row lock all the same.
+    const auto delete_status = exec("DELETE FROM auth.pending_agents WHERE agent_id = $1", 1);
+    const auto commit_status = exec("COMMIT");
+    worker.join();
+    REQUIRE(delete_status == PGRES_COMMAND_OK);
+    REQUIRE(commit_status == PGRES_COMMAND_OK);
+    return out;
+}
+
+std::string count_scalar(const std::string& dsn, const char* sql, const std::string& id = {}) {
+    yuzu::server::pg::PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    const char* params[1] = {id.c_str()};
+    yuzu::server::pg::PgResult r{PQexecParams(c.get(), sql, id.empty() ? 0 : 1, nullptr,
+                                              id.empty() ? nullptr : params, nullptr, nullptr, 0)};
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return PQgetvalue(r.get(), 0, 0);
+}
+
+} // namespace
+
+TEST_CASE("Register and ProxyRegister: a legacy bad-charset row removed after the read is not "
+          "re-created, whichever write path runs",
+          "[pg][agent_service][register][gateway][agent_id_charset][race][5513]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    // So the enrollment-store degrade counter is observable below.
+    h.auth_mgr.set_metrics_registry(&h.metrics);
+    const std::string dsn = h.auth_db.dsn();
+    const std::string kCharsetMessage =
+        "agent_id may only contain letters, digits, '.', '_', ':' and '-'";
+
+    // The `add_pending` (pending-queue) handler mapping of `CharsetRefused` is deliberately
+    // not driven here: the window it would need is the handler's second status read, and no
+    // row lock can park a handler between two reads. The store-level `add_pending` case in
+    // test_auth_db_pg.cpp pins the refusal itself.
+    enum class Path { token, auto_approve };
+    for (const bool via_gateway : {false, true}) {
+        for (const Path path : {Path::token, Path::auto_approve}) {
+            const std::string id = std::string("legacy ") + (via_gateway ? "gw " : "direct ") +
+                                   (path == Path::token ? "token" : "auto");
+            INFO("id=" << id << " gateway=" << via_gateway
+                       << " path=" << (path == Path::token ? "token" : "auto_approve"));
+            REQUIRE(h.auth_mgr.add_pending_agent(id, "h", "linux", "x86_64", "1").value());
+
+            auto req = make_plain_register(id);
+            if (path == Path::token) {
+                req.set_enrollment_token(
+                    mint_enrollment_token(h.auth_mgr, "t", 0, std::chrono::hours(1)));
+            } else {
+                // The request hostname is "host"; an exact hostname rule approves it.
+                REQUIRE(h.auto_approve.add_rule(
+                    {yuzu::server::auth::AutoApproveRuleType::hostname_glob, "host", "race", true}));
+            }
+
+            apb::RegisterResponse resp;
+            const auto out = run_with_row_vanishing_before_write(dsn, id, [&] {
+                return via_gateway ? gateway_svc.ProxyRegister(nullptr, &req, &resp)
+                                   : h.svc.Register(nullptr, &req, &resp);
+            });
+
+            CHECK(out.write_was_queued);
+            // The same refusal the door gives a new bad-charset id.
+            CHECK(out.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+            CHECK(out.status.error_message() == kCharsetMessage);
+            CHECK_FALSE(resp.accepted());
+            // Nothing created, no token use consumed.
+            auto st = h.auth_mgr.get_pending_status(id);
+            REQUIRE(st.has_value());
+            CHECK_FALSE(st->has_value());
+            if (path == Path::token) {
+                // Every token minted so far is unused: the refused claim rolled back.
+                CHECK(count_scalar(dsn, "SELECT coalesce(sum(use_count), 0) FROM "
+                                        "auth.enrollment_tokens") == "0");
+            }
+            // Cleared so the next iteration's auto-approve rule is the only one.
+            if (path == Path::auto_approve)
+                REQUIRE(h.auto_approve.remove_rule(0).status ==
+                        yuzu::server::auth::RuleEdit::Status::ok);
+        }
+    }
+
+    // Counted as reason=charset on each surface, once per refusal (two paths each).
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", {{"reason", "charset"}}).value() ==
+          2.0);
+    CHECK(h.metrics
+              .counter("yuzu_register_invalid_agent_id_total",
+                       {{"reason", "charset"}, {"source", "gateway_proxy"}})
+              .value() == 2.0);
+    CHECK(count_scalar(dsn, "SELECT count(*) FROM auth.pending_agents") == "0");
+
+    // A charset refusal is caller input, not a store outage: the enrollment-store degrade
+    // counter must not move. Only the ensure_enrolled series can catch a regression of the
+    // exclusion (its refusal is a StoreError); the token path reports the refusal as a value
+    // (Kind::charset_refused), so its zero is a plain regression guard.
+    for (const char* op : {"consume", "ensure_enrolled"}) {
+        for (const char* reason : {"no_store", "pool_acquire_timeout", "query_error"}) {
+            INFO("op=" << op << " reason=" << reason);
+            CHECK(h.metrics
+                      .counter("yuzu_auth_enrollment_store_degrade_total",
+                               {{"op", op}, {"reason", reason}})
+                      .value() == 0.0);
+        }
+    }
+}
+
+TEST_CASE("enrollment_store_status: caller-input refusals are INVALID_ARGUMENT, outages UNAVAILABLE",
+          "[agent_service][agent_id_charset][enrollment]") {
+    using yuzu::server::StoreError;
+    using yuzu::server::enrollment_store_status;
+    CHECK(enrollment_store_status(StoreError::InvalidInput).error_code() ==
+          grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK(enrollment_store_status(StoreError::CharsetRefused).error_code() ==
+          grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK(enrollment_store_status(StoreError::Unavailable).error_code() ==
+          grpc::StatusCode::UNAVAILABLE);
+    CHECK(enrollment_store_status(StoreError::QueryFailed).error_code() ==
+          grpc::StatusCode::UNAVAILABLE);
 }
 
 TEST_CASE("is_valid_new_agent_id: the charset table", "[agent_service][agent_id_charset]") {
