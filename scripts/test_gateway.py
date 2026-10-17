@@ -148,6 +148,12 @@ if suite == "ct":
     env["YUZU_PERF_CHURN_CYCLES"] = "1"
     env["YUZU_PERF_ENDURANCE_AGENTS"] = "10"
     env["YUZU_PERF_ENDURANCE_SECS"] = "1"
+    # The scale suite (yuzu_gw_scale_SUITE, 500 agents by default) runs its
+    # `gate` group here: a broken invariant (Register parallelism, replay,
+    # notices lost on an outage or a planned stop, fan-out answers, ...) fails
+    # the leg. Switched on once all six cases passed in gate mode on three
+    # consecutive runs after the PR #5695 fixes; docs/testing/gateway-scale-tests.md.
+    env["YUZU_GW_SCALE_GATE"] = "1"
 
 # ──────────────────────────────────────────────────────────────────────
 # hex.pm flake retry helper
