@@ -72,7 +72,7 @@
     "capability_id": "get.fragments-settings-analytics-events",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.api-analytics-recent"
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-analytics-recent; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
   },
   {
     "method": "GET",
@@ -115,7 +115,7 @@
       "method": "GET",
       "path": "/api/v1/discover/plugin-docs"
     },
-    "mcp_twin": null,
+    "mcp_twin": "resource:yuzu://plugin-docs",
     "status": "twinned"
   },
   {
@@ -157,7 +157,7 @@
     "capability_id": "get.fragments-settings-general-runtime",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.api-config"
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-config; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
   },
   {
     "method": "GET",
@@ -220,7 +220,7 @@
     "capability_id": "get.fragments-settings-webhooks",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.api-webhooks"
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-webhooks; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
   },
   {
     "method": "GET",
@@ -228,7 +228,7 @@
     "capability_id": "get.fragments-settings-webhooks-param-deliveries",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.api-webhooks-param-deliveries"
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-webhooks-param-deliveries; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
   },
   {
     "method": "GET",
