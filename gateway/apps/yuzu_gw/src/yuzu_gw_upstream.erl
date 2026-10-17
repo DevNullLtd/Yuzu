@@ -94,7 +94,7 @@
 %%%   answered the same way by every probe, for ever). The one exception is a registration REPLAY answered
 %%%   FAILED_PRECONDITION: that is the server's authoritative answer that the
 %%%   presented session was superseded, and do_replay_one counts it as a breaker
-%%%   SUCCESS (record_result_no_replay({ok, superseded}, State)), so a run of
+%%%   SUCCESS (record_result({ok, superseded}, State)), so a run of
 %%%   stale replays after a reconnect storm cannot trip the breaker. A replay
 %%%   answered with any other request-fault status stays neutral.
 %%%   Every other status still counts as a failure: UNAVAILABLE, INTERNAL,
@@ -125,7 +125,7 @@
 %%%       warning names the agent and the reason), it is neither retired as sent
 %%%       nor given back, and the breaker is not touched.
 %%%     - The breaker is moved only when it is still half_open under the SAME
-%%%       generation: ok closes it (and casts the replay), error reopens it with
+%%%       generation: ok closes it (nothing is replayed), error reopens it with
 %%%       doubled backoff (a local encode exception does neither). In any other
 %%%       state or generation the result does not
 %%%       touch the breaker (a call path RPC may have closed or reopened it
@@ -143,16 +143,42 @@
 %%%   half_open — one probe RPC allowed; success closes, failure reopens
 %%%               (a call path RPC, or one held notification as the probe)
 %%%
-%%% Registration replay on reconnect:
-%%%   When the upstream connection re-establishes after a failure, the
-%%%   C++ server may be a fresh instance with an empty agent registry —
-%%%   but the gateway still holds the agent connections. Without a
-%%%   replay, those agents are silently stranded (invisible to the
-%%%   server) until they happen to reconnect. So on any RPC success
-%%%   that follows a period of failures (the half_open -> closed
-%%%   transition, or a closed-state success with a non-zero failure
-%%%   counter), we re-proxy a ProxyRegister for every agent the
-%%%   registry currently holds (#5695):
+%%% A lost connection is one failure (#5695):
+%%%   The proxied calls, notification sends and replays run with the client's
+%%%   `report_conn' option, so a call that ended because its CONNECTION closed or
+%%%   went away comes back as {error, {connection_lost, Conn}} (see
+%%%   yuzu_grpc_client). The breaker counts the first such result for a
+%%%   connection as one failure and ignores the rest (cb_lost_conns): one dropped
+%%%   connection with 50 calls on it used to be 50 failures, which opened the
+%%%   breaker against a server that was up and answering on the next connection.
+%%%   A server that keeps dropping connections still opens it: every connection
+%%%   it drops is a failure, and while the channel backs off between redials the
+%%%   calls that find no connection fail one by one.
+%%%
+%%% Registration replay: what the server says it does not know (#5695):
+%%%   A breaker recovery replays nothing by itself. It used to: on the
+%%%   half_open -> closed transition, and on any success after a failure while
+%%%   closed, every agent the registry held was re-proxied, in case the server
+%%%   was a fresh instance with an empty registry. That replayed the whole fleet
+%%%   to a server that had lost nothing whenever one connection dropped (5,000
+%%%   agents and 5,000 repeated CONNECTED notices for one reset connection), and
+%%%   a failure during that replay opened the breaker again and started over.
+%%%   The server tells the gateway what it does not know: every BatchHeartbeat
+%%%   answer lists the sessions of the batch it does not hold
+%%%   (unknown_session_ids, typically right after a server restart), and those
+%%%   are replayed (the targeted replay below). A full replay of every agent this
+%%%   node holds runs only on evidence that the server lost its state:
+%%%     - a heartbeat verdict that lists at least half of its batch as unknown,
+%%%       and at least the evidence floor (verdict_floor/1: one session per 64
+%%%       this node holds, at least 1, at most 16), or that the server marked
+%%%       truncated (more than 4096 unknown);
+%%%     - and no full replay ended in the last ?FULL_REPLAY_COOLDOWN_MS (60 s),
+%%%       so a server that keeps answering "unknown" costs at most one full
+%%%       replay a minute on top of the targeted replays;
+%%%   counted as registration_replay_triggered{trigger="server_lost_state"}. A
+%%%   lost CONNECTED notification also starts one (notify_loss, below), and so
+%%%   does the replay_registrations cast (trigger="manual"; nothing in the
+%%%   gateway sends it). The full replay:
 %%%     - after a start jitter (registration_replay_start_jitter_ms), the
 %%%       registry's agents table is walked in chunks of ?REPLAY_CHUNK
 %%%       {AgentId, SessionId} pairs (ets:select/3, the table safe_fixtable'd
@@ -165,7 +191,8 @@
 %%%       probe), and only while the held notifications plus the replays in
 %%%       flight stay under half of notify_pending_max (every adopted replay
 %%%       makes the agent re-send its CONNECTED);
-%%%     - the breaker opening aborts the rest; the next recovery starts again.
+%%%     - the breaker opening aborts the rest; the next verdict that shows
+%%%       the server still does not know the sessions starts again.
 %%%   Rate = replay_limit / server latency: 5,000 agents at 24 in flight and
 %%%   50 ms per call take about 10 s.
 %%%
@@ -179,6 +206,10 @@
 %%%   verdict can create. A verdict that arrives while the breaker is open is
 %%%   dropped and counted (a later heartbeat lists the sessions again); one
 %%%   that arrives half_open is queued, and its first replay RPC is the probe.
+%%%   After a server restart every agent is listed within one heartbeat
+%%%   interval (each agent's next heartbeat), and the first verdict already
+%%%   shows the evidence that starts a full replay, so everyone is replayed
+%%%   within about a second of the first flush that reaches the new server.
 %%%
 %%% Configuration (sys.config / application env):
 %%%   circuit_breaker_failure_threshold   - consecutive failures to trip
@@ -230,6 +261,7 @@
          notify_stream_status/5,
          forward_guardian_message/2,
          replay_sessions/1,
+         replay_sessions/2,
          circuit_state/0]).
 %% Planned stop (yuzu_gw_app:prep_stop/1, #5695).
 -export([begin_stop/0, last_gasp/1]).
@@ -330,6 +362,14 @@
 %% ?MAX_VERDICT_IDS in yuzu_gw_heartbeat_buffer, which applies it before the
 %% cast; keep the two equal.
 -define(MAX_REPLAY_SESSION_IDS, 4096).
+%% After a full replay ends, a verdict does not start another one for this long
+%% (the targeted replay still runs): a server that keeps listing sessions as
+%% unknown after they were replayed costs at most one full replay a minute.
+-define(FULL_REPLAY_COOLDOWN_MS, 60000).
+%% The connections the breaker has counted as lost (one failure each), newest
+%% first. A lost connection's calls all end within one RPC timeout of the loss,
+%% and the channel has a handful of connections, so a short list is enough.
+-define(MAX_LOST_CONNS, 16).
 
 %% The lock-free cell: an `atomics' array behind a persistent_term, written only
 %% by this process and read by anyone. It exists because everything else this
@@ -459,6 +499,9 @@
     cb_max_timeout  :: non_neg_integer(),
     cb_cur_timeout  :: non_neg_integer(),
     cb_timer        :: reference() | undefined,
+    %% The connections whose loss the breaker has counted (one failure each,
+    %% however many calls ended with them), newest first, at most ?MAX_LOST_CONNS.
+    cb_lost_conns   = [] :: [pid()],
     %% The number of times the breaker entered half_open, and the held
     %% notification currently sent as the half_open probe (its worker, monitor,
     %% the generation it was started under, and the store key and event it
@@ -478,7 +521,7 @@
     %% continuation, `start' before the first chunk, and the rows still to
     %% walk as an estimate for the depth gauge). The table is safe_fixtable'd
     %% by this process while walking.
-    replay_walk = idle :: idle | {pending, reference(), breaker | notify_loss} |
+    replay_walk = idle :: idle | {pending, reference(), server_lost_state | notify_loss | manual} |
                           {walking, start | '$end_of_table' | term(), non_neg_integer()},
     %% Replay workers in flight: pid => {AgentId, SessionId}. At most
     %% replay_limit (one while the breaker is half_open: the probe).
@@ -487,6 +530,9 @@
     replay_jitter_ms :: non_neg_integer(),
     %% When the replay now running started (monotonic ms), for its duration.
     replay_started = undefined :: undefined | integer(),
+    %% When the last full walk ended (monotonic ms): a verdict starts no other
+    %% one within ?FULL_REPLAY_COOLDOWN_MS of it.
+    full_replay_ended = undefined :: undefined | integer(),
     %% Sessions replayed within the last session_guard_ms (monotonic ms of the
     %% pop that replayed them). Stamped when a replay worker is started for the
     %% session and removed again if that worker sent nothing (never stamped when
@@ -585,7 +631,16 @@ forward_guardian_message(AgentId, ResponseFrame) ->
 %% bounds it again: a non-list is ignored and only the first 4096 ids are used.
 -spec replay_sessions([binary()]) -> ok.
 replay_sessions(SessionIds) ->
-    gen_server:cast(?SERVER, {replay_sessions, SessionIds}).
+    replay_sessions(SessionIds, #{}).
+
+%% @doc As replay_sessions/1, with what the verdict was an answer to: `batch',
+%% the number of heartbeats in the BatchHeartbeat request, and `truncated', the
+%% server's unknown_session_ids_truncated. They are the evidence that decides
+%% whether the server lost its state and every agent is replayed (see the
+%% module doc); without them only the listed sessions are.
+-spec replay_sessions([binary()], #{batch => non_neg_integer(), truncated => boolean()}) -> ok.
+replay_sessions(SessionIds, Verdict) when is_map(Verdict) ->
+    gen_server:cast(?SERVER, {replay_sessions, SessionIds, Verdict}).
 
 %% @doc Planned stop, step one (#5695): stop taking work. From here proxied
 %% calls are refused (`stopping', answered UNAVAILABLE so agents go to another
@@ -1136,38 +1191,43 @@ handle_cast({forward_guardian_message, AgentId, ResponseFrame},
             end
     end;
 
-handle_cast({replay_sessions, _SessionIds}, #state{mode = Mode} = State) when Mode =/= running ->
+handle_cast({replay_sessions, SessionIds}, State) ->
+    handle_cast({replay_sessions, SessionIds, #{}}, State);
+handle_cast({replay_sessions, _SessionIds, _Verdict}, #state{mode = Mode} = State)
+  when Mode =/= running ->
     {noreply, State};
-handle_cast({replay_sessions, SessionIds0}, State) ->
+handle_cast({replay_sessions, SessionIds0, Verdict}, State) ->
     Before = notify_counts(State),
-    %% replay_sessions/1 is exported, so this boundary bounds its own input
+    %% replay_sessions/1,2 are exported, so this boundary bounds its own input
     %% (the heartbeat buffer's cap is not the only caller's guarantee): a
     %% non-list is ignored, a list is cut to ?MAX_REPLAY_SESSION_IDS before it
-    %% is counted, dropped or queued.
+    %% is counted, dropped or queued; the verdict facts are read with defaults.
     case bound_session_ids(SessionIds0) of
         invalid ->
             logger:debug("Registration replay: ignoring a verdict that is not a list"),
             {noreply, State};
         SessionIds ->
-            {noreply, report_notify_counts(Before, settle(replay_verdict(SessionIds, State)))}
+            State1 = replay_verdict(SessionIds, verdict_facts(Verdict), State),
+            {noreply, report_notify_counts(Before, settle(State1))}
     end;
 
 handle_cast(replay_registrations, #state{mode = Mode} = State) when Mode =/= running ->
     {noreply, State};
 handle_cast(replay_registrations, #state{replay_walk = Walk} = State) when Walk =/= idle ->
     %% Gate 7 UP-5: a full replay is already pending or walking. Reseeding it on
-    %% every trigger restarted it from zero each time a flapping server came
-    %% back, and at fleet scale it never finished. The running walk completes;
-    %% if the upstream went away again, the walk is aborted when the breaker
-    %% opens and the next real recovery starts a new one.
+    %% every trigger restarted it from zero each time, and at fleet scale it
+    %% never finished. The running walk completes; if the upstream went away
+    %% again, the walk is aborted when the breaker opens.
     logger:debug("Registration replay: a full replay is already running; ignoring the trigger"),
     {noreply, State};
 handle_cast(replay_registrations, State) ->
-    %% Idle: start a full walk of the registry after the start jitter. The walk
-    %% reads the table when it runs, so an agent that disconnected during the
-    %% outage is already gone and is not replayed. A targeted replay already
+    %% A full replay asked for by hand (nothing in the gateway sends this since
+    %% a breaker recovery stopped replaying; an operator can, from a remote
+    %% shell). Idle: start a full walk of the registry after the start jitter.
+    %% The walk reads the table when it runs, so an agent that disconnected
+    %% meanwhile is already gone and is not replayed. A targeted replay already
     %% queued (a verdict) keeps running; the walk is pumped after it.
-    {noreply, start_full_replay(breaker, State)};
+    {noreply, start_full_replay(manual, State)};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -1447,7 +1507,7 @@ replay_send(AgentId, Pid, SessionId, RegisterReq) ->
     case Result of
         {local_error, {Class, Why}} ->
             %% The stored request could not be encoded here, so nothing was
-            %% sent: no verdict about the upstream (record_result_no_replay/2
+            %% sent: no verdict about the upstream (record_result/2
             %% ignores it).
             logger:warning("Registration replay: ~s could not be encoded (~p:~p); "
                            "skipped without touching the circuit breaker",
@@ -1510,7 +1570,7 @@ replay_outcome({sent, Kind, BreakerResult}, SessionId, Gen,
                       #{replayed => 1, queue_depth => replay_depth(State)}, #{}),
     _ = SessionId,
     case CbState =/= open andalso Gen =:= CbGen of
-        true  -> record_result_no_replay(BreakerResult, State);
+        true  -> record_result(BreakerResult, State);
         false -> State
     end;
 replay_outcome(skipped, SessionId, _Gen, #state{recent_replays = Recent} = State) ->
@@ -1653,6 +1713,7 @@ notify_pending_len(Pending) ->
 redact_message({proxy_register, _Req})            -> {proxy_register, '$redacted'};
 redact_message({proxy_inventory, _Report})        -> {proxy_inventory, '$redacted'};
 redact_message({replay_sessions, _Ids})           -> {replay_sessions, '$redacted'};
+redact_message({replay_sessions, _Ids, Verdict})  -> {replay_sessions, '$redacted', Verdict};
 redact_message({forward_guardian_message, AgentId, _Frame}) ->
     {forward_guardian_message, AgentId, '$redacted'};
 redact_message({notify_stream_status, AgentId, _SessionId, Event, _PeerAddr, _Home}) ->
@@ -1725,19 +1786,21 @@ drop_call(Rpc) ->
 
 %% @doc Record the result of an RPC and update circuit breaker state.
 %%
-%% An RPC success that follows a period of failures means the upstream
-%% connection has re-established — possibly against a fresh server with
-%% an empty registry. on_success/1 flags that case; record_result/2
-%% then casts replay_registrations to self so the agents the gateway
-%% already holds get re-proxied. The cast (not an inline call) keeps
-%% the replay off the hot path of whatever RPC just succeeded.
+%% A success never starts a registration replay (#5695): a recovery says the
+%% upstream answers again, not that it lost what it knew. The server's heartbeat
+%% verdict says that (replay_verdict/3).
+%%
+%% A call that ended because its connection was lost counts once per connection
+%% (see the module doc): the first result naming a connection is a failure, any
+%% later one naming the same connection is ignored.
 record_result({ok, _}, State) ->
-    case on_success(State) of
-        {State1, replay} ->
-            gen_server:cast(self(), replay_registrations),
-            State1;
-        {State1, noop} ->
-            State1
+    on_success(State);
+record_result({error, {connection_lost, Conn}}, #state{cb_lost_conns = Lost} = State)
+  when is_pid(Conn) ->
+    case lists:member(Conn, Lost) of
+        true  -> State;
+        false -> on_failure(State#state{cb_lost_conns =
+                                            lists:sublist([Conn | Lost], ?MAX_LOST_CONNS)})
     end;
 record_result({error, {Status, _Message}}, State) when ?IS_REQUEST_FAULT(Status) ->
     %% The server answered that the request itself was wrong: a fact about the
@@ -1753,55 +1816,30 @@ record_result({local_error, _}, State) ->
     %% fact about the upstream, so neither a success nor a failure.
     State.
 
-%% @doc Like record_result/2 but never triggers a registration replay.
-%% Used by the replay itself: a replay RPC must still advance the
-%% circuit breaker (so a mid-replay outage trips it), but it must not
-%% kick off a second, nested replay cascade.
-record_result_no_replay({ok, _}, State) ->
-    {State1, _Trigger} = on_success(State),
-    State1;
-record_result_no_replay({error, {Status, _Message}}, State) when ?IS_REQUEST_FAULT(Status) ->
-    State;
-record_result_no_replay({error, _}, State) ->
-    on_failure(State);
-record_result_no_replay({local_error, _}, State) ->
-    State.
-
-%% @doc Returns {NewState, replay | noop}. `replay' means an RPC just
-%% succeeded after one or more failures — treat it as a reconnect.
+%% @doc A success: the consecutive failures are over. Nothing is replayed (see
+%% record_result/2): if the server came back without its state, its heartbeat
+%% verdicts list the sessions it does not know.
 on_success(#state{cb_state = closed, cb_failures = 0} = State) ->
     %% Steady state — nothing recovered.
-    {State, noop};
+    State;
 on_success(#state{cb_state = closed} = State) ->
-    %% Closed but cb_failures > 0: the upstream had failing RPCs and is
-    %% now answering again, yet never accumulated enough consecutive
-    %% failures to trip the breaker. This is the common server-bounce
-    %% case (few/idle agents, short outage) — replay so the freshly
-    %% restarted server relearns every agent.
-    %%
-    %% Gate 7 UP-5 — this trigger fires readily (a single failed RPC
-    %% then a success is routine under packet loss), but that is now
-    %% safe: the replay_registrations handler below NO LONGER restarts
-    %% an in-flight replay from scratch. Each outage event arms at most
-    %% one full-fleet replay that runs to completion; redundant
-    %% triggers while it drains are dropped. The storm was the
-    %% restart-from-zero, not the trigger.
+    %% Closed but cb_failures > 0: the upstream had failing RPCs and answers
+    %% again, without enough consecutive failures to trip the breaker.
     logger:info("Upstream recovered (closed, ~b prior failures)",
                 [State#state.cb_failures]),
-    {State#state{cb_failures = 0}, replay};
+    State#state{cb_failures = 0};
 on_success(#state{cb_state = half_open, cb_base_timeout = BaseTimeout} = State) ->
-    %% Probe succeeded — close the circuit, reset backoff. The breaker
-    %% fully tripped, so the upstream was definitely down; replay.
+    %% Probe succeeded — close the circuit, reset backoff.
     logger:info("Circuit breaker: half_open -> closed (probe succeeded)"),
     telemetry:execute([yuzu, gw, upstream, circuit_state],
                       #{count => 1},
                       #{state => <<"closed">>}),
     publish_breaker(closed),
-    {State#state{
+    State#state{
         cb_state      = closed,
         cb_failures   = 0,
         cb_cur_timeout = BaseTimeout
-    }, replay}.
+    }.
 
 on_failure(#state{cb_state = closed, cb_failures = F, cb_threshold = T} = State) ->
     NewF = F + 1,
@@ -2216,7 +2254,7 @@ settle(State) ->
 %%     and disconnects). A replay held back by this resumes when a notify
 %%     worker finishes.
 %% An open breaker aborts the replay: the upstream went away again, and the
-%% next recovery starts a new one. Each worker is told the breaker generation,
+%% verdicts after it closes start a new one. Each worker is told the breaker generation,
 %% so its result counts only if the breaker has not moved since.
 pump_replay(#state{mode = Mode} = State) when Mode =/= running ->
     State;
@@ -2303,7 +2341,8 @@ walk_chunk(Cont) ->
 
 end_walk(#state{replay_walk = {walking, _, _}} = State) ->
     _ = (catch ets:safe_fixtable(?AGENTS_TABLE, false)),
-    State#state{replay_walk = idle};
+    State#state{replay_walk = idle,
+                full_replay_ended = erlang:monotonic_time(millisecond)};
 end_walk(#state{replay_walk = {pending, TRef, _}} = State) ->
     _ = erlang:cancel_timer(TRef),
     State#state{replay_walk = idle};
@@ -2397,8 +2436,9 @@ bound_session_ids(_) ->
     invalid.
 
 %% @doc The verdict of a bounded list: dropped while the circuit is open,
-%% queued otherwise.
-replay_verdict(SessionIds, #state{cb_state = open} = State) ->
+%% queued otherwise; and when it shows the server lost its state, a full replay
+%% (maybe_full_replay/3).
+replay_verdict(SessionIds, _Facts, #state{cb_state = open} = State) ->
     %% Drop, do not queue: the upstream is known to be down, so every replay
     %% RPC would fail fast anyway. The server lists these sessions again on a
     %% later heartbeat once it answers, so nothing is lost but time.
@@ -2407,10 +2447,67 @@ replay_verdict(SessionIds, #state{cb_state = open} = State) ->
     logger:debug("Registration replay: heartbeat verdict named ~b session(s) "
                  "while the circuit is open; dropped", [Count]),
     State;
-replay_verdict(SessionIds, State) ->
+replay_verdict(SessionIds, Facts, State) ->
     %% closed or half_open. half_open queues on purpose: the first replay
-    %% RPC is the probe that decides whether the breaker closes.
-    enqueue_sessions(SessionIds, State).
+    %% RPC is the probe that decides whether the breaker closes. The listed
+    %% sessions go first; a full walk started here skips them (they are stamped
+    %% replayed when their workers start).
+    maybe_full_replay(length(SessionIds), Facts, enqueue_sessions(SessionIds, State)).
+
+%% @doc The verdict facts replay_sessions/2 passes, read with defaults: a batch
+%% size that is not a non-negative integer is unknown (no ratio evidence), and
+%% only `true' is truncated.
+verdict_facts(Verdict) when is_map(Verdict) ->
+    #{batch => case maps:get(batch, Verdict, undefined) of
+                   B when is_integer(B), B >= 0 -> B;
+                   _ -> undefined
+               end,
+      truncated => maps:get(truncated, Verdict, false) =:= true};
+verdict_facts(_) ->
+    #{batch => undefined, truncated => false}.
+
+%% @doc Start a full replay when the verdict is evidence that the server lost
+%% its state (see the module doc): the server truncated its list, or it listed
+%% at least half of the batch and at least verdict_floor/1 sessions; and no full
+%% replay ended within ?FULL_REPLAY_COOLDOWN_MS. In a large fleet one unknown
+%% session says that agent is unknown, not that the server forgot everyone, so
+%% the evidence needed grows with the fleet; in a small one a full replay costs
+%% little more than the targeted one, and it spares the rest of the fleet a wait
+%% of up to one heartbeat interval for their own heartbeats to be listed.
+maybe_full_replay(Unknown, #{batch := Batch, truncated := Truncated}, State) ->
+    Evidence = Truncated orelse
+        (is_integer(Batch) andalso Batch > 0 andalso Unknown * 2 >= Batch
+         andalso Unknown >= verdict_floor(agents_held())),
+    case Evidence andalso cooled_down(State) of
+        true ->
+            logger:info("Registration replay: the server does not know ~b of the ~s "
+                        "session(s) of a heartbeat batch~s; replaying every agent",
+                        [Unknown, case Batch of undefined -> "?"; _ -> integer_to_list(Batch) end,
+                         case Truncated of true -> " (list truncated)"; false -> "" end]),
+            start_full_replay(server_lost_state, State);
+        false ->
+            State
+    end.
+
+%% @doc The fewest unknown sessions in one verdict that count as evidence the
+%% server lost its state: one per 64 agents this node holds, at least 1 and at
+%% most 16. At 5,000 agents a 1 s batch carries about 170 heartbeats (agents
+%% heartbeat every 30 s), so a restarted server lists far more than 16; a
+%% session the server dropped on its own is one or two.
+-spec verdict_floor(non_neg_integer()) -> pos_integer().
+verdict_floor(Agents) ->
+    max(1, min(16, Agents div 64)).
+
+agents_held() ->
+    case ets:info(?AGENTS_TABLE, size) of
+        N when is_integer(N) -> N;
+        undefined -> 0
+    end.
+
+cooled_down(#state{full_replay_ended = undefined}) ->
+    true;
+cooled_down(#state{full_replay_ended = Ended}) ->
+    erlang:monotonic_time(millisecond) - Ended >= ?FULL_REPLAY_COOLDOWN_MS.
 
 %% @doc Queue the entries for the sessions a heartbeat verdict named (#1197).
 %% Ids are resolved to entries by session (yuzu_gw_registry:
@@ -2557,7 +2654,8 @@ do_rpc(Method, Request, Tag, Metadata, Timeout) ->
     Path = <<"/yuzu.gateway.v1.GatewayUpstream/", (atom_to_binary(Method, utf8))/binary>>,
     StartTime = erlang:monotonic_time(millisecond),
     Result = try yuzu_grpc_client:unary(Metadata, Path, Request, Def,
-                                        #{channel => default_channel, timeout => Timeout})
+                                        #{channel => default_channel, timeout => Timeout,
+                                          report_conn => true})
              catch
                  %% The stacktrace is dropped on purpose: a frame prints its
                  %% argument list (the request, with its credentials) in the
@@ -2651,6 +2749,15 @@ do_rpc(Method, Request, Tag, Metadata, Timeout) ->
                                 code => Status}),
             logger:warning("Upstream RPC ~s failed with HTTP-level error: ~p", [Method, Status]),
             {error, {internal, iolist_to_binary(io_lib:format("http_error ~p", [Status]))}};
+        {error, {connection_lost, Conn}} when is_pid(Conn) ->
+            %% The connection the call ran on closed or went away: the breaker
+            %% counts this connection once (record_result/2), and the caller sees
+            %% the same internal error as for any transport failure.
+            telemetry:execute([yuzu, gw, upstream, rpc_error],
+                              #{count => 1},
+                              #{rpc_name => atom_to_binary(Tag, utf8),
+                                code => connection_lost}),
+            {error, {connection_lost, Conn}};
         {error, Reason} ->
             %% R-3 (#1243): emit a DISTINCT metric for a TLS handshake failure
             %% (cert expiry / CA rotation / wrong-SAN / unreadable cert) so it is
@@ -2696,6 +2803,8 @@ encode_request(Msg, InputType) ->
 -spec public_result(rpc_result()) -> {ok, term()} | {error, term()}.
 public_result({local_error, {Class, Why}}) ->
     {error, exception_reason(Class, Why)};
+public_result({error, {connection_lost, _Conn}}) ->
+    {error, {internal, <<"connection_lost">>}};
 public_result(Result) ->
     Result.
 

@@ -424,7 +424,8 @@ handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Con
                            [<<"security">>], N);
 
 %% Heartbeat verdict consumer (#1197). `registration_replay_triggered'
-%% counts replays that started, by trigger (breaker | heartbeat); the label is
+%% counts replays that started, by trigger (heartbeat | server_lost_state |
+%% notify_loss | manual; breaker is no longer emitted, its series stays); the label is
 %% an atom chosen by yuzu_gw_upstream, never caller-supplied, so a sender
 %% cannot control label cardinality. `unknown_truncated' counts verdicts the
 %% server cut short. `verdict_dropped' counts session ids the verdict named
@@ -439,7 +440,8 @@ handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Con
 %% every metric.
 handle_event([yuzu, gw, upstream, registration_replay_triggered], #{count := N}, Meta, _Config) ->
     Trigger = case maps:get(trigger, Meta, unknown) of
-        T when T =:= breaker; T =:= heartbeat; T =:= notify_loss -> T;
+        T when T =:= breaker; T =:= heartbeat; T =:= notify_loss;
+               T =:= server_lost_state; T =:= manual -> T;
         _ -> unknown
     end,
     prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total,
@@ -900,11 +902,14 @@ metric_specs() ->
         {counter, [
             {name, yuzu_gw_registration_replay_triggered_total},
             {labels, [trigger]},
-            {help, "Registration replays started, by trigger (breaker = the upstream "
-                   "recovered from failures, replaying every agent this node holds; "
-                   "heartbeat = the server's heartbeat verdict listed sessions it does "
-                   "not know, replaying only those; notify_loss = a held CONNECTED "
-                   "notification was lost, replaying every agent so each re-sends it)"}]},
+            {help, "Registration replays started, by trigger (heartbeat = the server's "
+                   "heartbeat verdict listed sessions it does not know, replaying only "
+                   "those; server_lost_state = a verdict listed at least half of its "
+                   "batch as unknown, so every agent this node holds is replayed; "
+                   "notify_loss = a held CONNECTED notification was lost, replaying "
+                   "every agent so each re-sends it; manual = a full replay asked for "
+                   "by hand; breaker = no longer emitted: a breaker recovery replays "
+                   "nothing since PR 5695)"}]},
         {counter, [
             {name, yuzu_gw_heartbeat_unknown_truncated_total},
             {labels, []},
@@ -1314,7 +1319,8 @@ seed_metrics() ->
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
     [prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total, [T], 0)
-     || T <- [<<"breaker">>, <<"heartbeat">>, <<"notify_loss">>]],
+     || T <- [<<"breaker">>, <<"heartbeat">>, <<"notify_loss">>,
+              <<"server_lost_state">>, <<"manual">>]],
     [prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total, [R], 0)
      || R <- [<<"malformed">>, <<"not_local">>, <<"circuit_open">>, <<"queue_full">>]],
     [prometheus_counter:inc(yuzu_gw_heartbeat_buffer_dropped_total, [R], 0)

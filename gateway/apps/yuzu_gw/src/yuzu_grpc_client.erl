@@ -13,11 +13,24 @@
 %%%   {error, Reason}
 %%%       the call did not complete: `timeout' (the whole call, waiting for a
 %%%       connection included), a connection error word (`econnrefused',
-%%%       `closed', `{tls_alert, Alert}', `{options, tls}'), `no_channel',
-%%%       `stream_error' or `connection_error' (the connection reset or refused
-%%%       the stream, or went away mid-call), `response_too_large' (over the
-%%%       channel's limit), `invalid_metadata' (a refused request header; nothing
-%%%       was sent) or `protocol' (gun sent something this client does not read)
+%%%       `closed', `{tls_alert, Alert}', `{options, tls}') when no connection
+%%%       could be had, `no_channel', `connection_lost' (the connection the call
+%%%       was sent on closed, went away or is going away: the call ended because
+%%%       of the CONNECTION, so every call on that connection ends the same way;
+%%%       see `report_conn' below), `stream_error' (the server reset this one
+%%%       stream), `response_too_large' (over the channel's limit),
+%%%       `invalid_metadata' (a refused request header; nothing was sent) or
+%%%       `protocol' (gun sent something this client does not read)
+%%%   {error, {connection_lost, Conn}}
+%%%       `connection_lost' with the connection's pid, when the call asked for it
+%%%       (option `report_conn'): a caller that counts failures can count one
+%%%       lost connection once, however many calls it took with it
+%%%
+%%% A connection the server is closing (it sent GOAWAY; gun then refuses new
+%%% calls on it and ends the ones the server will not process) is handed back to
+%%% its channel the first time a call fails on it (yuzu_grpc_client_channel:
+%%% retire/2), so the channel stops handing it out and opens its replacement at
+%%% once instead of when the closing connection is finally down.
 %%% Marshalling runs in the caller: a request that cannot be encoded raises
 %%% here, and the caller decides what that means.
 %%%
@@ -56,6 +69,9 @@
 %% is sent as the `grpc-timeout' header, unless `send_timeout' is false (then
 %% only this client enforces it: the tests of the client's own give-up path use
 %% that, since a server that honours grpc-timeout ends the call first).
+%% `report_conn' (default false): a call that ends because its connection was
+%% lost returns `{error, {connection_lost, Conn}}' instead of
+%% `{error, connection_lost}'.
 -spec unary(map(), binary(), term(), def(), map()) -> result().
 unary(Metadata, Path, Request, #{marshal := Marshal, unmarshal := Unmarshal}, Options)
   when is_map(Metadata), is_binary(Path), is_map(Options) ->
@@ -75,10 +91,26 @@ unary(Metadata, Path, Request, #{marshal := Marshal, unmarshal := Unmarshal}, Op
                                  _     -> [{<<"grpc-timeout">>,
                                             timeout_header(remaining(Deadline))} | Extra]
                              end,
-                    call(Conn, Path, Extra1, Body, Unmarshal, Max, Deadline);
+                    case call(Conn, Path, Extra1, Body, Unmarshal, Max, Deadline) of
+                        {error, {connection_lost, Why}} ->
+                            connection_lost(Channel, Conn, Why, Options);
+                        Result ->
+                            Result
+                    end;
                 {error, _} = Error ->
                     Error
             end
+    end.
+
+%% A call that ended with its connection. A connection that is going away (the
+%% server sent GOAWAY) is handed back to the channel, which stops handing it out
+%% and opens its replacement; one that is gone is the channel's to see already
+%% (gun tells it).
+connection_lost(Channel, Conn, Why, Options) ->
+    _ = Why =:= going_away andalso yuzu_grpc_client_channel:retire(Channel, Conn),
+    case maps:get(report_conn, Options, false) of
+        true -> {error, {connection_lost, Conn}};
+        _    -> {error, connection_lost}
     end.
 
 %% @doc Request headers for a metadata map. A key that is not a lowercase
@@ -274,10 +306,27 @@ end_stream(_Conn, Ref, _Reason) ->
     catch gun:flush(Ref),
     ok.
 
-%% A transport failure as a short term: the connection's own reason where it
-%% is a plain word (the channel's `compact/1' classification), never a term
-%% that could carry request data.
+%% A transport failure of gun:await/3 as a short term, never a term that could
+%% carry request data (gun's await answers only these four shapes besides a
+%% message: a timeout, a stream error, a connection error and the connection's
+%% DOWN). A failure of the CONNECTION the call ran on is
+%% `{connection_lost, gone | going_away}' (unary/5 turns it into the caller's
+%% `connection_lost'), told apart from a reset of this one stream by what gun
+%% reports:
+%%   gone        gun ended the stream because the connection closed (`closed',
+%%               `{closed, _}'), the connection process ended under the call
+%%               (`{down, _}', the await monitor), or gun reported an error of
+%%               the connection rather than of a stream;
+%%   going_away  the server sent GOAWAY: gun ended the streams the server will
+%%               not process (`{goaway, _, _}'), or refused the call because the
+%%               connection is closing (`closing').
+%% A stream reset by the server (`{stream_error, Code, _}') is `stream_error':
+%% it says nothing about the other calls on the connection.
 transport(timeout) -> timeout;
+transport({stream_error, closed}) -> {connection_lost, gone};
+transport({stream_error, {closed, _}}) -> {connection_lost, gone};
+transport({stream_error, {goaway, _, _}}) -> {connection_lost, going_away};
+transport({stream_error, closing}) -> {connection_lost, going_away};
 transport({stream_error, _}) -> stream_error;
-transport({connection_error, _}) -> connection_error;
-transport(Reason) -> yuzu_grpc_client_channel:compact(Reason).
+transport({connection_error, _}) -> {connection_lost, gone};
+transport({down, _}) -> {connection_lost, gone}.

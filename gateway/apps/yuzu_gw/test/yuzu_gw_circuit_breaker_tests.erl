@@ -28,7 +28,12 @@ circuit_breaker_test_() ->
       {"reopens on failed probe", fun reopens_on_probe_failure/0},
       {"answers that blame the request never open the breaker", fun request_faults_do_not_trip/0},
       {"a request-fault answer from a half-open probe leaves the breaker half open", fun request_fault_probe_leaves_half_open/0},
-      {"a request-fault answer neither resets nor extends the run of failures", fun request_fault_leaves_the_run/0}
+      {"a request-fault answer neither resets nor extends the run of failures", fun request_fault_leaves_the_run/0},
+      {"calls ended by one lost connection count as one failure", fun one_lost_connection_is_one_failure/0},
+      {"each lost connection counts, so a server dropping every connection still opens the breaker",
+       fun each_lost_connection_counts/0},
+      {"the upstream asks the client which connection a call lost (report_conn)",
+       fun calls_ask_for_the_lost_connection/0}
      ] ++
      %% The set of request faults is closed and the default is to count: each of
      %% these still opens the breaker. One entry each, so each gets a fresh process.
@@ -205,3 +210,53 @@ request_fault_leaves_the_run() ->
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
     Fail(),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
+
+%% #5695: a connection that closes takes every call on it with it. They are one
+%% event, not one failure each: ten calls ended by the same lost connection
+%% leave the breaker closed with one failure (threshold 3), and the next call on
+%% a new connection succeeds.
+one_lost_connection_is_one_failure() ->
+    Conn = spawn(fun() -> receive stop -> ok end end),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
+        {error, {connection_lost, Conn}}
+    end),
+    [{error, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}) || _ <- lists:seq(1, 10)],
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(1, cb_failures()),
+    Conn ! stop.
+
+%% A server that keeps dropping connections is still a failing server: each
+%% lost connection is a failure, the third opens the breaker.
+each_lost_connection_counts() ->
+    Conns = [spawn(fun() -> receive stop -> ok end end) || _ <- lists:seq(1, 3)],
+    lists:foreach(
+      fun(Conn) ->
+              meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
+                  {error, {connection_lost, Conn}}
+              end),
+              [_ = yuzu_gw_upstream:proxy_register(#{info => #{}}) || _ <- lists:seq(1, 2)]
+      end, Conns),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    [C ! stop || C <- Conns].
+
+%% Without report_conn the client returns the bare word, and the breaker could
+%% not tell one connection from another.
+calls_ask_for_the_lost_connection() ->
+    {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
+    [Opts] = [O || {_, {yuzu_grpc_client, unary, [_, _, _, _, O]}, _}
+                       <- meck:history(yuzu_grpc_client)],
+    ?assertEqual(true, maps:get(report_conn, Opts, false)).
+
+%% The breaker's run of consecutive failures, read from the state record by
+%% field name (the record is private to yuzu_gw_upstream).
+cb_failures() ->
+    Src = filename:join([code:lib_dir(yuzu_gw), "src", "yuzu_gw_upstream.erl"]),
+    {ok, Forms} = epp:parse_file(Src, []),
+    [Fs] = [Fs0 || {attribute, _, record, {state, Fs0}} <- Forms],
+    Names = [field_name(F) || F <- Fs],
+    [I] = [I || {I, cb_failures} <- lists:zip(lists:seq(2, length(Names) + 1), Names)],
+    element(I, sys:get_state(yuzu_gw_upstream)).
+
+field_name({typed_record_field, F, _Type}) -> field_name(F);
+field_name({record_field, _, {atom, _, Name}}) -> Name;
+field_name({record_field, _, {atom, _, Name}, _Default}) -> Name.

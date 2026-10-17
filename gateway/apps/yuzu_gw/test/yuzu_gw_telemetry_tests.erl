@@ -424,6 +424,8 @@ verdict_families_test_() ->
            [?assertNotEqual(nomatch, binary:match(Out, Line))
             || Line <- [<<"yuzu_gw_registration_replay_triggered_total{trigger=\"breaker\"} ">>,
                         <<"yuzu_gw_registration_replay_triggered_total{trigger=\"heartbeat\"} ">>,
+                        <<"yuzu_gw_registration_replay_triggered_total{trigger=\"server_lost_state\"} ">>,
+                        <<"yuzu_gw_registration_replay_triggered_total{trigger=\"manual\"} ">>,
                         <<"yuzu_gw_heartbeat_unknown_truncated_total ">>,
                         <<"yuzu_gw_heartbeat_verdict_dropped_total{reason=\"malformed\"} ">>,
                         <<"yuzu_gw_heartbeat_verdict_dropped_total{reason=\"not_local\"} ">>,
@@ -439,7 +441,13 @@ verdict_families_test_() ->
            ?assertEqual({H0 + 1, B0}, {Read(<<"heartbeat">>), Read(<<"breaker">>)}),
            telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
                              #{count => 1}, #{trigger => breaker}),
-           ?assertEqual({H0 + 1, B0 + 1}, {Read(<<"heartbeat">>), Read(<<"breaker">>)})
+           ?assertEqual({H0 + 1, B0 + 1}, {Read(<<"heartbeat">>), Read(<<"breaker">>)}),
+           S0 = Read(<<"server_lost_state">>), M0 = Read(<<"manual">>),
+           telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                             #{count => 1}, #{trigger => server_lost_state}),
+           telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                             #{count => 1}, #{trigger => manual}),
+           ?assertEqual({S0 + 1, M0 + 1}, {Read(<<"server_lost_state">>), Read(<<"manual">>)})
        end},
       {"a trigger or reason outside the closed set goes to unknown and the handler stays attached",
        fun() ->

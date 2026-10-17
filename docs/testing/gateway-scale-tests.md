@@ -73,6 +73,7 @@ a stream over the limit where gRPC C++ queues it, so the client queues).
 | `gateway_crash` | N agents registered; the gateway node is killed and a new one started on the same ports. Every agent comes back by its own retry rule |
 | `planned_stop` | N agents registered; `application:stop(yuzu_gw)`. Counts the `DISCONNECTED` notices the server received |
 | `fanout` | N agents registered; one command to each agent over one management connection; agents answer after a random 0 to 10 s |
+| `upstream_conn_loss` | N agents registered; a wave of N/10 more (at least 100) registers at once, and once at least 8 `ProxyRegister` calls are open at the server it closes the gateway's upstream connection (kills its connection process) and keeps running with everything it knows. Counts breaker openings, replayed registrations and repeated `CONNECTED` notices |
 
 The crash, stop and fan-out cases first register the N agents with the server
 answering at once, then switch to the measured behaviour.
@@ -131,6 +132,7 @@ Each case also checks invariants that involve no timing:
 | `gateway_crash` | every agent registers again; no `Register` to the new gateway fails; the server holds a `CONNECTED` for every live session |
 | `planned_stop` | the server receives a `DISCONNECTED` for every session |
 | `fanout` | every command is answered; the management connection is never closed; no agent loses its session |
+| `upstream_conn_loss` | the server closed at least one connection; the circuit breaker never opened; no registration was replayed; at most 10 sessions got a second `CONNECTED` (the notifications in flight when the connection went are sent again, their answers were lost with it); every agent registers within the budget; the server holds a `CONNECTED` for every live session |
 
 Several of these fail on the gateway as of commit 29a8e655b (see the numbers
 below). The suite therefore has two groups with the same cases:
@@ -326,3 +328,30 @@ node, 340 to 350 KB per agent):
   run followed the 25,000-agent `storm` case on a host using swap; the fake
   server's own counters, added since, were not captured in it, so the cause of
   the first stall is not isolated.
+
+## One lost upstream connection
+
+The `upstream_conn_loss` case was added after a 5,000-agent `storm` against a
+healthy server whose single upstream connection had been closed showed the
+gateway replaying its whole fleet: every call on the connection failed and each
+counted against the circuit breaker, the breaker opened, its recovery started a
+full replay, and a later failure aborted it and started over. The server got up
+to 7,303 replayed registrations and 12,276 `CONNECTED` notices for 5,000 agents
+it already knew. Same host as above.
+
+| | 500 before | 500 after | 5,000 before | 5,000 after |
+|---|---|---|---|---|
+| wave, `ProxyRegister` open at the server when it closed the connection | 100, 21 | 100, 14 | 500, 10 | 500, 11 |
+| breaker openings | 1 | 0 | 1 | 0 |
+| registrations replayed | 600 (every agent) | 0 | 5,500 (every agent) | 0 |
+| sessions with a second `CONNECTED` | 600 | 0 | 5,500 | 0 |
+| wave agents whose first `Register` failed | 100 (74 `INTERNAL`, 26 `UNAVAILABLE` from the open breaker) | 50 (`INTERNAL`, their calls were on the connection) | 500 (38 `INTERNAL`, 462 `UNAVAILABLE`) | 37 (`INTERNAL`) |
+| all registered after the wave started | 14.3 s | 2.3 s | 14.7 s | 2.3 s |
+
+"Before" is c318b1e5a; "after" is the change that counts a lost connection once
+and replays only what the server's heartbeat verdict says it does not know (see
+"What starts a full replay" in `docs/user-manual/gateway.md`). The agents whose
+calls were on the closed connection retry by their own rule (2 s), which is the
+2.3 s. A real server restart still replays everyone: `server_crash` after the
+change replayed all 450 held sessions in 6.8 s at 500 agents and all 4,500 in
+13.2 s at 5,000 (13.3 s before it), 24 in flight, no `DISCONNECTED` lost.

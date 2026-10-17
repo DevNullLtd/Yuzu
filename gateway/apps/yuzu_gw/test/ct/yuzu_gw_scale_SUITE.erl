@@ -29,6 +29,12 @@
 %%%                  (one SendCommand per agent, one management connection, at
 %%%                  most 4096 open, the shipped stream cap); agents answer
 %%%                  after 0-10 s
+%%%   upstream_conn_loss
+%%%                  N registered; a wave of N/10 (at least 100) more agents
+%%%                  registers at once and, with calls in flight, the server
+%%%                  closes the gateway's upstream connection once and keeps
+%%%                  running with its state. Counts breaker openings, replayed
+%%%                  ProxyRegisters and repeated CONNECTED notices
 %%%
 %%% Each scenario MEASURES and REPORTS (never fails on a timing): registration
 %%% counts and latency percentiles, replay time, notices lost, gateway memory
@@ -87,7 +93,7 @@
 %%% CT callbacks
 %%%===================================================================
 
-cases() -> [ramp, storm, server_crash, gateway_crash, planned_stop, fanout].
+cases() -> [ramp, storm, server_crash, gateway_crash, planned_stop, fanout, upstream_conn_loss].
 
 all() ->
     case os:getenv("YUZU_GW_SCALE_GATE") of
@@ -393,6 +399,62 @@ fanout(Config) ->
           gateway => gateway_report(Config)},
     finish(fanout, Config, R).
 
+%% @doc The server keeps running with everything it knows, but the gateway's
+%% upstream connection is closed once (a reset connection: the fake kills its
+%% connection process) while a registration wave is in flight. One lost
+%% connection is one event: it must not open the breaker, and since the server
+%% lost nothing, nothing is replayed and no agent's CONNECTED is sent twice
+%% (beyond the few notices in flight when the connection went, which are sent
+%% again because their answers were lost with it).
+upstream_conn_loss(Config) ->
+    N = ?config(n, Config),
+    Pre = setup_registered(Config),
+    Wave = max(100, N div 10),
+    set_upstream(Config, #{register_latency_ms => latency()}),
+    Opens0 = breaker_transitions(Config),
+    #{replay_rpcs := Replays0} = up_call(Config, stats, []),
+    Dups0 = duplicate_connected(up_call(Config, notices, [])),
+    T0 = mark(Config),
+    ok = load_call(Config, spawn_agents, [#{from => N + 1, count => Wave, mode => storm}]),
+    %% Close with ProxyRegister calls on the wire: each would count against the
+    %% breaker if the connection loss were not one event.
+    {InFlight, InFlightSeen} =
+        wait_until(fun() ->
+                           I = maps:get(register_inflight, up_call(Config, stats, [])),
+                           {I >= 8, I}
+                   end, 30000, 2),
+    Closed = up_call(Config, close_connections, [abort]),
+    TClose = erlang:system_time(millisecond),
+    Reg = await_registered(Config, N + Wave, T0),
+    Settle = settle(Config),
+    Opens = maps:map(fun(K, V) -> V - maps:get(K, Opens0) end, breaker_transitions(Config)),
+    #{replay_rpcs := Replays1} = up_call(Config, stats, []),
+    Notices = up_call(Config, notices, []),
+    R0 = registration_report(Config, T0, Reg, Wave),
+    R = R0#{setup => Pre,
+            wave => Wave,
+            register_inflight_at_close => InFlightSeen,
+            inflight_reached => InFlight,
+            connections_closed => Closed,
+            breaker_transitions => Opens,
+            replay_rpcs_after_close => Replays1 - Replays0,
+            duplicate_connected_after_close => duplicate_connected(Notices) - Dups0,
+            connected_notices_after_close =>
+                length([1 || {_, _, connected, T} <- Notices, T >= TClose]),
+            settle => Settle},
+    finish(upstream_conn_loss, Config, R).
+
+%% The breaker's transitions so far, read from the gateway's own counter.
+breaker_transitions(Config) ->
+    maps:from_list([{S, gw_call(Config, prometheus_counter, value,
+                                [yuzu_gw_upstream_circuit_transitions_total, [atom_to_binary(S)]])}
+                    || S <- [open, half_open, closed]]).
+
+%% CONNECTED notices for a session that already had one.
+duplicate_connected(Notices) ->
+    Connected = [S || {_, S, connected, _} <- Notices],
+    length(Connected) - sets:size(sets:from_list(Connected, [{version, 2}])).
+
 %%%===================================================================
 %%% Invariants (no timing in any of them)
 %%%===================================================================
@@ -420,6 +482,21 @@ invariants(gateway_crash, R) ->
 invariants(planned_stop, R) ->
     [inv(no_lost_disconnected, maps:get(disconnected_lost, R) =:= 0,
          "the server received a DISCONNECTED notice for every session on a planned stop")];
+invariants(upstream_conn_loss, R) ->
+    #{register := Reg, convergence := Conv} = R,
+    [inv(connection_closed, maps:get(connections_closed, R) >= 1,
+         "the server closed at least one gateway connection with calls in flight"),
+     inv(breaker_stayed_closed, maps:get(open, maps:get(breaker_transitions, R)) =:= 0,
+         "one lost upstream connection did not open the circuit breaker"),
+     inv(no_replay_after_conn_loss, maps:get(replay_rpcs_after_close, R) =:= 0,
+         "no registration was replayed to a server that lost nothing"),
+     inv(no_repeated_connected, maps:get(duplicate_connected_after_close, R) =< 10,
+         "no session's CONNECTED reached the server twice, beyond the at most 10 "
+         "notices in flight when the connection went"),
+     inv(all_registered_within_budget, maps:get(unregistered_at_budget, Reg) =:= 0,
+         "every agent was registered within the scenario budget"),
+     inv(every_live_session_connected, maps:get(missing_connected, Conv) =:= 0,
+         "the server holds a CONNECTED notice for every live session")];
 invariants(fanout, R) ->
     #{fanout := F} = R,
     [inv(every_command_answered, maps:get(answered, F) =:= maps:get(targets, F),

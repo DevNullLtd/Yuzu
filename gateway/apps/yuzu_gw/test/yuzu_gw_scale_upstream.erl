@@ -16,6 +16,12 @@
 %%%   register_fail       none | {Status, Message}  answer every ProxyRegister
 %%%                                   with that gRPC status instead
 %%%
+%%% close_connections/1 closes the connections the gateway holds to this server
+%%% while the server keeps running with its state (sessions, notices): `abort'
+%%% kills each connection process (the socket closes at once, every call on it
+%%% ends unanswered), `goaway' asks each one to close gracefully (GOAWAY, the
+%%% calls already started finish, then the socket closes).
+%%%
 %%% What it records, for the suite to read (stats/0, registers/0, notices/0):
 %%%   - every ProxyRegister: agent id, receive and answer time (ms, OS clock:
 %%%     every node of the suite runs on one host), whether it was a replay (the
@@ -36,7 +42,7 @@
 
 %% Control API (called in the upstream peer through peer:call).
 -export([start/1, port/0, set_config/1, stats/0, registers/0, notices/0, sessions/0,
-         trace_stream_ends/0, stream_ends/0]).
+         trace_stream_ends/0, stream_ends/0, close_connections/1]).
 %% GatewayUpstream handlers (yuzu_grpc_runner unary convention).
 -export([proxy_register/2, batch_heartbeat/2, proxy_inventory/2,
          notify_stream_status/2, forward_guardian_message/2]).
@@ -139,6 +145,23 @@ notices() ->
 sessions() ->
     ets:tab2list(?SESSIONS).
 
+%% @doc Close every connection a client (the gateway) holds to this server; the
+%% server itself and its state stay. Returns how many were closed.
+%%   abort   the connection process is killed: the socket closes at once and no
+%%           call on it is answered (what a reset connection looks like to the
+%%           gateway);
+%%   goaway  the connection is asked to stop (sys:terminate/3, Cowboy's graceful
+%%           path): GOAWAY, the calls already started finish, then it closes.
+-spec close_connections(abort | goaway) -> non_neg_integer().
+close_connections(Mode) ->
+    Ref = gen_server:call(?SERVER, ranch_ref),
+    Conns = ranch:procs(Ref, connections),
+    [case Mode of
+         abort -> exit(C, kill);
+         goaway -> spawn(fun() -> catch sys:terminate(C, shutdown, 10000) end)
+     end || C <- Conns],
+    length(Conns).
+
 %% @doc Diagnostic: count the reason every stream of this server's listener
 %% ends with, other than a normal end (yuzu_grpc_stream_h:terminate/3 is
 %% traced; the call pattern is cheap and only this node is traced). Read with
@@ -201,7 +224,7 @@ init(Opts) ->
                          max_received_frame_rate => {10000000, 10000},
                          idle_timeout => 600000}},
     case start_listener(Entry, 50) of
-        {ok, L} -> {ok, #{listener => L}};
+        {ok, L} -> {ok, #{listener => L, ranch_ref => yuzu_grpc_listener:ref(Entry)}};
         {error, Reason} -> {stop, Reason}
     end.
 
@@ -216,7 +239,9 @@ start_listener(Entry, N) ->
     end.
 
 handle_call(port, _From, #{listener := L} = S) ->
-    {reply, yuzu_grpc_listener:port(L), S}.
+    {reply, yuzu_grpc_listener:port(L), S};
+handle_call(ranch_ref, _From, #{ranch_ref := Ref} = S) ->
+    {reply, Ref, S}.
 
 handle_cast(_Msg, S) -> {noreply, S}.
 handle_info(_Msg, S) -> {noreply, S}.

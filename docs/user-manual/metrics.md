@@ -104,8 +104,14 @@ Notification" and "Planned stop".
 | `yuzu_gw_upstream_notify_pending_hwm` | gauge | Most notifications held at once over the last one to two minutes (kept by the upstream process, so a spike between scrapes is seen) |
 | `yuzu_gw_upstream_notify_pending_max` | gauge | The held-notification cap in force (`notify_pending_max`) |
 
-`yuzu_gw_registration_replay_triggered_total{trigger}` gained the value
-`notify_loss`: a full replay started because a held `CONNECTED` was lost. The
+`yuzu_gw_registration_replay_triggered_total{trigger}` gained the values
+`notify_loss` (a full replay started because a held `CONNECTED` was lost),
+`server_lost_state` (a heartbeat verdict showed the server lost its state) and
+`manual`; `breaker` is no longer incremented, because a breaker recovery no
+longer replays every agent. `yuzu_gw_upstream_rpc_errors_total{code}` gained the
+value `connection_lost` (a call ended because its upstream connection closed or
+went away; the breaker counts one such connection once, however many calls it
+ended), which replaces `stream_error` and `connection_error` for those calls. The
 pressure lane `serial` of `yuzu_gw_upstream_lane_saturated_seconds_total{lane}` is
 now `permits` (a live `Register` or inventory report waiting for a permit). No new
 alert ships for these; a sustained rise of
@@ -205,7 +211,7 @@ peer node) or because it is a histogram; every other family exists from start.
 | `yuzu_gw_register_refused_total` | counter | `reason` | Registers the edge refused before any upstream call |
 | `yuzu_gw_registration_replay_total` | counter | | Registration replay attempts |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | `node` | Agents queued for registration replay |
-| `yuzu_gw_registration_replay_triggered_total` | counter | `trigger` | Registration replays started (`breaker`, `heartbeat`, `notify_loss`) |
+| `yuzu_gw_registration_replay_triggered_total` | counter | `trigger` | Registration replays started: `heartbeat` (a heartbeat verdict named sessions the server does not know; only those are replayed), `server_lost_state` (a verdict named at least half of its batch, and at least one session per 64 agents held, or was truncated: every agent is replayed, at most once a minute), `notify_loss` (a held `CONNECTED` was lost: every agent is replayed), `manual` (a full replay asked for by hand). `breaker` is kept at 0: since #5695 a breaker recovery replays nothing |
 | `yuzu_gw_guardian_forward_accepted_total` | counter | | Guardian drift events accepted for forwarding |
 | `yuzu_gw_guardian_forward_dropped_total` | counter | `reason` | Guardian drift events dropped (`circuit_open`, `at_capacity`) |
 | `yuzu_gw_heartbeat_rejected_total` | counter | `reason` | Heartbeats refused for want of a usable session binding |

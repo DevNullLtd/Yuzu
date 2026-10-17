@@ -24,6 +24,13 @@
 %%% so a dead server is answered in microseconds and the circuit breaker above
 %%% sees it, instead of every call waiting out its timeout.
 %%%
+%%% A connection the server is closing (GOAWAY) is retired as soon as a caller
+%%% reports it (retire/2, from yuzu_grpc_client): it is no longer handed out,
+%%% the calls already on it finish, and its slot is redialled at once, the way a
+%%% lost connection's is (failed/3). Without this the slot kept handing out the
+%%% closing connection, whose new calls gun refuses, until gun closed it
+%%% (closing_timeout, 3 s).
+%%%
 %%% Nothing here logs a reason term: the exit reason of a connection can carry
 %%% socket and TLS details, and a log line carries a word instead (`word/1').
 %%% @end
@@ -31,7 +38,7 @@
 -module(yuzu_grpc_client_channel).
 -behaviour(gen_server).
 
--export([child_spec/1, start_link/1, pick/2, max_receive/1, config_error/1]).
+-export([child_spec/1, start_link/1, pick/2, retire/2, max_receive/1, config_error/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
 -export([compact/1, word/1, backoff_ms/1]).
 
@@ -54,7 +61,10 @@
 -record(st, {name :: atom(),
              cfg :: yuzu_grpc_client_config:channel(),
              slots = #{} :: #{pos_integer() => #slot{}},
-             by_pid = #{} :: #{pid() => pos_integer()},
+             %% every connection this process owns: the slot it serves, or
+             %% {retired, Slot} for one that is closing (retire/2) and is only
+             %% waited out (its end is not a failure of the slot)
+             by_pid = #{} :: #{pid() => pos_integer() | {retired, pos_integer()}},
              %% callers of await_up waiting for a connection that is being opened,
              %% each with the monotonic ms at which it stops waiting (an expired
              %% caller has already given up; its entry is dropped, never answered)
@@ -98,6 +108,14 @@ pick(Name, Timeout) ->
     catch
         error:badarg -> {error, no_channel}
     end.
+
+%% @doc A caller found that connection `Conn' is going away (the server sent
+%% GOAWAY): stop handing it out and open its replacement. A cast; a connection
+%% that is not (or no longer) a slot's current one is ignored, so any number of
+%% callers may report the same connection.
+-spec retire(atom(), pid()) -> ok.
+retire(Name, Conn) when is_pid(Conn) ->
+    gen_server:cast(Name, {retire, Conn}).
 
 %% @doc `none' while the channel's connections can be tried, or the problems
 %% found while its most recent attempt failed because the TLS options are
@@ -202,7 +220,25 @@ do_call({await_up, Timeout}, From, #st{name = Name} = State) ->
 do_call(_Request, _From, State) ->
     {reply, {error, unsupported}, State}.
 
-handle_cast(_Msg, State) ->
+handle_cast(Msg, State) ->
+    guard(fun() -> do_cast(Msg, State) end).
+
+do_cast({retire, Pid}, #st{slots = Slots, by_pid = ByPid} = State) ->
+    case maps:find(Pid, ByPid) of
+        {ok, Id} when is_integer(Id) ->
+            %% The slot's current connection: it stays linked and is waited out
+            %% (gun ends it once its streams are done, or after closing_timeout),
+            %% and the slot is redialled as for a loss: at once the first time,
+            %% with backoff if its connections keep going away before they were
+            %% stable.
+            Slot = maps:get(Id, Slots),
+            State1 = State#st{slots = Slots#{Id := Slot#slot{pid = undefined}},
+                              by_pid = ByPid#{Pid := {retired, Id}}},
+            {noreply, failed(Id, goaway, State1)};
+        _ ->
+            {noreply, State}
+    end;
+do_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info(Info, State) ->
@@ -215,7 +251,7 @@ guard(Fun) ->
 
 do_info({gun_up, Pid, _Protocol}, #st{by_pid = ByPid} = State) ->
     case maps:find(Pid, ByPid) of
-        {ok, Id} ->
+        {ok, Id} when is_integer(Id) ->
             erlang:send_after(?STABLE_MS, self(), {stable, Id, Pid}),
             true = ets:delete(State#st.name, config_error),
             State1 = mark(Id, up, State#st{config_logged_at = undefined}),
@@ -247,8 +283,8 @@ do_info({reconnect, Id}, #st{slots = Slots} = State) ->
 do_info(_Other, State) ->
     {noreply, State}.
 
-terminate(_Reason, #st{slots = Slots}) ->
-    _ = [close_conn(P) || #slot{pid = P} <- maps:values(Slots), is_pid(P)],
+terminate(_Reason, #st{by_pid = ByPid}) ->
+    _ = [close_conn(P) || P <- maps:keys(ByPid)],
     ok.
 
 %% What a crash report or sys:get_status shows of this process: the shape, not
@@ -319,6 +355,10 @@ socket_opts(Tcp) ->
 
 lost(Pid, Reason, #st{slots = Slots, by_pid = ByPid} = State) ->
     case maps:find(Pid, ByPid) of
+        {ok, {retired, _Id}} ->
+            %% A retired connection has closed: its slot was redialled already.
+            close_conn(Pid),
+            State#st{by_pid = maps:remove(Pid, ByPid)};
         {ok, Id} ->
             close_conn(Pid),
             Slot = maps:get(Id, Slots),

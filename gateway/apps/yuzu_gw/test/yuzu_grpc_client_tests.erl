@@ -12,7 +12,13 @@
 %%%     response over the channel's limit fails the call;
 %%%   - calls run concurrently on a channel's connections;
 %%%   - a dead server is answered at once with its error, a connection that goes
-%%%     away is reopened, and the deadline ends a call that never answers.
+%%%     away is reopened, and the deadline ends a call that never answers;
+%%%   - a call that ends because its CONNECTION closed is `connection_lost', the
+%%%     same connection pid for every call it took with it (`report_conn'), so
+%%%     the circuit breaker can count one lost connection once (#5695);
+%%%   - a connection the server closes gracefully (GOAWAY) is retired at the
+%%%     first call it refuses: the next call runs on a new connection at once,
+%%%     not after gun's closing_timeout (#5695).
 %%%
 %%% Nothing waits for time to pass to make an assertion true: the waits are on
 %%% events (a connection coming up, a monitor). The deadline case uses a real
@@ -60,6 +66,123 @@ plaintext_test_() ->
          {"test client: bidi echo, then close_send ends the call with status 0", fun() -> bidi_echo(State) end},
          {"test client: a stream error status arrives as trailers", fun() -> bidi_error(State) end}]
      end}.
+
+%% A listener and a one-connection channel of their own: these tests close the
+%% server side of the channel's connection.
+conn_loss_test_() ->
+    {foreach,
+     fun conn_setup/0,
+     fun conn_cleanup/1,
+     [fun(State) ->
+              {"calls on a connection that closes are connection_lost, one pid for all",
+               {timeout, 30, fun() -> lost_connection_is_one_pid(State) end}}
+      end,
+      fun(State) ->
+              {"a connection the server closes gracefully is retired at the first refused call",
+               {timeout, 30, fun() -> goaway_retires_the_connection(State) end}}
+      end]}.
+
+conn_setup() ->
+    {ok, _} = application:ensure_all_started(gun),
+    {ok, _} = application:ensure_all_started(cowboy),
+    {ok, _} = application:ensure_all_started(telemetry),
+    yuzu_grpc_stub_svc:init_state(),
+    Unique = integer_to_list(erlang:unique_integer([positive])),
+    Name = list_to_atom("client_conn_loss_" ++ Unique),
+    {Port, Listener} = yuzu_gw_test_listener:start(
+                         #{name => Name, service_protos => [agent_pb],
+                           services => #{?SVC => yuzu_grpc_stub_svc}}),
+    Chan = yuzu_gw_test_listener:client_channel(list_to_atom("client_conn_loss_chan_" ++ Unique),
+                                                #{port => Port}),
+    #{ref => {yuzu_grpc, Name}, listener => Listener, chan => Chan}.
+
+conn_cleanup(#{listener := Listener, chan := Chan}) ->
+    [S ! release || S <- yuzu_grpc_stub_svc:sleepers()],
+    yuzu_gw_test_listener:stop_channel(Chan),
+    yuzu_gw_test_listener:stop(Listener),
+    flush_mailbox().
+
+%% Three calls are on the wire (their handlers sleep) when the server's side of
+%% the connection is killed: each ends as connection_lost naming the one
+%% connection, and a call without report_conn gets the bare word. The channel
+%% reopens the slot and the next call is answered.
+lost_connection_is_one_pid(#{ref := Ref, chan := Chan}) ->
+    %% setup/0 may run in another process: the stub notifies this one.
+    yuzu_grpc_stub_svc:notify(self()),
+    {ok, Conn} = yuzu_grpc_client_channel:pick(Chan, 1000),
+    Self = self(),
+    Opts = [#{channel => Chan, report_conn => true}, #{channel => Chan, report_conn => true},
+            #{channel => Chan}],
+    Callers = [spawn_link(fun() ->
+                                  R = yuzu_grpc_client:unary(#{}, ?HEARTBEAT,
+                                                             #{session_id => <<"sleep">>},
+                                                             def(), O#{timeout => 10000}),
+                                  Self ! {caller, self(), R}
+                          end) || O <- Opts],
+    [receive {stub, sleeping, _} -> ok after 10000 -> error(handler_never_slept) end
+     || _ <- Callers],
+    [ServerConn] = ranch:procs(Ref, connections),
+    exit(ServerConn, kill),
+    Results = [receive {caller, C, R} -> R after 10000 -> error({caller_silent, C}) end
+               || C <- Callers],
+    ?assertEqual([{error, {connection_lost, Conn}}, {error, {connection_lost, Conn}},
+                  {error, connection_lost}], Results),
+    %% gun tells the channel after it told the calls; once the channel has
+    %% redialled, calls are answered again.
+    ok = wait_new_connection(Chan, Conn, 400),
+    ?assertMatch({ok, #{acknowledged := true}, _}, heartbeat(Chan, <<"ok">>)).
+
+%% Wait (bounded) until the channel hands out a connection other than Old.
+wait_new_connection(_Chan, Old, 0) ->
+    error({still_handing_out, Old});
+wait_new_connection(Chan, Old, N) ->
+    case yuzu_grpc_client_channel:pick(Chan, 1000) of
+        {ok, New} when New =/= Old -> ok;
+        _ -> receive after 25 -> ok end, wait_new_connection(Chan, Old, N - 1)
+    end.
+
+%% The server closes the connection gracefully while a call sleeps on it:
+%% Cowboy sends GOAWAY, and once the second GOAWAY (the real last stream id)
+%% is in, gun is `closing' and refuses every new call on that connection until
+%% the sleeping stream ends or its closing_timeout (3 s) passes. The first
+%% refused call reports the connection to the channel, which retires it and
+%% opens a new one: the very next call is answered, while the old connection
+%% is still alive finishing the sleeping call.
+goaway_retires_the_connection(#{ref := Ref, chan := Chan}) ->
+    %% setup/0 may run in another process: the stub notifies this one.
+    yuzu_grpc_stub_svc:notify(self()),
+    {ok, Conn} = yuzu_grpc_client_channel:pick(Chan, 1000),
+    Self = self(),
+    Sleeper = spawn_link(fun() ->
+                                 R = yuzu_grpc_client:unary(#{}, ?HEARTBEAT,
+                                                            #{session_id => <<"sleep">>}, def(),
+                                                            #{channel => Chan, timeout => 10000}),
+                                 Self ! {sleeper, R}
+                         end),
+    receive {stub, sleeping, _} -> ok after 10000 -> error(handler_never_slept) end,
+    [ServerConn] = ranch:procs(Ref, connections),
+    _ = spawn(fun() -> catch sys:terminate(ServerConn, shutdown, 15000) end),
+    ok = wait_gun_state(Conn, closing, 400),
+    ?assertEqual({error, {connection_lost, Conn}},
+                 yuzu_grpc_client:unary(#{}, ?HEARTBEAT, #{session_id => <<"ok">>}, def(),
+                                        #{channel => Chan, report_conn => true})),
+    %% The retire is a cast: a call to the channel is handled after it.
+    _ = sys:get_state(Chan),
+    ?assertMatch({ok, #{acknowledged := true}, _}, heartbeat(Chan, <<"ok">>)),
+    {ok, Conn2} = yuzu_grpc_client_channel:pick(Chan, 1000),
+    ?assertNotEqual(Conn, Conn2),
+    ?assert(is_process_alive(Conn)),
+    unlink(Sleeper),
+    [S ! release || S <- yuzu_grpc_stub_svc:sleepers()].
+
+%% Wait (bounded) until a gun connection's state machine is in StateName.
+wait_gun_state(_Conn, StateName, 0) ->
+    error({gun_never_reached, StateName});
+wait_gun_state(Conn, StateName, N) ->
+    case catch sys:get_state(Conn, 1000) of
+        {StateName, _} -> ok;
+        _ -> receive after 25 -> ok end, wait_gun_state(Conn, StateName, N - 1)
+    end.
 
 setup() ->
     {ok, _} = application:ensure_all_started(gun),

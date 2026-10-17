@@ -67,8 +67,9 @@
 %%% Heartbeat verdict (#1197): a successful BatchHeartbeatResponse may
 %%% list sessions the server does not know (unknown_session_ids), typically
 %%% after a server restart. Each successful chunk hands that list to
-%%% yuzu_gw_upstream:replay_sessions/1, which re-proxies exactly those
-%%% sessions. The buffer only validates the ids and counts what it drops as
+%%% yuzu_gw_upstream:replay_sessions/2, which re-proxies exactly those
+%%% sessions, with the chunk's size and the truncated flag: when the server
+%%% does not know most of a chunk, the upstream replays every agent (#5695). The buffer only validates the ids and counts what it drops as
 %%% malformed; every other decision (which are local, which are already
 %%% queued, the breaker, the queue cap) belongs to the upstream. Flush results
 %%% never feed the circuit breaker, and the only coupling to the upstream is
@@ -739,7 +740,7 @@ flush_loop([Chunk | Rest], State, #acc{rpcs = Rpcs} = Acc) ->
     Acc1 = Acc#acc{rpcs = Rpcs + 1},
     case do_flush(BatchReq, length(Chunk)) of
         {ok, Response} ->
-            State1 = consume_verdict(Response, State),
+            State1 = consume_verdict(Response, length(Chunk), State),
             {State2, Bytes} = remove_chunk(Chunk, State1),
             flush_loop(Rest, State2,
                        Acc1#acc{sent     = Acc1#acc.sent + length(Chunk),
@@ -848,8 +849,8 @@ flushed(#acc{sent = Sent, nchunks = NChunks}) ->
 %% for an OK with trailers and no DATA frame): nothing is cast or counted and
 %% the flush still succeeds. A key of the wrong type is treated as absent. A
 %% crash here would take this process, and every heartbeat it buffers, with it.
--spec consume_verdict(term(), #state{}) -> #state{}.
-consume_verdict(Response, State) when is_map(Response) ->
+-spec consume_verdict(term(), non_neg_integer(), #state{}) -> #state{}.
+consume_verdict(Response, Batch, State) when is_map(Response) ->
     Listed = listed_ids(maps:get(unknown_session_ids, Response, [])),
     {Kept, Malformed} = lists:partition(fun is_session_id/1, Listed),
     Ids = lists:sublist(lists:usort(Kept), ?MAX_VERDICT_IDS),
@@ -868,7 +869,8 @@ consume_verdict(Response, State) when is_map(Response) ->
                               #{count => length(Malformed)},
                               #{reason => malformed})
     end,
-    State1 = case maps:get(unknown_session_ids_truncated, Response, false) of
+    Truncated = maps:get(unknown_session_ids_truncated, Response, false) =:= true,
+    State1 = case Truncated of
         true ->
             telemetry:execute([yuzu, gw, heartbeat, unknown_truncated],
                               #{count => 1}, #{}),
@@ -878,18 +880,18 @@ consume_verdict(Response, State) when is_map(Response) ->
     end,
     case Ids of
         [] -> ok;
-        _  -> cast_replay(Ids)
+        _  -> cast_replay(Ids, #{batch => Batch, truncated => Truncated})
     end,
     State1;
-consume_verdict(_NotAMap, State) ->
+consume_verdict(_NotAMap, _Batch, State) ->
     logger:debug("Heartbeat verdict: response body is not a message; no verdict"),
     State.
 
 %% @doc Cast Ids to the upstream replay unless its mailbox is already long.
 %% No upstream process (or one that died since the lookup) has no queue to
 %% protect: the cast is a no-op then, exactly as before.
--spec cast_replay([binary()]) -> ok.
-cast_replay(Ids) ->
+-spec cast_replay([binary()], map()) -> ok.
+cast_replay(Ids, Verdict) ->
     case upstream_queue_len() of
         Len when is_integer(Len), Len > ?UPSTREAM_QUEUE_MAX ->
             telemetry:execute([yuzu, gw, heartbeat, verdict_dropped],
@@ -899,7 +901,7 @@ cast_replay(Ids) ->
                          "~b session id(s) not cast", [Len, length(Ids)]),
             ok;
         _ ->
-            yuzu_gw_upstream:replay_sessions(Ids)
+            yuzu_gw_upstream:replay_sessions(Ids, Verdict)
     end.
 
 -spec upstream_queue_len() -> non_neg_integer() | undefined.
