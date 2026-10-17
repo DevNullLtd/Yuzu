@@ -47,6 +47,8 @@ plaintext_test_() ->
          {"concurrent calls all complete on a channel's connections", {timeout, 30, fun() -> concurrent(State) end}},
          {"calls spread over both connections of the pool", fun() -> spread(State) end},
          {"the deadline ends a call that never answers", {timeout, 20, fun() -> deadline(State) end}},
+         {"a server that honours grpc-timeout ends the call first, DEADLINE_EXCEEDED",
+          {timeout, 20, fun() -> server_deadline(State) end}},
          {"a timed-out call cancels its stream: the handler ends and nothing reaches the caller later",
           {timeout, 20, fun() -> timeout_cancels_the_stream(State) end}},
          {"a response over the limit that spans many frames stops the stream: nothing reaches the caller later",
@@ -196,15 +198,30 @@ conn_of(Chan) ->
 %% Deadline, channel, socket
 %%--------------------------------------------------------------------
 
+%% The client's own deadline (no grpc-timeout sent: a server that honours it
+%% would end the call first, see server_deadline/1).
 deadline(#{chan := Chan}) ->
     T0 = erlang:monotonic_time(millisecond),
     ?assertEqual({error, timeout},
                  yuzu_grpc_client:unary(#{}, ?HEARTBEAT, #{session_id => <<"sleep">>}, def(),
-                                        #{channel => Chan, timeout => 300})),
+                                        #{channel => Chan, timeout => 300,
+                                          send_timeout => false})),
     Elapsed = erlang:monotonic_time(millisecond) - T0,
     ?assert(Elapsed >= 300),
     ?assert(Elapsed < 5000),
     %% the channel is still good afterwards
+    ?assertMatch({ok, #{acknowledged := true}, _}, heartbeat(Chan, <<"ok">>)).
+
+%% With grpc-timeout sent (the default), the gateway's own listener ends the
+%% handler a tenth early (yuzu_grpc_stream_h:deadline_ms/1) and answers status 4,
+%% so the client gets the server's answer, not its local timeout.
+server_deadline(#{chan := Chan}) ->
+    T0 = erlang:monotonic_time(millisecond),
+    ?assertMatch({error, {<<"4">>, _}, _},
+                 yuzu_grpc_client:unary(#{}, ?HEARTBEAT, #{session_id => <<"sleep">>}, def(),
+                                        #{channel => Chan, timeout => 1000})),
+    Elapsed = erlang:monotonic_time(millisecond) - T0,
+    ?assert(Elapsed < 1000),
     ?assertMatch({ok, #{acknowledged := true}, _}, heartbeat(Chan, <<"ok">>)).
 
 %% The call is given up on at 300 ms. The stream is cancelled (RST_STREAM), so the
@@ -218,7 +235,8 @@ timeout_cancels_the_stream(#{chan := Chan}) ->
     Self = self(),
     Caller = spawn_link(fun() ->
                             R = yuzu_grpc_client:unary(#{}, ?HEARTBEAT, #{session_id => <<"sleep">>},
-                                                       def(), #{channel => Chan, timeout => 300}),
+                                                       def(), #{channel => Chan, timeout => 300,
+                                                                send_timeout => false}),
                             Stray = collect_messages(500),
                             Self ! {caller, R, Stray}
                         end),
