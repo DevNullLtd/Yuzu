@@ -38,9 +38,11 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
   leg (`windows-asan`, agent-only, Wee Tam pool, gated on
   `weetam_pool_healthy`) covering the Windows-only spark mechanisms that the
-  Linux sanitizers can't reach (#1934a). On any leg failure, the `alert` job auto-opens or comments on a
-  `nightly-broken` issue. **Discipline norm: no merge to main while a
-  `nightly-broken` issue is open.**
+  Linux sanitizers can't reach (#1934a). On any leg failure, or a leg ending
+  `cancelled` (a timeout) while the run itself was not cancelled, the `alert`
+  job auto-opens or comments on a `nightly-broken` issue.
+  **Discipline norm: no merge to main while a `nightly-broken` issue is
+  open.**
 
   **Scheduled nightlies always run the DEFAULT branch's copy of the workflow**
   (currently `main`) — `dev` gets zero nightly ASan/TSan/coverage coverage
@@ -1586,6 +1588,27 @@ correlation yet; building that is a real #3443 follow-up, not assumed
 done here. Response to either trigger is rebalancing/splitting the
 affected shard(s) or reverting to slots=2, never another timeout
 increase. Tracked: #3443.
+
+**Nightly Coverage runs after the sanitizer legs (#4019).** Within a
+single nightly run, `coverage` `needs:` both `sanitize-asan` and
+`sanitize-tsan`, so at most two of that run's three Linux legs share Big
+Tam at once. Running all three together oversubscribed the box, which made
+timing-sensitive sanitizer tests fail far more often; the tests that
+assumed a scheduling order were fixed in the same change, so neither half
+alone is the fix. The `needs:` is for ordering only: Coverage's `if:` leads
+with `!cancelled()`, so it still runs when a sanitizer leg is red.
+
+- Nightly wall time grows by roughly one sanitizer leg, and re-running a
+  failed sanitizer leg also re-runs Coverage.
+- This change does not close #3443. The legs still bypass the slot gate, other
+  workflows can still land on the box alongside them, and a dispatch on
+  another ref can overlap a scheduled run.
+- Related alerting change: the `alert` job also opens `nightly-broken` when
+  a leg ends `cancelled` while the run itself was not cancelled. That covers
+  a leg hitting its
+  `timeout-minutes`, which GitHub reports as cancelled rather than failed.
+  It also fires if a runner goes away mid-job, which is a real
+  infrastructure signal.
 
 **Within-job cap extended to the non-pg step (2026-09-18).** The "3 non-pg
 server tests, both uncapped" status above (now 6 named entries, see the

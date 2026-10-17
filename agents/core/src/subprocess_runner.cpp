@@ -79,6 +79,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <cstring> // std::memcpy (spawn_errno decode below)
 
@@ -189,6 +190,22 @@ bool subprocess_cancel_requested() {
 }
 
 #ifndef _WIN32
+
+namespace {
+// TEST-ONLY (#4019): see ScopedSubprocessProbeForTest in subprocess_runner.hpp.
+thread_local const SubprocessProbe* t_subprocess_probe = nullptr;
+} // namespace
+
+ScopedSubprocessProbeForTest::ScopedSubprocessProbeForTest(SubprocessProbe probe)
+    : probe_(std::move(probe)), previous_(t_subprocess_probe) {
+    t_subprocess_probe = &probe_;
+}
+
+ScopedSubprocessProbeForTest::~ScopedSubprocessProbeForTest() {
+    // Out-of-order destruction would leave the thread pointing at a dead probe.
+    assert(t_subprocess_probe == &probe_ && "ScopedSubprocessProbeForTest scopes must nest LIFO");
+    t_subprocess_probe = previous_;
+}
 
 namespace {
 
@@ -1256,8 +1273,20 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         }
     };
 
+    // TEST-ONLY ordering seam (#4019) -- inert unless a ScopedSubprocessProbeForTest
+    // is live on this thread.
+    auto probe = [&](SubprocessProbePoint point) {
+        if (t_subprocess_probe)
+            (*t_subprocess_probe)(point,
+                                  SubprocessProbeState{.pid = pid,
+                                                       .start = start,
+                                                       .child_reaped = child_reaped,
+                                                       .exec_confirmed = exec_confirmed_ok,
+                                                       .killed = killed});
+    };
+
     while (true) {
-        auto now = std::chrono::steady_clock::now();
+        probe(SubprocessProbePoint::before_reap);
 
         // Reap and poll the exec-error pipe opportunistically and
         // non-blockingly every iteration. Pipe EOF alone does not prove
@@ -1266,6 +1295,15 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // independently confirmed dead.
         try_reap();
         poll_err_pipe();
+
+        probe(SubprocessProbePoint::before_kill_decision);
+
+        // Read AFTER the reap (and the probe), so the deadline below is judged at
+        // the moment the kill is decided, not before the reap that preceded it.
+        // The Windows loop below still reads its clock at the top: deliberate, its
+        // exit check runs before its kill decision and the `!process_exited` guard
+        // resolves the same race (#4019); do not "align" the two loops.
+        auto now = std::chrono::steady_clock::now();
 
         const bool deadline_hit = !killed && (now - start >= opts.deadline);
         const bool cancel_hit =
@@ -2132,6 +2170,9 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     };
 
     while (true) {
+        // Read at the top, unlike the POSIX loop (which reads after its reap):
+        // deliberate -- the exit check below still precedes the kill decision, and
+        // its `!process_exited` guard covers the race (#4019).
         auto now = std::chrono::steady_clock::now();
 
         if (!process_exited && WaitForSingleObject(process_h.get(), 0) == WAIT_OBJECT_0)
