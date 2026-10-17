@@ -52,7 +52,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `network_diag` | ✅ ✅ ✅ | Network diagnostics — listening ports and established connections | [README](../../agents/plugins/network_diag/README.md) |
 | `os_info` | ✅ ✅ ✅ | Reports OS name, version, build, architecture, and system uptime | [README](../../agents/plugins/os_info/README.md) |
 | `peripherals` | ✅ ✅ ✅ | USB, PCI and Thunderbolt/USB4 device inventory | [README](../../agents/plugins/peripherals/README.md) |
-| `pkg_inventory` | 🟡 ✅ 🟡 | Machine-scope package-manager inventory (managers and packages); per-user package stores are out of scope, deferred to the user-session helper | [README](../../agents/plugins/pkg_inventory/README.md) |
+| `pkg_inventory` | 🟡 ✅ ✅ | Machine-scope package-manager inventory (managers, packages and store_packages); per-user package stores are out of scope, deferred to the user-session helper | [README](../../agents/plugins/pkg_inventory/README.md) |
 | `platform_security` | ✅ ✅ ✅ | Secure Boot and code-integrity enforcement posture (read-only) | [README](../../agents/plugins/platform_security/README.md) |
 | `power_health` | ✅ ✅ 🟡 | Battery, thermal, and power-plan inventory, plus a gated power-plan switch | [README](../../agents/plugins/power_health/README.md) |
 | `printing` | ✅ ✅ ✅ | Printer/job inventory plus a single narrowly-scoped clear_queue cancellation | [README](../../agents/plugins/printing/README.md) |

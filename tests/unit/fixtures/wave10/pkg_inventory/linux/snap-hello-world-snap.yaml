@@ -1,0 +1,20 @@
+name: hello-world
+version: 6.4
+architectures: [ all ]
+summary: The 'hello-world' of snaps
+description: |
+    This is a simple snap example that includes a few interesting binaries
+    to demonstrate snaps and their confinement.
+    * hello-world.env  - dump the env of commands run inside app sandbox
+    * hello-world.evil - show how snappy sandboxes binaries
+    * hello-world.sh   - enter interactive shell that runs in app sandbox
+    * hello-world      - simply output text
+apps:
+ env:
+   command: bin/env
+ evil:
+   command: bin/evil
+ sh:
+   command: bin/sh
+ hello-world:
+   command: bin/echo

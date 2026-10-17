@@ -23,11 +23,13 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <stdexcept>
@@ -294,6 +296,89 @@ TEST_CASE("CustomPropertiesStore: delete all properties for agent",
 
     auto props = require_ok(store.get_properties("agent-1"));
     CHECK(props.empty());
+}
+
+TEST_CASE("CustomPropertiesStore: writes reject an agent_id with an embedded NUL",
+          "[pg][custom_props][crud][failclosed]") {
+    // libpq text binds are NUL-terminated C strings: every write seam refuses an id containing
+    // a NUL byte and leaves the row of the id before the NUL untouched. Mirrors TagStore's
+    // write guard.
+    PROPS_SHARED(store, pool);
+    require_ok(store.set_property("agent-a", "owner", "alice"));
+    const std::string nul_id("agent-a\0x", 9);
+
+    SECTION("set_property reports failure and writes nothing") {
+        auto r = store.set_property(nul_id, "owner", "bob");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("invalid agent id") != std::string::npos);
+        // The error is a caller error, not a store-degrade error (the REST route maps the
+        // latter to 503).
+        CHECK(r.error().rfind(kCustomPropertiesDbErrorPrefix, 0) != 0);
+        auto v = store.get_value("agent-a", "owner");
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(**v == "alice");
+        CHECK(require_ok(store.get_properties("agent-a")).size() == 1);
+    }
+    SECTION("delete_property answers not-found and leaves the row of agent-a") {
+        CHECK_FALSE(store.delete_property(nul_id, "owner"));
+        auto v = store.get_value("agent-a", "owner");
+        REQUIRE(v.has_value());
+        CHECK(v->has_value());
+    }
+    SECTION("delete_all_properties leaves the rows of agent-a") {
+        store.delete_all_properties(nul_id);
+        CHECK(require_ok(store.get_properties("agent-a")).size() == 1);
+    }
+    SECTION("empty and oversized ids are refused the same way") {
+        CHECK_FALSE(store.set_property("", "k", "v").has_value());
+        CHECK_FALSE(store.set_property(std::string(257, 'a'), "k", "v").has_value());
+        CHECK_FALSE(store.delete_property("", "k"));
+        CHECK_FALSE(store.delete_property(std::string(257, 'a'), "k"));
+    }
+}
+
+TEST_CASE("CustomPropertiesStore: reads answer empty for an invalid agent_id",
+          "[pg][custom_props][crud][failclosed]") {
+    // The same guard as the write seams: an id that is empty, contains a NUL byte or is longer
+    // than 256 bytes has no properties by definition, so every read answers empty / nullopt and
+    // never returns the rows of the id before the NUL (the text bind would stop at the NUL).
+    PROPS_SHARED(store, pool);
+    require_ok(store.set_property("agent-a", "owner", "alice"));
+    // Control: the valid id does see its row through each read.
+    REQUIRE(require_ok(store.get_properties("agent-a")).size() == 1);
+    REQUIRE(require_ok(store.get_property("agent-a", "owner")).has_value());
+    REQUIRE(require_ok(store.get_property_map("agent-a")).size() == 1);
+
+    const std::vector<std::string> bad_ids{std::string("agent-a\0x", 9), std::string(),
+                                           std::string(257, 'a')};
+    for (const auto& bad : bad_ids) {
+        INFO("agent_id size " << bad.size());
+        CHECK(require_ok(store.get_properties(bad)).empty());
+        CHECK_FALSE(require_ok(store.get_property(bad, "owner")).has_value());
+        CHECK(require_ok(store.get_property_map(bad)).empty());
+    }
+}
+
+TEST_CASE("CustomPropertiesStore: an agent_id of exactly 256 bytes is accepted",
+          "[pg][custom_props][crud][failclosed]") {
+    // The upper bound of the guard is inclusive: 256 bytes is the longest id the REST and gRPC
+    // doors admit, so it must round-trip, while 257 is refused (pinned by the neighbouring cases).
+    PROPS_SHARED(store, pool);
+    const std::string edge_id(256, 'e');
+    require_ok(store.set_property(edge_id, "owner", "alice"));
+
+    auto v = store.get_value(edge_id, "owner");
+    REQUIRE(v.has_value());
+    REQUIRE(v->has_value());
+    CHECK(**v == "alice");
+    const auto props = require_ok(store.get_properties(edge_id));
+    REQUIRE(props.size() == 1);
+    CHECK(props[0].agent_id == edge_id);
+    CHECK(require_ok(store.get_property(edge_id, "owner")).has_value());
+    CHECK(require_ok(store.get_property_map(edge_id)).size() == 1);
+    CHECK(store.delete_property(edge_id, "owner"));
+    CHECK(require_ok(store.get_properties(edge_id)).empty());
 }
 
 TEST_CASE("CustomPropertiesStore: get_properties lists all for agent",
@@ -803,4 +888,122 @@ TEST_CASE("CustomPropertiesStore: delete schema removes validation",
     // Accepted without schema
     auto r2 = store.set_property("agent-1", "env", "testing");
     REQUIRE(r2.has_value());
+}
+
+// ============================================================================
+// libpq error text in the store's log lines is neutralised (#5513)
+// ============================================================================
+
+TEST_CASE("CustomPropertiesStore: a failed statement logs the libpq error text on one line",
+          "[pg][custom_props][log_injection][5513]") {
+    // libpq error text ends in a newline and, for a statement error, carries "LINE 1:" and caret
+    // continuation lines, and it can quote the claimed agent id. Each of the nine
+    // PQerrorMessage log sites wraps it in log_key_token, so one failing call is exactly one
+    // physical log line (five sites asserted by name, four sampled ones by the line count).
+    // Per-test cloned database: the tables are renamed away and the clone is dropped with the
+    // test, so nothing is restored.
+    YUZU_REQUIRE_PG_DB_TPL(db, props_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    CustomPropertiesStore store{pool};
+    REQUIRE(store.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        for (const char* sql :
+             {"ALTER TABLE custom_properties_store.custom_properties RENAME TO gone_p",
+              "ALTER TABLE custom_properties_store.custom_property_schemas RENAME TO gone_s"}) {
+            auto r = pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        }
+    }
+
+    yuzu::test::LogCapture cap;
+    auto props = store.get_properties("agent-1");
+    auto prop = store.get_property("agent-1", "k");
+    auto prop_map = store.get_property_map("agent-1");
+    auto values = store.get_values_for_keys({"k"});
+    CHECK_FALSE(store.delete_property("agent-1", "k"));
+    store.delete_all_properties("agent-1");
+    CHECK(store.list_schemas().empty());
+    auto schema = store.get_schema("k");
+    auto deleted = store.delete_schema("k");
+    cap.stop();
+
+    REQUIRE_FALSE(props.has_value());
+    CHECK(props.error() == CustomPropertiesReadError::kDegraded);
+    REQUIRE_FALSE(prop.has_value());
+    CHECK(prop.error() == CustomPropertiesReadError::kDegraded);
+    REQUIRE_FALSE(prop_map.has_value());
+    CHECK(prop_map.error() == CustomPropertiesReadError::kDegraded);
+    REQUIRE_FALSE(values.has_value());
+    CHECK(values.error() == CustomPropertiesReadError::kDegraded);
+    REQUIRE_FALSE(schema.has_value());
+    CHECK(schema.error() == CustomPropertiesReadError::kDegraded);
+    REQUIRE_FALSE(deleted.has_value());
+    CHECK(deleted.error() == CustomPropertiesReadError::kDegraded);
+
+    const std::string text = cap.text();
+    // Every log line this store wrote carries "CustomPropertiesStore::" exactly once and ends in
+    // exactly one newline, so the two counts match. Without the wrap, libpq's own trailing newline
+    // and its "LINE 1:" continuation add more newlines than lines. The four read sites
+    // (get_properties, get_property, get_property_map, get_values_for_keys) log through a
+    // process-wide sampler (first degrade per 60 s episode, then every 100th), so whether they
+    // appear depends on earlier tests in the same process: they are exercised above but not
+    // asserted by name. The five sites below are unsampled and asserted.
+    std::size_t lines = 0;
+    for (std::size_t pos = text.find("CustomPropertiesStore::"); pos != std::string::npos;
+         pos = text.find("CustomPropertiesStore::", pos + 1))
+        ++lines;
+    CHECK(lines >= 5);
+    CHECK(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) == lines);
+    for (const char* site :
+         {"delete_property: query failed", "delete_all_properties: delete failed",
+          "list_schemas: query failed", "get_schema: query failed",
+          "delete_schema: query failed"}) {
+        INFO("site=" << site);
+        CHECK(text.find(site) != std::string::npos);
+    }
+    // The statement-error continuation is folded into the same line: the newline after the
+    // "ERROR: ..." sentence became '_' before "LINE 1:".
+    CHECK(text.find("does not exist_LINE 1:") != std::string::npos);
+    CHECK(yuzu::test::stray_control_bytes(text) == 0);
+}
+
+TEST_CASE("CustomPropertiesStore: an invalid stored schema regex is logged on one line",
+          "[pg][custom_props][log_injection][5513]") {
+    // upsert_schema refuses a regex that does not compile, so the only way a stored one fails to
+    // compile at validation time is a row written outside it. validate_against_schema then logs
+    // a warning that prints the schema key and the stored pattern and lets the write through.
+    // The pattern is admin-defined free text: it is folded by log_key_token, so a line break in
+    // it cannot split the line. The schema key is already limited to a safe charset by
+    // validate_key, so it passes through unchanged.
+    PROPS_SHARED(store, pool);
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO custom_properties_store.custom_property_schemas "
+            "(key, display_name, type, description, validation_regex) "
+            "VALUES ($1, 'Env', 'string', '', $2)",
+            std::vector<std::string>{"envkey", "[unclosed(\nforged_second_line"});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::LogCapture cap;
+    auto r = store.set_property("agent-1", "envkey", "anything");
+    cap.stop();
+    // The warning does not block the write.
+    REQUIRE(r.has_value());
+
+    const std::string text = cap.text();
+    CHECK(text.find("invalid regex for schema key 'envkey': [unclosed(_forged_second_line") !=
+          std::string::npos);
+    std::size_t lines = 0;
+    for (std::size_t pos = text.find("invalid regex for schema key"); pos != std::string::npos;
+         pos = text.find("invalid regex for schema key", pos + 1))
+        ++lines;
+    CHECK(lines == 1);
+    CHECK(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) == lines);
 }
