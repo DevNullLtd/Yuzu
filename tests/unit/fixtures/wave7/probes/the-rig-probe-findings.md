@@ -1,13 +1,13 @@
 # the-rig probe findings (2026-09-06)
 
-Host: the-rig (desktop-04dnsig). Checkout used: `D:\yuzu-dev\Yuzu` (`C:\Users\alex\yuzu-dev` does NOT
+Host: the-rig (desktop-04dnsig). Checkout used: `D:\yuzu-dev\Yuzu` (`C:\Users\jsmith\yuzu-dev` does NOT
 exist on this host, confirmed via `Test-Path`). Compiler: MSVC 2022 BuildTools,
 `cl /std:c++latest /EHsc`, single TU (`probe_wave7.cpp`), no repo dependencies. Compiled clean under
 `/W3`, no warnings.
 
 ## Identity of each run
 
-- Admin SSH session: `whoami /all` first line -> `desktop-04dnsig\alex S-1-5-21-571721511-16201247-3531262703-1001`
+- Admin SSH session: `whoami /all` first line -> `desktop-04dnsig\jsmith S-1-5-21-1111111111-2222222222-3333333333-1001`
   (SeBackupPrivilege, SeRestorePrivilege, SeDebugPrivilege all already Enabled in this session).
 - SYSTEM scheduled task: `whoami /all` first line -> `nt authority\system S-1-5-18`. Task registered
   with `New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest`
@@ -107,3 +107,5 @@ registered for this capture; no `WMI subscription` was created and none needed r
   Amcache.hve copy) removed: `Test-Path D:\wave7_capture` -> `False`.
 - No HKLM/HKU keys were modified; no scheduled task or WMI subscription other than the two temporary
   probe launchers (both since removed) was created.
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

@@ -4,6 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <format>
+#include <memory>
 #include <re2/re2.h>
 #include <sstream>
 #include <string>
@@ -666,6 +667,19 @@ bool ci_starts_with(std::string_view text, std::string_view prefix) {
     return true;
 }
 
+// The ONE MATCHES compile step, shared by eval_condition and validate_regex so
+// authoring and evaluation cannot drift. Returns nullptr when the pattern is
+// over kMaxRegexPattern; otherwise the caller checks ok(). RE2 is non-movable,
+// hence the unique_ptr.
+std::unique_ptr<RE2> compile_matches(std::string_view pattern) {
+    if (pattern.size() > kMaxRegexPattern)
+        return nullptr;
+    // RE2 guarantees linear-time matching — immune to ReDoS (G2-SEC-D2-001)
+    RE2::Options opts;
+    opts.set_case_sensitive(false);
+    return std::make_unique<RE2>(pattern, opts);
+}
+
 bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
     // Synthetic attributes (`__len:`/`__startswith:`) — decoded through the
     // ONE shared classifier so the preload collector can never miss a form
@@ -700,14 +714,9 @@ bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
     case CompOp::Like:
         return wildcard_match(cond.value, resolved);
     case CompOp::Matches: {
-        if (cond.value.size() > 256)
-            return false;
-        // RE2 guarantees linear-time matching — immune to ReDoS (G2-SEC-D2-001)
-        RE2::Options opts;
-        opts.set_case_sensitive(false);
-        RE2 re(cond.value, opts);
-        if (!re.ok()) return false;
-        return RE2::PartialMatch(std::string(resolved), re);
+        auto re = compile_matches(cond.value);
+        if (!re || !re->ok()) return false;
+        return RE2::PartialMatch(std::string(resolved), *re);
     }
     case CompOp::Exists:
         return !resolved.empty();
@@ -779,6 +788,15 @@ std::expected<void, std::string> validate(std::string_view input) {
     if (result)
         return {};
     return std::unexpected(result.error());
+}
+
+std::expected<void, std::string> validate_regex(std::string_view pattern) {
+    const auto re = compile_matches(pattern);
+    if (!re)
+        return std::unexpected(std::format("regex longer than {} characters", kMaxRegexPattern));
+    if (!re->ok())
+        return std::unexpected("invalid regex: " + re->error());
+    return {};
 }
 
 std::string_view operator_token(CompOp op) {
