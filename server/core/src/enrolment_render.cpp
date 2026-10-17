@@ -247,7 +247,7 @@ std::string render_tokens(const std::vector<auth::EnrollmentToken>* tokens,
     } else {
         html += "<div class=\"tw\"><table><thead><tr><th>ID</th><th>Label</th><th>Uses</th>"
                 "<th>Expires</th><th>Status</th><th></th></tr></thead><tbody>";
-        const std::size_t shown = std::min(rows.size(), kRenderCap);
+        const std::size_t shown = (std::min)(rows.size(), kRenderCap);
         for (std::size_t i = 0; i < shown; ++i) {
             const auto& t = *rows[i].t;
             const std::string uses =
@@ -335,7 +335,7 @@ std::string render_pending(const std::vector<auth::PendingAgent>* agents) {
     const std::size_t n_waiting = waiting.size(); // counted BEFORE the render cap
     std::vector<const auth::PendingAgent*> rows = waiting;
     rows.insert(rows.end(), denied.begin(), denied.end());
-    const std::size_t shown = std::min(rows.size(), kRenderCap);
+    const std::size_t shown = (std::min)(rows.size(), kRenderCap);
 
     std::string html;
     if (rows.empty()) {
@@ -407,7 +407,7 @@ std::string render_pending(const std::vector<auth::PendingAgent>* agents) {
         // arrive after this render, so the buttons are off whenever the list is not whole.
         const bool whole = n_waiting <= kRenderCap;
         std::string names;
-        for (std::size_t i = 0; i < std::min(n_waiting, kBulkHostnamesListed); ++i)
+        for (std::size_t i = 0; i < (std::min)(n_waiting, kBulkHostnamesListed); ++i)
             names += "\n- " + waiting[i]->hostname;
         if (n_waiting > kBulkHostnamesListed)
             names += "\n- and " + std::to_string(n_waiting - kBulkHostnamesListed) + " more";

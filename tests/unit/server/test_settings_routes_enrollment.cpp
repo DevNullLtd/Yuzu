@@ -1498,8 +1498,8 @@ TEST_CASE("settings auto-approve: match-everything rules and oversized text are 
 TEST_CASE("settings enrollment: a year-9999 expiry is listed Active and never as Expired",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;
-    auto far = h.auth_mgr.create_enrollment_token("far-future", 0, std::chrono::hours(1), "admin");
-    REQUIRE(far.has_value());
+    auto far_future = h.auth_mgr.create_enrollment_token("far-future", 0, std::chrono::hours(1), "admin");
+    REQUIRE(far_future.has_value());
     {
         auto lease = h.auth_db->pool().try_acquire_for(std::chrono::seconds(2));
         REQUIRE(lease);
@@ -1507,7 +1507,7 @@ TEST_CASE("settings enrollment: a year-9999 expiry is listed Active and never as
             lease.get(),
             "UPDATE auth.enrollment_tokens SET expires_at = '9999-12-31 23:59:59+00' "
             "WHERE token_id = $1",
-            std::vector<std::string>{far->token_id});
+            std::vector<std::string>{far_future->token_id});
         REQUIRE(upd.status() == PGRES_COMMAND_OK);
     }
     const auto listed = h.auth_mgr.list_enrollment_tokens().value();
@@ -1516,7 +1516,7 @@ TEST_CASE("settings enrollment: a year-9999 expiry is listed Active and never as
 
     auto res = h.sink.Get("/fragments/settings/tokens");
     REQUIRE(res);
-    const auto row = res->body.find("<code>" + far->token_id + "</code>");
+    const auto row = res->body.find("<code>" + far_future->token_id + "</code>");
     REQUIRE(row != std::string::npos);
     const auto pill = res->body.find("pill ", row);
     REQUIRE(pill != std::string::npos);

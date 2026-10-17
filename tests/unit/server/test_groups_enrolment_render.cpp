@@ -119,11 +119,11 @@ TEST_CASE("enrolment: utc_stamp prints out of range instead of a bogus date",
     // End to end through a row: a far-future expiry that is NOT the never sentinel renders as a
     // date or "out of range" by the clock's reach, never "Never" and never Expired. The exact
     // text is derived from the same helper so the assertion holds on every standard library.
-    const auto far = (Clock::time_point::max)() - std::chrono::hours(24);
-    const std::vector<auth::EnrollmentToken> v = {token("farfuture", "x", 0, 0, false, far)};
+    const auto far_future = (Clock::time_point::max)() - std::chrono::hours(24);
+    const std::vector<auth::EnrollmentToken> v = {token("farfuture", "x", 0, 0, false, far_future)};
     const auto html = render_tokens(&v, "", kNow);
     const auto want = utc_stamp_epoch_secs(
-        std::chrono::floor<std::chrono::seconds>(far).time_since_epoch().count());
+        std::chrono::floor<std::chrono::seconds>(far_future).time_since_epoch().count());
     CHECK_THAT(html, ContainsSubstring("<td>" + want + "</td>"));
     CHECK_THAT(html, !ContainsSubstring("<td>Never</td>"));
     CHECK_THAT(html, ContainsSubstring("<span class=\"pill info\">Active</span>"));
@@ -515,9 +515,9 @@ TEST_CASE("enrolment pending: denied rows cut off by the render cap are announce
     CHECK_THAT(html, !ContainsSubstring("including the ones not shown"));
 
     // Nothing is cut: no note. Cut waiting agents: the bulk-bar banner, not this note.
-    const std::vector<auth::PendingAgent> small = {agent("w1", "h"),
+    const std::vector<auth::PendingAgent> small_list = {agent("w1", "h"),
                                                    agent("d1", "h", auth::PendingStatus::denied)};
-    CHECK_THAT(render_pending(&small), !ContainsSubstring("Showing "));
+    CHECK_THAT(render_pending(&small_list), !ContainsSubstring("Showing "));
     std::vector<auth::PendingAgent> many;
     for (std::size_t i = 0; i < kRenderCap + 1; ++i)
         many.push_back(agent("p" + std::to_string(i), "h"));
