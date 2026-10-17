@@ -37,6 +37,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <map>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -68,6 +71,7 @@ extern const std::string kYuzuChartsJs;
 // yuzu::server like the JS bundles).
 extern const char* const kVizFleetPageHtml;
 extern const char* const kVizHostPageHtml;
+extern const char* const kSettingsGeneralHtml;
 
 using Catch::Matchers::ContainsSubstring;
 
@@ -363,6 +367,26 @@ TEST_CASE("static_js_bundle: kYuzuVizJs declares per-OS palette for linux/darwin
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("macos:   '#f5c542'"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows: '#4c9aff'"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("default: '#9aa2ae'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs pins the listener coral, talking-socket blue and local edge",
+          "[static-js][viz]") {
+    // Reverting the listener sphere to yellow (or the :port label away from the coral chart
+    // token) must fail loud: the invariants doc and the legend both name these colours.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xff6b7a"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("ctx.fillStyle = '#ff6b7a'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("TALKING_SOCKET_COLOR = 0x7ab6ff"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xe9ecf0"));
+}
+
+TEST_CASE("static_js_bundle: the Fleet page keeps its error banner and the Host page its Refresh button",
+          "[static-js][viz][page]") {
+    REQUIRE(kVizFleetPageHtml != nullptr);
+    REQUIRE(kVizHostPageHtml != nullptr);
+    const std::string fleet(kVizFleetPageHtml);
+    CHECK_THAT(fleet, ContainsSubstring("id=\"viz-error\" role=\"alert\""));
+    CHECK_THAT(fleet, ContainsSubstring("#viz-error.shown { display: flex; }"));
+    CHECK_THAT(std::string(kVizHostPageHtml), ContainsSubstring("id=\"refresh-btn\""));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs leaves the stage backdrop to the page CSS",
@@ -1102,6 +1126,201 @@ TEST_CASE("static_js_bundle: kYuzuCss carries the design-system token layer",
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'IBM Plex Mono'"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuCss ships the five alternate colour schemes",
+          "[static-js][yuzu-css][theme]") {
+    // Each scheme is a self-contained html[data-theme] block (same element as :root, so the
+    // short-name aliases re-resolve) that redefines the minimal token set. The picker
+    // (settings_general_ui.cpp) and the boot script name the same six.
+    const std::string_view css = yuzu::server::kYuzuCss;
+    auto block = [&](const std::string& t) {
+        const std::string selector = "html[data-theme=\"" + t + "\"] {";
+        const auto at = css.find(selector);
+        REQUIRE(at != std::string_view::npos);
+        const auto end = css.find('}', at);
+        REQUIRE(end != std::string_view::npos);
+        return std::string(css.substr(at, end - at));
+    };
+    for (const char* t : {"navy", "jade", "light", "light-baby", "light-hot"}) {
+        const auto b = block(t);
+        for (const char* tok :
+             {"color-scheme:", "--mds-color-theme-background-canvas:",
+              "--mds-color-theme-background-solid-primary:", "--mds-color-theme-text-primary:",
+              "--mds-color-theme-text-tertiary:", "--mds-color-theme-accent-primary-normal:",
+              "--mds-color-text-on-accent:", "--raise:", "--faint:", "--hl:", "--focus:",
+              "--mds-color-theme-indicator-error:", "--mds-color-indicator-error-bright:",
+              "--mds-elevation-2:", "--mds-elevation-3:"})
+            CHECK_THAT(b, ContainsSubstring(tok));
+    }
+    // The light family flips the UA colour scheme and puts white on the action colour; the dark
+    // ones keep dark. Slate is the :root and has no block.
+    for (const char* t : {"light", "light-baby", "light-hot"}) {
+        CHECK_THAT(block(t), ContainsSubstring("color-scheme: light;"));
+        CHECK_THAT(block(t), ContainsSubstring("--mds-color-text-on-accent: #ffffff;"));
+    }
+    for (const char* t : {"navy", "jade"})
+        CHECK_THAT(block(t), ContainsSubstring("color-scheme: dark;"));
+    CHECK_THAT(std::string(css), !ContainsSubstring("html[data-theme=\"slate\"]"));
+    // Chart cards lift through one token; slate's value is the :root default.
+    CHECK_THAT(std::string(css), ContainsSubstring("--mds-elevation-2: 0 6px 18px rgba(0,0,0,.35);"));
+}
+
+TEST_CASE("static_js_bundle: the Appearance swatches show each scheme's real colours",
+          "[static-js][yuzu-css][theme]") {
+    // The picker draws six palettes at once, so its swatches carry inline hex (the live tokens
+    // can only show the current one). They are checked against the CSS so they cannot drift.
+    const std::string_view css = yuzu::server::kYuzuCss;
+    const std::string page = kSettingsGeneralHtml;
+    auto decl = [](const std::string& hay, const std::string& name) {
+        const auto at = hay.find(name + ":");
+        REQUIRE(at != std::string::npos);
+        const auto from = hay.find('#', at);
+        return hay.substr(from, 7);
+    };
+    for (const char* t : {"navy", "jade", "light", "light-baby", "light-hot"}) {
+        const auto cs = css.find(std::string("html[data-theme=\"") + t + "\"] {");
+        REQUIRE(cs != std::string_view::npos);
+        const std::string blk(css.substr(cs, css.find('}', cs) - cs));
+        const auto card = page.find(std::string("name=\"theme\" value=\"") + t + "\"");
+        REQUIRE(card != std::string::npos);
+        const std::string row = page.substr(card, page.find("</span></span>", card) - card);
+        CHECK(decl(row, "--bg") == decl(blk, "--mds-color-theme-background-canvas"));
+        CHECK(decl(row, "--surface") == decl(blk, "--mds-color-theme-background-solid-primary"));
+        CHECK(decl(row, "--raise") == decl(blk, "--raise"));
+        CHECK(decl(row, "--primary") == decl(blk, "--mds-color-theme-accent-primary-normal"));
+        CHECK(decl(row, "--hl") == decl(blk, "--hl"));
+        CHECK(decl(row, "--ok") == decl(blk, "--mds-color-theme-indicator-success"));
+    }
+}
+
+// ── Colour-scheme contrast (WCAG 2.x) ───────────────────────────────────────
+// Pure: reads only the embedded stylesheet. A scheme's tokens are :root with the
+// html[data-theme] block laid over it; the short-name aliases (--ink, --surface, --c1 ...)
+// are resolved against that merged map, exactly as the browser resolves them on <html>.
+namespace {
+
+using WcagTokens = std::map<std::string, std::string>;
+
+struct WcagRgb {
+    double r, g, b;
+};
+
+std::string wcag_trim(std::string s) {
+    const auto b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos)
+        return {};
+    const auto e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+// The custom properties declared in the first block that follows `selector`.
+WcagTokens wcag_block(std::string_view css, std::string_view selector) {
+    const auto at = css.find(selector);
+    REQUIRE(at != std::string_view::npos);
+    const auto open = css.find('{', at);
+    const auto close = css.find('}', open);
+    REQUIRE(open != std::string_view::npos);
+    REQUIRE(close != std::string_view::npos);
+    std::string body(css.substr(open + 1, close - open - 1));
+    for (auto c = body.find("/*"); c != std::string::npos; c = body.find("/*")) {
+        const auto e = body.find("*/", c);
+        REQUIRE(e != std::string::npos);
+        body.erase(c, e + 2 - c);
+    }
+    WcagTokens out;
+    for (std::size_t pos = 0;;) {
+        const auto semi = body.find(';', pos);
+        if (semi == std::string::npos)
+            break;
+        const auto decl = body.substr(pos, semi - pos);
+        pos = semi + 1;
+        const auto colon = decl.find(':');
+        if (colon == std::string::npos)
+            continue;
+        const auto name = wcag_trim(decl.substr(0, colon));
+        if (name.starts_with("--"))
+            out[name] = wcag_trim(decl.substr(colon + 1));
+    }
+    return out;
+}
+
+WcagTokens wcag_scheme(std::string_view css, std::string_view scheme) {
+    auto tokens = wcag_block(css, "\n:root {");
+    if (scheme != "slate")
+        for (auto& [k, v] : wcag_block(css, "html[data-theme=\"" + std::string(scheme) + "\"] {"))
+            tokens[k] = std::move(v);
+    return tokens;
+}
+
+WcagRgb wcag_resolve(const WcagTokens& tokens, const std::string& name, int depth = 0) {
+    REQUIRE(depth < 8);
+    const auto it = tokens.find(name);
+    REQUIRE(it != tokens.end());
+    const std::string& v = it->second;
+    if (v.starts_with("var(--")) { // an alias: follow it
+        const auto close = v.find(')');
+        REQUIRE(close != std::string::npos);
+        return wcag_resolve(tokens, v.substr(4, close - 4), depth + 1);
+    }
+    REQUIRE(v.size() == 7); // a literal #rrggbb
+    REQUIRE(v[0] == '#');
+    auto byte = [&](std::size_t i) { return static_cast<double>(std::stoi(v.substr(i, 2), nullptr, 16)); };
+    return {byte(1), byte(3), byte(5)};
+}
+
+double wcag_luminance(const WcagRgb& c) {
+    auto lin = [](double v) {
+        v /= 255.0;
+        return v <= 0.03928 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+}
+
+double wcag_contrast(const WcagRgb& a, const WcagRgb& b) {
+    const double la = wcag_luminance(a), lb = wcag_luminance(b);
+    return (std::max(la, lb) + 0.05) / (std::min(la, lb) + 0.05);
+}
+
+} // namespace
+
+TEST_CASE("static_js_bundle: the contrast calculator matches the WCAG reference values",
+          "[static-js][yuzu-css][theme][contrast]") {
+    CHECK(std::abs(wcag_contrast({0, 0, 0}, {255, 255, 255}) - 21.0) < 1e-9);
+    CHECK(std::abs(wcag_contrast({255, 255, 255}, {255, 255, 255}) - 1.0) < 1e-9);
+    // #767676 on white is the documented 4.54:1 boundary.
+    CHECK(std::abs(wcag_contrast({0x76, 0x76, 0x76}, {255, 255, 255}) - 4.54) < 0.01);
+}
+
+TEST_CASE("static_js_bundle: every colour scheme keeps text; action and heading colours legible",
+          "[static-js][yuzu-css][theme][contrast]") {
+    const std::string_view css = yuzu::server::kYuzuCss;
+    for (const std::string_view scheme : {"slate", "navy", "jade", "light", "light-baby", "light-hot"}) {
+        const auto tokens = wcag_scheme(css, scheme);
+        const bool light = scheme.starts_with("light");
+        auto ratio = [&](const char* fg, const char* bg) {
+            return wcag_contrast(wcag_resolve(tokens, fg), wcag_resolve(tokens, bg));
+        };
+        // Body, secondary, tertiary and hint text on every surface they sit on.
+        for (const char* bg : {"--bg", "--surface", "--surface2", "--raise"})
+            for (const char* fg : {"--ink", "--ink2", "--mut", "--faint"}) {
+                INFO(scheme << ": " << fg << " on " << bg);
+                CHECK(ratio(fg, bg) >= 4.5);
+            }
+        // Link text on the canvas, and the label on a solid action button.
+        INFO(scheme << ": --primary on --bg");
+        CHECK(ratio("--primary", "--bg") >= 4.5);
+        INFO(scheme << ": --on-primary on --primary");
+        CHECK(ratio("--on-primary", "--primary") >= 4.5);
+        // Chart hues 1-5 colour Home's family headings and tile icons and the Trends line, so
+        // they are text on the light schemes (4.5:1); the unchanged dark ones keep the 3:1
+        // non-text minimum.
+        for (const char* fg : {"--c1", "--c2", "--c3", "--c4", "--c5"})
+            for (const char* bg : {"--bg", "--surface"}) {
+                INFO(scheme << ": " << fg << " on " << bg);
+                CHECK(ratio(fg, bg) >= (light ? 4.5 : 3.0));
+            }
+    }
+}
+
 TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and keep a page recolour",
           "[static-js][yuzu-css]") {
     // The variant hover rules (0,4,0) outrank a page's own one-class recolour
@@ -1494,4 +1713,25 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml does not reference any CDN",
     CHECK(html.find("cdn.") == std::string::npos);
     CHECK(html.find("unpkg.") == std::string::npos);
     CHECK(html.find("jsdelivr.") == std::string::npos);
+}
+
+// ── Shared dialog module (yuzu-dialog.js) ───────────────────────────────────
+
+namespace yuzu::server {
+extern const std::string kYuzuDialogJs;
+} // namespace yuzu::server
+
+TEST_CASE("static_js_bundle: kYuzuDialogJs exposes YuzuDialog and carries no markup sink",
+          "[static-js][dialog][security]") {
+    const std::string& js = yuzu::server::kYuzuDialogJs;
+    CHECK(js.size() >= 4000);
+    CHECK(js.find('\0') == std::string::npos);
+    CHECK_THAT(js, ContainsSubstring("window.YuzuDialog"));
+    CHECK_THAT(js, ContainsSubstring("showModal"));
+    CHECK_THAT(js, ContainsSubstring("AbortSignal.timeout(15000)"));
+    CHECK(js.find("innerHTML") == std::string::npos);
+    CHECK(js.find("insertAdjacentHTML") == std::string::npos);
+    CHECK(js.find("eval(") == std::string::npos);
+    CHECK(js.find("new Function") == std::string::npos);
+    CHECK(js.find("document.write") == std::string::npos);
 }

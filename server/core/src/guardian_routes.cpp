@@ -2079,7 +2079,7 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
         };
         h += "<div class=\"gp-hero\"><div class=\"gp-pct\">" + std::to_string(pct) +
              "%<small>compliant &middot; " + std::to_string(agents) + " agent(s)</small></div>"
-             "<div style=\"flex:1;min-width:320px\"><div class=\"gp-bar\">" +
+             "<div class=\"gp-hero-bar\"><div class=\"gp-bar\">" +
              seg("var(--ok)", total.ok) + seg("var(--warn)", total.drift) +
              seg("var(--bad)", total.err) + seg("var(--faint)", total.unk) + seg(kNotImplColor, total.notimpl) +
              "</div><div class=\"gp-legend\">"
@@ -2195,7 +2195,7 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     }
 
     // Assignment (deferred until management groups land).
-    h += "<div class=\"gp-sech\">Assignment <span class=\"gp-mute\" style=\"font-weight:400\">"
+    h += "<div class=\"gp-sech\">Assignment <span class=\"gp-mute gp-reg\">"
          "(management groups)</span></div>";
     if (assign.empty()) {
         h += "<div class=\"gp-placeholder\"><b>Targeting not available yet</b>"
@@ -2454,7 +2454,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         };
         h += "<div class=\"gp-hero\"><div class=\"gp-pct\">" + std::to_string(pct) +
              "%<small>compliant &middot; " + std::to_string(d_total) + " device(s)</small></div>"
-             "<div style=\"flex:1;min-width:320px\"><div class=\"gp-bar\">" +
+             "<div class=\"gp-hero-bar\"><div class=\"gp-bar\">" +
              seg("var(--ok)", d_ok) + seg("var(--warn)", d_drift) + seg("var(--bad)", d_err) +
              seg("var(--faint)", d_unk) + seg(kNotImplColor, d_notimpl) + "</div><div class=\"gp-legend\">"
              "<span><i style=\"background:var(--ok)\"></i>Compliant <b>" + std::to_string(d_ok) +
@@ -2486,7 +2486,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
              "to Enforce and a remediation-effectiveness block appears here.</div>";
 
     // Per-device census (filterable, on-demand).
-    h += "<div class=\"gp-sech\">Per-device status <span class=\"gp-mute\" style=\"font-weight:400\">"
+    h += "<div class=\"gp-sech\">Per-device status <span class=\"gp-mute gp-reg\">"
          "&mdash; on-demand census</span></div>";
     if (d_total == 0) {
         h += "<div class=\"gp-note\">No device reports yet.</div>";
@@ -2526,9 +2526,13 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             const std::string rowstate = ni ? "notimpl" : (d.state == "errored" ? "drifted" : d.state);
             h += "<tr data-gpf=\"d\" data-gpstate=\"" + rowstate + "\" data-gpname=\"" +
                  html_escape(lower(d.host)) + "\"><td class=\"" + std::string(d.online ? "" : "gp-mute") +
-                 "\"><a href=\"/viz/host/" + html_escape(d.agent_id) +
-                 "\" title=\"Open host detail\">" +
-                 html_escape(d.host) + "</a>" +
+                 "\">" +
+                 // agent_id is agent-supplied: one encoded path segment, and no link
+                 // at all for an empty, `.` or `..` id (browsers collapse those).
+                 (path_segment_ok(d.agent_id)
+                      ? "<a href=\"/viz/host/" + url_path_segment(d.agent_id) +
+                            "\" title=\"Open host detail\">" + html_escape(d.host) + "</a>"
+                      : html_escape(d.host)) +
                  (d.online ? "" : " <span class=\"gp-mute\">(offline)</span>") +
                  "</td><td>" + statecell + "</td>"
                  "<td class=\"gp-mute\">" + as_of + "</td></tr>";

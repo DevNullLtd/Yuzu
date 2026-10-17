@@ -239,15 +239,16 @@ const char* const kCompliancePageTemplate =
       panelNote(e, 'The server is taking too long to answer. Try Refresh in a moment.');
     });
     /* With no session the server answers a fragment request with a 302 to
-       /login, which XHR follows silently: htmx would swap the login page into
+       the landing page (/home; /login is its old address and still forwards
+       there), which XHR follows silently: htmx would swap the sign-in page into
        the panel and raise no error at all. Catch it by the final URL. */
     document.body.addEventListener('htmx:beforeSwap', function(e) {
       var x = e.detail && e.detail.xhr;
       var u = x && x.responseURL;
       if (!u) return;
-      try { if (new URL(u).pathname !== '/login') return; } catch (err) { return; }
+      try { var pn = new URL(u).pathname; if (pn !== '/home' && pn !== '/login') return; } catch (err) { return; }
       e.detail.shouldSwap = false;
-      location.assign('/login');
+      location.assign('/home');
     });
     /* htmx has no request timeout by default, so a server that takes the
        connection and never answers raises no event at all. */

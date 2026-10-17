@@ -16,8 +16,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <expected>
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -60,6 +62,8 @@ struct HwHarness {
     authz::VisibleSet scope;            // FleetReadGate scope; nullopt = unfiltered, set = confine to these ids
     bool allow_execute = true;          // scoped Execution:Execute probe (sync affordance/actions)
     bool allow_tag_write = true;        // scoped Tag:Write probe (tag controls)
+    bool allow_tag_delete = true;       // scoped Tag:Delete probe (Remove control; Tags lens only)
+    std::vector<std::string> probes;    // "Type:Op" for every scoped probe, in call order
 
     std::vector<InventoryDeviceRow> roster_rows;
     bool roster_ci_degraded = false;
@@ -78,6 +82,25 @@ struct HwHarness {
     bool unwire_agent_version_fn = false;
     bool audit_should_fail = false; // simulates an audit-store degrade (AuditFn returns false)
     int sync_dispatch_calls = 0;
+    std::string auth_source; // what the same-site gate sees for the caller ("api_token", ...)
+
+    // Quarantine pill (es-1): `quarantine_rows` unset = the list closure is left unwired.
+    // The pill uses ONE Security:Read list-gate decision per render (never a per-record probe).
+    std::optional<std::vector<QuarantineRecord>> quarantine_rows;
+    bool quarantine_list_wired = false;
+    bool quarantine_read_degraded = false;
+    std::vector<std::string> security_read_probes; // per-device probes (must stay empty for pills)
+    // The Security:Read LIST gate the pills use (one call per render). `security_gate_status`:
+    // 0 = admit (scope below), 403 = scope refusal, other = anomalous (401/503).
+    int security_gate_status = 0;
+    int security_gate_calls = 0;
+    authz::VisibleSet security_scope; // nullopt = TOP
+    int quarantine_list_calls = 0;
+    std::vector<std::string> last_quarantine_ids; // ids pushed into the last store read
+
+    // Actions lens: the plugins the (online) agent reports. Every action classifies ReadOnly,
+    // so each row renders a form and a Run button.
+    std::vector<HwPluginActions> actions_plugins;
 
     std::vector<std::string> audits;        // "action|result"
     std::vector<std::string> audit_full;    // "action|result|target_type|target_id"
@@ -90,22 +113,42 @@ struct HwHarness {
     // works), that decision is baked in at construction time: a post-construction
     // `h.unwire_sync_dispatch = true` is silently a no-op — the route already holds
     // the real lambda. Pass either flag to the constructor, never assign it after.
-    explicit HwHarness(bool unwire_sync_dispatch_ctor = false, bool unwire_agent_version_fn_ctor = false) {
+    // `containment_ui_ctor` is Deps::containment_ui: the default is the shipped state (hidden);
+    // the tests that exercise the pill/panel/banner/tab pass true.
+    explicit HwHarness(bool unwire_sync_dispatch_ctor = false, bool unwire_agent_version_fn_ctor = false,
+                       bool quarantine_list_wired_ctor = false,
+                       bool containment_ui_ctor = kContainmentUi) {
+        quarantine_list_wired = quarantine_list_wired_ctor;
         unwire_sync_dispatch = unwire_sync_dispatch_ctor;
         unwire_agent_version_fn = unwire_agent_version_fn_ctor;
         auto auth = [](const httplib::Request&, httplib::Response&) {
             return std::optional<auth::Session>(auth::Session{});
         };
-        auto scoped_perm = [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                                  const std::string&, const std::string&) {
+        auto scoped_perm = [this](const httplib::Request&, httplib::Response& res,
+                                  const std::string& type, const std::string& op,
+                                  const std::string& id) {
+            if (type == "Security" && op == "Read") {
+                security_read_probes.push_back(id); // the pills must never reach this
+                return true;
+            }
             if (!allow_scoped_perm)
                 res.status = 403;
             return allow_scoped_perm;
         };
         HardwareRoutes::FleetReadFn fleet_read =
-            [this](const httplib::Request&, httplib::Response& res, const std::string&,
+            [this](const httplib::Request&, httplib::Response& res, const std::string& type,
                   const std::string&) -> authz::FleetReadGate {
             authz::FleetReadGate g;
+            if (type == "Security") { // the Quarantined pill's list gate (ADR-0017)
+                ++security_gate_calls;
+                if (security_gate_status != 0) {
+                    res.status = security_gate_status;
+                    return g;
+                }
+                g.admitted = true;
+                g.scope = security_scope;
+                return g;
+            }
             if (!allow_fleet_read) {
                 res.status = 403;
                 return g; // admitted=false, scope=deny_all() (unused — response already written)
@@ -125,6 +168,9 @@ struct HwHarness {
         HardwareRoutes::CiDetailFn ci_fn = [this](const std::string&) { return ci_detail; };
         HardwareRoutes::ScopedProbeFn probe = [this](const httplib::Request&, const std::string& type,
                                                      const std::string& op, const std::string&) {
+            probes.push_back(type + ":" + op);
+            if (type == "Tag" && op == "Delete")
+                return allow_tag_delete;
             if (type == "GuaranteedState" && op == "Read")
                 return allow_guaranteed_state;
             if (type == "Execution" && op == "Execute")
@@ -162,8 +208,50 @@ struct HwHarness {
         deps.ci_detail_fn = ci_fn;
         deps.scoped_probe_fn = probe;
         deps.dex_score_fn = dex_fn;
+        if (quarantine_list_wired) {
+            deps.quarantine_list_fn = [this](const std::vector<std::string>* ids, std::size_t limit)
+                -> std::optional<std::vector<QuarantineRecord>> {
+                ++quarantine_list_calls;
+                last_quarantine_ids = ids ? *ids : std::vector<std::string>{};
+                if (quarantine_read_degraded)
+                    return std::nullopt;
+                std::vector<QuarantineRecord> out;
+                for (const auto& r : quarantine_rows.value_or(std::vector<QuarantineRecord>{})) {
+                    if (ids && std::find(ids->begin(), ids->end(), r.agent_id) == ids->end())
+                        continue;
+                    out.push_back(r);
+                    if (limit != 0 && out.size() >= limit)
+                        break;
+                }
+                return out;
+            };
+        }
+        deps.containment_ui = containment_ui_ctor;
+        deps.actions_fn = [this](const std::string&) -> std::optional<std::vector<HwPluginActions>> {
+            return actions_plugins;
+        };
+        deps.classify_fn = [](std::string_view plugin, std::string_view action)
+            -> std::expected<CommandCapability, ClassificationError> {
+            return CommandCapability{.plugin = plugin,
+                                     .action = action,
+                                     .dispatch_class = DispatchClass::ReadOnly,
+                                     .mutability = Mutability::None,
+                                     .securable = "Execution",
+                                     .operation = authz::Operation::Execute,
+                                     .risk_tier = authz::RiskTier::Low,
+                                     .execute_gate = ExecuteGate::None};
+        };
         deps.sync_dispatch_fn = unwire_sync_dispatch ? HardwareRoutes::SyncDispatchFn{} : sync_fn;
         deps.agent_version_fn = unwire_agent_version_fn ? HardwareRoutes::AgentVersionFn{} : version_fn;
+        deps.write_gate.resolve_session = [this](const httplib::Request&) {
+            auth::Session sess;
+            sess.username = "alice";
+            sess.auth_source = auth_source;
+            return std::optional<auth::Session>(sess);
+        };
+        // A browser sends these on every same-origin write; the per-device sync POST refuses a
+        // cookie-session write without them.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
         routes.register_routes(sink, deps);
     }
 };
@@ -624,6 +712,45 @@ TEST_CASE("route: POST .../sync — non-string source is a 400, not an uncaught 
     REQUIRE(denied);
 }
 
+TEST_CASE("route: POST .../sync — a cross-site, foreign-origin or header-less cookie write is 403",
+          "[hardware][route][rest][security]") {
+    const std::vector<std::unordered_map<std::string, std::string>> bad = {
+        {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}},
+        {{"Host", "yuzu.test"}, {"Referer", "https://evil.example/x"}},
+        {{"Host", "yuzu.test"}},
+    };
+    for (const auto& headers : bad) {
+        HwHarness h;
+        h.sink.default_headers = headers;
+        auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", "");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.sync_dispatch_calls == 0);
+        REQUIRE_FALSE(h.audits.empty());
+        CHECK(h.audits.back() == "csrf.denied|denied");
+    }
+    // Admission first: a caller without Execute keeps the plain 403 and leaves no csrf row.
+    {
+        HwHarness h;
+        h.allow_scoped_perm = false; // the route's scoped Execution:Execute gate is this closure
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+        auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", "");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(std::find(h.audits.begin(), h.audits.end(), "csrf.denied|denied") == h.audits.end());
+    }
+    // Token callers send no Origin and are exempt.
+    for (const char* source : {"api_token", "mcp_token"}) {
+        HwHarness h;
+        h.auth_source = source;
+        h.sink.default_headers = {{"Host", "yuzu.test"}};
+        auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", "");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(h.sync_dispatch_calls == 1);
+    }
+}
+
 TEST_CASE("route: POST .../sync — agent below the sync-now version floor is 409",
           "[hardware][route][rest]") {
     // READ hardware_routes.cpp: this branch sets res.status = 409 (not the brief's
@@ -734,6 +861,37 @@ TEST_CASE("route: POST .../sync — audit-store degrade fails CLOSED, no dispatc
     // The whole point of auditing BEFORE dispatch: a degraded audit store must
     // never let the side effect through.
     REQUIRE(h.sync_dispatch_calls == 0);
+}
+
+// #4644: offset/limit/await_since are ONE base-10 integer or a 400. `await_since` is
+// the freshness bound a sync poll waits past: a malformed one used to read as "no bound" and
+// the poll could serve a STALE snapshot as fresh.
+TEST_CASE("route: hardware list and JSON list and sync poll refuse malformed numeric params",
+          "[hardware][route][numeric_params]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "HOST-1", "linux", true)};
+    // A NEGATIVE offset/limit is malformed too (it used to be silently clamped to 0).
+    for (const char* bad : {"limit=3abc", "limit=0x10", "limit=1e1", "limit=", "offset=2x",
+                            "limit=99999999999999999999", "offset=-1", "limit=-5"}) {
+        INFO(bad);
+        auto frag = h.sink.Get(std::string("/fragments/hardware/list?results_only=1&") + bad);
+        REQUIRE(frag);
+        CHECK(frag->status == 400);
+        auto json = h.sink.Get(std::string("/api/v1/hardware?") + bad);
+        REQUIRE(json);
+        CHECK(json->status == 400);
+    }
+    auto ok = h.sink.Get("/fragments/hardware/list?results_only=1&limit=3&offset=0");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+
+    for (const char* bad : {"1000abc", "0x10", "1e3", "", "-"}) {
+        INFO("await_since=" << bad);
+        auto res = h.sink.Get(std::string(
+            "/fragments/hardware/ci?id=agent-1&lens=overview&lens_only=1&await_since=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
 }
 
 // ───────────────────────── #5531: failed roster read is never an empty fleet ───
@@ -1146,4 +1304,533 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with a readabl
         REQUIRE_FALSE(h.audits.empty());
         REQUIRE(h.audits.back() == "inventory.device.ci|success");
     }
+}
+
+// ───────────────────────── Containment UI hidden (kContainmentUi == false) ───────────
+// The quarantine surfaces are hidden on /hardware until the approval workflow lands; the
+// renderers, fragment routes, REST and MCP are untouched. These pin the hidden state.
+
+namespace {
+QuarantineRecord q_rec(const std::string& id) {
+    QuarantineRecord r;
+    r.agent_id = id;
+    r.status = "active";
+    r.quarantined_by = "alice";
+    r.quarantined_at = 1700000000;
+    return r;
+}
+
+// Every marker a visible quarantine/containment surface on the list would emit.
+void check_list_has_no_containment_ui(const std::string& body) {
+    CHECK_FALSE(contains(body, "hw-pill bad"));
+    CHECK_FALSE(contains(body, "Quarantined"));
+    CHECK_FALSE(contains(body, "data-act=\"row-containment\""));
+    CHECK_FALSE(contains(body, "lens=containment"));
+    CHECK_FALSE(contains(body, "hw-quarantine"));
+    CHECK_FALSE(contains(body, "/fragments/hardware/quarantine"));
+    CHECK_FALSE(contains(body, "Quarantine state unavailable"));
+}
+} // namespace
+
+// Kills: a pill, row link or banner leaking back in, or the quarantine store / Security:Read
+// gate still being consulted (cost + denied-audit noise) for a surface nobody can see.
+TEST_CASE("route: list — no quarantine pill or row link and no quarantine read; even with active records",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, /*quarantine_list_wired=*/true);
+    h.roster_rows = {make_row("a-on-page", "PAGE-HOST", "linux", true),
+                     make_row("b-clean", "CLEAN-HOST", "linux", true)};
+    h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("a-on-page"), q_rec("z-off-page")};
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(contains(res->body, "PAGE-HOST")); // the list itself still renders
+    check_list_has_no_containment_ui(res->body);
+    CHECK(h.quarantine_list_calls == 0);
+    CHECK(h.security_gate_calls == 0);
+    CHECK(h.security_read_probes.empty());
+}
+
+// Kills: a degraded gate or store raising the "Quarantine state unavailable" banner.
+TEST_CASE("route: list — an unavailable gate or degraded read raises no quarantine banner",
+          "[hardware][route][quarantine]") {
+    {
+        HwHarness h(false, false, true);
+        h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
+        h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("a")};
+        h.security_gate_status = 503;
+        auto res = h.sink.Get("/fragments/hardware/list");
+        REQUIRE(res);
+        check_list_has_no_containment_ui(res->body);
+        CHECK(h.quarantine_list_calls == 0);
+        CHECK(h.security_gate_calls == 0);
+    }
+    {
+        HwHarness h(false, false, true);
+        h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
+        h.quarantine_read_degraded = true;
+        auto res = h.sink.Get("/fragments/hardware/list?results_only=1");
+        REQUIRE(res);
+        check_list_has_no_containment_ui(res->body);
+        CHECK(h.quarantine_list_calls == 0);
+    }
+}
+
+// Kills: the Quarantined devices panel placeholder returning to the full list render.
+TEST_CASE("route: list — neither the full render nor results_only carries the Quarantined panel placeholder",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, true);
+    h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
+    auto full = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(full);
+    check_list_has_no_containment_ui(full->body);
+    auto ro = h.sink.Get("/fragments/hardware/list?results_only=1");
+    REQUIRE(ro);
+    check_list_has_no_containment_ui(ro->body);
+}
+
+// Kills: the fragment writing an attacker `lens` into the audit detail / echoed markup, and
+// `lens=containment` still reaching the containment lens placeholder.
+TEST_CASE("route: ci fragment — lens is allowlisted; unknown; oversized or containment falls back to overview",
+          "[hardware][route][quarantine]") {
+    HwHarness h;
+    h.ci_detail.identity = make_row("agent-1", "HOST-1", "linux", true);
+    const std::string hostile = "<script>alert(1)</script>" + std::string(4096, 'x');
+    auto res = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=" + hostile);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK_FALSE(contains(res->body, "<script>alert(1)"));
+    REQUIRE_FALSE(h.audit_details.empty());
+    CHECK(contains(h.audit_details.back(), "hardware CI lens=overview"));
+    CHECK(h.audit_details.back().size() < 200);
+
+    auto hidden = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=containment&lens_only=1");
+    REQUIRE(hidden);
+    CHECK_FALSE(contains(hidden->body, "hw-containment"));
+    CHECK_FALSE(contains(hidden->body, "/fragments/hardware/ci/containment"));
+    CHECK(contains(h.audit_details.back(), "hardware CI lens=overview"));
+}
+
+// Kills: /hardware/ci dropping the lens or forwarding it unencoded.
+TEST_CASE("route: /hardware/ci forwards lens URL-encoded into the fragment URL",
+          "[hardware][route][quarantine]") {
+    HwHarness h;
+    auto page = h.sink.Get("/hardware/ci?id=agent-1&lens=software");
+    REQUIRE(page);
+    CHECK(contains(page->body, "/fragments/hardware/ci?id=agent-1&lens=software"));
+    auto evil = h.sink.Get("/hardware/ci?id=agent-1&lens=a%22%3E%3Cb");
+    REQUIRE(evil);
+    CHECK(contains(evil->body, "lens=a%22%3E%3Cb"));
+    CHECK_FALSE(contains(evil->body, "lens=a\"><b"));
+    // the page loads the dialog module before the estate controller
+    const auto d = page->body.find("/static/yuzu-dialog.js");
+    const auto e = page->body.find("/static/yuzu-estate.js");
+    REQUIRE(d != std::string::npos);
+    REQUIRE(e != std::string::npos);
+    CHECK(d < e);
+}
+
+// Kills: the lazy quarantine banner placeholder or the Containment tab returning to the record
+// header, or the header taking a Security probe.
+TEST_CASE("route: record header carries no quarantine banner placeholder and no Containment tab",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, true);
+    h.ci_detail.identity = make_row("agent-1", "HOST-1", "linux", true);
+    auto res = h.sink.Get("/fragments/hardware/ci?id=agent-1");
+    REQUIRE(res);
+    CHECK(contains(res->body, "hw-lens-bar")); // the lens bar itself is still there
+    CHECK_FALSE(contains(res->body, "hw-quarantine-banner"));
+    CHECK_FALSE(contains(res->body, "/fragments/hardware/ci/containment"));
+    CHECK_FALSE(contains(res->body, "lens=containment"));
+    CHECK_FALSE(contains(res->body, ">Containment<"));
+    CHECK(h.security_read_probes.empty());
+}
+
+// ───────────────────────── Containment UI on (Deps::containment_ui == true) ──────────
+// The shipped state is hidden (above); these keep the restore path honest. Chiefly the invariant
+// that a degraded containment read fails closed — a banner and no pill, never "nothing is
+// quarantined" — and that a scope refusal (403) is not mistaken for a degrade.
+
+// Kills: probing every active record instead of the intersection with the page's rows
+// (an unbounded audit-noise / DoS loop), and the pill landing on the wrong row.
+TEST_CASE("route: list pill — one Security:Read gate decision; only on-page ids reach the store; pill on those rows",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, /*quarantine_list_wired=*/true, /*containment_ui=*/true);
+    h.roster_rows = {make_row("a-on-page", "PAGE-HOST", "linux", true),
+                     make_row("b-clean", "CLEAN-HOST", "linux", true)};
+    h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("a-on-page"), q_rec("z-off-page"),
+                                                      q_rec("y-off-page")};
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // ONE list-gate decision, no per-device probe, and the store was asked only for page ids.
+    CHECK(h.security_gate_calls == 1);
+    CHECK(h.security_read_probes.empty());
+    CHECK(h.quarantine_list_calls == 1);
+    CHECK(h.last_quarantine_ids.size() == 2); // the read is restricted to the page's ids
+    // exactly one Quarantined pill, and it is in a-on-page's row
+    const auto first = res->body.find("hw-pill bad\">Quarantined");
+    REQUIRE(first != std::string::npos);
+    CHECK(res->body.find("hw-pill bad\">Quarantined", first + 1) == std::string::npos);
+    // the pill sits inside PAGE-HOST's own <tr>, not CLEAN-HOST's
+    const auto name_a = res->body.find("PAGE-HOST");
+    REQUIRE(name_a != std::string::npos);
+    const auto tr_begin = res->body.rfind("<tr", name_a);
+    const auto tr_end = res->body.find("</tr>", name_a);
+    REQUIRE(tr_begin != std::string::npos);
+    REQUIRE(tr_end != std::string::npos);
+    CHECK((first > tr_begin && first < tr_end));
+    CHECK_FALSE(contains(res->body, "Quarantine state unavailable"));
+}
+
+// Kills: a confined caller's scope not narrowing what the store is asked for.
+TEST_CASE("route: list pill — the caller's scope narrows the pills",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, true, /*containment_ui=*/true);
+    h.roster_rows = {make_row("mine", "MINE-HOST", "linux", true),
+                     make_row("theirs", "THEIRS-HOST", "linux", true)};
+    h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("mine"), q_rec("theirs")};
+    h.security_scope = authz::VisibleSet{std::unordered_set<std::string>{"mine"}};
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    CHECK(h.last_quarantine_ids.size() == 2); // both candidates were read; only "mine" is shown
+    CHECK(h.security_gate_calls == 1);
+    const auto pill = res->body.find("hw-pill bad\">Quarantined");
+    REQUIRE(pill != std::string::npos);
+    CHECK(res->body.find("hw-pill bad\">Quarantined", pill + 1) == std::string::npos);
+    CHECK(h.security_read_probes.empty());
+}
+
+// Kills: an unavailable gate or store being rendered as "not quarantined".
+TEST_CASE("route: list pill — an unavailable gate or a degraded read raises the banner, no pill",
+          "[hardware][route][quarantine]") {
+    {
+        HwHarness h(false, false, true, /*containment_ui=*/true);
+        h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
+        h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("a")};
+        h.security_gate_status = 503;
+        auto res = h.sink.Get("/fragments/hardware/list");
+        REQUIRE(res);
+        CHECK(contains(res->body, "Quarantine state unavailable"));
+        CHECK_FALSE(contains(res->body, "hw-pill bad\">Quarantined"));
+        CHECK(h.security_gate_calls == 1);
+    }
+    {
+        HwHarness h(false, false, true, /*containment_ui=*/true);
+        h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
+        h.quarantine_read_degraded = true;
+        auto res = h.sink.Get("/fragments/hardware/list?results_only=1");
+        REQUIRE(res);
+        CHECK(contains(res->body, "Quarantine state unavailable"));
+    }
+}
+
+// Kills: a 403 (scope refusal) being rendered as a pill or as the degraded banner.
+TEST_CASE("route: list pill — an explicit 403 from the gate hides pills without a banner",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, true, /*containment_ui=*/true);
+    h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
+    h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("a")};
+    h.security_gate_status = 403;
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    CHECK_FALSE(contains(res->body, "hw-pill bad\">Quarantined"));
+    CHECK_FALSE(contains(res->body, "Quarantine state unavailable"));
+    CHECK(h.security_gate_calls == 1);
+}
+
+// Kills: the gate being called (and a denied audit row written) on every Hardware page load,
+// including pages and callers with nothing quarantined.
+TEST_CASE("route: list pill — no quarantine on the page means no list-gate call",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, true, /*containment_ui=*/true);
+    h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
+    h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("elsewhere")};
+    h.security_gate_status = 403; // would be a denied audit row if it were ever asked
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    CHECK(h.quarantine_list_calls == 1);
+    CHECK(h.security_gate_calls == 0);
+    CHECK_FALSE(contains(res->body, "hw-pill bad\">Quarantined"));
+    CHECK_FALSE(contains(res->body, "Quarantine state unavailable"));
+}
+
+TEST_CASE("route: list — full render carries the Quarantined panel placeholder, results_only does not",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, true, /*containment_ui=*/true);
+    h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
+    auto full = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(full);
+    CHECK(contains(full->body, "hx-get=\"/fragments/hardware/quarantine\""));
+    auto ro = h.sink.Get("/fragments/hardware/list?results_only=1");
+    REQUIRE(ro);
+    CHECK_FALSE(contains(ro->body, "/fragments/hardware/quarantine"));
+}
+
+// Kills: the row's Quarantine route dropping the lens key (D2).
+TEST_CASE("route: list row — Quarantine link targets the Containment lens", "[hardware][route][quarantine]") {
+    HwHarness h(false, false, true, /*containment_ui=*/true);
+    h.roster_rows = {make_row("agent 1", "A-HOST", "linux", true)};
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    CHECK(contains(res->body, "data-act=\"row-containment\" href=\"/hardware/ci?id=agent%201&amp;lens=containment\""));
+}
+
+// Kills: `lens=containment` not reaching the Containment lens when the UI is on.
+TEST_CASE("route: ci fragment — containment is an allowed lens when the UI is on",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, false, /*containment_ui=*/true);
+    h.ci_detail.identity = make_row("agent-1", "HOST-1", "linux", true);
+    auto ok = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=containment&lens_only=1");
+    REQUIRE(ok);
+    CHECK(contains(ok->body, "id=\"hw-containment\""));
+    REQUIRE_FALSE(h.audit_details.empty());
+    CHECK(contains(h.audit_details.back(), "hardware CI lens=containment"));
+}
+
+// Kills: the banner placeholder missing from the record header, or probing at header render.
+TEST_CASE("route: record header carries the lazy quarantine banner and takes no Security probe itself",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, true, /*containment_ui=*/true);
+    h.ci_detail.identity = make_row("agent-1", "HOST-1", "linux", true);
+    auto res = h.sink.Get("/fragments/hardware/ci?id=agent-1");
+    REQUIRE(res);
+    CHECK(contains(res->body, "hx-get=\"/fragments/hardware/ci/containment?id=agent-1&banner=1\""));
+    CHECK(h.security_read_probes.empty());
+    CHECK(contains(res->body, "lens=containment"));
+}
+
+// Kills: the Containment tab or its lens link being dropped from the lens bar when the UI is on.
+TEST_CASE("route: lens-only response carries the Containment tab when the UI is on",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, false, /*containment_ui=*/true);
+    h.ci_detail.identity = make_row("agent-1", "HOST-1", "linux", true);
+    auto res = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=software&lens_only=1");
+    REQUIRE(res);
+    CHECK(contains(res->body, "lens=containment&lens_only=1"));
+    CHECK(contains(res->body, ">Containment</a>"));
+}
+
+// ───────────────────────── Actions lens: quarantine plugin rows ──────────────────────
+
+namespace {
+void report_quarantine_and_firewall_plugins(HwHarness& h) {
+    h.ci_detail.identity = make_row("agent-1", "HOST-1", "linux", true);
+    h.actions_plugins = {
+        {.name = "quarantine", .version = "1", .actions = {"quarantine", "unquarantine", "status", "whitelist"}},
+        {.name = "firewall", .version = "1", .actions = {"rules"}}};
+}
+} // namespace
+
+// Kills: a Run button for the quarantine plugin's own actions (quarantine, unquarantine,
+// whitelist) surviving in the Actions lens while the rest of the containment UI is hidden —
+// the owner chose to hide every quarantine control on the Hardware pages. Other plugins stay.
+TEST_CASE("route: actions lens — the quarantine plugin's rows are left out while the UI is hidden",
+          "[hardware][route][quarantine]") {
+    HwHarness h;
+    report_quarantine_and_firewall_plugins(h);
+    auto res = h.sink.Get("/fragments/hardware/ci/actions?id=agent-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"rules\""));
+    CHECK(contains(res->body, "hwRunAction"));
+    CHECK_FALSE(contains(res->body, "data-plugin=\"quarantine\""));
+    CHECK_FALSE(contains(res->body, "<summary>quarantine</summary>"));
+    for (const char* action : {"quarantine.quarantine", "quarantine.unquarantine", "quarantine.status",
+                               "quarantine.whitelist"})
+        CHECK_FALSE(contains(res->body, action));
+    REQUIRE_FALSE(h.audit_details.empty());
+    CHECK(contains(h.audit_details.back(), "actions catalogue: 1 rows"));
+}
+
+// Kills: the filter dropping the quarantine rows when the UI is on (the restore path).
+TEST_CASE("route: actions lens — the quarantine plugin's rows are listed when the UI is on",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, false, /*containment_ui=*/true);
+    report_quarantine_and_firewall_plugins(h);
+    auto res = h.sink.Get("/fragments/hardware/ci/actions?id=agent-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    for (const char* action : {"quarantine", "unquarantine", "status", "whitelist"})
+        CHECK(contains(res->body, std::string("data-plugin=\"quarantine\" data-action=\"") + action + "\""));
+    CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"rules\""));
+    CHECK(contains(h.audit_details.back(), "actions catalogue: 5 rows"));
+}
+
+// Remove needs Tag:Delete, which is not Tag:Write: a Write-only viewer is offered Add and no
+// Remove (a control that can only 403). Kills: the Remove column keyed off can_write again.
+TEST_CASE("route: Tags lens offers Remove only behind a Tag:Delete probe and hosts the "
+          "properties fragment",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail.identity = make_row("agent-1", "TAG-HOST", "windows", true);
+    h.ci_detail.tags = std::vector<DeviceTag>{{"agent-1", "owner", "ops", "api", 0}};
+
+    auto full = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags");
+    REQUIRE(full);
+    CHECK(contains(full->body, "data-act=\"tag-add\""));
+    CHECK(contains(full->body, "data-act=\"tag-del\""));
+    CHECK(contains(full->body, "/fragments/hardware/ci/properties?id=agent-1"));
+    CHECK(contains(full->body, ">Tags and properties<"));
+
+    h.allow_tag_delete = false;
+    auto write_only = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags&lens_only=1");
+    REQUIRE(write_only);
+    CHECK(contains(write_only->body, "data-act=\"tag-add\""));
+    CHECK_FALSE(contains(write_only->body, "data-act=\"tag-del\""));
+
+    h.allow_tag_write = false;
+    h.allow_tag_delete = true;
+    auto delete_only = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags&lens_only=1");
+    REQUIRE(delete_only);
+    CHECK_FALSE(contains(delete_only->body, "data-act=\"tag-add\""));
+    CHECK(contains(delete_only->body, "data-act=\"tag-del\""));
+}
+
+// A record view on another lens must not pay a denied-probe audit row for a control it
+// never renders. Kills: moving the Tag:Delete probe into affordances_for (every lens).
+TEST_CASE("route: the Tag:Delete probe is taken only when the Tags lens is the active one",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail.identity = make_row("agent-1", "TAG-HOST", "windows", true);
+    h.ci_detail.tags = std::vector<DeviceTag>{};
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1"));
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=software"));
+    CHECK(std::count(h.probes.begin(), h.probes.end(), "Tag:Delete") == 0);
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags"));
+    CHECK(std::count(h.probes.begin(), h.probes.end(), "Tag:Delete") == 1);
+}
+
+// The tags lens moved off the inline hwTagSet/hwTagDelete handlers onto data-act controls
+// served by static/yuzu-device-data.js and the shared dialog (A8b: no window.confirm).
+// Kills: restoring an inline onclick on Add or Remove.
+TEST_CASE("tags lens: controls are data-act, carry no inline handler, and name the service "
+          "sentences",
+          "[hardware][tags][render]") {
+    const std::vector<DeviceTag> tags{{"agent-1", "service", "web", "api", 0},
+                                      {"agent-1", "owner", "ops", "api", 0}};
+    const auto html = yuzu::server::render_hardware_tags_lens("agent-1", tags, true, true);
+    CHECK_FALSE(contains(html, "onclick="));
+    CHECK_FALSE(contains(html, "hwTag"));
+    CHECK(contains(html, "data-act=\"tag-add\""));
+    // The hint lists the real categories including the closed environment set.
+    CHECK(contains(html, "environment (Dev, UAT or Production, exact case)"));
+    CHECK(contains(html, "management group if it does not exist"));
+    // The Remove sentence rides only on the service row.
+    const auto svc = html.find("data-key=\"service\"");
+    const auto own = html.find("data-key=\"owner\"");
+    REQUIRE(svc != std::string::npos);
+    REQUIRE(own != std::string::npos);
+    CHECK(contains(html.substr(svc, own - svc), "data-service-note="));
+    CHECK_FALSE(contains(html.substr(own), "data-service-note="));
+}
+
+TEST_CASE("hardware shell loads the dialog module before the device-data controls",
+          "[hardware][route]") {
+    HwHarness h;
+    auto page = h.sink.Get("/hardware");
+    REQUIRE(page);
+    const auto dlg = page->body.find("src=\"/static/yuzu-dialog.js\" defer");
+    const auto dd = page->body.find("src=\"/static/yuzu-device-data.js\" defer");
+    REQUIRE(dlg != std::string::npos);
+    REQUIRE(dd != std::string::npos);
+    CHECK(dlg < dd);
+    // The bulk bar's Apply buttons carry the service sentence hwBulkTag shows.
+    auto list = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(list);
+    CHECK(contains(list->body, "data-service-note="));
+}
+
+// ---- readouts over the scoped roster (median memory, manufacturer counts) -------------------
+
+namespace {
+yuzu::server::InventoryDeviceRow ci_row(const std::string& id, const std::string& ram,
+                                        const std::string& vendor) {
+    yuzu::server::InventoryDeviceRow r;
+    r.agent_id = id;
+    r.hostname = id;
+    r.ci_ram_bytes = ram;
+    r.ci_manufacturer = vendor;
+    return r;
+}
+constexpr const char* kGiB8 = "8589934592";
+constexpr const char* kGiB16 = "17179869184";
+constexpr const char* kGiB64 = "68719476736";
+} // namespace
+
+TEST_CASE("readouts: median memory over rows with a synced figure, odd and even",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    std::size_t n = 0;
+    CHECK(*median_ram_gb({ci_row("a", kGiB8, ""), ci_row("b", kGiB16, ""), ci_row("c", kGiB64, "")},
+                         &n) == 16.0);
+    CHECK(n == 3);
+    CHECK(*median_ram_gb({ci_row("a", kGiB8, ""), ci_row("b", kGiB16, "")}) == 12.0);
+    // Unsynced, "unknown", zero and non-numeric are not devices with hardware synced.
+    CHECK_FALSE(median_ram_gb({ci_row("a", "", ""), ci_row("b", "unknown", ""), ci_row("c", "0", ""),
+                               ci_row("d", "12x", "")}, &n));
+    CHECK(n == 0);
+}
+
+TEST_CASE("readouts: manufacturer counts fold case, sum the tail into Other and skip blanks",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    std::vector<InventoryDeviceRow> rows{ci_row("1", "", "Dell"), ci_row("2", "", " dell "),
+                                         ci_row("3", "", "HP"), ci_row("4", "", "unknown"),
+                                         ci_row("5", "", "")};
+    const auto c = count_by_manufacturer(rows);
+    REQUIRE(c.size() == 2);
+    CHECK(c[0].first == "Dell");
+    CHECK(c[0].second == 2);
+    CHECK(c[1].first == "HP");
+
+    rows.clear();
+    for (int i = 0; i < 10; ++i)
+        rows.push_back(ci_row("d" + std::to_string(i), "", "V" + std::to_string(i)));
+    const auto top = count_by_manufacturer(rows, 8);
+    REQUIRE(top.size() == 9);
+    CHECK(top.back().first == "Other");
+    CHECK(top.back().second == 2);
+    CHECK(count_by_manufacturer({}).empty());
+}
+
+TEST_CASE("readouts: list KPIs describe the scoped roster only and hide when nothing synced",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    // H12: only the rows the confinement gate admitted reach hardware_kpis, so a
+    // confined caller's figures cannot include an out-of-scope device.
+    const auto admitted = hardware_kpis({ci_row("in-1", kGiB8, "Dell"), ci_row("in-2", kGiB8, "Dell")});
+    CHECK(admitted.ram_devices == 2);
+    REQUIRE(admitted.by_manufacturer.size() == 1);
+    CHECK(admitted.by_manufacturer[0].second == 2);
+
+    HardwareListPage page;
+    page.kpis = admitted;
+    const auto shown = render_hardware_list_fragment(page, false, false);
+    CHECK(contains(shown, "Median memory, 2 devices with hardware synced"));
+    CHECK(contains(shown, "By manufacturer: Dell 2"));
+    // CI columns degraded: no readout (a blank would read as "none").
+    const auto degraded = render_hardware_list_fragment(page, true, false);
+    CHECK_FALSE(contains(degraded, "Median memory"));
+    // Nothing synced: hidden.
+    HardwareListPage bare;
+    bare.kpis = hardware_kpis({ci_row("x", "", "")});
+    const auto none = render_hardware_list_fragment(bare, false, false);
+    CHECK_FALSE(contains(none, "Median memory"));
+    CHECK_FALSE(contains(none, "By manufacturer"));
+}
+
+TEST_CASE("software lens header: count and last synced, never-synced told apart from degraded",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    const std::vector<SoftwareEntry> sw{SoftwareEntry{}};
+    HwSyncAffordance sync;
+    const auto synced = render_hardware_software_lens("a", sw, false, true, sync, 1700000000);
+    CHECK(contains(synced, "1 application, last synced 2023-11-14"));
+    CHECK(contains(render_hardware_software_lens("a", sw, false, true, sync, 0), "never synced"));
+    CHECK(contains(render_hardware_software_lens("a", sw, false, true, sync, std::nullopt),
+                   "last synced time unavailable"));
+    // Click-to-load hosts ride the same lens and nothing is fetched on render.
+    CHECK(contains(synced, "hx-trigger=\"click\""));
 }

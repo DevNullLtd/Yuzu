@@ -321,6 +321,61 @@ TEST_CASE("tar parse_ts_param: epoch, datetime-local, and rejection", "[tar][tre
     CHECK(parse_ts_param("2026-06-18T12:00:30.123") == 1781784030); // fractional suffix ignored
 }
 
+TEST_CASE("tar parse_ts_param_strict: refuses what the lenient parser reads as unset or shifted",
+          "[tar][tree][parse]") {
+    CHECK(parse_ts_param_strict("") == std::optional<std::int64_t>{0}); // absent
+    CHECK(parse_ts_param_strict("1718000000") == std::optional<std::int64_t>{1718000000});
+    CHECK(parse_ts_param_strict("2026-06-18T12:00:00") == std::optional<std::int64_t>{1781784000});
+    CHECK(parse_ts_param_strict("2026-06-18T12:00") == std::optional<std::int64_t>{1781784000});
+    CHECK_FALSE(parse_ts_param_strict("9999999999999999999")); // 19 digits
+    CHECK_FALSE(parse_ts_param_strict("2026-13-01T00:00"));    // invalid month
+    CHECK_FALSE(parse_ts_param_strict("99999-01-01T00:00"));   // five-digit year
+    CHECK_FALSE(parse_ts_param_strict("not-a-time"));
+    CHECK_FALSE(parse_ts_param_strict(" 2026-06-18T12:00:00"));    // leading whitespace
+    CHECK_FALSE(parse_ts_param_strict("2026-06-18T12:00:"));       // bare trailing ':'
+    CHECK_FALSE(parse_ts_param_strict("2026-06-18T12:00:30xyz"));  // trailing junk
+    CHECK_FALSE(parse_ts_param_strict("2026-06-18T12:00:30.123")); // fractional suffix
+    CHECK_FALSE(parse_ts_param_strict("2026-+6-+18T+12:+00:+30")); // sign acceptance
+    CHECK_FALSE(parse_ts_param_strict("2026-06-18 12:00:00"));     // space instead of 'T'
+    CHECK_FALSE(parse_ts_param_strict("-5"));
+}
+
+TEST_CASE("tar parse_ts_param_strict: refuses a calendar-impossible date", "[tar][tree][parse]") {
+    // The lenient parser rolls these into the next month; the strict one must refuse them.
+    CHECK_FALSE(parse_ts_param_strict("2026-02-31T00:00"));
+    CHECK_FALSE(parse_ts_param_strict("2026-02-29T00:00")); // 2026 is not a leap year
+    CHECK_FALSE(parse_ts_param_strict("2026-04-31T00:00:00"));
+    CHECK_FALSE(parse_ts_param_strict("2100-02-29T00:00")); // divisible by 100, not by 400
+    CHECK(parse_ts_param_strict("2028-02-29T00:00").has_value()); // leap year
+    CHECK(parse_ts_param_strict("2000-02-29T00:00").has_value()); // divisible by 400
+    CHECK(parse_ts_param_strict("2026-04-30T23:59:59").has_value());
+    CHECK(parse_ts_param_strict("2026-01-31T00:00").has_value());
+    CHECK_FALSE(parse_ts_param_strict("2028-02-30T00:00")); // 30 Feb never exists
+    CHECK(parse_ts_param_strict("2026-02-28T00:00").has_value());
+    CHECK(parse_ts_param_strict("2026-12-31T23:59:59").has_value());
+    // Month 00 and 13 stay out of the day-length table; the lenient range check refuses them.
+    CHECK_FALSE(parse_ts_param_strict("2026-00-31T00:00"));
+    CHECK_FALSE(parse_ts_param_strict("2026-13-31T00:00"));
+    // has_value() cannot see a roll-over, so pin the leap day to the day before March 1st.
+    const auto leap_day = parse_ts_param_strict("2028-02-29T00:00");
+    const auto march_first = parse_ts_param_strict("2028-03-01T00:00");
+    REQUIRE(leap_day);
+    REQUIRE(march_first);
+    CHECK(*leap_day + 86400 == *march_first);
+}
+
+TEST_CASE("tar parse_ts_param_strict: every month accepts its last day and refuses the next",
+          "[tar][tree][parse]") {
+    constexpr int kLastDay[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}; // 2026
+    const auto two = [](int n) { return std::string(n < 10 ? "0" : "") + std::to_string(n); };
+    for (int m = 1; m <= 12; ++m) {
+        const std::string ym = "2026-" + two(m) + "-";
+        INFO("month " << m);
+        CHECK(parse_ts_param_strict(ym + two(kLastDay[m - 1]) + "T00:00").has_value());
+        CHECK_FALSE(parse_ts_param_strict(ym + two(kLastDay[m - 1] + 1) + "T00:00"));
+    }
+}
+
 TEST_CASE("tar anchors: non-positive ts cannot poison observed_since", "[tar][tree][anchor]") {
     std::vector<TarProcEvent> e{ev(0, "started", 9, 0, "garbage"),     // ts<=0 ignored
                                 ev(-5, "started", 8, 0, "garbage"),    // negative ignored
@@ -664,10 +719,11 @@ TEST_CASE("TAR page: the capture-sources push bar stays hidden until a change is
     CHECK(page.find(".apply-bar[hidden] { display: none; }") != std::string::npos);
 }
 
-TEST_CASE("TAR page: cell colour rules are table-prefixed so they outrank the td default",
+TEST_CASE("TAR page CSS declares the table-prefixed cell colour selectors",
           "[tar][page]") {
-    // `.tar-frame-body td { color: var(--ink2) }` has specificity (0,1,1); a bare single-class
-    // cell rule (0,1,0) loses to it and the support-state / ARP-type colours never apply.
+    // yuzu.css's `:is(.panel table, .tw table) td { color: var(--ink2) }` has specificity (0,1,2);
+    // a bare single-class cell rule loses to it, so these selectors carry a table / id prefix.
+    // This pins that the selectors are declared, not their computed outcome.
     const std::string page = kTarPageHtml;
     CHECK(page.find("#capTable .os-ok { color: var(--ok); }") != std::string::npos);
     CHECK(page.find("#capTable .os-con { color: var(--warn); }") != std::string::npos);

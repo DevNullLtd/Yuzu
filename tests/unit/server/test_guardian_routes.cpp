@@ -34,6 +34,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "test_route_sink.hpp"
+#include "url_attr_scan.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -380,6 +381,8 @@ TEST_CASE("create_baseline_from_form reports a duplicate name without a second r
     // htmx does not swap 4xx bodies, so the conflict surfaces as 200 + a banner.
     CHECK(res->status == 200);
     CHECK(res->body.find("already exists") != std::string::npos);
+    // The banner keeps its stable gs-error-banner marker (the Spark load generator keys on it).
+    CHECK(res->body.find("gs-error-banner") != std::string::npos);
     CHECK(h.baselines->list_baselines().size() == 1);
 }
 
@@ -2199,4 +2202,44 @@ TEST_CASE("guard detail page: a degraded rule read is not shown as Guard not fou
     auto missing = h2.sink.Get("/fragments/guardian/guard/nope/page");
     REQUIRE(missing);
     CHECK(missing->body.find("Guard not found") != std::string::npos);
+}
+
+// ── URL path-segment encoding: the census host link carries ONE encoded segment ──
+
+TEST_CASE("guard detail census: an agent-supplied id is encoded in the /viz/host link, and a "
+          "dot-only id gets no link",
+          "[pg][guardian_routes][census][url_path_segment]") {
+    Harness h;
+    auto rule = make_rule_with_spark("svc1", "ServiceGuard", "service-status-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "svc1");
+
+    const std::vector<std::string> ids = {"../../fragments/device/live/run?id=x", "a/b",
+                                          "x?y#z", "..", "ok-1"};
+    nlohmann::json agents = nlohmann::json::array();
+    int n = 0;
+    for (const auto& id : ids) {
+        agents.push_back({{"agent_id", id}, {"hostname", "host" + std::to_string(n)},
+                          {"os", "linux"}});
+        h.seed_status("e" + std::to_string(n), id, "svc1", "guard.compliant");
+        ++n;
+    }
+    h.agents_json = agents.dump();
+
+    auto res = h.sink.Get("/fragments/guardian/guard/svc1/page");
+    REQUIRE(res != nullptr);
+    const auto urls = yuzu::test::url_attr_values(res->body);
+
+    for (const auto& id : {ids[0], ids[1], ids[2], ids[4]}) {
+        INFO("id=" << id);
+        CHECK(yuzu::test::has_url(urls, "/viz/host/" + yuzu::server::url_path_segment(id)));
+    }
+    for (const auto& u : urls) {
+        CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+        if (u.rfind("/viz/host/", 0) == 0)
+            CHECK(yuzu::test::path_slashes(u) == 3);
+    }
+    // The dot-only device is still listed by name, just not linked.
+    CHECK(res->body.find("host3") != std::string::npos);
+    CHECK_FALSE(yuzu::test::has_url(urls, "/viz/host/.."));
 }

@@ -57,7 +57,7 @@ TEST_CASE("render_dex_app_perf_picker: top-level tab — subnav + Dashboard back
     CHECK(has(h, "class=\"on\" hx-get=\"/fragments/dex/perf/apps"));
     CHECK(has(h, ">Performance<"));
     CHECK(has(h, ">App Performance<"));
-    CHECK(has(h, "href=\"/\">&larr; Dashboard</a>")); // top-level convention, not a sub-fragment back-link
+    CHECK(has(h, "href=\"/\">&larr; Console</a>")); // top-level convention, not a sub-fragment back-link
 }
 
 TEST_CASE("render_dex_app_perf_picker: search filters by name, case-insensitive",
@@ -192,11 +192,11 @@ TEST_CASE("render_dex_app_perf_trend: floor pctile, suppression, scope selector"
     CHECK(has(fleet, ">Eng</option>")); // group option (names only — no N+1 count)
     CHECK_FALSE(has(fleet, "hx-on"));   // CSP: no eval-compiled handlers
 
-    // Group scope: subtitle names the group, the works-council floor + the shorter
+    // Group scope: subtitle names the group, the floor handed in + the shorter
     // (B1, 31-day) window are both captioned.
     const auto grp = render_dex_app_perf_trend("chrome.exe", {v1}, "g1", groups, 10, 30);
     CHECK(has(grp, "Eng"));
-    CHECK(has(grp, "works-council"));
+    CHECK(has(grp, "below the floor of 10 devices"));
     CHECK(has(grp, "31 days")); // window-divergence disambiguator
 
     // No versions → honest placeholder, never an empty table.

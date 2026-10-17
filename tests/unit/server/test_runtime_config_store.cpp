@@ -441,6 +441,11 @@ TEST_CASE("RuntimeConfigStore: set() validates typed keys", "[pg][runtime_config
     Wired w{db.dsn()};
     CHECK_FALSE(w.store.set("heartbeat_timeout", "not-a-number", "alice").has_value());
     CHECK_FALSE(w.store.set("heartbeat_timeout", "-5", "alice").has_value());
+    // Floor: the default agent heartbeat interval is 30 s, so 1-29 would flap direct agents.
+    CHECK_FALSE(w.store.set("heartbeat_timeout", "0", "alice").has_value());
+    CHECK_FALSE(w.store.set("heartbeat_timeout", "1", "alice").has_value());
+    CHECK_FALSE(w.store.set("heartbeat_timeout", "29", "alice").has_value());
+    CHECK(w.store.set("heartbeat_timeout", "30", "alice").has_value());
     CHECK(w.store.set("heartbeat_timeout", "60", "alice").has_value());
 
     CHECK_FALSE(w.store.set("auto_approve_enabled", "maybe", "alice").has_value());

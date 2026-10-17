@@ -870,6 +870,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "Management-plane posture, facts only: which plane controls the device (none/ad/ipa on "
          "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
          "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
+        {"shares.list",
+         "Shares this host serves over SMB/NFS as configured: name, path, ro/rw, anonymous access "
+         "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
+         "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
+         "/etc/exports.d and /etc/samba/smb.conf, macOS and Windows are planned; read-only"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -1295,7 +1300,7 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
     // OOB side-effects: context label + row count (extracted by HTMX
     // regardless of position, won't break the tbody parse context)
     result += "<span id=\"result-context\" hx-swap-oob=\"innerHTML\" "
-              "style=\"font-size:0.75rem;color:#8b949e\">" +
+              "class=\"result-context\">" +
               esc(context) + "</span>";
     result +=
         "<span id=\"row-count\" hx-swap-oob=\"innerHTML\">" + std::to_string(row_count) + "</span>";
@@ -1531,6 +1536,18 @@ std::vector<std::string> AgentRegistry::all_ids() const {
             ids.push_back(p.agent_id);
     }
     return ids;
+}
+
+std::expected<std::size_t, PresenceReadError> AgentRegistry::known_agent_count() const {
+    auto presence = live_presence(); // cached, runs OFF mu_ (see all_ids)
+    if (!presence)
+        return std::unexpected(presence.error());
+    std::lock_guard lock(mu_);
+    std::size_t n = agents_.size();
+    for (const auto& p : *presence)
+        if (!agents_.contains(p.agent_id))
+            ++n;
+    return n;
 }
 
 std::size_t AgentRegistry::local_agent_count() const {

@@ -304,3 +304,145 @@ TEST_CASE("DeploymentRunStore reports !is_open on a migration failure",
     DeploymentRunStore store{pool};
     CHECK_FALSE(store.is_open());
 }
+
+TEST_CASE("DeploymentRunStore list reports truncation exactly and never shows a short page as the whole",
+          "[pg][deployment][store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(store.create_deployment(make_dep("t" + std::to_string(i), "carol", t + i),
+                                        {tgt("a1")}));
+    REQUIRE(store.create_deployment(make_dep("other", "dave", t), {tgt("d1")}));
+
+    auto two = store.list_deployments_checked("carol", false, 2);
+    REQUIRE(two);
+    CHECK(two->rows.size() == 2);
+    CHECK(two->truncated); // a third exists
+    CHECK(two->rows[0].deployment_id == "t2"); // newest first survives the trim
+
+    auto three = store.list_deployments_checked("carol", false, 3);
+    REQUIRE(three);
+    CHECK(three->rows.size() == 3);
+    CHECK_FALSE(three->truncated); // exactly full is not truncated
+
+    auto many = store.list_deployments_checked("carol", false, 50);
+    REQUIRE(many);
+    CHECK(many->rows.size() == 3);
+    CHECK_FALSE(many->truncated);
+
+    // Another owner's row never counts toward carol's truncation.
+    auto dave = store.list_deployments_checked("dave", false, 1);
+    REQUIRE(dave);
+    CHECK(dave->rows.size() == 1);
+    CHECK_FALSE(dave->truncated);
+
+    // The admin read sees everything: 4 rows, limit 3 is truncated.
+    auto admin = store.list_deployments_checked("anyone", /*is_admin=*/true, 3);
+    REQUIRE(admin);
+    CHECK(admin->rows.size() == 3);
+    CHECK(admin->truncated);
+}
+
+TEST_CASE("DeploymentRunStore list order is deterministic across rows sharing a millisecond",
+          "[pg][deployment][store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    for (const char* id : {"e1", "e3", "e2"}) // inserted out of order, all the same millisecond
+        REQUIRE(store.create_deployment(make_dep(id, "erin", t), {tgt("a1")}));
+
+    // The tie breaks on id, descending, so the page and the truncation cut never flip between reads.
+    for (int i = 0; i < 3; ++i) {
+        auto two = store.list_deployments_checked("erin", false, 2);
+        REQUIRE(two);
+        REQUIRE(two->rows.size() == 2);
+        CHECK(two->rows[0].deployment_id == "e3");
+        CHECK(two->rows[1].deployment_id == "e2");
+        CHECK(two->truncated);
+    }
+    // The admin query carries the same tie-break.
+    auto admin = store.list_deployments_checked("anyone", /*is_admin=*/true, 2);
+    REQUIRE(admin);
+    REQUIRE(admin->rows.size() == 2);
+    CHECK(admin->rows[0].deployment_id == "e3");
+    CHECK(admin->rows[1].deployment_id == "e2");
+    CHECK(admin->truncated);
+}
+
+TEST_CASE("DeploymentRunStore checked readers: a miss is not a fault, a fault is not a miss",
+          "[pg][deployment][store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    REQUIRE(store.create_deployment(make_dep("cA", "alice", t), {tgt("a1"), tgt("a2"), tgt("a3")}));
+
+    SECTION("healthy store: hit, miss, not-yours, empty id") {
+        auto hit = store.get_deployment_checked("cA", "alice");
+        REQUIRE(hit);
+        REQUIRE(*hit);
+        CHECK((*hit)->deployment_id == "cA");
+        auto miss = store.get_deployment_checked("nope", "alice");
+        REQUIRE(miss); // engaged outer: "asked, no such row"
+        CHECK_FALSE(*miss);
+        auto theirs = store.get_deployment_checked("cA", "bob");
+        REQUIRE(theirs);
+        CHECK_FALSE(*theirs);
+        auto empty = store.get_deployment_checked("", "alice");
+        REQUIRE(empty);
+        CHECK_FALSE(*empty);
+
+        auto list = store.list_deployments_checked("alice", false, 10);
+        REQUIRE(list);
+        CHECK(list->rows.size() == 1);
+        CHECK_FALSE(list->truncated);
+        auto none = store.list_deployments_checked("nobody", false, 10);
+        REQUIRE(none); // zero rows is a successful read
+        CHECK(none->rows.empty());
+        CHECK_FALSE(none->truncated);
+    }
+
+    SECTION("device grid is ordered, bounded, and exact in the run row") {
+        auto all = store.get_devices_checked("cA");
+        REQUIRE(all);
+        CHECK(all->size() == 3);
+        CHECK((*all)[0].hostname == "host-a1");
+        auto two = store.get_devices_checked("cA", 2);
+        REQUIRE(two);
+        CHECK(two->size() == 2);
+        // Equal hostnames order by agent_id, so a capped page is stable.
+        REQUIRE(store.create_deployment(make_dep("cT", "alice", t),
+                                        {{"z2", "same-host", "windows"}, {"a9", "same-host", "windows"}}));
+        auto tied = store.get_devices_checked("cT");
+        REQUIRE(tied);
+        REQUIRE(tied->size() == 2);
+        CHECK((*tied)[0].agent_id == "a9");
+        CHECK((*tied)[1].agent_id == "z2");
+        auto absent = store.get_devices_checked("nope");
+        REQUIRE(absent);
+        CHECK(absent->empty());
+    }
+
+    SECTION("pool exhaustion surfaces as an error, never an empty result") {
+        auto hog = pool.try_acquire_for(std::chrono::seconds{8});
+        REQUIRE(hog);
+        CHECK_FALSE(store.get_deployment_checked("cA", "alice").has_value());
+        CHECK_FALSE(store.list_deployments_checked("alice", false, 10).has_value());
+        CHECK_FALSE(store.get_devices_checked("cA").has_value());
+        // The fail-soft wrappers keep their old contract for the engine and fragments.
+        CHECK(store.list_deployments("alice", false, 10).empty());
+        CHECK_FALSE(store.get_deployment("cA", "alice").has_value());
+    }
+}

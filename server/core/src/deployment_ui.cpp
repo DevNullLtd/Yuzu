@@ -28,6 +28,7 @@ constexpr int kRenderCapPerGroup = 500;
 // `af-rhd`, `af-empty`) from kAutoCss (preflight_ui.cpp): this fragment only ever
 // renders inside the /auto page. Design tokens only (yuzu.css).
 const char* kDeployCss = R"CSS(<style>
+#auto-deploy-grid{margin-top:14px}
 .dp-cohort{margin:0 0 14px;padding:12px 14px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:13.5px}
 .dp-cohort b{color:var(--ink)}
 #deploy-cfg input{font-family:var(--mds-font-family-mono);font-size:12.5px}
@@ -163,7 +164,7 @@ std::string render_deploy_config(const std::string& run_id, const std::string& r
          "&quot;? This runs the installer on each device and cannot be undone.\" "
          "hx-target=\"#auto-deploy-grid\" hx-swap=\"innerHTML\">Stage + deploy to cohort\xE2\x80\xA6</button>";
 
-    h += "<div id=\"auto-deploy-grid\" style=\"margin-top:14px\"></div></div>";
+    h += "<div id=\"auto-deploy-grid\"></div></div>";
     return h;
 }
 
@@ -266,7 +267,7 @@ std::string render_deploy_results(const DeploymentRow& dep,
             ++rendered;
             const std::string host = d.hostname.empty() ? d.agent_id : d.hostname;
             h += "<div class=\"af-dev\" data-bucket=\"" + std::string(bkey) + "\">";
-            h += "<span class=\"hn\"><a href=\"/hardware/ci?id=" + esc(d.agent_id) + "\">" + esc(host) +
+            h += "<span class=\"hn\"><a href=\"/hardware/ci?id=" + url_query_value(d.agent_id) + "\">" + esc(host) +
                  "</a></span>";
             h += "<span class=\"os\">" + esc(d.os.empty() ? "?" : d.os) + "</span>";
             h += "<span class=\"prog\">" + step_chips(d) + "</span></div>";

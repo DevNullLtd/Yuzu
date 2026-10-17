@@ -1,0 +1,13 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-12 · euid 0 · leg-hash 9e669e86fe0e
+== action=list
+status|list|supported|-
+source|exports|read|2
+source|exports_d|read|1
+source|smb_conf|read|2
+share|nfs|-|/srv/nfs/public|ro|true|clients_1|exports
+share|nfs|-|/srv/nfs/projects|mixed|false|no_root_squash,clients_2|exports
+share|nfs|-|/srv/nfs/archive|ro|true|clients_1|exports_d
+share|smb|public|/srv/samba/public|ro|true|-|smb_conf
+share|smb|projects|/srv/samba/projects|rw|false|hidden|smb_conf
+[result_status] OK / FULL / 
+

@@ -2,12 +2,16 @@
 
 #include "enrollment_directory_model.hpp" // #4031: shared row builders, REST/MCP parity (Rule 1)
 #include "http_route_sink.hpp"
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
+#include "integrations_sync_model.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <chrono>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,26 +41,29 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                                       AuditFn audit_fn, DirectorySync* directory_sync,
                                       PatchManager* patch_manager,
                                       DeploymentStore* deployment_store,
-                                      DiscoveryStore* discovery_store) {
+                                      DiscoveryStore* discovery_store, WriteGate write_gate) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors DexRoutes/GuardianRoutes).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
-                    directory_sync, patch_manager, deployment_store, discovery_store);
+                    directory_sync, patch_manager, deployment_store, discovery_store,
+                    std::move(write_gate));
 }
 
 void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                       AuditFn audit_fn, DirectorySync* directory_sync,
                                       PatchManager* patch_manager,
                                       DeploymentStore* deployment_store,
-                                      DiscoveryStore* discovery_store) {
+                                      DiscoveryStore* discovery_store, WriteGate write_gate) {
     // ── Directory Sync API (Phase 7: AD/Entra integration) ──────────────
 
     // POST /api/directory/sync — trigger directory sync
     sink.Post("/api/directory/sync",
-             [auth_fn, perm_fn, audit_fn, directory_sync](const httplib::Request& req,
-                                                           httplib::Response& res) {
+             [perm_fn, audit_fn, directory_sync, write_gate](const httplib::Request& req,
+                                                              httplib::Response& res) {
                  if (!perm_fn(req, res, "Directory", "Write"))
+                     return;
+                 if (write_gate.refuse_cross_site(audit_fn, req, res, "/api/directory/sync"))
                      return;
                  if (!directory_sync || !directory_sync->is_open()) {
                      res.status = 503;
@@ -70,6 +77,9 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  try {
                      body = nlohmann::json::parse(req.body);
                  } catch (const std::exception& e) {
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res, "directory.sync",
+                                                         "failure", "Directory", "",
+                                                         "invalid_json");
                      res.status = 400;
                      res.set_content(nlohmann::json({{"error", e.what()}}).dump(),
                                      "application/json");
@@ -86,6 +96,9 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                      if (ec.tenant_id.empty() || ec.client_id.empty() ||
                          ec.client_secret.empty()) {
+                         (void)detail::emit_behavioral_audit(
+                             audit_fn, req, res, "directory.sync", "failure", "Directory",
+                             "entra", "missing_credentials");
                          res.status = 400;
                          res.set_content(
                              R"({"error":"tenant_id, client_id, and client_secret are required"})",
@@ -93,6 +106,11 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                          return;
                      }
 
+                     // Audit-first (ADR-0033 section 9): no `attempted` row, no sync. The
+                     // row names the provider only; the credentials never reach it.
+                     if (!detail::audit_attempted(audit_fn, req, res, "directory.sync",
+                                                  "Directory", "entra", ""))
+                         return;
                      auto result = directory_sync->sync_entra(ec);
                      if (!result) {
                          // ADR-1007: the re-entrancy guard's specific refusal
@@ -108,22 +126,28 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                              res.set_content(
                                  nlohmann::json({{"error", result.error()}}).dump(),
                                  "application/json");
-                             auto session = auth_fn(req, res);
-                             if (session)
-                                 audit_fn(req, "directory.sync", "denied", "Directory", "entra",
-                                          std::string(yuzu::server::kEntraSyncAlreadyInProgress));
+                             (void)detail::emit_behavioral_audit(
+                                 audit_fn, req, res, "directory.sync", "denied", "Directory",
+                                 "entra", std::string(yuzu::server::kEntraSyncAlreadyInProgress));
                              return;
                          }
+                         // Fixed detail: the upstream error text can carry
+                         // tenant and client identifiers and is already in the
+                         // status row's last_error.
+                         (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                             "directory.sync", "failure",
+                                                             "Directory", "entra", "sync_failed");
                          res.status = 500;
                          res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                          "application/json");
                          return;
                      }
 
-                     auto session = auth_fn(req, res);
-                     if (session)
-                         audit_fn(req, "directory.sync", "success", "Directory", "entra",
-                                  "Entra ID sync completed");
+                     // The principal comes from the request inside audit_fn; a second auth_fn
+                     // call (which can answer 401 after a multi-minute sync) is not needed.
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res, "directory.sync",
+                                                         "success", "Directory", "entra",
+                                                         "Entra ID sync completed");
 
                      auto status = directory_sync->get_status();
                      res.set_content(nlohmann::json({{"status", "completed"},
@@ -165,9 +189,8 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
     // and the MCP tool list_directory_users) — Rule 1, no more independent
     // drift on this PII-bearing shape. Also closes a real pre-existing gap
     // the #4031 issue flagged: this route exposed email/UPN/group PII with
-    // NO audit call at all. Uses the file's existing void-AuditFn
-    // fire-and-forget convention (matches this file's directory.sync /
-    // directory.group_mapping.update / discovery.scan calls) rather than
+    // NO audit call at all. Discards AuditFn's bool result (the
+    // Integrations writes in this file use it; this legacy read does not) rather than
     // the newer bool/fail-closed rest_audit.hpp contract the REST v1 twin
     // uses — upgrading DiscoveryRoutes wholesale onto that contract is a
     // separate, broader modernization, not scoped to this PR.
@@ -232,9 +255,12 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
     // PUT /api/directory/group-mappings — configure group-to-role mappings
     sink.Put("/api/directory/group-mappings",
-            [auth_fn, perm_fn, audit_fn, directory_sync](const httplib::Request& req,
-                                                          httplib::Response& res) {
+            [perm_fn, audit_fn, directory_sync, write_gate](const httplib::Request& req,
+                                                             httplib::Response& res) {
                 if (!perm_fn(req, res, "Directory", "Write"))
+                    return;
+                if (write_gate.refuse_cross_site(audit_fn, req, res,
+                                                 "/api/directory/group-mappings"))
                     return;
                 if (!directory_sync || !directory_sync->is_open()) {
                     res.status = 503;
@@ -261,27 +287,84 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                     return;
                 }
 
-                int count = 0;
+                // Read the WHOLE request before writing any of it: an entry that is not an
+                // object, or whose fields are not strings, would otherwise throw after the
+                // earlier pairs were already stored, leaving a part-applied batch with no
+                // audit row. Nothing is stored for a refused request.
+                std::vector<integrations::MappingChange> applied;
                 for (const auto& m : body["mappings"]) {
-                    auto group_id = m.value("group_id", "");
-                    auto role_name = m.value("role_name", "");
+                    if (!m.is_object()) {
+                        res.status = 400;
+                        res.set_content(detail::a4_error(res, "each mapping must be an object"),
+                                        "application/json");
+                        return;
+                    }
+                    const auto gid = m.find("group_id");
+                    const auto role = m.find("role_name");
+                    if ((gid != m.end() && !gid->is_string()) ||
+                        (role != m.end() && !role->is_string())) {
+                        res.status = 400;
+                        res.set_content(
+                            detail::a4_error(res, "group_id and role_name must be strings"),
+                            "application/json");
+                        return;
+                    }
+                    auto group_id = gid != m.end() ? gid->get<std::string>() : std::string{};
                     if (group_id.empty())
                         continue;
+                    applied.push_back({std::move(group_id),
+                                       role != m.end() ? role->get<std::string>() : std::string{}});
+                }
 
+                // Audit-first (ADR-0033 section 9): no `attempted` row, no mapping change. The
+                // per-pair rows below follow the read-back.
+                // The row states the TOTAL requested and names the pairs that fit its first chunk
+                // (the per-pair rows below carry the whole list), so a lone surviving `attempted`
+                // row still says how much was asked and, for a short request, exactly what.
+                const auto requested = integrations::mapping_audit_chunks(applied, "requested");
+                const auto pairs_at = requested.front().find(':');
+                const std::string attempted_detail =
+                    std::to_string(applied.size()) + " mappings requested" +
+                    (requested.size() > 1 ? " (first listed)" : "") +
+                    (pairs_at == std::string::npos ? std::string{} : requested.front().substr(pairs_at));
+                if (!detail::audit_attempted(audit_fn, req, res, "directory.group_mapping.update",
+                                             "Directory", "group-mappings", attempted_detail))
+                    return;
+                for (const auto& [group_id, role_name] : applied) {
                     if (role_name.empty())
                         directory_sync->remove_group_role_mapping(group_id);
                     else
                         directory_sync->configure_group_role_mapping(group_id, role_name);
-                    ++count;
                 }
 
-                auto session = auth_fn(req, res);
-                if (session)
-                    audit_fn(req, "directory.group_mapping.update", "success",
-                             "Directory", "group-mappings",
-                             std::to_string(count) + " mappings updated");
+                // Read back before auditing: the store's writers swallow a failed
+                // write, so a "success" row listing pairs that were never stored
+                // would be false evidence. A confirmed pair gets a success row, an
+                // unconfirmed one a failure row (both when a batch is mixed), and a
+                // failed read-back confirms nothing. A group named twice counts as
+                // its last entry, which is what the store ends with.
+                auto stored = directory_sync->get_group_role_mappings_checked();
+                const auto outcome = integrations::classify_mapping_changes(
+                    applied, stored ? std::optional<std::map<std::string, std::string>>(*stored)
+                                    : std::nullopt);
 
-                auto mappings = directory_sync->get_group_role_mappings();
+                // Every pair reaches the trail: a long list is split over several rows. A row that
+                // cannot be written marks the response Sec-Audit-Failed (the change is made).
+                if (!outcome.confirmed.empty() || outcome.unconfirmed.empty())
+                    for (const auto& d : integrations::mapping_audit_chunks(outcome.confirmed))
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                            "directory.group_mapping.update",
+                                                            "success", "Directory",
+                                                            "group-mappings", d);
+                if (!outcome.unconfirmed.empty())
+                    for (const auto& d : integrations::mapping_audit_chunks(
+                             outcome.unconfirmed, "not confirmed by read-back"))
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                            "directory.group_mapping.update",
+                                                            "failure", "Directory",
+                                                            "group-mappings", d);
+                auto mappings = stored ? *stored : std::map<std::string, std::string>{};
+
                 nlohmann::json mappings_arr = nlohmann::json::array();
                 for (const auto& [gid, role] : mappings) {
                     mappings_arr.push_back({{"group_id", gid}, {"role_name", role}});
@@ -313,10 +396,19 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                 q.severity = req.get_param_value("severity");
                 q.status = req.get_param_value("status");
                 try {
-                    auto limit_str = req.get_param_value("limit");
-                    if (!limit_str.empty())
-                        q.limit = std::stoi(limit_str);
-                } catch (...) {
+                    if (req.has_param("limit")) {
+                        q.limit = strict_stoi(req.get_param_value("limit"));
+                        // A negative LIMIT is rejected by PG and the store answers an empty
+                        // list: a valid-looking 200 for a malformed request.
+                        if (q.limit < 0)
+                            throw std::invalid_argument("negative limit");
+                    }
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
                 }
 
                 auto status_filter = q.status.empty() ? "missing" : q.status;
@@ -510,10 +602,18 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                 int limit = 50;
                 try {
-                    auto limit_str = req.get_param_value("limit");
-                    if (!limit_str.empty())
-                        limit = std::stoi(limit_str);
-                } catch (...) {
+                    if (req.has_param("limit")) {
+                        limit = strict_stoi(req.get_param_value("limit"));
+                        // Negative: PG rejects `LIMIT -1`; the store would answer an empty 200.
+                        if (limit < 0)
+                            throw std::invalid_argument("negative limit");
+                    }
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
                 }
 
                 auto deployments = patch_manager->list_deployments(limit);

@@ -162,11 +162,12 @@ The asset tag operations are defined as formal instruction definitions that can 
 - `asset_tags.yaml` — four `InstructionDefinition` documents
 - `asset_tags_set.yaml` — one `InstructionSet` grouping them
 
-These can be imported via the instruction import API:
+These can be imported via the instruction import API. Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
 
 ```bash
 # Import the YAML definitions (server parses and stores them)
 curl -s -X POST http://localhost:8080/api/instructions/import \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -770,8 +771,8 @@ inventory, applying each device's reported model string as the tag value.
 
 Other useful cohort keys: `image` (e.g. `vanilla` vs `layered` for VDI
 image comparison), `location`, `role`. Pick any key from the tab's
-"cohort by tag key" selector. Honesty rules: cohorts under **10 reporting
-devices** show "n too small" rather than noisy percentiles, and untagged
+"cohort by tag key" selector. Honesty rules: under the one-device floor a cohort
+is published whenever at least one device reported (only an empty cohort shows "n too small"), and untagged
 devices always appear as an explicit "(untagged)" residual row.
 
 > **Choosing keys for the Prometheus cohort export** (DEX → Alerts):

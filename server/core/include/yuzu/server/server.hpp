@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -13,6 +15,30 @@ class AuthManager;
 }
 
 namespace yuzu::server {
+
+/// A seconds value written by `PUT /api/config/heartbeat_timeout` on an HTTP thread while the
+/// stale-session sweep and the General page read it. `Config` is passed and copied by value and
+/// `std::atomic` is not copyable, so this wraps one: copies take a relaxed snapshot. Relaxed is
+/// enough, the value is independent of any other state.
+class LiveSeconds {
+public:
+    LiveSeconds(std::chrono::seconds v = {}) noexcept : v_(v.count()) {}
+    LiveSeconds(const LiveSeconds& o) noexcept : v_(o.v_.load(std::memory_order_relaxed)) {}
+    LiveSeconds& operator=(const LiveSeconds& o) noexcept { return *this = o.get(); }
+    LiveSeconds& operator=(std::chrono::seconds v) noexcept {
+        v_.store(v.count(), std::memory_order_relaxed);
+        return *this;
+    }
+    [[nodiscard]] std::chrono::seconds get() const noexcept {
+        return std::chrono::seconds(v_.load(std::memory_order_relaxed));
+    }
+    operator std::chrono::seconds() const noexcept { return get(); }
+    [[nodiscard]] std::chrono::seconds::rep count() const noexcept { return get().count(); }
+
+private:
+    std::atomic<std::int64_t> v_;
+    static_assert(std::atomic<std::int64_t>::is_always_lock_free);
+};
 
 struct Config {
     std::string listen_address{"0.0.0.0:50051"};     // Agent-facing gRPC
@@ -72,8 +98,8 @@ struct Config {
     std::filesystem::path mgmt_tls_ca_cert;
 
     // Session management
-    std::chrono::seconds session_timeout{
-        90}; // Agents disconnected after this many seconds without heartbeat
+    LiveSeconds session_timeout{
+        std::chrono::seconds{90}}; // Agents disconnected after this many seconds without heartbeat
     std::size_t max_agents{10'000};
 
     // JIT admin elevation (SOC 2 CC6.3/CC6.6) — `/auth-and-authz` gap P1 #9.

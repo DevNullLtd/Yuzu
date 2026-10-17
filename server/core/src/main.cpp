@@ -9,6 +9,7 @@
 #include "gateway_mgmt_stub_pool.hpp" // parse_gateway_cluster_addrs
 #include "gateway_service_impl.hpp"   // detail::kMaxClusterIdLen
 #include "guardian_ingest.hpp"        // detail::create_t_server_logger / set_t_server_logger (#4666 PR-4)
+#include "healthcheck_probe.hpp"      // #5906: --healthcheck run_healthcheck
 #include "insecure_tls_gate.hpp"
 #include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
@@ -690,7 +691,9 @@ int main(int argc, char* argv[]) {
                    "--max-sse-streams, which is what you want; setting it clamps the stream "
                    "target to what your pool can carry. The whole pool is created at BOOT, so "
                    "size the host's process/thread limit (systemd TasksMax, container pids) at "
-                   "or above this number before starting.")
+                   "or above this number before starting. With HTTPS on, the HTTP->HTTPS "
+                   "redirect listener also creates its own fixed pool at boot (at most 64 "
+                   "threads); count them in the same budget.")
         // Ceiling is the real clamp the server applies (kMaxHttpWorkerThreads), so the
         // flag cannot accept a value the pool will silently refuse to honour.
         ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
@@ -839,8 +842,23 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_HTTPS_CERT");
     app.add_option("--https-key", cfg.https_key_path, "PEM private key for HTTPS")
         ->envname("YUZU_HTTPS_KEY");
-    app.add_flag("--no-https-redirect", "Disable HTTP→HTTPS redirect")
+    app.add_flag("--no-https-redirect",
+                 "Disable the HTTP→HTTPS redirect listener (and with it the cleartext health "
+                 "probes on --web-port)")
         ->each([&cfg](const std::string&) { cfg.https_redirect = false; });
+
+    // #5906: in-image health probe. Deliberately NO envname on either option: a
+    // stray environment variable must never turn the server into a probe.
+    bool healthcheck = false;
+    std::string healthcheck_path = "/readyz";
+    app.add_flag("--healthcheck", healthcheck,
+                 "Probe this server's health endpoint over the configured listener and exit 0 "
+                 "(HTTP 200) or non-zero; uses the same --no-https/--https-port/--web-port/"
+                 "--web-address/--https-cert/--ca-dir flags and env as the server");
+    app.add_option("--healthcheck-path", healthcheck_path,
+                   "Probe path: /readyz (default) or /livez")
+        ->check(CLI::IsMember({"/readyz", "/livez"}))
+        ->needs("--healthcheck");
 
     // Certificate hot-reload options
     app.add_flag("--no-cert-reload", "Disable automatic certificate hot-reload")
@@ -979,6 +997,11 @@ int main(int argc, char* argv[]) {
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
 
     CLI11_PARSE(app, argc, argv);
+
+    // #5906: probe-and-exit, before any server init (no config, secrets, DB, log or
+    // cert-dir side effects).
+    if (healthcheck)
+        return yuzu::server::healthcheck::run_healthcheck(cfg, healthcheck_path, std::cerr);
 
     // ── Secrets from files (#5272) ──
     // Resolved here, before anything reads cfg. A failure is reported again

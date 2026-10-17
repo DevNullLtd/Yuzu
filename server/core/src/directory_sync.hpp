@@ -157,6 +157,13 @@ struct LdapConfig {
     bool use_ssl{false};
 };
 
+/// Why a checked read failed. Absent from every success path, including
+/// "no rows": that is a business answer, not an error.
+enum class DirectoryReadError {
+    store_unavailable, ///< store not open or no connection in time
+    query_failed,      ///< a query against an open store failed
+};
+
 // ── DirectorySync ────────────────────────────────────────────────────────────
 
 /// The exact `sync_entra` busy-rejection string, shared with
@@ -215,6 +222,22 @@ public:
     /// SQLite era (see file header).
     std::vector<DirectoryUser> get_synced_users(const std::string& group_filter = {}) const;
 
+    /// Checked variant of `get_synced_users`: a failed read is an error, never
+    /// an empty list, so a page can tell "no synced users" from "could not read".
+    /// `limit` > 0 caps the rows read (and so the membership lookup); 0 = all.
+    /// `require_groups`: when true a failed group-membership lookup fails the
+    /// whole read (the users would otherwise look like members of no group);
+    /// the plain `get_synced_users` keeps the best-effort enrichment.
+    [[nodiscard]] std::expected<std::vector<DirectoryUser>, DirectoryReadError>
+    get_synced_users_checked(const std::string& group_filter = {}, int limit = 0,
+                             bool require_groups = true) const;
+
+    /// Number of synced users, from the stored snapshot (one COUNT, no PII
+    /// read). The status row's `user_count` cannot be used for this: a failed
+    /// sync writes the count of a snapshot that was never stored.
+    [[nodiscard]] std::expected<std::int64_t, DirectoryReadError>
+    get_synced_user_count_checked() const;
+
     /// Get a single synced user by directory object ID.
     std::optional<DirectoryUser> get_user(const std::string& id) const;
 
@@ -223,6 +246,15 @@ public:
 
     /// Get sync status for each configured provider.
     SyncStatus get_status() const;
+
+    /// Checked variant of `get_synced_groups`.
+    [[nodiscard]] std::expected<std::vector<DirectoryGroup>, DirectoryReadError>
+    get_synced_groups_checked() const;
+
+    /// Checked variant of `get_status`: a failed read is an error, never the
+    /// default "idle, never synced" value (a stored row absent is still that
+    /// default, because that IS never-synced).
+    [[nodiscard]] std::expected<SyncStatus, DirectoryReadError> get_status_checked() const;
 
     // ── Group-to-role mapping ───────────────────────────────────────────
 
@@ -235,6 +267,11 @@ public:
 
     /// Get all group-to-role mappings.
     std::map<std::string, std::string> get_group_role_mappings() const;
+
+    /// Checked variant: a failed read is an error, never an empty map, so a
+    /// caller verifying a write cannot mistake "could not read" for "removed".
+    [[nodiscard]] std::expected<std::map<std::string, std::string>, DirectoryReadError>
+    get_group_role_mappings_checked() const;
 
 private:
     pg::PgPool& pool_;

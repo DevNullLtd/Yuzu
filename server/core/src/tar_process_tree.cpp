@@ -488,6 +488,51 @@ std::int64_t parse_ts_param(const std::string& s) {
            H * 3600 + Mi * 60 + Se;
 }
 
+std::optional<std::int64_t> parse_ts_param_strict(const std::string& s) {
+    if (s.empty())
+        return std::int64_t{0}; // absent: the same "unset" the lenient parser reports
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    if (std::all_of(s.begin(), s.end(), digit)) {
+        if (s.size() > 18) // cannot be a real epoch; refuse rather than report "unset"
+            return std::nullopt;
+        return parse_ts_param(s);
+    }
+    // Exactly YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS -- no sign, whitespace, bare trailing ':'
+    // or trailing junk, all of which the lenient parser tolerates.
+    constexpr std::string_view kShortShape = "dddd-dd-ddTdd:dd";
+    constexpr std::string_view kLongShape = "dddd-dd-ddTdd:dd:dd";
+    const std::string_view shape = s.size() == kShortShape.size()  ? kShortShape
+                                   : s.size() == kLongShape.size() ? kLongShape
+                                                                   : std::string_view{};
+    if (shape.empty())
+        return std::nullopt;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (shape[i] == 'd' ? !digit(s[i]) : s[i] != shape[i])
+            return std::nullopt;
+    }
+    // The lenient parser only range-checks the day as 1..31 and days_from_civil rolls the
+    // overflow into the next month (31 Feb reads as 3 Mar), so check the day against the
+    // month length here. The shape is validated above, so the digits are safe to read.
+    const auto num = [&](std::size_t pos, std::size_t len) {
+        int n = 0;
+        for (std::size_t i = pos; i < pos + len; ++i)
+            n = n * 10 + (s[i] - '0');
+        return n;
+    };
+    const int year = num(0, 4);
+    const int month = num(5, 2);
+    const int day = num(8, 2);
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    constexpr int kDaysInMonth[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    // A month outside 1..12 is left to the range check below; this guards the table index.
+    if (month >= 1 && month <= 12 && day > kDaysInMonth[month - 1] + (month == 2 && leap ? 1 : 0))
+        return std::nullopt;
+    const auto v = parse_ts_param(s);
+    if (v == 0) // range-checked inside: invalid month, year outside [1970,9999], ...
+        return std::nullopt;
+    return v;
+}
+
 namespace {
 
 /// A pid's lifetime as walked from the event stream (one incarnation).
@@ -1304,7 +1349,7 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     h += "</tbody></table>";
     if (rendered == 0)
         return "<div class=\"devnet-empty\">No capture sources reported by this device.</div>";
-    h += "<div class=\"apply-bar\" id=\"capApplyBar\" hidden><span class=\"apply-icon\">&#9888;</span>"
+    h += "<div class=\"apply-bar note warn\" id=\"capApplyBar\" hidden><span class=\"apply-icon\">&#9888;</span>"
          "<span id=\"capApplyMsg\">0 pending changes</span><span class=\"apply-spacer\"></span>"
          "<button class=\"btn-secondary\" onclick=\"discardCapChanges()\">Discard</button>"
          "<button class=\"apply-push\" onclick=\"pushCapChanges()\">Push changes &#8594;</button></div>";

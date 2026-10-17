@@ -1,0 +1,336 @@
+{
+  "actions": [
+    {
+      "action": "list",
+      "definition_ids": [
+        "crossplatform.network.shares"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "configured shares as written, not live nfsd/smbd state; Samba registry backend, include= files and usershares are not read (constrained token); a symlinked config file or exports.d is refused",
+          "mechanism": "bounded no-follow reads of /etc/exports, /etc/exports.d/*.exports and /etc/samba/smb.conf (pure parsers); one lstat of the usershares directory",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "not read yet: one unsupported status row, macos:planned",
+          "mechanism": "share-point listing plus /etc/exports (BSD syntax)",
+          "rung": "2",
+          "support": "planned"
+        },
+        "windows": {
+          "fallback": "not read yet: one unsupported status row, windows:planned",
+          "mechanism": "NetShareEnum level 2 (netapi32)",
+          "rung": "1",
+          "support": "planned"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**No documented customer driver.** No documented customer driver for this plugin was found (as in `mgmt_posture`'s caveat); it exists to answer what this host exposes over SMB and NFS, which no other plugin reports. Pure capability-gap reasoning.",
+    "**Configured, not live; some Samba scope is not read.** Linux reports what the files say, not whether `nfsd` or `smbd` runs or what a client sees. The Samba registry backend, `include =` files and usershares are reported as `constrained` tokens, never as a wrong share list. `[global]` parameters written after a share section apply to it here but not in Samba.",
+    "**Windows and macOS are planned.** The Windows `NetShareEnum` level-2 read, which will flag the administrative `STYPE_SPECIAL` shares (`ADMIN$`, `IPC$`, drive shares) as `special` rather than hide them, and the macOS share-point and `/etc/exports` read are not implemented; each leg reports one `unsupported` row, `windows:planned` or `macos:planned`.",
+    "**Names and paths can identify people.** See the sensitivity bullet: a share name or path may contain an account name, so dispatch is gated at `Infrastructure:Read` (the stored result is readable by `Response:Read` holders, as for every plugin) and the definition says so."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reports the shares this host is configured to serve over SMB and NFS: name, path, ro/rw/mixed, whether anonymous access is configured and a few flags, never ACLs or NFS client host lists (clients are a count). On Linux, read from /etc/exports, /etc/exports.d and /etc/samba/smb.conf as written, not live nfsd/smbd state; the Samba registry backend, include files and usershares are not read. The macOS and Windows legs are planned and not yet read. A refused or failed read is permission_denied or constrained with a reason token, never an empty result; one source row per source says whether it was read. Share names and paths can embed account names, so the result is sensitive. A leading status row states whether the read was complete.",
+      "display_name": "Shares",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "crossplatform.network.shares",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs",
+  "how_it_works": "`list` reports the shares this host is configured to serve over SMB and NFS: names, paths, read-only or read-write, whether anonymous access is configured, and a few flags. For SMB the anonymous flag reflects `guest ok` as written: whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). It reads local configuration files and changes nothing. The first row is always a `status` row saying whether the read was complete, then one `source` row per source the leg knows about (so zero `share` rows is never an ambiguous empty success), then the `share` rows. These are configured exports, not live `nfsd` or `smbd` state, and they are not the mapped-drive and session observations `tar` records for `mapdrive` (which track mappings this host makes and sessions against its shares). ACLs, `valid users` and NFS client host lists are never emitted: an NFS export carries a client count (`clients_<n>`) and an `anonymous` flag only.\n\nOn Linux the leg reads `/etc/exports`, the `/etc/exports.d/*.exports` snippets and `/etc/samba/smb.conf` with bounded reads that never follow a symlink at the final path component (a symlinked ancestor directory is followed), under one row and byte budget per listing. The exports files use the `exports(5)` grammar. `smb.conf` is parsed with Samba's own semantics: lines before the first `[header]` belong to `[global]`, parameter synonyms collapse to one key so the last occurrence wins, a `copy =` chain and `[global]` are consulted when a share does not set a value itself, and Samba's built-in defaults apply last. A line the parser cannot read (a UTF-8 BOM on the first line, an unterminated `[header`, a relative or option-first exports line) is skipped without a count, as `nfsd` and `testparm` reject it too.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "9e669e86fe0e",
+  "manifest_version": 1,
+  "name": "shares",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Row shape discriminator (field 0). Values: status, source, share.",
+          "example": "share",
+          "name": "row_kind",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "status",
+            "source",
+            "share"
+          ]
+        },
+        {
+          "description": "status: the literal \"list\". source: exports, exports_d or smb_conf. share: nfs or smb.",
+          "example": "smb",
+          "name": "field_1",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "status: supported, constrained, permission_denied or unsupported (the planned macOS and Windows legs, and a leg that threw). source: read, absent, refused or failed (absent is a state, not a failure). share: the SMB share name, or \"-\" for NFS (identified by path).",
+          "example": "supported",
+          "name": "field_2",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "status: reason token(s) for a non-supported read, \"-\" when complete; tokens look like linux:shares:exports:permission_denied, linux:shares:smb_conf:registry_backend, macos:planned, windows:planned. source: the number of shares read from it, \"-\" unless it was read. share: the exported path (\"-\" when none is set).",
+          "example": "-",
+          "name": "field_3",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "share: ro, rw, mixed (clients, security flavours or a Samba read/write list disagree with the share default) or \"-\" when unknown. Not used by the other kinds.",
+          "example": "rw",
+          "name": "field_4",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "share: true when any client may use it (guest, `*`, a wildcard made only of `*`/`?`, or a network with an all-zero mask), false when not, \"-\" when unknown. For SMB this reflects `guest ok` as written; whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). Not used by the other kinds.",
+          "example": "false",
+          "name": "field_5",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "share: comma-separated flags from hidden, unavailable, special, no_root_squash, clients_<n> (the NFS client count; hosts are never listed), or \"-\". Not used by the other kinds.",
+          "example": "clients_2",
+          "name": "field_6",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "share: the source it came from (exports, exports_d or smb_conf). Not used by the other kinds.",
+          "example": "exports",
+          "name": "field_7",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.network.shares"
+    }
+  ],
+  "outputs_note": "Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, and the first row is always `status|list|<supported\\|constrained\\|permission_denied\\|unsupported>|<reason or ->`. A `source|<exports\\|exports_d\\|smb_conf>|<read\\|absent\\|refused\\|failed>|<share count or ->` row follows for every source the leg knows about (Linux three; the macOS and Windows placeholders answer the status row alone; `absent` is a state, not a failure). Each share is `share|<nfs\\|smb>|<name or ->|<path or ->|<ro\\|rw\\|mixed\\|->|<true\\|false\\|->|<flags or ->|<source>`: the name is the SMB share name and `-` for NFS (identified by path), `mixed` means clients, security flavours, or a Samba read/write list disagree with the share default, and the flags are a closed set: `hidden`, `unavailable` (Samba `available = no`), `special` (Samba `[homes]`, `[printers]`, `[print$]`), `no_root_squash` (root is not squashed: no `root_squash` or `all_squash` in effect) and `clients_<n>`. Every free field is scrubbed of NUL and invalid UTF-8 and pipe-escaped.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "planned",
+    "windows": "planned"
+  },
+  "privileges": [
+    {
+      "grant": "n/a",
+      "if_refused": "n/a — the placeholder reports `unsupported` with `windows:planned`",
+      "measured": "n/a",
+      "os": "Windows",
+      "runs_as": "n/a — the leg reads nothing (caveat 3)"
+    },
+    {
+      "grant": "n/a",
+      "if_refused": "n/a — the placeholder reports `unsupported` with `macos:planned`",
+      "measured": "n/a",
+      "os": "macOS",
+      "runs_as": "n/a — the leg reads nothing (caveat 3)"
+    },
+    {
+      "grant": "None: `/etc/exports`, `/etc/exports.d/*.exports` and `/etc/samba/smb.conf` are world-readable (0644) on stock packages. A site that tightens them can grant read access to the agent account, or accept the token",
+      "if_refused": "`PERMISSION_DENIED` / partial with `linux:shares:<source>:permission_denied` when a source was refused and none was read, `CONSTRAINED` when another source was read; the source row says `refused`",
+      "measured": "Not measured on the `yuzu` account; see Sample output for the capture",
+      "os": "Linux",
+      "runs_as": "agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`)"
+    }
+  ],
+  "readme": "agents/plugins/shares/README.md",
+  "result_status": [
+    {
+      "completeness": "full",
+      "provenance": "(empty)",
+      "status": "`OK`",
+      "when": "every source that exists was read in full; no shares is `supported` with `absent` or `read|0` source rows"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:shares:<exports|exports_d|smb_conf>:<errno token>`, `linux:shares:<source>:symlink_refused`, `linux:shares:<source>:not_regular`, `linux:shares:<source>:oversized`, `linux:shares:<source>:invalid_bytes`, `linux:shares:exports_d:not_a_directory`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: a source could not be read (a symlinked file or `exports.d` (a NixOS-style `/etc`) is refused rather than followed, a FIFO, a file over 256 KiB, a NUL byte, an I/O error; a containerised agent reads the image's `/etc`, not the host's); its source row says `failed` and the other sources are still reported. A refusal (EACCES/EPERM) is `refused`, not `failed` (the `PERMISSION_DENIED` row below)"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:shares:exports_d:too_many`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: more than 64 `exports.d` snippets or 4096 directory entries; the source row stays `read` with the count of shares read, and the excess snippets are cut"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:shares:smb_conf:registry_backend`, `linux:shares:smb_conf:include_unresolved`, `linux:shares:smb_conf:copy_unresolved`, `linux:shares:smb_conf:usershares_not_read`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: the Samba shares are incomplete by design: a registry backend (`config backend = registry`, `registry shares = yes`), a live `include =` or `config file =`, a `copy =` target that is missing, names `[global]`, is cyclic, over 255 bytes, deeper than 8, defined after the copying share or re-opened after it (Samba snapshots a copy target where the directive stands; any `copy` line counts, not only the last, and a flagged copying share is still listed, with inherited values that may differ from what Samba applies), or usershares (configured, or the default usershares directory exists and `usershare max shares` is not `0`). A stock Debian host has a compiled-in usershare default the file does not show, so with `usershare max shares` unset and the directory present it lands here, because usershares may be in use and are not listed; `usershare max shares = 0` states they are off and gives `OK`, whatever `usershare path` says"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:shares:smb_conf:usershares_unreadable`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: `usershare max shares` is unset and an `lstat` of the default usershares directory failed for a reason other than absence (for example a permission error), so whether usershares are in use is unknown"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:shares:row_cap`, `linux:shares:field_oversized`",
+      "status": "`CONSTRAINED`",
+      "when": "more than 512 shares or 1 MiB of share text (name, path and flags, plus a fixed 64-byte charge per share) before pipe-escaping across all sources (the listing stops there; the wire can be up to about twice that), or a name or path over 4096 bytes was cut"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:shares:<source>:permission_denied`",
+      "status": "`PERMISSION_DENIED`",
+      "when": "a source was refused and no source was read; accumulated constrained tokens may follow, comma-joined"
+    },
+    {
+      "completeness": "unknown",
+      "provenance": "`windows:planned` / `macos:planned`",
+      "status": "`UNAVAILABLE`",
+      "when": "Windows or macOS: one `status|list|unsupported|<os>:planned` row (caveat 3)"
+    },
+    {
+      "completeness": "unknown",
+      "provenance": "`windows:leg:exception` / `linux:leg:exception` / `macos:leg:exception`",
+      "status": "`UNAVAILABLE`",
+      "when": "a leg threw: an `unsupported` status row, reported instead of unwinding across the plugin boundary"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 9,
+          "rows": [
+            "status|list|supported|-",
+            "source|exports|read|2",
+            "source|exports_d|read|1",
+            "source|smb_conf|read|2",
+            "share|nfs|-|/srv/nfs/public|ro|true|clients_1|exports"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-10-12",
+        "host_class": "container",
+        "leg_hash": "9e669e86fe0e",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "list",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_shares.hpp"
+    ],
+    "changelog": [
+      "changelog.d/2026-10-12-shares.added.md"
+    ],
+    "definitions": [
+      "content/definitions/shares.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/shares/src/shares_legs.hpp",
+      "agents/plugins/shares/src/shares_linux.cpp",
+      "agents/plugins/shares/src/shares_macos.cpp",
+      "agents/plugins/shares/src/shares_parsers.hpp",
+      "agents/plugins/shares/src/shares_plugin.cpp",
+      "agents/plugins/shares/src/shares_posix_fs.hpp",
+      "agents/plugins/shares/src/shares_win.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/test_shares_definition.py",
+      "tests/unit/test_shares_legs.cpp",
+      "tests/unit/test_shares_local_dispatcher.cpp",
+      "tests/unit/test_shares_parsers.cpp",
+      "tests/unit/test_shares_posix_fs.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `list` is also a gathered definition (`crossplatform.network.shares`, 3600s TTL).",
+    "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
+    "**Default on, and how to turn it off.** The plugin is on by default; disable it with the generic per-plugin kill switch (`PUT /api/v1/plugin-config/shares/kill-switch`) or by omitting it from `--plugin-allowlist`.",
+    "**Sensitivity.** Share names and paths can embed account names: Samba `[homes]` and per-user shares. Treat the result as sensitive; dispatch is gated at `Infrastructure:Read` and the stored result is readable by `Response:Read` holders, as for every plugin. No ACLs, `valid users` lists or NFS client host lists are read into a row; NFS clients are a count and an anonymous flag.",
+    "**Siblings:** `tar` `mapdrive` (the mapped drives and sessions this host makes and receives, not the exports it offers) and `network_config`."
+  ]
+}

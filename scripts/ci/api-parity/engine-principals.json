@@ -6,5 +6,21 @@
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/principals/list",
+    "capability_id": "get.fragments-access-principals-list",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/principals/detail",
+    "capability_id": "get.fragments-access-principals-detail",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
   }
 ]

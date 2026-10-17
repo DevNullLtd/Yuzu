@@ -39,7 +39,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the platform default: `/etc/yuzu/yuzu-server.cfg` on Linux (and on macOS as root), `~/Library/Application Support/Yuzu/yuzu-server.cfg` on macOS as a non-root user, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows. |
 | `--data-dir` | *(config dir)* | Directory for runtime state files (auto-approve rules) and the NVD CVE cache `nvd_cves.db`, the one remaining server SQLite store, plus the `agent-updates/` (unless `--update-dir` is set) and `upload-blobs/` file directories. All other server data is in PostgreSQL — enrollment tokens and pending agents are PostgreSQL-authoritative (WS-6 6.2), not `--data-dir` files; see the blockquote below. Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but state files need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
 | `--postgres-dsn-file` | *(none)* | Read the PostgreSQL connection string from this file instead of `--postgres-dsn`, which puts it, password included, on the command line where every local user can read it. The whole file is the connection string; trailing whitespace (including the final newline) and a UTF-8 byte-order mark are ignored. Fails at startup if the file is missing, empty or larger than 64 KiB, and cannot be combined with `--postgres-dsn` / `YUZU_POSTGRES_DSN`. The file's own permissions are not checked (a Docker or Kubernetes secret is mounted world-readable inside its container): keep it where only the server's account can read it. The Windows installer stores it in the locked `%ProgramData%\Yuzu Server\postgres.dsn` and passes this flag. Env: `YUZU_POSTGRES_DSN_FILE`. |
-| `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
+| `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. When HTTPS is on this port is the HTTP→HTTPS redirect listener, which still answers `GET`/`HEAD` on the four health-probe paths directly (see [Probing a TLS-enabled server](#probing-a-tls-enabled-server)). |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
 | `--shutdown-drain-seconds` | `0` | On `SIGTERM`, keep serving for at least this many seconds after `/readyz` turns `503 draining`, so a load balancer stops routing here before the listener closes (HA WS-8). Range 0–60; `0` keeps the listener-closes-at-once behaviour a single server has always had. Set it to at least the load balancer's health-check interval × unhealthy threshold, plus one interval — see "Load balancers and shutdown drain" below. Env: `YUZU_SHUTDOWN_DRAIN_SECONDS`. |
 | `--no-https` | off | Disable HTTPS (insecure, for development only). HTTPS is **enabled by default**; provide `--https-cert` and `--https-key`, or pass `--no-https` to disable. Env: `YUZU_NO_HTTPS`. |
@@ -64,7 +64,9 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--https-port` | `8443` | HTTPS listen port. |
 | `--https-cert` | *(auto)* | Path to PEM-encoded TLS certificate for the dashboard. **A per-install default cert is auto-generated when omitted** (unless `--no-default-certs`); `--no-https` disables HTTPS entirely. |
 | `--https-key` | *(auto)* | Path to PEM-encoded TLS private key. Auto-generated default used when omitted (unless `--no-default-certs`). The file must not be world-readable (Unix: `chmod 600`). |
-| `--no-https-redirect` | off | When HTTPS is enabled, do not redirect HTTP requests to HTTPS. By default, HTTP requests are redirected. |
+| `--no-https-redirect` | off | When HTTPS is enabled, do not start the HTTP listener at all (no redirect, and no plain-HTTP health probes). By default, HTTP requests are redirected, except `GET`/`HEAD` on `/livez`, `/readyz`, `/health` and `/api/health`, which are served directly. |
+| `--healthcheck` | off | Probe this server's own health endpoint and exit `0` (HTTP 200) or non-zero, without starting the server. Uses the same listener flags and environment as the server (`--no-https`, `--https-port`, `--web-port`, `--web-address`, `--https-cert`, `--ca-dir`). Has no environment variable and never reads `yuzu-server.cfg`. See [Probing a TLS-enabled server](#probing-a-tls-enabled-server). |
+| `--healthcheck-path` | `/readyz` | With `--healthcheck`: the path to probe, `/readyz` or `/livez`. |
 | `--no-cert-reload` | off | Disable automatic certificate hot-reload. By default, the server polls cert/key files and hot-swaps the SSL context when they change. Env: `YUZU_NO_CERT_RELOAD`. |
 | `--cert-reload-interval` | `60` | Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
 | `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. **Warning:** enabling this exposes fleet composition data (OS, architecture, version counts) — and, when the cohort metrics export is enabled, **operator tag values** as `cohort` labels — to any network client. See [Metrics Security](metrics.md#security-considerations). Env: `YUZU_METRICS_NO_AUTH`. |
@@ -169,6 +171,51 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 
 ---
 
+## Settings: Integrations page
+
+**Settings → Integrations** (`/settings/integrations`, admin only; the MCP and Gateway panels also
+stay on the `/settings` page). Every panel reads through admin-only fragments that are also gated
+by the securable of the matching JSON route (Infrastructure Read for webhooks and offload
+targets, Directory Read for directory sync), so a fragment is never wider than its JSON twin.
+
+- **MCP server** enables or disables the endpoint and sets Read-only or Full access, with one
+  Save. The confirmation names the state being saved (MCP off, on in read-only mode, or on with
+  write and execute tools). A change lasts until the server restarts, then the start-up flags
+  (`--mcp-disable`, `--mcp-read-only`) apply again; a server started with `--mcp-disable` does not
+  serve MCP until it is restarted without it.
+- **Gateway** shows the upstream-service state, the listen address, the gateway mode and the
+  number of agents connected through the gateway, the flag guidance for a server where the
+  upstream service is not running, and the gateway environment-variable reference.
+- **Webhooks** lists the configured webhooks (destination host, events, last delivery) and opens
+  a delivery history. You can create and delete a webhook; the create confirmation names the
+  destination host and the data the chosen events carry. A destination with embedded
+  `user:password@`, or with control characters in the URL or event types, is refused. The
+  signing secret is write-only. There is no restriction on the destination address, and the
+  confirmation is a click-through, not an approval step.
+- **Offload targets** lists the targets (destination host, events, batch size, last delivery),
+  opens a delivery history, and creates and deletes targets under the same rules. The credential
+  is write-only. The create audit row records the name, the destination's scheme and host and a fingerprint
+  of the URL, never its path or query (see [Audit Log](audit-log.md)).
+- **Directory sync** shows the Microsoft Entra sync state (never synced, running, completed or
+  failed are separate states, and a failed read says so rather than showing an empty panel), the
+  synced user and group counts, and a form that runs a sync. The tenant, client and secret are used
+  for that one request and never stored. "Show directory users" loads the list on request, audited
+  as `directory.users.view`; it is withheld if the audit row cannot be written and shows the first
+  200 users. Group-to-role mappings are recorded for reference; nothing reads them at sign-in.
+
+**Upgrade note.** `POST /api/settings/mcp` now requires exactly one `enabled` and exactly one
+`read_only` field, each the literal `true` or `false`, and answers `400` otherwise. Scripts that
+omitted a field or sent another value must be updated. Creating a webhook or offload target with
+`user:password@` in the URL, or with a control character in the URL or event types, now answers
+`400` (existing rows are not changed). Webhook and offload-target audit rows now record the
+destination's scheme and host plus a short fingerprint, never the URL path or query; rows written by
+earlier builds still hold the full URL and should be treated like a credential. These writes (and
+directory sync, the group-mapping save and `POST /api/settings/mcp`) write an `attempted` audit row
+first and refuse with `503` if it cannot be stored, and refuse a cross-site browser request with
+`403`.
+
+---
+
 ## Configuration Files
 
 The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg` on Linux, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) and its runtime state files live on disk; the state files are written to `--data-dir` (default: the directory containing the config file). Apart from those files, the NVD cache and the `agent-updates/`/`upload-blobs/` file directories, everything — users, sessions, MFA/TOTP, SCIM and every other server store — lives in PostgreSQL (see [PostgreSQL Substrate](#postgresql-substrate)). There is no `auth.db`; legacy `*.db` files left in `--data-dir` by older releases are only probed at startup to warn, never read.
@@ -233,7 +280,54 @@ separately.
 
 ---
 
+## Settings: General page
+
+**Settings → General** (`/settings/general`, admin only; every panel it shows also stays on the
+`/settings` page).
+
+- **Appearance** holds the colour scheme and the table-density preference. The scheme is one of
+  six: Slate (the default), Navy and Jade are dark; Light, Light Baby Pink and Light Hot Pink are
+  light. It applies to every page and repaints as soon as you pick it. Density (Comfortable or
+  Compact) applies to the Console results table. Both are saved in this browser only.
+- **Server** holds the two runtime settings that change on a running server, written through
+  `PUT /api/config/{key}`: the **agent heartbeat timeout** (`heartbeat_timeout`; seconds of silence
+  after which this server drops an agent connected directly to it) and the **log level**
+  (`log_level`). Both apply to this server process only, are stored, and are re-applied at restart;
+  the log level then wins over `--log-level`. Neither is the dashboard sign-in expiry: that is the
+  read-only **Console idle timeout** (`--session-inactivity-secs`) and **Console session
+  lifetime** (fixed, 8 hours) rows in the server-configuration table below the form. The heartbeat
+  timeout must be 30 seconds or more (a lower value stored by an earlier build is raised to 30 at
+  start, with a log line); keep it well above the agents' own heartbeat interval, since 30 leaves no
+  margin for a late heartbeat. Runtime changes are audited first: if the `attempted` audit
+  row cannot be written the change is refused and the page shows the error; if only the outcome row
+  is lost the change stays applied and the page shows a banner.
+- **Analytics** shows the event-collection status and the most recent buffered events (type,
+  source, severity, time; no host or user).
+
+---
+
 ## Upgrade Notes
+
+### vNEXT - Integrations writes need a same-site Origin on a cookie session, write an `attempted` audit row first, and store no destination URL (breaking for cookie-reusing scripts)
+
+`POST`/`DELETE /api/webhooks`, `POST`/`DELETE /api/v1/offload-targets`, `POST /api/directory/sync`, `PUT /api/directory/group-mappings` and `POST /api/settings/mcp` now answer `403` to a request authenticated by a **session cookie** that carries no `Origin`/`Referer`, or one naming another site. A script that reuses a login cookie jar (`curl -b`) must switch to an API token (token callers are not gated) or send a same-site `Origin`; behind a proxy that rewrites `Host`, declare the external origin with `--csrf-trusted-origin` as described above. Each of these writes also records a `result=attempted` audit row before it changes anything and answers `503` with `Sec-Audit-Failed: true` when that row cannot be stored; during an audit-store outage they are unavailable, deleting a webhook or offload target included (the MCP switches can still be turned off with `--mcp-disable` and a restart; check `/healthz` `stores.audit` and the `YuzuAuditPersistFailures` alert). SIEM rules that filter `result != success` will now also see the `attempted` rows. Webhook and offload audit rows record `url=<scheme>://<host>[:<port>] url_fp=<12 hex>` instead of the full URL, and their log lines name the host (and the webhook or target id where one exists), never the URL; rows written by earlier builds keep the full URL, so rotate any hook URL that appears in one.
+
+### vNEXT - `POST /api/settings/mcp` now refuses a body that omits or repeats `enabled` or `read_only` (breaking for scripted callers)
+
+The dashboard route behind the MCP settings form used to read the first `enabled` and `read_only`
+value it found and treat an absent one as `false`: a request carrying only `enabled=true` switched
+Read-only MCP to Full access, and an empty request switched MCP off. It now requires exactly one
+`enabled` and exactly one `read_only`, each `true` or `false`, and answers `400` with nothing
+changed otherwise. The rebuilt panel always sends both. A script that posted a single field must
+send both.
+
+### vNEXT - changing an account's role or granting elevation eligibility needs your own administrator role (breaking for elevation-only operators)
+
+**What changed.** `POST /api/settings/users/{username}/role` and the grant form (`eligible=true`) of `POST /api/v1/users/{username}/elevation-eligibility` refuse, with `403`, a session that is administrator only through a temporary elevation. The attempt is audited (`elevated_session_role_change_blocked`, `elevated_session_eligibility_grant_blocked`).
+
+**Who this affects.** Operators who rely on an elevated session to change roles or grant eligibility, in particular deployments where every administrator is an elevation-eligible `user` account.
+
+**What to do.** Make the change from an account whose own role is `admin` (a local administrator, or a member of the identity provider's administrator group). Revoking eligibility is still allowed during an elevation.
 
 ### vNEXT - `--gateway-upstream` refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs)
 
@@ -245,6 +339,14 @@ The gateway-upstream service now admits only a gateway whose certificate key (SP
 - **Windows installer:** `/GATEWAY` with your own gRPC certificates needs `/GATEWAY_PEER_PIN_FILE=<cert.pem>` (preferred) or `/GATEWAY_PEER_PIN=<64 hex>` the first time, and `/GATEWAY /NOTLS` together with either is refused.
 
 Check your own unit, env file, compose file or installer arguments before upgrading; the literal commands, the per-deployment table and the rollback steps are in [Upgrading](upgrading.md) ("Breaking: `--gateway-upstream` now refuses to start without gateway peer authorization"), and the full reference is [Gateway upstream peer authorization](#gateway-upstream-peer-authorization) below. Pins are fixed at boot; changing or withdrawing one is a restart.
+
+### vNEXT - changing sign-in provider settings needs your own administrator role (breaking for elevation-only operators)
+
+**What changed.** `POST /api/settings/oidc` (Settings > OIDC) and `PUT /api/config/{key}` for the `oidc_*` keys refuse, with `403`, any session whose own role is not `admin`: a session that is administrator only through a temporary elevation, and (for the config route) a non-administrator account that holds `Infrastructure:Write` through a custom or service role, or whose authority is an RBAC Administrator grant only, and any MCP-tier token. The attempt is audited (`elevated_session_oidc_change_blocked`, `elevated_session_oidc_setting_blocked`). Other runtime-config keys are unaffected.
+
+**Who this affects.** Operators who rely on an elevated session to change the OIDC issuer, client, secret, redirect URI or administrator group, in particular deployments where every administrator is an elevation-eligible `user` account; and automation that writes `oidc_*` through `PUT /api/config/{key}` with a token whose creator is not an `admin` account.
+
+**What to do.** Make the change from an account whose own role is `admin` (a local administrator, or a member of the identity provider's administrator group). If no such account can sign in, use the break-glass account (`--break-glass-user`, `--break-glass-arm`) or the direct-SQL fallback in [`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md). A stored `oidc_*` value overrides the matching `--oidc-*` flag after a restart, so correct the stored value rather than only the flag.
 
 ### vNEXT — the shipped Docker Compose files keep `/etc/yuzu/certs` on a volume (#5370; action needed before you recreate a 0.14.0 container)
 
@@ -1238,6 +1340,39 @@ via a fire-and-forget path that cannot detect a dropped audit row — see
 three-way posture (REST v1 fail-closed / MCP set-and-proceed-with-signal /
 legacy silent).
 
+### vNEXT — the audit trail is admin-only while RBAC is disabled (#5771) (breaking)
+
+**Who this affects.** Deployments with RBAC enforcement off (the
+shipped default; see `GET /api/v1/rbac/enforcement`) where a non-admin, authenticated session or API token reads
+the audit trail — a SIEM export, an evidence-collection script or a
+dashboard user signed in as a plain `user`. RBAC-**enabled** deployments are
+unaffected.
+
+**What changes.** `AuditLog:Read` joins the authorization topology floor (see
+the #2376 note above). With RBAC disabled, every audit read surface now
+requires the `admin` session role: `GET /api/audit`, `GET /api/v1/audit`,
+`GET /api/v1/audit/auth-sample`,
+`GET /api/v1/engine-principals/audit/no-admin`, the MCP `query_audit_log` and
+`audit_engine_no_admin` tools, and the `yuzu://audit/recent` resource. A
+non-admin gets `403`, audited with a `detail` beginning `topology floor: non-admin role denied
+AuditLog:Read` (match on the prefix: an MCP-tier token's row appends
+`(mcp_tier=<tier>)`) and counted in
+`yuzu_auth_topology_floor_denied_total{permission="AuditLog:Read"}`. Why: the
+trail is the SOC 2 CC6.1/CC7.2 evidence chain, and the legacy route also
+returns each actor's role and source IP.
+
+**What does not change.** An `admin`-role session, and an MCP token minted by
+one, still read the trail. Under RBAC-**enabled** enforcement a role holding
+`AuditLog:Read` (the seeded `Administrator`, `PlatformEngineer`, `Operator`,
+`ITServiceOwner` and `Viewer`, or any custom role granted it) is admitted
+exactly as before. Engine principals and service-scoped tokens were already
+refused with RBAC off.
+
+**What to do.** If a non-admin identity needs the trail, either enable RBAC
+and assign it a role that holds `AuditLog:Read`, or run the automation as an
+admin-owned token. See [`rbac.md`](rbac.md) "The authorization topology
+floor".
+
 ### vNEXT — approval tickets outstanding at the upgrade must be re-requested (#2442) (breaking)
 
 **Who this affects.** Any deployment holding an **MCP** approval that was granted but not yet
@@ -1385,7 +1520,7 @@ need no change.
 **The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
 — CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
 gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
-Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`). The dashboard renders fine and reads work; only the destructive actions
+Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), the General page's runtime Save (`PUT /api/config/{key}`, `403 cross-site request refused`), the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only), and the Integrations page's webhook, offload-target, directory-sync, group-mapping and MCP-settings saves (`403 cross-site request refused`). The dashboard renders fine and reads work; only the destructive actions
 fail.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
@@ -1467,7 +1602,7 @@ bar, the 403s will continue. It is the fastest diagnosis for a mistyped entry.
 
 **What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as
 before, so an unproxied deployment sees no difference. Non-browser clients sending neither
-`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, and the two
+`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, except on the routes that gate a cookie session with `browser_write_is_cross_site` (the bell, instruction and dashboard-dispatch writes, and the Integrations writes: webhooks, offload targets, directory sync, group mappings, MCP settings), which refuse a header-less cookie request; and the two
 CA endpoints still treat both-headers-absent as cross-site. Leaving the flag unset is safe: it
 means same-host only, which is the previous behaviour.
 
@@ -2793,7 +2928,7 @@ unaffected and needs no change.
 
 The Settings page is the primary administrative interface. It is accessible only to users with the **admin** role and is rendered server-side using HTMX.
 
-**URL:** `/settings` (redirects to `/login` if unauthenticated or non-admin)
+**URL:** `/settings` (redirects to the sign-in page, `/home`, if unauthenticated; a signed-in non-admin is sent to `/`)
 
 The Settings page is organized into sections, each loaded as an HTMX fragment. Changes take effect immediately without a server restart unless otherwise noted.
 
@@ -2802,7 +2937,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Section | Fragment Route | Description |
 |---|---|---|
 | TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
-| User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. |
+| User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. The accounts are also listed, read-only, on the **Users** page (`/access/users`) in the Access section of the sidebar. |
 | Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
 | Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
@@ -2812,7 +2947,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. The upload form also takes an optional detached CMS **Signature** (`.sig`, max 64 KB), stored as a sidecar beside the binary and served to agents on `CheckForUpdate` — see *Signing update binaries*. The server stores but never verifies it. |
 | Tag Compliance | *(moved)* | Now the **Compliance by tag** panel on the Compliance page; see [Tag Compliance](#tag-compliance). |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
-| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart reverts to the command-line/environment value, so a durable rotation must update that too; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
+| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart rebuilds the provider from the command-line/environment value, so a durable rotation must update that too; the stored admin group is the exception and still applies; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
 | Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). A view over the same `AuditLog:Read`/`AuditLog:Attest`-gated `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. See `docs/auth-architecture.md` "Periodic access reviews". |
 
@@ -2978,7 +3113,7 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 1. Navigate to **Settings > TLS Configuration**.
 2. Toggle **Enable HTTPS**.
 3. Upload PEM-encoded certificate and private key files using the **Upload PEM** button, or paste PEM content directly using the **Paste PEM** button.
-4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS.
+4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS, except GET/HEAD on the four health-probe paths (see Probing a TLS-enabled server).
 
 ### Certificate Requirements
 
@@ -2986,6 +3121,7 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 - The certificate file may contain the full chain (leaf + intermediates).
 - The private key must not be password-protected.
 - On Unix, the private key file must not be readable by group or others. The server will refuse to start if permissions are too open. Fix with: `chmod 600 /path/to/key.pem`.
+- A key uploaded or pasted in Settings is created owner-only (0600) and replaced atomically by rename. Mount the certificate directory, not the single `server-key.pem` file, into a container: a single-file bind mount cannot be replaced and the upload fails with an error in the server log.
 - For production, use certificates signed by a trusted CA. Self-signed certificates work but require agents to trust the CA.
 
 ### Certificate Hot-Reload
@@ -3259,6 +3395,7 @@ The server emits an audit event on every branch:
 | Role changed | `success` | `old_role=user,new_role=admin` (or vice versa) |
 | Same role requested | `no_op` | `same_role=admin` (or `user`) |
 | Self-target rejected | `denied` | `self_role_change_blocked` |
+| Caller is an administrator only through a temporary elevation | `denied` | `elevated_session_role_change_blocked` (HTTP 403) |
 | Invalid username | `denied` | `invalid_username` |
 | Invalid JSON body | `denied` | `invalid_json` |
 | Missing `role` field | `denied` | `missing_role` |
@@ -3268,6 +3405,10 @@ The server emits an audit event on every branch:
 | Account deactivated between the route's lookup and the write, `admin` requested | `denied` | `inactive_promotion_refused` (HTTP 409; an account already inactive when the request arrives is `user_not_found`, HTTP 404) |
 | Role store unavailable, or the guard is not wired | `failure` | `store_failure` (HTTP 503, no retry hint: the change may or may not have been applied, so check the user's role and revoke the user's sessions) |
 | Role changed but session cleanup failed | `partial` | `role_changed session_wipe_failed=true old_role=<r> new_role=<r>` (HTTP 503, no retry hint: revoke the user's sessions) |
+
+> **Changing a role needs your own administrator role.** A session that is
+> administrator only through a temporary elevation (`POST /api/v1/elevate`) is
+> refused with HTTP 403: an account role is a standing grant, an elevation is not.
 
 > **You cannot change your own role.** The endpoint rejects self-target
 > with HTTP 403, audited as `denied:self_role_change_blocked`. The same
@@ -3444,7 +3585,7 @@ identity by clicking the **Sign out everywhere** button on their own
 row in Settings → Users. Unlike the admin **Revoke sessions** button,
 this revokes BOTH cookie sessions AND every API token the user owns
 (the lost-laptop scenario must kill every credential, not just
-browser cookies). After the request the page redirects to `/login`
+browser cookies). After the request the page redirects to `/home`
 and the response clears the session cookie via `Set-Cookie: Max-Age=0`.
 
 > **MCP-tier and service-scoped tokens cannot self-revoke.** Those
@@ -3481,6 +3622,7 @@ For automated or bulk deployment. Agents present a token at startup for instant 
 3. Configure token properties:
    - **Expiry** -- time limit (e.g., 24 hours, 7 days).
    - **Max uses** -- how many agents can use this token (1 for single-device, unlimited for bulk).
+     Leave the field empty or enter `0` for unlimited. Any other value must be one whole number: a typo such as `0x5` or `5abc` is refused with `400` and no token is minted (it used to be read as `0`, which means unlimited). The same rule applies to the token lifetime (`ttl_hours`, empty or `0` for no expiry); a negative `ttl_hours` is refused with `400` too, because it used to compute to "never expires".
 4. Copy the generated token string.
 
 **Agent side:**
@@ -3663,7 +3805,7 @@ editing the unit:
 | Platform | How |
 |---|---|
 | Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
-| macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
+| macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. Package upgrades keep every `YUZU_*` variable there, except `YUZU_PLUGIN_DIR` and `YUZU_DATA_DIR`, which the package sets. |
 | Windows | Set them in the service's own environment, a `REG_MULTI_SZ` value named `Environment` under the service's registry key, then restart the service. **Not in its binary path:** every installer run rewrites that path and drops them, and signing is then silently off (#5196). See *Windows: the service's `Environment` value* below for the commands and the cases that remove the value. |
 
 Every flag below has the environment variable shown beside it:
@@ -4165,10 +4307,10 @@ the `openssl` keypair-generation and IdP-registration recipe.
 ### Known limitations in this release
 
 - **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
-- **`--auth-mode=sso-only`:** Requires an SSO provider — OIDC, or (Linux/macOS, HTTPS enabled) a complete SAML SP config. A SAML-only deployment **can** disable local-password login. Note: SAML sessions cannot use JIT elevation (grant admin via `--saml-admin-group` instead), and there is no login-page SAML button — SAML operators go to `/auth/saml/start`.
+- **`--auth-mode=sso-only`:** Requires an SSO provider — OIDC, or (Linux/macOS, HTTPS enabled) a complete SAML SP config. A SAML-only deployment **can** disable local-password login. Note: SAML sessions cannot use JIT elevation (grant admin via `--saml-admin-group` instead), and the sign-in page (`/home`) offers a SAML button only when no OIDC provider is enabled — SAML operators otherwise go to `/auth/saml/start`.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
 - **IdP cert rotation:** Update `--saml-idp-cert` and restart the server. There is no hot-reload.
-- **No login-page button:** Navigate directly to `GET /auth/saml/start`; there is no "Sign in with SAML" button on the login page.
+- **Login-page button:** The sign-in page (`/home`) shows "Sign in with single sign-on" for SAML when SAML is enabled and no OIDC provider is; with both enabled the button starts OIDC and SAML operators navigate to `GET /auth/saml/start`.
 
 See `docs/user-manual/authentication.md` "SAML 2.0 SSO" for the full login flow, capability table, and `docs/auth-architecture.md` "SAML 2.0 SP" for the implementation reference.
 
@@ -4255,7 +4397,7 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 — backup tooling, Grafana's data source, ad-hoc `psql`. Sized this way the servers cannot exhaust the database by themselves; only other clients can. To keep *them* out of the servers' share, the shipped `yuzu-postgres` images (single-node and the HA Patroni profile) set **`reserved_connections`** (PostgreSQL 16+; default **40**, env `YUZU_PG_RESERVED_CONNECTIONS`, `0` disables) and **grant `pg_use_reserved_connections` to the app role** at first boot. Once the free slots fall to `superuser_reserved_connections + reserved_connections`, only the app role (and superusers) can still connect — so a backup job or a stray session can never take the slot the `/readyz` probe needs to reconnect, which would otherwise turn a replica red on a database that still serves (the probe holds its connection in steady state and reconnects only after a failure; at the limit that reconnect was the connection refused first). The reserve covers the pool and the probe alike — the probe connects exactly as a pool connection does, so it is never green while the pool is refused. Set `YUZU_PG_RESERVED_CONNECTIONS` to `N_servers × (pool_size + 2)` (the default fits two servers at the default pool, e.g. 2 × (16 + 2) = 36 ≤ 40). **Never set it to `max_connections` minus `superuser_reserved_connections` or higher** — both scripts refuse to boot on that value (the boot-time check reads the live `max_connections`; the Patroni entrypoint checks against its own literal 200), because it would leave zero connection slots any ordinary (non-privileged) client could ever use, not merely under load. **On the single-node image this refusal happens AFTER the role/database/grant already exist** on the now-initialized data directory (Postgres's initdb-only-runs-once convention means those steps ran before this check) — restarting the SAME container with a corrected value does **not** retroactively apply anything; either start over on a fresh (wiped) data volume, or apply the fix by hand per "Existing databases" just below. The Patroni entrypoint's check runs before ANY of that (at bootstrap, before the cluster exists), so a Patroni refusal is a clean, no-op-safe retry. **This check runs once, at bootstrap.** A later `patronictl edit-config --set postgresql.parameters.max_connections=...` on an already-running Patroni cluster is not re-validated against the `reserved_connections` value already in force — re-check the arithmetic by hand after any live `max_connections` change (tracked for a real runtime check: #4943 fast-follow). **Existing databases:** first-boot init does not re-run; apply it by hand — `ALTER SYSTEM SET reserved_connections = 40;` (restart required; under Patroni, `patronictl edit-config --set postgresql.parameters.reserved_connections=40` then `patronictl restart <scope>` — `edit-config` alone only writes the DCS config and marks the member pending-restart, it does not apply a postmaster-context GUC like this one; the GRANT below is unchanged either way) and `GRANT pg_use_reserved_connections TO yuzu;`. Verify with `SHOW reserved_connections` and `SELECT pg_has_role('yuzu', 'pg_use_reserved_connections', 'MEMBER')`. On PostgreSQL 15 or older the grant is skipped with a notice and only the formula protects you. **Re-run this same verification** after anything that can silently undo it: a first boot interrupted between the `GRANT` and the `ALTER SYSTEM` (the init script never re-runs once the data directory exists, so a kill in that narrow window leaves the grant in place but the GUC at Postgres's own default of 0 — inert, not incorrect, but not protecting anything either), or any role recreation, credential rotation, or disaster-recovery restore that can drop and re-add the app role without this script running again.
 
-**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. `Register` also draws a short-lived lease per call, and a mass-reconnect event (a fleet-wide server restart, or a network partition healing across many agents at once) can spike concurrent `Register` calls well above the steady-state heartbeat rate — size with that burst in mind, not just steady-state. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing`, `YuzuServerPostgresUnreachable` in `docs/prometheus/yuzu-alerts.yml`). Pool saturation never affects `/readyz` — a busy but healthy server must stay in rotation — while an unreachable database turns `/readyz` red within seconds, well before those alerts' `for:` windows page. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
+**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. `Register` also draws a short-lived lease per call, and a mass-reconnect event (a fleet-wide server restart, or a network partition healing across many agents at once) can spike concurrent `Register` calls well above the steady-state heartbeat rate — size with that burst in mind, not just steady-state. A Software-page **Sync now** run can do the same on purpose: up to 500 agents (the per-request cap) re-send their inventory at nearly the same moment, a transient ingest burst on the pool. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing`, `YuzuServerPostgresUnreachable` in `docs/prometheus/yuzu-alerts.yml`). Pool saturation never affects `/readyz` — a busy but healthy server must stay in rotation — while an unreachable database turns `/readyz` red within seconds, well before those alerts' `for:` windows page. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 
 **Saturation fast-fail (not operator-configurable).** When the pool is already saturated at the moment of acquire (no idle connection, no spare capacity to open one), every bounded acquire across every Postgres-backed store now gives up after a short, fixed ceiling (~500 ms) instead of running to the caller's own, often much longer, timeout, freeing the calling worker thread for other routes rather than pinning it on a connection unlikely to free up in time. This substantially reduces, but does not eliminate, the risk of a saturated pool cascading into broader worker-thread exhaustion (including on unrelated routes such as auth) under sustained load; the underlying pool-to-worker sizing ratio is unchanged, so a large enough sustained saturation event can still exhaust worker capacity, just at a materially higher load threshold than before this mitigation. This ceiling is a compiled-in default, not exposed via a CLI flag or environment variable; if it proves wrong for your deployment's connection-hold-time distribution, that is a code change, not a config change. The metrics and alert rules named above (particularly `yuzu_pg_acquire_wait_seconds` and `YuzuPgAcquireWaitHigh`) remain the right signals to watch; a rising rate of fast-failed acquires under this ceiling is visible via the same `yuzu_pg_acquire_timeout_total` counter as a genuine full-timeout exhaustion (the counter does not currently distinguish the two).
 
@@ -4918,7 +5060,7 @@ re-checks. Configuration is via CLI flags at startup (each has an env-var equiva
 | CLI Flag | Env | Default | Description |
 |---|---|---|---|
 | `--nvd-api-key` | `YUZU_NVD_API_KEY` | *(none)* | NVD API key. Raises the NVD rate limit substantially — the difference between the initial backfill taking minutes versus hours. |
-| `--nvd-proxy` | `YUZU_NVD_PROXY` | *(none)* | HTTP proxy URL for egress to `services.nvd.nist.gov`, for deployments with restricted outbound network access. |
+| `--nvd-proxy` | `YUZU_NVD_PROXY` | *(none)* | HTTP proxy for egress to `services.nvd.nist.gov`, for deployments with restricted outbound network access. Accepted forms: `host:port`, `http://host:port`, `https://host:port` (the scheme is case-insensitive and only the host and port are used: the proxy is always contacted over plain HTTP; a port outside 1 to 65535, or not a plain number, falls back to 8080). `user:password@` in the URL is ignored: the client does not authenticate to the proxy, so a proxy that requires authentication answers `407` and the sync fails. A value with no usable host (a scheme other than `http`/`https` such as `socks5://`, an empty host, or a `?` or `#` ahead of the credentials) is **refused**: the server logs an error at startup and every NVD fetch fails as a connection failure, shown in `GET /api/nvd/status` as `last_error` and counted in `yuzu_nvd_sync_failures_total{reason="connection"}`. It never falls back to a direct connection. Prefer `YUZU_NVD_PROXY` over the flag, since a flag value is visible in the process list. |
 | `--nvd-sync-interval` | `YUZU_NVD_SYNC_INTERVAL` | `4` | Freshness re-check cadence, in hours, once the backfill has completed. |
 | `--nvd-backfill-years` | `YUZU_NVD_BACKFILL_YEARS` | `8` | How far back (in years) the newest-first backfill walks. `0` = full history. The floor is clamped to NVD's catalog start (1999-01-01) and to a 200-year effective maximum, so no value reaches before the catalog begins. |
 | `--no-nvd-sync` | `YUZU_NO_NVD_SYNC` | off | Disable NVD sync entirely. |
@@ -4949,7 +5091,7 @@ the audit log. Each stamps `ttl_expires_at` once, at INSERT, from the retention
 setting in force at the time (`AuditStore::log`, `ResponseStore::store`,
 `GuaranteedStateStore::compute_ttl_epoch`), and nothing ever rewrites it, so
 existing rows always age out on their original TTLs. Only rows written after the
-change (and, per the #483 note below, after a restart) get the shorter window.
+change get the shorter window.
 
 What is specific to the audit log is *how* the expired rows then leave: see the
 note below.
@@ -4965,7 +5107,7 @@ note below.
 > single declined pass more likely right after the change. It is self-healing --
 > see [The retention clock guard](audit-log.md#the-retention-clock-guard).
 
-> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`) and can be updated at runtime via `PUT /api/config/<key>` with an `Infrastructure:Write` permission. Runtime updates are persisted via `RuntimeConfigStore` and reflected immediately in the `/api/config` GET response — **but the running store captures its retention value at construction time and does not re-read it, so TTL computation on new inserts continues to use the startup value until the next server restart.** This "takes effect on restart" limitation is shared across all three retention keys and is tracked as issue #483.
+> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`). `PUT /api/config/<key>` (with `Infrastructure:Write`) persists a value via `RuntimeConfigStore` and `/api/config` then reports it — **but each running store copied its retention value at construction and does not re-read it, so a stored value is not the window being enforced.** Change a window with the startup option or environment variable and restart. This limitation is shared across all three retention keys and is tracked as issue #483. The **Data and retention** page (Settings, System group) shows the enforced value and flags a stored value that is not in force.
 
 ---
 
@@ -5008,7 +5150,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|---|
 | `GET` | `/fragments/settings/tokens` | Render the enrollment tokens fragment (HTMX). |
 | `POST` | `/api/settings/enrollment-tokens` | Generate a new enrollment token. Body: `{ "expiry", "max_uses" }`. |
-| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. |
+| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. Defaults when a field is empty or omitted: `count` 10 (allowed 1 to 10000), `max_uses` 1, `ttl_hours` 0 (no expiry). Each number may be a JSON integer or a numeric string. A malformed, fractional, boolean, `null` or negative number, one outside the 32-bit range, a `count` outside 1 to 10000, or a body that is not one JSON object, is a `400` and nothing is minted. |
 | `DELETE` | `/api/settings/enrollment-tokens/{id}` | Revoke a token by ID. |
 
 ### Pending Agents
@@ -5021,6 +5163,8 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `DELETE` | `/api/settings/pending-agents/{id}` | Remove a pending agent from the queue. `409` if the row is no longer `pending` (already `approved`/`denied`) — removal only succeeds against a genuinely pending row, by design (WS-6 6.2). |
 
 The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin routes) may not contain an ASCII control character or a comma — both are rejected before the row is ever created, closing an audit-log injection path (WS-6 6.2). A UUID, hostname, or MAC-derived id is unaffected.
+
+An agent id seen for the first time must also use only letters, digits, `.`, `_`, `:` and `-`, and must not consist only of dots; otherwise `Register` (and the gateway's `ProxyRegister`) answers `INVALID_ARGUMENT` and no row is created. The check applies only when the enrollment store holds no row for the id: an agent that is already enrolled, pending or denied keeps registering under its existing id. The agent generates a UUID, so only an operator-chosen `--agent-id` / `YUZU_AGENT_ID` is affected. In the pending list, an id that is empty or is `.` or `..` is shown without row actions and the approve, deny and remove routes answer `400` for it; the Approve All / Deny All buttons are shown for such a row (even when it is the only pending one), and they act on every pending agent, so review the queue first.
 
 ### Auto-Approval Policies
 
@@ -5039,6 +5183,19 @@ The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin r
 | `GET` | `/fragments/settings/api-tokens` | Render the API tokens management fragment (HTMX). |
 | `POST` | `/api/settings/api-tokens` | Create a new API bearer token. Body: `{ "name", "role", "scopes" }`. |
 | `DELETE` | `/api/settings/api-tokens/{id}` | Revoke an API token by ID. |
+
+### Tokens and principals page
+
+`/access/tokens` (Access group in the navigation) lists API tokens and engine principals. It is read-only: creating, rotating and revoking stay in Settings. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/access/tokens` | The page. Redirects to `/login` without a session. |
+| `GET` | `/fragments/access/tokens/list` | API token list (HTMX). `?state=active` (default) or `all`. Gated on `ApiToken:Read`. Administrators on a cookie session see every owner; every other caller, including an administrator's API or MCP token, sees their own tokens only, as `GET /api/v1/tokens` does. Capped at 500 rows with a banner. |
+| `GET` | `/fragments/access/principals/list` | Engine principal list (HTMX). Gated on `EnginePrincipal:Read`, as `GET /api/v1/engine-principals`; engine and MCP-tier credentials are refused. Writes an `engine_principal.list` audit row, plus `engine_principal.role.listed` when the Roles column was read. |
+| `GET` | `/fragments/access/principals/detail` | One principal with its active credentials and roles (HTMX). `?id=engine:<slug>`. Same gate. Writes an `engine_principal.get` audit row, plus `engine_principal.role.listed` when the roles were read. A revoked principal's revocation detail needs `AuditLog:Read` and is otherwise shown as withheld (also when the grant could not be confirmed). |
+
+Each panel loads on its own. A refused browser session writes no denied-access audit row for any of them (the panels load automatically, so opening the page must not fill the audit log); a refused API or MCP token that reaches a fragment URL does. The no-administrator check at the top of the principals panel (a call to `/api/v1/engine-principals/audit/no-admin`, which needs `AuditLog:Read`) runs only when the principals fragment reports that the caller holds that permission. The `AuditLog:Read` checks that decide this (and whether a revoked principal's free-text detail is shown) are quiet for browser sessions only: a non-browser caller that holds `EnginePrincipal:Read` but not `AuditLog:Read` writes one ordinary permission-denied row per principals-list load and per revoked-principal detail load. The no-administrator result is a statement about the roles and grants the server could read: a role read that degrades is not distinguishable from "no roles" on that route, so the page words a clean result accordingly. Device tokens are not shown on this page.
 
 ### OTA Updates
 
@@ -5065,8 +5222,8 @@ DEX alerting is configured on the **DEX page, Alerts tab** (it moved out of Sett
 | `GET` | `/fragments/dex/alerts` | The Alerts tab: DEX sub-nav, role note and the configuration form (HTMX). Any signed-in viewer may load it; the form renders for administrators only. Composed of the settings fragment below. |
 | `GET` | `/fragments/settings/dex-alerts` | Render the DEX alerts configuration form body only (HTMX). Admin-only. |
 | `POST` | `/api/settings/dex-alerts/routing` | Update the routed signal types. Body: form-encoded `types=<obs_type>` repeated per checked type; values are allow-listed against the signal catalogue. Persisted to `runtime_config` key `dex_alert_routing` (sorted JSON array). Applied live. Audit: `settings.dex_alerts.routing` (detail records the full routed set). |
-| `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
-| `POST` | `/api/settings/dex-alerts/cohort-export` | Set (or clear) the cohort metrics export tag key. Body: `export_key` (tag-key alphabet `[A-Za-z0-9_.:-]`, max 64; empty disables — the default). When set, the per-cohort `yuzu_fleet_perf_cohort_*` Prometheus gauges are published for that key's cohorts (top 50 by population, 10-device floor, `yuzu_fleet_perf_cohort_clipped` makes capping visible). Persisted to `dex_cohort_export_key`. Applied on the next gauge sweep. Audit: `settings.dex_alerts.cohort_export`. |
+| `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (a malformed value is `400` and nothing is saved; a well-formed integer is clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
+| `POST` | `/api/settings/dex-alerts/cohort-export` | Set (or clear) the cohort metrics export tag key. Body: `export_key` (tag-key alphabet `[A-Za-z0-9_.:-]`, max 64; empty disables — the default). When set, the per-cohort `yuzu_fleet_perf_cohort_*` Prometheus gauges are published for that key's cohorts (top 50 by population, the one-device floor — an empty cohort is withheld —, `yuzu_fleet_perf_cohort_clipped` makes capping visible). Persisted to `dex_cohort_export_key`. Applied on the next gauge sweep. Audit: `settings.dex_alerts.cohort_export`. |
 
 **New `runtime_config` keys.** All are runtime-set via the DEX Alerts tab and applied live (and re-applied at boot):
 
@@ -5087,6 +5244,32 @@ DEX alerting is configured on the **DEX page, Alerts tab** (it moved out of Sett
 | `settings.dex_alerts.cohort_export` | An admin sets or clears the cohort metrics export tag key (detail records the new key, or "export disabled"). |
 | `dex.device.perf.query` | An operator loads a device performance sparkline panel (DEX device drill-down). Execute-gated; detail records the target agent and command id. |
 | `dex.device.procperf.query` | An operator loads a device's per-application panel (usage-class telemetry — deliberately a separate verb from the machine-health `dex.device.perf.query` so usage reads stay separately countable). Execute-gated; detail records the target agent and command id. |
+
+### Home (sign-in landing page)
+
+`GET /home` is the landing and sign-in page: the first page a visitor sees, with no sidebar and no header bar because there may be no session yet. Top to bottom it shows a slim bar (the Yuzu mark; the server's host name and the running version are added only once signed in, because the page is reachable without a session), and a headline with the sign-in panel beside it. Signed out, that is all the page shows. Once signed in, the fifteen screens of the product appear below as tiles in five families (Operate, Posture, Estate, Access, System), each saying what the area does. The page fetches no data. It is reached from the Yuzu logo on every other page; it has no sidebar entry, and `/` stays the Console.
+
+**Signing in.** The panel carries the one sign-in form: username and password, a "Sign in with single sign-on" link when an identity provider (OIDC or SAML) is configured, and a note about two-factor codes when `--mfa-enforcement` is `admin-only` or `required`. The form posts to `POST /login` and, where applicable, `POST /login/mfa` or `POST /login/mfa/enroll`, exactly as before; `GET /login` now redirects to `/home`, so bookmarks and the SSO error bounces keep working. After signing in the user stays on `/home`: the panel is replaced by a signed-in panel showing the display name and role, an "Open Console" button, a "Sign out" button, and the line "You are signed in. Open the Console, or pick an area below." A signed-in user who opens `/home` (or clicks the logo) sees that panel straight away. Sign out returns to the form.
+
+**Opening a screen without a session.** Any page requested without a session is redirected to `/home?next=<key>`, where `<key>` names the requested screen (`devices`, `compliance`, ... one of the fifteen tiles; a sub-page such as `/approvals` counts as its parent, Instructions). The page shows "Sign in to open <area>." above the form and, after sign-in, labels the primary button "Open <area>" instead of "Open Console". `next` is only ever one of those keys: a path, a URL or an unknown value is ignored, so it cannot redirect anywhere, and the server never redirects automatically after sign-in.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/home` | The landing and sign-in page. No session needed: a signed-out visitor gets the sign-in form and headline, with no tiles (with `?next=<screen key>` driving the "Sign in to open <area>." notice), a signed-in one the signed-in panel. Never cached. |
+| `GET` | `/login` | Redirects (`302`) to `/home`, forwarding a validated `next` key and a known `error` code (`sso_denied`, `sso_failed`, `sso_invalid`, `saml`) and nothing else. |
+
+### Dashboard panels
+
+The Dashboard (`/`) carries, under the console, a four-cell readout (devices online, policy checks passing, failed executions in the last 24 hours, approvals waiting), a Needs attention list beside Server health, a Recent events table, and Estate state beside Compliance by policy. Each is an HTMX fragment loaded once per page view; none of them polls (the console's own scope picker still refreshes every 5 seconds, as before). The page header (shared by every page) does poll in the background: the online count and approvals badge every 30 seconds and the notifications bell every 60 seconds while the tab is visible. A figure the account is refused is decided with a non-auditing check (the same decision as the gate, with its `auth.permission_required` and `auth.fleet_read_required` rows withheld), so rendering the Dashboard writes no denial rows; the Recent events panel also checks the administrator role first. That includes a direct request to a panel URL by a refused interactive sign-in, and a store outage met by one on those panels (the `503` and the degrade counter remain); an API, MCP or engine token that reaches a panel URL still leaves its denial row. The bell and the approvals badge keep the auditing gate on their own requests: an account refused either leaves one `auth.permission_required` row per page view, because each stops polling after the first `403`. When the live registry knows more connected agents than the device store counts as live (for example after failed presence writes or during start-up lag), the Estate figures read "at least N" instead of understating the fleet or claiming no devices; if it persists, check the database and the server log for presence-write failures. The devices figure for an unrestricted account comes from one database count that costs seconds on a large fleet, so each server process reuses it for 60 seconds; a reload inside that minute shows the same device numbers, and the "As of" time on the panels is the time of the view, so the online count can be about a minute (plus the registry's 3 second presence cache) older than it. If that count cannot be read, devices show "could not read" (never 0) for the next 5 seconds of views without trying again. The cache is per server process: with several replicas behind a load balancer each reads and caches on its own, so two views can differ by up to a minute, and the database sees one such count per replica per minute while reads succeed (one attempt per replica every 5 seconds while the database cannot answer). When the live registry's online count cannot be read (it is unavailable past about 100,000 presence rows, and on a presence-store error) the online number is the database presence count instead, which leaves out an agent that has connected but not yet been written to the presence store. Accounts limited to a group of devices are never served this cached count.
+
+Every figure is a typed read of an existing source and keeps its own gate. A figure that cannot be shown says why (no access, limited to a group of devices, could not be read) and is never rendered as 0. "Nothing needs attention" appears only when every contributing figure was read successfully. The enrolment row is shown to administrators only. The design's remaining Dashboard rows (a ranked "devices to look at first" list, events by severity, command throughput and activity by hour) have no data source on the server and are not drawn rather than filled with sample figures; the scope bar's reference line lists the scope kinds from the same catalogue as `GET /api/v1/discover/scope-kinds`.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/fragments/dashboard/summary` | The readout, Needs attention and Estate state panels (HTMX). Per-figure gates: `Inventory:Read`, `Policy:Read`, `Execution:Read`, `Approval:Read`. Answers `200` for every signed-in caller: a refused or degraded figure becomes a panel note, never an error body. A service-scoped token is refused first with `403` (audit action `dashboard.fragment.access_denied`); a request with no session gets `401`. Accounts limited to a group of devices see device figures narrowed to their group, read from the newest 100,000 devices and shown as "at least N" when that read is full, and a "limited" note for fleet-wide compliance and failed executions. Estate state is the same device figure as the readout (seen in 30 days, online, offline, not seen for 2 days or more). |
+| `GET` | `/fragments/dashboard/policies` | Compliance by policy (HTMX): the five enabled policies with the lowest pass rate and "Lowest 5 of N policies", where N counts the first 100 enabled policies. A policy with no results yet shows "No results yet", never 0%. Gate: `Policy:Read`; accounts limited to a group of devices see a "limited" note because the per-policy counts are fleet-wide. A refused or degraded read, and a service-scoped token (audit action `dashboard.fragment.access_denied`), become a panel note with status `200`; a request with no session gets `401`. |
+| `GET` | `/fragments/dashboard/activity` | Recent events (HTMX): the eight newest audit rows as a five-column table (time, who, action, target, severity). The severity column is the audit row's own result (success, failure, denied) and nothing more. Shown to administrators only, and also gated by `AuditLog:Read`; other accounts see a note and no denial is written for them. The detail, source address, user agent and session of an event are never shown. The panel is not narrowed to a device group: an administrator limited to a group who holds `AuditLog:Read` sees what `GET /api/audit` returns. The "Audit log" button appears only when the navigation has an audit item. Notes answer `200`; a request with no session gets `401`. |
+| `GET` | `/fragments/dashboard/health` | Server health (HTMX): overall status, database reachability, uptime, version, agents connected to this server and, for an account with unscoped `Execution:Read`, executions running. A signed-in session is required; a service-scoped token gets a note first. Notes answer `200`; a request with no session gets `401`. |
 
 ---
 
@@ -5227,9 +5410,12 @@ management-group-confined principal, or rate-limit the export routes at the prox
 pool-acquire timeout on a response read surfaces as `503` `response store degraded`.
 
 **Malformed filters.** `yuzu_server_response_param_rejected_total{surface}` counts requests refused
-for a malformed numeric parameter on the response routes and MCP `query_responses` only. A steady
+for a malformed numeric parameter on the response routes, MCP `query_responses` and MCP `list_issued_certs` only (both MCP tools count under `surface="mcp"`). A steady
 non-zero rate on one surface is a client sending fractional timestamps, `null`s or trailing
-characters; it is not a server fault.
+characters; it is not a server fault. The same strict parsing now answers `400` (or `-32602` on
+MCP) on about a dozen other route families and on MCP `query_audit_log`, and those rejections have
+no counter of their own: after an upgrade, a rise in 4xx on those routes is visible only in the
+generic request metrics.
 
 ## File Logging
 
@@ -5267,6 +5453,76 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 - **A sustained overload also reds every replica together, and that is deliberate (#4944).** If the probe's one-row, no-table `SELECT` misses its 2 s deadline twice in a row, the database cannot answer real requests within their deadlines either (nearly every request validates a session and writes an audit row), so the replica is truthfully unable to serve — and, from the client side, a hopelessly slow backend and a frozen one look the same. There is **no server-side hysteresis** by decision: the rule stays two failures to go red, one success to recover, and your load balancer's thresholds are the damping — see "Load balancers and shutdown drain" below for the recommended values. A *brief* stall never evicts: one failed probe is a blip (`scripts/ha/ha-readyz-scenarios.sh`, scenario M holds a 3 s pause green; scenario L shows a CPU-starved database going red and recovering within one probe of the limit being lifted).
 - **The store rows are startup checks.** Every other row (`response_store`, `session_store`, ...) reports whether that store opened and migrated when the server started. They do not re-check a running store — a runtime problem with one store (a revoked grant, a dropped table) shows up as `503`s on that store's routes and in metrics, not on `/readyz`, because every replica shares the same database and moving traffic elsewhere would not help.
 - **Leadership is not readiness.** A replica that is not the background-work leader is fully ready.
+
+### Probing a TLS-enabled server
+
+The shipped images contain no `curl` (the chiselled image ships a static busybox with `wget`, see `deploy/docker/Dockerfile.server.chisel`), and images built before `--healthcheck` existed (#5906) answer every request on the HTTP port with a redirect when HTTPS is on. Two mechanisms let an orchestrator probe such a server.
+
+**1. The HTTP port answers the four probes directly, in cleartext.** With HTTPS on, the redirect listener (`--web-port`, `8080` by default) serves `/livez`, `/readyz`, `/health` and `/api/health` without redirecting. The port is **unencrypted and unauthenticated**: `/health` returns the version, the store names, `agents.online` and the `tls` block (whether default certificates are active, the install CA fingerprint and its expiry), and a failing `/readyz` names the failed stores and the Postgres state. Publish it only to the orchestrator network or `127.0.0.1`, or remove it with `--no-https-redirect`. `--web-address 127.0.0.1` binds the HTTPS dashboard to loopback too (both listeners share that address), so it is not a way to restrict only the plain port: for that, use network placement or `--no-https-redirect`. The rules:
+
+- `GET` and `HEAD` only, on those exact paths. Every other path, any other method, and a probe that declares a request body (`Content-Length`, even `0`, or `Transfer-Encoding`) still receives the `301` to HTTPS; the HTTPS listener does answer a probe with `Content-Length: 0`.
+- No session is ever resolved on this port. `/health` and `/api/health` always return the unauthenticated shape here (no `agents.pending`, `executions.*` or `system.*`), even when the request carries a valid session cookie.
+- Every answer is `503 {"status":"not ready","reason":"https_listener_not_serving"}` while the HTTPS listener is not bound or has exited. The check means "bound and not yet exited", not "accepting": if the HTTPS listener hits a fatal accept error, requests it had already accepted keep answering normally until they finish, while new connections are refused. A broken certificate reload that leaves the socket open is not seen by this check; use `--healthcheck` for that. A failed HTTPS bind logs an error and turns plain `/livez` into `503` as well, so a liveness probe on this port restarts the server: that is intended, the port never reports healthy for a server whose HTTPS listener is down.
+- The listener has a fixed worker pool (at most 64 threads, created at boot; count them in any `pids`/`TasksMax` budget) and no request deadline, so many idle or trickling connections can make plain-port probes time out while the server itself is fine. Keep it on the orchestrator network, and use `--healthcheck` for any check that restarts the container.
+- A server started with `--no-https-redirect` has no HTTP listener, so there is nothing to probe on this port.
+
+**2. `yuzu-server --healthcheck`.** Probes the real HTTPS listener from inside the container and exits `0` only on HTTP 200:
+
+| Aspect | Behaviour |
+|---|---|
+| Target | `https://<web-address>:<https-port>/readyz` (a wildcard bind, `0.0.0.0` or `::`, is dialled over loopback); with `--no-https`, `http://<web-address>:<web-port>/readyz`. `--healthcheck-path /livez` selects liveness. |
+| Trust | The certificate chain is verified against **only** a trust anchor, never the system trust store. Default-certs mode: `<ca-dir>/default-ca.pem` (the install CA). Operator certificate (`--https-cert`): the first certificate in that file (the server certificate itself); certificates after it are not trusted, and a first certificate that is not a `-----BEGIN CERTIFICATE-----` block (for example `X509 CERTIFICATE` or `TRUSTED CERTIFICATE`) is refused with an `SSL certificate loading failed` error, never the whole file. In operator-certificate mode the anchor must resolve to a regular file of at most 64 KiB; a larger, missing or unreadable file is refused with the same error. The host name is not checked. |
+| Redirects | Not followed. A `301` is a failure. |
+| Time | Each phase is bounded: TCP connect 1 s, each TLS handshake step 1 s, the request as a whole 3 s; and the whole probe, name resolution and handshake included, is cut at 4 s with the reason `timed out after 4000 ms`. A plain or post-handshake server that accepts but never answers is reported in about 2 s, a TLS peer that accepts and never starts the handshake in about 1 s, one that trickles a response in about 3 s, one that trickles its TLS handshake at 4 s. |
+| Output | Nothing on success. Exit status `0` is healthy, non-zero otherwise (`1` is a failed probe; a bad flag exits with CLI11's own code). On failure one stderr line naming the target, the HTTP status or TLS reason (for example `certificate has expired`), and the trust anchor used. It never prints a key path or a response body. `docker inspect --format '{{json .State.Health}}' <container>` shows the last lines; for a `503`, the server's `docker logs` carry the `[readyz]` line that says why. |
+| Inputs | The server's own flags and environment variables, with the server's defaults. It does not read `yuzu-server.cfg`. |
+
+A compose `healthcheck:` does not inherit the container's `CMD` arguments, so repeat any listener flags the server was started with. Default certificates:
+
+```yaml
+healthcheck:
+  test: ["CMD", "yuzu-server", "--healthcheck"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+```
+
+Operator certificate (the same `--https-cert` the server uses; the probe trusts the first certificate in that file as its anchor, which must be a `-----BEGIN CERTIFICATE-----` block in a regular file of at most 64 KiB, and refuses anything else rather than trusting the whole file):
+
+```yaml
+healthcheck:
+  test: ["CMD", "yuzu-server", "--healthcheck", "--https-cert", "/etc/yuzu/tls/server.pem"]
+  interval: 30s
+  timeout: 5s
+  retries: 4
+  start_period: 30s
+```
+
+Kubernetes `exec` probe. `timeoutSeconds` defaults to 1, which is under the probe's own 4 s bound, so always set it to 5 or more. The `startupProbe` holds the liveness probe off for up to 5 minutes, because a large upgrade's first boot builds an index before anything answers (see `docs/user-manual/upgrading.md`):
+
+```yaml
+startupProbe:
+  exec:
+    command: ["yuzu-server", "--healthcheck", "--healthcheck-path", "/livez"]
+  failureThreshold: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+livenessProbe:
+  exec:
+    command: ["yuzu-server", "--healthcheck", "--healthcheck-path", "/livez"]
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+```
+
+Notes:
+
+- A check that restarts the container (Kubernetes liveness, Swarm, autoheal) should use `--healthcheck-path /livez`: a database outage turns `/readyz` red on every replica, and restarting them all fixes nothing. Keep the default `/readyz` for readiness and Compose `depends_on: condition: service_healthy`. Never set `timeout` below 5 s.
+- If the server runs with a non-default `--ca-dir` or `--https-port`, repeat them on the healthcheck line.
+- Once `--https-cert` is set, a `default-ca.pem` left in the certificate directory by an earlier default-certs boot is **not** used. Omitting `--https-cert` from the healthcheck line while the server uses an operator certificate makes the probe anchor on that stale file and report `SSL server verification failed`.
+- After you rotate the `--https-cert` file, the probe anchors on the new certificate while the server keeps serving the old one until its next reload (`--cert-reload-interval`, 60 s by default), and reports `SSL server verification failed` in between. A check turns unhealthy on its `retries`-th (Kubernetes: `failureThreshold`-th) consecutive failure, so the time it tolerates is (`retries` − 1) × `interval` in Compose and (`failureThreshold` − 1) × `periodSeconds` in Kubernetes. Make that longer than the reload interval (the `interval: 30s`, `retries: 4` snippet above tolerates 90 s; on Kubernetes with `periodSeconds: 10` set `failureThreshold: 8`, which tolerates 70 s), or restart the server after rotating. The server's reload watches the file the path resolves to when it starts, so a rotation that replaces a symlink instead of rewriting the file (a certbot `live/` link, a Kubernetes Secret volume) is never reloaded: restart the server after such a rotation, or the probe keeps failing. An expired certificate fails the probe with `certificate has expired`, and a restart cannot fix that: renew the certificate.
+- Images built before `--healthcheck` existed (#5906) exit on the unknown argument; keep their existing probes.
 
 ### Load balancers and shutdown drain
 
@@ -5334,7 +5590,8 @@ A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first s
 
 | Port | Service | Deployment |
 |---|---|---|
-| 8080 | Web dashboard + REST API | Always |
+| 8080 | HTTP→HTTPS redirect + cleartext health probes with HTTPS on (`--no-https-redirect` removes it); the dashboard and REST API in plain HTTP with `--no-https` | Always |
+| 8443 | Web dashboard + REST API (HTTPS) | Always when HTTPS is on (the default) |
 | 50051 | gRPC (agent connections) | Always -- server in standalone, gateway in scaled |
 | 50052 | gRPC (management) | Always |
 | 50055 | gRPC (gateway upstream) | Gateway deployments only |

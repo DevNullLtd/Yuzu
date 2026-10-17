@@ -112,6 +112,7 @@ std::string inv_style() {
     return R"css(<style>
   .inv-wrap>*+*{margin-top:22px}
   .inv-h1{margin:0;font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
+  .inv-titlerow{display:flex;align-items:center;justify-content:space-between;gap:12px}
   .inv-wrap>.inv-sub{margin-top:4px;max-width:70ch;color:var(--mut)}
   .inv-wrap>.inv-sub a{color:var(--primary)}.inv-wrap>.inv-sub a:hover{text-decoration:underline}
   .inv-wrap :focus-visible{outline:2px solid var(--focus);outline-offset:2px}
@@ -156,6 +157,8 @@ std::string inv_style() {
   .inv-resbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px 14px;padding:12px 16px;border-bottom:1px solid var(--line)}
   .inv-count{font-size:13px;color:var(--mut)}.inv-count b{color:var(--ink);font-weight:600}
   .inv-exports{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px;color:var(--mut)}
+  .inv-exports .inv-exp-gap{margin-left:.5rem}
+  .inv-degrade .inv-btn{margin-left:.6rem}
   .inv-btn{display:inline-flex;align-items:center;height:var(--ctl);padding:0 14px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--raise);color:var(--ink);font:inherit;font-weight:500;white-space:nowrap;text-decoration:none;cursor:pointer}
   .inv-btn:hover{border-color:var(--mut);background:var(--surface2)}
   .inv-btn:disabled{opacity:.5;cursor:not-allowed}
@@ -310,7 +313,11 @@ std::string results_get(const SoftwarePageFilters& f) {
 
 std::string sw_head() {
     return inv_style() +
-           "<div class=\"inv-wrap\"><h1 class=\"inv-h1\">Software</h1>"
+           "<div class=\"inv-wrap\"><div class=\"inv-titlerow\"><h1 class=\"inv-h1\">Software</h1>"
+           // Opens the Sync now dialog (device / scope / whole fleet); the route enforces
+           // Execution:Execute, so a caller without it is told so in the dialog.
+           "<button type=\"button\" class=\"gp-btn accent\" data-act=\"sync\" onclick=\"swSync()\" "
+           "title=\"Ask devices to re-send their software inventory now\">Sync now</button></div>"
            "<div class=\"inv-sub\">Installed-software inventory by application, version and "
            "device, synced <b>daily</b> from every endpoint (ADR-0016 daily-sync). Looking for a "
            "device? See <a href=\"/hardware\">Hardware</a>.</div>";
@@ -321,7 +328,7 @@ std::string sw_degrade(const SoftwarePageFilters& f) {
     return std::string("<div class=\"inv-degrade\"><b>Inventory store unavailable.</b> The "
                        "installed-software store did not answer, so nothing is shown rather "
                        "than an empty list that could be mistaken for \"no software\". <button "
-                       "class=\"inv-btn\" data-act=\"retry\" style=\"margin-left:.6rem\" hx-get=\"") +
+                       "class=\"inv-btn\" data-act=\"retry\" hx-get=\"") +
            esc(software_page_url(f, SoftwarePageMode::Full, true)) + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Retry</button></div>";
 }
 
@@ -651,7 +658,7 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
          "</div><div class=\"inv-exports\"><span>Export installs</span>" +
          dl("json", "software-installs.json", "/api/v1/inventory/software?" + export_kv("json", false), tip, "JSON") +
          dl("csv", "software-installs.csv", "/api/v1/inventory/software?" + export_kv("csv", false), tip, "CSV") +
-         "<span style=\"margin-left:.5rem\">Export titles</span>" +
+         "<span class=\"inv-exp-gap\">Export titles</span>" +
          dl("titles", "software-titles.csv", "/api/v1/inventory/software/catalogue?" + export_kv("csv", true),
             "one row per title with installs and versions", "CSV") +
          "</div></div>";
@@ -755,14 +762,12 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
     } else {
         h += kpi_strip(f, *d.kpis, d.now_secs);
     }
-    // A confined caller never reaches here with fleet counts (that view printed its own notice).
-    if (!d.confined)
-        h += "<div class=\"inv-caveat\">Scope (ADR-0017): these fleet-wide counts need a global "
-             "<span class=\"inv-mono\">Inventory:Read</span> grant. A management-group-confined "
-             "account is refused the fleet view and sees only the devices in its own groups; every "
-             "read is audited.</div>";
     h += "<div class=\"inv-panel inv-pb\">" + controls(f, d) + active_region(f, false) + "</div>";
     h += results_region(f, d);
+    // Inventory sources (the REST /inventory/tables twin): loads once with the page; its own
+    // fragment carries the fleet-wide gate and the note a confined caller sees.
+    h += "<div id=\"sw-sources\" hx-get=\"/fragments/inventory/sources\" hx-trigger=\"load\" "
+         "hx-swap=\"innerHTML\"></div>";
     h += "</div>";
     return h;
 }
@@ -931,6 +936,73 @@ function swShut(box) { box.innerHTML = ''; box.removeAttribute('data-open'); swM
 function swClose(x) {
   var b = x.closest('.inv-exp-body'), box = b && b.parentNode;
   if (box && box.id) swShut(box);
+}
+/* Sync now: pick the devices (this device / a scope expression or group / the whole fleet), confirm
+   the count, POST /api/v1/hardware/sync. Two shared-dialog steps; the server enforces every bound. */
+function swSyncDone(r) {
+  var d = r.data && r.data.data, msg, skip = [];
+  if (!r.ok || !d) {
+    if (typeof showToast === 'function') showToast(r.message || ('Sync request failed (' + r.status + ')'), 'error');
+    return;
+  }
+  msg = 'Sync requested for ' + d.agents_reached + ' device' + (d.agents_reached === 1 ? '' : 's');
+  if (d.skipped_offline) skip.push(d.skipped_offline + ' not connected to this server');
+  if (d.skipped_version) skip.push(d.skipped_version + ' on an agent older than 0.13.1');
+  if (skip.length) msg += ' (skipped: ' + skip.join(', ') + ')';
+  if (typeof showToast === 'function') showToast(msg, d.agents_reached ? 'success' : 'warning');
+}
+function swSync() {
+  var D = window.YuzuDialog;
+  if (!D) return;
+  var a = document.getElementById('sw-agent'), h = document.getElementById('sw-host'),
+      id = a ? a.value : '', host = id && h && h.value.trim() ? h.value.trim() : id, count = null, opts = [];
+  if (id) opts.push({ value: 'device', label: 'This device (' + host + ')' });
+  opts.push({ value: 'scope', label: 'Devices matching a scope expression or group' });
+  opts.push({ value: 'fleet', label: 'Whole fleet' });
+  D.form({
+    title: 'Sync now',
+    body: 'Ask devices to re-send their installed-software inventory now instead of waiting for the daily sync. ' +
+          'This server asks the devices connected to it. Devices not connected to this server (including one ' +
+          'attached to another server) and agents older than 0.13.1 are skipped, and one request reaches at ' +
+          'most 500 devices.',
+    fields: [
+      { name: 'kind', label: 'Which devices', type: 'select', options: opts },
+      { name: 'expr', label: 'Scope expression or group', type: 'text', maxlength: 1024,
+        placeholder: 'ostype == "windows"  or  group:<id>',
+        hint: 'Used only for "Devices matching a scope expression or group". Up to 1,024 bytes.' }
+    ],
+    submitLabel: 'Review',
+    validate: function (v) { return v.kind === 'scope' && !v.expr.trim() ? 'Enter a scope expression or group:<id>.' : null; },
+    submit: function (v) {
+      var e = v.expr.trim();
+      count = null;
+      if (v.kind !== 'scope' || e.indexOf('group:') === 0) return Promise.resolve(null);
+      return D.request('POST', '/api/v1/scope/preview', { json: { expression: e } }).then(function (r) {
+        /* The preview needs Infrastructure:Read, which Execution:Execute does not imply. A permission
+           refusal (403, or 401) just means no count: the confirm step words the scope without one and
+           the sync route enforces everything itself. Any other failure (an invalid expression, a
+           missing route, an outage) is shown here, before the operator confirms. */
+        if (!r.ok && r.status !== 403 && r.status !== 401)
+          return r.message || ('Scope preview failed (' + r.status + ')');
+        count = r.ok && r.data && r.data.data && typeof r.data.data.matched_count === 'number'
+                  ? r.data.data.matched_count : null;
+        return count === 0 ? 'That scope matches no devices you can sync.' : null;
+      });
+    }
+  }).then(function (v) {
+    if (!v) return null;
+    var e = v.expr.trim(), body = { source: 'installed_software' }, what;
+    if (v.kind === 'device') { body.scope = id; what = '1 device (' + host + ') will be asked to re-send its software inventory.'; }
+    else if (v.kind === 'fleet') { body.scope = '__all__'; what = 'Every device connected to this server that you can reach will be asked to re-send its software inventory.'; }
+    else if (e.indexOf('group:') === 0) { body.scope = e; what = 'Every device in ' + e + ' that is connected to this server will be asked to re-send its software inventory.'; }
+    else {
+      body.scope_expression = e;
+      what = (count === null ? 'The devices matching this scope' : count + ' device' + (count === 1 ? ' matches' : 's match') + ' this scope and') +
+             ' will be asked to re-send their software inventory.';
+    }
+    return D.confirm({ title: 'Sync now?', body: [what, 'Devices not connected to this server (including one attached to another server) and agents older than 0.13.1 are skipped.'], confirmLabel: 'Sync now' })
+      .then(function (ok) { return ok ? D.request('POST', '/api/v1/hardware/sync', { json: body }) : null; });
+  }).then(function (r) { if (r) swSyncDone(r); }, function () { /* dialog busy or closed */ });
 }
 document.body.addEventListener('htmx:configRequest', function (e) {
   var p = e.detail.path || '';

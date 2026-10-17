@@ -107,7 +107,7 @@ std::string cell(const std::optional<double>& v, Unit u) {
 
 std::string render_network_overview_fragment(const NetPerfFleetNow& now) {
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     // The DEX sub-nav with "network" active (Network sits under DEX). This is a
     // now-view with no window of its own, so the threaded window is the DEX
     // default (7 = "7d") — it only governs which window a sibling signal tab opens.
