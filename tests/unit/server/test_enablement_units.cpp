@@ -1,7 +1,7 @@
 /**
  * test_enablement_units.cpp — invariants of the switchable-unit overlay
  * (enablement_units.hpp, ADR-3006) over the REAL capability catalogue,
- * composed from all 27 fragments exactly as test_capability_catalogue.cpp does
+ * composed from all 28 fragments exactly as test_capability_catalogue.cpp does
  * (test_real_capability_registry.hpp omits two fragments, #5131).
  *
  * Pure: constexpr tables only, no I/O, no clock, no process.
@@ -34,11 +34,13 @@
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "dispatch_confined_arms.hpp"
 #include "enablement_resolver.hpp"
 #include "enablement_units.hpp"
 
 #include <yuzu/agent/plugin_loader.hpp> // kReservedPluginNames (cross-check)
+#include <yuzu/protective_actions.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -54,7 +56,7 @@ using namespace yuzu::server::enablement;
 
 namespace {
 
-// The 27 real fragments, spelled once. A macro because the registry-style
+// The 28 real fragments, spelled once. A macro because the registry-style
 // constructor only takes a brace-enclosed initializer_list.
 #define YUZU_REAL_FRAGMENTS \
     capdecls::plugin_action_catalogue_a(),\
@@ -83,10 +85,11 @@ namespace {
     capdecls::plugin_action_catalogue_system_hardening(),\
     capdecls::plugin_action_catalogue_pkg_inventory(),\
     capdecls::plugin_action_catalogue_mgmt_posture(),\
+    capdecls::plugin_action_catalogue_shares(),\
     capdecls::core_dispatch_capabilities()
 
 UnitOverlay real_overlay() {
-    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, &is_quarantine_control_plugin);
+    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, &yuzu::protective::is_protective_action);
     REQUIRE(r.has_value());
     return std::move(*r);
 }
@@ -124,7 +127,7 @@ constexpr CommandCapability cap(std::string_view plugin, std::string_view action
 
 TEST_CASE("enablement units: the real catalogue builds with no missing or stale os row",
           "[enablement][catalogue]") {
-    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, &is_quarantine_control_plugin);
+    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, &yuzu::protective::is_protective_action);
     INFO(std::string(r.has_value() ? "" : r.error()));
     REQUIRE(r.has_value());
 }
@@ -133,10 +136,32 @@ TEST_CASE("enablement units: no unit is protective or reserved", "[enablement][c
     const auto ov = real_overlay();
     for (const auto& u : ov.units) {
         INFO(u.name);
-        CHECK_FALSE(is_quarantine_control_plugin(u.plugin, u.action));
+        CHECK_FALSE(yuzu::protective::is_protective_action(u.plugin, u.action));
         CHECK_FALSE(plugin_config::is_reserved_plugin_name(u.plugin));
         CHECK_FALSE(yuzu::agent::is_reserved_plugin_name(u.plugin));
     }
+}
+
+TEST_CASE("enablement units: every catalogue pair follows the canonical protective predicate",
+          "[enablement][catalogue]") {
+    // Compared per pair against yuzu::protective::is_protective_action rather than a
+    // hand-spelled list, so widening the canonical set turns the new action into a
+    // non-unit here without an edit, and a unit that ought to be protective fails.
+    const auto ov = real_overlay();
+    std::size_t pairs = 0;
+    for (const auto& src : std::initializer_list<std::span<const CommandCapability>>{
+             YUZU_REAL_FRAGMENTS}) {
+        for (const auto& row : src) {
+            ++pairs;
+            const std::string name = std::string(row.plugin) + "." + std::string(row.action);
+            const bool non_unit = yuzu::protective::is_protective_action(row.plugin, row.action) ||
+                                  plugin_config::is_reserved_plugin_name(row.plugin);
+            INFO(name);
+            CHECK((ov.find_non_unit(name) != nullptr) == non_unit);
+            CHECK((ov.find(name) != nullptr) == !non_unit);
+        }
+    }
+    CHECK(pairs > 100);
 }
 
 TEST_CASE("enablement units: the non-unit set is exactly the protective and reserved rows",
@@ -221,7 +246,7 @@ TEST_CASE("enablement units: a catalogue row with no os row fails the build - na
     static constexpr std::array<CommandCapability, 1> extra{CommandCapability{
         .plugin = "zz", .action = "new", .execute_gate = ExecuteGate::None}};
     auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS, std::span<const CommandCapability>{extra}},
-                                &is_quarantine_control_plugin);
+                                &yuzu::protective::is_protective_action);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().find("zz.new") != std::string::npos);
     CHECK(r.error().find("enablement_units.hpp") != std::string::npos);
@@ -231,7 +256,7 @@ TEST_CASE("enablement units: a stale os row fails the build - naming it",
           "[enablement][catalogue]") {
     std::vector<UnitOsRow> rows(kUnitOs.begin(), kUnitOs.end());
     rows.push_back({"zz", "gone", kAllOs});
-    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, &is_quarantine_control_plugin, rows);
+    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, &yuzu::protective::is_protective_action, rows);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().find("zz.gone") != std::string::npos);
 }
@@ -255,7 +280,7 @@ TEST_CASE("enablement units: the protective predicate is the caller's and not a 
         }
     }
     SECTION("the quarantine predicate leaves the same fragment switchable") {
-        auto r = build_unit_overlay({src}, &is_quarantine_control_plugin, os, {});
+        auto r = build_unit_overlay({src}, &yuzu::protective::is_protective_action, os, {});
         REQUIRE(r.has_value());
         CHECK(r->non_units.empty());
         for (const auto* name : {"zz", "zz.a", "zz.b"})
@@ -275,7 +300,7 @@ TEST_CASE("enablement units: build_unit_overlay refuses malformed inputs - namin
     };
     const auto ok_rows = std::vector<CommandCapability>{cap("zz", "a"), cap("zz", "b")};
     const std::vector<UnitOsRow> ok_os{{"zz", "a", kAllOs}, {"zz", "b", kAllOs}};
-    auto pred = &is_quarantine_control_plugin;
+    auto pred = &yuzu::protective::is_protective_action;
     const std::vector<Case> cases{
         {"duplicate catalogue pair",
          {cap("zz", "a"), cap("zz", "a")},
