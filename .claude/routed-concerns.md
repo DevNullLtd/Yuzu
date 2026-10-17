@@ -5,8 +5,8 @@
      `routed-concerns-access-control.md`, the read-only security-posture
      plugin rows in `routed-concerns-security-posture.md`, and Forensics /
      per-user-software-data concerns in `routed-concerns-software-estate.md`
-     (CLAUDE.md's own table names each). The gateway-upstream peer-authorization
-     row lives in the security-posture file; four files is the cap
+     (CLAUDE.md's own table names each). Gateway rows (upstream peer authz,
+     origin trust) are in security-posture; four files is the cap
      (docs/instruction-file-standard.md). Row discipline: catastrophic-if-violated
      invariants + doc pointers ONLY — detail goes in the routed doc. -->
 

@@ -198,6 +198,12 @@ jobs:
       - name: Agent installer trust-anchor ACL lint
         run: python3 tests/test_agent_installer_acl_lint.py
 
+      # Gateway scrape (#5695): every shipped Prometheus config, and every
+      # compose stack that runs a Prometheus next to a gateway, scrapes the
+      # gateway's metrics port. Stdlib only.
+      - name: Gateway Prometheus scrape lint
+        run: python3 -I tests/test_gateway_prometheus_scrape.py
+
       # Release artifact gate (#5242): the expected SBOM set in
       # scripts/check-release-artifacts.sh includes the three chisel images,
       # and a release missing one fails before publishing. Stdlib + bash.

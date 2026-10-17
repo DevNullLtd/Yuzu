@@ -5,31 +5,40 @@
 %% {sys_config, "config/sys.config"} unless the prod profile overrides it, and
 %% the Docker images MOUNT deploy/docker/gateway-sys.config over the release
 %% config at runtime. This file is the canonical, correct reference for the
-%% production grpcbox TLS shape — copy it (or mount it) and adjust cert paths.
+%% production TLS shape -- copy it (or mount it) and adjust cert paths.
 %%
-%% TLS is configured ENTIRELY in the {grpcbox, ...} block below — grpcbox reads
-%% its own config at boot and starts the listeners/channels itself. yuzu_gw's
+%% The gateway's two listeners are the entries of {yuzu_gw, grpc_listeners}
+%% below, each with its own `tls` map; the upstream channel to the C++ server is
+%% the {yuzu_gw, upstream_client} entry (read by yuzu_grpc_client_config:from_env/0;
+%% the client itself is yuzu_grpc_client over gun). A legacy {grpcbox, client}
+%% entry is invisible to the VM and refuses boot -- move it. yuzu_gw's
 %% `tls`/`tls_enabled` env (set by YUZU_GW_TLS_* in yuzu_gw_app:apply_tls_
-%% overrides/0) is ADVISORY ONLY and does not drive grpcbox; an env-substituted
-%% sys.config.src that wires YUZU_GW_TLS_* into the grpcbox block is a tracked
+%% overrides/0) is ADVISORY ONLY and drives neither; an env-substituted
+%% sys.config.src that wires YUZU_GW_TLS_* into the config is a tracked
 %% follow-up. See docs/pki-architecture.md "Gateway TLS".
 %%
 %% Container env overrides (handled by yuzu_gw_app:apply_env_overrides/0):
-%%   YUZU_GW_UPSTREAM_ADDR  — C++ server hostname (default: 127.0.0.1)
-%%   YUZU_GW_UPSTREAM_PORT  — C++ server port     (default: 50055)
+%%   YUZU_GW_UPSTREAM_ADDR / YUZU_GW_UPSTREAM_PORT — INERT: nothing applies them,
+%%                            and boot logs a WARNING naming each one that is
+%%                            set. The server the gateway dials is the endpoint
+%%                            list of the channel in {yuzu_gw, upstream_client}
+%%                            below; change the host and port there.
 %%   YUZU_GW_PROMETHEUS_PORT / YUZU_GW_HEALTH_PORT — metrics / health ports
+%%   YUZU_GW_AGENT_PORT / YUZU_GW_MGMT_PORT — the `listen.port' of the grpc_listeners
+%%                            entry serving agent_pb / management_pb; applied only
+%%                            when exactly ONE entry serves that proto (else a WARN
+%%                            names the variable and it is ignored)
 %%   YUZU_GW_CLUSTER_ID     — trust-zone/region cluster id (default: "default")
 [
     {yuzu_gw, [
-        %% Agent-facing gRPC listen address (agents connect here)
-        {agent_listen_addr, "0.0.0.0"},
-        {agent_listen_port, 50051},
+        %% Listener addresses and ports are the `listen' maps of the
+        %% {grpc_listeners, ...} entries below (YUZU_GW_AGENT_PORT /
+        %% YUZU_GW_MGMT_PORT set the port when exactly one entry serves that
+        %% proto).
 
-        %% Operator-facing gRPC listen address (dashboard/CLI connects here)
-        {mgmt_listen_addr, "0.0.0.0"},
-        {mgmt_listen_port, 50063},
-
-        %% Upstream C++ yuzu-server address (GatewayUpstream service port)
+        %% Not read by anything (nor set by YUZU_GW_UPSTREAM_ADDR/PORT, which
+        %% are inert): the upstream server is the endpoint list of the channel
+        %% in {yuzu_gw, upstream_client} below.
         {upstream_addr, "127.0.0.1"},
         {upstream_port, 50055},
 
@@ -54,10 +63,46 @@
         %% Circuit breaker settings (upstream connection protection)
         {circuit_breaker_failure_threshold, 5},
         {circuit_breaker_reset_timeout_ms, 10000},
-        {circuit_breaker_max_reset_timeout_ms, 300000},
+        {circuit_breaker_max_reset_timeout_ms, 30000},
+
+        %% Stream-status notifications (CONNECTED / DISCONNECTED) held while
+        %% they cannot be sent (server down or slow). The cap counts keys (one
+        %% per agent session and stream home), not agents. Shipped value: three
+        %% per connection the agent listener below admits (max_connections
+        %% 60000), which is also the default when this key is unset (and at
+        %% least 15000). Three, because one flap of every agent while notices
+        %% cannot be sent holds two keys per agent (the old session's
+        %% DISCONNECTED and the new one's CONNECTED), plus room for a second
+        %% flap. When full, a DISCONNECTED evicts the oldest held CONNECTED (a
+        %% full registration replay then makes those agents re-send it); a
+        %% DISCONNECTED over a store full of DISCONNECTED is lost and counted
+        %% (yuzu_gw_upstream_notify_lost_total). About 0.9 KB per held key, so
+        %% the cap is a ceiling of about 160 MB, reached only with that many
+        %% agents. Change it together with max_connections.
+        {notify_pending_max, 180000},
 
         %% Stream backpressure threshold (message queue length)
         {backpressure_threshold, 1000},
+
+        %% Node-wide memory load shedding (yuzu_gw_memory_shedder). Samples
+        %% erlang:memory(total); above the high-water mark it suspends the AGENT
+        %% listener(s) (the listen socket closes, so new agent connections are
+        %% refused with ECONNREFUSED and the agents retry, while established
+        %% ones are untouched), below the low-water mark it resumes them. The
+        %% management listener is never suspended. While shed, /readyz reports
+        %% not-ready so a load balancer drains this node.
+        %%
+        %% The defaults (high 0.75, low 0.65 of the memory limit, 1000 ms) apply
+        %% without this key. The memory limit is the smaller of the host's
+        %% memory (/proc/meminfo) and the cgroup memory limit the gateway runs
+        %% under (a container limit or a systemd MemoryMax=), read at start;
+        %% where neither can be read (no absolute bytes set) the shedder runs
+        %% inactive (the per-connection and per-stream bounds
+        %% still apply). To set absolute marks instead of fractions, use
+        %% high_water_bytes / low_water_bytes. {enabled, false} turns it off.
+        %%   {memory_shedding, #{high_water_fraction => 0.75,
+        %%                       low_water_fraction => 0.65,
+        %%                       interval_ms => 1000}},
 
         %% Consistent hash ring: virtual nodes per physical node
         {hash_ring_vnodes, 256},
@@ -70,9 +115,16 @@
         {cluster_id, <<"default">>},
 
         %% Mgmt-plane peer pins (#1422): the identities the :50063 auth_fun
-        %% (yuzu_gw_authz:check_mgmt_peer/1, wired in the grpcbox block below)
-        %% accepts. {cert_file, Path} pins to the SPKI of the cert at Path and
-        %% re-reads it when the file changes (server leaf rotation self-heals);
+        %% (yuzu_gw_authz:check_mgmt_peer/1, wired in grpc_listeners below)
+        %% accepts. {cert_file, Path} pins to the SPKI of the cert at Path; the
+        %% yuzu_gw_mgmt_pins watcher re-reads it every mgmt_pin_refresh_ms
+        %% (default 5000) and re-pins when its contents changed, so a rotated server
+        %% leaf is pinned within one interval (the auth_fun itself never
+        %% touches the file). Commands the server forwards inside that interval
+        %% are refused and NOT retried: they fail as gateway_unauthenticated.
+        %% Once read, a key stays pinned if the file later fails to read or
+        %% parse (yuzu_gw_cert_file_readable{role="mgmt_peer_pin"} reads 0);
+        %% replace the file, do not delete it, to change the pin;
         %% for bring-your-own-cert installs point it at YOUR server cert, or use
         %% {spki_sha256, "hex"} (openssl x509 -in cert.pem -pubkey -noout |
         %% openssl pkey -pubin -outform DER | openssl dgst -sha256). List two
@@ -99,12 +151,180 @@
         %% Lifetime cap on DISTINCT peer addresses ever atomized — see
         %% config/sys.config's identical setting for the full rationale
         %% (PR #4604 review round 2, atom-table exhaustion).
-        {cluster_max_lifetime_addrs, 1024}
-    ]},
+        {cluster_max_lifetime_addrs, 1024},
 
-    {grpcbox, [
+        %% ── gRPC listeners ──────────────────────────────────────────────────
+        %% One map per listener, served by the gateway's own gRPC layer over
+        %% Cowboy (yuzu_grpc_listener). They are the supervision tree's LAST
+        %% children, and every entry is validated before anything is bound.
+        %% `tls` present means TLS and certfile, keyfile AND cacertfile are all
+        %% required (an incomplete map refuses boot); omit `tls` for plaintext.
+        %% Do NOT also set {grpcbox, servers}: a leftover entry refuses boot.
+        {grpc_listeners, [
+            %% Agent listener (:50051): ONE-WAY (server-authenticated) TLS --
+            %% encrypts the hop and authenticates the GATEWAY to agents WITHOUT
+            %% requiring a client cert (verify_none + fail_if_no_peer_cert=false).
+            %% This closes the plaintext command-fan-out edge while still letting
+            %% an UNENROLLED agent bootstrap (it has no client cert until it
+            %% completes CSR enrollment). Agent identity is app-layer (the
+            %% enrollment token), NOT transport. The address the gateway forwards
+            %% as gateway_observed_peer is attribution for the audit log, not
+            %% authentication.
+            %%
+            %% NEVER give this listener an auth_fun: a peer without a certificate
+            %% is refused whenever there is one, and the agents that have not
+            %% enrolled yet have none -- it would cut agent bootstrap fleet-wide.
+            %% The way to client certificates on this edge is configuration, not
+            %% code (docs/user-manual/gateway.md, "Moving the agent edge to mutual
+            %% TLS"): `verify => verify_peer, fail_if_no_peer_cert => false` asks
+            %% for a certificate and serves the agents that have none.
+            %%
+            %% Agents ping every 60 s, so the idle timeout is 180 s (the 60 s
+            %% default would race the ping). 32 acceptors: reconnect storms.
+            #{name => agent,
+              service_protos => [agent_pb],
+              services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service},
+              listen => #{port => 50051, ip => {0,0,0,0}},
+              tls => #{certfile   => "/etc/yuzu/certs/default-gateway.pem",
+                       keyfile    => "/etc/yuzu/certs/default-gateway.key",
+                       cacertfile => "/etc/yuzu/certs/default-ca.pem",
+                       verify => verify_none,
+                       fail_if_no_peer_cert => false},
+              acceptors => 32,
+              http2 => #{idle_timeout => 180000, max_concurrent_streams => 32},
+              %% Ceilings on the unauthenticated edge. max_connections bounds file
+              %% descriptors: every connection holds one and, for old and new
+              %% connections overlapping after a proxy idle cut, a fleet of N
+              %% agents needs about 1.5-2xN of them. The ceiling is the systemd
+              %% unit's LimitNOFILE (65536) less ~5500 of headroom for the
+              %% upstream channel (32 sockets), the health and metrics ports, the
+              %% mgmt listener, Erlang distribution and files: 60000 connections
+              %% hold to a fleet of about 30000 agents. Raise it with
+              %% LimitNOFILE (keep ~5500 below it), lower it if LimitNOFILE is
+              %% lower. It is NOT protection against a flood: a connection that
+              %% has not finished the PROXY header / TLS handshake is closed
+              %% after about 1 s / 10 s, but one that has completed them and keeps
+              %% sending is held indefinitely (a PING resets Cowboy's idle timer),
+              %% so an unauthenticated peer can fill the ceiling; new connections
+              %% then wait in the kernel backlog while established agents are
+              %% unaffected until they reconnect. Known residual of this port;
+              %% limit connections per source at the L4 balancer or firewall (the
+              %% peer reconnects after a restart). The ceiling is soft by the acceptor count
+              %% less one.
+              %% max_message_bytes: 4 MiB, gRPC's default receive limit. NOT
+              %% lowered: an agent's installed-software inventory blob may be 3 MiB
+              %% by design (sync_source_installed_software.cpp kMaxBlobBytes; real
+              %% captures are ~50 KB), so the whole InventoryReport can approach
+              %% 4 MiB. Over-limit frames are refused with RESOURCE_EXHAUSTED from
+              %% the 5-byte frame header, before the body is buffered.
+              %%
+              %% Two further limits bound a peer that opens streams and stalls
+              %% them half-sent (an anonymous peer on this port could otherwise
+              %% hold ~4 MiB per stream, max_concurrent_streams of them, for the
+              %% life of the connection). Both have safe defaults, shown here:
+              %%   max_connection_memory_bytes: a per-connection memory ceiling
+              %%     (a max_heap_size on the connection process counting its
+              %%     streams' refc buffers). A connection that buffers more than
+              %%     this of half-finished requests is killed. Default = four
+              %%     times max_message_bytes = 16 MiB; `infinity' disables it.
+              %%   request_timeout_ms: a unary/server-streaming stream that
+              %%     buffers its one request this long without completing it is
+              %%     aborted DEADLINE_EXCEEDED and its buffer dropped. Default
+              %%     30000; `infinity' disables it. It never cuts a long-lived
+              %%     Subscribe (bidirectional), which runs before any message.
+              limits => #{max_connections => 60000, max_message_bytes => 4194304,
+                          max_connection_memory_bytes => 16777216,
+                          request_timeout_ms => 30000}
+              %% Behind a load balancer or router? Say so and name the proxies you
+              %% trust; with no `origin` the agent's address is the TCP peer, and a
+              %% client-sent x-forwarded-for / PROXY header is ignored:
+              %%   , origin => #{mode => proxy_protocol,   %% F5 iRule, HAProxy send-proxy-v2
+              %%                 sources => [{10,0,0,5}, {{10,1,0,0}, 24}]}
+              %%   , origin => #{mode => forwarded_for,    %% a router that terminates TLS
+              %%                 sources => [{10,0,0,5}],
+              %%                 trusted_hops => 0}        %% 0: the last entry, the router's
+              %% See docs/user-manual/gateway.md, "Client addresses behind a proxy".
+            },
+
+            %% Mgmt listener (:50063): the PRIVILEGED operator/command plane.
+            %% STRICT mTLS (#1314, HIGH-2) + SPKI peer pin (#1422). This listener
+            %% binds 0.0.0.0, so a one-way or plaintext posture would leave the
+            %% command-fan-out plane UNAUTHENTICATED (anyone routing to it could
+            %% push commands to the fleet). By OMITTING verify /
+            %% fail_if_no_peer_cert below, the layer uses its strict defaults
+            %% (verify_peer + fail_if_no_peer_cert=true) so a client MUST present
+            %% a CA-issued cert. The auth_fun then pins the peer to the C++
+            %% server's KEY (mgmt_peer_pins above): CA membership alone is NOT
+            %% authorization -- the same CA signs every agent leaf and the
+            %% gateway's own group-readable leaf, so without the pin any
+            %% compromised endpoint's cert could command the fleet (the #1314 M-1
+            %% residual, closed by #1422). The auth_fun runs before a handler
+            %% exists (yuzu_grpc_stream_h) and only on a TLS listener; the
+            %% yuzu_gw_app boot guard refuses a non-loopback management_pb
+            %% listener without any of this, and refuses it behind a proxy.
+            #{name => mgmt,
+              service_protos => [management_pb],
+              services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
+              listen => #{port => 50063, ip => {0,0,0,0}},
+              tls => #{certfile   => "/etc/yuzu/certs/default-gateway.pem",
+                       keyfile    => "/etc/yuzu/certs/default-gateway.key",
+                       cacertfile => "/etc/yuzu/certs/default-ca.pem"},
+              auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1,
+              acceptors => 4,
+              %% One connection per server replica, held open. max_connections
+              %% bounds file descriptors; it is NOT protection. 256 is far above
+              %% any replica count, but ~256 held connections would stop the
+              %% server's NEW connections to this gateway; established ones are
+              %% unaffected. Before the TLS handshake anyone with layer-4 reach
+              %% can hold a slot (10 s handshake timeout); after it, any holder
+              %% of a certificate issued by the install CA can (every enrolled
+              %% agent has one; the SPKI pin above runs later, per stream).
+              %% KNOWN, accepted, not fixed in the gateway: the management port
+              %% (:50063) MUST be firewalled so only the server replicas reach
+              %% it. Set listen.ip above to the management interface's address
+              %% so it is not bound on the agent-facing one, and where you can
+              %% multi-home the server so this interface is on a different NIC
+              %% from the agent- and database-facing ones. The shipped composes
+              %% do not publish it. Detection and recovery: docs/user-manual/
+              %% gateway.md, "Connection ceilings and the unauthenticated ports".
+              %% (Before this key the listener's ceiling was infinity.)
+              %% 4 MiB messages: a command step carries at most 32 parameters of
+              %% 64 KiB each (about 2 MiB).
+              %% No max_connection_memory_bytes: on a management-only listener
+              %% the per-connection memory ceiling is OFF unless set here. Its
+              %% one peer is the pinned server, and the ceiling (which also
+              %% counts responses waiting to be written) killed the server's
+              %% connection, every call on it, when a fan-out's agents answered
+              %% together. Cowboy's output-buffer alarm paces the senders
+              %% instead; what the connection can then hold is about 16 MB plus
+              %% one response per stream in flight (max_concurrent_streams below).
+              limits => #{max_connections => 256, max_message_bytes => 4194304},
+              %% The server's command client does not ping: 10 minutes idle.
+              %% The server sends every command of a fan-out over its ONE
+              %% connection to this port (about 2 received frames per call).
+              %% Cowboy's own frame ceiling, 10000 per 10 s, closes that
+              %% connection with enhance_your_calm and fails every call in
+              %% flight; 100000 per 10 s is the management listener's default
+              %% (yuzu_grpc_listener:http2_opts/1), set here so it is visible.
+              %% max_concurrent_streams 4096 (the management default, set here
+              %% so it is visible): the server's client queues calls past the
+              %% cap, so a fan-out takes about agents x mean answer time / cap
+              %% when that exceeds the answer time. Measured with 5,000 agents
+              %% answering in 0-10 s over one connection: 30.7 s at 1024,
+              %% 11.9 s at 4096, 10.1 s at 8192. Not higher: every stream in
+              %% flight can hold one response waiting to be written, so the cap
+              %% also bounds that memory (5,000 answers of 256 KiB inside 1 s
+              %% peaked at ~1 GB at 4096, ~1.2 GB at 8192). See
+              %% docs/user-manual/gateway.md, "gRPC listeners".
+              http2 => #{idle_timeout => 600000, max_concurrent_streams => 4096,
+                         max_received_frame_rate => {100000, 10000}}}
+        ]},
+
         %% ── Upstream channel: mutual TLS to the C++ server ──────────────────
-        %% `https` selects ssl (grpcbox prepends ALPN h2). verify_peer is
+        %% Read from {yuzu_gw, upstream_client} by yuzu_grpc_client_config:
+        %% from_env/0 (NOT from a {grpcbox, client} entry, which the VM never
+        %% applies and which refuses boot if left in this file).
+        %% `https` selects ssl (the client advertises ALPN h2). verify_peer is
         %% REQUIRED — an ssl client does NOT verify the server otherwise.
         %% certfile/keyfile present the gateway leaf for the server's client-cert
         %% check (the server's gateway-upstream listener requires a client cert
@@ -116,7 +336,7 @@
         %% server's gethostname() — so the "127.0.0.1" below validates against a
         %% default-cert, same-host install. For cross-container dialing use the
         %% server's hostname and set that service's `hostname:` so its SAN matches.
-        {client, #{channels => [
+        {upstream_client, #{channels => [
             {default_channel, [{https, "127.0.0.1", 50055, [
                 {cacertfile, "/etc/yuzu/certs/default-ca.pem"},
                 {certfile,   "/etc/yuzu/certs/default-gateway.pem"},
@@ -125,9 +345,8 @@
                 %% Chain depth 2 — margin for one intermediate (M2 subordinate CA);
                 %% the M1 default CA signs leaves directly.
                 {depth, 2},
-                %% TLS 1.2 floor — no 1.0/1.1 (matches grpcbox's own server side,
-                %% which pins ['tlsv1.2']). Prevents a stale OTP VM from
-                %% negotiating a legacy version.
+                %% TLS 1.2 floor — no 1.0/1.1 (the listeners above are TLS 1.2 only
+                %% too). Prevents a stale OTP VM from negotiating a legacy version.
                 {versions, ['tlsv1.2']},
                 %% Explicit AEAD + PFS cipher whitelist, ECDSA-leaf-aligned (the
                 %% gateway/server leaves are EC P-256). Excludes CBC-SHA1 and
@@ -136,59 +355,7 @@
                            "ECDHE-ECDSA-AES128-GCM-SHA256",
                            "ECDHE-ECDSA-CHACHA20-POLY1305"]}
             ]}], #{}}
-        ]}},
-
-        %% ── Listeners ──────────────────────────────────────────────────────
-        %% Agent listener (:50051): ONE-WAY (server-authenticated) TLS — encrypts
-        %% the hop and authenticates the GATEWAY to agents, WITHOUT requiring a
-        %% client cert (verify_none + fail_if_no_peer_cert=false). This closes the
-        %% plaintext command-fan-out edge while still letting an UNENROLLED agent
-        %% bootstrap (it has no client cert until it completes CSR enrollment).
-        %% Requires the vendored+patched grpcbox (_checkouts/grpcbox) — stock
-        %% grpcbox v0.17.1 hardcodes fail_if_no_peer_cert=true. Agent identity is
-        %% app-layer (enrollment token / gateway_observed_peer), NOT transport.
-        %% `ssl => true` is mandatory; without it grpcbox silently runs plaintext.
-        {servers, [
-            #{grpc_opts => #{
-                service_protos => [agent_pb],
-                services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}
-            },
-            listen_opts => #{port => 50051, ip => {0,0,0,0}},
-            transport_opts => #{ssl => true,
-                                certfile   => "/etc/yuzu/certs/default-gateway.pem",
-                                keyfile    => "/etc/yuzu/certs/default-gateway.key",
-                                cacertfile => "/etc/yuzu/certs/default-ca.pem",
-                                verify => verify_none,
-                                fail_if_no_peer_cert => false}},
-            %% Mgmt listener (:50063): the PRIVILEGED operator/command plane.
-            %% STRICT mTLS (#1314, HIGH-2) + SPKI peer pin (#1422). This listener
-            %% binds 0.0.0.0, so a one-way or plaintext posture would leave the
-            %% command-fan-out plane UNAUTHENTICATED (anyone routing to it could
-            %% push commands to the fleet). By OMITTING verify /
-            %% fail_if_no_peer_cert below, the patched grpcbox uses its strict
-            %% defaults (verify_peer + fail_if_no_peer_cert=true) so a client MUST
-            %% present a CA-issued cert. The auth_fun then pins the peer to the
-            %% C++ server's KEY (mgmt_peer_pins in the yuzu_gw env above): CA
-            %% membership alone is NOT authorization — the same CA signs every
-            %% agent leaf and the gateway's own group-readable leaf, so without
-            %% the pin any compromised endpoint's cert could command the fleet
-            %% (the #1314 M-1 residual, closed by #1422). The auth_fun only runs
-            %% on a TLS listener — grpcbox silently drops it under ssl => false,
-            %% which the yuzu_gw_app boot guard refuses on a non-loopback bind.
-            %% NEVER copy auth_fun onto the :50051 agent listener: it is
-            %% verify_none (unenrolled agents bootstrap there), and grpcbox
-            %% rejects every certless peer once an auth_fun is installed.
-            #{grpc_opts => #{
-                service_protos => [management_pb],
-                services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
-                auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1
-            },
-            listen_opts => #{port => 50063, ip => {0,0,0,0}},
-            transport_opts => #{ssl => true,
-                                certfile   => "/etc/yuzu/certs/default-gateway.pem",
-                                keyfile    => "/etc/yuzu/certs/default-gateway.key",
-                                cacertfile => "/etc/yuzu/certs/default-ca.pem"}}
-        ]}
+        ]}}
     ]},
 
     {kernel, [

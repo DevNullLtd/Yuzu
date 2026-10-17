@@ -3701,6 +3701,236 @@ tests:
         eval_time: 30m
         exp_samples: []
 
+  # CASE V -- a trusted proxy that keeps sending no usable address fires
+  # YuzuGatewayOriginUnusable after its 10m `for:`, labelled with instance, mode and
+  # reason (nothing else). The counters are pre-seeded to 0, so the series is present
+  # from the start (`0x5`) and then rises. g2 is flat: a healthy proxied listener
+  # stays quiet. RED if the reason matcher dropped bad_claim or no_claim, if the `for:`
+  # were dropped (it would fire at 10m), or if the aggregation lost a label.
+  - interval: 1m
+    name: gateway origin unusable - sustained no_claim and bad_claim fire after for
+    input_series:
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g1",mode="forwarded_for",reason="no_claim"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g3",mode="proxy_protocol",reason="bad_claim"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g2",mode="forwarded_for",reason="no_claim"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing", instance="g1", mode="forwarded_for", reason="no_claim", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing", instance="g3", mode="proxy_protocol", reason="bad_claim", severity="warning"}'
+            value: 1
+
+  # CASE W -- untrusted_source does NOT fire YuzuGatewayOriginUnusable (a different
+  # condition with its own alert), and a single no_claim increment (t5 to t6, then
+  # flat) keeps the 10m increase above zero only until about t14, so the alert is pending
+  # from t6 and its expression is false again before the 10m `for:` elapses: it
+  # never fires. The 12m check is the one that would catch a dropped `for:` (the
+  # alert would be firing then); the 20m and 40m checks cannot, since by then the
+  # burst has aged out of the window either way (CASE V is the other `for:` guard).
+  # RED if the matcher became a regex that includes untrusted_source, or the `for:`
+  # were shortened below the burst length.
+  - interval: 1m
+    name: gateway origin unusable - untrusted_source and a short burst stay quiet
+    input_series:
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g1",mode="forwarded_for",reason="untrusted_source"}'
+        values: "0x5 1+1x40"
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g2",mode="proxy_protocol",reason="no_claim"}'
+        values: "0x5 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples: []
+
+  # CASE X -- a steady untrusted_source rate fires YuzuGatewayOriginSourcesMismatch
+  # only after its 30m `for:` (still quiet at 20m), labelled with instance and mode
+  # (the reason is part of the matcher, not a label). A steady no_claim rate on
+  # another listener does not fire it. RED if the `for:` were shortened or the
+  # matcher widened.
+  - interval: 1m
+    name: gateway origin sources mismatch - sustained untrusted_source fires after for
+    input_series:
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g1",mode="forwarded_for",reason="untrusted_source"}'
+        values: "0x5 1+1x60"
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g2",mode="forwarded_for",reason="no_claim"}'
+        values: "0x5 1+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginSourcesMismatch", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginSourcesMismatch", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayOriginSourcesMismatch", alertstate="firing", instance="g1", mode="forwarded_for", severity="warning"}'
+            value: 1
+
+  # CASE Y -- a counter that stopped rising (a probe long ago, value 3 for the whole
+  # hour) is quiet. This guards the expression's use of increase(): comparing the
+  # raw counter to zero would fire here after the 30m `for:`. RED if increase() were
+  # dropped. It does not guard the matcher or the `for:` (CASE X does).
+  - interval: 1m
+    name: gateway origin sources mismatch - a counter that stopped rising stays quiet
+    input_series:
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g1",mode="proxy_protocol",reason="untrusted_source"}'
+        values: "3x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginSourcesMismatch", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # ── YuzuGatewayUpstreamSlow (up-5) ────────────────────────────────────────
+  #
+  # The gauge is the gateway's own trailing-60 s figure, so the rule only asks
+  # that it HOLD: 5 minutes of 1 before firing, and a dip to 0 starts the 5
+  # minutes again. A rule that fired on the first 1 would page on every restart
+  # herd; one that never reset on a dip would fire on a gateway that flaps.
+
+  # CASE A -- slow from minute 5: pending (quiet) at 8m, firing at 12m, for the
+  # slow gateway only. The other gateway sits at 0 the whole time. RED if the
+  # `== 1` were dropped (g2 would fire) or `for:` shortened (8m would fire).
+  - interval: 1m
+    name: gateway upstream slow - sustained slow fires after for, for that gateway only
+    input_series:
+      - series: 'yuzu_gw_upstream_slow{job="yuzu-gateway",instance="g1"}'
+        values: "0x4 1x40"
+      - series: 'yuzu_gw_upstream_slow{job="yuzu-gateway",instance="g2"}'
+        values: "0x44"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
+  # CASE B -- a herd that drains: slow for 4 minutes, then clear. Never fires.
+  # RED if `for:` were under 4m.
+  - interval: 1m
+    name: gateway upstream slow - a short episode stays quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_slow{job="yuzu-gateway",instance="g1"}'
+        values: "1x3 0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE C -- a dip resets the five minutes: slow for 3m, 0 at minute 4, slow
+  # again from minute 5. The first run is shorter than `for:`, so the alert is
+  # quiet at 9m (4 minutes after the dip) and firing at 12m. RED if the rule
+  # smoothed the gauge so that a dip did not reset (it would fire at 9m or earlier).
+  - interval: 1m
+    name: gateway upstream slow - a dip to 0 starts the for period again
+    input_series:
+      - series: 'yuzu_gw_upstream_slow{job="yuzu-gateway",instance="g1"}'
+        values: "1x3 0 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
+  # CASE D -- a gateway that has never been slow (the gauge is created at 0)
+  # never fires, however long it runs.
+  - interval: 1m
+    name: gateway upstream slow - a gauge that stays 0 never fires
+    input_series:
+      - series: 'yuzu_gw_upstream_slow{job="yuzu-gateway",instance="g1"}'
+        values: "0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow"}'
+        eval_time: 100m
+        exp_samples: []
+
+  # ── YuzuGatewayNotifyUnacknowledged (NOTIFY-ACK, #5695) ─────────────────
+  #
+  # The gauge counts refused notices the gateway still holds to send again.
+  # The rule asks that refusals HOLD for 10 minutes (ten times the longest
+  # backoff): a route store that cannot be read for a few minutes must stay
+  # quiet, a server that keeps refusing must fire, and a dip to 0 (everything
+  # acknowledged) starts the ten minutes again.
+
+  # CASE A -- refusals from minute 2 that never stop: quiet at 11m (pending),
+  # firing at 13m, for that gateway only; g2 sits at 0. RED if `> 0` were
+  # dropped (g2 would fire) or `for:` shortened (11m would fire).
+  - interval: 1m
+    name: gateway notify unacknowledged - persistent refusals fire after for, for that gateway only
+    input_series:
+      - series: 'yuzu_gw_upstream_notify_unacked_keys{job="yuzu-gateway",instance="g1"}'
+        values: "0x1 500x40"
+      - series: 'yuzu_gw_upstream_notify_unacked_keys{job="yuzu-gateway",instance="g2"}'
+        values: "0x42"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 13m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
+  # CASE B -- a brief blip: 500 refused for 4 minutes (a route store that
+  # could not be read), then every resend acknowledged. Never fires. RED if
+  # `for:` were 3m or less (firing at 4m).
+  - interval: 1m
+    name: gateway notify unacknowledged - a brief blip stays quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_notify_unacked_keys{job="yuzu-gateway",instance="g1"}'
+        values: "0 500x3 0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE C -- a dip to 0 starts the ten minutes again: refused from minute 1
+  # to minute 8, all acknowledged at minutes 9 and 10, refused again from
+  # minute 11. Quiet at 18m (the second run is 7 minutes old), firing at 21m.
+  # RED if the rule smoothed the gauge over a window (it would fire at 11m or
+  # soon after, the first run plus the dip lasting ten minutes).
+  - interval: 1m
+    name: gateway notify unacknowledged - a dip to 0 starts the for period again
+    input_series:
+      - series: 'yuzu_gw_upstream_notify_unacked_keys{job="yuzu-gateway",instance="g1"}'
+        values: "0 3x7 0 0 3x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 21m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
   # YuzuGatewayUpstreamEncodeErrors (#4632 rounds 4 and 5)
   #
   # A systematic local encode failure (every Register answered INTERNAL, breaker
@@ -3811,4 +4041,760 @@ tests:
         exp_samples: []
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
         eval_time: 29m
+        exp_samples: []
+
+  # YuzuGatewayMemorySheddingActive — the gauge is 1 while the gateway has
+  # suspended its agent listener(s) under memory pressure; the rule needs it true
+  # for 3m so a transient blip of shedding (which is normal and self-healing)
+  # does not page. The gauge is pre-seeded at 0, so a gateway that has never shed
+  # reports 0, not an absent series.
+
+  # CASE: the seeded-0 gauge of a gateway that has never shed stays quiet.
+  - interval: 1m
+    name: gateway memory shedding - a flat zero gauge never fires
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_active{job="yuzu-gateway",instance="g1"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE: a brief blip (shed for two samples, then back to 0) never FIRES (kills a
+  # `for` shorter than 3m, and a bare `== 1` with no `for`). It may be pending
+  # during the blip, but it must never reach firing and must clear afterwards.
+  # `1x1` is samples at minutes 6 and 7; the gauge is 0 again from minute 8.
+  - interval: 1m
+    name: gateway memory shedding - a sub-3m blip never fires
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_active{job="yuzu-gateway",instance="g1"}'
+        values: "0x5 1x1 0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # CASE: sustained shedding is pending at 2m and firing at 4m (kills a `for`
+  # longer than 3m), and resolves after the gauge returns to 0.
+  - interval: 1m
+    name: gateway memory shedding - sustained shedding fires after 3m and resolves
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_active{job="yuzu-gateway",instance="g1"}'
+        values: "0x5 1x10 0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="pending"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="pending", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingActive"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # YuzuGatewayMemorySheddingTransitionFailing -- the shedder could not suspend
+  # or resume an agent listener and is retrying every tick. A failure that
+  # clears inside 5 minutes must not page; one that lasts 5 minutes must, per
+  # action, and resolve once the gauge is back at 0.
+
+  # CASE: the seeded zero of both actions stays quiet.
+  - interval: 1m
+    name: gateway shedder transition failing - seeded zeros never fire
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="resume"}'
+        values: "0x30"
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="suspend"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE: a resume that fails from minute 6 to minute 10 and then succeeds
+  # never fires (kills a `for` of 4m or less, and a bare `> 0`).
+  - interval: 1m
+    name: gateway shedder transition failing - a failure shorter than 5m never fires
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="resume"}'
+        values: "0x5 1x4 0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # CASE: a resume that keeps failing is pending at 3m and firing at 6m (kills
+  # a `for` longer than 5m), carries its action label, and resolves.
+  - interval: 1m
+    name: gateway shedder transition failing - a lasting resume failure fires and resolves
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="resume"}'
+        values: "0x5 1x10 0x20"
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="suspend"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="pending"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="pending", action="resume", instance="g1", job="yuzu-gateway", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing", action="resume", instance="g1", job="yuzu-gateway", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE: a lasting suspend failure fires with action="suspend".
+  - interval: 1m
+    name: gateway shedder transition failing - a lasting suspend failure fires
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="suspend"}'
+        values: "0x2 1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing", action="suspend", instance="g1", job="yuzu-gateway", severity="critical"}'
+            value: 1
+
+  # -- YuzuGatewayUpstreamCircuitOpened (S3, #5695) ---------------------------
+  #
+  # yuzu_gw_telemetry.erl pre-seeds yuzu_gw_upstream_circuit_transitions_total
+  # for closed, open and half_open at 0 when the gateway starts, so the first
+  # open of a fresh process is a 0 -> 1 step. The rule fires when the breaker
+  # opened and has not closed for 3 minutes (clause 1), or when it keeps
+  # opening and closing (clause 2: three closes in 15 minutes). The old rule
+  # (any open in 15 minutes, for 2 minutes) fired on case A below for 17
+  # minutes; it goes red there.
+
+  # CASE A -- a server that comes back inside 3 minutes: open at t6 (`0x5` is
+  # six zeros, t0..t5), closed at t8. Pending at t6, never firing (the close resets the `for: 3m`, and once the open is
+  # older than the close nothing is left to fire on).
+  - interval: 1m
+    name: gateway circuit opened - open then closed within 3m stays quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="open"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="closed"}'
+        values: "0x7 1x28"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="pending", instance="g1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE B -- a server that stays down: the breaker opens at t6 and reopens
+  # every minute (the half-open probe fails), and never closes. Pending from
+  # t6, firing at t9 (`for: 3m`), and still firing while it lasts.
+  - interval: 1m
+    name: gateway circuit opened - open with no close for 3m fires
+    input_series:
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="open"}'
+        values: "0x5 1+1x25"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="closed"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="pending"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="pending", instance="g1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
+            value: 1
+
+  # CASE C -- a flapping server, up just often enough to close the breaker
+  # between failures: it opens at every odd minute and closes at every even
+  # one from t2. Clause 1 never holds for 3 minutes (a close every 2), but the
+  # closes pile up: three in 15 minutes by t6, so it is firing by t10, and it
+  # keeps firing while the flapping lasts.
+  - interval: 1m
+    name: gateway circuit opened - a flapping breaker that mostly fails still fires
+    input_series:
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="open"}'
+        values: "0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="half_open"}'
+        values: "0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="closed"}'
+        values: "0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
+        eval_time: 24m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
+            value: 1
+
+  # CASE D -- the first open of a fresh process (no series before it starts at
+  # t5; `_x5` is five missing samples) that is never followed by a close:
+  # pending at 7m, firing at 10m.
+  - interval: 1m
+    name: gateway circuit opened - first open of a fresh process fires
+    input_series:
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="open"}'
+        values: "_x5 0x1 1x20"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="closed"}'
+        values: "_x5 0x22"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="pending"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="pending", instance="g1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
+            value: 1
+
+  # CASE E -- a crash-looping gateway: each life seeds `open` at 0, opens once
+  # and dies before the next scrape (`_`). The breaker never closes, so the
+  # alert fires and stays firing while the loop lasts.
+  - interval: 1m
+    name: gateway circuit opened - a gateway that opens once per life fires
+    input_series:
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="open"}'
+        values: "0 1 _ 0 1 _ 0 1 _ 0 1 _ 0 1 _ 0 1 _ 0 1 _"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
+            value: 1
+
+  # CASE F -- a healthy gateway (every seeded series at 0, never moving) is quiet.
+  - interval: 1m
+    name: gateway circuit opened - seeded zero series stay quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="open"}'
+        values: "0x40"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="half_open"}'
+        values: "0x40"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="closed"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # -- Gateway mgmt-plane rejections: rotation must not page (owner policy,
+  #    2026-10-17: "a page should only happen when someone needs to do
+  #    something") -------------------------------------------------------------
+  #
+  # A routine server-leaf rotation produces a few pin_mismatch rejections just
+  # BEFORE the gateway's pin watcher publishes the new key and sets
+  # yuzu_gw_mgmt_pin_rotated_timestamp_seconds. YuzuGatewayMgmtPinMismatch
+  # reads the counter one minute late and is suppressed for 240 s after the
+  # timestamp; YuzuGatewayMgmtAuthRejected no longer counts pin_mismatch. The
+  # old single rule (increase()[1h] > 0 over every reason) fires on case A for
+  # an hour; these cases go red against it.
+
+  # CASE A -- the rotation race at a 1m scrape: the rejections (t = 8m57s) are
+  # scraped at 9m, the watcher publishes the new key at 9m02s (542 s), and the
+  # timestamp is scraped one interval later, at 10m. Neither rule may be
+  # pending or firing at any evaluation.
+  - interval: 1m
+    name: gateway mgmt pin_mismatch - rotation rejections scraped before the rotation stay quiet
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="pin_mismatch"}'
+        values: "0x8 3x40"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="bad_peer_cert"}'
+        values: "0x48"
+      - series: 'yuzu_gw_mgmt_pin_rotated_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "0x9 542x39"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 13m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE A2 -- the same race at a 15 s scrape (rejections scraped at 9m00s,
+  # key published at 9m02s, timestamp scraped at 9m15s), checked every 15 s
+  # across the whole window the rejections can be counted in.
+  - interval: 15s
+    name: gateway mgmt pin_mismatch - rotation at a 15s scrape stays quiet
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="pin_mismatch"}'
+        values: "0x35 2x100"
+      - series: 'yuzu_gw_mgmt_pin_rotated_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "0x36 542x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 9m15s
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 10m15s
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 11m45s
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 13m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE B -- the rotation happened (542 s) but rejections keep coming every
+  # minute: the server presents a key the gateway still does not pin. Quiet
+  # while suppressed (to 782 s), firing at the first evaluation after.
+  - interval: 1m
+    name: gateway mgmt pin_mismatch - rejections continuing after a rotation fire
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="pin_mismatch"}'
+        values: "0x8 3+1x40"
+      - series: 'yuzu_gw_mgmt_pin_rotated_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "0x9 542x39"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 13m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 14m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch", alertstate="firing", instance="g1", job="yuzu-gateway", reason="pin_mismatch", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 14m
+        exp_samples: []
+
+  # CASE C -- pin_mismatch and the rotation gauge was never set (absent: an
+  # older gateway, or the series not scraped). Fires a minute after the
+  # rejection is scraped (the offset), not before.
+  - interval: 1m
+    name: gateway mgmt pin_mismatch - no rotation gauge fires
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="pin_mismatch"}'
+        values: "0x5 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch", alertstate="firing", instance="g1", job="yuzu-gateway", reason="pin_mismatch", severity="critical"}'
+            value: 1
+
+  # CASE C2 -- pin_mismatch with the gauge at its seeded 0 (no rotation in
+  # this gateway process): 0 must not suppress, so it fires too. A one-off
+  # rejection is enough (the pinned file was never updated, or a key holder
+  # probed once).
+  - interval: 1m
+    name: gateway mgmt pin_mismatch - seeded zero rotation gauge does not suppress
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="pin_mismatch"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_mgmt_pin_rotated_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "0x36"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch", alertstate="firing", instance="g1", job="yuzu-gateway", reason="pin_mismatch", severity="critical"}'
+            value: 1
+
+  # CASE D -- any other reason fires at once, rotation or not, and only under
+  # the old name.
+  - interval: 1m
+    name: gateway mgmt rejection - another reason fires promptly even during a rotation
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="missing_server_auth_eku"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_mgmt_pin_rotated_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "0x5 330x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="missing_server_auth_eku", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 8m
+        exp_samples: []
+
+  # -- Gateway pin file and certificate files unreadable --------------------
+  #
+  # A pin file whose latest read failed keeps its last key (commands still
+  # flow), so this is a warning that waits out one half-written file.
+
+  # CASE E -- the pin file stays unreadable: pending at 6m, firing at 8m.
+  - interval: 1m
+    name: gateway pin file unreadable - fires after 2m
+    input_series:
+      - series: 'yuzu_gw_cert_file_readable{job="yuzu-gateway",instance="g1",role="mgmt_peer_pin",name="default-server.pem"}'
+        values: "1x5 0x20"
+      - series: 'yuzu_gw_mgmt_auth_pin_unresolved_total{job="yuzu-gateway",instance="g1"}'
+        values: "0x25"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing", instance="g1", job="yuzu-gateway", name="default-server.pem", role="mgmt_peer_pin", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayCertificateFileUnreadable"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE E1 -- the counter half: a configured pin that has never resolved
+  # counts a management call; the file gauge stays 1 (another entry reads).
+  - interval: 1m
+    name: gateway pin never resolved - the counter fires after 2m
+    input_series:
+      - series: 'yuzu_gw_cert_file_readable{job="yuzu-gateway",instance="g1",role="mgmt_peer_pin",name="default-server.pem"}'
+        values: "1x25"
+      - series: 'yuzu_gw_mgmt_auth_pin_unresolved_total{job="yuzu-gateway",instance="g1"}'
+        values: "0x5 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
+  # CASE E2 -- one scrape caught a half-written pin file: no page.
+  - interval: 1m
+    name: gateway pin file unreadable - a single bad read does not fire
+    input_series:
+      - series: 'yuzu_gw_cert_file_readable{job="yuzu-gateway",instance="g1",role="mgmt_peer_pin",name="default-server.pem"}'
+        values: "1x5 0 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+
+  # CASE E3 -- a listener certificate file unreadable for 10m fires the
+  # other rule (and not the pin rule).
+  - interval: 1m
+    name: gateway listener certificate file unreadable - fires after 10m
+    input_series:
+      - series: 'yuzu_gw_cert_file_readable{job="yuzu-gateway",instance="g1",role="listener",name="agent"}'
+        values: "1x5 0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayCertificateFileUnreadable", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayCertificateFileUnreadable", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayCertificateFileUnreadable", alertstate="firing", instance="g1", job="yuzu-gateway", name="agent", role="listener", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved"}'
+        eval_time: 16m
+        exp_samples: []
+
+  # -- Certificate expiry ladder (server and gateway) ------------------------
+  #
+  # promtool's clock starts at 0, so a gauge holding N seconds has N - t left
+  # at evaluation time t. One band fires at a time: 30d..7d warning
+  # (ExpiringSoon, for 1h), 7d..24h critical (ExpiryImminent, for 10m),
+  # under 24h critical (ExpiryCritical: gateway for 5m, server for 10m).
+
+  # 40 days left: nothing, at any band.
+  - interval: 1m
+    name: cert expiry ladder - 40 days left is quiet (gateway and server)
+    input_series:
+      - series: 'yuzu_gw_cert_expiry_timestamp_seconds{job="yuzu-gateway",instance="g1",role="listener",name="agent"}'
+        values: "3456000x180"
+      - series: 'yuzu_server_cert_expiry_timestamp_seconds{job="yuzu-server",instance="s1",cert="default-ca"}'
+        values: "3456000x180"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)"}'
+        eval_time: 150m
+        exp_samples: []
+
+  # 20 days left: ExpiringSoon only, firing after its hour.
+  - interval: 1m
+    name: cert expiry ladder - 20 days left warns (gateway and server)
+    input_series:
+      - series: 'yuzu_gw_cert_expiry_timestamp_seconds{job="yuzu-gateway",instance="g1",role="upstream_client",name="default_channel"}'
+        values: "1728000x180"
+      - series: 'yuzu_server_cert_expiry_timestamp_seconds{job="yuzu-server",instance="s1",cert="default-ca"}'
+        values: "1728000x180"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)", alertstate="firing"}'
+        eval_time: 59m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)"}'
+        eval_time: 61m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayCertificateExpiringSoon", alertstate="firing", instance="g1", job="yuzu-gateway", name="default_channel", role="upstream_client", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCertificateExpiringSoon", alertstate="firing", instance="s1", job="yuzu-server", cert="default-ca", severity="warning"}'
+            value: 1
+
+  # 5 days left: ExpiryImminent only (critical), firing after 10m.
+  - interval: 1m
+    name: cert expiry ladder - 5 days left is imminent (gateway and server)
+    input_series:
+      - series: 'yuzu_gw_cert_expiry_timestamp_seconds{job="yuzu-gateway",instance="g1",role="mgmt_peer_pin",name="default-server.pem"}'
+        values: "432000x60"
+      - series: 'yuzu_server_cert_expiry_timestamp_seconds{job="yuzu-server",instance="s1",cert="default-ca"}'
+        values: "432000x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayCertificateExpiryImminent", alertstate="firing", instance="g1", job="yuzu-gateway", name="default-server.pem", role="mgmt_peer_pin", severity="critical"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCertificateExpiryImminent", alertstate="firing", instance="s1", job="yuzu-server", cert="default-ca", severity="critical"}'
+            value: 1
+
+  # 12 hours left: ExpiryCritical only. The gateway rule fires after 5m, the
+  # server rule after 10m.
+  - interval: 1m
+    name: cert expiry ladder - 12 hours left is critical (gateway and server)
+    input_series:
+      - series: 'yuzu_gw_cert_expiry_timestamp_seconds{job="yuzu-gateway",instance="g1",role="listener_ca",name="mgmt"}'
+        values: "43200x60"
+      - series: 'yuzu_server_cert_expiry_timestamp_seconds{job="yuzu-server",instance="s1",cert="default-ca"}'
+        values: "43200x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)", alertstate="firing"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayCertificateExpiryCritical", alertstate="firing", instance="g1", job="yuzu-gateway", name="mgmt", role="listener_ca", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayCertificateExpiryCritical", alertstate="firing", instance="g1", job="yuzu-gateway", name="mgmt", role="listener_ca", severity="critical"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCertificateExpiryCritical", alertstate="firing", instance="s1", job="yuzu-server", cert="default-ca", severity="critical"}'
+            value: 1
+
+  # ── Gateway capacity alerts (#5695, METRICS workstream) ───────────────────
+  #
+  # Three gauges sampled by yuzu_gw_gauge, each alert held for 10 minutes so a
+  # reconnect herd that drains does not page.
+
+  # YuzuGatewayListenerNearConnectionCeiling. CASE A -- the agent listener at
+  # 95% of its ceiling from minute 0: quiet at 9m, firing at 11m, for that
+  # listener only (the management listener at 4% stays quiet). RED if `for:`
+  # were shortened or the 0.9 factor dropped (management would not fire either
+  # way; agent would fire at 9m).
+  - interval: 1m
+    name: gateway listener near its ceiling - sustained, that listener only
+    input_series:
+      - series: 'yuzu_gw_listener_connections{job="yuzu-gateway",instance="g1",listener="agent"}'
+        values: "950x20"
+      - series: 'yuzu_gw_listener_max_connections{job="yuzu-gateway",instance="g1",listener="agent"}'
+        values: "1000x20"
+      - series: 'yuzu_gw_listener_connections{job="yuzu-gateway",instance="g1",listener="management"}'
+        values: "10x20"
+      - series: 'yuzu_gw_listener_max_connections{job="yuzu-gateway",instance="g1",listener="management"}'
+        values: "256x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayListenerNearConnectionCeiling", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayListenerNearConnectionCeiling", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayListenerNearConnectionCeiling", alertstate="firing", instance="g1", job="yuzu-gateway", listener="agent", severity="warning"}'
+            value: 1
+
+  # CASE B -- a herd at 95% for 8 minutes that then drains never fires; and a
+  # listener with no ceiling (no max series: the default) never fires however
+  # many connections it holds.
+  - interval: 1m
+    name: gateway listener near its ceiling - a short herd, and no ceiling, stay quiet
+    input_series:
+      - series: 'yuzu_gw_listener_connections{job="yuzu-gateway",instance="g1",listener="agent"}'
+        values: "950x7 100x30"
+      - series: 'yuzu_gw_listener_max_connections{job="yuzu-gateway",instance="g1",listener="agent"}'
+        values: "1000x37"
+      - series: 'yuzu_gw_listener_connections{job="yuzu-gateway",instance="g2",listener="agent"}'
+        values: "100000x37"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayListenerNearConnectionCeiling"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # YuzuGatewayFileDescriptorsNearLimit. CASE A -- the file descriptor limit is
+  # the lower one: fires at 11m. CASE B (g2) -- the VM's port limit is the
+  # lower one and the fd limit is not reported (an absent series): fires too.
+  # g3 at half its limits stays quiet. RED if either side of the `or` went.
+  - interval: 1m
+    name: gateway ports near the fd or port limit - either limit fires, half does not
+    input_series:
+      - series: 'yuzu_gw_beam_ports{job="yuzu-gateway",instance="g1"}'
+        values: "950x20"
+      - series: 'yuzu_gw_beam_fd_limit{job="yuzu-gateway",instance="g1"}'
+        values: "1000x20"
+      - series: 'yuzu_gw_beam_port_limit{job="yuzu-gateway",instance="g1"}'
+        values: "65536x20"
+      - series: 'yuzu_gw_beam_ports{job="yuzu-gateway",instance="g2"}'
+        values: "950x20"
+      - series: 'yuzu_gw_beam_port_limit{job="yuzu-gateway",instance="g2"}'
+        values: "1000x20"
+      - series: 'yuzu_gw_beam_ports{job="yuzu-gateway",instance="g3"}'
+        values: "500x20"
+      - series: 'yuzu_gw_beam_fd_limit{job="yuzu-gateway",instance="g3"}'
+        values: "1000x20"
+      - series: 'yuzu_gw_beam_port_limit{job="yuzu-gateway",instance="g3"}'
+        values: "1000x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayFileDescriptorsNearLimit", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayFileDescriptorsNearLimit", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayFileDescriptorsNearLimit", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayFileDescriptorsNearLimit", alertstate="firing", instance="g2", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
+  # YuzuGatewayProcessBacklogged. CASE A -- the registry holds 20,000 messages
+  # from minute 0: firing at 11m with its process label; the router at 50 stays
+  # quiet. CASE B (g2) -- a reconnect herd: 50,000 for 5 minutes, then drained:
+  # never fires. RED if `for:` were under 5m or the threshold dropped.
+  - interval: 1m
+    name: gateway process backlogged - sustained fires for that process, a drained burst does not
+    input_series:
+      - series: 'yuzu_gw_process_mailbox_len{job="yuzu-gateway",instance="g1",process="registry"}'
+        values: "20000x20"
+      - series: 'yuzu_gw_process_mailbox_len{job="yuzu-gateway",instance="g1",process="router"}'
+        values: "50x20"
+      - series: 'yuzu_gw_process_mailbox_len{job="yuzu-gateway",instance="g2",process="registry"}'
+        values: "50000x4 0x16"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayProcessBacklogged", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayProcessBacklogged", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayProcessBacklogged", alertstate="firing", instance="g1", job="yuzu-gateway", process="registry", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayProcessBacklogged", instance="g2"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # YuzuGatewayAgentOwnerCrashLoop (OWNER-RESTART, #5695). CASE A (g1) -- one
+  # owner gives up at t5 (the series is pre-seeded at 0, so it is a 0 -> 1
+  # step): firing at once, still firing at 30m, quiet at 40m. CASE B (g2) --
+  # 50 restarted owners that recovered and 3 that ended with the agent
+  # reconnecting, none that gave up: never fires. RED if the outcome filter
+  # went (case B would fire) or the window shrank below 30m.
+  - interval: 1m
+    name: gateway agent owner crash loop - a give-up fires for 30m, recovered restarts do not
+    input_series:
+      - series: 'yuzu_gw_agent_owner_restarts_total{job="yuzu-gateway",instance="g1",outcome="gave_up"}'
+        values: "0x4 1x40"
+      - series: 'yuzu_gw_agent_owner_restarts_total{job="yuzu-gateway",instance="g2",outcome="gave_up"}'
+        values: "0x45"
+      - series: 'yuzu_gw_agent_owner_restarts_total{job="yuzu-gateway",instance="g2",outcome="recovered"}'
+        values: "0x4 50x40"
+      - series: 'yuzu_gw_agent_owner_restarts_total{job="yuzu-gateway",instance="g2",outcome="disconnected_only"}'
+        values: "0x4 3x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop"}'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop"}'
+        eval_time: 40m
         exp_samples: []

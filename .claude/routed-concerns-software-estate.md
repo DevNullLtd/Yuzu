@@ -6,7 +6,7 @@
      remain in the sibling `routed-concerns.md`, auth/access-control/
      request-admission in `routed-concerns-access-control.md`, the
      security-posture plugins (Wave 8, a concurrently-developed split) and
-     the gateway-upstream peer-authorization row in
+     the gateway rows in
      `routed-concerns-security-posture.md`; four files is the cap
      (docs/instruction-file-standard.md). Row
      discipline unchanged: catastrophic-if-violated invariants + doc

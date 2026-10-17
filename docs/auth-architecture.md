@@ -3991,7 +3991,7 @@ CIDR containment in `cidr_match.{hpp,cpp}`.
 
 **Gateway origin-IP attribution (#1064).** On the gateway `ProxyRegister` path
 the server's transport peer is the *gateway's* IP, so audit rows would
-mis-attribute the source (SOC 2 IR-2). `RegisterRequest.gateway_observed_peer`
+mis-attribute the source (SOC 2 CC7.2). `RegisterRequest.gateway_observed_peer`
 (an optional, gateway-authoritative, transport-agnostic field — carried in the
 message, not in transport metadata) carries the agent's origin IP; the server records
 `source_ip`=agent origin and `gateway_ip`=transport peer, falling back to the
@@ -3999,11 +3999,22 @@ gateway IP (`origin_observed=false`) when absent. The *direct* Register path
 ignores the field, so a *direct* agent cannot forge a source IP. It is **not** a
 defence against a compromised gateway (which is inside the trust boundary and
 can set any value) — both `source_ip` and the gateway's `gateway_ip` are
-recorded so an auditor can cross-check. **Server-side consumption ships now; the
-gateway-side population is a follow-up** — today's grpcbox transport can only
-source it from `x-forwarded-for` (proxied deployments); grpcbox does not yet
-expose the transport peer to the gateway's handlers, and the vendored accessor
-that will is #1172.
+recorded so an auditor can cross-check. **The gateway sets the field itself and
+discards whatever the agent sent** (`yuzu_gw_agent_service:register/2`): the value
+is the call's origin address as the gateway's own gRPC layer decides it — the
+transport peer by default, or the address a trusted proxy vouched for when the
+listener is configured with an `origin` mode (`proxy_protocol` or `forwarded_for`,
+judged by who connected, never by whether the claim matches; a claim from a peer
+that is not a configured proxy is ignored, and attributed to its TCP peer) — as a
+bare IP text. Empty means no observation: on a listener configured as proxied, a
+trusted proxy that gave no usable address (a PROXY `LOCAL`, a missing or unusable
+`x-forwarded-for`) is sent as empty rather than attributed to the proxy itself, and the
+server then records `source_ip`=the gateway node with `origin_observed=false`. A
+listener left in `transport` mode behind a proxy that was never configured records the
+proxy's address and nothing flags it. The server cannot tell a gateway that overwrites
+the field from an older one that forwards the agent's value, so all gateways must be
+upgraded before `source_ip` is relied on. See `docs/user-manual/gateway.md`,
+"Client addresses behind a proxy".
 
 ## HTTPS and bind defaults (hard invariants)
 
@@ -4056,8 +4067,9 @@ issued leaf's `CN` *is* the `agent_id` the server already checks.
 Issuance happens on **both** the direct `Register` and the gateway-proxied
 `ProxyRegister` paths (PKI PR5d — both share one `sign_agent_csr` chokepoint); see
 `docs/pki-architecture.md` "Per-agent enrollment through the gateway" for the
-gateway specifics (the agent↔gateway hop is one-way TLS in M1, so through-gateway
-identity stays the app-layer `gateway_observed_peer` until gateway mTLS lands).
+gateway specifics (the agent↔gateway hop is one-way TLS in M1, so through the gateway the
+agent's address is attributed by the app-layer `gateway_observed_peer` — attribution, not
+authentication — until gateway mTLS lands).
 
 **Bootstrap (chicken-and-egg) — resolved on one port.** The agent has no client
 cert on first boot, but the data plane requires one. Resolution:
@@ -4221,8 +4233,9 @@ direct-connect-authoritative caveat called out in `docs/pki-architecture.md`
 **Gateway CSR-swap forgery (R-5, accepted M1 residual).** Wiring `ProxyRegister`
 to sign forwarded CSRs makes the gateway a bounded **confused deputy**. The
 server signs the relayed CSR's public key under the **gateway-supplied**
-`agent_id` (the through-gateway identity is the app-layer `gateway_observed_peer`,
-not a transport-cryptographic binding in M1), so a compromised or on-path gateway
+`agent_id` (through the gateway the `agent_id` is a gateway-supplied message field and the
+agent's address is the app-layer `gateway_observed_peer`: attribution, not authentication,
+and not a transport-cryptographic binding in M1), so a compromised or on-path gateway
 can relay a *victim's* `agent_id` paired with its *own* CSR and obtain a real
 CA-signed leaf for that `agent_id`. Worse than a transient relay: that leaf is a
 durable credential the attacker can present for **persistent direct mTLS

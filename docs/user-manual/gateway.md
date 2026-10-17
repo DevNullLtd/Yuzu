@@ -90,7 +90,9 @@ all writes to that agent go through its mailbox with no mutex contention.
 
 | State | Description |
 |---|---|
-| `connecting` | Agent called Register; forwarded to upstream server; awaiting session_id |
+| `registering` | The first event after the process starts: it enters the routing table (the session was already registered with the server by `Register`) |
+| `recovering` | The first event of an agent process restarted after a crash: see [When an agent's owner process crashes](#when-an-agents-owner-process-crashes) |
+| `connecting` | Registered, waiting for the Subscribe stream (only for a process started without one) |
 | `streaming` | Bidi stream active; agent process owns the stream writer |
 | `disconnected` | Stream broken or heartbeat timeout; cleanup and termination |
 
@@ -107,13 +109,19 @@ The gateway source lives in `gateway/apps/yuzu_gw/src/`:
 | `yuzu_gw_sup` | Top-level supervisor |
 | `yuzu_gw_agent_sup` | `simple_one_for_one` supervisor for agent processes |
 | `yuzu_gw_agent` | `gen_statem`: one process per agent bidi stream |
-| `yuzu_gw_registry` | Process groups + ETS routing table, plus the node-local session index used by heartbeat admission |
+| `yuzu_gw_registry` | ETS routing table, plus the node-local session index used by heartbeat admission. It makes no `pg` call: each agent process joins its own `{agent, Id}` group, which a node reads to find an agent held by another node |
 | `yuzu_gw_router` | Command fanout coordinator |
-| `yuzu_gw_upstream` | gRPC client to the C++ server: one channel, one HTTP/2 connection, one call at a time (see "Registration rate per gateway" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
+| `yuzu_gw_upstream` | Owner of the circuit breaker, the held stream-status notifications and the registration replay; makes no RPC itself (proxied calls run in the caller, notifications and replays in workers; #5695) |
+| `yuzu_gw_upstream_regulator` | Permits for proxied `Register` and inventory calls and for replays, with a bounded wait queue whose entries carry the caller's deadline (see "Upstream call permits") |
+| `yuzu_grpc_client`, `yuzu_grpc_client_channel`, `yuzu_grpc_client_config` | The upstream gRPC client, unary calls only (see [The upstream client](#the-upstream-client)): `yuzu_grpc_client` makes one call over a connection the channel hands it, `yuzu_grpc_client_channel` keeps a pool of HTTP/2 connections (gun) per endpoint open and reopens them, `yuzu_grpc_client_config` reads `{yuzu_gw, upstream_client}` |
 | `yuzu_gw_agent_service` | Agent-facing gRPC server (AgentService proxy) |
-| `yuzu_gw_conn` | Connection key (the HTTP/2 connection pid) of an agent-facing gRPC call, read through the vendored grpcbox accessors |
+| `yuzu_gw_conn` | Connection key (the HTTP/2 connection pid) of an agent-facing gRPC call, read from the call's context or stream |
 | `yuzu_gw_heartbeat_admission` | Admission decision for agent `Heartbeat` calls (session held by this node and call on the connection that opened it), rejection counters and the rate-limited summary log line |
 | `yuzu_gw_mgmt_service` | Operator-facing gRPC server (ManagementService proxy) |
+| `yuzu_grpc_listener` | One gRPC listener per `grpc_listeners` entry: a Ranch listener running Cowboy's HTTP/2 connection with `yuzu_grpc_stream_h` as its only stream handler; a `gen_server` the supervisor starts as one of its last children |
+| `yuzu_grpc_stream_h` | Cowboy stream handler: runs the listener's `auth_fun` on the peer certificate, resolves the caller's address (`yuzu_grpc_origin`), routes the call and spawns the handler |
+| `yuzu_grpc_origin` | Which address a call is attributed to (transport peer, PROXY protocol header, `x-forwarded-for`); pure |
+| `yuzu_grpc`, `yuzu_grpc_stream`, `yuzu_grpc_route`, `yuzu_grpc_runner`, `yuzu_grpc_frame` | The rest of the gRPC layer: context accessors (`peer/1`, `origin/1`, `peer_cert/1`), the stream API handlers use (`send/2`), route table built from the proto modules, handler runner (unary, server-streaming, bidi), and gRPC message framing |
 | `yuzu_gw_telemetry` | Telemetry event definitions and handlers |
 | `yuzu_gw_gauge` | Periodic gauge emission for Prometheus |
 | `yuzu_gw_proto` | Protobuf encode/decode wrappers |
@@ -132,6 +140,23 @@ server handles enrollment logic (token validation, pending approval queue)
 and returns a `RegisterResponse` with a session ID. The gateway relays the
 response to the agent and starts an agent process.
 
+The `ProxyRegister` (and `ProxyInventory`) call runs in the process of the agent's
+own gRPC request, not inside the `yuzu_gw_upstream` process (#5695), so registrations
+go to the server in parallel. Each needs a permit first ("Upstream call permits"
+below): 48 at a time for `Register` by default, 8 for inventory. A request that finds
+every permit taken waits in a bounded queue with its own deadline, the agent's
+`grpc-timeout` less the stream handler's margin; it is refused `UNAVAILABLE` (the agent
+retries) when the queue is full or its deadline passes first, and a request that ran
+out of time while it waited is never sent, so the server never registers an agent
+nobody is waiting for. The call to the server gets what is left of that deadline, at
+most `upstream_rpc_timeout_ms` (5 s), and sends it as `grpc-timeout`. If the agent's
+call is cancelled (the stream is reset, the deadline passes or the connection closes),
+the request's process is stopped: its permit or its place in the queue is freed by its
+exit, and its reservation is released at once. A call already in flight to the server
+is not cancelled. An open breaker, a full queue, a passed deadline and a planned stop
+are all answered `UNAVAILABLE`. Stream status, Guardian forwards and registration
+replays are not affected.
+
 When the server's built-in CA is active, that `RegisterResponse` now also carries
 a signed **per-agent client certificate** — the same certificate an agent would
 receive on the direct-connect path (PKI PR5d). The gateway relays the full
@@ -141,9 +166,10 @@ presented leaf but does **not** prevent re-enrollment; to stop an agent from
 re-enrolling and re-obtaining a certificate, **deny** the agent (dashboard
 Devices → deny). Both the direct and gateway paths reject a denied agent before
 signing. (In M1 the agent↔gateway hop is one-way TLS, so the agent's client cert
-is not yet verified at the gateway transport — through-gateway identity remains
-the app-layer `gateway_observed_peer`; the issued cert is for inventory,
-revocation, and the future gateway-mTLS cutover.)
+is not yet verified at the gateway transport — the agent's address reaches the
+server as the app-layer `gateway_observed_peer`, which is attribution, not
+authentication; the issued cert is for inventory, revocation, and the future
+gateway-mTLS cutover.)
 
 The gateway checks the agent id first, before it handles the peer address,
 reserves a session or sends anything upstream: an empty, missing or non-binary id,
@@ -319,11 +345,17 @@ node failover that leaves the session not held by the surviving node is expected
 behave the same way (inferred, not tested).
 
 **Supported topologies.** Agents connect to the gateway agent listener (`:50051`)
-directly, or through an L4 / TLS-passthrough path that keeps one TCP connection per
-agent end to end (a plain TCP load balancer, an L4 virtual IP, a TLS-passthrough
-proxy). An HTTP/2-terminating or HTTP/2-multiplexing proxy between agents and the
-gateway (including a service-mesh sidecar that terminates HTTP/2) is **not
-supported** for this check: it may cause repeated heartbeat rejection or share
+directly, or through a path that keeps **one gateway-side connection per agent for the
+whole life of its session**: an L4 / TLS-passthrough path (a plain TCP load balancer, an L4
+virtual IP, a TLS-passthrough proxy), or a proxy that terminates HTTP/2 **and is
+configured for connection affinity**, meaning each client connection gets its own
+backend connection, kept for as long as the client connection lives (see
+[Keeping each agent on one backend connection](#keeping-each-agent-on-one-backend-connection)).
+An HTTP/2-terminating proxy that pools backend connections across clients, or that
+sends one agent's calls over several of them (a service-mesh sidecar that terminates
+HTTP/2, nginx `grpc_pass` as observed below), is
+**not supported**: it
+may cause repeated heartbeat rejection or share
 gateway-side connections across agents, removing the per-agent connection separation
 this check requires. It can spread one agent's calls over several
 connections, which shows up as connection mismatches (the `connection_mismatch=`
@@ -341,8 +373,9 @@ per RPC. An agent that re-registers on a new connection (for example after a fai
 to another node) mints a new session, which is compatible with this rule. Multi-node
 behaviour is not tested with a real agent (a two-node registry unit test exists).
 
-*Observed in testing* (a real C++ agent, a plaintext gateway listener, two agents per
-run):
+*Observed in testing.* The first two results are from a real C++ agent against a
+plaintext gateway listener, two agents per run; the last two are 50 agents against a TLS
+agent listener (OKD 4.21 and HAProxy 3.2.25, details below):
 
 - Behind an HTTP/2-terminating proxy (nginx `grpc_pass`, two agents), every heartbeat was
   rejected as a connection mismatch: the mismatch counter rose and nothing reached
@@ -353,29 +386,61 @@ run):
   counters and the gateway summary log, not silently; that is one two-agent test, not
   a guarantee for every HTTP/2-terminating proxy.
 - Behind an L4 TCP forwarder (nginx `stream`), there were zero rejections.
-- A multiplexing HTTP/2 proxy with upstream keepalive was **not tested**.
+- Behind HAProxy 3.2.25 (default settings, and with `http-reuse never`) and behind the
+  OKD 4.21 router (HAProxy 2.8), 50 agents for ten minutes or more each, the mismatch
+  counter stayed at 0 and every agent attributed its real address. HAProxy documents
+  `safe` as reserving a backend connection to the session once it has carried a
+  stream, which matches what was measured. See
+  [Keeping each agent on one backend connection](#keeping-each-agent-on-one-backend-connection).
+- Behind HAProxy 3.2.25 in `mode tcp` with `send-proxy-v2` to a `proxy_protocol` listener,
+  50 agents for ten minutes, the mismatch counter stayed at 0, the zero-valued `no_claim`
+  and `bad_claim` counters stayed at 0, and every agent attributed its real address. A
+  forged PROXY header sent by a client that reached the listener directly (not a listed
+  `source`) was ignored and counted as `untrusted_source`; a client that sent no header was
+  closed after about a second. This is the measured stand-in for an F5 iRule, which was not
+  tested.
+- A multiplexing HTTP/2 proxy with upstream keepalive other than those was **not tested**.
 
 The agent-facing message is the same `unknown session` for every reason (this is
 deliberate, see above), so the agent log cannot tell the reasons apart. Diagnose from
 the counters and the gateway summary log line, not from the agent log.
 
-**Connection drain.** The gateway's HTTP/2 server closes a connection as soon as it
-sends `GOAWAY`, so a `Subscribe` stream and its binding end with the connection;
-there is no drain period. A heartbeat that reaches the gateway on a different
-connection while the old `Subscribe` is still bound is rejected (`NOT_FOUND`,
-connection mismatch), and an agent with the reconnect fix recovers by re-registering. This is what the
-gateway's own tests observed with a test HTTP/2 client. With the real C++ agent (a build
-from the branch tree) a graceful `GOAWAY` injected by the tester on the gateway-side
-connection (the gateway itself did not send one) moved the agent's next heartbeat to a
-new connection: the mismatch counter rose by one, the agent logged `(#1894)` and
-re-registered 16 s after the `GOAWAY`, and acked heartbeats resumed about 30 s later. An
-abrupt close of just that agent's connection made it re-register in 9 s with the
-counters unchanged. A graceful gateway SIGTERM and restart (observed twice) showed the
-branch agent reconnecting in about 11 to 12 s with no rejections; in the second run the released agents
-tested (v0.14.0-rc6, v0.13.0, v0.12.0, default settings) did not notice the lost
-`Subscribe` stream across that restart, their heartbeats got `NOT_FOUND`, and rc6 and
-v0.13.0 then wedged as described above (restart them). A `GOAWAY` originating from the
-gateway on its own was not observed.
+**Connection drain.** Two different things are described here, and only the first was
+measured on the previous stack.
+
+*Measured on the previous (grpcbox) stack, before the Cowboy listeners.* That server
+closed a connection as soon as it sent `GOAWAY`, so a `Subscribe` stream and its binding
+ended with the connection and there was no drain period. A heartbeat that reached the
+gateway on a different connection while the old `Subscribe` was still bound was rejected
+(`NOT_FOUND`, connection mismatch), and an agent with the reconnect fix recovered by
+re-registering. With the real C++ agent (a build from the branch tree) a graceful `GOAWAY`
+injected by the tester on the gateway-side connection (the gateway itself did not send one)
+moved the agent's next heartbeat to a new connection: the mismatch counter rose by one, the
+agent logged `(#1894)` and re-registered 16 s after the `GOAWAY`, and acked heartbeats
+resumed about 30 s later. An abrupt close of just that agent's connection made it
+re-register in 9 s with the counters unchanged. A graceful gateway SIGTERM and restart
+(observed twice) showed the branch agent reconnecting in about 11 to 12 s with no
+rejections; in the second run the released agents tested (v0.14.0-rc6, v0.13.0, v0.12.0,
+default settings) did not notice the lost `Subscribe` stream across that restart, their
+heartbeats got `NOT_FOUND`, and rc6 and v0.13.0 then wedged as described above (restart
+them). A `GOAWAY` originating from the gateway on its own was not observed.
+
+*On the Cowboy listeners.* Read from the Cowboy 2.19.0 source (`cowboy_http2`), not
+measured: when the listener's supervisor stops its connection processes (a gateway stop,
+or a listener restart), each HTTP/2 connection sends a first `GOAWAY` with last stream id
+2^31-1 and `NO_ERROR`, waits `goaway_initial_timeout` (1 s), sends a second `GOAWAY` with
+the real last stream id, and, if streams are still open (a `Subscribe` stream always is),
+waits up to `goaway_complete_timeout` (3 s) before closing. The two options are not set by
+the gateway, so these are Cowboy's defaults. The listeners are the last children of the
+supervision tree, so they stop first. The gateway's own 10 s wait for in-flight commands
+(`drain_pending`, in `yuzu_gw_app:stop/1`) runs after the tree is down (INFERRED from OTP,
+which calls `stop/1` after the application's processes have stopped), so it does not hold
+the listeners open. What an agent does with that `GOAWAY` was not measured on this stack.
+The only restart measured on it is one gateway pod rollout on OKD with 50 agents (the
+`yuzu-agent-chisel:0.14.1` image, default settings, agents connected directly): the agent
+count fell as the old pod terminated and all 50 were back on the new gateway 58 s after the
+rollout began, pod start included. The same rollout on the previous stack, with the same
+agents, was still at 0 agents after 405 s. One run each; the difference is not explained.
 
 **Observability.** Rejections are counted by two families (see
 [Available Metrics](#available-metrics)): `yuzu_gw_heartbeat_rejected_total{reason}`
@@ -391,9 +456,8 @@ It carries reason names and counts only, never a session id. The line is written
 when a rejection arrives, so counts that trail the last line wait for the next
 rejection and the line can lag the counters; the counters are authoritative. The rate
 limit is one state shared by all concurrent rejections (it is created at gateway
-start, after telemetry setup and before the gateway supervision tree starts; the agent
-listener belongs to the grpcbox dependency application, which can start first, so a
-heartbeat in that window is rejected and the state is then created lazily), so in initialized operation a burst of simultaneous first rejections produces one line; a heartbeat before the state exists can race with other lazy initializations and may produce an extra line. At startup the
+start, after telemetry setup and before the gateway supervision tree starts; the
+listeners are that tree's last children, so they start after it), so in initialized operation a burst of simultaneous first rejections produces one line; a heartbeat before the state exists can race with other lazy initializations and may produce an extra line. At startup the
 gateway logs `Heartbeat admission is connection-bound: a heartbeat is admitted only on the connection that opened its session`. No alert rule ships for these series. The
 rejected heartbeat has no resolved principal, so there is no audit row, only the
 counters and the summary line.
@@ -428,8 +492,8 @@ counters and the summary line.
 - `yuzu_gw_heartbeat_rejected_total{reason="no_connection"}` rises when the call, or
   the session it names, has no connection key to compare. Not observed in testing. Its
   possible causes are a registration path that carries no connection key, or a
-  regression in the connection accessor (`yuzu_gw_conn` returns `undefined` when the
-  vendored grpcbox accessor fails, see `gateway/_checkouts/grpcbox/YUZU_PATCH.md`). The
+  regression in the connection accessor (`yuzu_gw_conn:key_from_ctx/1` and
+  `key_from_stream/1` return `undefined` when the call carries no connection). The
   decision is in `gateway/apps/yuzu_gw/src/yuzu_gw_heartbeat_admission.erl`.
 - `yuzu_gw_heartbeat_rejected_total{reason="registry_unavailable"}` stays at 0 on a
   gateway that was restarted to deploy this change. A non-zero value means the session
@@ -590,18 +654,18 @@ runs are marked below.)
   queue (a newer notification for the same key still supersedes it), the breaker
   opens again with the doubled backoff, and the next half-open cycle sends a new
   probe. One WARN is logged per timeout (see the log table). Behind it sit the
-  vendored client's own bounds (connect 5000 ms, HTTP/2 handshake 4500 ms,
-  response 5000 ms), which usually end an unresponsive probe first: 5 to 10
-  seconds per half-open cycle was observed against an unresponsive upstream, and
-  the serial waits sum to about 20 to 25 seconds with default settings (a sum
-  read from the source, not measured, before any local queueing). Those
-  bounds can be removed (an endpoint `connect_timeout` set to `infinity`, which no
-  shipped configuration does, or a connection process blocked in initialisation);
-  the gateway's deadline does not depend on them. The default sits just above their serial sum (14.5 s) and below the 20 to 25 s a probe can take with an initialisation stall; a `did not answer` WARN that repeats while the server is healthy points at raising `notify_probe_timeout_ms`, and a value below about 5000 kills probes that would have answered (a killed probe is requeued, so delivery stays at least once). The deadline was exercised in
+  upstream client's own bounds (`yuzu_grpc_client`: a connect timeout, TCP and TLS each,
+  5000 ms by default, and a per-call timeout of 5000 ms that includes the connection wait),
+  which usually end an unresponsive probe first. The 5 to 10 seconds per half-open cycle
+  that was observed against an unresponsive upstream, and the 20 to 25 second serial
+  sum, were measured on the previous client (grpcbox) and have not been re-measured
+  on this one. Those bounds can be removed (an endpoint `connect_timeout` set to
+  `infinity`, which no shipped configuration does, or a connection process blocked in
+  initialisation); the gateway's deadline does not depend on them. The default sits above the client's default bounds; a `did not answer` WARN that repeats while the server is healthy points at raising `notify_probe_timeout_ms`, and a value below about 5000 kills probes that would have answered (a killed probe is requeued, so delivery stays at least once). The deadline was exercised in
   unit tests with a mocked client, not against a real unresponsive upstream on a
-  rig. It covers the notification probe only: the `ProxyRegister`, `ProxyInventory`
-  and replay RPCs run inside the upstream process and have no deadline of the
-  gateway's own. Without the probe, held notifications could sit
+  rig. It covers the notification probe only: a proxied `ProxyRegister` or
+  `ProxyInventory` is bounded by its caller's deadline and a replay by
+  `upstream_rpc_timeout_ms`. Without the probe, held notifications could sit
   indefinitely after the server recovers, because a disconnected session produces
   no heartbeat to trigger a replay. A probe that timed out may still have reached
   the server, and its notification is sent again after the requeue, so delivery of
@@ -613,27 +677,51 @@ runs are marked below.)
   the server six times. A held `CONNECTED` used as the probe was also delivered
   twice (the timed-out copy executed when the frozen server resumed, then the
   resend) and changed no server desync counter; all 300 agents ended routable.
-- **Cap.** `notify_pending_max` (default 10000, see "Upstream client tuning")
-  bounds the number of held keys, not agents. A notification for a new key that
-  arrives when the store is full is dropped and counted in
-  `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`. While a half open
-  probe is out its key still counts as held, so the store admits a new key only
-  while the held keys plus the probe's key stay below the cap (one key fewer than
-  the cap). A newer notification for the probe's own key is never refused at the
-  cap: it is held in the probe's reserved slot, at the tail of the queue. If the
-  probe fails, it supersedes the probe's older notification (counted in
-  `yuzu_gw_upstream_notify_coalesced_total`); if the probe succeeds, the older
-  notification has already been sent and the newer one is sent after it (not
-  counted as coalesced). With `notify_pending_max` set to 1 the reserved slot is
-  the whole cap, so every other new key is refused as `at_capacity` for as long
-  as a probe is out; use 2 or more. The cap bounds
-  the retained keys only: it is not a memory ceiling, and casts still queue in
-  the upstream client's mailbox while a `ProxyRegister`, `ProxyInventory` or
-  replay call runs synchronously.
-- **Replay fairness.** While a registration replay is active, one of the 10
-  in-flight slots is kept free for it, so a long backlog of held notifications
-  cannot stop the replay from advancing. Notification throughput is one slot
-  lower during a replay.
+- **Cap.** `notify_pending_max` bounds the number of held keys, not agents (#5695).
+  Its default is three per connection the agent listeners admit (the sum of their
+  `limits.max_connections`), and at least 15,000; the shipped `sys.config.prod`
+  sets 180,000 for its 60,000 connections. Why three: a server that is down lets
+  no agent get a new session, so an outage holds at most one `DISCONNECTED` per
+  agent; a server that is up but slow lets an agent that flaps register again,
+  which holds its old session's `DISCONNECTED` and its new session's `CONNECTED`,
+  two per agent for one flap of the whole fleet; the third leaves room for a
+  second flap. Each send in flight (the half open probe included) still counts
+  toward the cap, because its notification comes back if the send fails: a new
+  key is admitted only while the held keys plus the sends in flight stay below
+  the cap. A newer notification for a key that is in flight is never refused at
+  the cap: it replaces what would come back. Memory: about 0.9 KB per held key
+  (855 bytes measured with 100,000 synthetic notifications), so 180,000 is a
+  ceiling of about 160 MB, reached only with that many keys held.
+- **When the store is full** (#5695). A `DISCONNECTED` evicts the oldest held
+  `CONNECTED` and is held in its place (counted in
+  `yuzu_gw_upstream_notify_lost_total{event="connected",reason="evicted"}`). A
+  `CONNECTED`, or a `DISCONNECTED` when no `CONNECTED` is held, is refused
+  (`yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}` and
+  `yuzu_gw_upstream_notify_lost_total{reason="at_capacity"}` by event). The two
+  losses are not alike, and neither is put right by the heartbeat verdict: the
+  server already knows the session, so it never lists it as unknown. A lost
+  `CONNECTED` leaves a live agent that the server cannot dispatch to; the gateway
+  puts it right itself: the loss arms a full registration replay, run once the
+  breaker is closed and the store has drained below half, and every agent
+  re-sends its `CONNECTED` after its adopted replay (counted in
+  `yuzu_gw_registration_replay_triggered_total{trigger="notify_loss"}`). A lost
+  `DISCONNECTED` leaves the server listing a session as online until that agent
+  registers again, which nothing on the gateway can repair; that is why it is
+  the one kept.
+- **Failed sends are retried** (#5695). A send that fails is held again at the
+  head of the store and retried (`yuzu_gw_upstream_notify_requeued_total`), in any
+  breaker state. While the breaker is closed each failure counts against it, so a
+  server that keeps failing gets at most the failure threshold (5) of retries
+  before the breaker opens and the half open probe takes over. A notification the
+  server answers as a bad request, or one that cannot be encoded, is not retried
+  (`notify_lost_total{reason="rejected"}`), nor is one whose worker died without a
+  result (`reason="crashed"`).
+- **Order.** A notification whose key has a send in flight waits until that send
+  has finished, so a `CONNECTED` and the `DISCONNECTED` after it for one session
+  cannot reach the server the other way round.
+- **High-water mark.** `yuzu_gw_upstream_notify_pending_hwm` is the most keys held
+  at once over the last one to two minutes, so a spike between two scrapes is
+  seen; `yuzu_gw_upstream_notify_pending_max` is the cap in force.
 - **Peer address.** The peer address of a notification is the agent's
   `:authority` header (or `x-forwarded-for`), so the agent controls every byte of
   it. The gateway sanitises it where the `Register` call reads it and again where
@@ -651,13 +739,99 @@ runs are marked below.)
   (`log_text`), whereas the value that is kept and sent is the sanitised one of up
   to 255 bytes.
 - **Volatile.** The pending store is memory only. It is lost when the upstream
-  client process restarts and when the gateway stops; nothing is flushed at
-  shutdown. A notification that an ordinary worker started and that then failed (a
-  returned RPC error or a killed worker) is not retried and not counted as
-  dropped, as before; only the probe is requeued on failure, and a probe that
-  cannot be encoded in the gateway is evicted (see Known limits). The gauges `yuzu_gw_upstream_notify_pending` and
+  client process restarts, and when the gateway stops except for what a planned
+  stop sends before it goes (see Planned stop); a crash or a kill sends nothing.
+  Failed sends are retried while the process runs, as described above: a
+  returned RPC error puts the notification back at the head of the store, a
+  notification the server rejects as a bad request or that cannot be encoded is
+  counted lost (`reason="rejected"`; a probe that cannot be encoded is evicted,
+  see Known limits), and one whose worker died without a result is counted lost
+  (`reason="crashed"`). The gauges `yuzu_gw_upstream_notify_pending` and
   `yuzu_gw_upstream_notify_inflight` report the held keys and the tracked workers
   of the current upstream client process only.
+
+#### When the server does not record a notification
+
+The server answers `NotifyStreamStatus` with gRPC OK and a `StreamStatusAck`
+whose `acknowledged` field says whether it recorded the notification. Before
+NOTIFY-ACK (#5695) the gateway took every OK as delivered. An independent test
+with a stub that answered every `CONNECTED` with `acknowledged=false` for 60 s,
+then `true`, left 500 of 500 agents unknown to the server for the 5 minutes it
+watched after the switch: one `CONNECTED` per agent, never sent again, and the
+heartbeat verdict does not repair it because the server knows those sessions. The
+gateway now reads the field: `acknowledged=false` means **not delivered**.
+
+What the server means by `false` (read from `NotifyStreamStatus` in
+`server/core/src/gateway_service_impl.cpp`; each case logs a WARN on the server
+and counts in `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}`
+under the outcome named):
+
+| Server WARN line (start) | Outcome | Event | Kind |
+|---|---|---|---|
+| `NotifyStreamStatus: CONNECTED for session ... refused — the directory read degraded and this replica holds no matching local session` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; the same notification is accepted once it reads again |
+| `NotifyStreamStatus: unknown session ... for agent ...` | `unknown_session` | both | Definitive for that session: the server lost its state or never saw the registration. For a live session the heartbeat verdict names it and the replay re-registers it |
+| `NotifyStreamStatus: CONNECTED for session ... but the directory names a different session — rejecting`, or `NotifyStreamStatus: CONNECTED for session ... is no longer the currently-installed session` | `stale_connected_session` | CONNECTED | Definitive: a newer registration owns the agent |
+| `NotifyStreamStatus: CONNECTED for agent ... claims cluster_id ..., which differs from this agent's already-bound cluster affinity` | `cluster_affinity_violation` (op `announce_connected`) | CONNECTED | Definitive until the cluster configuration is fixed |
+
+A failed directory write is answered `true` by this server (the write is
+fail-open); a server change in review (#5961) answers it `UNAVAILABLE` instead,
+which the gateway already retries as a failed send. The answer carries no reason,
+so the gateway treats every `false` the same way:
+
+- **Held and sent again.** The notification goes to a retry set beside the
+  pending store, one entry per session, and is sent again after a backoff with
+  decorrelated jitter: the next delay is a random value between
+  `notify_unacked_retry_base_ms` (1 s) and three times the previous delay, at
+  most `notify_unacked_retry_max_ms` (60 s). The first resend comes 1 to 3 s
+  after the refusal; once refusals go on, the delay averages about 34 s
+  (simulated), so 5,000 refused sessions cost about 150 resends a second. A
+  server that starts accepting again has every refused notification within about
+  a minute.
+- **The circuit breaker is not touched.** A refusal is an answer, so it is not a
+  failure, and the server recorded nothing, so it is not a recovery either: it
+  neither opens the breaker nor clears real failures. A refused half-open probe
+  leaves the breaker half open, and the next notification is probed.
+- **A newer notification wins.** A `DISCONNECTED` for the session cancels a
+  pending `CONNECTED` resend and is sent; the `CONNECTED` is not sent again. A
+  resend already on its way is waited for, so the two still reach the server in
+  order.
+- **A `CONNECTED` is resent only while the gateway holds the session**, checked
+  when each backoff ends. It has no time limit: a live session the server does not
+  record is the failure this exists to repair.
+- **A `DISCONNECTED` is resent for at most
+  `notify_unacked_disconnected_window_ms` (120 s)**, then counted lost
+  (`yuzu_gw_upstream_notify_lost_total{event="disconnected",reason="unacknowledged"}`).
+  The server answers a `DISCONNECTED` `false` only for an unknown session:
+  harmless when it never knew the session or already removed it, and otherwise
+  the route row it would have removed stops being routable when its 90 s lease
+  runs out.
+- **Bounded.** Resends use at most 5 of the 10 notification slots, and new
+  notifications are sent first, so a large refused population cannot hold up a
+  fresh `CONNECTED` or `DISCONNECTED` (a unit test with 5,000 refused sessions,
+  each refusal answered after 5 ms, saw a fresh `CONNECTED` and a fresh
+  `DISCONNECTED` each delivered within 12 ms, measured with a 10 ms poll, and
+  never more than 5 resends in flight). The retry set holds at most `notify_pending_max`
+  sessions; a refusal past that is counted lost (`reason="unacknowledged"`).
+- **Planned stop.** When the last gasp begins, a refused `CONNECTED` still
+  waiting is dropped (counted `reason="shutdown"`; the session ends with the
+  stop), and a refused `DISCONNECTED` still waiting is sent with the other held
+  notifications. A refusal during the last gasp is not resent.
+- **Volatile**, like the pending store: lost when the upstream client restarts.
+
+Signals: `yuzu_gw_upstream_notify_unacknowledged_total{event}` counts every
+`false`; `yuzu_gw_upstream_notify_unacked_keys` is the number of sessions waiting
+for a resend; `yuzu_gw_upstream_notify_unacked_ended_total{outcome}` says how each
+wait ended. The gateway logs a WARN, at most one a second, `Server did not record
+the <event> stream status notice for <agent> (acknowledged=false); sending it again
+in <ms> ms`. `YuzuGatewayNotifyUnacknowledged` fires when sessions have been
+waiting for 10 minutes: the server is refusing to record sessions. Read the
+server log for the lines in the table above and
+`yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` by outcome. For
+`connected_unverified`, the route store cannot be read: check PostgreSQL and the
+server's pool (`yuzu_server_gateway_route_write_failed_total{op="session_lookup"}`,
+`YuzuGatewayRouteWriteFailed`); the resends succeed once it reads again. For the
+definitive outcomes, find the agents in the gateway WARN and look at their
+registrations on the server (a newer session elsewhere, a cluster id mismatch).
 
 Measured evidence for this behaviour (OBSERVED on a loopback rig with a
 debug-built server, PostgreSQL with fsync off, on a shared host): a cold wave of
@@ -721,8 +895,8 @@ connection with the issued certificate dropped 0 notifications, left 1000
 routable rows, made 2000 `ProxyRegister` calls and got 1000 certificates, with
 notifications in flight never above 10 (OBSERVED). All were registered in 4.6 to
 5.8 s against 1.95 s without a signing request: a signing-request `Register` took
-about 3.3 ms against 2.0 ms, and every `Register` runs one at a time in the
-gateway's upstream process. The 1000 first-`Register` entries stay in the
+about 3.3 ms against 2.0 ms, and every `Register` ran one at a time in the
+gateway's upstream process (before #5695; they now run in parallel under permits). The 1000 first-`Register` entries stay in the
 gateway's pending registry until the bootstrap connection's dead-connection grace
 clears them (about 19 s after connect, with gateway memory about 75 MB higher
 meanwhile; the cause is INFERRED from the registry code and the 15 s default
@@ -824,6 +998,11 @@ message StreamStatusNotification {
 }
 ```
 
+`peer_addr` is the address the gateway attributed the agent to when it registered: a bare
+IP address (see [Client addresses behind a proxy](#client-addresses-behind-a-proxy)), or
+`unknown` when the listener had no observation for the registration. It used to be the
+`:authority`, `x-forwarded-for` or `unknown`. The server does not read the field.
+
 ---
 
 ## Configuration
@@ -832,20 +1011,20 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 
 ```erlang
 {yuzu_gw, [
-    %% Agent-facing gRPC (agents connect here)
-    {agent_listen_addr, "0.0.0.0"},
-    {agent_listen_port, 50051},
+    %% The agent-facing (:50051) and operator-facing (:50063) gRPC listeners
+    %% are the {grpc_listeners, [...]} entries described under "gRPC listeners"
+    %% below. The agent_listen_* / mgmt_listen_* keys that older configs carry
+    %% are read by nothing and have no effect.
 
-    %% Operator-facing gRPC (dashboard/CLI)
-    {mgmt_listen_addr, "0.0.0.0"},
-    {mgmt_listen_port, 50052},
-
-    %% Upstream C++ server (GatewayUpstream service)
+    %% No effect: no gateway code reads upstream_addr or upstream_port (the
+    %% environment variables YUZU_GW_UPSTREAM_ADDR / YUZU_GW_UPSTREAM_PORT only
+    %% set these two keys). The address the gateway dials is the endpoint of
+    %% the default_channel in {upstream_client, ...} (see "The upstream client")
     {upstream_addr, "127.0.0.1"},
     {upstream_port, 50055},
 
-    %% No effect: no gateway code reads this key. The upstream channel is one
-    %% connection whatever the value (see "Registration rate per gateway")
+    %% No effect either: no gateway code reads this key. The connections per
+    %% endpoint are the `pool_size` option of the channel (default 1)
     {upstream_pool_size, 16},
 
     %% Heartbeat batching interval (ms)
@@ -892,8 +1071,309 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     %% addresses forever. No env override; edit sys.config directly if a
     %% real deployment's lifetime address churn needs a higher ceiling.
     {cluster_max_lifetime_addrs, 1024}
+    %% ... plus {grpc_listeners, [...]}, below
 ]}
 ```
+
+### gRPC listeners
+
+The gateway's two listeners are served by its own gRPC layer over Cowboy/Ranch
+(`yuzu_grpc_listener`). They are configured as a list of maps under
+`{yuzu_gw, grpc_listeners}`, one map per listener, and are the last children of the
+supervision tree. Every entry is validated before anything is bound, and the validation
+is **closed**: an entry and each of its `tls`, `listen`, `http2`, `limits` and `origin`
+maps may carry only the keys listed below, and any other key refuses boot. An entry
+that cannot start (an unknown or legacy key, an incomplete `tls` map, an `origin` mode
+with no `sources`, an `auth_fun` on a listener that serves the agent service, a service module
+that lacks what its proto declares, a name or a fixed port used twice) refuses boot with
+a critical log line that names the defect by a term (`legacy_keys`, `unknown_keys`,
+`tls_incomplete`, `auth_fun_on_agent_listener`, `duplicate_name`, ...; the terms and what to
+change for each are in the
+[table in Upgrading the Gateway](upgrading.md#gateway-listeners-move-to-grpc_listeners-the-cowboy-edge--breaking)).
+A config with no listeners at all (the key
+unset, empty or `[]`) refuses boot too, because the gateway would otherwise start,
+report healthy and accept no connection, and so does a config whose entries are all valid
+but none of which **routes the AgentService** (an entry counts only if its `services` map has
+the key `'yuzu.agent.v1.AgentService'`; `service_protos => [agent_pb]` with an empty
+`services` does not, because nothing would answer an agent; no agent could connect and
+`/readyz` would never answer ready); the lab-rig acknowledgement for both is
+`{yuzu_gw, [{allow_no_listeners, true}]}` (only the literal `true`), which unit tests use and
+a deployment does not. A `services` entry whose module exports none of that service's methods
+is refused too (`{bad_routes, {service_without_routes, Name}}`, a mistyped module); one that
+exports only some is accepted and answers the rest `UNIMPLEMENTED`. Moving from the old `{grpcbox, [{servers, ...}]}` shape: see the key mapping
+below and [Upgrading the Gateway](upgrading.md#gateway-listeners-move-to-grpc_listeners-the-cowboy-edge--breaking).
+This is the production shape, from `gateway/config/sys.config.prod` (comments shortened):
+
+```erlang
+{yuzu_gw, [
+    {grpc_listeners, [
+        %% Agent listener: one-way (server-authenticated) TLS. NEVER give this
+        %% listener an auth_fun (see "Moving the agent edge to mutual TLS").
+        #{name => agent,
+          service_protos => [agent_pb],
+          services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service},
+          listen => #{port => 50051, ip => {0,0,0,0}},
+          tls => #{certfile   => "/etc/yuzu/certs/default-gateway.pem",
+                   keyfile    => "/etc/yuzu/certs/default-gateway.key",
+                   cacertfile => "/etc/yuzu/certs/default-ca.pem",
+                   verify => verify_none,
+                   fail_if_no_peer_cert => false},
+          acceptors => 32,
+          http2 => #{idle_timeout => 180000, max_concurrent_streams => 32}},
+
+        %% Mgmt listener: strict mTLS (the defaults) + the SPKI peer pin.
+        #{name => mgmt,
+          service_protos => [management_pb],
+          services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
+          listen => #{port => 50063, ip => {0,0,0,0}},
+          tls => #{certfile   => "/etc/yuzu/certs/default-gateway.pem",
+                   keyfile    => "/etc/yuzu/certs/default-gateway.key",
+                   cacertfile => "/etc/yuzu/certs/default-ca.pem"},
+          auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1,
+          acceptors => 4,
+          http2 => #{idle_timeout => 600000, max_concurrent_streams => 4096}}
+    ]}
+]}
+```
+
+| Key | Meaning |
+|---|---|
+| `name` | Any term; names the listener. Mandatory and unique (the old `{grpcbox, [{servers, ...}]}` shape had no names). |
+| `service_protos` | The proto modules (`agent_pb`, `management_pb`) that describe the services the listener serves. |
+| `services` | `#{ServiceName => Module}`: the module that serves each service. |
+| `listen` | `#{port, ip, socket_opts}`. `ip` defaults to `0.0.0.0`. `port => 0` binds any free port (tests). An optional `socket_opts` list is appended to the socket options; it may not carry `ip`, `ifaddr`, `fd`, `port` or `{local, _}`, which would move the bind away from `listen` (boot refuses them on every listener, because an `ifaddr` of `0.0.0.0` on a listener whose `ip` says loopback would publish the plaintext management plane to the network). |
+| `tls` | Keys: `certfile`, `keyfile`, `cacertfile`, `verify`, `fail_if_no_peer_cert`, `ciphers`. Omit the map for plaintext HTTP/2 (an explicit choice: a listener with no `tls` map is plaintext whatever certificates are mounted next to it). When present, `certfile`, `keyfile` **and** `cacertfile` are all required and an incomplete map refuses boot. A listener that still carries certificate settings under a legacy key (`transport_opts`, `ssl`) refuses boot rather than running plaintext, so "certificates configured but plaintext" cannot come from a half-converted entry. `verify` defaults to `verify_peer` and `fail_if_no_peer_cert` to `true` (mutual TLS); `verify => verify_none` is one-way TLS and then `fail_if_no_peer_cert` defaults to `false`. TLS 1.2 only. Cipher suites follow the certificate's key type when `ciphers` is unset: ECDHE-ECDSA AEAD suites for an EC key (the generated default certificates), ECDHE-RSA AES-GCM suites for an RSA key (a bring-your-own certificate); an explicit `ciphers` list always wins. FIPS mode is not claimed. The listener also sets `reuse_sessions => false` (every reconnect is a full TLS handshake, so a reconnect herd costs more CPU than with session resumption) and `honor_cipher_order => true` (the gateway's list decides the suite, not the client's); listeners built from the old `{grpcbox, [{servers, ...}]}` shape took OTP's defaults for both. **Not supported:** the `tls` map is closed, so an encrypted private key (`password`) and the ssl options `depth`, `crl_check`, `partial_chain` and `versions` that a `transport_opts` map could carry refuse boot. Decrypt the key first (`openssl pkey -in encrypted.key -out gateway.key`, with the file readable by the gateway user only) and use the defaults; supporting them is a follow-up, not something to work around. **Decrypting removes the passphrase protection the key had at rest**: if you answer "are private keys encrypted at rest?" for this key, the answer is now "protected by file permissions and the secret store that mounts it". |
+| `auth_fun` | Management listener only: `fun(Der) -> {true, Id} \| true \| false`, run by the stream handler on the peer certificate before a handler exists. Needs `tls`. **Boot refuses an `auth_fun` on any listener that serves the agent service** (`auth_fun_on_agent_listener`), that is, whose `service_protos` include `agent_pb` **or** whose `services` map has `'yuzu.agent.v1.AgentService'` as a key (the management proto embeds the AgentService definition, so `service_protos` alone would miss it), including a combined agent-and-management listener that has one; a combined listener without an `auth_fun` is valid (the integration test uses one). That refusal and the boot and `/readyz` rule are two different tests: the refusal asks whether the entry *serves* the agent service by either route, while boot and `/readyz` require at least one entry that *routes* it (the `services` key). |
+| `origin` | Keys: `mode`, `sources`, `trusted_hops`. How the caller's address is decided; default `#{mode => transport}`. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy). |
+| `acceptors` | Acceptor processes, a positive integer (default 4). `sys.config.prod` and the reference configs give the agent listener 32 for reconnect storms; the plaintext default, demo and UAT configs set nothing and so run 4. |
+| `http2` | Overrides of the Cowboy HTTP/2 options, by Cowboy's own option names; the options the layer owns and any unknown name are refused. Defaults: `idle_timeout` 600000 ms, `max_concurrent_streams` 1024, `max_frame_size_received` 16384, `linger_timeout` 1000, and, on a listener whose `services` map has `'yuzu.server.v1.ManagementService'` as a key (a combined agent-and-management listener included), `max_received_frame_rate` `{100000, 10000}`: 100000 received frames per 10 s. A listener that routes only the AgentService leaves `max_received_frame_rate` unset and so keeps Cowboy's own `{10000, 10000}`, the flood guard for the agents' unauthenticated connections. The management value is ten times Cowboy's because the server sends every command of a fan-out over its one connection to the management listener, at about 2 received frames per call: Cowboy's ceiling is about 5000 calls per 10 s, and past it Cowboy closes the whole connection with GOAWAY `enhance_your_calm` and every call in flight on it fails (`stream_error`). `{100000, 10000}` is about 5000 calls per second, far above the ~205 responses per second measured per server channel even with 8 channels to one gateway, and it is still finite. Raising `max_concurrent_streams` does not help: the ceiling counts frames, not streams. A listener that routes the `ManagementService` also defaults `max_concurrent_streams` to 4096 instead of 1024. The server sends each forwarded command as its own call over its one connection and queues the calls past the cap, so a fan-out takes about the agents' answer time or (agents x mean answer time / cap), whichever is longer. Measured over one loopback connection with 5,000 agents answering uniformly in 0 to 10 s: 30.7 s at 1024, 18.8 s at 2048, 11.9 s at 4096 and 10.1 s at 8192 (25,000 agents: 37.1 s at 4096, 21.7 s at 8192). 4096 brings 5,000 agents to within about 2 s of the answer time. It is not higher because the cap also bounds the memory the management connection can hold: each call in flight can have one response waiting to be written when agents answer faster than the server reads, and 5,000 answers of 256 KiB inside 1 s peaked at about 1 GB in the connection at 4096 and 1.2 GB at 8192. Past 5,000 agents per gateway, more server connections or one message per fan-out (#5956) is the way forward, not a larger cap. The measurement used a gun client that keeps at most the cap in flight, as the server's gRPC C++ client does; it was not repeated with the server itself. `sys.config.prod` and `deploy/docker/reference-gateway-sys.config` set `max_received_frame_rate => {100000, 10000}` and `max_concurrent_streams => 4096` on the management listener explicitly; every other shipped config gets them from the default. `sys.config.prod` and the reference configs set the agent listener's `idle_timeout` to 180000 because agents ping every 60 s (the 60 s default would race the ping) and `max_concurrent_streams` to 32. The shipped plaintext default, demo and UAT configs set neither and so inherit 600000 ms and 1024 streams. The management client does not ping, so it keeps ten minutes. |
+| `limits` | Keys: `max_connections` (a positive integer or `infinity`, the default; the most simultaneous connections the listener holds, over which Ranch stops accepting until one closes), `max_message_bytes` (a positive integer, default 4194304), `send_timeout_ms` (a positive integer or `infinity`, default 30000), `max_connection_memory_bytes` (a positive integer at least 1048576, or `infinity`; default four times `max_message_bytes`, i.e. 16 MiB for the 4 MiB default, except on a listener that routes the `ManagementService` and does not serve the agent service, where the default is no ceiling) and `request_timeout_ms` (a positive integer or `infinity`, default 30000). A request message larger than `max_message_bytes` is refused before it is buffered, but a message that fits is decoded in full, so a smaller `max_message_bytes` also bounds the memory one stream can make the gateway decode. `max_connection_memory_bytes` caps a single connection's memory (a `max_heap_size` on the Cowboy connection process that counts the refc buffers its streams hold); a connection that buffers more than this of half-finished requests is killed by the VM and the kill is counted in `yuzu_gw_grpc_connection_killed_total`. The ceiling also counts the responses waiting to be written, which is why the management listener has none by default: its one peer is the pinned server sending a whole fan-out over one connection, and when the agents answered together with large responses the ceiling (equal to Cowboy's own 16 MB output-buffer alarm) killed that connection, and every call on it, before Cowboy's backpressure could act. Without it, Cowboy's buffer alarm paces the senders and the connection holds about 16 MB plus one response per stream in flight; set `max_connection_memory_bytes` on the management listener to keep a hard cap anyway. A combined agent-and-management listener serves anonymous agents and keeps the ceiling. `request_timeout_ms` is how long a unary or server-streaming stream may buffer its one request before it is aborted `DEADLINE_EXCEEDED` (counted in `yuzu_gw_grpc_recv_timeout_total`) and its buffer dropped; it never cuts a bidirectional or client-streaming handler (an agent's long-lived `Subscribe`), which runs before any message, and a `grpc-timeout` the client sent runs alongside it with the earlier of the two winning. The gateway ends a call that carries a `grpc-timeout` with `DEADLINE_EXCEEDED` a tenth of that timeout early, at most 1 s early (299 s for the server's 300 s calls), so the client receives the status before its own deadline instead of resetting the stream: when thousands of the server's calls expire together, their resets exceed Cowboy's `max_cancel_stream_rate` (500 per 10 s) and Cowboy closes the whole management connection. Tested with a gun client; that the server's gRPC C++ client then sends no reset is standard gRPC behaviour but was not observed against the server. Together these two bound an unauthenticated peer that opens streams and stalls them half-sent (see "Connection ceilings and the unauthenticated ports" below). `max_connections` bounds the file descriptors a listener's connections can take. It is **not protection against a hostile peer**: see that same section for what it does and does not do on each listener. `sys.config.prod`, the reference configs and the packaged release config (`gateway/config/sys.config`, the one the release packages and the systemd unit run) set `max_connections => 60000` on the agent listener (the systemd unit's `LimitNOFILE` of 65536 less about 5500 of headroom for the upstream channel, the health and metrics ports, the management listener, Erlang distribution and files, so it holds to a fleet of about 30000 agents; raise it together with `LimitNOFILE` and keep about 5500 below it, lower it if the limit is lower) and `max_connections => 256` on the management listener. Both set `max_message_bytes => 4194304` explicitly, which is the default and gRPC's default receive limit: it is not lowered on the agent listener because an agent's installed-software inventory blob may be 3 MiB by design. The agent listener also sets `max_connection_memory_bytes => 16777216` and `request_timeout_ms => 30000` explicitly (both the defaults). The demo and UAT configs set no `limits`, so `max_connections` is `infinity` there, but the memory ceiling and request deadline still apply at their defaults. Size the file-descriptor limit for the listener's `max_connections` plus the other sockets (about 1.5 to 2 times the agent count plus 200 in use). |
+
+**Connection ceilings and the unauthenticated ports (known residual risk).**
+`limits.max_connections` bounds file descriptors. It does not protect either port from a
+peer that wants to hold connections, and this is what it does on each listener:
+
+- *Before it existed* both listeners had no ceiling (`infinity`), so a flood of connections
+  exhausted the gateway process's file-descriptor limit and took down everything in the
+  process: the upstream channel, the health and metrics ports and Erlang distribution as
+  well as the listeners. A ceiling keeps the process alive. It does not keep the port
+  serving.
+- *Agent listener (`:50051`), 60000.* The port is unauthenticated by design: an agent that
+  has not enrolled has no certificate. A connection that has not finished the PROXY header
+  (about 1 s) or the TLS handshake (10 s) is closed on those timers, and one that then sends
+  nothing is closed by the listener's `idle_timeout`. A connection that keeps sending is
+  **not**: any received data, a `PING` included, resets Cowboy's idle counter
+  (`cowboy_http2.erl` in Cowboy 2.19.0, read from the source, not measured), so a peer that
+  has completed the handshake can hold the connection open for as long as it likes. A peer that holds
+  60000 of them fills the ceiling; new connections then wait in the kernel's listen
+  backlog while the agents already connected are unaffected until they reconnect, and
+  a gateway restart frees the slots only until the peer reconnects. This predates the
+  ceiling, which only changed what the same flood exhausts, and it is an accepted residual
+  risk of the unauthenticated agent port with follow-up work, not a fixed defect. Mitigate
+  it by limiting connections per source address at the L4 balancer or firewall. Behind a
+  proxy the gateway sees only the proxy's address, so the limit has to be on the proxy.
+  What the ceiling does **not** bound — the *memory* a held connection can consume — is
+  bounded separately: `limits.max_connection_memory_bytes` kills a connection that buffers
+  more than its ceiling of half-finished requests, `limits.request_timeout_ms` aborts a
+  single stalled request, and node-wide memory shedding (below) suspends the whole listener
+  before the node runs out. A held but quiet connection still occupies a slot; those three
+  stop a held connection from being turned into a memory-exhaustion attack.
+- *Management listener (`:50063`), 256.* The only peers that need it are the server's
+  replicas, one connection each. Who can hold the other slots depends on how far the
+  connection gets. **Before the TLS handshake**, anyone with layer-4 reach to the port can
+  hold a slot, for up to the 10 s handshake timeout. **After the handshake**, any holder of
+  a certificate issued by the install CA can hold it for as long as `PING`s keep the
+  connection busy; every enrolled agent has such a certificate, and the SPKI pin
+  (`mgmt_peer_pins`) is checked later, per stream (against the key the pin watcher last
+  published, with no file I/O on the connection), so it does not turn the connection
+  away. About 256 held connections stop the server making **new** connections to the
+  gateway; connections already established are unaffected. This is a **known, accepted
+  limitation that will not be fixed in the gateway** (owner decision, 2026-10-10): you must
+  firewall the management port so that only the server replicas can reach it, and the
+  preferred deployment multi-homes the server so that its management- and gateway-facing
+  interface is on a different network interface from the agent- and database-facing
+  ones. The shipped composes do not publish `:50063`. The practical lever is `listen.ip`:
+  set the management listener's `ip` to the address of the management interface (for
+  example `listen => #{port => 50063, ip => {10,0,5,12}}`), so the port is not bound on
+  the agent-facing interface at all. The shipped configs bind `{0,0,0,0}`, so this is a
+  change you make. The gateway cannot check that the firewall rule exists or that the
+  interfaces are separate, and a host that the firewall allows can still hold slots.
+  *Detection* (there is no gateway metric at the ceiling): on the gateway host,
+  `ss -Htn state established '( sport = :50063 )' | wc -l` against the number of server
+  replicas (each holds one), `ss -Htn state syn-recv '( sport = :50063 )' | wc -l`, and the
+  Recv-Q of `ss -ltn '( sport = :50063 )'` (connections the kernel accepted that the
+  listener has not); on the server, `yuzu_server_gateway_forward_total{status="unavailable"}`
+  rising, which counts commands to gateway-connected agents dropped after three
+  attempts, whatever the cause, so it says the forward path is failing, not why. An alert on `increase(yuzu_server_gateway_forward_total{status="unavailable"}[5m]) > 0`
+  is recommended; none ships. *Recovery*: find the source address in the `ss` output and
+  block it at the firewall. A process restart does not clear it (the peer reconnects), and
+  the server's established connection is unaffected throughout.
+
+**Node-wide memory load shedding.** The per-connection bounds above cap one
+connection; a large enough fleet of well-behaved connections, or a flood that each
+stay just under their own ceiling, can still drive the node's total memory up. The
+memory shedder (`yuzu_gw_memory_shedder`) is the backstop: it samples
+`erlang:memory(total)` every `interval_ms` and, above a **high-water mark**, calls
+`ranch:suspend_listener/1` on the **agent** listener(s), and below a **low-water mark**
+it resumes them. The two marks give hysteresis so a node hovering at the line does not
+flap. The **management listener is never suspended**: the operator and command plane
+stays reachable so you can drain the fleet and act on the pressure.
+
+*What a new agent connection sees while shedding.* Suspending a listener closes its
+listen socket, so a new connection to the agent port is **refused** at once
+(`ECONNREFUSED`); connections the kernel had queued but the gateway had not yet
+accepted are reset. Every connection already established is untouched and keeps
+working. This is deliberate, rather than leaving new connections waiting in the kernel's
+listen backlog: a refused agent goes straight into its reconnect backoff (2, 4, 8 ...
+seconds, at most 256 s) and a load balancer retries a refused connect on another node,
+while a connection parked in the backlog completes the TCP handshake, makes the agent
+wait for a TLS handshake nobody answers until gRPC gives up (about 18 s, measured
+against a server that accepts TCP and never answers), is not
+retried elsewhere by the balancer, holds kernel socket memory that counts against a
+container's memory limit, and is accepted in one burst with all the others when the
+shedder resumes. Agents reconnect without jitter today (#5990), so a refused fleet
+retries in step; the backoff still spreads it over minutes. While shedding, `/readyz`
+reports not-ready (the agent listener reads as not running, `"listeners":false`), so a
+load balancer drains this node automatically.
+
+*When a suspend or resume fails.* Resuming opens the listen socket again, which can fail:
+`eaddrinuse` if another process took the port while it was closed, `emfile`/`enfile` if
+the gateway is out of file descriptors. The shedder then leaves that listener as it is
+and tries again on every tick. It logs the first failure (`could not resume agent
+listener(s) ... retrying every N ms`), then at most once a minute while it lasts, and
+the success; it counts each failed attempt in
+`yuzu_gw_memory_shedding_transition_failures_total{action}` and shows the listeners still
+not moved in `yuzu_gw_memory_shedding_transition_failing{action}`. `/readyz` stays 503
+until the listener is actually running again. The alert
+`YuzuGatewayMemorySheddingTransitionFailing` fires only when a failure has lasted 5
+minutes, and says what to do. The same applies the other way round to a suspend that
+fails (the listener keeps accepting and the shedder keeps trying). If the shedder process
+itself restarts while it has a listener suspended, the new process finds the listener
+suspended, treats it as shed and resumes it once memory is at or below the low-water mark.
+
+Configure it under `{yuzu_gw, [{memory_shedding, #{...}}]}`:
+
+| Key | Meaning | Default |
+|---|---|---|
+| `high_water_fraction` / `high_water_bytes` | The mark above which the agent listener(s) are suspended, as a fraction of the memory limit (below) or absolute bytes (bytes win if both are set). | `0.75` of the memory limit |
+| `low_water_fraction` / `low_water_bytes` | The mark below which they resume. Must be below the high-water mark. | `0.65` of the memory limit |
+| `interval_ms` | How often `erlang:memory(total)` is sampled, and how often a failed suspend or resume is retried. | `1000` |
+| `enabled` | `false` turns the shedder off. | `true` |
+
+*The memory limit* a fraction applies to is the smaller of the host's memory and the
+cgroup memory limit the gateway runs under, read once at start without adding `os_mon`:
+
+- host memory: `MemTotal` in `/proc/meminfo` on Linux, the `hw.memsize` sysctl on macOS;
+- cgroup v2: `memory.max` (`max` means no limit); cgroup v1:
+  `memory/memory.limit_in_bytes` (a value of 2^62 or more means no limit). Both are read
+  in the gateway's own cgroup (from `/proc/self/cgroup`) and in each parent up to the root
+  of `/sys/fs/cgroup`, and the smallest limit wins, so a container's memory limit
+  (`docker run --memory`, a Kubernetes `resources.limits.memory`) and a systemd
+  `MemoryMax=` on the unit or its slice are all seen.
+
+Before this, the fraction was of the host's memory only, so a gateway in a container with
+a memory limit below the host's memory never shed before the kernel's OOM killer stopped
+it. The gauges `yuzu_gw_memory_shedding_high_water_bytes` and
+`yuzu_gw_memory_shedding_low_water_bytes` show the marks the shedder resolved, and its
+start-up log line names the limit and where it came from (`cgroup_v2`, `cgroup_v1` or
+`host`): check them against the container's limit after a deployment. A cgroup file that
+exists but cannot be read or parsed is logged as a warning and skipped; the shedder then
+uses the host's memory, which may be too high, so set `high_water_bytes` and
+`low_water_bytes` below the limit in that case. A configured `high_water_bytes` at or
+above the cgroup limit is also logged, since it can never trip first. `memory.high` (a
+throttling threshold, not a kill) is not read. A limit changed while the gateway runs
+(`docker update --memory`) takes effect at the next restart.
+
+*What is sampled* stays `erlang:memory(total)`, the memory the VM has allocated, not the
+cgroup's `memory.current`. It is what the agent connections cost and what shedding them
+relieves, it needs no file read per sample, and it does not move with the page cache
+(`memory.current` counts file cache that the kernel reclaims before it kills anything, so
+log writes alone could trip the shedder). The cost is that it leaves out what the cgroup
+also counts: allocator overhead (memory the VM holds from the OS but has not handed out),
+memory outside the VM's allocators and kernel socket buffers. The default high-water mark
+of 0.75 of the limit leaves that quarter for them. Compare
+`yuzu_gw_beam_memory_bytes{type="total"}` with the container's working set (cAdvisor's
+`container_memory_working_set_bytes`) under load; if the gap is more than about a quarter
+of the limit, lower the fractions.
+
+Where no limit can be read at all (no cgroup, no `/proc/meminfo`, not macOS) and no
+absolute bytes are configured, the shedder runs **inactive** and logs it, rather than
+failing boot: it is a backstop, and the per-connection and per-stream bounds still hold.
+The config shape is validated at boot; a malformed `memory_shedding` map refuses to start.
+
+Metrics: `yuzu_gw_memory_shedding_active` is a gauge, `1` while the gateway is shedding
+(memory passed the high-water mark and has not yet fallen to the low-water mark) and `0`
+otherwise; `yuzu_gw_memory_shedding_suspensions_total` counts each time shedding began.
+The failure metrics and mark gauges are described above. The shipped alert
+`YuzuGatewayMemorySheddingActive` fires while the gauge is `1` for 3 minutes
+(`docs/prometheus/yuzu-alerts.yml`). **Tuning:** if the node sheds under normal load, the
+node is undersized for the fleet (lower the fleet per node or raise the memory); if it
+never sheds under a flood that is hurting it, lower the high-water mark. Leave at least a
+few points between the two marks so it does not flap. The kill and receive-timeout
+counters above (`yuzu_gw_grpc_connection_killed_total`,
+`yuzu_gw_grpc_recv_timeout_total`) tell you whether the pressure is a flood of
+half-finished requests rather than genuine fleet growth.
+
+A leftover `{grpcbox, [{servers, ...}]}` block **refuses boot**: nothing reads it, so
+it would configure no listener while the file reads as if it did. The same goes for a
+leftover `{grpcbox, [{client, ...}]}` block (the upstream channel to the C++ server, now
+`{yuzu_gw, [{upstream_client, ...}]}`; see [The upstream client](#the-upstream-client)).
+The gateway contains no `grpcbox` application, so no `{grpcbox, ...}` block of any kind
+belongs in a `sys.config` any more. Both refusals are checked before any listener is
+bound.
+
+**Moving an old config.** The key mapping from the grpcbox shape, one listener at a time
+(a worked before and after, the refusal text and the roll-out order are in
+[Upgrading the Gateway](upgrading.md#gateway-listeners-move-to-grpc_listeners-the-cowboy-edge--breaking)):
+
+| Old key (inside `{grpcbox, [{servers, [...]}]}`) | New key (inside `{yuzu_gw, [{grpc_listeners, [...]}]}`) |
+|---|---|
+| `grpc_opts => #{service_protos, services, auth_fun}` | Dissolved: `service_protos`, `services` and `auth_fun` are keys of the listener entry itself. |
+| `listen_opts => #{port, ip}` | `listen => #{port, ip}` |
+| `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify, fail_if_no_peer_cert}` | `tls => #{certfile, keyfile, cacertfile, verify, fail_if_no_peer_cert}`. `ssl => true` is gone: the presence of the `tls` map turns TLS on. A legacy `transport_opts` key refuses boot. |
+| `pool_opts => #{size => N}` | `acceptors => N` |
+| (none) | `name`: mandatory and unique. |
+| (none) | `origin`, `http2`, `limits`: new, all optional. |
+| `{yuzu_gw, [{agent_listen_addr, ...}, {agent_listen_port, ...}, {mgmt_listen_addr, ...}, {mgmt_listen_port, ...}]}` | Dead. No code reads them, and a config can keep them harmlessly; the bind address and port are `listen`. |
+
+The block `grpc_listeners` belongs in is the `yuzu_gw` application block, not `grpcbox`:
+a `grpc_listeners` key placed under `grpcbox` is ignored, and the gateway then refuses
+to boot for lack of listeners.
+
+**Environment overrides for the listeners.** `YUZU_GW_AGENT_PORT` rewrites
+`listen.port` of the entry whose `service_protos` contains `agent_pb`, and
+`YUZU_GW_MGMT_PORT` that of the entry serving `management_pb` (applied at start by
+`yuzu_gw_app:apply_listener_port_overrides/0`). An override applies only when
+**exactly one** entry serves the proto: with none, or with several (two agent listeners,
+one for an F5 path and one for a router path, say), the variable is logged as a warning
+that names it and is ignored, because one port cannot be applied to several listeners
+without creating a duplicate. A value that is not an integer from 0 to 65535 is logged
+and ignored. On a single combined agent-and-management listener only `YUZU_GW_AGENT_PORT`
+can apply. The `agent_listen_port` / `mgmt_listen_port` keys that older configs still
+carry are dead and are left alone. **Check `YUZU_GW_MGMT_PORT` before you upgrade:** the server's
+Settings page lists it with the default 50052, but the management listener is on 50063 and the
+variable is now live, so a gateway whose environment carries `YUZU_GW_MGMT_PORT=50052` moves its
+management listener to 50052 on first start (and the server's command connections then fail).
+Leave the variable unset, or set it to the port in `listen`. The `YUZU_GW_TLS_*` variables still do not drive the
+listeners' certificates (#1291): certificate paths are in the `tls` map.
+
+**Readiness.** `/healthz` answers 200 whenever the health endpoint itself responds; it checks
+no other process. The endpoint serves each connection in its own process and waits at most
+2 s for the request, so a client that connects and sends nothing does not hold up the probes
+behind it; at most 64 connections are served at once, and past that new ones wait in the
+listen backlog until one finishes. `/readyz` answers 200 only when every check in its body passes, and 503
+`not_ready` otherwise: the registry, upstream, agent supervisor and router processes are alive
+(`registry`, `upstream`, `agent_sup`, `router`); the registry's session index table exists
+(`sessions_index`); no upstream channel's latest connection attempt failed on unusable TLS
+files (`upstream_tls_files`); the upstream circuit breaker is not open (`circuit_breaker`, read
+from the state the upstream process publishes rather than by a call into it, so it answers at
+once while that process is inside a slow RPC); and
+every configured listener is running (its Ranch listener `{yuzu_grpc, Name}` reports `running`,
+shown as `listeners`) with at least one of them routing the AgentService (the same rule as boot: the entry's `services` map has the key `'yuzu.agent.v1.AgentService'`); an empty list, or a list with no entry that routes it, is ready only with `allow_no_listeners` set to `true`. The `listeners` check asks
+Ranch and does not connect to the ports, and the `upstream` check tests only that the process is
+alive, so a 200 does not show that a running listener accepts connections or that the server is
+reachable. A listener whose Ranch status is not `running` turns `/readyz` red (503)
+instead of leaving a "ready" gateway that accepts nothing.
 
 **`cluster_id`** (the `cluster_id` key above, or the `YUZU_GW_CLUSTER_ID` environment
 variable, which replaces it when set): the name is stamped on every notification as
@@ -934,31 +1414,138 @@ makes every notification fail to encode would silently lose all stream status. A
 empty name is still accepted, and the default is `default`. What a cluster id means
 for routing is in [ADR-2002](../adr/2002-high-availability-architecture.md) section 7.
 
-**Upstream client tuning** (registration replay and pending notifications; application env keys read by the upstream
-client at start, except `upstream_call_timeout_ms`, which is read on every call; set them in the `yuzu_gw` section of `sys.config`. No
+**Upstream client tuning** (proxied calls, registration replay and pending notifications; application env keys read by the upstream
+client at start, except `upstream_call_timeout_ms` and `upstream_rpc_timeout_ms`, which are read on every call; set them in the `yuzu_gw` section of `sys.config`. No
 `YUZU_GW_*` environment variable maps to any of them):
 
 | Key | Default | Valid range | Meaning |
 |---|---|---|---|
-| `registration_replay_spacing_ms` | 20 | 0 to 60000 | Gap between two replay `ProxyRegister` calls in the replay drip |
-| `registration_replay_session_guard_ms` | 10000 | 0 to 3600000 | A session that was just replayed is not queued again by a heartbeat verdict until this many ms have passed. The stamp is taken when the replay is sent, so a stale verdict can arrive up to the 5 s flush deadline (the vendored grpcbox client default) plus the replay RPC time later (INFERRED from the code): do not set it below 5000 plus the expected replay RPC time, because a smaller guard lets such a stale verdict replay a session the server already knows; the default 10000 is safe (see "Replaying a session the server already knows is not free" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
-| `registration_replay_queue_max` | 10000 | 1 to 1000000 | Most agents the replay queue holds when a heartbeat verdict appends to it; there is one pending entry per agent, and an id past the cap is counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}` (so is an id in a verdict that the heartbeat buffer did not cast because the upstream client's mailbox held more than 100 messages, see "Heartbeat batching interval" below). The cap bounds only verdict appends: the snapshot a breaker recovery seeds is not capped (it is bounded by the number of agents the node holds, as before), and while a snapshot of this size or larger drains, every verdict id for an agent not already queued counts as `queue_full` |
-| `notify_pending_max` | 10000 | 1 to 1000000 | Most stream-status notification keys (agent id, session id and stream home id) the upstream client holds while they cannot be sent, because 10 are already in flight or the circuit breaker is not closed. The cap counts keys, not agents. A notification for a new key past the cap is dropped and counted in `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`; a newer notification for a key already held replaces it and never counts against the cap. It bounds the retained keys only, not memory or the upstream client's mailbox. The key of a `half_open` probe that is out counts toward the cap: a new key is admitted only while the held keys plus the probe's key stay below the cap, while a newer notification for the probe's own key is held in the probe's reserved slot and is not refused. A value of 1 refuses every other new key while a probe is out, so use 2 or more. Memory: each held key costs about 0.9 to 1.2 KB of the upstream client process heap (measured on the queue module with synthetic events at 10000 entries, not on a rig), so the default holds about 10 MB and 1000000 keys up to about 1.2 GB, with a transient copy during garbage collection; size to the burst, not to the maximum. Sizing: set it at least as high as the largest `Subscribe` burst the gateway can receive; the measured held peak was about the burst size (event-level maximum 989 for 1000 agents; 100 ms sample peaks up to 1906 for 2000 agents). An agent holds two keys (the old session's `DISCONNECTED` and the new session's `CONNECTED`) when its new `Register` succeeded before the breaker opened, or when the in-flight cap was full: `ProxyRegister` is refused while the breaker is open, so an agent that reconnects during the open interval holds only the old session's `DISCONNECTED` until it can register again. Size for the agents that may reconnect together, not only the new ones (INFERRED from the key). Read once at start and logged in the start line of the upstream client |
-| `notify_probe_timeout_ms` | 15000 | 100 to 300000 | The gateway's own deadline for the half-open notification probe. A probe worker that has not reported after this many ms is killed, and the probe fails like any failed probe: its notification goes back to the head of the held queue, the breaker opens again with the doubled backoff, and the next half-open cycle sends a new probe. One WARN `Notify probe worker for <agent> did not answer within <ms>ms and was killed; the notification is held again` is logged per timeout. It bounds the notification probe only, not the call-path RPCs (`ProxyRegister`, `ProxyInventory`, replay), and it does not depend on the vendored client's connect, handshake and response bounds. Tuning: 15000 sits just above the serial sum of the vendored client's own bounds (5000 + 4500 + 5000 = 14.5 s) and below the 20 to 25 s a probe can take when connection initialisation stalls, so a healthy upstream answers in milliseconds and a silent one is cut off after one deadline. A `did not answer` WARN that repeats while the server is healthy points at RAISING the value, not lowering it. A value below about 5000 kills probes that would have answered. A killed probe is requeued, so delivery stays at least once. Read once at start (a change needs a gateway restart). Not present in any shipped `sys.config`. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
-| `upstream_call_timeout_ms` | 30000 | 100 to 300000 | How long `yuzu_gw_upstream:proxy_register/1` and `proxy_inventory/1` wait for the upstream client before the call gives up with `{error, upstream_unavailable}` and one caller-side warning that names the class `timeout`. Read on every call, not at start. It exists so a test can exercise the timeout without waiting 30 s, and it also works as a setting. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
+| `registration_replay_start_jitter_ms` | 1000 | 0 to 60000 | A full replay (when a heartbeat verdict shows the server lost its state, see "What starts a full replay") starts after a random delay of 0 to this many ms, so gateways that saw the same server come back do not all start at once. `registration_replay_spacing_ms`, which paced the old one-at-a-time drip, is no longer read (#5695) |
+| `upstream_register_concurrency` | 48 | 1 to 1024 | Permits for `ProxyRegister` calls in flight at once (live registrations and replays together). See "Upstream call permits" |
+| `upstream_replay_concurrency` | half of the above (24) | 1 to `upstream_register_concurrency` | Most of those permits a registration replay may hold, so live registrations always have the rest |
+| `upstream_inventory_concurrency` | 8 | 1 to 1024 | Permits for `ProxyInventory` calls in flight at once |
+| `upstream_register_queue_max` | 10000 | 0 to 1000000 | Most `Register` requests that wait for a permit; one more is refused `UNAVAILABLE` at once |
+| `upstream_inventory_queue_max` | 1000 | 0 to 1000000 | The same for inventory reports |
+| `upstream_rpc_timeout_ms` | 5000 | 100 to 60000 | The longest one proxied call or replay may take; a caller with less time left gets what it has left |
+| `registration_replay_session_guard_ms` | 10000 | 0 to 3600000 | A session that was just replayed is not queued again by a heartbeat verdict until this many ms have passed. The stamp is taken when the replay is sent, so a stale verdict can arrive up to the 5 s flush deadline (the upstream client's default per-call timeout, 5000 ms in `yuzu_grpc_client`) plus the replay RPC time later (INFERRED from the code): do not set it below 5000 plus the expected replay RPC time, because a smaller guard lets such a stale verdict replay a session the server already knows; the default 10000 is safe (see "Replaying a session the server already knows is not free" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
+| `registration_replay_queue_max` | 10000 | 1 to 1000000 | Most agents the replay queue holds when a heartbeat verdict appends to it; there is one pending entry per agent, and an id past the cap is counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}` (so is an id in a verdict that the heartbeat buffer did not cast because the upstream client's mailbox held more than 100 messages, see "Heartbeat batching interval" below). The cap bounds only verdict appends: a full replay walks the registry in chunks of 500 and is not capped (it is bounded by the number of agents the node holds) |
+| `notify_pending_max` | three per agent-listener connection (sum of `limits.max_connections`), at least 15000 | 1 to 1000000 | Most stream-status notification keys (agent id, session id and stream home id) the upstream client holds while they cannot be sent, counting the sends in flight. The cap counts keys, not agents. When full, a `DISCONNECTED` evicts the oldest held `CONNECTED`; anything else past the cap is refused and counted. The derivation, the drop policy and the memory per key are under "Stream Status Notification" above. `sys.config.prod` and the reference compose config ship 180000 for their 60,000 connections; change it with `max_connections`. Read once at start and logged in the start line of the upstream client |
+| `notify_probe_timeout_ms` | 15000 | 100 to 300000 | The gateway's own deadline for the half-open notification probe. A probe worker that has not reported after this many ms is killed, and the probe fails like any failed probe: its notification goes back to the head of the held queue, the breaker opens again with the doubled backoff, and the next half-open cycle sends a new probe. One WARN `Notify probe worker for <agent> did not answer within <ms>ms and was killed; the notification is held again` is logged per timeout. It bounds the notification probe only, not the call-path RPCs (`ProxyRegister`, `ProxyInventory`, replay), and it does not depend on the upstream client's connect and call bounds. Tuning: 15000 sits above the upstream client's default bounds (a 5000 ms connect and a 5000 ms call), so a healthy upstream answers in milliseconds and a silent one is cut off after one deadline. A `did not answer` WARN that repeats while the server is healthy points at RAISING the value, not lowering it. A value below about 5000 kills probes that would have answered. A killed probe is requeued, so delivery stays at least once. Read once at start (a change needs a gateway restart). Not present in any shipped `sys.config`. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
+| `notify_unacked_retry_base_ms` | 1000 | 10 to 60000 | The first backoff before a notification the server refused (`acknowledged=false`) is sent again; each later delay is a random value between this and three times the previous delay. See "When the server does not record a notification". Read once at start |
+| `notify_unacked_retry_max_ms` | 60000 | 100 to 3600000 (raised to the base when below it) | The longest backoff between resends of a refused notification: once the server accepts again, every refused notification is sent within about this long. Read once at start |
+| `notify_unacked_disconnected_window_ms` | 120000 | 0 to 3600000 | How long after its first refusal a refused `DISCONNECTED` is still sent again (0: never), then counted lost (`reason="unacknowledged"`). The default is past the server's 90 s route lease, after which the row the `DISCONNECTED` would remove is no longer routable. A refused `CONNECTED` has no window. Read once at start |
+| `upstream_call_timeout_ms` | 30000 | 100 to 300000 | The budget of a proxied `Register` or inventory report whose agent sent no `grpc-timeout`, from the call's arrival: the wait for a permit and the call itself must fit in it. Read on every call. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
+| `shutdown_flush_budget_ms` | 20000 | 0 to 600000 | How long a planned stop may spend ending the agent sessions and sending their `DISCONNECTED` notices before the processes stop. See "Planned stop". The container's or unit's stop timeout must be larger (40 s is shipped) |
+| `agent_restart_intensity` | 2000 | 1 to 1000000 | How many agent owner processes may be restarted within `agent_restart_period_s` before the agent supervisor itself stops and is restarted (shared by all owners). See "When an agent's owner process crashes". Read when the agent supervisor starts |
+| `agent_restart_period_s` | 10 | 1 to 3600 | The window of `agent_restart_intensity`, in seconds |
 
 An invalid value for any of these keys falls back to the default and logs a
 warning that names the key. See
 [What happens when the server restarts](#what-happens-when-the-server-restarts).
 
-**Upstream channel tuning** (read once, by `yuzu_gw_app` before the supervision
-tree starts; set it in the `yuzu_gw` section of `sys.config`. No `YUZU_GW_*`
+**Upstream call permits** (#5695). `ProxyRegister` and `ProxyInventory` run in the
+process of the agent's own request, under a permit from
+`yuzu_gw_upstream_regulator`, not inside one upstream process. The pools:
+
+| Class | Permits | Wait queue | Notes |
+|---|---|---|---|
+| `register` | 48 (`upstream_register_concurrency`) | 10000 | live `Register`, served before replays |
+| `replay` | at most 24 of the register pool | not counted | registration replays; live registrations always keep the other 24 |
+| `inventory` | 8 (`upstream_inventory_concurrency`) | 1000 | `ProxyInventory`; large payloads, not on the connect path |
+
+These are the configured sizes. The permits in force can be lower when the server
+allows fewer streams: see "How the gateway sizes its upstream calls" below.
+
+Why these numbers. The register pool, by Little's law: a restarted gateway can
+see its whole fleet register at once; 5,000 agents inside the agent's 30 s `Register`
+deadline (25 s with margin) is 200 per second, and at 50 to 200 ms per server call
+that is 10 to 40 calls in flight, so 48 serves the storm with margin even at 200 ms
+(240 per second, 5,000 in about 21 s). Measured with a mocked server at 50 ms per
+call: a burst of 600 `Register` calls was served with 0 refused and 48 in flight at
+most, in 0.67 s; the previous serial path refused 503 of the 600 within a 5 s budget.
+
+A request that finds every permit of its pool taken waits in the queue, each with
+its own deadline (the agent's `grpc-timeout` less the stream handler's margin, or
+`upstream_call_timeout_ms` when it sent none). It is refused `UNAVAILABLE` when the
+queue is full (`yuzu_gw_upstream_permit_refused_total{reason="queue_full"}`) or when
+its deadline passes first (`reason="deadline"`, and the request is not sent:
+`yuzu_gw_upstream_calls_dropped_total`); the agent retries. A request whose process
+is stopped (a reset stream, a closed connection) frees its permit or its place by
+its exit. The wait is in `yuzu_gw_upstream_permit_wait_seconds`; held and waiting
+permits are `yuzu_gw_upstream_permits_held` and `yuzu_gw_upstream_permits_waiting`
+by class.
+
+**How the gateway sizes its upstream calls.** Every upstream call is one HTTP/2
+stream on a connection of the upstream channel. The server says how many streams it
+accepts at once on a connection (`SETTINGS_MAX_CONCURRENT_STREAMS`, sent when the
+connection starts and possibly changed later, RFC 9113 sections 6.5 and 6.5.2), and
+the gateway must not open more (section 5.1.2): its HTTP/2 client refuses a call past
+the limit itself (`too_many_streams`). For the C++ server the value is its
+`--grpc-max-concurrent-streams` (128 by default), because the gateway-upstream
+service shares the gRPC builder of the agent service.
+
+The gateway reads the value from the server instead of assuming it. The channel
+records what each of its connections declared, adds them up (one connection by
+default, `pool_size`), and updates the total whenever the server sends new settings
+or a connection goes down. The total is `yuzu_gw_upstream_server_max_streams` (0 when
+nothing is known, or when the server declared no limit). From it the gateway works
+out the permits in force (`yuzu_gw_upstream_permit_limit`):
+
+- First it sets aside 61 streams for the lanes that take no permit: up to 10
+  stream-status notifications, up to 50 Guardian forwards, and one heartbeat flush.
+- If what is left covers the configured `register` and `inventory` pools together,
+  they apply unchanged. At the C++ default of 128 and `pool_size` 1, 67 streams are
+  left for 48 + 8, so nothing changes.
+- Otherwise what is left is split between the two pools in proportion to their
+  configured sizes: `register` gets (left x 48 / 56) rounded down and `inventory`
+  the rest. Neither gets less than one permit or more than its configured size.
+  The replay cap shrinks with `register` (half of it, by default). For example, a
+  server that allows 100 streams gives `register` 33, `replay` 16 and `inventory` 6.
+- A server that allows fewer streams than the 61 the other lanes need leaves one
+  permit each, and the gateway logs a WARN (`The server allows <N> concurrent
+  streams on the gateway's connections; ...`). The other lanes can then hit the
+  server's limit too, and a failed stream-status notification counts against the
+  circuit breaker as before. Raise the server's `--grpc-max-concurrent-streams`, or
+  the channel's `pool_size`.
+- Each change is logged (`Upstream permits in force: ...` or `Upstream permits
+  lowered to the server's stream limit: ...`).
+
+A lower limit takes nothing away: calls already holding a permit finish, and no new
+permit is granted until fewer are held than the new limit. If the server lowers its
+limit just as a call is granted, and the call is then refused with
+`too_many_streams`, the call is not counted against the circuit breaker: nothing was
+sent. The call hands its permit back, waits 10 ms (doubling up to 100 ms), and asks
+for a permit again, so it waits in the queue like any other call until its deadline
+(then the agent is told `UNAVAILABLE` and retries). Registration replays do the
+same. Each refusal is counted in `yuzu_gw_upstream_rpc_errors_total` under
+`code="too_many_streams"`.
+
+There is nothing to configure for this. To give the gateway more upstream capacity,
+raise the server's stream limit or the channel's `pool_size`; raising
+`upstream_register_concurrency` above what the server allows has no effect.
+
+**Upstream channel tuning** (read when the upstream channel configuration is parsed,
+at start-up; set it in the `yuzu_gw` section of `sys.config`. No `YUZU_GW_*`
 environment variable maps to it, so a compose deployment cannot switch it off
 through the environment; it takes a `sys.config` edit):
 
 | Key | Default | Valid values | Meaning |
 |---|---|---|---|
-| `upstream_tcp_nodelay` | `true` | `true` or `false` | Sets TCP_NODELAY on the gateway-to-server (upstream) gRPC channel. Without it, every upstream call with a request under about 64 KiB waited about 41 to 43 ms for Nagle's algorithm and the server's delayed ACK, which capped registration at about 24 agents per gateway per second (see "Registration rate per gateway"). At start the gateway restarts grpcbox's `default_channel` with `{nodelay, true}` added to the `socket_options` of each endpoint; the channel connects on its first call, so the restart drops no connection and existing `sys.config` files need no edit. Other `socket_options` of an endpoint are kept, and a `nodelay` entry you set there yourself wins (a hand-set `{nodelay, false}` keeps Nagle on that endpoint). It applies only to the upstream channel, not to the agent listener or the management channel. A value that is not a boolean logs a warning that names the key and uses the default `true`. `false` logs one INFO line and leaves the channel as configured. If the restart fails, one WARN `could not restart it with TCP_NODELAY` is logged and the channel is restored with the endpoints as configured; if that restore fails as well, one further WARN `could not restore it with the endpoints as configured either` is logged, and the node then has no upstream channel (the restart itself was observed on a rig in pass 6, run K0; the restore paths are read from the code and its eunit tests, not run on a rig). |
+| `upstream_tcp_nodelay` | `true` | `true` or `false` | Sets TCP_NODELAY on the gateway-to-server (upstream) gRPC channel. Without it, every upstream call with a request under about 64 KiB waited about 41 to 43 ms for Nagle's algorithm and the server's delayed ACK, which capped registration at about 24 agents per gateway per second (see "Registration rate per gateway"). Each upstream connection is opened with `{nodelay, true}` among its TCP socket options, for `http` and `https` endpoints alike (the options go to the TCP socket that TLS is then started on). An endpoint whose own `socket_options` (the optional fifth element of the endpoint tuple, see [The upstream client](#the-upstream-client)) already hold a `nodelay` entry keeps it, in either direction: a hand-set `{nodelay, false}` keeps Nagle on that endpoint. Other `socket_options` are kept. Existing `sys.config` files need no edit. It applies only to the upstream channel, not to the agent listener or the management channel. A value that is not a boolean logs a warning that names the key and uses the default `true` (the warning can appear more than once, because the configuration is parsed more than once at start). `false` leaves the endpoints as configured and logs nothing. Since 2026-10-11 nothing restarts the channel and the gateway logs no line about nodelay (an earlier release restarted grpcbox's `default_channel` at start and logged `Upstream channel default_channel: TCP_NODELAY on`; the `could not restart it with TCP_NODELAY` warning no longer exists). The option placement was checked in `yuzu_grpc_client_channel:gun_opts/2` and the default in `yuzu_grpc_client_config`; the effect on a live stack was one measurement, see the update under "Registration rate per gateway". |
+
+**gRPC handler failure log** (read on every failure; set it in the `yuzu_gw` section of
+`sys.config`. No `YUZU_GW_*` environment variable maps to it):
+
+| Key | Default | Valid values | Meaning |
+|---|---|---|---|
+| `grpc_runner_warn_interval_ms` | 1000 | `0` to 3600000 | The shortest gap between two `gateway grpc handler <Method> failed` WARN lines on this node. `0` logs every failure. A value that is not a non-negative integer is read as 1000 **without a warning**, and a larger integer is read as 3600000 (an hour), so a typo cannot silence the log. A line that follows suppressed ones ends `(N similar failures not logged since the last line)`. |
+
+**Management-pin refresh** (#5696; read once when the pin watcher starts; set it in the
+`yuzu_gw` section of `sys.config`. No `YUZU_GW_*` environment variable maps to it):
+
+| Key | Default | Valid values | Meaning |
+|---|---|---|---|
+| `mgmt_pin_refresh_ms` | 5000 | 100 to 3600000 | How often the `yuzu_gw_mgmt_pins` process re-reads every `{cert_file, Path}` entry of `mgmt_peer_pins`. It parses the PEM again only when the file's bytes changed (it compares a SHA-256 of the contents, not the modification time or size, so a new key of the same size copied with `cp -p` is still picked up), and publishes the pinned key for the management `auth_fun` to read. The `auth_fun` runs once per management stream and does no file I/O itself, so a stalled certificate volume stalls only the watcher, never a connection. The interval bounds how long a rotated server leaf is refused: until the next refresh the gateway still pins the old key, so a stream the server opens with its new leaf in that window gets `UNAUTHENTICATED` (`pin_mismatch`, fail closed). The server does not retry it: the commands it forwards in that window fail as `gateway_unauthenticated`, and commands after the refresh go through. The same tick refreshes the certificate expiry gauges (see [Certificate rotation and expiry](#certificate-rotation-and-expiry)). The pins are resolved once at start, before the listeners, so the first stream never waits for a refresh. A value outside the range, or one that is not an integer, **refuses boot** (`Refusing to start: invalid {yuzu_gw, mgmt_pin_refresh_ms}`). Not present in any shipped `sys.config`. |
 
 **Heartbeat batching interval** (read by the heartbeat buffer at start; unlike
 the replay keys above, it also has an environment override):
@@ -1007,7 +1594,7 @@ a change needs a gateway restart):
 
 | Key | Default | Valid range | Meaning |
 |---|---|---|---|
-| `max_sessions_per_connection` | 8 | 1 to 1000 | Most session slots one gRPC connection may hold. Each unexpired reservation row (a `Register` that was admitted and is not yet answered by the server, see below) is one slot, including the registering agent's own in-flight reservations. Another agent's live row counts one; another agent's committed pending row (registered and not yet subscribed) counts one only if that agent has no reservation in flight. The registering agent's own live row and committed pending row never count, because a commit supersedes them, and the `Subscribe` path leaves out all of that agent's own rows. A `Register` is admitted while fewer than the cap of those slots are held, so a connection holds at most the cap of counted slots plus the registering agent's own live row and committed pending row; the stored rows can briefly exceed that by the committed pending row of an agent that has a retry in flight, which its commit removes. A slot is reserved inside the registry process, which handles one call at a time, when a `Register` is admitted and before it is proxied to the server, so N concurrent `Register` calls on one connection, whether they carry one agent id or several, admit at most the cap and nothing beyond it is proxied (a retry made while an earlier `Register` of the same id is in flight uses one more slot until that one is released or committed). The reservation row is turned into the pending row by a commit step once the server accepted the registration; it is released if the proxied `Register` fails or is not accepted, and a handler that is killed while its `Register` is proxied leaves a reservation that the pending time to live (120 s, swept every 60 s) removes. Over the cap, a `Register` is answered `UNAVAILABLE` (14) and a `Subscribe` ends its stream (status 2 today, see Known limits); both are counted in `yuzu_gw_session_limit_rejected_total` and logged as a warning at most once per second that names only the cap. A value outside the range falls back to the default and logs one warning that names the key. |
+| `max_sessions_per_connection` | 8 | 1 to 1000 | Most session slots one gRPC connection may hold. Each unexpired reservation row (a `Register` that was admitted and is not yet answered by the server, see below) is one slot, including the registering agent's own in-flight reservations. Another agent's live row counts one; another agent's committed pending row (registered and not yet subscribed) counts one only if that agent has no reservation in flight. The registering agent's own live row and committed pending row never count, because a commit supersedes them, and the `Subscribe` path leaves out all of that agent's own rows. A `Register` is admitted while fewer than the cap of those slots are held, so a connection holds at most the cap of counted slots plus the registering agent's own live row and committed pending row; the stored rows can briefly exceed that by the committed pending row of an agent that has a retry in flight, which its commit removes. A slot is reserved inside the registry process, which handles one call at a time, when a `Register` is admitted and before it is proxied to the server, so N concurrent `Register` calls on one connection, whether they carry one agent id or several, admit at most the cap and nothing beyond it is proxied (a retry made while an earlier `Register` of the same id is in flight uses one more slot until that one is released or committed). The reservation row is turned into the pending row by a commit step once the server accepted the registration; it is released if the proxied `Register` fails or is not accepted, and a handler that is killed while its `Register` is proxied (the client reset the stream, the call's deadline passed, the connection closed) has its reservation released promptly by a guard process that watches the handler. The pending time to live (120 s, swept every 60 s) is the backstop for a kill in the short windows before the guard exists and between the release and the commit. Over the cap, a `Register` is answered `UNAVAILABLE` (14) and a `Subscribe` is refused with `UNAVAILABLE` (14); both are counted in `yuzu_gw_session_limit_rejected_total` and logged as a warning at most once per second that names only the cap. A value outside the range falls back to the default and logs one warning that names the key. |
 | `dead_connection_grace_ms` | 15000 | 0 to 120000 | How long the reserved and pending rows of a connection that went down stay takeable. The registry monitors each connection once; when it goes down its rows are not dropped at once, so that a `Subscribe` on a reconnected channel can still take a pending session after the connection was closed with a GOAWAY. Without the grace, a released agent v0.13.0 or v0.14.0-rc6 would be answered `NOT_FOUND` and wedge (INFERRED from bug #2182, see "Agent dependency"; not run for this key). When the grace has passed, the reserved and committed pending rows that the connection's index names are deleted, each by its key (the cost is that connection's rows, never a scan of the pending table), so a client that reconnects over and over neither starts again below the cap nor leaves its stored registration requests to wait for the time to live. A row that a handler stored and has not committed yet is in no index and survives the removal: it is removed when its own commit finds the connection down and monitors it again, or by the pending time to live sweep (120 s time to live, swept every 60 s) if its handler died (read from the code and its eunit tests, not rig-run). `0` drops them at once. A value outside the range falls back to the default and logs one warning that names the key. |
 
 The cap exists so that one connection cannot hold many pending sessions with large
@@ -1020,9 +1607,11 @@ one-connection-per-agent rule under [Heartbeat admission](#heartbeat-admission))
 deployments sit at 1 of 8 and the default is not expected to matter for the
 supported topologies. An L4 balancer or proxy that multiplexes several agents onto
 one HTTP/2 connection to the gateway would reach the cap, and the `Register` calls of
-those agents would be answered `UNAVAILABLE` (a refused `Subscribe` ends its stream);
-the operator raises the key (an HTTP/2-terminating proxy is
-already unsupported, see "Supported topologies").
+those agents would be answered `UNAVAILABLE` (so would a refused `Subscribe`).
+Putting several agents on one backend connection is not a supported topology (see
+"Supported topologies"); raising the key does not make it one, because the agent
+listener's 32 concurrent streams per connection also apply, and heartbeat admission can
+no longer tell the agents apart.
 
 Both counts come from per-connection indexes that only the registry process writes,
 so a count costs the rows of that connection, never a scan of the pending table.
@@ -1094,6 +1683,16 @@ proxied `Register` is left without a pending row. (4) Behaviour with real agents
 near the cap and with an L4 forwarder multiplexing agents was not run, and the
 default of 8 is a chosen value, not one derived from fleet data.
 
+**What counts as a failure.** The breaker counts calls that failed because of the
+server or the path to it: no connection, a timeout, and every gRPC status except the
+five that say the request itself was wrong. `INVALID_ARGUMENT`, `NOT_FOUND`,
+`ALREADY_EXISTS`, `FAILED_PRECONDITION` and `OUT_OF_RANGE` are the server answering
+correctly, so they leave the breaker as it is: not a failure, and not a success either
+(they do not reset the run of consecutive failures or close a half-open breaker).
+`PERMISSION_DENIED`, `UNAUTHENTICATED` and `RESOURCE_EXHAUSTED` are counted;
+`RESOURCE_EXHAUSTED` because it is the only brake the gateway has until the server sends
+explicit backpressure.
+
 **Circuit breaker tuning** (the breaker the replay and the other upstream calls
 share; read once when the upstream client starts, and each key has an environment
 override, unlike the replay keys above. All three are range-checked: the failure
@@ -1103,9 +1702,9 @@ never below the base, see the max row):
 
 | Key | Environment override | Default | Meaning |
 |---|---|---|---|
-| `circuit_breaker_failure_threshold` | `YUZU_GW_CB_FAILURE_THRESHOLD` | 5 (valid range 1 to 1000) | Consecutive failed upstream calls that open the breaker. A value that is not an integer in 1 to 1000 logs `Invalid circuit_breaker_failure_threshold value <V> (expected an integer in 1..1000); using 5` and takes the default; before this check a threshold of 0 opened the breaker on the first failure. An environment override that is not an integer is ignored with the `ENV override` line, as for the timeouts (INFERRED from the code and unit tests, not run on a rig) |
-| `circuit_breaker_reset_timeout_ms` | `YUZU_GW_CB_RESET_TIMEOUT_MS` | 10000 (valid range 100 to 3600000) | How long the breaker stays open the first time before it goes half open and allows one probe: a call-path RPC or, when stream-status notifications are held, the head held notification. A successful probe closes the breaker and starts the registration replay of every agent the node holds (OBSERVED on a rig). A value that is not an integer in 100 to 3600000 (0, a negative number, a float, a string, more than an hour) logs a WARN that names the key (`Invalid circuit_breaker_reset_timeout_ms value <V> (expected an integer in 100..3600000); using 10000`) and takes the default. The floor is 100 because the probe is timer driven: 0 would stay 0 and make the half open probe a hot loop forever, and a base or cap of 1 ms would still give a probe loop of about 1000 attempts a second. An environment override that is not an integer never reaches that check: `yuzu_gw_app` logs `ENV override: <VAR> has invalid value '<value>', ignoring` and the `sys.config` value (or the default) applies. An environment override that is an integer is stored and checked against the same range when the upstream client starts, so only an out-of-range integer produces the WARN above. A value above 3600000 does not clamp to one hour: it takes the default 10000, with the WARN (INFERRED from the code and unit tests, not run on a rig) |
-| `circuit_breaker_max_reset_timeout_ms` | `YUZU_GW_CB_MAX_RESET_TIMEOUT_MS` | 300000 (valid range 100 to 3600000) | Cap on the open duration, which doubles each time a trip or a failed probe reopens the breaker (10 s, 20 s, 40 s, 80 s and so on) and returns to the first value when a probe succeeds. This is the 300 s the recovery bounds in "What happens when the server restarts" cite. An invalid value takes the default 300000 with a WARN that names the key (`Invalid circuit_breaker_max_reset_timeout_ms value <V> (expected an integer in 100..3600000); using 300000`), and an environment override that is not an integer is ignored with the `ENV override` line, both as for the reset timeout; a value above 3600000 takes the default, not the limit. When the base is above the cap the effective cap is the base and one WARN is logged, with a different text for each case. An operator-set valid cap below the base logs `circuit_breaker_max_reset_timeout_ms (<Max>) is below circuit_breaker_reset_timeout_ms (<Base>); using <Base> for both`. A cap that is not set, or was rejected as invalid (the default 300000 applies), logs `circuit_breaker_reset_timeout_ms (<Base>) is above the default circuit_breaker_max_reset_timeout_ms (<Max>, not set or rejected); the maximum backoff is raised to <Base>. Set circuit_breaker_max_reset_timeout_ms to choose it.` (a base of 600000 with the default cap of 300000 used to stay open 600 s the first time and 300 s afterwards; it is now 600 s each time) |
+| `circuit_breaker_failure_threshold` | `YUZU_GW_CB_FAILURE_THRESHOLD` | 5 (valid range 1 to 1000) | Consecutive failed upstream calls that open the breaker. A value that is not an integer in 1 to 1000 logs `Invalid circuit_breaker_failure_threshold value <V> (expected an integer in 1..1000); using 5` and takes the default; before this check a threshold of 0 opened the breaker on the first failure. An environment override that is not an integer is ignored with the `ENV override` line, as for the timeouts (INFERRED from the code and unit tests, not run on a rig). A failed stream-status notification (CONNECTED or DISCONNECTED) sent while the breaker is closed counts by the same rule as a failed `ProxyRegister` or `ProxyInventory` (see "What counts as a failure" above), and so does a success after failures: it clears the failure count (since #5695 it starts no registration replay; before #5695 it replayed the registrations). A Guardian forward and a heartbeat batch do not count. While the breaker is not closed the notifications are held, not sent (the head held one is the half-open probe), and an answer to a notification sent before the breaker last opened does not count against the breaker, although its notification is still retried or retired as usual (INFERRED from the code and unit tests, not run on a rig) |
+| `circuit_breaker_reset_timeout_ms` | `YUZU_GW_CB_RESET_TIMEOUT_MS` | 10000 (valid range 100 to 3600000) | How long the breaker stays open the first time before it goes half open and allows one probe: a call-path RPC or, when stream-status notifications are held, the head held notification. A successful probe closes the breaker. Since #5695 that starts no registration replay; before #5695 it started the registration replay of every agent the node holds (OBSERVED on a rig). A value that is not an integer in 100 to 3600000 (0, a negative number, a float, a string, more than an hour) logs a WARN that names the key (`Invalid circuit_breaker_reset_timeout_ms value <V> (expected an integer in 100..3600000); using 10000`) and takes the default. The floor is 100 because the probe is timer driven: 0 would stay 0 and make the half open probe a hot loop forever, and a base or cap of 1 ms would still give a probe loop of about 1000 attempts a second. An environment override that is not an integer never reaches that check: `yuzu_gw_app` logs `ENV override: <VAR> has invalid value '<value>', ignoring` and the `sys.config` value (or the default) applies. An environment override that is an integer is stored and checked against the same range when the upstream client starts, so only an out-of-range integer produces the WARN above. A value above 3600000 does not clamp to one hour: it takes the default 10000, with the WARN (INFERRED from the code and unit tests, not run on a rig) |
+| `circuit_breaker_max_reset_timeout_ms` | `YUZU_GW_CB_MAX_RESET_TIMEOUT_MS` | 30000 (valid range 100 to 3600000; 300000 before #5695) | Cap on the open duration, which doubles each time a trip or a failed probe reopens the breaker (10 s, 20 s, then 30 s with the defaults) and returns to the first value when a probe succeeds. 30 s means a server that comes back is used again within about 30 s, while a server that stays down gets one probe (a held notification or a proxied call) twice a minute; the `YuzuGatewayUpstreamCircuitOpened` alert relies on reopens at least every few minutes (its 5-minute window), so an operator who raises the cap above about 4 minutes must widen that rule with it. An invalid value takes the default 30000 with a WARN that names the key (`Invalid circuit_breaker_max_reset_timeout_ms value <V> (expected an integer in 100..3600000); using 30000`), and an environment override that is not an integer is ignored with the `ENV override` line, both as for the reset timeout; a value above 3600000 takes the default, not the limit. When the base is above the cap the effective cap is the base and one WARN is logged, with a different text for each case. An operator-set valid cap below the base logs `circuit_breaker_max_reset_timeout_ms (<Max>) is below circuit_breaker_reset_timeout_ms (<Base>); using <Base> for both`. A cap that is not set, or was rejected as invalid (the default applies), logs `circuit_breaker_reset_timeout_ms (<Base>) is above the default circuit_breaker_max_reset_timeout_ms (<Max>, not set or rejected); the maximum backoff is raised to <Base>. Set circuit_breaker_max_reset_timeout_ms to choose it.` |
 
 
 **`YUZU_GW_ADVERTISE_ADDR`** (env var only, no `sys.config` key — consumed by
@@ -1126,6 +1725,237 @@ container picked a surprising address):
 
 See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 
+### The upstream client
+
+The gateway calls the server's `GatewayUpstream` service (registration, inventory, heartbeat
+batches, stream-status notices, Guardian forwarding) with its own unary gRPC client,
+`yuzu_grpc_client`, over a **channel** of HTTP/2 connections opened by gun
+(`yuzu_grpc_client_channel`). Before 2026-10-11 this hop was grpcbox, configured in
+`{grpcbox, [{client, ...}]}`; the wire protocol, the protobuf contracts and the server are
+unchanged, and the value moved without changing shape (see *Upgrade notes by release* in
+[Upgrading](upgrading.md#the-upstream-channel-moves-to-upstream_client--breaking)).
+
+The channels are the `upstream_client` entry of the `yuzu_gw` application:
+
+```erlang
+{yuzu_gw, [
+    {upstream_client, #{channels => [
+        {default_channel,
+         [{https, "yuzu-server.example.com", 50055, [
+              {cacertfile, "/etc/yuzu/certs/default-ca.pem"},
+              {certfile,   "/etc/yuzu/certs/default-gateway.pem"},
+              {keyfile,    "/etc/yuzu/certs/default-gateway.key"},
+              {verify, verify_peer}]}],
+         #{pool_size => 1}}
+    ]}}
+]}
+```
+
+A channel is `{Name, Endpoints, Options}`. The registration, inventory and heartbeat code
+calls the channel named **`default_channel`**, so that name is required. An endpoint is
+`{http | https, Host, Port, SslOptions}`, or the same with a fifth element, a map whose
+`socket_options` (a list) go to the TCP socket. `SslOptions` are Erlang `ssl` client options,
+handed on unchanged; `http` is plaintext HTTP/2 (the lab and UAT posture), `https` is TLS
+with ALPN `h2`. The shipped `sys.config.prod` is the mutual-TLS reference.
+
+**What is acceptable for production:** `https`, `{verify, verify_peer}`, a CA-pinned
+`cacertfile` (or `cacerts`) of the endpoint's own, and a client certificate and key
+(`certfile` and `keyfile`): mutual TLS. Everything else (plaintext `http`, `https` without
+those) is a dev or UAT posture, and the gateway refuses the unsafe half of it at boot (see
+"What the gateway refuses at boot" below). A channel is one scheme: it may not list both
+`http` and `https` endpoints.
+
+| Channel option | Default | Meaning |
+|---|---|---|
+| `pool_size` | 1 | HTTP/2 connections **per endpoint**, 1 to 64 (a value outside that range is replaced by the default and the gateway logs a warning at boot, see [Bad values replaced by defaults](#bad-values-replaced-by-defaults)). One connection is what the grpcbox client held. **Raising it has consequences:** calls go round-robin over the live connections, so behind a layer-4 VIP in front of several server replicas the connections can land on different replicas (see "Several core replicas" under [What happens when the server restarts](#what-happens-when-the-server-restarts)), and after a certificate change the connections redial independently. Registration and inventory calls run one at a time, so a larger pool does not speed them up |
+| `connect_timeout` | 5000 | Milliseconds allowed for the TCP connect and, separately, for the TLS handshake, 1 to 600000 |
+| `max_receive_message_bytes` | 16777216 (16 MiB) | The largest response message accepted, up to 1 GiB; a larger one fails the call as soon as the limit is passed |
+
+The grpcbox-era options `balancer`, `encoding` and `sync_start` are accepted and ignored.
+Messages are never compressed (a compressed response message fails the call).
+
+**How calls use the channel.** The channel process only owns the connections: it opens
+`pool_size` of them per endpoint when it starts, notices when one comes up or goes down, and
+reopens a lost one after a delay of 100 ms doubling to 5 s, with up to 20% jitter added on
+top (so the longest delay is about 5.8 s, and the delay returns to 100 ms only once a
+connection has stayed up for 5 s), so a restarted server is not met by every gateway at the
+same instant. A call does not pass
+through that process: it takes the next **live** connection, round-robin, and sends its
+request there. A call that finds no live connection waits, at most for its own timeout, for
+one that is already connecting; if none is connecting it fails **at once** with the last
+connection error (`econnrefused`, `closed`, a TLS alert name), so a dead server is answered
+in microseconds and the circuit breaker sees it. The per-call timeout is 5000 ms and covers
+the connection wait; the callers do not change it. Nothing recycles a connection that is up:
+there is no connection-age cap.
+
+**TCP_NODELAY** is on for every connection by default (`upstream_tcp_nodelay`, see the table
+under *Upstream channel tuning*).
+
+**Certificates.** The gateway reads no certificate file itself: `SslOptions` reach Erlang's
+`ssl` application, which reads `certfile`, `keyfile` and `cacertfile` when a connection's TLS
+handshake runs. A connection that is up keeps presenting the certificate it opened with; a
+reconnect presents the files as they are then, except that `ssl` caches file contents and
+cleans that cache about every 120 s. MEASURED with this channel on OTP 28 against a local TLS
+listener that requires a client certificate: after the files were replaced, the open connection
+kept presenting the old certificate; a reconnect inside the cache window presented the old
+one again; a reconnect after the `ssl` cache was cleared presented the new one. Replacing
+the files therefore takes effect on the next reconnect, which happens when the connection
+drops (a server restart does it) and can still present the previous certificate for up to
+about 2 minutes. With the default of one connection per endpoint this is all or nothing, as it was with grpcbox. If you raise `pool_size` above 1, each connection redials on its own when it drops, so after a certificate change (or while an expired certificate is still in use) some calls can be refused by the server's peer check while others succeed, until every connection has redialed (INFERRED from the channel code, not run); see [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)
+for the procedure around pins and expiry.
+
+**Log volume while TLS keeps failing.** Every failed TLS handshake writes the channel's own
+`down` line plus Erlang `ssl` progress reports, about 5.8 KB per attempt in a probe. A
+connection that fails persistently (a wrong CA, an expired certificate) redials about every
+5.8 s once the delay has reached its cap, which at `pool_size` 1 comes to roughly 100 MB a day
+(DERIVED from that figure, not measured over a day); a larger pool multiplies it, and a probe
+at `pool_size` 8 wrote 369 KB in 12 s. Bound container logs (`logging: {driver: json-file,
+options: {max-size: "50m", max-file: "5"}}` in Compose) and alert on the failure rather than
+reading the log. The `ssl` progress reports list the option sets of each TLS connection,
+including the **file paths** of the key and certificate (never the key's passphrase, probed
+on OTP 28.4.2); treat the gateway log as sensitive to the same degree as the paths are.
+
+**What the gateway refuses at boot.** Before any listener is bound it exits, with a critical
+log line, when:
+
+- a `{grpcbox, [{client, _}]}` or `{grpcbox, [{servers, _}]}` entry exists, in the application
+  environment or in any config file the VM was started with (nothing reads them; see the
+  upgrade notes);
+- `upstream_client` is present but unusable: the log line gives the shape of the first defect
+  (`bad_client_config`, `bad_channel`, `bad_endpoint`, `bad_host`, `bad_socket_options`),
+  never the value, because SSL options name key files;
+- no channel is named `default_channel`. A gateway with none would register no agent and
+  forward no heartbeat while `/readyz` answered ready (its `upstream` check only tests that
+  the `yuzu_gw_upstream` process is alive, not that the server is reachable). Only the literal
+  `{yuzu_gw, [{allow_no_upstream, true}]}` excuses it, for a gateway under test;
+- **any** `https` upstream endpoint lacks `{verify, verify_peer}`, or lacks a `cacertfile` /
+  `cacerts` of its own (`Refusing to start: the upstream channel uses TLS (https) WITHOUT
+  {verify,verify_peer} and a {cacertfile,...} of its own`). Without a CA of its own the TLS
+  stack trusts the operating system's CA store, so any publicly trusted certificate for the
+  server's name would be accepted. One verified endpoint does not excuse an unverified one:
+  calls go round-robin over all of them. Only the dev/CI override
+  `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` excuses it (the gateway then logs a warning);
+- a TLS file named by an `https` endpoint (`cacertfile`, `certfile`, `keyfile`) is a directory or
+  another non-file (`Refusing to start: a TLS file of an upstream endpoint is a directory or not
+  a regular file`; reason `unusable_upstream_tls_file`). It cannot become a file by waiting, and a
+  container runtime creates exactly this in place of a bind-mounted file that does not exist on
+  the host. A file that is merely **missing**, empty or without a certificate is not refused;
+  see [A CA, certificate or key file that is wrong](#a-ca-certificate-or-key-file-that-is-wrong);
+- one channel lists both `http` and `https` endpoints (`Refusing to start: the upstream
+  channel <name> lists both plaintext (http) and TLS (https) endpoints`; reason
+  `mixed_upstream_endpoints`). Calls go round-robin over every live connection, so some would
+  travel unencrypted whatever the `https` endpoint is verified against. There is no override:
+  give the channel one scheme.
+
+The boot log then names the posture: `mutual-TLS` only when every endpoint also carries a
+`certfile` and `keyfile`, otherwise `server-authenticated TLS (no client certificate)`. The
+gateway does not require the client certificate; the server enforces it (mutual TLS plus
+the gateway's SPKI pin, see [Gateway upstream peer
+authorization](server-admin.md#gateway-upstream-peer-authorization)), so a gateway without one
+boots and is then refused by the server.
+
+**Keys that look related and do nothing.** `upstream_addr`, `upstream_port` and
+`upstream_pool_size` are read by nothing: the endpoints of the channel are what is dialled,
+and the pool size is the channel's `pool_size`. This was already so before the client was
+replaced. The environment variables `YUZU_GW_UPSTREAM_ADDR` and `YUZU_GW_UPSTREAM_PORT` are
+now **ignored with a boot warning** (`YUZU_GW_UPSTREAM_ADDR is set but has no effect`); they
+no longer log an `ENV override` line as if they had applied. Change the endpoint in the channel
+to repoint a gateway, not these variables.
+
+**Two limits of the endpoint.** An IPv6 literal host (`"::1"`) fails name resolution in a
+retry loop unless the endpoint's `socket_options` include `inet6`, and `"[::1]"` fails too;
+the dial is IPv4 only, with no fallback, so `localhost` against an IPv6-only listener reads as
+`econnrefused`. Both look like a server that is down. A `pool_size`,
+`connect_timeout` or `max_receive_message_bytes` that is out of range or not an integer is
+replaced by its default; see [Bad values replaced by defaults](#bad-values-replaced-by-defaults).
+
+#### A CA, certificate or key file that is wrong
+
+When the CA, certificate or key file an `https` endpoint names is missing, unreadable, empty
+or holds no PEM certificate (or no PEM key, for `keyfile`), Erlang's `ssl` rejects the whole
+option set. Every connection attempt then fails in about 2 ms with the one word
+`bad_tls_options`, which says nothing about which file. The gateway therefore looks at the
+files itself and says it in three places:
+
+1. **At boot**, one WARNING per file: `Upstream channel default_channel endpoint
+   gw.example:50055: cacertfile /etc/yuzu/ca.pem does not exist (yet). Every connection to it
+   fails until this is fixed. The gateway starts anyway ...`. The gateway starts on purpose: the
+   server generates its certificates on its first start, which can be after the gateway's, and
+   the channel keeps retrying. A **directory** where a file belongs is the one case it refuses
+   (see above).
+2. **While it keeps failing**, an ERROR line from the channel, the first at once and then at
+   most once a minute: `Upstream channel default_channel: the TLS client options cannot be used,
+   so every connection fails: cacertfile /etc/yuzu/ca.pem does not exist (yet). The gateway
+   keeps retrying and /readyz stays 503 until this is fixed`. If none of the files is at fault,
+   it says so, and the cause is one of the other `ssl` options.
+3. **In `/readyz`**: the check `upstream_tls_files` is `false` and the whole answer is 503
+   `not_ready` while the most recent connection attempt of any channel failed because its TLS
+   options are unusable. It is a table read, so a slow upstream cannot hold it. The circuit
+   breaker alone would have stayed closed until five calls had failed.
+
+The reasons are `does not exist (yet)`, `cannot be read (permission denied)`, `is a directory,
+not a file`, `is not a regular file`, `is empty`, `contains no PEM certificate` and `contains no
+PEM private key`; any other file error is shown as its POSIX name (`eio`). The path of a
+`cacertfile` or `certfile` is printed, the path of a `keyfile` is **never** printed (the line
+says `keyfile`, and you know which key your configuration names).
+
+Limits, so the signal is not read as more than it is:
+
+- It reports the **most recent attempt**. If the server is also down, the TCP connect fails
+  before TLS is tried, the report clears, and it returns once the server is reachable. A gateway
+  with both problems is not ready for the first reason either way.
+- The file check reads each file once per failed attempt and parses it only up to 4 MiB. A file that is
+  a valid PEM certificate but the wrong one (another CA) is not a file problem: it fails the
+  handshake with a TLS alert such as `unknown_ca` instead, which the `down (<alert>)` lines
+  and `yuzu_gw_upstream_tls_handshake_failures_total` carry.
+- A key that does not match its certificate is not detected here.
+- The OTP `ssl` progress reports that also appear on each attempt still print the option set,
+  key file paths included (tracked separately); this line adds none.
+
+#### Bad values replaced by defaults
+
+A channel option that is present but is not an integer inside its range does not stop the
+gateway. It is replaced by the option's default, and the gateway logs one warning per option at
+boot, before it binds any listener:
+
+```
+Upstream channel default_channel: pool_size is 100, not an integer from 1 to 64; the default 1
+is used instead (docs/user-manual/gateway.md 'Bad values replaced by defaults').
+```
+
+The gateway starts anyway on purpose: a typo in a tuning option would otherwise turn into a
+refusal to boot on the next restart, on every gateway that shares the file. The cost is that the
+gateway that runs is not the one the file describes, so look for this warning after any change to
+`upstream_client`.
+
+| Option | Accepted | Default used instead |
+|---|---|---|
+| `pool_size` | integer, 1 to 64 | 1 |
+| `connect_timeout` (ms) | integer, 1 to 600000 | 5000 |
+| `max_receive_message_bytes` | integer, 1 to 1073741824 | 16777216 (16 MiB) |
+
+What the warning says about the value: an integer is printed as it is, an atom by name
+(`infinity`), and anything else only by its type (`a list`, `a binary`, `a float`, `a map`). So
+`"4"` (a string) and `2.0` (a float) are both replaced, and the warning reads `a list` and `a
+float`. The contents are not printed, because these options sit beside the channel's SSL options
+in the same file.
+
+To clear the warning, correct the value in `sys.config`. It takes effect the next time the
+gateway starts, and a restart disconnects every agent the node holds (see [What happens when the
+server restarts](#what-happens-when-the-server-restarts)), so schedule it like any other restart.
+
+What this warning does **not** cover:
+
+- A value that is valid but unwise. A `max_receive_message_bytes` of a few hundred bytes is in
+  range, so it is used as written, and every response larger than that then fails the call
+  after the server has already acted on the request (a `ProxyRegister` is committed on the
+  server and the gateway sees an error).
+- An option that is misspelled or unknown, such as `poolsize`. It is not a bad value, it is
+  simply not read, and nothing is logged.
+- Other gateway settings. Each is described where it is introduced; this warning concerns the
+  channel options above only. `upstream_tcp_nodelay` and the other boolean environment
+  settings log a warning of their own when their value is invalid.
+
 ### TLS posture (M1)
 
 > **⚠ SECURITY — do not expose the agent listener (`:50051`) to an untrusted
@@ -1137,33 +1967,35 @@ See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 > the CA to agents. **Until your deployment turns it on (only the reference gateway compose
 > ships it; the cluster, demo and UAT composes are plaintext, see the table
 > below), a gateway exposed to an untrusted network MUST**
-> either (a) front the gateway at L4 or with TLS passthrough only (one TCP
+> either (a) front the gateway at L4 or with TLS passthrough (one TCP
 > connection per agent end to end, with the gateway's own agent-listener TLS
-> enabled; an HTTP/2-terminating reverse proxy, including a service-mesh sidecar
-> that terminates HTTP/2, is not supported for heartbeat admission, see
-> [Heartbeat admission](#heartbeat-admission)), or (b) keep
+> enabled), or with an HTTP/2-terminating proxy configured for connection affinity
+> (re-encrypting to the gateway; see
+> [Keeping each agent on one backend connection](#keeping-each-agent-on-one-backend-connection)),
+> never one that pools backend connections across clients, or (b) keep
 > `:50051` on a trusted network (VPN / private subnet / a mesh policy that does not
 > terminate HTTP/2; see [Heartbeat admission](#heartbeat-admission)). Direct
 > agent→server connections use TLS; this gap is specific to the gateway edge.
 
 | Hop | State | Notes |
 |---|---|---|
-| gateway → server upstream (`:50055`) | **mutual TLS** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. |
-| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` (needs the vendored `_checkouts/grpcbox`). Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or a UAT/demo `sys.config` (inline in `docker-compose.uat.yml`, mounted as a file by the others); the remaining composes do not run the gateway. Heartbeats are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. |
-| server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert`) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one. |
+| gateway → server upstream (`:50055`) | **mutual TLS in `sys.config.prod`; the gateway itself enforces only server verification** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. The gateway refuses to boot on `https` without `verify_peer` and a CA of its own, and on a channel mixing `http` and `https`; it does **not** require a client certificate, so mutual TLS holds only where the endpoint carries `certfile` and `keyfile` and the server demands them (SPKI pin, see [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)). Plaintext `http` boots as the lab/UAT posture. |
+| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `tls => #{certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` in its `grpc_listeners` entry. Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or a UAT/demo `sys.config` (inline in `docker-compose.uat.yml`, mounted as a file by the others); the remaining composes do not run the gateway. Heartbeats are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. |
+| server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert` from the `tls` map) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one — within `mgmt_pin_refresh_ms` (default 5 s, see "Management-pin refresh"): the `yuzu_gw_mgmt_pins` watcher re-reads the file on its own timer (comparing a SHA-256 of its contents, so a new key of the same size with a preserved mtime is still picked up) and the per-stream check reads its published key, never the file, so a rotated server leaf can be refused for up to one interval (fail closed). The server does not retry a refused command: it fails terminally as `gateway_unauthenticated` and must be submitted again (#5988 tracks a server-side retry). |
 
-TLS is configured **entirely in the `grpcbox` block** (grpcbox reads its own
-config at boot — the old `{tls, [...]}` advisory key under `yuzu_gw` was removed
-in PKI PR5 and does **nothing**). To enable upstream mutual TLS, copy the
-`{grpcbox, [{client, ...}]}` `{https,...}` channel from
-`gateway/config/sys.config.prod`.
+TLS is configured in two places: the `tls` map of each `grpc_listeners` entry (the
+two listeners) and the `{yuzu_gw, [{upstream_client, ...}]}` entry (the upstream channel;
+it was `{grpcbox, [{client, ...}]}` before 2026-10-11, and a leftover block under that
+name refuses boot). The
+old `{tls, [...]}` advisory key under `yuzu_gw` was removed in PKI PR5 and does
+**nothing**. To enable upstream mutual TLS, copy the `{https,...}` channel of
+`upstream_client` from `gateway/config/sys.config.prod`. A listener without a `tls`
+map is plaintext, and a `tls` map must carry all three of `certfile`, `keyfile` and
+`cacertfile` or the gateway refuses to boot.
 
-To enable mTLS on the agent listener for a deployment where **every agent already
-holds a CA-issued client cert** (not the normal enrollment path), add a
-`transport_opts` map to each server entry — see the commented block in
-`sys.config.prod`. **`ssl => true` is mandatory**; omit it and grpcbox silently
-runs plaintext regardless of the other options. Full detail:
-`docs/pki-architecture.md` "Gateway TLS".
+Do not turn on client-certificate enforcement on the agent listener by adding an
+`auth_fun`: see [Moving the agent edge to mutual TLS](#moving-the-agent-edge-to-mutual-tls)
+for what exists and what does not. Full detail: `docs/pki-architecture.md` "Gateway TLS".
 
 #### Enabling agent-listener TLS — order of operations + caveats (#1244)
 
@@ -1182,7 +2014,7 @@ at once — there is no dual-listen transition):**
 1. **Distribute the CA** (`default-gateway`'s issuing CA, i.e. the install root)
    to every agent's `--ca-cert` / cert dir.
 2. **Reconfigure agents** to dial the gateway over TLS and verify that CA.
-3. **Only then flip the listener** to `ssl => true` in `sys.config.prod`.
+3. **Only then flip the listener** to TLS by adding the `tls` map to its entry (as in `sys.config.prod`).
 
 Reversing the order strands the fleet until every agent is re-pointed.
 
@@ -1191,7 +2023,10 @@ agent**, not the agent to the gateway. It closes the on-path eavesdrop/inject of
 the plaintext edge, but a *compromised gateway itself* can still inject commands
 to the fleet — the compensating control is app-layer: the enrollment approval
 workflow. (The server also accepts gateway-authoritative `gateway_observed_peer`
-attribution, but the gateway does not populate that field yet — see #1172 below.)
+attribution, which the gateway now sets itself for every registration; see
+[Client addresses behind a proxy](#client-addresses-behind-a-proxy). It is
+attribution, not authentication: a compromised gateway, and a host listed in a
+listener's `origin.sources`, can assert any source address.)
 Full cryptographic agent-to-gateway identity (so the gateway can't forge an
 agent) is tracked in the through-gateway attestation work (#1292, design in
 #5578); no release is committed.
@@ -1217,10 +2052,9 @@ cp /etc/yuzu/certs/default-ca.pem ./install-ca.pem   # or GET /api/v1/ca/root
 
 # 1. Point the gateway's upstream at the server over mutual TLS (PR5) and turn on
 #    the agent-listener one-way TLS (PR5c) — both live in sys.config.prod:
-#      {grpcbox,[{client,...,{https,...,[{ssl_options,...}]}}]}   % upstream mTLS
-#      listener transport_opts => #{ssl=>true, certfile, keyfile, cacertfile,
+#      {yuzu_gw,[{upstream_client,#{channels=>[{default_channel,[{https,...,[{certfile,...},...]}],#{}}]}}]}   % upstream mTLS
+#      grpc_listeners agent entry: tls => #{certfile, keyfile, cacertfile,
 #                                   verify=>verify_none, fail_if_no_peer_cert=>false}
-#    (needs the vendored _checkouts/grpcbox — the image build asserts it.)
 
 # 2. Distribute install-ca.pem to every agent and have them dial the gateway over
 #    TLS, verifying that CA:
@@ -1235,6 +2069,510 @@ Verify: the gateway boot log shows `tls` posture (not `plaintext`); an agent
 connects and enrolls; `openssl s_client -connect gateway:50051` presents the
 `default-gateway` leaf. Direct agent→server connections (no gateway) use TLS and
 need none of this.
+
+### Certificate rotation and expiry
+
+**What the gateway watches.** The management-pin watcher (`yuzu_gw_mgmt_pins`)
+checks every certificate file the gateway is configured with every
+`mgmt_pin_refresh_ms` (default 5 s). It reads every file on every check and
+parses it again only when its bytes changed (a SHA-256 of the contents is
+compared). The modification time and size are not enough: a new certificate
+with a key of the same type usually has exactly the same size, and `cp -p`,
+`rsync -a` or `tar -p` keep the old modification time, so a check on those
+alone would keep the old key. Certificate files are a few kilobytes, so this
+costs one small read per file per interval, on the watcher's own timer; no
+management call ever touches the file system. The files,
+and the `role` and `name` labels they are reported under:
+
+| `role` | File | `name` |
+|---|---|---|
+| `listener` | `tls.certfile` of a `grpc_listeners` entry | the listener's `name` |
+| `listener_ca` | `tls.cacertfile` of the same entry | the listener's `name` |
+| `upstream_client` | `certfile` of an `upstream_client` channel endpoint | the channel name |
+| `upstream_ca` | `cacertfile` of the same endpoint | the channel name |
+| `mgmt_peer_pin` | the `Path` of a `{cert_file, Path}` entry of `mgmt_peer_pins` (the **server's** certificate) | the file name |
+
+Inline certificates (`cert`, `cacerts`) are not files and are not reported.
+
+**Metrics.** `yuzu_gw_cert_expiry_timestamp_seconds{role,name}` is the
+certificate's `notAfter` in Unix seconds (for a file holding several
+certificates, the earliest). `yuzu_gw_cert_file_readable{role,name}` is 1 while
+the latest read of the file parsed as PEM certificates and 0 when the stat, the
+read or the parse failed. When a file becomes unreadable the expiry gauge keeps
+the last value read from it, so an expiring certificate keeps alerting; a file
+that was never readable has no expiry series. Two certificates under one
+`role` and `name` (two endpoints of one channel with different files) are
+reported as one series: the earliest `notAfter`, and readable only if both are.
+`yuzu_gw_mgmt_pin_rotated_timestamp_seconds` is the Unix time at which the
+watcher last published a **different** key for a `{cert_file, Path}` pin. It is
+0 until the first such change in the gateway process; reading the file at start,
+or a rewrite of the same key, does not set it.
+
+**A management pin file that cannot be read.** Once a `{cert_file, Path}` pin has
+been read, the gateway keeps the key it read if a later read fails (the file is
+missing, unreadable, not a PEM certificate, or caught half-written). Commands
+keep flowing, `yuzu_gw_cert_file_readable{role="mgmt_peer_pin"}` reads 0, the
+log says `the key last read from it stays pinned until the file is readable
+again`, and `YuzuGatewayMgmtPinUnresolved` fires after 2 minutes. Fix the file:
+until it is readable again the gateway cannot pick up the server's next
+rotation, which it would then refuse. Deleting the file does **not** withdraw
+the pin. To change the pinned key, replace the file with the new certificate
+(picked up within one interval). Removing the entry from `mgmt_peer_pins` also
+withdraws it, but only at the next gateway restart, which disconnects every
+agent on the node; agents without the #5183 fix stay wedged after it, so
+prefer replacing the file unless the entry itself must go. A pin file that is unreadable when the gateway starts pins
+nothing, as before (fail closed): every management stream is refused
+`no_pins_resolved` unless another pin admits the server.
+
+**A routine rotation of the server's certificate.** When the server replaces its
+leaf at the pinned path, the gateway pins the new key at its next refresh. In
+the window between the two (at most one `mgmt_pin_refresh_ms`, 5 s by default)
+the server's management streams carry the new key while the gateway still pins
+the old one, and they are refused `pin_mismatch`. **The server does not retry
+these**: each command it forwards to this gateway in that window fails
+terminally as `gateway_unauthenticated`, is counted in the server's
+`yuzu_server_gateway_forward_total{status="unauthenticated"}` and shows as a
+failed command. Commands sent after the refresh go through, and nothing needs to
+be done about the gateway. If a failed command matters, run it again. To make
+the window empty, pre-stage the new key as a second pin (`{spki_sha256, Hex}` of
+the new certificate) before the server rotates, and remove it after. Each change
+to `mgmt_peer_pins` applies only at a gateway restart, which disconnects every
+agent on the node (agents without the #5183 fix stay wedged after it), so weigh
+that against re-running the few commands a rotation drops.
+
+**Alerts** (group `yuzu-gateway` and `yuzu-tls` of
+`docs/prometheus/yuzu-alerts.yml`; scrape the gateway). Each fires only when
+someone has something to do:
+
+| Alert | Fires when | What to do |
+|---|---|---|
+| `YuzuGatewayMgmtAuthRejected` (warning) | a management peer was refused for any reason **other than** `pin_mismatch`, in the last hour | `missing_server_auth_eku`, `bad_peer_cert`: a holder of an install-CA certificate that is not the server reached `:50063`, or the server's leaf lacks the serverAuth usage; investigate the source, fix the server certificate. `no_pins_resolved`, `no_pins_configured`, `bad_pin_config`: the pins admit nobody and every forwarded command fails; restore the pinned file or correct `mgmt_peer_pins`. `internal_error`: collect the log, report it. A rotation never produces these. |
+| `YuzuGatewayMgmtPinMismatch` (critical) | `pin_mismatch` rejections that no pin rotation on this gateway explains: rejections are read one minute late and ignored for 4 minutes after `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` moves | Commands to this gateway's agents are failing. If the server's certificate changed, update the pinned file (picked up within one interval). If it did not change, someone is presenting another serverAuth certificate (for example the gateway's own key) to the command plane: treat it as a security incident. |
+| `YuzuGatewayMgmtPinUnresolved` (warning, 2 m) | a configured pin has never resolved, or a pin file's latest read failed (`yuzu_gw_cert_file_readable{role="mgmt_peer_pin"} == 0`) | Correct the fingerprint, or restore the pinned file (owner, mode, contents). The fix is picked up within one interval. |
+| `YuzuGatewayCertificateFileUnreadable` (warning, 10 m) | a listener or upstream certificate file cannot be read or parsed | Restore it before the gateway restarts or redials: until then it keeps the certificate it loaded, but anything that reads the file again fails. |
+| `YuzuGatewayCertificateExpiringSoon` (warning, 1 h) | a configured certificate expires in 7 to 30 days | Schedule the renewal. |
+| `YuzuGatewayCertificateExpiryImminent` (critical, 10 m) | it expires in 1 to 7 days | Renew it today. |
+| `YuzuGatewayCertificateExpiryCritical` (critical, 5 m) | it expires in under 24 hours, or has expired | Renew it now. |
+
+The three expiry bands do not overlap, so one renewal pages once at a time. For
+`mgmt_peer_pin` the certificate is the server's: renew it on the server, and the
+gateway pins the new key on its own. Renewing the gateway's own leaf
+(`listener`, `upstream_client`) over a **new key** needs the server's gateway
+peer pin updated first: see "Rotation" in [Gateway upstream peer
+authorization](server-admin.md#gateway-upstream-peer-authorization).
+
+**Limits.** The rotation suppression assumes the scrape interval plus
+`mgmt_pin_refresh_ms` is at most one minute; with a longer refresh interval the
+refused window is longer and a rotation can fire `YuzuGatewayMgmtPinMismatch`.
+The rotation timestamp lives in the gateway process and starts at 0: a gateway
+that starts after the server rotated reads the new key at start and records no
+rotation, which is correct because it never refuses the new key. The `notAfter` comes from the
+file, not from the certificate a listener or connection loaded: after replacing a
+file, the new date is reported within one interval even if a long-lived
+connection still presents the old certificate.
+
+### Client addresses behind a proxy
+
+The server records the address of the agent that registered (`source_ip` in audit rows,
+`gateway_observed_peer` on the wire). The gateway decides that address itself, per call,
+from the listener's `origin` option. Whatever an agent puts in
+`RegisterRequest.gateway_observed_peer` is discarded and replaced by the gateway's value:
+a bare IP address (no port, no brackets), or empty, which means "no observation".
+
+A gateway behind a load balancer or a router sees the balancer as its TCP peer. The
+address of the agent behind it arrives as a claim: a PROXY protocol header, or an
+`x-forwarded-for` header. A claim is believable only when the proxy made it, so the
+decision is made by **who connected, never by whether the claim matches** the connection:
+
+| `origin` | The address is | Use when |
+|---|---|---|
+| `#{mode => transport}` (default) | The TCP peer. A PROXY header or `x-forwarded-for` a client sends is ignored. | Agents connect to the gateway directly. |
+| `#{mode => proxy_protocol, sources => [...]}` | The address in the PROXY protocol header, if the TCP peer is one of `sources`. | An F5 (iRule) or HAProxy (`send-proxy-v2`) passes the TCP stream through. |
+| `#{mode => forwarded_for, sources => [...], trusted_hops => N}` | The `x-forwarded-for` entry `trusted_hops` places from the right (0 = the last entry, the one the nearest proxy appended), if the TCP peer is one of `sources`. Entries further left are never examined. `trusted_hops` is an integer from 0 to 31. | A router terminates TLS and forwards HTTP/2 to the gateway. |
+
+What the server is told, by who connected:
+
+| The call came from | `gateway_observed_peer` | Counter | Server audit |
+|---|---|---|---|
+| A listener in `transport` mode | The TCP peer | none | `source_ip` = the TCP peer, no flag. **Behind a proxy you have not configured this is the proxy's address, and nothing flags it.** |
+| A configured proxy, usable claim | The claimed address | none | `source_ip` = the claimed address |
+| A configured proxy, claim missing or unusable (`no_claim`, `bad_claim`) | **Empty: no observation** | `origin_ignored{reason="no_claim"\|"bad_claim"}` | `source_ip` = the gateway node's address, `origin_observed=false` |
+| A peer that is not one of the `sources` (`untrusted_source`) | The TCP peer (what that client really is) | `origin_ignored{reason="untrusted_source"}` | `source_ip` = the TCP peer |
+
+An unusable claim from a proxy you trust is therefore never turned into the proxy's own
+address: the gateway says "not observed" and the server's audit row carries
+`origin_observed=false` beside the fallback `source_ip`, so a rise of `no_claim` /
+`bad_claim` is both a counter you can alert on and a visible flag in the audit trail. A
+claim from a TCP peer that is **not** a source is **ignored, not refused**: the call is
+served and attributed to that peer. Behind NAT, an F5 or a router the claim and the
+connection legitimately differ, so refusing a mismatch would turn a configuration slip
+into an outage; the TCP peer is what a client that reached the listener directly, and sent
+the claim itself, really is. Addresses are attributed without a port, and IPv4-mapped IPv6
+addresses are folded to IPv4 (including a source network written that way, such as
+`{{0,0,0,0,0,16#ffff,16#0a00,0}, 104}` for `10.0.0.0/8`; a mapped network with a prefix
+of 96 or less is refused at boot).
+
+The server's audit row records the address (or `origin_observed=false`), not how it was
+obtained: it does not distinguish the TCP peer, a proxy-vouched address and a listener left in
+`transport` mode behind an unconfigured proxy. A separate, later change will add that.
+
+Version skew: the server cannot tell a gateway that overwrites the field from one that does
+not. An older gateway forwards the value the agent sent, so **upgrade every gateway before
+you rely on `source_ip`**; until then a forged value passes through that gateway.
+
+```erlang
+%% F5 iRule or HAProxy `send-proxy-v2`; v1 and v2 headers are both read.
+origin => #{mode => proxy_protocol, sources => [{10,0,0,5}, {{10,1,0,0}, 24}]}
+
+%% A router that terminates TLS and appends the client it saw to x-forwarded-for.
+origin => #{mode => forwarded_for, sources => [{10,0,0,5}], trusted_hops => 0}
+```
+
+`sources` are the proxies as the gateway's socket sees them: an IP tuple such as
+`{10,0,0,5}`, or `{Ip, PrefixLen}` for a network such as `{{10,1,0,0}, 24}`. A proxy mode
+with no sources refuses boot, as does an unknown mode or option. Keep `sources` narrow: a
+wide network (a `/8`, say) trusts every host in it to vouch for any address.
+
+**`proxy_protocol`.** The header precedes the TLS handshake, so a TLS-passthrough
+balancer keeps the TLS session end to end and the **client certificate still reaches the
+gateway**. Every connection on the listener must carry the header or it is closed (after a
+second), so such a listener serves only the proxy. An F5 health monitor aimed at that port
+will fail unless it sends the header: monitor another port (for example the gateway's
+health port). A PROXY `LOCAL` command (a health check by the proxy itself) carries no
+client: if the connection goes on to make a call, that call counts as `no_claim` and is not
+attributed to anyone; a check that only connects opens no stream and is not counted. A PROXY header
+with an address family that has no address (`UNSPEC`, a unix socket) counts as
+`bad_claim`.
+
+**`forwarded_for`.** The router terminates TLS, so the certificate the gateway sees is the
+router's, not the agent's, and the option **cannot be combined with an `auth_fun`**
+(boot refuses it: the check would pass on the router's certificate and say nothing about the
+agent). Cowboy joins repeated `x-forwarded-for` lines with `, ` in order, so the entry the
+nearest proxy added is the last one, whether it sent a new line or extended the client's.
+The gateway examines only the entry `trusted_hops` places from the right and ignores
+everything to its left, whatever its length, count or bytes: a client cannot spoil the
+claim by sending a long or malformed header. The entry is trimmed of spaces and tabs and
+must be a bare IP address of at most 64 bytes (no port, no brackets, no leading zeros, no
+`1.2.3`). A scoped IPv6 entry such as `fe80::1%eth0` is accepted with the zone dropped (the
+Erlang address parser reads it that way), so it is attributed as `fe80::1`; an entry over 64
+bytes is `bad_claim` however valid it is. A header with fewer than `trusted_hops + 1` entries, or whose selected entry is
+not an IP, is `bad_claim`; no header at all is `no_claim`. In both cases the call has no
+observed address (see the table above). With an OpenShift/OKD router, leave the
+IngressController's `spec.httpHeaders.forwardedHeaderPolicy` at `Append` (the default) or
+`Replace`: either puts the address the router saw last in `x-forwarded-for`, which
+`trusted_hops => 0` reads. `IfNone` and `Never` can leave a client-supplied header as the
+only entry; do not use them with this option. On OKD 4.21 with the default `Append`, the
+real client address was attributed for every agent and a forged `x-forwarded-for` was
+ignored. A router that terminates HTTP/2 must also keep each agent on one backend
+connection, because [Heartbeat admission](#heartbeat-admission) binds heartbeats to the
+connection that opened the session: see the next section.
+
+**Count your proxies.** `trusted_hops` is the number of trusted proxies between the client
+and the gateway, minus one: 0 when one proxy appends the client's address, 1 when two do.
+A value **larger** than the real number lets a client choose the entry: behind one proxy,
+`trusted_hops => 1` selects the entry to the left of the proxy's, which is whatever the
+client put in its own `x-forwarded-for`, so the audit `source_ip` is a forged address. A
+value that is **smaller** attributes the call to an address the proxy chain owns (the
+outer proxy, say), which is wrong but not forged. Check it with the real path: send a
+`Register` that presents an enrollment token from a test host through the proxy with a
+client-supplied `x-forwarded-for` header (a made-up address) and confirm that the
+`source_ip` of the `enrollment.token_consumed` audit row is the test host's own address and
+not the header's. The check needs the enrollment token because the server writes the gateway
+origin to the audit log only on that action (an unknown or already-used token writes the same row
+with `result=failure`); a `Register` without one leaves nothing to read.
+
+#### Keeping each agent on one backend connection
+
+Behind a router that terminates TLS the gateway's "connection" is the router's
+connection to the gateway, not the agent's to the router. Heartbeat admission compares the
+connection of an agent's `Heartbeat` calls with the one that opened its `Subscribe`
+stream, so the router must give **each client connection its own backend connection and
+keep it for as long as the client connection lives**. Then all of an agent's calls arrive
+on one backend connection (and, with several gateway replicas, on the one replica that
+backend connection is to, which the node-local admission state also needs). A router that
+pools backend connections across clients breaks this in both directions: one agent's
+calls spread over several connections are rejected as `connection_mismatch`, and calls of
+different agents share one, which weakens the separation the check provides.
+
+HAProxy's default `http-reuse safe` did **not** do this in testing (HAProxy 3.2.25 and
+the OKD 4.21 router's 2.8, 50 agents, ten minutes or more, zero mismatches): its
+documentation says that once a stream has been processed the connection is reserved for
+the streams of the same session. `http-reuse never` is the setting that states the
+requirement outright, costs nothing for this workload, and is what to use if you want the
+configuration to say what it needs. Even `http-reuse always` gave zero mismatches in a
+six-minute run, but it exists to share connections between clients and nothing in its
+documentation promises otherwise, so do not rely on it. A mismatch counter that stays at 0 only means
+something if it can move: a Register on one connection followed by a Heartbeat on another
+raised it to 1 in the same rig.
+
+HAProxy as the terminating proxy, re-encrypting to the gateway over HTTP/2. This is the
+configuration that was tested; the `defaults` section is part of it, because without
+`mode http` HAProxy ignores `option forwardfor` and the `http-request` rule, adds no
+`X-Forwarded-For`, and every agent is then attributed to the proxy (`no_claim`):
+
+```
+defaults
+    mode http
+    timeout connect 5s
+    timeout client 300s
+    timeout server 300s
+
+frontend yuzu_agents
+    bind :443 ssl crt /etc/haproxy/agents.pem alpn h2
+    http-request del-header X-Forwarded-For   # drop anything the client sent
+    option forwardfor                         # add the address HAProxy saw
+    default_backend yuzu_gateway
+
+backend yuzu_gateway
+    http-reuse never                          # a backend connection belongs to ONE client connection
+    balance leastconn                         # chooses the replica when the client connects
+    timeout server 300s                       # longer than the agent's 60 s keepalive
+    server gw1 10.0.1.11:50051 ssl verify required ca-file /etc/haproxy/yuzu-ca.pem alpn h2
+```
+
+`http-reuse never` is HAProxy's setting for connection-bound protocols: the server
+connection a session opened stays attached to that session instead of returning to a
+pool other sessions draw from. `option forwardfor` adds the client address as its own
+`X-Forwarded-For` line after any the client sent; the gateway joins the lines in order and
+reads the one `trusted_hops` places from the right, so the client's own claim is never the
+one used (deleting it first keeps the header short). `timeout client` belongs in the
+`defaults` or `frontend` section and `timeout server` in the backend or `defaults`; the
+snippet sets both in `defaults` and repeats `timeout server` in the backend.
+
+What was run. The snippet is the file the acceptance run checked with `haproxy -c` on
+HAProxy 3.2.25 (the official container image; rc 0), and 50 agents then ran for ten
+minutes or more through a configuration that differs from it only in the listening port
+(`:8443`, because the container did not run as root), the backend address (the test
+gateway) and a `global` section that sets `maxconn 4096` and logging. `haproxy -c` on
+2.8.14 also accepts it without a warning (paths changed for a scratch directory). Without
+the `defaults` section HAProxy still accepts the file (`haproxy -c` returns 0) but warns
+that the `http-request` rule and `option forwardfor` are ignored because the proxy is not
+in HTTP mode, and it adds no header: a `-c` that returns 0 proves the syntax, not that the
+configuration does its job, so read its warnings. Not tested: timeouts of 1 hour in `mode
+http`, `bind :443` itself, more than one `server` line, and any HAProxy older than 2.8.
+
+*Idle timeouts.* An agent's `Subscribe` stream is long-lived and carries no traffic while
+idle, and a router cuts it once its timeout passes. Measured with 50 agents behind
+`forwarded_for` (the gateway's connected and disconnected counters, sampled every 10 to
+30 s, so each time is good to one sample interval; "t0" is the sample at which all 50 had
+registered):
+
+| Run | Idle timeout | Sampled cut |
+|---|---|---|
+| OKD router, stock timeouts | 30 s | 3 disconnects 33 s after the first connect sample, all 50 by 74 s |
+| OKD router, route `timeout` annotation only (the server side) | 30 s client side | 2 disconnects 32 s after the first connect sample, all 50 by 63 s |
+| HAProxy 3.2.25, the snippet above | 300 s | none at t0 + 332 s, all 50 at t0 + 362 s |
+| HAProxy 3.2.25, the snippet without `http-reuse never` | 300 s | none at t0 + 332 s, all 50 at t0 + 363 s |
+| OKD router, `clientTimeout` and `serverTimeout` 10 m | 600 s | disconnect counter 4 at t0 + 634 s and 51 at t0 + 664 s (it stood at 1 from t0 + 30 s: the mismatch check made then) |
+| HAProxy 3.2.25, `mode tcp` with `send-proxy-v2` | 3600 s | none in the 10 minutes watched |
+
+Read against the timeout: in the two 300 s runs the sample 32 s after it showed no
+disconnect and the sample 62 s (63 s in the second run) after it showed all 50 gone; in the
+10 m run the sample 34 s after it showed 3 of the 50 gone and the sample 64 s after it
+showed all 50. So the first disconnect was seen 34 s after the timeout in the 10 m run and
+between 32 and 62 s after it in the 300 s runs, and the cut was complete 62 to 64 s after
+the timeout in all three. The two 30 s runs began to disconnect 32 and 33 s after the first
+connect sample, when 47 and 50 agents had connected, and had cut all 50 by 74 and 63 s
+after it. The sample interval (10 to 30 s) does not allow more precision, and why the cut
+lands after the timeout rather than at it is not established. In every run the agents re-registered each
+time with no mismatches, but each cut is a reconnect and a fresh session, so a short
+timeout turns into constant churn, and every agent behind the proxy reconnects in the same
+few seconds (see "Sizing the proxy and the gateway for a fleet" below). Raise **both** the
+client and the server timeout; on OpenShift a route's
+`haproxy.router.openshift.io/timeout` annotation changes only the server side (the second
+row). The agent listener itself closes a connection that has carried no bytes for 180 s
+on `sys.config.prod` and the reference configs (the plaintext default, demo and UAT
+configs inherit 600 s), so behind a router the gateway is not what ends a quiet
+connection.
+
+**OpenShift / OKD router.** Measured on OKD 4.21.0-okd-scos.8 (single node, router
+HAProxy 2.8.10), 50 agents, no route or router setting for connection reuse was needed.
+What was needed:
+
+- **Enable HTTP/2 on the router.** A stock router ships with HTTP/2 off, so no ALPN is
+  negotiated and a gRPC client refuses the connection. Annotate the IngressController
+  with `ingress.operator.openshift.io/default-enable-http2=true`. Red Hat's guidance for
+  gRPC through the router is that HTTP/2 on the front end needs a custom certificate on
+  the route and that HTTP/2 end to end works with a **re-encrypt** or **passthrough**
+  route, not **edge**.
+- **Use a re-encrypt route** with the gateway's certificate as the route's custom
+  certificate (or a passthrough route, which keeps the agent's own TCP connection and
+  needs no `forwarded_for`).
+- **Raise the idle timeouts** as above: `spec.tuningOptions.clientTimeout` and
+  `serverTimeout` on the IngressController.
+- **Set the listener to `forwarded_for`** with `trusted_hops => 0`. With `hostNetwork`
+  the gateway sees the router as the node's OVN management address (10.217.0.2 on the
+  test cluster), not the router pod's. If `yuzu_gw_grpc_origin_ignored_total{reason="untrusted_source"}`
+  rises for traffic that came through the router, `sources` does not name the address the
+  gateway actually sees.
+
+A second, sharded `IngressController` behaves the same and is a supported way to keep
+agent traffic off the default router. A router run from a custom HAProxy template (the
+`TEMPLATE_FILE` mechanism of the router image) also passed, but Red Hat does not support
+custom templates or an unmanaged router on OpenShift 4.x (knowledge-base solution
+5381141): treat it as your own proxy, not as the platform's. The ingress operator offers
+no setting for `http-reuse`; an HAProxy of your own, configured as above, is the way to
+control it. Repeat the check below after any change of OKD or router version: this was one
+single-node cluster and one router pod, and several router replicas were not tried.
+
+**Check it.** Run agents through the proxy for at least ten minutes, then check three
+things in the gateway's `/metrics` and the server's audit log:
+
+1. Connection pinning. `yuzu_gw_heartbeat_session_mismatch_total` and
+   `yuzu_gw_heartbeat_rejected_total{reason="no_connection"}` must not rise, and the summary
+   log line must not report `connection_mismatch=`. A router that is not pinning shows as a
+   steady rise of the first, and as agents that re-register every few minutes.
+2. Attribution. `yuzu_gw_grpc_origin_ignored_total{reason=~"no_claim|bad_claim"}` must not
+   rise on a proxied listener, and the `source_ip` of the server's gateway-path registration audit rows
+   (`enrollment.token_consumed`) must equal each agent's own address, with no
+   `origin_observed=false` on them. The server writes the gateway origin to the audit log
+   only on that action, so this check needs agents that enroll with an enrollment token
+   (new agents, or a test agent registered with a fresh token); a `Register` without a
+   token leaves no row to read. A rise of `untrusted_source` means `sources` does not name
+   the address the gateway sees (see [Origin counters](#origin-counters) below).
+3. Churn. `increase(yuzu_gw_agents_connected_total[10m])` should be close to the number of
+   agents that came up in that window, and `yuzu_gw_agents_current` should be steady. An agent
+   count that sawtooths with a period equal to a proxy idle timeout is a proxy cutting idle
+   connections (see "Idle timeouts" above and "Sizing the proxy and the gateway for a fleet"
+   below); a count that falls once and stays down is a proxy or network fault, not churn.
+
+Repeat after any change to the router's configuration or version.
+
+#### Which topologies were tested
+
+| Topology | Gateway listener `origin` | Status | Evidence |
+|---|---|---|---|
+| Agents reach the gateway directly | `transport` (default) | MEASURED | OKD acceptance run A (agents direct to the gateway), and the eunit wire tests |
+| Router or HAProxy only, terminating TLS | `forwarded_for`, `trusted_hops => 0`, `sources` = the proxy | MEASURED for HAProxy 3.2.25 (run C, 50 agents, 10 minutes) and the stock OKD 4.21 router (run B; router HAProxy 2.8.10; HTTP/2 enabled, re-encrypt route, `Append` policy) | Real client address attributed for all 50 agents in both; a forged `x-forwarded-for` ignored |
+| Router run from a custom HAProxy template | `forwarded_for` | MEASURED, not supported by Red Hat (knowledge-base solution 5381141) | Run F; treat as your own proxy |
+| HAProxy `send-proxy-v2` in `mode tcp` | `proxy_protocol`, `sources` = HAProxy | MEASURED (run D, 50 agents, 10 minutes) | Real address attributed for all 50; a forged PROXY header from a non-listed peer ignored; a client with no header is closed after about 1 s |
+| PROXY protocol from a generic sender | `proxy_protocol` | MEASURED against a synthetic relay only | `yuzu_grpc_origin_wire_tests` (eunit) |
+| F5 only, TLS passthrough, PROXY protocol by iRule | `proxy_protocol`, `sources` = the F5's self IPs | UNTESTED: no F5 was available. See "F5" below | none |
+| F5 in front of a router (the gateway sits behind the router) | `forwarded_for`, `sources` = the router; `trusted_hops => 0` if the F5 hands the client address to the router by PROXY protocol, `1` if the F5 inserts `X-Forwarded-For` itself and the router appends the F5's address | UNTESTED, INFERRED from the header rules | none |
+| Both an F5 path and a router path reach the gateway | Two listeners on two ports, one entry per path, each with its own mode and `sources` | UNTESTED with a real F5; the port-override rule for two agent listeners is covered by eunit | `yuzu_gw_app_tests` |
+| 2000 or more agents behind a router or HAProxy | as above | UNMEASURED. The largest run is 50 agents. | none |
+| Several router replicas | as above | UNMEASURED. One single-node cluster and one router pod were tried. | none |
+
+The runs above were one OKD 4.21.0-okd-scos.8 single-node cluster and one HAProxy 3.2.25
+container, on 2026-10-09 and 10; the raw logs are with the pull request record, not in the
+repository. Only the INFERRED and UNTESTED rows are claims about code paths, not about a
+product. Do not treat a MEASURED row as a statement about another version of the same
+product.
+
+**F5 (UNVERIFIED).** The `proxy_protocol` mode expects the F5 to prepend a PROXY protocol
+header (v1 or v2) carrying the real client address to every TCP connection it opens to the
+gateway, before any TLS bytes, with the virtual server in TLS passthrough (no TLS
+termination). This is done in an iRule on the F5; no iRule is given here because none has
+been run against the gateway and a plausible-looking one that has not would be worse than
+none. What the iRule must achieve is the contract above: one header per backend connection,
+first on the wire, carrying the client's address and not the F5's own. Test it with a lab F5
+before relying on it: register an agent that presents an enrollment token through the virtual server and check
+that the `enrollment.token_consumed` audit row's `source_ip` is the agent's address and that
+`yuzu_gw_grpc_origin_ignored_total{reason=~"no_claim|bad_claim"}` stays flat. Two F5 behaviours
+to plan for: a health monitor that connects to the PROXY-protocol port without sending the
+header is closed by the gateway after about a second and the pool member then reads down, so
+monitor another port; and the self IPs the F5 connects from are what `sources` must list.
+
+**The listener must also be reachable only from the proxy** (a firewall rule, a Kubernetes
+NetworkPolicy). `sources` is defence in depth, not a substitute: the trust decision is
+made on the TCP peer, so the strength of the attribution is the strength of who can reach
+that port. The management listener is never proxied: the boot guard refuses a
+network-reachable management listener whose `origin` is not `transport`.
+
+#### Sizing the proxy and the gateway for a fleet
+
+Only 50 agents behind a proxy were measured. Everything below for larger fleets is
+arithmetic or the proxy vendors' guidance, not a measurement; test your own proxy at your
+own scale before relying on it.
+
+- **One backend connection per agent connection.** The supported proxy topology needs the
+  proxy to open one connection to the gateway for each agent connection and keep it for the
+  life of the agent's connection. Pooling many agents onto one backend connection is
+  **unsupported**: the per-connection cap of 8 sessions (`max_sessions_per_connection`) and
+  of 32 concurrent streams on the agent listener (`max_concurrent_streams`) would apply to all
+  of them together, the ninth `Register` on that connection is answered `UNAVAILABLE`, and
+  heartbeat admission cannot tell the agents apart.
+- **Gateway file descriptors.** Plan for about 1.5 to 2 times the agent count plus 200:
+  old and new connections overlap for a moment after a proxy idle cut. 2000 agents need
+  about 4000 or more; 10000 agents about 20000 or more. A systemd unit with
+  `LimitNOFILE=65536` holds to about 30000 agents; the gateway services in the shipped
+  compose files set no `ulimits`, so add `ulimits: nofile: 131072` to the gateway service and check
+  the **hard** limit in `/proc/1/limits` inside the container (the BEAM raises its soft limit
+  to the hard one). The agent listener's `limits.max_connections => 60000` assumes about 65536
+  descriptors, so raising the descriptor limit alone changes nothing at the ceiling: raise
+  `max_connections` with it (keep about 5500 descriptors below the limit) or the listener
+  still stops accepting at 60000.
+- **HAProxy.** Each agent costs two sockets (client side and server side). Set the global
+  `maxconn` to about 1.5 times the agent count, `ulimit-n` to at least `2 * maxconn + 100`,
+  and do not set a `maxconn` on the `server` line below that; check `show info` on the
+  stats socket for `Maxconn` and `Maxsock`.
+- **OKD / OpenShift router.** `spec.tuningOptions.maxConnections` on the IngressController
+  is shared by every route the router serves.
+- **Idle timeouts above 180 s** on both sides (three times the agent's 60 s ping), and expect
+  a herd: when the proxy cuts every idle connection at once, every agent reconnects within
+  seconds (50 agents did in the runs above; thousands is unmeasured). The gateway asks for a listen
+  backlog of 4096; raise `net.core.somaxconn` on the gateway host for fleets of 10000 or
+  more, or the kernel caps it lower.
+
+#### Origin counters
+
+`yuzu_gw_grpc_origin_ignored_total{mode,reason}` counts calls on a proxied listener whose
+claim was not used. The origin is resolved **per RPC stream**, so only a connection that
+opens a stream is counted: an L4, TCP, TLS or PROXY-`LOCAL` health check opens none and is
+never counted, and only an HTTP/2 health check that makes a call would be. Both labels
+come from closed sets, and an address is never a label or a log field. The counters carry
+no listener label.
+
+| Reason | Meaning | What the call is attributed to |
+|---|---|---|
+| `untrusted_source` | The TCP peer is not one of the `sources`, so any claim was ignored. | The TCP peer. |
+| `no_claim` | A trusted proxy sent nothing to read on a connection that went on to make a call: a PROXY `LOCAL` command, or no `x-forwarded-for` header. | No observation (empty; the server records `origin_observed=false`). |
+| `bad_claim` | A trusted proxy sent something that is not usable: a PROXY header whose address family has no address (`UNSPEC`, unix), an `x-forwarded-for` with fewer than `trusted_hops + 1` entries, or a selected entry that is empty, longer than 64 bytes, or not a bare IP address (a port, brackets, a leading zero, `1.2.3`). | No observation. |
+
+A steady `untrusted_source` rate means something other than the proxy is reaching the
+listener (or `sources` is wrong): fix the network rule, not the counter. A steady
+`no_claim` or `bad_claim` rate on a proxied listener means the proxy is not giving the
+gateway an address it can use (HAProxy without `mode http`, a missing `option forwardfor`,
+a PROXY `LOCAL` connection that goes on to make a call): the shipped alert rules
+`YuzuGatewayOriginUnusable` and `YuzuGatewayOriginSourcesMismatch` fire on these two
+conditions. `yuzu_gw_grpc_dropped_data_bytes_total{reason}` is the request bytes the layer
+discarded in a state that must not run a handler (`extra_request_data`, `stream_ended`).
+
+### Moving the agent edge to mutual TLS
+
+Agent identity at the gateway is application-layer: the agent listener is **one-way
+TLS**, encrypting the hop and authenticating the gateway to the agent, and a client
+certificate is neither requested nor checked. The move to client certificates has three
+stages. Only the first two exist in code today, and the second enforces nothing.
+
+1. **One-way TLS (today, shipped).** `tls => #{..., verify => verify_none,
+   fail_if_no_peer_cert => false}`. This is the shape in `sys.config.prod`.
+2. **Request a certificate, enforce nothing (available now, configuration only).**
+   `tls => #{..., verify => verify_peer, fail_if_no_peer_cert => false}` asks every client
+   for a certificate and still serves agents that have none (an agent that has not
+   enrolled yet has none). A handler can see the certificate the client presented
+   (`yuzu_grpc:peer_cert/1` returns its DER, or `undefined`); no shipped handler reads it
+   and nothing refuses a call because of it. A certificate that is presented but invalid
+   (expired, wrong CA) still aborts the handshake under `verify_peer`, whatever
+   `fail_if_no_peer_cert` says, so an agent with a stale leaf would be locked out: check
+   that before using this stage on a fleet.
+3. **Enforcement (not built; needs a design and its own ADR).** An `auth_fun` refuses
+   every peer without a certificate, and the agents that have not enrolled have none, so
+   enforcing certificates needs more than configuration: enrollment has to be separated
+   from the enforced surface (a listener that serves only `Register`, and a per-listener
+   method allow-list, which the layer does not have yet). The cryptographic agent
+   identity work is tracked in #1292 and the design in #5578.
+
+**Never put an `auth_fun` on the agent listener as it stands today.** It would refuse
+every agent without a certificate and cut agent bootstrap fleet-wide, so boot refuses an
+`auth_fun` on any listener that serves the agent service (`agent_pb` in `service_protos`, or the
+AgentService as a key of `services`); a combined agent-and-management listener is covered.
+
+How this interacts with a proxy: behind `proxy_protocol` the certificate still reaches
+the gateway (TLS passes through the balancer), so stages 2 and 3 are possible. Behind
+`forwarded_for` the router terminates TLS, so the certificate the gateway sees is the
+router's and cannot identify an agent; the layer refuses `forwarded_for` together with
+an `auth_fun` for that reason.
 
 ### Distribution Cookie (Required in Production)
 
@@ -1296,22 +2634,26 @@ network is still the first line of defense.
 ### Server-Side Setup
 
 The C++ server must be started with the `--gateway-upstream` flag specifying
-the address and port for the GatewayUpstream service. This port must match
-`upstream_port` in `sys.config`:
+the address and port for the GatewayUpstream service. This port must match the
+port of the `default_channel` endpoint in `{yuzu_gw, [{upstream_client, ...}]}` (see
+[The upstream client](#the-upstream-client); `upstream_port` is read by nothing):
 
 ```bash
 yuzu-server --gateway-upstream "0.0.0.0:50055"
 ```
 
-> **Known limitation — gateway origin-IP attribution (#1064).** On the gateway
-> `ProxyRegister` path, audit rows currently record the **gateway node's** IP as
-> `source_ip`, not the originating agent's IP. The server already consumes the
-> `RegisterRequest.gateway_observed_peer` field that carries the agent origin
-> (recording `source_ip`=agent origin and `gateway_ip`=transport peer when
-> present), but the gateway does not yet populate it — today's grpcbox transport
-> does not expose the direct agent peer to the gateway's handlers; the fix is
-> tracked in #1172. Until then, SIEM/audit consumers correlating
-> `source_ip` with network logs on this path will see the gateway's address.
+> **Gateway origin-IP attribution (#1064, #1172).** On the gateway `ProxyRegister`
+> path the server's transport peer is the gateway. The gateway therefore sets
+> `RegisterRequest.gateway_observed_peer` itself on every registration, to the
+> address it decided for the caller (the TCP peer, or the address a trusted proxy
+> vouched for, see [Client addresses behind a proxy](#client-addresses-behind-a-proxy)),
+> and discards whatever the agent put in that field; on a proxied listener whose proxy
+> gave no usable address it sends the field empty, and the server then records
+> `source_ip`=the gateway node and `origin_observed=false`. Otherwise the server records
+> `source_ip`=that address and `gateway_ip`=transport peer. Behind a load
+> balancer or router with no `origin` configured, the address is the balancer's and
+> nothing flags it: configure `origin` to get the agent's. Upgrade every gateway: an
+> older one still forwards the value the agent sent.
 
 ### What happens when the server restarts
 
@@ -1327,8 +2669,10 @@ This needs a gateway that carries the reconcile (#1197); with an older gateway
 the listing is ignored and the registry stays empty until the agents
 re-register (the behaviour under "Without the reconcile" below). If the
 gateway's circuit breaker opened during the outage, the verdict is dropped while
-it is open and the breaker's own recovery replay re-registers the agents instead
-(see "Several agents and a long outage" below).
+it is open; once the breaker has closed, the next verdict lists the agents again,
+and because the server does not know most of that batch the gateway replays every
+agent it holds (see "Several agents and a long outage" and "What starts a full
+replay" below).
 Restart the gateway to deploy this behaviour; the wire format is unchanged, so
 an old gateway with a new server, or a new gateway with an old server, still
 works (the old pairing simply keeps the behaviour described under "Without the
@@ -1362,11 +2706,14 @@ re-proxied an agent, the restarted server has no local session for it:
 for a fleet of 10,000 or more; correlate it with the gateway
 `Registration replay` INFO lines). Heartbeats are acknowledged and leases
 renewed throughout, so nothing is reaped meanwhile and you must not restart the
-gateway. The replay is paced: the per-session guard is
-`registration_replay_session_guard_ms` (default 10 s), and the drip sends one
-`ProxyRegister` at a time with a 20 ms gap by default, so the rate is set by the
-round trip: at 100 ms per call that is about 8.3 agents per second, and 10,000
-agents take about 1,200 s (the table under "Several agents and a long outage" gives the rest),
+gateway. The replay is paced by permits (#5695): the per-session guard is
+`registration_replay_session_guard_ms` (default 10 s), and up to 24 `ProxyRegister`
+replays run at once (`upstream_replay_concurrency`), so the rate is 24 divided by the
+round trip: at 100 ms per call that is about 240 agents per second, and 10,000
+agents take about 42 s (arithmetic; measured with a mocked server: 5,000 agents in
+10.7 s at 50 ms per call; before #5695 the drip sent one at a time with a 20 ms gap:
+about 8.3 agents per second and 1,200 s; the table under "Several agents and a long
+outage" gives the older figures),
 and the queue holds `registration_replay_queue_max` (10,000) entries. Each
 response lists at most 4,096 ids, so a larger fleet converges over several
 rounds. Scope targeting and command dispatch reach agents through the directory
@@ -1385,29 +2732,46 @@ do not.
 | gateway | WARN | `Circuit breaker: OPEN (will probe in <ms>ms)` | The upstream circuit breaker opened. A verdict that arrives while it is open is dropped and counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="circuit_open"}`; the matching line `heartbeat verdict named N session(s) while the circuit is open; dropped` is DEBUG, so at the default log level you see the counter and this warning, not that line. While the breaker is open, the whole `/readyz` answer is 503 `not_ready` (`circuit_breaker` is false in its checks), and the shipped guidance is that a load balancer probes `:8081/readyz`, so an open breaker can take this node out of rotation (INFERRED from `yuzu_gw_health.erl`; not run). Wait: do not restart the gateway, unless the repeating-failure signature in the next two rows applies. The replay runs after the breaker goes half open (INFO `Circuit breaker: open -> half_open (allowing probe RPC)`; `/readyz` reads ready again from that point), and the probe closing it logs INFO `Circuit breaker: half_open -> closed (probe succeeded)`. |
 | gateway | WARN | `Circuit breaker: half_open -> open (probe failed, increasing backoff)` | The probe failed, so the breaker is open again for a longer time (the backoff doubles up to the cap). The probe is either a call-path RPC or, when notifications are held, the head held notification (see "Stream Status Notification"); a notification probe that fails as a breaker failure also logs a `Failed to notify stream status for <agent>` WARN (see that row), and a probe worker that is killed without a result logs a different WARN instead (described in the same row). Read the reason in that line and the `code` label of `yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream"}` first (a probe killed at its deadline has neither: it logs the `did not answer within` line (later in this table) instead, and does not move that counter). A transport reason (`timeout`, `econnrefused`, a TLS handshake error) means the server is down, frozen or unreachable from the gateway: escalate to the server and check that it is healthy and reachable. Restarting the gateway does not help and reconnects every agent it holds. The SAME agent id in that line at every cycle is expected in this case too, because a failed probe goes back to the head of the queue (OBSERVED on a rig: the same head was probed again at every half open period while the server stayed down), so a repeating id alone does not identify the cause. A probe whose outcome is neutral (a local encode failure, or a server status that means the request itself was wrong) does not produce this line: see the next row and the `Failed to notify` row. |
 | gateway | WARN | `Evicted held stream status notification for <agent>: it cannot be encoded (<Class>:<Why>); the circuit breaker is not affected` | A held notification that cannot be encoded inside the gateway is not a probe failure, because the request never left it: a local encode exception does not move the breaker at all (see "Known limits"), so it does not produce the `half_open -> open` line. The signature is `Upstream RPC NotifyStreamStatus raised <Class>:<Why>` (for example `error:badarg`) with `yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="encode"}` rising, followed, when it was the probe, by this eviction line. The breaker state does not change, the entry is evicted from the store, and the next held notification is probed at once. Nothing blocks behind it and `ProxyRegister` and `ProxyInventory` are not refused because of it (INFERRED from the code and unit tests, not run on a rig). |
-| gateway | WARN | Reading an eviction or a `raised` line | What an eviction means for the agent: an evicted `CONNECTED` leaves the agent acknowledged by the server but not dispatchable until it reconnects, and an evicted `DISCONNECTED` leaves it looking online in the server's registry until its route lease expires. Every field of a notification is bounded, sanitised or minted by the gateway or the server before it is held, so a repeating eviction points at the gateway or its encoder, not at that agent. The agent id appears only in the eviction line: the `raised` and `Register refused` lines carry none, so for those discriminate by the `code` label of `yuzu_gw_upstream_rpc_errors_total`, by the `<Class>:<Why>` reason in the line, and by the ` (N similar line(s) suppressed since the last)` suffix, and treat `code="encode"` as a local encoder fault (see "Known limits"). A gateway restart is not the remedy, because it removes only the held entries and reconnects every agent the node holds. An `Upstream RPC ... raised` line with no eviction line comes from a call-path RPC or from an ordinary notification worker. For a call-path RPC (and for a probe) an exception raised by the request encoder does not move the breaker, whereas any other exception out of the call, every transport error and timeout, and every server status outside the request-fault set (3, 5, 6, 9, 11) is a breaker failure. An ordinary notification worker never feeds the breaker whatever its result: with the breaker closed it loses that one entry and logs `Failed to notify stream status` (next row). |
-| gateway | WARN | `Failed to notify stream status for <agent>: <reason>` | One `NotifyStreamStatus` call failed. It is logged for an ordinary notification worker and once for every failed (not killed) breaker probe that is a notification. A probe worker that is killed without a result does not log this line: it logs `Notify probe worker for <agent> exited without a result: <reason>` instead (see the next row), and a probe killed at its own deadline logs the `did not answer within` line instead of either (the row after next) and does not increment `rpc_errors_total`. With the breaker closed it means that one agent's `CONNECTED` or `DISCONNECTED` did not reach the server and is not retried: the worker's failure is not counted in `notify_dropped` and does not feed the breaker (see the `at_capacity` row for the effects on the server). For a probe that failed as a breaker failure (a transport error, a timeout, a server status that counts, or an exception out of the client) it is followed by the `half_open -> open` WARN above and the notification stays held. A probe with a neutral outcome has no `half_open -> open` transition: the breaker stays half open until a real RPC or probe decides. A probe whose request cannot be encoded in the gateway logs the eviction WARN described two rows up instead of this line, and the entry is evicted; a probe answered with a request-fault status (3, 5, 6, 9, 11; the server cannot return one for `NotifyStreamStatus` today) logs this line and the notification is retired, not requeued. The reason is the call's error: an `internal` error with the message `timeout` (the server did not answer within 5 s: frozen or overloaded), `econnrefused` (nothing is listening), a TLS handshake error (see `yuzu_gw_upstream_tls_handshake_failures_total`), or an `rpc exception <Class>:<Why>` (an exception inside the call; a request that failed to encode in the gateway is one of these and is counted as `code="encode"`, and for it the breaker is not touched, an ordinary worker loses the entry and a probe evicts it, see the previous row). The line names the agent id only, never a session id or a peer address. OBSERVED on a rig: 10 lines, one per stopped agent, when 10 agents were stopped while the server was frozen for more than 5 s with the breaker closed, and one line per failed probe in the failing-probe runs. |
+| gateway | WARN | Reading an eviction or a `raised` line | What an eviction means for the agent: an evicted `CONNECTED` leaves the agent acknowledged by the server but not dispatchable until it reconnects, and an evicted `DISCONNECTED` leaves it looking online in the server's registry until its route lease expires. Every field of a notification is bounded, sanitised or minted by the gateway or the server before it is held, so a repeating eviction points at the gateway or its encoder, not at that agent. The agent id appears only in the eviction line: the `raised` and `Register refused` lines carry none, so for those discriminate by the `code` label of `yuzu_gw_upstream_rpc_errors_total`, by the `<Class>:<Why>` reason in the line, and by the ` (N similar line(s) suppressed since the last)` suffix, and treat `code="encode"` as a local encoder fault (see "Known limits"). A gateway restart is not the remedy, because it removes only the held entries and reconnects every agent the node holds. An `Upstream RPC ... raised` line with no eviction line comes from a call-path RPC or from an ordinary notification worker. For a call-path RPC (and for a probe) an exception raised by the request encoder does not move the breaker, whereas any other exception out of the call, every transport error and timeout, and every server status outside the request-fault set (3, 5, 6, 9, 11) is a breaker failure. An ordinary notification worker feeds the breaker by the same rule, but only while the breaker is closed and still in the generation the worker started in. Whatever the breaker state, an encoder exception or a request-fault status retires its entry as lost (`yuzu_gw_upstream_notify_lost_total{reason="rejected"}`), and any other failure puts the entry back at the head of the store to be retried (`yuzu_gw_upstream_notify_requeued_total`); either way it logs `Failed to notify stream status` (next row) (INFERRED from the code and unit tests, not run on a rig). |
+| gateway | WARN | `Failed to notify stream status for <agent>: <reason>` | One `NotifyStreamStatus` call failed. It is logged for an ordinary notification worker and once for every failed (not killed) breaker probe that is a notification. A probe worker that is killed without a result does not log this line: it logs `Notify probe worker for <agent> exited without a result: <reason>` instead (see the next row), and a probe killed at its own deadline logs the `did not answer within` line instead of either (the row after next) and does not increment `rpc_errors_total`. For an ordinary worker it means that one agent's `CONNECTED` or `DISCONNECTED` did not reach the server on that attempt. It is held again at the head of the store and retried, whatever the breaker state (`yuzu_gw_upstream_notify_requeued_total`; if a newer notification for the same session was held meanwhile, that one is sent instead and the old one is counted in `notify_coalesced`). While the breaker is closed, and the worker was started in the breaker's current generation, the failure counts against the breaker like a failed call, so a server that keeps failing gets at most about the failure threshold (5) of retries, plus the sends already in flight, before the breaker opens and the half open probe takes over. Two outcomes are not retried and do not move the breaker: a server status that blames the request (3, 5, 6, 9, 11) and a request that failed to encode in the gateway; both are counted in `yuzu_gw_upstream_notify_lost_total{reason="rejected"}` (see the `at_capacity` row for the effects on the server). During a planned stop's last gasp a failed send is not retried (`reason="shutdown"`). None of these is counted in `notify_dropped` (INFERRED from the code and unit tests, not run on a rig). For a probe that failed as a breaker failure (a transport error, a timeout, a server status that counts, or an exception out of the client) it is followed by the `half_open -> open` WARN above and the notification stays held. A probe with a neutral outcome has no `half_open -> open` transition: the breaker stays half open until a real RPC or probe decides. A probe whose request cannot be encoded in the gateway logs the eviction WARN described two rows up instead of this line, and the entry is evicted; a probe answered with a request-fault status (3, 5, 6, 9, 11; the server cannot return one for `NotifyStreamStatus` today) logs this line and the notification is retired, not requeued. The reason is the call's error: an `internal` error with the message `timeout` (the server did not answer within 5 s: frozen or overloaded), `econnrefused` (nothing is listening), a TLS handshake error (see `yuzu_gw_upstream_tls_handshake_failures_total`), or an `rpc exception <Class>:<Why>` (an exception inside the call; a request that failed to encode in the gateway is one of these and is counted as `code="encode"`, and for it the breaker is not touched, an ordinary worker loses the entry and a probe evicts it, see the previous row). The line names the agent id only, never a session id or a peer address. OBSERVED on a rig: 10 lines, one per stopped agent, when 10 agents were stopped while the server was frozen for more than 5 s with the breaker closed, and one line per failed probe in the failing-probe runs. |
 | gateway | WARN | `Notify probe worker for <agent> exited without a result: <reason>` | This WARN is logged when the probe worker is killed and so returns nothing; it carries the agent id and a redacted reason only (never the notification), and is followed by the `half_open -> open` WARN and a requeue of the notification. On the rig run that killed a probe worker no such line existed, because the WARN was added afterwards; it is covered by unit tests and was not re-run on a rig (INFERRED from the code). |
 | gateway | WARN | `Notify probe worker for <agent> did not answer within <ms>ms and was killed; the notification is held again` | The half-open probe did not report within `notify_probe_timeout_ms` (default 15000 ms), so the gateway killed the worker and failed the probe: the notification goes back to the head of the queue and, while the breaker is still half open under the same generation, the `half_open -> open` WARN follows with the doubled backoff. One line per timeout. A second line can follow in the same half-open cycle when an earlier generation's probe times out after the breaker has re-entered half open (a call-path RPC failure reopened the breaker while that probe was out, and the deadline is longer than the breaker's open interval): that late timeout leaves the breaker as it is and the next probe is sent in the same cycle. The line carries the agent id (control characters replaced) and the configured milliseconds, never the notification. It means the upstream did not answer in time, or the connection attempt did not complete in time: check that the server is healthy and reachable, as for the `half_open -> open` row. A probe killed at its deadline increments neither `yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream"}` nor logs `Failed to notify stream status` (the worker is killed before it reports), so do not look for either. The signals are this WARN, the `half_open -> open` WARN with its `Circuit breaker: OPEN (will probe in <ms>ms)` line, `yuzu_gw_upstream_circuit_transitions_total` cycling through open, half open and open, and a high `yuzu_gw_upstream_notify_pending`. A WARN that repeats while the server is healthy points at RAISING `notify_probe_timeout_ms` (see "Upstream client tuning") The notification may have reached the server before the kill, so it can be sent again (at least once). Covered by unit tests with a mocked client; not run on a rig. |
+| gateway | WARN | `Server did not record the <event> stream status notice for <agent> (acknowledged=false); sending it again in <ms> ms` (also `...; giving up after <ms> ms (<why>)` and `... during the planned-stop flush; not sent again`) | The server answered a `NotifyStreamStatus` with `acknowledged=false`: it did not record the notification, so the gateway holds it and sends it again (see "When the server does not record a notification"). At most one line a second; the next line says how many were suppressed. A line now and then is a session the server no longer knows or that a newer registration replaced; a steady stream, with `yuzu_gw_upstream_notify_unacked_keys` above 0, means the server is refusing to record sessions (`YuzuGatewayNotifyUnacknowledged`). `giving up` names a `DISCONNECTED` past `notify_unacked_disconnected_window_ms` or a full retry set. Covered by unit tests with a mocked client and the scale suite's `unacknowledged` case; not run against a real server. |
 | gateway | WARN | `Register refused: the agent id is empty or longer than 256 bytes (size <N> bytes)` | A `Register` carried an agent id that the server would refuse (empty, missing, not a binary, or over 256 bytes) and was answered `INVALID_ARGUMENT` at the gateway edge with no upstream call; the circuit breaker is untouched. The line carries the byte size (0 for a value that is not a binary) and no agent id, so it cannot name the sender. At most one line per second, with a ` (N similar line(s) suppressed since the last)` suffix, so the number of lines is not the number of refusals: the counter `yuzu_gw_register_refused_total{reason="agent_id_length"}` counts every one, and it and the suffix are the two edge-refusal signals. A few refusals point at one broken or misconfigured client; a steady rate means clients are sending agent ids outside the bound. No gateway action is needed, because these cannot move the breaker (INFERRED from the code and unit tests, not run on a rig). |
 | gateway | WARN | `Upstream Register failed: <reason>` (also `Upstream ReportInventory failed: <reason>` and `Upstream RPC <Method> failed: <Status> <message>`) | An upstream `ProxyRegister` or inventory call failed and the agent's request failed with it; the agent retries with its own backoff. The reason is `circuit_open` (the breaker is open), a server status, a transport reason, or `rpc exception <Class>:<Why>`. These lines are rate limited to one per second per kind, and the next line ends with ` (N similar line(s) suppressed since the last)`, so the number of lines is not the number of failed requests: during a genuine outage the per-event signal is the unlimited `Circuit breaker:` lines and the suppressed-count suffix, not a line per `Register` (a `circuit_open` rejection never reaches the call, so `yuzu_gw_upstream_rpc_errors_total` does not count it). `Upstream RPC <Method> failed: <Status> <message>` is limited only for the five request-fault statuses (3, 5, 6, 9, 11); the same line for any other status is not limited (INFERRED from the code and unit tests, not run on a rig). |
-| gateway | WARN | `Upstream RPC <Method> raised <Class>:<Why>` with `yuzu_gw_upstream_rpc_errors_total{code="encode"}` rising | The gateway's own request encoder failed, so the request was never sent and the breaker is untouched (`error:badarg` is a field that is not valid UTF-8; `error:request_too_large` is a request over 4194304 bytes). A few lines are expected now and then, one per request the encoder rejected. A STEADY rise with every `Register` answered `INTERNAL` (`Upstream registration failed: {internal,<<"rpc exception <Class>:<Why>">>}`), the breaker CLOSED and `/readyz` ready is a systematic local encoder fault: nothing in the breaker or in readiness shows it, so this row is the discriminator. Read `<Class>:<Why>` first; if every agent is affected, escalate and fix the sender or the build; rolling back to the previous gateway build is possible but re-exposes the defect this change fixed (a request the gateway rejected locally counting as an upstream failure that can open the circuit breaker; see the security note in the release changelog), so prefer fixing the sender. A gateway restart does not help and reconnects every agent the node holds. The shipped `YuzuGatewayUpstreamErrors` alert fires only above 0.1 errors per second and has no `code` filter, so a slow stream of encode failures does not reach it; `YuzuGatewayUpstreamEncodeErrors` (about ten increases of `code="encode"` in 10 minutes, `increase()` being extrapolated, so a lone rejected request stays quiet; read the rate, not the firing alone) is the alert for this row. The line carries no agent id, so identify the cause by the `<Class>:<Why>` text and the `rpc_name` and `code` labels. With `code="exception"` instead, an exception out of the client or transport counts against the breaker only on the `Register` and `ProxyInventory` call paths, on the half-open notification probe and on a registration replay; an ordinary notification worker, a guardian forward and the heartbeat buffer's own flush do not feed the breaker (INFERRED from the code and unit tests, not run on a rig). |
+| gateway | WARN | `Upstream RPC <Method> raised <Class>:<Why>` with `yuzu_gw_upstream_rpc_errors_total{code="encode"}` rising | The gateway's own request encoder failed, so the request was never sent and the breaker is untouched (`error:badarg` is a field that is not valid UTF-8; `error:request_too_large` is a request over 4194304 bytes). A few lines are expected now and then, one per request the encoder rejected. A STEADY rise with every `Register` answered `INTERNAL` (`Upstream registration failed: {internal,<<"rpc exception <Class>:<Why>">>}`), the breaker CLOSED and `/readyz` ready is a systematic local encoder fault: nothing in the breaker or in readiness shows it, so this row is the discriminator. Read `<Class>:<Why>` first; if every agent is affected, escalate and fix the sender or the build; rolling back to the previous gateway build is possible but re-exposes the defect this change fixed (a request the gateway rejected locally counting as an upstream failure that can open the circuit breaker; see the security note in the release changelog), so prefer fixing the sender. A gateway restart does not help and reconnects every agent the node holds. The shipped `YuzuGatewayUpstreamErrors` alert fires only above 0.1 errors per second and has no `code` filter, so a slow stream of encode failures does not reach it; `YuzuGatewayUpstreamEncodeErrors` (about ten increases of `code="encode"` in 10 minutes, `increase()` being extrapolated, so a lone rejected request stays quiet; read the rate, not the firing alone) is the alert for this row. The line carries no agent id, so identify the cause by the `<Class>:<Why>` text and the `rpc_name` and `code` labels. With `code="exception"` instead, an exception out of the client or transport counts against the breaker on the `Register` and `ProxyInventory` call paths, on a stream-status notification (the half-open probe, and an ordinary notification worker while the breaker is closed and in the worker's generation; either way the notification is held again and retried) and on a registration replay; a guardian forward and the heartbeat buffer's own flush do not feed the breaker (INFERRED from the code and unit tests, not run on a rig). |
 | gateway | CRITICAL | `Refusing to start: the cluster id (<source>) cannot be represented as UTF-8 (a code point above 16#10FFFF, a surrogate, or bytes that are not UTF-8). Set YUZU_GW_CLUSTER_ID, or cluster_id in sys.config, to a name made of valid Unicode characters.` | The gateway did not start: `<source>` is `YUZU_GW_CLUSTER_ID` or `the cluster_id application setting`, and the application start returned `{error, {invalid_cluster_id, env}}` or `{error, {invalid_cluster_id, app_env}}`. The value is never logged. Check the named source: for `sys.config`, a plain binary `<<"...">>` that holds a non-ASCII character is the usual cause (one holding code points above 255 is truncated to bytes and passes only if those bytes happen to be valid UTF-8), so write the name as a string (`"Z\x{FC}rich"`) or as `<<"Z\x{FC}rich"/utf8>>`; for the variable, check that the value is valid UTF-8 text. Correct it and start the gateway again; a restart without the fix will refuse again (see the `cluster_id` paragraph under "Configuration"; INFERRED from the code and unit tests, not run on a rig). |
 | gateway | metric | `up == 0` for the gateway job, `YuzuGatewayDown`, or a unit that stays `failed` after a `cluster_id` refusal | The refusal is a boot failure, so the supervisor decides what you see. Under systemd, `deploy/systemd/yuzu-gateway.service` sets `Restart=on-failure`, `RestartSec=5`, `StartLimitIntervalSec=60` and `StartLimitBurst=3`: the unit is started at most three times in 60 s (the initial start plus two restarts) and is then left `failed`, which is reached within roughly 15 to 20 s of the first start (derived from those values, not measured). The unit's journal tag is `yuzu-gateway`, so `journalctl -t yuzu-gateway` shows the `Refusing to start` line (it names the source and never the value). Under the reference compose files the gateway has `restart: unless-stopped`, so it loops without ever being marked failed; read `docker logs` for the same line. In both cases the metrics endpoint is down, so Prometheus sees `up == 0` and `YuzuGatewayDown` fires after its 2 minute `for` (shipped in `docs/prometheus/yuzu-alerts.yml`). Fix the named source and start the unit again (`systemctl reset-failed yuzu-gateway` first if the start limit was hit). Whether the process exits with a non-zero status on this refusal, so that systemd counts it under `Restart=on-failure`, was not run; check `systemctl status yuzu-gateway` on your first rollout (INFERRED from the unit file, not run on a rig). |
 | gateway | WARN | `ENV override: YUZU_GW_CLUSTER_ID cannot be represented as UTF-8; ignoring it (the value is not logged)` | The variable could not be converted. It is not applied, and because the variable is still set the gateway then refuses to start with the critical line above. |
-| gateway | WARN | `Registration replay aborted: circuit open (N agent(s) not yet re-proxied)` | The breaker opened while the drip was running. The queue is dropped; the agents come back on a later verdict or on the next breaker recovery. |
-| gateway | WARN | `Registration replay aborted: registry unavailable (N queued entries dropped)` | The gateway's registry process was down when the drip popped an entry, so nothing queued could be re-verified and the queue was dropped. This abort disconnects no agent. INFERRED from the code (not tested): a registry that died has lost its tables (see [Heartbeat admission](#heartbeat-admission)), so a later verdict finds no local session for these agents and counts them `not_local`; they are not listed again into the replay. They come back only through their own `NOT_FOUND` re-register path, which released v0.13.0 and v0.14.0-rc6 agents do not complete (see "Agent dependency" below). |
+| gateway | WARN | `Registration replay aborted: circuit open (N agent(s) not yet re-proxied)` | The breaker opened while the drip was running. The queue is dropped; the agents come back on a later verdict once the breaker has closed (a breaker recovery replays nothing by itself since #5695). |
+| gateway | WARN | `Registration replay aborted: registry unavailable (N agent(s) not yet re-proxied)` | The gateway's registry process was down when the drip popped an entry, so nothing queued could be re-verified and the queue was dropped. This abort disconnects no agent. INFERRED from the code (not tested): a registry that died has lost its tables (see [Heartbeat admission](#heartbeat-admission)), so a later verdict finds no local session for these agents and counts them `not_local`; they are not listed again into the replay. They come back only through their own `NOT_FOUND` re-register path, which released v0.13.0 and v0.14.0-rc6 agents do not complete (see "Agent dependency" below). |
 | gateway | WARN | `Registration replay: <agent> failed: <reason>` | A replay `ProxyRegister` failed. It counts as a failure for the shared circuit breaker (see "Replay failures feed the shared circuit breaker" below). |
-| gateway | metric | `yuzu_gw_registration_replay_triggered_total{trigger="breaker"}` rising | The circuit breaker closed after an outage and the gateway replayed every agent this node holds. Expected after a long outage when the breaker opened (see "Several agents and a long outage" below). No action. |
+| gateway | metric | `yuzu_gw_registration_replay_triggered_total{trigger="server_lost_state"}` rising | A heartbeat verdict showed that the server does not know most of the sessions of a batch, and the gateway replayed every agent this node holds (see "What starts a full replay" below). Expected once after a server restart. Rising again and again with the server up means the server keeps forgetting or refusing the replayed sessions: read the server's `ProxyRegister` lines. The `breaker` value of this label is no longer emitted (#5695): a breaker recovery replays nothing by itself. |
 | gateway | metric | `yuzu_gw_heartbeat_coalesced_total` rising | Newer heartbeats of a session are replacing older buffered ones, one at a time. Expected during a server outage: heartbeats pile up between failed flushes and are merged, so the buffer stays at one entry per session. No action. The server's `yuzu_heartbeats_received_total{via="gateway"}` falls short of the number of heartbeats the agents sent for the same reason; that is not a loss of agents. |
 | gateway | metric | `yuzu_gw_upstream_notify_pending` non-zero | Stream-status notifications are held (#4632). Check the breaker first: while it is open the entries are held by design and this is the common case (the `Circuit breaker:` lines above, `yuzu_gw_upstream_circuit_transitions_total`, and `/readyz`). One entry is sent as the probe when it goes half open and the rest drain in first in first out order once the probe succeeds (OBSERVED on a rig: 10 held entries waited 55 to 59 s, the probe closed the breaker, and the pending gauge was back at 0 about 2 ms after the half open transition). If the breaker is closed and the gauge stays above 0 for longer than a connect burst, read `yuzu_gw_upstream_notify_inflight` (at most 10; a value stuck at 10 means the workers are slow or stuck) and `yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream"}`, whose `code` label separates a timeout (the server is slow or frozen) from `encode` (a request that failed to encode in the gateway: local, no breaker effect), from `exception` (an exception out of the client or transport) and from a transport error. A short rise is normal during a cold `Subscribe` wave: the gauge counts held keys and falls as the 10 workers drain them first in first out (INFERRED from the code; OBSERVED on a rig: 100 ms samples peaked at 660 to 762 held keys for 1000 agents (the one event-level trace of a run measured a maximum of 989) and at 1850 and 1906 for 2000 agents, and the gauge was back at 0 within about 0.3 s of the last `Register`, so a one second scrape does not see such a burst and a faster sampler is needed). The 3 a.m. diagnostic with no other tooling is `sys:get_status(yuzu_gw_upstream)` from a remote shell on the node: the state is shown redacted, with `cb_state`, `notify_pending_len` (a count) and `notify_probe_held` (whether a probe is out), and no session ids or addresses (INFERRED from `format_status`, not run on a rig). An agent reconnect recovers one agent whose notification was lost; a held notification that can never be encoded does not hold the queue: as the half open probe it is evicted with a WARN, and with the breaker closed an ordinary worker loses it and logs `Failed to notify stream status` (see the `half_open -> open` row). Both gauges describe the current upstream client process only: after it restarts they start at 0, held entries are gone, and workers of the old process are not counted. |
 | gateway | metric | `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}` rising | The pending store was at its cap and a notification for a new key was lost at admission (#4632): a new key is admitted only while the held keys plus the key of a half open probe in flight stay below `notify_pending_max`. Each lost notification can leave one agent acknowledged by the server but not dispatchable until it registers again. Find out why so many distinct keys are held (a connect storm with the breaker open, or a server that answers too slowly for the 10 workers), or raise `notify_pending_max` in the `yuzu_gw` section of `sys.config` (read at start; a gateway restart disconnects every agent it holds, see "Upgrade day" above). The series has no agent label, so the affected agents cannot be listed from the metric. The counter does not include a notification lost after admission (a failed or killed worker, or a gateway stop with entries held). A lost `DISCONNECTED` has a different effect from a lost `CONNECTED`: the agent is not undispatchable, it looks online. When the server was only paused, its registry kept listing the stopped agent as online (OBSERVED on the previous build: all 10 stopped agents were still online 20 minutes after the server resumed; a server restart rebuilds the registry and does not list them). Its route row stays routable until the 90 s lease expires (OBSERVED after a server kill and restart with the `DISCONNECTED` requests lost: 30 routable rows for 20 live agents 51 s after the restart, 20 routable and 10 without a lease at 141 s), and the server's route reaper tombstones it at about 5 minutes and deletes it at about 10 minutes (OBSERVED at 282 s and 582 s after the server resumed, on the previous build). A command sent to such an agent in the meantime goes to a stream that no longer exists (INFERRED). |
 | server | metric | An agent is acknowledged by the server (heartbeats accepted, `agents.online`) but commands to it fail with `503 no agent connected` | The second branch of #4632: the server knows the session but its dispatch placement was not published, because the `CONNECTED` notification was lost or refused. Read the server counters `yuzu_server_gateway_route_desync_total{op="notify_stream_status",outcome="unknown_session"}` (the notification named a session the answering replica does not hold), `{op="notify_stream_status",outcome="stale_connected_session"}` (a `CONNECTED` for a session that was no longer the current one) and `{op="deregister",outcome="session_mismatch"}` (a `DISCONNECTED` for a session that was already superseded; expected to rise a little when held `DISCONNECTED` notifications flush after an outage). After a server restart, `{op="notify_stream_status",outcome="unknown_session"}` also rises by about the number of notifications that were held: the held entries flush when the breaker closes, before the registration replay has re-registered the sessions on the new server, so the server answers each with `unknown_session` (OBSERVED on a rig: +10 for 10 held, with and without TLS). That rise is expected, not a fault; agents with a live stream converge through the replay's re-announce (INFERRED from the code). Restarting the agent service recovers an agent (OBSERVED earlier for any agent). The 90 s route lease is how long the durable row stays valid after the last renewing heartbeat; it is not an expiry guarantee for the server's in-memory belief about a session, which can last until that agent registers again on that replica (INFERRED from the code, not run). Limit, stated plainly: with several core replicas, if replica A still holds an old session of an agent while replica B registered a newer one, A can accept a late `CONNECTED` for the old session into its own in-memory registry; the durable route update refuses it, but the in-memory publication is not undone. No gateway-side change closes that case (INFERRED from the code, not run). |
 | gateway | metric | `yuzu_gw_heartbeat_buffer_dropped_total{reason}` rising | The buffer is under pressure, typically after a long server outage. `snapshot_evicted`: older snapshots were dropped to stay under `max_heartbeat_buffer_bytes`, oldest first. `buffer_full`: the buffer held `max_heartbeat_buffer` sessions and a heartbeat of a new session was dropped, or it was still over `max_heartbeat_buffer_bytes` with no snapshot left and its oldest whole session was dropped. `snapshot_oversize`: one heartbeat larger than about 3 MiB was sent without its snapshot (see "Known limits" below for the agent side). `heartbeat_oversize`: a heartbeat still larger than about 3 MiB after its snapshot was removed, or with more than 512 status tags, or with a status tag key or value over about 64 KiB or more than about 256 KiB of tag bytes in total (checked before the UTF-8 repair, so such a heartbeat costs no repair work), lost all of its status tags and was forwarded without them. `heartbeat_invalid`: a heartbeat with a status tag that was not valid UTF-8 was forwarded with the invalid bytes replaced by replacement characters. The reason also counts tags removed because a tag was not a binary and a heartbeat dropped for a bad or empty session id (see "Heartbeat Batching"). `chunk_rejected`: one heartbeat that the server rejected with a non-transient status (for example `RESOURCE_EXHAUSTED`) was dropped so that it does not block newer heartbeats. `heartbeat_oversize` and `heartbeat_invalid` mean an agent, or a plugin on it, sent oversized or invalid status tags: only the tags of those heartbeats are lost or repaired, and liveness is unaffected because the heartbeat itself is forwarded and the session keeps renewing its lease. `chunk_rejected` means the server refused one heartbeat, which is lost; the agent sends the next on its own interval. The metric has no agent label, so identify the agent from the gateway log or debug log if one names it, and upgrade or fix that agent or the plugin that produces the tags; no other action is needed. Transient server trouble (server unreachable, timeouts) does not lose heartbeats: they stay buffered. The data lost for the first three reasons is only older heartbeat state, which the agents refresh on their own interval. No action unless `buffer_full`, `snapshot_oversize` or `snapshot_evicted` keeps rising after the server is back; if it does, check that the server is reachable and answering `BatchHeartbeat` (`yuzu_gw_upstream_rpc_errors_total{rpc_name}`), and consider raising `max_heartbeat_buffer_bytes` or `max_heartbeat_buffer` if your fleet is larger than the defaults assume. Do not restart the gateway for this: a restart disconnects every agent the node holds. |
-| gateway | metric | `yuzu_gw_session_limit_rejected_total` rising | A `Register` or `Subscribe` was refused because one gRPC connection already holds `max_sessions_per_connection` agent sessions (default 8; see "Per-connection session cap" for what counts). A stock agent holds one session per connection (INFERRED), so a rise means an L4 balancer, forwarder or client is carrying several agents on one connection (see "Per-connection session cap" under Configuration). A refused `Register` is answered `UNAVAILABLE` (14); a refused `Subscribe` ends the stream (status 2 today, see Known limits) and is counted the same. The agent retries either way. If the topology is legitimate, raise the key in `sys.config`; the key is read once when the registry starts, so the change needs a gateway restart, which disconnects every agent the node holds, so plan it. The metric has no agent label. A refused `Register` leaves nothing on the server and no row on the gateway. Rows of a connection that closed stay counted for the dead connection key only, which no new connection uses, until `dead_connection_grace_ms` (default 15 s) has passed, so a reconnecting client is not refused because of them. |
+| gateway | metric | `yuzu_gw_session_limit_rejected_total` rising | A `Register` or `Subscribe` was refused because one gRPC connection already holds `max_sessions_per_connection` agent sessions (default 8; see "Per-connection session cap" for what counts). A stock agent holds one session per connection (INFERRED), so a rise means an L4 balancer, forwarder or client is carrying several agents on one connection (see "Per-connection session cap" under Configuration). A refused `Register` is answered `UNAVAILABLE` (14); a refused `Subscribe` is also answered `UNAVAILABLE` (14) and is counted the same. The agent retries either way. If the topology is legitimate, raise the key in `sys.config`; the key is read once when the registry starts, so the change needs a gateway restart, which disconnects every agent the node holds, so plan it. The metric has no agent label. A refused `Register` leaves nothing on the server and no row on the gateway. Rows of a connection that closed stay counted for the dead connection key only, which no new connection uses, until `dead_connection_grace_ms` (default 15 s) has passed, so a reconnecting client is not refused because of them. |
 | gateway | WARN | `Register failed: registry_unavailable` | The agent was answered `INTERNAL` (13) "Registration failed: registry unavailable". The gateway's registry process could not be reached for this `Register`: its table is missing, a call timed out, or the registry restarted and lost the row (see the `Registration replay aborted: registry unavailable` row). This line no longer covers a superseded `Register` (see the next row). The agent registers again with its reconnect backoff (read from the agent code). A sustained run of lines is not expected: check `/readyz` and the registry process. |
 | gateway | INFO | `Register superseded by a newer registration` | Two `Register` calls of one agent id overlapped on one connection and the newer one committed first. The older one was answered `UNAVAILABLE` (14) and left no row; the registry is healthy. No action: the agent retries a non-OK `Register` with its reconnect backoff (read from the agent code). An occasional line is expected; a sustained run would mean an agent or forwarder keeps repeating `Register` for one agent id on one connection (INFERRED from the code, not observed). |
-| gateway | WARN | `Upstream channel default_channel: could not restart it with TCP_NODELAY` | At start the gateway could not restart its upstream channel with `upstream_tcp_nodelay` applied. It restored the channel with the endpoints as configured, so registration runs at the stock rate (see "Registration rate per gateway"). If a second WARN `could not restore it with the endpoints as configured either` follows, the node has no upstream channel (read from the code, not run). |
+| gateway | WARN | `mgmt-plane peer rejected: <reason> (CA-issued cert is not authorization to command the fleet — see mgmt_peer_pins)` | A management-listener (`:50063`) stream was refused `UNAUTHENTICATED` by the SPKI pin (#1422). `<reason>` is one of the closed set counted on `yuzu_gw_mgmt_auth_rejected_total{reason}` (`pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `internal_error`); no certificate contents are logged. At most one line per reason per second (any holder of an install-CA certificate that reaches the port can provoke one per stream, N4); a line that follows suppressed ones ends `(N similar line(s) suppressed since the last)`. The counter counts every rejection; read it, not the log, for how many there were. A `pin_mismatch` burst right after the server rotated its leaf that stops within `mgmt_pin_refresh_ms` is the rotation window, not an attack; the server does not retry those streams, so the commands it forwarded in that window failed as `gateway_unauthenticated` (see [Certificate rotation and expiry](#certificate-rotation-and-expiry)). |
+| gateway | WARN | `mgmt_peer_pins: the certificate at <path> cannot be read or is not a PEM certificate; it pins nothing until it is fixed (fail closed)` | The pin watcher (`yuzu_gw_mgmt_pins`) could not stat, read or parse a `{cert_file, Path}` pin that has never been read since the gateway started. That entry admits nothing until the file is readable and holds a certificate (picked up within `mgmt_pin_refresh_ms`); with no other pin resolved every management stream is refused `no_pins_resolved`. One line per change of state, not per stream. |
+| gateway | WARN | `mgmt_peer_pins: the certificate at <path> cannot be read or is not a PEM certificate; the key last read from it stays pinned until the file is readable again (fix the file; replace it with a different certificate to change the pin)` | The same failure on a pin file that was read before. The key last read stays pinned, so commands still flow; `yuzu_gw_cert_file_readable{role="mgmt_peer_pin"}` reads 0 and `YuzuGatewayMgmtPinUnresolved` fires after 2 minutes. Fix the file before the server's next rotation, which would otherwise be refused. Deleting the file does not withdraw the pin. |
+| gateway | INFO | `mgmt_peer_pins: the certificate at <path> is readable again; the pinned key is unchanged` | A pin file that had failed is readable again with the key already pinned. No action. |
+| gateway | NOTICE | `mgmt_peer_pins: the certificate at <path> changed; the new key is pinned` | The pin watcher picked up a rotated server leaf and set `yuzu_gw_mgmt_pin_rotated_timestamp_seconds`. Management streams made with the old leaf are refused from now on (`pin_mismatch`). |
+| gateway | WARN | `certificate expiry refresh failed: <class>:<reason>; the expiry gauges keep their last values` | The expiry refresh on the pin watcher's tick raised. The pins are unaffected; the expiry and readable gauges stop updating until it succeeds. Not expected: collect the log line and report it. |
+| gateway | WARN | `gateway grpc handler <Method> failed: class=<class> at <frame>` | A service handler raised, and the call was answered `INTERNAL` (13). The line names only the method, the exception class and the top stack frame, never a request, headers or the exception term. At most one line is written per second per node (`{yuzu_gw, grpc_runner_warn_interval_ms}`, default 1000, `0` logs every failure, an invalid value reads as 1000 silently and one above 3600000 as 3600000); a line that follows suppressed ones ends `(N similar failures not logged since the last line)`. The number of failed calls is not in the log: it is in the status the calls were answered with. |
+| gateway | WARN | `gateway grpc: a <tag> message arrived for stream <id>, which had already ended; dropped` (or `gateway grpc: a process whose stream had already ended exited (<tag>)`) | A message for a stream that had already ended reached its connection: a handler's response frame or status, or the stream's deadline timer, that lost a race with the client resetting the stream. Expected now and then; harmless (the message is dropped). Cowboy used to write one such warning per stream, with the whole message (a response body); the gateway now writes at most one of each kind per second for the whole node (not per connection: a registration storm against a slow server ends one timed-out `Register` per agent connection, each with a late status, and wrote about 15,000 such lines at 25,000 agents when the limit was per connection), with the message's tag only, and a line that follows suppressed ones ends `(N similar line(s) not logged since the last)`, which counts every connection's. A steady stream of them on the management listener means the server is resetting many calls: check for a server restart or a mass cancel, and see the `max_cancel_stream_rate` note under "gRPC listeners"; on the agent listener during a reconnect storm it means agents are giving up on `Register` (see `yuzu_gw_upstream_permit_wait_seconds`). |
+| gateway | INFO | `Upstream channel <name> connection <n> down (<word>); retrying in <ms> ms` | One of the channel's connections to the server went down or could not be opened; the channel reopens it after the delay (100 ms doubling to 5 s, with up to 20% jitter). `<word>` is a socket error such as `econnrefused` or `closed`, a TLS alert name, or `bad_tls_options`. A call made while no connection is up and none is connecting fails at once with the last such word (see [The upstream client](#the-upstream-client)); the circuit breaker counts it. One line per failed attempt, so a server that is down for a minute writes a line per connection every 5 to 6 s once the delay has reached its cap. Expected while the server restarts; a persistent TLS alert word means the certificate, the CA or the hostname is wrong (see the runbooks in [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)). Read from the code, not run. |
+| gateway | CRITICAL | `Refusing to start: the upstream channel configuration {yuzu_gw, upstream_client} is unusable (<Why>)` | `<Why>` names the shape of the first defect (`bad_client_config`, `bad_channel`, `bad_endpoint`, `bad_host`, `bad_socket_options`), never a value. Fix that entry; the pre-flight in [Upgrading](upgrading.md#the-upstream-channel-moves-to-upstream_client--breaking) finds it offline. |
+| gateway | CRITICAL | `Refusing to start: the upstream channel uses TLS (https) WITHOUT {verify,verify_peer} and a {cacertfile,...} of its own` | At least one `https` endpoint has no `verify_peer`, or no `cacertfile` / `cacerts` of its own (a missing CA means the operating system's CA store would be trusted). Add both to every `https` endpoint; `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` is dev/CI only and makes the gateway log a warning at every boot. |
+| gateway | CRITICAL | `Refusing to start: the upstream channel <name> lists both plaintext (http) and TLS (https) endpoints` | One channel mixes schemes, so some calls would travel unencrypted. Give the channel one scheme (two channels cannot help: only `default_channel` is called). No override. |
+| gateway | crash report | `yuzu_gw_sup` fails to start with a child specification error | Two channels share a name, or a channel is named after a registered process (`yuzu_gw_registry`, say). Loud and fail-closed, but the text does not name the duplicate. Give every channel a unique name (seen in a probe; the boot guard does not check it). |
+| gateway | ERROR | `Upstream channel <name>: the TLS client options cannot be used, so every connection fails: <file> ...`, `/readyz` 503 with `upstream_tls_files` false | A CA, certificate or key file named by an `https` endpoint is missing, unreadable, empty or holds no certificate or key. The line names the option and, except for a `keyfile`, the path. Create or fix the file; the channel finds it on its next attempt (within about 5 s, or up to about 2 minutes if `ssl` had cached an earlier version of the same file; see Certificates above) with no restart, and `/readyz` returns to 200 once a connection attempt fails for any other reason or succeeds. If the line says none of the files is at fault, check the other `ssl` options. A file that is a directory refuses boot instead. See [A CA, certificate or key file that is wrong](#a-ca-certificate-or-key-file-that-is-wrong). Covered by tests; not run against a live server. |
+| gateway | INFO/metric | `Upstream channel <name> connection <n> down (<TLS alert word>)` repeating, and `yuzu_gw_upstream_tls_handshake_failures_total` rising | Certificates or the CA were replaced or expired after the connection opened: an open connection keeps the old material until it drops, then the reconnect presents the new files (after Erlang's `ssl` cache clears, about 2 minutes). Recovery takes the cache window plus up to 5.8 s of delay, plus the circuit breaker's open time if it tripped (up to 300 s, doubling). While the breaker is open the counter moves only at its probes. INFERRED from the code and the certificate probe, not run end to end. |
+| gateway | metric | `yuzu_gw_upstream_rpc_errors_total{code="timeout"}` rising on every call, no channel log line, and `/readyz` 200 until the breaker opens | A blackhole peer: the server host or a VIP failed over without a FIN or RST. The gateway sends an HTTP/2 PING on each upstream connection every 45 s and closes the connection when two go unanswered, so a peer that stopped answering is noticed after about 90 s, after which the slot redials; it also sets `SO_KEEPALIVE` on the socket, with the operating system's default timers (the kernel alone would take about 15 minutes with default TCP retries). Until the PINGs give up, every call times out. INFERRED from the gun options in `yuzu_grpc_client_channel.erl`; not run against a true blackhole (an earlier observation of a peer that stopped answering saw the connection counted as up for the whole 35 s watched, inside the 90 s window). Restart the gateway early only if the server is confirmed healthy and reachable by another route; it redials at once (INFERRED), but agents behind it reconnect as described for #5183 above. The 45 s interval is not configurable and must stay above the server's 30 s floor for pings without data: a faster client keepalive is refused with GOAWAY `too_many_pings`. |
+| gateway | metric | `yuzu_gw_upstream_rpc_errors_total{code="connection_lost"}` rising by a few, then recovery | An upstream connection closed (reset, or the server's end went away) or the server sent HTTP/2 GOAWAY (a server draining or restarting) with calls on it: those calls fail as `connection_lost` and the agents whose `Register` was among them retry. Since #5695 the breaker counts one lost connection once, however many calls it ended, so one dropped connection no longer opens it; and a connection that is going away is retired at the first call it refuses, its slot redialled at once (before, it kept being handed out for its 3 s closing window and every call on it failed and counted). Expected around a server restart. A count that keeps rising with the server up means connections keep dropping: look at the network path and the server's connection limits. |
 
 Progress shows as `yuzu_agents_connected` (and `/health` `agents.online`)
 ramping back, together with the gateway `Registration replay` INFO lines and
@@ -1434,15 +2798,19 @@ the rig runs under "Observed on a rig" below are the measured evidence).
 - **Breaker open.** A verdict that arrives while the breaker is open is
   dropped and counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="circuit_open"}`.
   The replay then waits for the breaker to go half open, so recovery is bounded
-  by the breaker's remaining backoff (capped at 300 s,
-  `circuit_breaker_max_reset_timeout_ms`, see "Circuit breaker tuning" under
-  Configuration), plus up to one heartbeat interval, plus one flush, plus the drip position. A
+  by the breaker's remaining backoff (capped at 30 s by default since #5695, 300 s on
+  the builds the runs below used; `circuit_breaker_max_reset_timeout_ms`, see
+  "Circuit breaker tuning" under Configuration), plus up to one heartbeat interval,
+  plus one flush, plus the agent's turn in the replay. A
   long outage can open the breaker because other upstream calls the agent keeps
   retrying feed it. Wait: do not restart anything for this (the 58 s recovery
   in R2d and the recoveries in runs F3a (all agents online at T0 + 85.2 s) and
   F3b (T0 + 50.4 s) under "Observed on a rig" are this case; in F3a and F3b the agents came back through
   the breaker's own replay right after the probe closed the breaker, with no wait
-  for a heartbeat). This applies to one agent too: in rig pass 4 (run H3, 1 agent,
+  for a heartbeat. Since #5695 a breaker recovery replays nothing by itself: the
+  first verdict after the probe closed the breaker starts the replay, one flush
+  interval later when agents heartbeat every second or more often across the node,
+  see "What starts a full replay" below). This applies to one agent too: in rig pass 4 (run H3, 1 agent,
   302 s outage) the breaker was open at the restart, the verdicts at T0 and the
   next two (30 s heartbeat cadence) were dropped, the breaker went half open and
   the next verdict closed it as the probe, and the agent was online at T0 + 86.7 s;
@@ -1482,12 +2850,37 @@ itself was accepted on the first flush after the server returned in these runs
 - Action: wait. Do not restart the gateway: a restart disconnects every agent the
   node holds.
 - How long: the wait after the server is back is the remaining breaker backoff.
-  The backoff doubles from 10 s up to `circuit_breaker_max_reset_timeout_ms`
-  (300 s by default). The steps up to 160 s were observed (F3a); a wait on the
-  300 s step was not observed and a longer outage with several agents was not
-  run, so the worst case is bounded by the configured maximum but not measured
-  beyond 160 s. The rig used a failure threshold of 5, a reset timeout of 10 s
-  and a maximum of 300 s, the defaults.
+  The backoff doubles from 10 s up to `circuit_breaker_max_reset_timeout_ms`,
+  30 s by default since #5695 (it was 300 s), so the wait is at most about 30 s plus
+  one probe, plus the first heartbeat flush after it (the verdict that starts the
+  replay, see below). The runs above used the old 300 s cap: the steps up to 160 s were
+  observed (F3a). The rig used a failure threshold of 5 and a reset timeout of 10 s,
+  the defaults.
+
+**What starts a full replay (since #5695).** The runs above predate this: the
+gateway then replayed every agent whenever the breaker closed, and whenever any
+call succeeded after a failed one. That replayed the whole node to a server that
+had lost nothing each time one upstream connection dropped (measured with the
+scale suite's `upstream_conn_loss` case: 5,500 replayed registrations and 5,500
+repeated `CONNECTED` notices for one reset connection at 5,500 agents). Now a
+recovery replays nothing, and the server's heartbeat verdict decides:
+
+- a verdict replays the sessions it names (`trigger="heartbeat"`);
+- a verdict that names at least half of the heartbeats of its batch, and at least
+  one session per 64 agents this node holds (at least 1, at most 16), or that the
+  server marked truncated (more than 4096 unknown), is evidence that the server
+  lost its state: the gateway then replays every agent it holds
+  (`trigger="server_lost_state"`, INFO line `Registration replay: the server does
+  not know N of the M session(s) of a heartbeat batch; replaying every agent`);
+- no second full replay starts within 60 s of the end of the previous one (the
+  named sessions are still replayed), so a server that keeps answering "unknown"
+  costs at most one full replay a minute.
+
+After a server restart that lost its in-memory registry, every agent is unknown,
+so the first verdict that reaches the new server starts the full replay. At 5,000
+agents in the scale suite's `server_crash` case the replay of 4,500 sessions
+finished 13.2 s after the new server started (13.3 s before this change), with
+the breaker open during the outage.
 
 The gateway-side counters move as follows: `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}`
 rises by one each time a verdict queued at least one agent,
@@ -1644,24 +3037,25 @@ wired. Two cases replay a session the server already knows:
 
 - A verdict computed before a replay landed arrives after it. The guard stamp is
   taken when the replay is sent, and a stale verdict can arrive up to the 5 s
-  flush deadline (INFERRED: the vendored grpcbox client default) plus the replay
+  flush deadline (read from the code: neither the flush nor the replay call passes a
+  timeout, so the upstream client's default of 5000 ms applies) plus the replay
   RPC time later. Do not set `registration_replay_session_guard_ms` below 5000
   plus the expected replay RPC time; the default 10000 is safe (INFERRED).
 - A double replay. A verdict replay runs first (the server has no prior session,
-  so nothing is revoked), and a later full breaker-recovery replay re-proxies
-  the same sessions (a prior session now exists). INFERRED from
-  `yuzu_gw_upstream.erl`: the breaker-seeded snapshot is not filtered by the guard.
+  so nothing is revoked), and a later full replay re-proxies the same sessions
+  (a prior session now exists) once their guard window has passed (the walk of a
+  full replay skips a session replayed within the window).
 
 Neither case was observed on the rig. An idempotent adopt (a re-adopt of a
 session the server already holds would no longer wipe placement) is tracked in
 #5244.
 
-**Breaker recovery and the verdict drip interact.** While a verdict-seeded
-(targeted) drip is queued, a breaker-recovery full replay trigger is dropped (the
-existing in-flight rule), so an agent that is not in the targeted queue is not
-replayed by that recovery. A targeted replay that is the half open probe closes
-the breaker without seeding a full replay. Unit test:
-`breaker_replay_during_targeted_drip_is_dropped`. The consequence is under "Known
+**A full replay and the verdict drip.** A full replay started while a
+verdict-seeded (targeted) drip runs is not dropped: it walks the registry after
+the queued entries and skips the sessions inside the guard window, so each agent
+is replayed once (unit test `breaker_replay_during_targeted_drip_walks_the_rest`).
+A breaker recovery starts no replay at all since #5695, including when a targeted
+replay is the half open probe that closes it. The consequence is under "Known
 limits" below.
 
 **What the reconcile promises, on one core replica.** Every session the server
@@ -1675,10 +3069,10 @@ times (ProxyRegister RPC time plus the spacing); with the breaker open, the
 breaker's remaining backoff is added first. The change adds no new unbounded state: one pending entry per agent,
 at most 4096 session ids of at most 64 bytes per flush, and a cap on verdict
 appends (`registration_replay_queue_max`, 10000 by default). The cap bounds only
-verdict appends: the snapshot a breaker recovery seeds is not capped (it is
-bounded by the number of agents the node holds, as before), and while a snapshot
-of 10000 or more agents drains, every verdict id for an agent not already queued
-counts as `queue_full`. The circuit breaker policy is unchanged, but replay
+verdict appends: a full replay walks the registry in chunks of 500 and is not
+capped (it is bounded by the number of agents the node holds), and while a chunk
+of the walk drains, every verdict id for an agent not already queued may count
+as `queue_full` once the queue is at its cap. The circuit breaker policy is unchanged, but replay
 failures now count toward the shared breaker (see below).
 
 **What it does not promise.**
@@ -1694,21 +3088,33 @@ failures now count toward the shared breaker (see below).
   while 10 are in flight or the breaker is not closed, and is sent first in
   first out (#4632; INFERRED from the code, OBSERVED on a rig: 0 notifications dropped across five 1000-agent and two 2000-agent cold waves). It is still
   lost when the pending store is at its cap, that is, the held keys plus the key of a half open probe in flight have reached `notify_pending_max` (counted in
-  `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`), when an
-  ordinary worker fails after taking it (not counted), and when the upstream
-  client process or the gateway stops while it is held (not counted). An agent
+  `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`), when the
+  server answers it with a request-fault status or it cannot be encoded
+  (`yuzu_gw_upstream_notify_lost_total{reason="rejected"}`), when its worker
+  dies without a result (`reason="crashed"`), and when the upstream client
+  process or the gateway stops while it is held (`reason="shutdown"`; nothing is
+  counted if the process is killed). A worker that fails with any other error
+  no longer loses it: since #5695 the notification is held again at the head of
+  the store and retried (before #5695 that failure lost it, uncounted). An agent
   affected that way stays acknowledged but unreachable for commands until its
   next reconnect. The dropped series is created at 0 at start, so a rise is
   visible. It has no agent label, so the affected agents cannot be identified
   from the metric. They recover at their next reconnect; to force it, restart
-  the agent service (OBSERVED: a restart recovers any agent). A CONNECTED the server delivers but
-  refuses has the same effect and does NOT move that gateway metric: the gateway
-  ignores `acknowledged=false` and does not retry. The server counts it under
+  the agent service (OBSERVED: a restart recovers any agent). A CONNECTED the server receives but
+  refuses (`acknowledged=false`) does NOT move that gateway metric either. Since
+  #5695 the gateway holds it and sends it again after a backoff while it still
+  holds the session (counted in
+  `yuzu_gw_upstream_notify_unacknowledged_total`; see "When the server does not
+  record a notification"); an older gateway ignores `acknowledged=false` and does
+  not retry. The server counts it under
   `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` with
   outcome `connected_unverified` (the directory read failed and this replica
   holds no matching local session) or `stale_connected_session` (the directory
-  row or the local registry names a different session). Recovery is the same:
-  the agent's next reconnect.
+  row or the local registry names a different session). On an older gateway
+  recovery is the same: the agent's next reconnect. On a gateway with #5695 the
+  resend is delivered once the server records it (a `connected_unverified`
+  refusal clears when the directory reads again; a `stale_connected_session`
+  refusal is definitive and is resent until the session ends).
 - Correctness on several core replicas (see below).
 - Any order beyond first-in, first-out in sorted session-id order. The gateway
   sorts the ids it keeps from one response, so each verdict's agents are queued
@@ -1888,7 +3294,7 @@ removed so the heartbeat carried no snapshot.
 | K1 to K3 (pass 6) | `c518edd93` | cold-start bursts of 1000, 2000 and 5000 simulated agents (a load generator: one connection per agent, the real 9,054 byte `Register`, the 30 s deadline; it answers no commands and sends no inventory), stock gateway, shipped nodelay | 1000 agents: all registered in 1.89, 2.11 and 2.09 s (three runs), 0 deadline failures, 1.0 `ProxyRegister` per agent; 2000 agents 4.16 s; 5000 agents 12.08 s; 0 failures, WARN 0, ERROR 0 in every run |
 | K1-control (pass 6) | `c518edd93` | the 1000 agent load with `upstream_tcp_nodelay` set to `false` | 703 registered inside the deadline and 297 hit it (the same count as the stock run on `71ee2b02f`), 1297 attempts, last agent at 55.5 s |
 | K4a to K4d (pass 6) | `c518edd93` | real agents (TAR plugin loaded): 30 agents and a 12 s outage; 45 agents and 150 s; 1 agent and 300 s (plus an open-breaker variant); 20 agents and three gateway kill -9 | K4a all 30 online at T0 + 15.5 s, same sessions; K4b breaker open, all 45 online at T0 + 17.3 s, 0 buffer drops; K4c online at T0 + 0.98 s (breaker closed), K4c2 at T0 + 52.9 s (breaker open); K4d 20 of 20 re-registered in every gateway life (12 to 13 s), 0 refused, 0 stale pending rows |
-| K5 (pass 6) | `c518edd93` | grace of a closed connection's pending rows, probe client | default grace: a `Subscribe` on a new connection accepted, rows 2 at +10 s and 0 at +17 s, a late `Subscribe` refused; with `dead_connection_grace_ms` 2000 the rows were gone by +3.7 s. The refusal reached the probe as status 2, see Known limits |
+| K5 (pass 6) | `c518edd93` | grace of a closed connection's pending rows, probe client | default grace: a `Subscribe` on a new connection accepted, rows 2 at +10 s and 0 at +17 s, a late `Subscribe` refused; with `dead_connection_grace_ms` 2000 the rows were gone by +3.7 s. The refusal reached the probe as status 2 (the previous transport; the current layer answers `UNAVAILABLE`, 14) |
 | K6 (pass 6) | `c518edd93` | server-only restart with 1000 and 2000 simulated agents that heartbeat and hold a `Subscribe` (the load generator) | 1000 agents all back at T0 + 22.7 to 23.3 s (10 s and 60 s outages), 2000 agents at T0 + 46.1 s; breaker closed throughout (the generator sends no inventory), 0 drops, original session ids kept |
 | K7 (pass 6) | `c518edd93` | 5 minute steady state after K4c, 1 real agent | WARN 0, ERROR 0, 0 flush errors |
 
@@ -1943,7 +3349,14 @@ Details of what these runs showed:
   forwarder only touched responses without unknown ids, so the injections landed
   on an otherwise healthy upstream.
 
-**Load and convergence bounds.** The drip sends one ProxyRegister at a time.
+**Load and convergence bounds.** This paragraph and the next two describe the
+replay drip as it was before #5695 and the runs made on it. Since #5695 a full
+replay walks the agents table in chunks of 500 and replays up to 24 agents at once
+under permits, so the period per agent is the call time divided by 24. Measured
+with a mocked server (no network, no notifications, one laptop): 5,000 agents
+replayed in 4.5 s at 20 ms per call and 10.7 s at 50 ms, against 217 s and 365 s
+for the drip on the same harness with its default 20 ms spacing (OBSERVED, #5695).
+The drip sent one ProxyRegister at a time.
 The period per agent is the ProxyRegister RPC time plus the spacing
 (`registration_replay_spacing_ms`, 20 ms by default) plus scheduling. The
 figures below are arithmetic on those constants, not measurements: the
@@ -1981,8 +3394,8 @@ sessions and triggers the gateway replay; expect a spike of that counter and do
 not restart anything.
 
 **Registration rate per gateway.** Every `ProxyRegister` goes through the one
-`yuzu_gw_upstream` process, over one channel and one HTTP/2 connection, one call
-at a time, so the time of one upstream call sets how many agents a gateway can
+`yuzu_gw_upstream` process, one call at a time (the measurements below were taken
+when the channel was one HTTP/2 connection; see the update after the table), so the time of one upstream call sets how many agents a gateway can
 register per second. OBSERVED on a rig, on gateway commit `71ee2b02f` (which does
 not have the `upstream_tcp_nodelay` change; loopback, one box, debug-built
 server, plaintext, a C++ client with the agents' 30 s `Register` deadline and
@@ -1992,7 +3405,7 @@ from a running agent through the gateway): each upstream call took about 41 to
 registrations per second whatever the concurrency. The cause is INFERRED from
 switching nodelay on and off at three places (no packet capture was taken):
 Nagle's algorithm on the gateway-to-server socket meets the server's delayed
-ACK, because the HTTP/2 client library the gateway uses does not set TCP_NODELAY.
+ACK, because the HTTP/2 client library the gateway then used did not set TCP_NODELAY.
 The server's own handler time for a real-size `Register` was 1 to 2 ms, new
 enrollment included (derived from client-side latency, the server has no such
 metric). Bursts of simultaneous registrations, one connection per agent:
@@ -2018,6 +3431,19 @@ setting that the key applies was also measured earlier by writing it into the
 channel declaration by hand, on `71ee2b02f` and against an in-VM fake upstream
 only: 40 concurrent real-size registrations took 1,665 ms stock and 43 ms with it,
 and a serial call 42 ms and 1 ms.
+
+**Update (2026-10-11): the upstream client was replaced.** The runs above used grpcbox
+as the upstream client, which held one HTTP/2 connection (the new client's default too), and the K0 start log line
+`Upstream channel default_channel: TCP_NODELAY on` came from the code that restarted that
+channel. Neither exists now: the client is `yuzu_grpc_client` over gun with a channel of
+`pool_size` connections per endpoint (default 1, as before; see [The upstream client](#the-upstream-client)),
+TCP_NODELAY is set when each connection is opened, and the gateway logs no line about it.
+Since #5695 the calls of registration run in parallel under permits (48, of which
+replays at most 24), so the rate is the permits divided by the call time; a larger
+pool raises the stream ceiling the permits must stay under, not the rate itself. The rate figures above were not
+re-measured with the new client. A single measurement on a live stack with TLS, reported by
+the author of the change and not repeated on the rig, put the `ProxyRegister` mean at
+about 3 ms with nodelay on and about 45 ms with it off.
 
 Three consequences. First, the agents give up on a `Register` after 30 s, and 24
 per second times 30 s is about 700, so a simultaneous burst of more than about
@@ -2062,15 +3488,80 @@ plus the call.
 
 | Symptom | What you see | Cause | Action |
 |---|---|---|---|
-| Agents slow to come back after a server restart on a large fleet | The server log shows more than one `[gateway] ProxyRegister succeeded` line per agent (5.9 attempts per agent in the 2000-agent stock run); agents give up on a `Register` after 30 s; `yuzu_gw_upstream_rpc_duration_ms` for the `register` rpc name has a mean near 40 ms | Before the `upstream_tcp_nodelay` change, the 43 ms per-`Register` Nagle delay (OBSERVED on a rig, see above); also a slow server, because the upstream process runs one call at a time | Confirm `upstream_tcp_nodelay` is not `false` in the `yuzu_gw` section of `sys.config` (and that no endpoint has a hand-set `{nodelay, false}`); check the server's `ProxyRegister` latency. There is no queue metric for the upstream process: the mailbox depth was read on a rig with `process_info`, and no metric or log line shows it |
+| Agents slow to come back after a server restart on a large fleet | The server log shows more than one `[gateway] ProxyRegister succeeded` line per agent; agents give up on a `Register` after 30 s; `yuzu_gw_upstream_rpc_duration_ms` for the `register` rpc name has a high mean | Before the `upstream_tcp_nodelay` change, the 43 ms per-`Register` Nagle delay (OBSERVED on a rig, see above); otherwise a slow server: the register pool (48) drains at 48 divided by the server's answer time | Confirm `upstream_tcp_nodelay` is not `false` in the `yuzu_gw` section of `sys.config` (and that no endpoint has a hand-set `{nodelay, false}`); check the server's `ProxyRegister` latency and `yuzu_gw_upstream_permits_waiting{class="register"}`. A slow server shows as `yuzu_gw_upstream_slow` 1 and a duty cycle near 1; see "Slow server" below |
+| Registrations are being refused or abandoned while the gateway is busy | `yuzu_gw_upstream_permit_refused_total{class="register"}` rises (`queue_full` or `deadline`), with `yuzu_gw_upstream_calls_dropped_total{rpc_name="register"}` for the deadline case; agents log `UNAVAILABLE` and retry | Every register permit is held and the wait queue is full, or a request's deadline passed while it waited; nothing is sent for it, so no server session is created for a request nobody waits for | Look at the cause (a slow server `ProxyRegister`, a restart herd; see the table above). The refused agents retry; a sustained `queue_full` with a healthy server points at raising `upstream_register_concurrency` together with the channel's `pool_size` (see "Upstream call permits") |
+
+**Slow server.** A gateway reaches the server through lanes of bounded capacity, and
+"slow" is defined from how often those lanes are full, not from a latency figure.
+
+- A lane is *saturated* at an instant when work is waiting on it or would be refused. There are
+  three. `permits` (`serial` before #5695): a live `Register` or inventory report waits for a
+  permit, because every permit of its pool is held (a replay waiting for one does not count; it
+  waits behind live registrations by design). `notify`: every
+  stream-status notification slot is held (10), so the next notification waits in the held store
+  until a slot frees (it is dropped, `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`,
+  only when the held store itself is full). `guardian`: all 50 Guardian
+  forward slots are held.
+- *Backpressure* is present at an instant when at least one lane is saturated. The *duty cycle* is
+  the share of a window during which it was present, 0 to 1.
+- A *slow server*, as one gateway sees it, is a duty cycle of **0.5 or more over the last 60 s**
+  (`yuzu_gw_upstream_slow` is 1): for at least half of the last minute, work waited on the server
+  or was refused because it answered slower than work arrived. Exactly 0.5 counts. The window is 60
+  one-second buckets, and until the gateway has run for a minute the missing seconds count as not
+  saturated, so after a start the figure can only read low.
+
+| To see | Query |
+|---|---|
+| This gateway's duty cycle over any window | `rate(yuzu_gw_upstream_backpressure_seconds_total[5m])` |
+| The same over the last 60 s, and the flag | `yuzu_gw_upstream_backpressure_duty_cycle`, `yuzu_gw_upstream_slow` |
+| Which lane | `rate(yuzu_gw_upstream_lane_saturated_seconds_total[5m])` by `lane`. The lanes overlap: never add them |
+| The server or its database, not one gateway | `avg(yuzu_gw_upstream_slow)` across the gateways. Near 1 means every gateway sees it; one gateway at 1 among many at 0 points at that gateway or its path |
+| Slow, or just a lot of work | `histogram_quantile(0.5, sum by (le) (rate(yuzu_gw_upstream_rpc_duration_ms_bucket{rpc_name="register"}[5m])))` beside the duty cycle |
+
+How it is measured: a process in the gateway samples the lanes every 100 ms. It reads the
+published counts of the upstream process and of the permit regulator without calling them, credits each sample with the time until the next, and credits one step at most 1 s, so a
+stalled VM does not credit a minute. It is a sampled estimate with a resolution of 100 ms: a state
+that begins and ends between two samples is missed.
+
+What it does not tell apart, and does not do:
+
+- A server that answers slowly, and more work than the permits drain at a healthy server's pace
+  (every agent of a restarted fleet registering at once), both read as a slow server: the server's
+  service rate is below the rate work arrives, which is the thing measured. The latency histogram in
+  the table says which it was.
+- It is one figure for the gateway, not one per upstream endpoint. With several servers behind a
+  channel it does not say which server is slow; per-endpoint state is not exported yet (#5648,
+  #5655).
+- It does not change what the gateway does. The breaker still counts only failed calls, so a
+  server that answers every call in 3 to 5 s never opens it; this is how that case is seen. What
+  the gateway should do about it is open (#5681).
+- A slow server is not a readiness input. The `/readyz` `circuit_breaker` check reads the breaker
+  state the `yuzu_gw_upstream` process publishes at each breaker transition, without a call into
+  that process, so it answers at once while the process is inside a slow RPC: a closed breaker
+  reads `true`, and a slow server alone does not turn `/readyz` 503 (#5680). Before this, the
+  check called the process, waited out its 5 s timeout behind the RPC in progress and reported
+  `circuit_breaker` false with the breaker closed. Covered by a unit test against a mocked server
+  whose RPC does not return (`circuit_breaker` true within the test's 2 s bound; the old check
+  answered false after 5 s), not run against a live server.
+- One alert ships: `YuzuGatewayUpstreamSlow` (warning) fires when `yuzu_gw_upstream_slow` has been 1
+  for 5 minutes, per gateway, so with many gateways behind one slow server they fire together and
+  its alert name should be grouped in Alertmanager. The threshold and window are initial values,
+  to be tuned on a real deployment.
+- Covered by unit tests against a mocked server whose RPC does not return and against synthetic
+  samples; not run against a live server.
 
 **Several core replicas.** The verdict and replay reconcile is correct and
 bounded on one core replica. On several replicas it converges in one round only
 if a gateway's `BatchHeartbeat`, replay `ProxyRegister` and re-announced
 `NotifyStreamStatus` reach the same replica during the reconcile. The shipped
-gateway does this per connection (one grpcbox channel, one endpoint, one
-HTTP/2 connection) through a layer-4 VIP. A multi-endpoint node list (grpcbox
-round-robins per RPC) or a layer-7 per-RPC balancer breaks it. Convergence is
+gateway sends all of these calls through one channel and one endpoint, through a
+layer-4 VIP, and with the default `pool_size` of 1 that is one HTTP/2 connection, as it was
+with grpcbox: unchanged. **Warning:** a channel opens `pool_size` connections per endpoint
+and sends each call on the next live connection, round-robin, so with `pool_size` above 1
+each connection can land on a different replica and two consecutive calls of the
+reconcile can reach different replicas (read from `yuzu_grpc_client_channel`, not run on
+several replicas); keep `pool_size` at 1 where this matters. A multi-endpoint node list (the channel
+round-robins per call) or a layer-7 per-RPC balancer breaks it too. Convergence is
 then probabilistic, not bounded, and the per-session guard bounds the replay
 rate but not the number of rounds. No multi-replica run exists; this is
 inferred from the code. The durable cross-replica session lookup (WS-5,
@@ -2100,10 +3591,14 @@ otherwise rejected (`acknowledged=false`) and counted under
 `yuzu_server_gateway_route_desync_total{op="notify_stream_status",outcome="connected_unverified"}`.
 A delayed CONNECTED for a session this replica has since superseded is counted
 the same way (a successful read counts it as `stale_connected_session`).
-The gateway does not retry a rejected CONNECTED and
-`yuzu_gw_upstream_notify_dropped_total` does not count it, so that server
-counter is the signal; an agent whose current session was rejected keeps
-heartbeating but cannot receive commands until it reconnects. When the read succeeds, the local fallback applies only if
+`yuzu_gw_upstream_notify_dropped_total` does not count a rejected CONNECTED.
+A gateway that includes #5695 counts it in
+`yuzu_gw_upstream_notify_unacknowledged_total{event="connected"}` and sends it
+again after a backoff while it holds the session, so a `connected_unverified`
+rejection is put right once the directory reads again (see "When the server
+does not record a notification"). An older gateway does not retry it: that
+server counter is then the only signal, and an agent whose current session was
+rejected keeps heartbeating but cannot receive commands until it reconnects. When the read succeeds, the local fallback applies only if
 the directory row is absent or tombstoned, or the session is one this replica
 recorded as having lost a race; a row with a different session id rejects the
 CONNECTED (`stale_connected_session`). A DISCONNECTED proceeds on the local
@@ -2230,20 +3725,25 @@ env keys with defaults, which a reverted build ignores.
   it is fixed. (5) An exit that escapes the flush RPC no longer ends the
   buffer process (it used to be able to, losing every buffered heartbeat), and
   the buffer's crash-report status shows counts only, not heartbeat contents.
-- **Registration is still serialised through one process.** The proxy RPC of a
-  `Register` runs inside the `yuzu_gw_upstream` process, so calls queue behind
-  each other even with nodelay on, and a slow server still limits how fast a
-  gateway registers agents (a call is as slow as the server's answer). The call
-  carries no deadline of its own (for the `Register` call itself only the vendored grpcbox client's default 5 s
-  receive timeout applies; read from the code, not run; the connect and
-  handshake bounds are listed with the notification probe); the caller waits `upstream_call_timeout_ms`
-  (30 s by default, the same as the agents' `Register` deadline), and a call whose
-  caller or agent has gone is still executed when its turn comes (OBSERVED, see
-  "Registration rate per gateway"). Planned follow-ups, with no issue numbers yet:
-  run the proxy RPC outside the gen_server, shed requests whose caller is gone,
-  and give the upstream call a deadline shorter than the agent's 30 s. The
-  `upstream_pool_size` key in the shipped `sys.config` files does nothing; there
-  is no connection pool to size.
+- **Registration runs in parallel, bounded by permits** (#5695; it was serialised
+  through one process). See "Upstream call permits". A request that waits for a permit
+  and runs out of time is refused and never sent; a call already in flight to the server
+  is not cancelled when the agent gives up, but the server is told the deadline
+  (`grpc-timeout`) and may stop it. The `upstream_pool_size` key in the shipped
+  `sys.config` files does nothing (nothing reads it); the connections per endpoint are the
+  channel's `pool_size` option (default 1, see [The upstream client](#the-upstream-client)),
+  and a larger pool raises the stream ceiling the permits must stay under.
+- **Queued upstream calls are not bounded per connection (accepted residual risk, part of
+  the unauthenticated-port family).** The agent listener is unauthenticated by design, and
+  a request is decoded in full before any handler sees it. A client that repeatedly sends
+  a large `Register` and resets the stream can keep decoded requests waiting for a
+  permit (each in its own request process, freed when the stream is reset); they are
+  bounded by the register wait queue (10000), Cowboy's cancel-stream rate limit
+  (`max_cancel_stream_rate`, an `http2` option) and memory, not by a per-connection
+  quota. The same family covers the decode amplification of a message that fits
+  `max_message_bytes` and the half-open connection flood described under "Connection ceilings and the
+  unauthenticated ports". The decode-side bound is the first follow-up; until it lands,
+  limit connections and request rate per source at the L4 balancer or firewall.
 - **R2b: a route row tombstoned while the server stayed up is not repaired by this
   reconcile.** OBSERVED: during a 6.9 minute network partition between the
   gateway and the server, with the server staying up (the traffic went through a
@@ -2280,21 +3780,15 @@ env keys with defaults, which a reverted build ignores.
   re-register by themselves after a rejection in the earlier tests (see "Agent dependency"). Without
   an action the row stayed tombstoned for the 4 minutes observed in R2b and the
   120 s observed in E4.
-- **A tombstoned route row is no longer repaired by a breaker-recovery full
-  replay while a verdict drip is queued or probing.** The server lists only the
-  sessions missing from its in-memory map, so a session it still knows whose
-  durable route row was tombstoned (the entry above) is never named by a
-  verdict. A breaker-recovery full replay was an incidental repair path for such a
-  row: it exists only when a breaker transition happens to coincide with a
-  tombstoned row, and this change narrows it. It was not observed to repair R2b
-  (that run had no breaker transition), and R2b itself is not caused by this
-  change. The limit stands: that trigger is now dropped while a targeted drip is
-  queued, and a targeted replay that is the half open probe closes the breaker
-  without seeding a full replay, so the row waits for the agent's own reconnect
-  (INFERRED from the code: the in-flight rule drops the second trigger and
-  `record_result_no_replay` discards the replay trigger; unit test
-  `breaker_replay_during_targeted_drip_is_dropped`). Not observed on a rig.
-  Tracked as a follow-up (no issue yet), together with the entry above.
+- **A tombstoned route row is not repaired by a breaker recovery.** The server
+  lists only the sessions missing from its in-memory map, so a session it still
+  knows whose durable route row was tombstoned (the entry above) is never named by
+  a verdict. A breaker-recovery full replay used to be an incidental repair path
+  for such a row, when a breaker transition happened to coincide with it; it was
+  not observed to repair R2b (that run had no breaker transition), and R2b itself
+  is not caused by this change. Since #5695 a breaker recovery replays nothing, so
+  the row waits for the agent's own reconnect. Not observed on a rig. Tracked as a
+  follow-up (no issue yet), together with the entry above.
 - **A crash report can still contain the enrollment token, certificate or CSR of
   a registration in four cases: use of the modules outside the application, a
   report shape the redaction filter does not recognise, new code hot-loaded into a
@@ -2327,14 +3821,18 @@ env keys with defaults, which a reverted build ignores.
   request and is never logged or returned. The wrapper logs at most one warning per
   second for each called process on a node, and the warning names only the class of
   the exit (`noproc`, `timeout` or `other`). The Register handler answers a gRPC
-  `INTERNAL` status for any `{error, _}` from `proxy_register/1` (the same status it
-  gives for `circuit_open`), and the agent retries registration on any non-OK
+  `UNAVAILABLE` status for `upstream_unavailable`, as for `circuit_open` and the
+  other refusals the gateway makes itself (#5695; it answered `INTERNAL` before),
+  and `INTERNAL` for any other `{error, _}`, and the agent retries registration on any non-OK
   status (read in `yuzu_gw_agent_service.erl` and `agents/core/src/agent.cpp`; not
   run). The third site matters because a failed registry call in the per-agent
   process's init used to exit that init with a reason that embedded the
   `RegisterRequest`, which the Subscribe handler then logged (INFERRED from the
-  code; not run). The agent init now stops with the fixed reason
-  `registry_unavailable`. Before this, the gRPC server library logged the exit of
+  code; not run). The agent process now answers a failed registry call with the
+  fixed reason `registry_unavailable` to the Subscribe handler that waits for it,
+  and stops with reason `normal`, which writes no crash report (since PR #5695 the
+  registration runs after the agent's `init/1` has returned, so the agent
+  supervisor never waits for the registry). Before this, the gRPC server library logged the exit of
   the calling handler process at INFO together with the whole request (OBSERVED by a
   security reviewer running the real application with a real gRPC client, for three
   triggers on the upstream client: a crash with a call queued, a 30 s stall with no
@@ -2454,10 +3952,15 @@ env keys with defaults, which a reverted build ignores.
   - The cap. A notification for a new key is still lost, and counted, when the
     store is at its cap: a new key is admitted only while the held keys plus the
     key of a half open probe in flight stay below `notify_pending_max`.
-  - A worker that fails after taking a notification (a returned RPC error or a
-    killed worker) loses it. This is not new and is not counted. Ordinary
-    notification results do not drive the breaker either; only the probe
-    resolves its own failure. Measured (OBSERVED): with the server stopped by SIGSTOP and resumed 12 s later,
+  - A worker that dies after taking a notification (killed or crashed, so it
+    returns no result) loses it, counted in
+    `yuzu_gw_upstream_notify_lost_total{reason="crashed"}`. Since #5695 a worker
+    that returns an RPC error no longer loses it: the notification is held again
+    at the head of the store and retried, and while the breaker is closed the
+    failure counts against it (see "Failed sends are retried" above; INFERRED
+    from the code and unit tests). On the #4632 build the runs below used, a
+    returned error lost the notification, uncounted, and ordinary notification
+    results did not drive the breaker. Measured on that build (OBSERVED): with the server stopped by SIGSTOP and resumed 12 s later,
     10 of 10 notification workers timed out (the 5 s call timeout; the 6.05 s in
     the rig notes is measured from the SIGSTOP, and the requests were dispatched
     about 1 s later) and logged `Failed to
@@ -2465,7 +3968,11 @@ env keys with defaults, which a reverted build ignores.
     because the requests were already in the frozen server's socket buffer. When
     the frozen server was killed and restarted instead, 0 of 10 stop notifications
     reached it: 51 s later the route directory showed 30 routable rows for 20 live
-    agents, and at 141 s 20 routable rows and 10 placed rows without a lease.
+    agents, and at 141 s 20 routable rows and 10 placed rows without a lease. On a
+    gateway that includes #5695 those timed-out notifications are held and sent
+    again, so in the first case the server can receive the same notification
+    twice and in the second the stop notifications are sent again once the server
+    answers (INFERRED from the code, not re-run on a rig).
   - Shutdown loses the volatile store. Held entries are not flushed when the
     upstream client process or the gateway stops.
   - Workers orphaned by an upstream client restart are not counted by
@@ -2507,7 +4014,8 @@ env keys with defaults, which a reverted build ignores.
   encodable notification closes it. Eviction happens only to the half open probe:
   with the breaker closed there is no probe, and an ordinary worker that meets
   the same encoder failure loses that one notification, logs `Failed to notify
-  stream status` and does not touch the breaker (not retried, not counted in
+  stream status` and does not touch the breaker (not retried; counted in
+  `yuzu_gw_upstream_notify_lost_total{reason="rejected"}`, not in
   `notify_dropped`). An evicted `CONNECTED` leaves the agent acknowledged by the
   server but undispatchable until it reconnects; an evicted `DISCONNECTED` leaves
   it looking online in the server's registry until its route lease expires. A
@@ -2631,10 +4139,11 @@ env keys with defaults, which a reverted build ignores.
 - **A successful probe does not prove registration works.** INFERRED from the
   code, not run. The probe is a `NotifyStreamStatus` call, an in-memory session
   lookup on the server. A server whose `Register` path is failing (for example a
-  degraded database) can still answer it, so the breaker closes, the full replay
-  runs, the call-path failures of the replay reopen the breaker after the
-  threshold, and the cycle repeats at the base interval (10 s by default) with no
-  exponential growth, because a success resets the backoff. Judge such a server by
+  degraded database) can still answer it, so the breaker closes, the next verdict
+  starts the replay, the call-path failures of the replay reopen the breaker after
+  the threshold, and the cycle repeats at the base interval (10 s by default) with
+  no exponential growth, because a success resets the backoff; a full replay runs
+  at most once a minute in that cycle. Judge such a server by
   the `Upstream Register failed` and `Registration replay` lines, not by the
   breaker state alone.
 - **The server's upstream port does not pin the gateway's identity, and TLS 1.3
@@ -2648,30 +4157,16 @@ env keys with defaults, which a reverted build ignores.
   protocol-version alert. This manual does not claim that the gateway identity is
   pinned on the upstream port or that the agent edge negotiates TLS 1.3; neither
   is true of the shipped build.
-- **A refused `Subscribe` reaches the client as status 2 (`process exited without
-  reason`), not as `NOT_FOUND`, and logs an error report.** OBSERVED in rig pass 6
-  (run K5) with an Erlang probe client, not with a real agent: for a `Subscribe`
-  with no pending registration the gateway logged the WARN `Subscribe: no pending
-  registration for session` and then an `[error] crasher` report from
-  `grpcbox_stream:handle_streams/2` carrying `throw: {grpc_error, {<<"5">>,
-  <<"No pending registration for session">>}}`, and the probe's stream ended with
-  status 2 instead of 5. INFERRED from the code: `yuzu_gw_agent_service:subscribe/2`
-  signals its refusals with `throw({grpc_error, ...})`, which crashes the stream
-  process of a bidirectional streaming call. The same throw pattern exists on
-  `origin/dev` (`subscribe/2` there throws at its argument, pending-registration
-  and internal-error refusals; checked with `git show` and `grep -n throw`), so
-  this is not introduced by this change. No functional effect was seen in pass 6,
-  but no real agent was refused: from `agents/core/src/agent.cpp` (not run) a
-  non-OK `Register` goes back to the retry loop and an ended `Subscribe` stream
-  goes through the reconnect loop, whichever status the stream ended with, so the
-  agent re-registers either way. Expect one error report per refused `Subscribe`
-  (for example after the dead connection grace has passed). A `Subscribe` refused
-  by the per-connection session cap is raised by the same throw pattern
-  (`session_limit_error()` in `subscribe/2`), so it is expected to end the same
-  way (INFERRED from the code, not run); a refused `Register` is returned and
-  reaches the client as `UNAVAILABLE` (14). Follow-up, no issue
-  number yet: answer these refusals with a status returned from the handler rather
-  than a throw.
+- **A refused `Subscribe` ends with its own status.** The handler returns or throws
+  `{grpc_error, {Status, Message}}` and the gRPC layer sends that status as the stream's
+  trailers: `INVALID_ARGUMENT` (3) when `x-yuzu-session-id` is missing, `NOT_FOUND` (5)
+  for a session with no pending registration, `UNAVAILABLE` (14) when the
+  per-connection session cap refuses it. Any other return, throw or crash of a
+  handler is `INTERNAL` (13) with one log line naming only the method, the exception
+  class and the top frame; the request, the context and the exit term are never
+  logged. (Rig pass 6 observed the previous transport ending such a stream with
+  status 2 and an error report; that no longer applies.) From `agents/core/src/agent.cpp` (read, not run) the
+  agent re-registers on any non-OK status either way.
 - Related tracked items: #5244 (an idempotent adopt: a re-adopt of a session the
   server already holds wipes placement), #4632 (stream-status notifications held
   instead of dropped, the change described under "Stream Status Notification";
@@ -2679,25 +4174,160 @@ env keys with defaults, which a reverted build ignores.
   follow-ups: the desync log seam and a concurrent-handler test) and #5313
   (re-registration load measurement).
 - Planned follow-ups, tracked as follow-ups (no issue numbers yet), in this
-  order: (i) retry or breaker feedback for an ordinary notification worker that
-  fails (today the notification is lost and the result does not reach the
-  breaker; the probe is the one exception), to be sized with the worker-loss
-  measurement above, and replacing the replay's in-flight pre-check with
-  a pending-depth check; (ii) a server-side re-arm of a tombstoned route row when a lease renewal
+  order: (i) a server-side re-arm of a tombstoned route row when a lease renewal
   comes up short, with a new advisory list that the gateway answers by
   re-announcing, which needs a protocol change and is planned to land before the
-  safe-to-scale gate; (iii) a session-match guard and a refusal counter for the
-  `accepted=false` disconnect; (iv) a server test that runs two overlapping
+  safe-to-scale gate; (ii) a session-match guard and a refusal counter for the
+  `accepted=false` disconnect; (iii) a server test that runs two overlapping
   `NotifyStreamStatus` handlers for one session (none was found in
   `tests/unit/server`; the gateway's per-key replacement relies on the server
   converging when a `CONNECTED` and a `DISCONNECTED` for one session overlap,
-  INFERRED from the code, not run); (v) alerts for pending
+  INFERRED from the code, not run); (iv) alerts for pending
   stuck, in-flight saturated and the `at_capacity` loss (the `code="encode"`
   alert and the pre-seeding of the `encode` and `exception` values have shipped);
-  (vi) refusing at the edge an agent id with a control character or a comma,
+  (v) refusing at the edge an agent id with a control character or a comma,
   which the server already refuses.
 
 ---
+
+### Planned stop
+
+A planned stop (`application:stop/1`, which the release runs on SIGTERM: `docker
+stop`, `systemctl stop`) tells the server about every session the gateway gives up
+(#5695). Before the processes stop (`yuzu_gw_app:prep_stop/1`), within one budget,
+`shutdown_flush_budget_ms` (20 s by default):
+
+1. Proxied `Register` and inventory calls are refused `UNAVAILABLE`, so agents
+   register through another gateway; no registration replay runs; the
+   held-notification cap is raised by twice the sessions held.
+2. The agent listeners are suspended (Ranch keeps the established connections;
+   new ones are refused) after the memory shedder is stopped, so nothing resumes
+   them. The router stops taking commands, and in-flight commands get up to 3 s
+   (or 30% of the budget) to finish.
+3. Every session is ended through its own agent process, which closes its stream
+   and sends the `DISCONNECTED` notice with the session's stream home id (the
+   server matches a `DISCONNECTED` to the placement by it; it is kept by the
+   agent process and its row in the owner table, not by the routing table). Up
+   to 5 s (or 40% of the budget) for them to finish. An agent process that is
+   restarted after a crash during the stop sends its session's `DISCONNECTED`
+   and stops: its re-registration is refused (`stopping`), so no session comes
+   back, and no session gets a second `DISCONNECTED`.
+4. The heartbeat buffer is flushed.
+5. Every held notification is sent, whatever the breaker state, 64 at a time,
+   until none is left or the budget ends. What is left is counted in
+   `yuzu_gw_upstream_notify_lost_total{reason="shutdown"}` and named in one WARN
+   (`Planned stop: <n> stream-status notification(s) sent, <m> not sent by the
+   flush deadline`); a failed send is not retried. A notification the server
+   refused (`acknowledged=false`) and that waits for a resend is sent here if it
+   is a `DISCONNECTED`, and dropped if it is a `CONNECTED` (counted
+   `reason="shutdown"`); a refusal during the flush is not resent
+   (`reason="unacknowledged"`). Later notifications are counted, not sent.
+
+The `/metrics` endpoint keeps answering through the drain and the shutdown of
+the processes, and is stopped last (`yuzu_gw_app:stop/1`). Before #5695 it was
+left to the application master's final clean-up, which killed the process that
+owns its listening socket under it, and every stop logged about 20 crash
+reports and as many supervisor reports from the inets `httpd_acceptor`
+(`noproc` on `link`); the scale suite's `planned_stop` case counted 67 at 500
+agents, and counts 0 now (it fails on any).
+
+Measured with a mocked server: 100 sessions, 100 `DISCONNECTED` notices delivered
+before `application:stop/1` returned (0 before #5695: the drain ran after the
+processes were gone); with a server that never answers, the stop returned 1.5 s
+after a 1.5 s budget and counted all 100 as lost.
+
+**Stop timeout coupling.** The budget must fit inside the container's or unit's
+stop timeout, with room for the processes to stop after it. Docker's default is
+10 s before SIGKILL, so every shipped compose file sets `stop_grace_period: 40s` on
+the gateway service, and `deploy/systemd/yuzu-gateway.service` sets
+`TimeoutStopSec=40`. Raise them together with `shutdown_flush_budget_ms`. A SIGKILL,
+a crash or a stop that outlasts the timeout sends nothing: the server keeps those
+sessions listed as online until the agents register again. At 5,000 sessions and
+50 ms per server call the flush takes about 4 s (64 at a time); a server at 200 ms
+per call needs about 16 s, close to the default budget (arithmetic, not measured at
+that scale). A server batch call ("this
+gateway is going away; these sessions are gone") would make it one call; it is not
+implemented.
+
+### When an agent's owner process crashes
+
+Each agent session is held by one Erlang process on the gateway, its owner
+(`yuzu_gw_agent`). Owners do not crash in normal operation; when one does (a
+gateway defect, or an operator killing it), the gateway does what the agent's
+own reconnect would do, faster, and without dropping the agent where it can
+avoid it (#5695):
+
+1. **The supervisor restarts the owner.** `yuzu_gw_agent_sup` restarts an owner
+   that ended abnormally (its children are `transient`); an owner that ends
+   normally (the agent disconnected, a refused registration) or is shut down (a
+   planned stop) is not restarted.
+2. **The restarted owner sends the `DISCONNECTED`** for the session its
+   predecessor held, with the predecessor's stream home id, so the server stops
+   showing the agent as connected through a process that no longer exists.
+   Before #5695 nothing told the server: it kept the agent listed as connected
+   until the agent itself reconnected, which took about 54 s in an independent
+   tester's runs (the agent's next heartbeat was refused, then it registered
+   again). The session's details survive the crash in the owner table (an ETS
+   table owned by `yuzu_gw_sup`, one row per owner, written when the session is
+   set up and removed when the owner ends for good). Exactly one process sends
+   a session's `DISCONNECTED`: the owner itself when it ends the session, or
+   its successor after a crash.
+3. **It tries to recover the agent.** The agent's Subscribe stream is a separate
+   process that watches its owner; after an abnormal owner exit it waits up to
+   5 s for the restarted owner to re-attach, and ends the stream otherwise. If
+   the stream is still open, the restarted owner re-attaches, waits until the
+   `DISCONNECTED` has reached the server (or been refused, or counted lost; a
+   refused one is not sent again: its resend, and any resend of the
+   predecessor's refused notices, is cancelled and counted
+   `yuzu_gw_upstream_notify_unacked_ended_total{outcome="superseded"}`, so none
+   reaches the server after the next step), registers the
+   session again in the routing table, presents the same session to the server
+   again (a `ProxyRegister` carrying the session id, as a registration replay
+   does), and announces `CONNECTED` for it with the same stream home id. The
+   agent keeps its connection and its session; commands reach it again at once.
+   If the stream is gone, or any of these steps fails (the agent registered a
+   newer session meanwhile, the server is unreachable, the server answers that
+   another session holds the agent), the owner closes the stream and ends after
+   the `DISCONNECTED`: the agent reconnects by itself.
+4. **A crash loop gives up.** One owner may be restarted at most 3 times within
+   60 s. The next restart sends the `DISCONNECTED` if it was not already sent,
+   closes the stream and ends, logging one WARN (`owner process restarted more
+   than 3 times in 60 s; giving up`) with the agent id.
+5. **A crash of most of the fleet's owners escalates.** The supervisor's restart
+   intensity is shared by every owner: `agent_restart_intensity` restarts
+   (default 2000) within `agent_restart_period_s` (default 10). An induced loss
+   of 10% of a 5,000-agent gateway's owners stays below it; a fault that crashes
+   more than 2000 owners within 10 s is a fault of the gateway, and the agent
+   supervisor stops. Every owner still running sends its session's
+   `DISCONNECTED` on the way down and its stream closes, so those agents
+   reconnect. The gateway supervisor starts a new agent supervisor, which
+   restarts an owner for every session left without one (it sends that
+   `DISCONNECTED` and recovers the session if its stream is still open). If the
+   fault persists, the gateway supervisor's own limit (10 restarts in 60 s)
+   stops the application and the container or systemd unit restarts the
+   gateway. Raise `agent_restart_intensity` for a gateway that holds far more
+   than 5,000 agents (about 40% of its agents keeps the same margins).
+
+What is lost: commands that were in flight at the crash. After an exception
+the dying owner answers their callers `agent_disconnected`; after a kill
+nothing can, and the router ends them at their timeout (300 s by default). The
+agent's replies to them arrive at the restarted owner and are dropped.
+
+Each restart writes the usual crash or supervisor report (one per crash,
+redacted) and one line naming the outcome. The outcomes are counted in
+`yuzu_gw_agent_owner_restarts_total{outcome}`: `recovered`,
+`disconnected_only`, `gave_up`. `YuzuGatewayAgentOwnerCrashLoop` fires for 30
+minutes after a give-up; a recovered restart raises no alert.
+
+Measured (EUnit, mocked server): a killed owner's `DISCONNECTED` reached the
+server 0.1 ms after the kill and the session was `CONNECTED` again 0.06 ms
+later, with a command reaching the agent on the same stream. Scale suite
+(`owner_kill`, 500 agents, 50 owners killed at once): 50 `DISCONNECTED`
+received, all 50 sessions recovered within 22 ms, no agent reconnected, every
+command to them answered, no supervisor restart; at 5,000 agents with 500
+owners killed at once, all 500 recovered within 147 ms, the same way. On the
+code before #5695 the 500-agent run received 0 `DISCONNECTED` and every one of
+the 50 agents had to reconnect.
 
 ## Building and Testing
 
@@ -2768,13 +4398,14 @@ This starts the gateway with all applications loaded, useful for debugging.
 
 | Dependency | Version | Purpose |
 |---|---|---|
-| grpcbox | 0.17.1 | gRPC server and client (HTTP/2, protobuf) |
+| cowboy / ranch | 2.19.0 / 2.3.0 | HTTP/2 server and listener behind the gateway's own gRPC layer (`yuzu_grpc*`) |
+| gun | 2.5.0 | HTTP/2 client behind the upstream gRPC client (`yuzu_grpc_client`); needs cowlib, which cowboy brings too |
+| ctx | 0.6.0 | The request-context type of the gRPC layer |
 | gpb | 4.21.7 | Protobuf compiler and runtime |
 | telemetry | 1.3.0 | Metrics event API |
 | prometheus | 4.11.0 | Prometheus exposition |
 | prometheus_httpd | 2.1.2 | HTTP endpoint for Prometheus scraping |
 | recon | 2.5.5 | Production introspection |
-| gproc | 1.0.0 | Extended process registry |
 
 Test-only dependencies (loaded in the `test` profile):
 
@@ -2886,15 +4517,15 @@ that are actually emitted are listed.
 | `yuzu_gw_command_duration_ms` | histogram | Command dispatch duration in ms (labels `plugin`, `status`) |
 | `yuzu_gw_agent_session_duration_ms` | histogram | Agent session duration in ms (label `node`) |
 | `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms (label `rpc_name`) |
-| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`). `code` is a server status digit (for example `14`), a transport reason, `exception` or `encode`. |
-| `yuzu_gw_upstream_rpc_errors_total{code="exception"}` | counter series | An exception out of the client or transport. It counts against the circuit breaker only on the `Register` and `ProxyInventory` call paths, the half-open notification probe and a registration replay; an ordinary notification worker, a guardian forward and the heartbeat buffer's own flush do not feed the breaker. Pre-seeded to 0 for `register`, `inventory`, `notify_stream`, `guardian` and `batch_heartbeat`. |
+| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`). `code` is the gRPC status number the server answered (`"16"` and so on) or, for a failure before any status, one of these words: `closed`, `econnrefused`, `timeout`, `connection_lost` (the call's connection closed or went away, since #5695), `stream_error` (the server reset that one call), `too_many_streams` (the gateway's own HTTP/2 client did not open the stream, because the connection was at the server's concurrent-stream limit; nothing was sent. Counted as `stream_error` before this was told apart), `protocol`, `response_too_large`, `invalid_metadata`, `no_channel`, `exception`, `encode`, `other`, or `{tls_alert,<Alert>}` for a TLS alert (for example `{tls_alert,certificate_required}`). Alerts keyed on `code="16"` or on `yuzu_gw_upstream_tls_handshake_failures_total` are unchanged |
+| `yuzu_gw_upstream_rpc_errors_total{code="exception"}` | counter series | An exception out of the client or transport. It counts against the circuit breaker on the `Register` and `ProxyInventory` call paths, a stream-status notification worker (while the breaker is closed), the half-open notification probe and a registration replay; a guardian forward and the heartbeat buffer's own flush do not feed the breaker. Pre-seeded to 0 for `register`, `inventory`, `notify_stream`, `guardian` and `batch_heartbeat`. |
 | `yuzu_gw_upstream_rpc_errors_total{code="encode"}` | counter series | A request that failed in the gateway's own encoder, including one over 4194304 bytes: local, never sent, no breaker effect. Pre-seeded to 0 for `register`, `inventory`, `notify_stream` and `guardian`; `batch_heartbeat` has no `encode` series, because a marshal failure on the heartbeat buffer's flush is counted as `code="exception"` and is not covered by the `YuzuGatewayUpstreamEncodeErrors` alert. That alert fires at about ten increases in 10 minutes (`increase()` is extrapolated). Other `code` values appear at their first occurrence. A `circuit_open` rejection never reaches the call and is not counted here. |
 | `yuzu_gw_register_refused_total` | counter | `Register` calls the gateway edge refused before any upstream call because the agent id was empty or longer than 256 bytes (label `reason`, closed set `agent_id_length` and `unknown`; both created at 0 at start). No label is derived from agent data. |
 | `yuzu_gw_registration_replay_total` | counter | Total registration replay attempts by the drip, any outcome. The drip runs after the upstream circuit breaker recovers, and when a heartbeat verdict lists sessions the gateway still holds |
-| `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay, whether queued by an upstream recovery or by a heartbeat verdict (0 = idle, label `node`). A non-zero value is normal while a drip runs: each entry takes the `ProxyRegister` RPC time plus the spacing (20 ms by default), so a full 10000-entry verdict queue takes at least 200 s to drain (250 s at 5 ms RPC time, see the table under "Load and convergence bounds"), and a breaker-seeded snapshot can be larger. A value that does not fall over longer than that points to a replay that is not draining (INFERRED). No alert rule ships for it. |
+| `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay, whether queued by a full replay or by a heartbeat verdict (0 = idle, label `node`). A non-zero value is normal while a replay runs: up to `upstream_replay_concurrency` (24) entries are replayed at once, each taking the `ProxyRegister` RPC time, so 5,000 agents at 50 ms per call take about 10 s, and a full replay counts every agent the node holds. A value that does not fall over longer than that points to a replay that is not draining (INFERRED). No alert rule ships for it. |
 | `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, by `trigger` (`breaker` = the upstream recovered and every agent this node holds is queued for replay, unless a verdict-seeded drip is already queued, in which case the trigger is dropped, `heartbeat` = a heartbeat verdict listed sessions the server does not know and only those are replayed). Both series are created at 0 at start. |
 | `yuzu_gw_heartbeat_unknown_truncated_total` | counter | `BatchHeartbeat` responses whose list of unknown sessions the server truncated at 4096. Sessions beyond the cap may be reported again by later heartbeats. Every occurrence is counted; the matching WARN is logged at most once per 60 s per heartbeat buffer process (the limit resets when that process restarts). |
-| `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap, or the upstream process already holds more than 100 unhandled messages so the ids were not handed to it; the cap bounds only verdict appends, so while a breaker-seeded snapshot of that size or larger drains, every verdict id for an agent not already queued counts here). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
+| `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap, or the upstream process already holds more than 100 unhandled messages so the ids were not handed to it; the cap bounds only verdict appends, not the walk of a full replay). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
 | `yuzu_gw_heartbeat_buffer_dropped_total` | counter | Heartbeat state the gateway's heartbeat buffer dropped instead of sending (label `reason`, closed set of six, all created at 0 at start: `buffer_full` = a heartbeat of a new session was dropped because the buffer held `max_heartbeat_buffer` sessions, or the oldest whole session was dropped because the buffer was still over `max_heartbeat_buffer_bytes` with no snapshot left to drop; `snapshot_oversize` = a single heartbeat larger than about 3 MiB was sent without its snapshot; `snapshot_evicted` = a retained snapshot was dropped, oldest first, because the buffer was over `max_heartbeat_buffer_bytes`; `heartbeat_oversize` = a heartbeat still larger than about 3 MiB after its snapshot was removed, or with more than 512 status tags, or with a status tag key or value over about 64 KiB or more than about 256 KiB of tag bytes in total (checked before the UTF-8 repair), was forwarded without its status tags; `heartbeat_invalid` = a heartbeat with a status tag that is not valid UTF-8 was forwarded with the invalid bytes replaced by replacement characters (the reason also counts tags removed because a tag was not a binary, and a heartbeat dropped for a bad or empty session id; see Heartbeat Batching); `chunk_rejected` = a single heartbeat the server rejected with a non-transient status was dropped). What is lost is older heartbeat state; for `heartbeat_oversize` the status tags of one heartbeat, for `heartbeat_invalid` only the invalid bytes, and for `chunk_rejected` one whole heartbeat. See [Heartbeat Batching](#heartbeat-batching). |
 | `yuzu_gw_heartbeat_coalesced_total` | counter | Buffered heartbeats replaced by a newer heartbeat of the same session (unlabelled). Expected to rise while the server is unreachable. While a backlog is coalesced, the server's `yuzu_heartbeats_received_total{via="gateway"}` under-counts, because it counts the heartbeats the server received. |
 | `yuzu_gw_upstream_notify_pending` | gauge | Stream-status notifications held because the in-flight limit is reached or the upstream circuit breaker is not closed; drained first in first out (0 = nothing held). The key of a half open probe in flight is not counted here (it is counted by `yuzu_gw_upstream_notify_inflight`), unless a newer notification for the same key has since been held, and the key still counts toward the `notify_pending_max` cap. The gauge can equal `notify_pending_max` without any loss, so do not alert on that; alert on `increase(yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}[5m]) > 0`. Label `node`, created at 0 at start. Counts the current upstream client process only |
@@ -2907,7 +4538,42 @@ that are actually emitted are listed.
 | `yuzu_gw_cluster_address_cap_exceeded_total` | counter | Total times the lifetime distinct-address cap (`cluster_max_lifetime_addrs`) refused a never-before-seen address (`#4555` review round 2). Any non-zero value should be investigated immediately — it means the seed DNS name is returning an unexpectedly large or rotating/hostile answer set. |
 | `yuzu_gw_heartbeat_rejected_total` | counter | Agent `Heartbeat` calls rejected before buffering because no usable session binding exists (label `reason`, closed set: `unknown_session` = the session is not held by this node, `no_connection` = no connection key to compare, `registry_unavailable` = the session index does not exist). Every reason is created at 0 at start. The agent re-registers on the `NOT_FOUND` answer when its build includes the reconnect fix (see the gateway manual); older agents only log it. A held session whose heartbeat arrived on a different connection is counted in the next row instead. See [Heartbeat admission](#heartbeat-admission). |
 | `yuzu_gw_heartbeat_session_mismatch_total` | counter | Agent `Heartbeat` calls rejected because the session is held by this node but the call arrived on a different connection than the one that opened it (label `event`, always `security`, for SIEM routing; created at 0 at start). Also rises when an HTTP/2 proxy between agents and the gateway spreads one agent's calls over several connections. A rise of one per affected agent is expected when an agent's connection is replaced while its session is still held (observed with an injected GOAWAY, a test-only trigger; not observed with an abrupt close or a gateway restart). There is no audit row (the sender of a rejected heartbeat is not a resolved principal): the counter and a rate-limited summary log line are the signal. |
-| `yuzu_gw_session_limit_rejected_total` | counter | Registrations refused because one connection already holds the configured number of agent sessions, pending plus live (`max_sessions_per_connection`, default 8). Unlabelled, created at 0 at start. A `Register` over the cap is answered `UNAVAILABLE` (14); a `Subscribe` over the cap ends its stream (status 2 today, see Known limits) and is counted the same. A stock agent holds one session per connection (INFERRED), so a rise points to an L4 balancer, forwarder or client that carries several agents on one connection; see "Per-connection session cap" under Configuration. |
+| `yuzu_gw_grpc_origin_ignored_total` | counter | gRPC calls on a listener configured as behind a proxy whose claimed client address was not used (labels `mode` = `proxy_protocol` or `forwarded_for`, `reason` = `untrusted_source`, `no_claim` or `bad_claim`). The call is served either way: for `untrusted_source` it is attributed to the TCP peer, for `no_claim` and `bad_claim` it is sent upstream with no observed address (empty `gateway_observed_peer`; the server records `origin_observed=false`). Created at 0 for every pair at start; no listener label. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy) and [Origin counters](#origin-counters). |
+| `yuzu_gw_grpc_dropped_data_bytes_total` | counter | Request bytes the gRPC layer discarded in a state that must not run a handler (label `reason`, closed set: `extra_request_data` = a second message on a unary call, `stream_ended` = data after the stream's status). |
+| `yuzu_gw_upstream_calls_dropped_total` | counter | Proxied `Register` or inventory calls not sent because the caller's deadline passed while it waited for a permit, or left too little time (250 ms) to make the call (label `rpc_name`, closed set `register` and `inventory`, both created at 0 at start). Nothing is sent for them, so no server session is created. Before #5695 it counted queued calls of callers that had exited. |
+| `yuzu_gw_upstream_permits_held` | gauge | Upstream call permits held now, by `class` (`register`, `replay`, `inventory`; created at 0). `register` and `replay` share one pool (see "Upstream call permits") |
+| `yuzu_gw_upstream_permits_waiting` | gauge | Callers waiting for a permit now, by `class`. Non-zero for `register` or `inventory` means every permit of the pool is held |
+| `yuzu_gw_upstream_permit_limit` | gauge | Permits in force, by `class` (`replay` is the most of the register pool a replay may hold): the configured size, or less when the server's stream limit leaves less room (see "How the gateway sizes its upstream calls") |
+| `yuzu_gw_upstream_server_max_streams` | gauge | Concurrent streams the server allows on the gateway's upstream connections together, as it declared them (`SETTINGS_MAX_CONCURRENT_STREAMS`, summed over the connections). Created at 0; 0 also means nothing is known (no connection up) or the server declared no limit, and then the configured permit sizes apply. No label: the gateway makes its upstream calls on one channel |
+| `yuzu_gw_upstream_permit_refused_total` | counter | Permits refused, by `class` and `reason` (`queue_full`, `deadline`, `stopping`; every pair created at 0). The agent is told `UNAVAILABLE` and retries |
+| `yuzu_gw_upstream_permit_wait_seconds` | histogram | Seconds a granted permit was waited for, by `class` |
+| `yuzu_gw_registration_replay_outcomes_total` | counter | Registration replay entries by `outcome` (`adopted`, `superseded`, `rejected`, `failed`, `skipped`, `aborted`; created at 0) |
+| `yuzu_gw_registration_replay_last_duration_seconds` | gauge | Seconds the last finished registration replay took (0 until one finished). Measured with a mocked server: 2,000 agents at 10 ms per call in 0.94 s, 24 in flight |
+| `yuzu_gw_upstream_notify_lost_total` | counter | Stream-status notifications lost, by `event` (`connected`, `disconnected`) and `reason`: `at_capacity` (refused at a full store), `evicted` (a held `CONNECTED` evicted for a `DISCONNECTED`; a full replay re-sends it), `rejected` (a bad-request answer or an encode failure), `crashed` (the send's worker died without a result), `shutdown` (left by a planned stop's flush). Every pair created at 0 |
+| `yuzu_gw_upstream_notify_requeued_total` | counter | Stream-status notifications whose send failed and that were held again to be retried |
+| `yuzu_gw_upstream_notify_pending_hwm` | gauge | Most stream-status notifications held at once over the last one to two minutes |
+| `yuzu_gw_upstream_notify_pending_max` | gauge | The held-notification cap in force (`notify_pending_max`) |
+| `yuzu_gw_upstream_backpressure_seconds_total` | counter | Seconds during which the path to the server was backed up: at least one lane saturated (a live `Register` or inventory report waiting for a permit, all 10 stream-status notification slots held, or all 50 Guardian forward slots held). `rate()` of it is the backpressure duty cycle, 0 to 1. Sampled every 100 ms. See "Slow server" |
+| `yuzu_gw_upstream_lane_saturated_seconds_total` | counter | The same, per lane (label `lane`: `permits` (`serial` before #5695), `notify`, `guardian`; all three created at 0 at start). The lanes overlap, so never add them: the figure for the gateway as a whole is the counter above |
+| `yuzu_gw_upstream_backpressure_duty_cycle` | gauge | The backpressure duty cycle over the last 60 s, 0 to 1. Reads low for the first minute after a start (the missing seconds count as not saturated) |
+| `yuzu_gw_upstream_slow` | gauge | 1 when the duty cycle above is 0.5 or more (a slow server, as this gateway sees it), else 0. Not a readiness input |
+| `yuzu_gw_session_limit_rejected_total` | counter | Registrations refused because one connection already holds the configured number of agent sessions, pending plus live (`max_sessions_per_connection`, default 8). Unlabelled, created at 0 at start. A `Register` over the cap is answered `UNAVAILABLE` (14); a `Subscribe` over the cap is also answered `UNAVAILABLE` (14) and is counted the same. A stock agent holds one session per connection (INFERRED), so a rise points to an L4 balancer, forwarder or client that carries several agents on one connection; see "Per-connection session cap" under Configuration. |
+| `yuzu_gw_mgmt_auth_rejected_total` | counter | Management-listener (`:50063`) streams refused by the SPKI peer pin, by `reason` (closed set: `pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `internal_error`; all created at 0 at start). Alerts: `YuzuGatewayMgmtAuthRejected` (every reason but `pin_mismatch`), `YuzuGatewayMgmtPinMismatch` |
+| `yuzu_gw_mgmt_auth_pin_unresolved_total` | counter | Management auth attempts during which at least one configured `mgmt_peer_pins` entry did not resolve (a typo'd fingerprint, or a pin file never readable since start) |
+| `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` | gauge | Unix time at which the pin watcher last published a different key for a `{cert_file, Path}` pin; 0 until the first such change in the process (created at 0 at start). Used by `YuzuGatewayMgmtPinMismatch` to stay quiet through a rotation |
+| `yuzu_gw_cert_expiry_timestamp_seconds` | gauge | `notAfter` in Unix seconds of each configured certificate file, the earliest for a file with several certificates (labels `role` = `listener`, `listener_ca`, `upstream_client`, `upstream_ca`, `mgmt_peer_pin`; `name` = listener or channel name, or the pin file's name). Keeps the last value read if the file becomes unreadable; absent for a file never read. Alerts: the `YuzuGatewayCertificateExpir*` ladder |
+| `yuzu_gw_cert_file_readable` | gauge | 1 when the latest read of every certificate file under that `role` and `name` parsed, 0 when a stat, read or parse failed. Alerts: `YuzuGatewayMgmtPinUnresolved` (`mgmt_peer_pin`), `YuzuGatewayCertificateFileUnreadable` (the other roles) |
+| `yuzu_gw_process_mailbox_len` | gauge | Messages waiting in the mailbox of a named gateway process, labeled by `process` (closed set: `upstream`, `upstream_regulator`, `registry`, `router`, `heartbeat_buffer`, `agent_sup`, `pg`, `upstream_channel`, `logger`; all created at 0). Sampled every `telemetry_gauge_interval_ms`. Alert: `YuzuGatewayProcessBacklogged` (over 10,000 for 10 minutes) |
+| `yuzu_gw_process_queue_wait_seconds` | gauge | How long a message sent to that process waited before it was handled (a probe's round trip each sample; while a probe is unanswered, the time since it was sent), labeled by `process` |
+| `yuzu_gw_listener_connections` | gauge | Connections a gRPC listener holds (Ranch active connections), labeled by `listener` role (`agent`, `management`, `other`; all created at 0) |
+| `yuzu_gw_listener_max_connections` | gauge | That role's `limits.max_connections`; no series without a ceiling (the default). Alert: `YuzuGatewayListenerNearConnectionCeiling` (over 90% for 10 minutes) |
+| `yuzu_gw_mgmt_streams_inflight` | gauge | Calls the management listener is running a handler for |
+| `yuzu_gw_router_fanouts_inflight` | gauge | Command fan-outs the router is tracking, set by the router whenever the number changes |
+| `yuzu_gw_beam_ports` | gauge | Ports open in the gateway VM (each TCP connection is one). Alert: `YuzuGatewayFileDescriptorsNearLimit` (over 90% of either limit below for 10 minutes) |
+| `yuzu_gw_beam_port_limit` | gauge | The most ports the VM can open (`+Q`) |
+| `yuzu_gw_beam_fd_limit` | gauge | The open-files limit the VM found at start; no series where the VM does not report one |
+| `yuzu_gw_beam_run_queue` | gauge | Processes waiting for a scheduler (`total_run_queue_lengths`) |
+| `yuzu_gw_grpc_connections_closed_total` | counter | Connections the gateway's HTTP/2 server closed itself, labeled by `listener` role and `reason` (`idle_timeout`, `enhance_your_calm`, `protocol_error`; every pair created at 0); counted once per connection that had a call open. A memory-ceiling kill is counted in `yuzu_gw_grpc_connection_killed_total` |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and
 queue-length histograms, circuit-breaker and cluster counters) is registered in

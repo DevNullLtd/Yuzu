@@ -8,7 +8,7 @@
 %%%   - Command fanout through the full stack
 %%%   - Telemetry and metrics collection
 %%%
-%%% This suite uses real grpcbox and real pb modules (not mocked),
+%%% This suite uses real pb modules (not mocked),
 %%% exercising the actual encode/decode paths and service handlers.
 %%% @end
 %%%-------------------------------------------------------------------
@@ -111,7 +111,6 @@ groups() ->
 init_per_suite(Config) ->
     %% Start required applications.
     {ok, _} = application:ensure_all_started(telemetry),
-    {ok, _} = application:ensure_all_started(gproc),
 
     %% Set up mock upstream configuration.
     application:set_env(yuzu_gw, upstream_addr, "127.0.0.1"),
@@ -146,10 +145,10 @@ init_per_suite(Config) ->
     meck:new(yuzu_gw_heartbeat_buffer, [non_strict, no_link]),
     meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
-    meck:expect(yuzu_gw_upstream, proxy_register, fun(_) ->
+    meck:expect(yuzu_gw_upstream, proxy_register, fun(_, _Opts) ->
         {ok, #{session_id => <<"test-session">>}}
     end),
-    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_) ->
+    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_, _Opts) ->
         {ok, #{received => true}}
     end),
 
@@ -185,13 +184,10 @@ init_per_group(upstream, Config) ->
             catch gen_server:stop(OldPid, shutdown, 5000),
             timer:sleep(100)
     end,
-    %% Mock grpcbox for upstream tests.
-    catch meck:unload(grpcbox_channel),
-    catch meck:unload(grpcbox_client),
-    meck:new(grpcbox_channel, [non_strict, no_link]),
-    meck:expect(grpcbox_channel, pick, fun(_, _) -> {ok, mock_channel} end),
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    %% Mock the upstream gRPC client for upstream tests.
+    catch meck:unload(yuzu_grpc_client),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     %% Start real upstream and heartbeat buffer (unlink so they outlive CT process).
@@ -217,8 +213,7 @@ end_per_group(upstream, Config) ->
         false ->
             ok
     end,
-    catch meck:unload(grpcbox_channel),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     %% Reinstall the global upstream mock for subsequent groups.
     catch meck:unload(yuzu_gw_upstream),
     catch meck:unload(yuzu_gw_heartbeat_buffer),
@@ -226,10 +221,10 @@ end_per_group(upstream, Config) ->
     meck:new(yuzu_gw_heartbeat_buffer, [non_strict, no_link]),
     meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
-    meck:expect(yuzu_gw_upstream, proxy_register, fun(_) ->
+    meck:expect(yuzu_gw_upstream, proxy_register, fun(_, _Opts) ->
         {ok, #{session_id => <<"test-session">>}}
     end),
-    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_) ->
+    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_, _Opts) ->
         {ok, #{received => true}}
     end),
     Config;
@@ -273,7 +268,7 @@ end_per_testcase(_TestCase, Config) ->
 
 agent_register_via_service(_Config) ->
     %% Update upstream mock for this specific test.
-    meck:expect(yuzu_gw_upstream, proxy_register, fun(_Req) ->
+    meck:expect(yuzu_gw_upstream, proxy_register, fun(_Req, _Opts) ->
         {ok, #{session_id => <<"test-session-1">>}}
     end),
 
@@ -326,7 +321,7 @@ agent_heartbeat_batching(_Config) ->
     end.
 
 agent_inventory_proxy(_Config) ->
-    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_Report) ->
+    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_Report, _Opts) ->
         {ok, #{received => true}}
     end),
 
@@ -389,9 +384,9 @@ agent_disconnect_cleanup(_Config) ->
     unlink(AgentPid),
     timer:sleep(50),
 
-    %% Verify pg group membership.
-    AllAgents = pg:get_members(yuzu_gw, all_agents),
-    ?assert(lists:member(AgentPid, AllAgents)),
+    %% Verify the agent joined its own cross-node lookup group (the only pg
+    %% group an agent is in).
+    ?assertEqual([AgentPid], pg:get_local_members(yuzu_gw, {agent, AgentId})),
 
     %% Kill the agent process.
     exit(AgentPid, kill),
@@ -502,7 +497,7 @@ mgmt_list_agents(_Config) ->
         io_lib:format("list-agent-~b", [I]))) || I <- lists:seq(1, 10)],
 
     Request = #{limit => 5, cursor => undefined},
-    {ok, Response, _} = yuzu_gw_mgmt_service:list_agents(Request, #{}),
+    {ok, Response, _} = yuzu_gw_mgmt_service:list_agents(ctx:background(), Request),
 
     AgentList = maps:get(agents, Response),
     ?assertEqual(5, length(AgentList)),
@@ -510,7 +505,7 @@ mgmt_list_agents(_Config) ->
 
     %% Second page.
     Request2 = #{limit => 10, cursor => maps:get(next_cursor, Response)},
-    {ok, Response2, _} = yuzu_gw_mgmt_service:list_agents(Request2, #{}),
+    {ok, Response2, _} = yuzu_gw_mgmt_service:list_agents(ctx:background(), Request2),
     AgentList2 = maps:get(agents, Response2),
     ?assert(length(AgentList2) >= 5),
 
@@ -521,7 +516,7 @@ mgmt_get_agent(_Config) ->
     {AgentPid, _} = start_silent_agent(AgentId),
 
     Request = #{agent_id => AgentId},
-    {ok, Response, _} = yuzu_gw_mgmt_service:get_agent(Request, #{}),
+    {ok, Response, _} = yuzu_gw_mgmt_service:get_agent(ctx:background(), Request),
 
     Summary = maps:get(summary, Response),
     ?assertEqual(AgentId, maps:get(agent_id, Summary)),
@@ -538,19 +533,19 @@ upstream_register_error_handling(Config) ->
     %%
     %% #4708 contract decision: the GATEWAY side is authoritative. A genuine
     %% (non-transport) gRPC status reaches yuzu_gw_upstream:do_rpc/4 in
-    %% grpcbox_client:unary/5's REAL shape -- `{error, {Status, Message},
+    %% yuzu_grpc_client:unary/5's REAL shape -- `{error, {Status, Message},
     %% Trailers}`, Status being the raw `grpc-status` trailer as a binary
-    %% digit string (grpcbox_stream:grpc_error_response()) -- and do_rpc
+    %% digit string -- and do_rpc
     %% surfaces it UNWRAPPED as `{error, {Status, Message}}`, which is what
     %% callers such as do_replay_one/6's FAILED_PRECONDITION branch match
     %% on. `{error, {internal, Bin}}` is reserved for transport-level
     %% `{error, Reason}` and HTTP-layer errors. This mock previously returned
-    %% `{error, {14, <<"UNAVAILABLE">>, #{}}}`, a shape grpcbox never
+    %% `{error, {14, <<"UNAVAILABLE">>, #{}}}`, a shape the client never
     %% produces, so it fell through to the transport arm; HA WS-4 4.4
     %% (e0e4f6a17) corrected the eunit twin (yuzu_gw_upstream_tests
     %% proxy_register_error) but this CT copy was hidden by #4800 (the ct
     %% gate ran zero suites).
-    meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
             _ -> {error, {<<"14">>, <<"UNAVAILABLE">>}, #{}}
@@ -563,8 +558,8 @@ upstream_register_error_handling(Config) ->
 
 upstream_batch_heartbeat_flush(Config) ->
     %% Queue several heartbeats and trigger flush.
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -585,8 +580,8 @@ upstream_batch_heartbeat_flush(Config) ->
     timer:sleep(150),
 
     %% Verify batch was sent.
-    Calls = meck:history(grpcbox_client),
-    BatchCalls = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
+    Calls = meck:history(yuzu_grpc_client),
+    BatchCalls = [Req || {_, {yuzu_grpc_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
                          binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch],
     ?assert(length(BatchCalls) > 0),
 
@@ -600,7 +595,7 @@ upstream_stream_status_notification(Config) ->
     %% Test stream status notifications.
     Self = self(),
     Ref = make_ref(),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"NotifyStreamStatus">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->

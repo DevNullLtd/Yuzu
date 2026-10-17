@@ -106,7 +106,7 @@ MIN_MATCHES = {
     "docs/pki-architecture.md": 3,
     "docs/security-reviews/gateway-peer-authz-minimal-2026-10-07.md": 3,
     "changelog.d/5565-gateway-peer-authz.security.md": 1,
-    "docs/prometheus/yuzu-alerts.yml": 3,
+    "docs/prometheus/yuzu-alerts.yml": 4,
     "deploy/docker/docker-compose.reference-gateway.yml": 0,  # comments carry no restart advice today
     "deploy/systemd/yuzu-server.service": 0,                  # (listed so a future one is checked)
 }
