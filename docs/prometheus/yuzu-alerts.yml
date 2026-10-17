@@ -1014,20 +1014,29 @@ groups:
           summary: "The server is slow for gateway {{ $labels.instance }}"
           description: >-
             For at least half of the last minute, and continuously for 5 minutes,
-            the path from {{ $labels.instance }} to the server was backed up: the
-            upstream process was inside an RPC with work waiting, or every
-            stream-status notification or Guardian forward slot was held.
-            Registrations queue behind the slow call and notifications beyond
-            the cap are dropped (yuzu_gw_upstream_notify_dropped_total). The
-            circuit breaker stays closed, because the calls succeed. FIRST: is it
+            the path from {{ $labels.instance }} to the server was backed up: a
+            live registration or inventory report was waiting for an upstream
+            permit because every permit of its pool was held (the pools are
+            sized from the configured pool sizes and the server's declared
+            stream limit), or every stream-status notification or Guardian forward
+            slot was held. A waiting registration queues until the agent's own
+            deadline; past it, or with the queue full, it is refused
+            UNAVAILABLE and the agent retries
+            (yuzu_gw_upstream_permit_refused_total{class="register"}). A
+            notification is held while its slots are full and lost only when
+            the held store is full (yuzu_gw_upstream_notify_dropped_total); a
+            Guardian forward past its slots is dropped. The circuit breaker
+            stays closed, because the calls succeed. FIRST: is it
             every gateway? avg(yuzu_gw_upstream_slow) near 1 means the server or
             its database is slow (check PostgreSQL, including a failover that
             slowed both servers); one gateway among many at 0 means that gateway
             or its network path. THEN: rate(yuzu_gw_upstream_lane_saturated_seconds_total[5m])
-            by lane says which lane, and yuzu_gw_upstream_rpc_duration_ms says
-            whether the server is slow or the gateway is simply carrying more
-            work than one serial lane drains (a restarted fleet registering at
-            once looks the same). Nothing is wrong with the gateway's readiness;
+            by lane says which lane (permits, notify or guardian),
+            yuzu_gw_upstream_permit_wait_seconds how long registrations wait,
+            and yuzu_gw_upstream_rpc_duration_ms whether the server is slow or
+            the gateway is carrying more work than its permits drain at a
+            healthy server's pace (a restarted fleet registering at once looks
+            the same). Nothing is wrong with the gateway's readiness;
             do not restart it, which disconnects its agents.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md"
 
