@@ -475,6 +475,35 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin can delete other use
     CHECK(h.has_audit("user.delete", "success", "User", "bob"));
 }
 
+TEST_CASE("SettingsRoutes POST /api/settings/users: re-creating a removed username is refused "
+          "honestly, not as a weak password",
+          "[pg][settings][users]") {
+    SettingsAdr2001Harness h;
+    REQUIRE(h.delete_user("bob")->status == 200);
+    h.audit_calls.clear();
+
+    // A policy-valid password: the store (not the policy) refuses, because the removed account's
+    // row still holds the name.
+    auto res = h.sink.Post("/api/settings/users", "username=bob&password=anotherpassword1",
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->body.find("removed account") != std::string::npos);
+    CHECK(res->body.find("at least") == std::string::npos);
+    CHECK(res->body.find("anotherpassword1") == std::string::npos); // never echoed
+    CHECK(res->get_header_value("HX-Trigger").find("anotherpassword1") == std::string::npos);
+    CHECK(h.audit_detail("user.create", "denied", "bob") == "create_refused");
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
+
+    // A genuinely short password is still the weak-password answer.
+    res = h.sink.Post("/api/settings/users", "username=carol&password=short",
+                      "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("at least") != std::string::npos);
+    CHECK(h.audit_detail("user.create", "denied", "carol") == "weak_password");
+}
+
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: a null ApiTokenStore fails CLOSED "
          "(503) rather than skip-and-proceed — MUTATION-CHECK target, see the comment below",
          "[settings][users][adr2001][failclosed]") {
@@ -758,6 +787,32 @@ TEST_CASE("is_valid_principal: rejects an over-255-byte principal", "[settings][
 // The guard must: (1) return 400, (2) emit the short-password error toast,
 // (3) audit the attempt as denied with detail="weak_password", (4) leave
 // the user NOT persisted.
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: a dot-only username is refused",
+          "[settings][users]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+    for (const char* name : {".", "..", "..."}) {
+        INFO(name);
+        auto res = h.Post("/api/settings/users",
+                          std::string("username=") + name + "&password=a-long-enough-password",
+                          "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK_FALSE(h.has_user(name));
+        CHECK(h.has_audit("user.create", "denied", "User", name));
+    }
+    // A name that merely contains a dot is fine, at either end.
+    for (const char* name : {"a.b", ".hidden", "x.", "-x"}) {
+        INFO(name);
+        auto ok = h.Post("/api/settings/users",
+                         std::string("username=") + name + "&password=a-long-enough-password",
+                         "application/x-www-form-urlencoded");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
+}
 
 TEST_CASE("SettingsRoutes POST /api/settings/users: short password rejected with toast",
           "[settings][users][weak-password]") {

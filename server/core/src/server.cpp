@@ -158,7 +158,7 @@
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
 #include "groups_routes.hpp" // Groups and enrolment page (Phase 2 UI): /groups + its script
-#include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
+#include "access_routes.hpp" // Access pages (Phase 2 UI): the Users and roles page (/access/users)
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
@@ -15698,11 +15698,13 @@ private:
                              .store = custom_properties_store_.get(),
                          });
 
-        // Access pages (Phase 2 UI): the read-only /access/users page, its two fragments and
-        // the page's static glue. Placed after audit_fn (which it binds for the Access PRs
-        // that follow). The read goes through AuthDB::list_users() (a std::expected: a store
-        // fault reaches the page as "could not be read", never as an empty list); the
-        // in-memory AuthManager::list_users() fallback is deliberately not used.
+        // Access pages (Phase 2 UI): the Users and roles page /access/users, its fragments
+        // (users, roles, role permissions, role assignments, enforcement) and the static glue.
+        // Placed after audit_fn. The lambdas below capture `this` and are quiesced by the
+        // web_thread_ join in stop(), before rbac_store_ is reset. The read goes through
+        // AuthDB::list_users() (a std::expected: a store fault reaches the page as "could not
+        // be read", never as an empty list); the in-memory AuthManager::list_users() fallback
+        // is deliberately not used.
         yuzu::server::access::register_access_routes(
             inline_sink,
             yuzu::server::access::Deps{
@@ -15721,6 +15723,36 @@ private:
                         return std::unexpected("AuthDB::list_users failed (error " +
                                                std::to_string(static_cast<int>(r.error())) + ")");
                     return std::move(*r);
+                },
+                // The checked reads the REST twins use: a closed store, a pool timeout or a
+                // query error is `unexpected`, never an empty list.
+                .list_roles_fn = [this]() -> std::expected<std::vector<RbacRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_roles_checked();
+                },
+                .role_permissions_fn =
+                    [this](const std::string& role) -> std::expected<std::vector<Permission>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->get_role_permissions_checked(role);
+                },
+                .list_assignments_fn = [this]() -> std::expected<std::vector<PrincipalRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_all_principal_roles_checked();
+                },
+                // Display accessors only: the cached view FIRST (reading it refreshes it), then the
+                // staleness flag. The enforcement-label and administrator predicates are
+                // deliberately not used here (routed A2/A1 row, clauses 3 and 4).
+                .enforcement_state_fn =
+                    [this]() -> std::expected<yuzu::server::access::EnforcementView, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    yuzu::server::access::EnforcementView v;
+                    v.enabled = rbac_store_->is_rbac_enabled();
+                    v.degraded = rbac_store_->rbac_enabled_view_degraded();
+                    return v;
                 },
             });
 

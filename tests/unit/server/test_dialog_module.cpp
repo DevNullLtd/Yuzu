@@ -63,6 +63,10 @@ TEST_CASE("dialog module: request maps both error shapes and the step-up contrac
     // Only the TOTP/recovery-code challenge is prompted for; anything else goes to sign-in.
     CHECK(has(js, "meta.mfa_step_up_required === true"));
     CHECK(has(js, "challenge !== '/login/mfa/stepup'"));
+    // An OIDC session is told to sign in again at its identity provider (no code field); that
+    // path is the one challenge allowed besides the code prompt.
+    CHECK(has(js, "challenge === '/auth/oidc/start'"));
+    CHECK(has(js, "Sign in again at your identity provider. You will return to the dashboard"));
     CHECK(has(js, "location.assign('/login')"));
     // A network failure or timeout never throws and never claims nothing changed.
     CHECK(has(js, "The request may not have applied."));

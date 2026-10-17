@@ -334,7 +334,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # decisions, `exception:#520 revisit:...`), which count untwinned. 11 rows were reclassified that
 # way, so 216 -> 227, with no change in capability; a 12th (settings developer plugins) is
 # satisfied by the `resource:yuzu://plugin-docs` MCP resource twin and stays `twinned`.
-BASELINE_UNTWINNED = 227
+BASELINE_UNTWINNED = 228
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific

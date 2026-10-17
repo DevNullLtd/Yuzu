@@ -1147,6 +1147,10 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/users"
     "/fragments/access/users/list"
     "/fragments/access/users/detail"
+    "/fragments/access/roles/assignments"
+    "/fragments/access/enforcement"
+    "/fragments/access/roles/list"
+    "/fragments/access/roles/permissions?role=Viewer"
     "/fragments/settings/tokens"
     "/fragments/settings/pending"
     "/fragments/settings/auto-approve"
@@ -1181,6 +1185,15 @@ SETTINGS_FRAGMENTS=(
 for frag in "${SETTINGS_FRAGMENTS[@]}"; do
     http_get "$SERVER_URL$frag"
     assert_status_any "GET $frag" "$HTTP_STATUS" 200 403 404
+done
+
+# The Users and roles fragments for the admin session this script runs as: exactly 200 (a 403 would
+# mean the gate regressed, a 404 an unregistered route; the loop above accepts both).
+for frag in "/fragments/access/users/list" "/fragments/access/roles/list" \
+            "/fragments/access/roles/permissions?role=Viewer" "/fragments/access/roles/assignments" \
+            "/fragments/access/enforcement"; do
+    http_get "$SERVER_URL$frag"
+    assert_status_any "GET $frag (admin)" "$HTTP_STATUS" 200
 done
 
 # System pages: an admin session gets the page; a non-admin is redirected to /.
