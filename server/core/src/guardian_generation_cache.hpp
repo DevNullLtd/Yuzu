@@ -28,6 +28,9 @@
 ///   - MONOTONIC INSTALL. A result is installed only if its read STARTED no earlier than the
 ///     currently held entry's, so a read that started long ago and finishes last cannot
 ///     overwrite a newer one (two `get_fresh()` calls, or a `get_fresh()` racing a `get()`).
+///     "Earlier" is decided by a sequence number taken under the mutex when the read starts,
+///     NOT by the clock: two reads that start within one clock tick compare equal by time,
+///     and the older one finishing last would then overwrite the newer.
 ///   - SINGLE FLIGHT. At most one thread runs the fetch at a time. While one is in
 ///     flight, a concurrent caller returns the previously cached SUCCESS if the last
 ///     outcome was a success. That value is stale by `ttl` plus the idle gap (nothing
@@ -112,6 +115,7 @@ public:
         std::shared_future<Result> waiting;
         std::shared_ptr<std::promise<Result>> promise;
         Clock::time_point started;
+        std::uint64_t seq = 0;
         std::uint64_t epoch = 0;
         {
             std::lock_guard lk(mu_);
@@ -126,6 +130,7 @@ public:
                 promise = std::make_shared<std::promise<Result>>();
                 inflight_ = promise->get_future().share();
                 started = now;
+                seq = ++read_seq_;
                 epoch = epoch_;
             }
         }
@@ -136,7 +141,7 @@ public:
         // this thread can complete. The guard makes completion unconditional.
         FlightGuard flight{*this, epoch};
         Result r = run_fetch();
-        install(r, started, epoch);
+        install(r, started, seq, epoch);
         flight.fulfil(*promise, r);
         return r;
     }
@@ -145,14 +150,16 @@ public:
     /// result as the cached outcome. Use before LABELLING a push (see the contract).
     [[nodiscard]] Result get_fresh() {
         Clock::time_point started;
+        std::uint64_t seq = 0;
         std::uint64_t epoch = 0;
         {
             std::lock_guard lk(mu_);
             started = clock_();
+            seq = ++read_seq_;
             epoch = epoch_;
         }
         Result r = run_fetch();
-        install(r, started, epoch, /*install_errors=*/false);
+        install(r, started, seq, epoch, /*install_errors=*/false);
         return r;
     }
 
@@ -181,7 +188,8 @@ private:
     struct Entry {
         Result result;
         Clock::time_point at;       // freshness reference (see install())
-        Clock::time_point started;  // when the read began; orders competing installs
+        Clock::time_point started;  // when the read began (freshness reference of a success)
+        std::uint64_t seq{0};       // read-start order under mu_; orders competing installs
     };
 
     bool fresh_locked(const Entry& e, Clock::time_point now) const {
@@ -218,18 +226,18 @@ private:
     }
 
     // Record `r` as the cached outcome unless an invalidate() ran since `epoch`, or the held
-    // entry came from a read that started later than this one (monotonic install), or `r` is
-    // an error and `install_errors` is false. Never throws: a failure here only means the
-    // next get() fetches again.
-    void install(const Result& r, Clock::time_point started, std::uint64_t epoch,
-                 bool install_errors = true) noexcept {
+    // entry came from a read that started later than this one (monotonic install, by `seq`),
+    // or `r` is an error and `install_errors` is false. Never throws: a failure here only
+    // means the next get() fetches again.
+    void install(const Result& r, Clock::time_point started, std::uint64_t seq,
+                 std::uint64_t epoch, bool install_errors = true) noexcept {
         try {
             std::lock_guard lk(mu_);
             if (epoch != epoch_)
                 return;
             if (!r.has_value() && !install_errors)
                 return;
-            if (entry_ && started < entry_->started)
+            if (entry_ && seq < entry_->seq)
                 return;  // an older read finishing last must not overwrite a newer one
             if (r.has_value()) {
                 if (last_served_ && *r < *last_served_)
@@ -239,8 +247,8 @@ private:
             // A success ages from when its read STARTED (conservative). An error ages from
             // when the read FINISHED: a slow failing read (a 2 s lease timeout) would
             // otherwise be stored already past `negative_ttl` and every heartbeat would
-            // re-run it, defeating the negative cache. `started` alone orders installs.
-            entry_ = Entry{r, r.has_value() ? started : clock_(), started};
+            // re-run it, defeating the negative cache. `seq` alone orders installs.
+            entry_ = Entry{r, r.has_value() ? started : clock_(), started, seq};
         } catch (...) {
             try {
                 std::lock_guard lk(mu_);
@@ -310,6 +318,7 @@ private:
     std::shared_future<Result> inflight_;  // valid() iff a fetch is running
     std::optional<std::uint64_t> last_served_;
     std::uint64_t epoch_{0};
+    std::uint64_t read_seq_{0};  // last read-start sequence handed out (under mu_)
     std::uint64_t fetches_{0};
     std::uint64_t regressions_{0};
 };

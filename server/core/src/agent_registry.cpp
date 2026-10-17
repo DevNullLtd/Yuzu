@@ -1714,31 +1714,28 @@ AgentRegistry::ids_with_os(const std::unordered_set<std::string>& os_values) con
 }
 
 // Collect every from_result_set:<id> reference in a scope expression so the
-// resolver can preload owner-checked membership once per set. The scope AST is
-// a variant of Condition | Combinator (scope_engine.hpp); walk it recursively.
+// resolver can preload owner-checked membership once per set. It goes through
+// the shared yuzu::scope::collect_attribute_suffixes, which decodes the
+// synthetic encodings first: `LEN(from_result_set:x)` and
+// `STARTSWITH(from_result_set:x, p)` carry the attributes `__len:from_result_set:x`
+// and `__startswith:from_result_set:x`, and eval_condition resolves the decoded
+// `from_result_set:x`. A collector that matched the raw attribute would miss
+// those forms, skip both the unresolvable abort and the owner check, and let the
+// empty value be inverted by NOT into membership.
 static void collect_result_set_ids(const yuzu::scope::Expression& expr,
                                    std::vector<std::string>& out) {
-    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
-        if (cond->attribute.starts_with("from_result_set:"))
-            out.push_back(cond->attribute.substr(16));
-    } else if (const auto* comb =
-                   std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
-        if (*comb)
-            for (const auto& child : (*comb)->children)
-                collect_result_set_ids(child, out);
-    }
+    yuzu::scope::collect_attribute_suffixes(expr, "from_result_set:", out);
 }
 
-// props.<key> and tag:<key> collection both use the shared
+// props.<key> and tag:<key> collection use the same shared
 // yuzu::scope::collect_attribute_suffixes (scope_engine.hpp) — added with
 // ADR-0050 for exactly this preload pattern. Folding props onto it (Gate 7,
 // governance DSL-3/arch-F1) also FIXED a pre-existing defect: the local
 // collector this replaced matched the raw attribute, so `LEN(props.x)` /
 // `STARTSWITH(props.x, …)` (synthetic `__len:`/`__startswith:` encodings)
 // never contributed `x` to the preload and those atoms resolved against
-// nothing. collect_result_set_ids above stays local — it is shape-different
-// (id extraction, not a prefix-suffix walk) and from_result_set: has no
-// synthetic interplay worth encoding.
+// nothing. from_result_set: has the same synthetic forms and goes through the
+// same collector above.
 
 namespace {
 

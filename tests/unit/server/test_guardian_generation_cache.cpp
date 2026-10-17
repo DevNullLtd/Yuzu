@@ -499,6 +499,37 @@ TEST_CASE("GuardianGenerationCache: an older read finishing last does not overwr
     CHECK(c.regressions() == 0);  // the older, lower read is not a store reset
 }
 
+TEST_CASE("GuardianGenerationCache: reads that start in the same clock tick still install in "
+          "start order",
+          "[guardian][generation_cache]") {
+    ManualClock clk;  // frozen: both reads see exactly the same time point
+    Event older_entered, release_older;
+    std::atomic<int> calls{0};
+    GuardianGenerationCache c(
+        [&]() -> GuardianGenerationCache::Result {
+            if (calls.fetch_add(1) == 0) {  // the older read: blocks, then reports the LOWER value
+                older_entered.set();
+                release_older.wait();
+                return 7;
+            }
+            return 8;
+        },
+        {}, clk.fn());
+
+    std::uint64_t older = 0;
+    std::jthread t([&] { older = c.get_fresh().value_or(0); });
+    REQUIRE(older_entered.wait());
+    // No clk.advance(): the second read starts in the same tick as the first. Ordering by
+    // time point alone treats them as equal and lets the older one overwrite the newer.
+    REQUIRE(c.get_fresh().value() == 8);
+    release_older.set();
+    t.join();
+
+    CHECK(older == 7);            // its own caller still gets what it read
+    CHECK(c.get().value() == 8);  // but the cache holds the read that started second
+    CHECK(calls.load() == 2);
+}
+
 TEST_CASE("GuardianGenerationCache: a newer read that returns a lower value is a store reset",
           "[guardian][generation_cache]") {
     ManualClock clk;
