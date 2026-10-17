@@ -354,16 +354,43 @@ drain_pending(Deadline) ->
 %% @private End every local session through its agent process and wait, until
 %% Deadline, for the processes to finish (each casts its DISCONNECTED before it
 %% exits). One that is still running at the deadline is left to the tree.
+%%
+%% The agents are the routing table's AND the agent supervisor's children: an
+%% agent still inside its registry call (the `registering' state) is not in the
+%% table yet, and ending only the table's agents would let it register, announce
+%% CONNECTED and never send its DISCONNECTED. It postpones the disconnect until
+%% its registration is done, then ends like the others. A second pass ends any
+%% agent started meanwhile (a Subscribe for a session registered just before the
+%% stop); at most three passes.
 end_sessions(Deadline) ->
-    Pids = local_agent_pids(),
-    Mons = [{erlang:monitor(process, P), P} || P <- Pids],
-    [yuzu_gw_agent:disconnect(P) || P <- Pids],
-    Left = await_down(maps:from_list(Mons), Deadline),
+    {Ended, Left} = end_sessions(Deadline, #{}, 3),
     case Left of
-        0 -> logger:info("Gateway stop: ended ~b agent session(s)", [length(Pids)]);
+        0 -> logger:info("Gateway stop: ended ~b agent session(s)", [Ended]);
         _ -> logger:warning("Gateway stop: ~b of ~b agent session(s) had not ended by the "
-                            "deadline", [Left, length(Pids)])
+                            "deadline", [Left, Ended])
     end.
+
+end_sessions(_Deadline, Seen, 0) ->
+    {map_size(Seen), 0};
+end_sessions(Deadline, Seen, Passes) ->
+    case [P || P <- agent_pids(), not is_map_key(P, Seen)] of
+        [] ->
+            {map_size(Seen), 0};
+        Pids ->
+            Mons = [{erlang:monitor(process, P), P} || P <- Pids],
+            [yuzu_gw_agent:disconnect(P) || P <- Pids],
+            Seen1 = maps:merge(Seen, maps:from_keys(Pids, true)),
+            case await_down(maps:from_list(Mons), Deadline) of
+                0    -> end_sessions(Deadline, Seen1, Passes - 1);
+                Left -> {map_size(Seen1), Left}
+            end
+    end.
+
+agent_pids() ->
+    Children = try supervisor:which_children(yuzu_gw_agent_sup)
+               catch _:_ -> []
+               end,
+    lists:usort(local_agent_pids() ++ [P || {_, P, _, _} <- Children, is_pid(P)]).
 
 await_down(Mons, _Deadline) when map_size(Mons) =:= 0 ->
     0;

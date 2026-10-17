@@ -28,7 +28,9 @@ planned_stop_test_() ->
      [{timeout, 120, {"application stop with 100 sessions delivers 100 DISCONNECTED notices "
                       "before it returns", fun stop_delivers_every_disconnected/0}},
       {timeout, 120, {"a server that never answers does not hold the stop past the flush "
-                      "budget; the rest is counted", fun stop_is_bounded_by_the_budget/0}}]}.
+                      "budget; the rest is counted", fun stop_is_bounded_by_the_budget/0}},
+      {timeout, 120, {"an agent still registering when the stop begins is ended too: its "
+                      "CONNECTED is followed by its DISCONNECTED", fun registering_agent_is_ended/0}}]}.
 
 setup() ->
     _ = application:stop(yuzu_gw),
@@ -111,6 +113,41 @@ stop_is_bounded_by_the_budget() ->
         ets:insert(?TAB, {release_all}),
         [P ! go || {blocked, P} <- ets:tab2list(?TAB)]
     end.
+
+%% An agent whose registration is still running (the registry is busy) when the
+%% stop begins is not in the routing table yet. It must still be ended: once its
+%% registration completes it announces CONNECTED, and the stop must then send
+%% its DISCONNECTED too, not leave a session the server keeps as online.
+registering_agent_is_ended() ->
+    mock(fun(_) -> ok end),
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    [Live] = start_agents(1),
+    ok = wait_until(fun() -> length(sent('CONNECTED')) >= 1 end, 10000),
+    Reg = whereis(yuzu_gw_registry),
+    ok = sys:suspend(Reg),
+    Late = <<"stop-agent-late">>,
+    Starter = spawn(fun() ->
+                        Stream = spawn(fun() -> receive _ -> ok after 60000 -> ok end end),
+                        _ = yuzu_gw_agent_sup:start_agent(
+                              #{agent_id => Late, agent_info => #{agent_id => Late},
+                                stream_pid => Stream, peer_addr => <<"127.0.0.1">>,
+                                session_id => <<"stop-session-late">>,
+                                register_req => #{info => #{agent_id => Late}}})
+                    end),
+    %% The late agent exists and is inside its registry call.
+    ok = wait_until(fun() -> length(supervisor:which_children(yuzu_gw_agent_sup)) >= 2 end, 5000),
+    Stopper = spawn(fun() -> ok = application:stop(yuzu_gw) end),
+    StopMon = monitor(process, Stopper),
+    timer:sleep(300),
+    %% A stop that does not wait for the registering agent has already taken
+    %% the tree (and the suspended registry) down by now.
+    catch sys:resume(Reg),
+    receive {'DOWN', StopMon, process, Stopper, R} -> ?assertEqual(normal, R)
+    after 60000 -> error(stop_hung)
+    end,
+    _ = Starter,
+    ?assertEqual(lists:sort([Live, Late]), lists:usort(sent('DISCONNECTED'))),
+    ?assert(lists:member(Late, sent('CONNECTED'))).
 
 %%--------------------------------------------------------------------
 %% Plumbing
