@@ -30,6 +30,10 @@ struct AutoApproveRule {
 /// callers must reject, never default to a (broader) type.
 std::optional<AutoApproveRuleType> parse_auto_approve_rule_type(std::string_view s);
 
+/// The machine name of a rule type (`hostname_glob`, ...): what the policy file stores and
+/// `parse_auto_approve_rule_type` accepts. Not the wording the dashboard shows.
+std::string rule_type_to_string(AutoApproveRuleType t);
+
 /// Upper bounds on a persisted rule's text: a hostname is at most 253 characters, and a
 /// label is an admin note. Without them a near-4 MiB value would be stored and then
 /// copied and matched under the engine mutex on every Register.
@@ -54,9 +58,21 @@ struct ApprovalContext {
     std::string attestation_provider;  // From RegisterRequest
 };
 
+/// What a caller saw at an index. The dashboard addresses a rule by list position, which shifts
+/// under a concurrent edit, so a view may state the rule it meant. Every field that is set must
+/// match the rule now at that index, checked under the engine lock; unset fields are not
+/// checked (a caller that states nothing keeps the by-index behaviour).
+struct RuleExpectation {
+    std::optional<AutoApproveRuleType> type;
+    std::optional<std::string> value;
+    std::optional<bool> enabled;
+};
+
 /// Outcome of a mutation that targets one rule by index.
 struct RuleEdit {
-    enum class Status { ok, not_found, persist_failed };
+    /// `mismatch`: a rule exists at the index but is not the one the caller expected; nothing
+    /// changed.
+    enum class Status { ok, not_found, persist_failed, mismatch };
     Status status{Status::not_found};
     AutoApproveRule rule; ///< the rule acted on (removed / toggled) - read under the same lock
 };
@@ -82,8 +98,9 @@ public:
     /// disk first and only a successful write changes the in-memory policy, so a failed
     /// persist leaves memory and file as they were.
     bool add_rule(const AutoApproveRule& rule);
-    RuleEdit remove_rule(size_t index);
-    RuleEdit toggle_rule(size_t index); ///< flips `enabled`; `rule` is the post-toggle state
+    RuleEdit remove_rule(size_t index, const RuleExpectation& expect = {});
+    /// Flips `enabled`; `rule` is the post-toggle state.
+    RuleEdit toggle_rule(size_t index, const RuleExpectation& expect = {});
 
     /// Get all rules (for admin UI).
     std::vector<AutoApproveRule> list_rules() const;

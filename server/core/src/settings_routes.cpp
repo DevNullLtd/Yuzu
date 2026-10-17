@@ -16,6 +16,7 @@
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "enrolment_render.hpp" // enrolment token / pending / auto-approve fragment markup (pure)
 #include "compliance_fragments.hpp" // pure renderer for the tag-compliance table
 #include "config_secret_keys.hpp" // is_exactly_redaction_placeholder in the OIDC handler
 #include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
@@ -832,12 +833,12 @@ namespace {
 constexpr const char* kMfaCredentialChangedMsg =
     "Your password changed during enrolment — sign in again";
 
-// Shown INSTEAD of a table when the enrollment store cannot be read (WS-6 6.2):
-// an outage must never render as an empty list ("No tokens created") — that
-// would tell an operator there is nothing to act on when the truth is unknown.
-constexpr const char* kEnrollmentStoreUnavailableHtml =
-    "<div class=\"feedback-error\">Enrollment store unavailable - state unknown. "
-    "Retry shortly.</div>";
+/// An enrolment secret, or a list that sits next to one, must not be stored by a cache
+/// or replayed from history. `Vary: Cookie` keeps a shared cache from crossing operators.
+void no_store_private(httplib::Response& res) {
+    res.set_header("Cache-Control", "no-store, private");
+    res.set_header("Vary", "Cookie");
+}
 
 /// `count=N ids=a,b,c` for a bulk enrollment audit row: the count is the size of
 /// the RETURNING set (authoritative), the id list is capped so a fleet-wide bulk
@@ -859,127 +860,12 @@ std::string bulk_audit_detail(const std::vector<std::string>& ids) {
 }
 } // namespace
 
-bool enrollment_token_expired(std::chrono::system_clock::time_point expires_at,
-                              std::chrono::system_clock::time_point now) noexcept {
-    return expires_at != (std::chrono::system_clock::time_point::max)() && expires_at <= now;
-}
-
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
-    // The reveal block is built first: a freshly minted raw token is shown ONCE, so
-    // it must survive even when the follow-up list read fails.
-    std::string reveal;
-    if (!new_raw_token.empty()) {
-        reveal = "<div class=\"token-reveal\">"
-                 "  <div class=\"token-reveal-header\">"
-                 "    COPY THIS TOKEN NOW — it will not be shown again"
-                 "  </div>"
-                 "  <code>" +
-                 html_escape(new_raw_token) +
-                 "</code><br>"
-                 "  <button class=\"btn btn-secondary btn-sm\" "
-                 "style=\"margin-top:0.5rem\" "
-                 "          data-copy-token>Copy to Clipboard</button>"
-                 "</div>";
-    }
+    // Markup is a pure function (enrolment_render.cpp). A freshly minted raw token is shown
+    // ONCE, so it is passed through even when the list read failed.
     auto tokens_result = auth_mgr_->list_enrollment_tokens();
-    if (!tokens_result)
-        return std::string(kEnrollmentStoreUnavailableHtml) + reveal;
-    const auto& tokens = *tokens_result;
-    const auto now = std::chrono::system_clock::now();
-    std::string html = "<table class=\"user-table\">"
-                       "  <thead><tr><th>ID</th><th>Label</th><th>Uses</th>"
-                       "  <th>Expires</th><th>Status</th><th></th></tr></thead>"
-                       "  <tbody>";
-
-    if (tokens.empty()) {
-        html += "<tr><td colspan=\"6\" class=\"muted\">No tokens created</td></tr>";
-    } else {
-        for (const auto& t : tokens) {
-            auto uses = t.max_uses == 0
-                            ? std::to_string(t.use_count) + " / \xe2\x88\x9e"
-                            : std::to_string(t.use_count) + " / " + std::to_string(t.max_uses);
-
-            std::string exp;
-            if (t.expires_at == (std::chrono::system_clock::time_point::max)()) {
-                exp = "Never";
-            } else {
-                auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                                 t.expires_at.time_since_epoch())
-                                 .count();
-                exp = std::to_string(epoch);
-            }
-
-            std::string status_cls, status_txt;
-            if (t.revoked) {
-                status_cls = "role-user";
-                status_txt = "Revoked";
-            } else if (t.max_uses > 0 && t.use_count >= t.max_uses) {
-                status_cls = "role-user";
-                status_txt = "Exhausted";
-            } else if (enrollment_token_expired(t.expires_at, now)) {
-                status_cls = "role-user";
-                status_txt = "Expired";
-            } else {
-                status_cls = "role-admin";
-                status_txt = "Active";
-            }
-
-            html += "<tr><td><code>" + html_escape(t.token_id) +
-                    "</code></td>"
-                    "<td>" +
-                    html_escape(t.label) +
-                    "</td>"
-                    "<td>" +
-                    uses +
-                    "</td>"
-                    "<td>" +
-                    exp +
-                    "</td>"
-                    "<td><span class=\"role-badge " +
-                    status_cls + "\">" + status_txt +
-                    "</span></td>"
-                    "<td>";
-            if (!t.revoked) {
-                html += "<button class=\"btn btn-danger\" "
-                        "hx-delete=\"/api/settings/enrollment-tokens/" +
-                        html_escape(t.token_id) +
-                        "\" "
-                        "hx-target=\"#token-section\" hx-swap=\"innerHTML\" "
-                        "hx-confirm=\"Revoke token &quot;" +
-                        html_escape(t.token_id) +
-                        "&quot;? Agents using this token will no longer be able to enroll.\""
-                        ">Revoke</button>";
-            }
-            html += "</td></tr>";
-        }
-    }
-
-    html += "  </tbody>"
-            "</table>"
-            "<form class=\"add-user-form\" hx-post=\"/api/settings/enrollment-tokens\" "
-            "      hx-target=\"#token-section\" hx-swap=\"innerHTML\">"
-            "  <div class=\"mini-field\">"
-            "    <label>Label</label>"
-            "    <input type=\"text\" name=\"label\" placeholder=\"e.g. NYC rollout\" "
-            "style=\"width:160px\">"
-            "  </div>"
-            "  <div class=\"mini-field\">"
-            "    <label>Max Uses</label>"
-            "    <input type=\"text\" name=\"max_uses\" placeholder=\"0 = unlimited\" "
-            "style=\"width:120px\">"
-            "  </div>"
-            "  <div class=\"mini-field\">"
-            "    <label>TTL (hours)</label>"
-            "    <input type=\"text\" name=\"ttl_hours\" placeholder=\"0 = never\" "
-            "style=\"width:120px\">"
-            "  </div>"
-            "  <button class=\"btn btn-primary\" type=\"submit\">Generate Token</button>"
-            "</form>"
-            "<div class=\"feedback\" id=\"token-feedback\"></div>";
-
-    html += reveal;
-
-    return html;
+    return enrolment::render_tokens(tokens_result ? &*tokens_result : nullptr, new_raw_token,
+                                    std::chrono::system_clock::now());
 }
 
 std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_raw_token,
@@ -988,19 +874,13 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
         return "<span class=\"muted\">API token store unavailable.</span>";
     }
 
+    // The shared chrono formatter, not gmtime/strftime: an expiry past year 3000 made MSVC's
+    // gmtime_s fail and strftime terminate the process, and POSIX printed a bogus date. A value
+    // outside 1970..9999 reads "out of range".
     auto fmt_epoch = [](int64_t epoch) -> std::string {
         if (epoch == 0)
             return "Never";
-        auto tt = static_cast<std::time_t>(epoch);
-        std::tm tm_buf{};
-#ifdef _WIN32
-        gmtime_s(&tm_buf, &tt);
-#else
-        gmtime_r(&tt, &tm_buf);
-#endif
-        char buf[32]{};
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-        return std::string(buf) + " UTC";
+        return enrolment::utc_stamp_epoch_secs(epoch);
     };
 
     // Scope by caller principal for non-admin sessions. list_tokens already
@@ -1141,19 +1021,13 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                "(not configured — requires PostgreSQL, design doc §3.1).</span>";
     }
 
+    // The shared chrono formatter, not gmtime/strftime: an expiry past year 3000 made MSVC's
+    // gmtime_s fail and strftime terminate the process, and POSIX printed a bogus date. A value
+    // outside 1970..9999 reads "out of range".
     auto fmt_epoch = [](int64_t epoch) -> std::string {
         if (epoch == 0)
             return "—";
-        auto tt = static_cast<std::time_t>(epoch);
-        std::tm tm_buf{};
-#ifdef _WIN32
-        gmtime_s(&tm_buf, &tt);
-#else
-        gmtime_r(&tt, &tm_buf);
-#endif
-        char buf[32]{};
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-        return std::string(buf) + " UTC";
+        return enrolment::utc_stamp_epoch_secs(epoch);
     };
 
     // Admin/auditor list surface — every engine principal, any lifecycle
@@ -1400,16 +1274,7 @@ namespace {
 std::string ar_fmt_epoch_ms(int64_t epoch_ms) {
     if (epoch_ms == 0)
         return "n/a";
-    auto tt = static_cast<std::time_t>(epoch_ms / 1000);
-    std::tm tm_buf{};
-#ifdef _WIN32
-    gmtime_s(&tm_buf, &tt);
-#else
-    gmtime_r(&tt, &tm_buf);
-#endif
-    char buf[32]{};
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-    return std::string(buf) + " UTC";
+    return enrolment::utc_stamp_epoch_secs(epoch_ms / 1000);
 }
 
 /// The self-contained JS helper block for the Access Reviews fragment's
@@ -1912,230 +1777,13 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
 }
 
 std::string SettingsRoutes::render_pending_fragment() {
-    auto all_agents_result = auth_mgr_->list_pending_agents();
-    if (!all_agents_result)
-        return kEnrollmentStoreUnavailableHtml;
-    auto all_agents = std::move(*all_agents_result);
-    // Filter out enrolled (approved) agents — they don't need admin attention.
-    // Only show pending and denied entries in the approval queue.
-    std::vector<auth::PendingAgent> agents;
-    for (auto& a : all_agents) {
-        if (a.status != auth::PendingStatus::approved) {
-            agents.push_back(std::move(a));
-        }
-    }
-    std::string html = "<table class=\"user-table\">"
-                       "  <thead><tr><th>Agent ID</th><th>Hostname</th><th>OS</th>"
-                       "  <th>Version</th><th>Status</th><th></th></tr></thead>"
-                       "  <tbody>";
-
-    if (agents.empty()) {
-        html += "<tr><td colspan=\"6\" class=\"muted\">No pending agents</td></tr>";
-    } else {
-        for (const auto& a : agents) {
-            auto status_str = auth::pending_status_to_string(a.status);
-            std::string status_cls;
-            if (a.status == auth::PendingStatus::approved) {
-                status_cls = "role-ok";
-            } else if (a.status == auth::PendingStatus::denied) {
-                status_cls = "role-bad";
-            } else {
-                status_cls = "role-warn";
-            }
-
-            auto short_id = a.agent_id.size() > 12 ? a.agent_id.substr(0, 12) + "..." : a.agent_id;
-
-            html += "<tr>"
-                    "<td><code>" +
-                    html_escape(short_id) +
-                    "</code></td>"
-                    "<td>" +
-                    html_escape(a.hostname) +
-                    "</td>"
-                    "<td>" +
-                    html_escape(a.os) + " " + html_escape(a.arch) +
-                    "</td>"
-                    "<td>" +
-                    html_escape(a.agent_version) +
-                    "</td>"
-                    "<td><span class=\"role-badge " +
-                    status_cls + "\">" + html_escape(status_str) +
-                    "</span></td>"
-                    "<td>";
-
-            if (a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id)) {
-                // The id is empty, `.` or `..`: a browser collapses a dot-only
-                // path segment, so no per-row URL can be built for it. Offer no
-                // row action (the bulk buttons below act on the whole queue and show for it).
-                html += "<span class=\"muted\">identifier not supported for row actions</span>";
-            } else if (a.status == auth::PendingStatus::pending) {
-                // The id is agent-supplied: percent-encode it as ONE path segment
-                // (html_escape alone leaves `/`, `?`, `#` and `.` live in the URL).
-                const std::string seg = url_path_segment(a.agent_id);
-                html += "<button class=\"btn btn-primary\" "
-                        "style=\"margin-right:0.3rem\" "
-                        "hx-post=\"/api/settings/pending-agents/" +
-                        seg +
-                        "/approve\" "
-                        "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
-                        ">Approve</button>"
-                        "<button class=\"btn btn-danger\" "
-                        "hx-post=\"/api/settings/pending-agents/" +
-                        seg +
-                        "/deny\" "
-                        "hx-target=\"#pending-section\" hx-swap=\"innerHTML\" "
-                        "hx-confirm=\"Deny agent enrollment?\""
-                        ">Deny</button>";
-            } else {
-                // This branch only ever reaches a `denied` row (approved rows are
-                // filtered out above, line ~1764). WS-6 6.2 (governance Finding 1)
-                // made removal of a denied row permanently refused (409) — the
-                // denial is a durable record and removing it would silently
-                // reverse the decision with no audit trail. There is no other
-                // action to offer here, so no button renders; the row stays
-                // visible in the queue as the durable evidence of the denial.
-                html += "<span class=\"muted\">denial recorded</span>";
-            }
-
-            html += "</td></tr>";
-        }
-    }
-
-    html += "  </tbody>"
-            "</table>";
-
-    auto pending_count = std::count_if(agents.begin(), agents.end(), [](const auto& a) {
-        return a.status == auth::PendingStatus::pending;
-    });
-    // The bulk bar also shows for a lone pending row whose id cannot be addressed
-    // per-row, so such a row is never left with no action at all.
-    const bool has_unaddressable_pending =
-        std::any_of(agents.begin(), agents.end(), [](const auto& a) {
-            return a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id);
-        });
-    if (pending_count > 1 || (pending_count == 1 && has_unaddressable_pending)) {
-        html += "<div style=\"margin-top:0.75rem;display:flex;gap:0.5rem\">"
-                "<button class=\"btn btn-primary\" "
-                "onclick=\"twoClickConfirm(this, function() { "
-                "htmx.ajax('POST','/api/settings/pending-agents/bulk-approve',"
-                "{target:'#pending-section',swap:'innerHTML'}); })\">"
-                "Approve All (" +
-                std::to_string(pending_count) +
-                ")</button>"
-                "<button class=\"btn btn-danger\" "
-                "onclick=\"twoClickConfirm(this, function() { "
-                "htmx.ajax('POST','/api/settings/pending-agents/bulk-deny',"
-                "{target:'#pending-section',swap:'innerHTML'}); })\">"
-                "Deny All (" +
-                std::to_string(pending_count) +
-                ")</button>"
-                "</div>";
-    }
-
-    html += "<div class=\"feedback\" id=\"pending-feedback\"></div>";
-
-    return html;
+    auto agents = auth_mgr_->list_pending_agents();
+    return enrolment::render_pending(agents ? &*agents : nullptr);
 }
 
 std::string SettingsRoutes::render_auto_approve_fragment() {
-    auto rules = auto_approve_->list_rules();
-    std::string html;
-
-    html += "<div class=\"form-row\" style=\"margin-bottom:1rem\">"
-            "<label>Match mode</label>"
-            "<select name=\"mode\" "
-            "hx-post=\"/api/settings/auto-approve/mode\" "
-            "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
-            "style=\"flex:0 0 auto;width:180px\">"
-            "<option value=\"any\"" +
-            std::string(auto_approve_->require_all() ? "" : " selected") +
-            ">Any rule (first match)</option>"
-            "<option value=\"all\"" +
-            std::string(auto_approve_->require_all() ? " selected" : "") +
-            ">All rules must match</option>"
-            "</select>"
-            "</div>";
-
-    html += "<table class=\"user-table\">"
-            "<thead><tr><th>Type</th><th>Value</th><th>Label</th>"
-            "<th>Enabled</th><th></th></tr></thead><tbody>";
-
-    if (rules.empty()) {
-        html += "<tr><td colspan=\"5\" class=\"muted\">No auto-approve rules "
-                "configured</td></tr>";
-    } else {
-        auto type_str = [](auth::AutoApproveRuleType t) -> std::string {
-            switch (t) {
-            case auth::AutoApproveRuleType::trusted_ca:
-                return "Trusted CA";
-            case auth::AutoApproveRuleType::hostname_glob:
-                return "Hostname Glob";
-            case auth::AutoApproveRuleType::ip_subnet:
-                return "IP Subnet";
-            case auth::AutoApproveRuleType::cloud_provider:
-                return "Cloud Provider";
-            }
-            return "Unknown";
-        };
-
-        for (size_t i = 0; i < rules.size(); ++i) {
-            const auto& r = rules[i];
-            auto idx = std::to_string(i);
-            html += "<tr>"
-                    "<td>" +
-                    html_escape(type_str(r.type)) +
-                    "</td>"
-                    "<td><code>" +
-                    html_escape(r.value) +
-                    "</code></td>"
-                    "<td>" +
-                    html_escape(r.label) +
-                    "</td>"
-                    "<td>"
-                    "<label class=\"toggle\">"
-                    "<input type=\"checkbox\"" +
-                    std::string(r.enabled ? " checked" : "") +
-                    " hx-post=\"/api/settings/auto-approve/" + idx +
-                    "/toggle\" "
-                    "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\">"
-                    "<span class=\"slider\"></span></label></td>"
-                    "<td><button class=\"btn btn-danger\" "
-                    "hx-delete=\"/api/settings/auto-approve/" +
-                    idx +
-                    "\" "
-                    "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Remove this auto-approve rule?\" "
-                    ">Remove</button></td></tr>";
-        }
-    }
-
-    html += "</tbody></table>";
-
-    html += "<div class=\"add-user-form\">"
-            "<form hx-post=\"/api/settings/auto-approve\" "
-            "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
-            "style=\"display:flex;gap:0.5rem;align-items:flex-end;width:100%\">"
-            "<div class=\"mini-field\">"
-            "<label>Type</label>"
-            "<select name=\"type\" style=\"width:140px\">"
-            "<option value=\"hostname_glob\">Hostname Glob</option>"
-            "<option value=\"ip_subnet\">IP Subnet</option>"
-            "<option value=\"trusted_ca\">Trusted CA</option>"
-            "<option value=\"cloud_provider\">Cloud Provider</option>"
-            "</select></div>"
-            "<div class=\"mini-field\" style=\"flex:1\">"
-            "<label>Value</label>"
-            "<input type=\"text\" name=\"value\" placeholder=\"*.prod.example.com\" required>"
-            "</div>"
-            "<div class=\"mini-field\" style=\"flex:1\">"
-            "<label>Label</label>"
-            "<input type=\"text\" name=\"label\" placeholder=\"Production servers\">"
-            "</div>"
-            "<button class=\"btn btn-primary\" type=\"submit\">Add Rule</button>"
-            "</form></div>"
-            "<div class=\"feedback\" id=\"auto-approve-feedback\"></div>";
-
-    return html;
+    return enrolment::render_auto_approve(auto_approve_->list_rules(),
+                                          auto_approve_->require_all());
 }
 
 std::string SettingsRoutes::render_tag_compliance_fragment() {
@@ -3410,21 +3058,23 @@ void SettingsRoutes::register_routes(
 
     sink.Get("/fragments/settings/tokens",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_admin(req, res))
                      return;
+                 no_store_private(res);
                  res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
              });
 
     sink.Get("/fragments/settings/pending",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_admin(req, res))
                      return;
+                 no_store_private(res);
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
     sink.Get("/fragments/settings/auto-approve",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_admin(req, res))
                      return;
                  res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
              });
@@ -5556,6 +5206,7 @@ void SettingsRoutes::register_routes(
                       " ttl_s=" + std::to_string(ttl.count()) + " label=" + label);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
+        no_store_private(res); // the raw token is in this body
         res.set_content(render_tokens_fragment(created->raw_token), "text/html; charset=utf-8");
     });
 
@@ -5578,12 +5229,16 @@ void SettingsRoutes::register_routes(
             res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             return;
         }
-        // An unknown token_id is a no-op the operator should be able to see.
+        // An unknown token_id is a no-op the operator must be able to see: the audit row says
+        // denied, so the toast must not say revoked.
         audit_fn_(req, "enrollment.token_revoke", *revoked ? "success" : "denied",
                   "EnrollmentToken", token_id,
                   std::string(*revoked ? "" : "token_not_found ") + "by=" + session->username);
-        res.set_header("HX-Trigger",
-                       R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})");
+        res.set_header(
+            "HX-Trigger",
+            *revoked
+                ? R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})"
+                : R"j({"showToast":{"message":"Token not found - nothing revoked (it may have been removed)","level":"warning"}})j");
         res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
     });
 
@@ -5679,6 +5334,7 @@ void SettingsRoutes::register_routes(
                     body = nlohmann::json::object();
                 body["count"] = tokens.size();
                 body["tokens"] = tokens;
+                no_store_private(res);
                 res.set_content(body.dump(), "application/json");
                 return;
             }
@@ -5691,6 +5347,7 @@ void SettingsRoutes::register_routes(
                       " ttl_s=" + std::to_string(ttl.count()) + " label=" + label + " " +
                       bulk_audit_detail(token_ids));
 
+        no_store_private(res); // N raw tokens are in this body
         res.set_content(nlohmann::json({{"count", tokens.size()}, {"tokens", tokens}}).dump(),
                         "application/json");
     });
@@ -6058,70 +5715,73 @@ void SettingsRoutes::register_routes(
         return true;
     };
 
+    // Single-row Approve and Deny share one body. The store answers changed / wrong_status /
+    // not_found, and each is told to the operator: a stale click must never read as success
+    // (the audit row says denied), and an already-decided row is never reversed.
+    auto decide_pending = [this, refuse_unaddressable_agent_id](const httplib::Request& req,
+                                                                httplib::Response& res,
+                                                                bool approve) {
+        if (!admin_fn_(req, res))
+            return;
+        const char* const action = approve ? "enrollment.approve" : "enrollment.deny";
+        const std::string past = approve ? "approved" : "denied";
+        const auto toast = [&](const std::string& message, const char* level) {
+            res.set_header("HX-Trigger", R"({"showToast":{"message":")" + message +
+                                             R"(","level":")" + level + R"("}})");
+        };
+        auto agent_id = req.matches[1].str();
+        auto session = auth_fn_(req, res);
+        if (!session)
+            return;
+        if (refuse_unaddressable_agent_id(req, res, action, agent_id, session->username))
+            return;
+        auto decided = approve ? auth_mgr_->approve_pending_agent(agent_id, session->username)
+                               : auth_mgr_->deny_pending_agent(agent_id, session->username);
+        if (!decided) {
+            const bool bad_input = !is_store_unavailable(decided.error());
+            audit_fn_(req, action, bad_input ? "denied" : "failure", "Agent", agent_id,
+                      "store_error by=" + session->username);
+            res.status = bad_input ? 400 : 503;
+            toast(bad_input ? "Invalid agent id"
+                            : "Enrollment store unavailable - agent NOT " + past,
+                  "error");
+            res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+            return;
+        }
+        switch (*decided) {
+        case auth::PendingTransitionOutcome::changed:
+            audit_fn_(req, action, "success", "Agent", agent_id, "by=" + session->username);
+            toast("Agent " + past, approve ? "success" : "warning");
+            break;
+        case auth::PendingTransitionOutcome::wrong_status:
+            // Refused: the row was already decided (by this admin in another tab, another
+            // admin, or another replica). Acting on it would reverse that decision with no
+            // trail; the store left it untouched. 409, like the Forget route.
+            audit_fn_(req, action, "denied", "Agent", agent_id,
+                      "refused_wrong_status by=" + session->username);
+            res.status = 409;
+            toast("Cannot " + std::string(approve ? "approve" : "deny") +
+                      ": agent has already been approved or denied",
+                  "error");
+            break;
+        case auth::PendingTransitionOutcome::not_found:
+            audit_fn_(req, action, "denied", "Agent", agent_id,
+                      "agent_not_found by=" + session->username);
+            toast("Agent not found - nothing " + past + " (it may have been removed)",
+                  "warning");
+            break;
+        }
+        res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+    };
+
     sink.Post(R"(/api/settings/pending-agents/(.+)/approve)",
-              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
-                  if (!admin_fn_(req, res))
-                      return;
-                  auto agent_id = req.matches[1].str();
-                  auto session = auth_fn_(req, res);
-                  if (!session)
-                      return;
-                  if (refuse_unaddressable_agent_id(req, res, "enrollment.approve", agent_id,
-                                                    session->username))
-                      return;
-                  auto approved = auth_mgr_->approve_pending_agent(agent_id, session->username);
-                  if (!approved) {
-                      const bool bad_input = !is_store_unavailable(approved.error());
-                      audit_fn_(req, "enrollment.approve", bad_input ? "denied" : "failure",
-                                "Agent", agent_id, "store_error by=" + session->username);
-                      res.status = bad_input ? 400 : 503;
-                      res.set_header("HX-Trigger",
-                                     bad_input
-                                         ? R"({"showToast":{"message":"Invalid agent id","level":"error"}})"
-                                         : R"({"showToast":{"message":"Enrollment store unavailable - agent NOT approved","level":"error"}})");
-                      res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
-                      return;
-                  }
-                  audit_fn_(req, "enrollment.approve", *approved ? "success" : "denied", "Agent",
-                            agent_id,
-                            std::string(*approved ? "" : "agent_not_found ") +
-                                "by=" + session->username);
-                  res.set_header("HX-Trigger",
-                                 R"({"showToast":{"message":"Agent approved","level":"success"}})");
-                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+              [decide_pending](const httplib::Request& req, httplib::Response& res) {
+                  decide_pending(req, res, /*approve=*/true);
               });
 
     sink.Post(R"(/api/settings/pending-agents/(.+)/deny)",
-              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
-                  if (!admin_fn_(req, res))
-                      return;
-                  auto agent_id = req.matches[1].str();
-                  auto session = auth_fn_(req, res);
-                  if (!session)
-                      return;
-                  if (refuse_unaddressable_agent_id(req, res, "enrollment.deny", agent_id,
-                                                    session->username))
-                      return;
-                  auto denied = auth_mgr_->deny_pending_agent(agent_id, session->username);
-                  if (!denied) {
-                      const bool bad_input = !is_store_unavailable(denied.error());
-                      audit_fn_(req, "enrollment.deny", bad_input ? "denied" : "failure",
-                                "Agent", agent_id, "store_error by=" + session->username);
-                      res.status = bad_input ? 400 : 503;
-                      res.set_header("HX-Trigger",
-                                     bad_input
-                                         ? R"({"showToast":{"message":"Invalid agent id","level":"error"}})"
-                                         : R"({"showToast":{"message":"Enrollment store unavailable - agent NOT denied","level":"error"}})");
-                      res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
-                      return;
-                  }
-                  audit_fn_(req, "enrollment.deny", *denied ? "success" : "denied", "Agent",
-                            agent_id,
-                            std::string(*denied ? "" : "agent_not_found ") +
-                                "by=" + session->username);
-                  res.set_header("HX-Trigger",
-                                 R"({"showToast":{"message":"Agent denied","level":"warning"}})");
-                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+              [decide_pending](const httplib::Request& req, httplib::Response& res) {
+                  decide_pending(req, res, /*approve=*/false);
               });
 
     sink.Delete(R"(/api/settings/pending-agents/(.+))",
@@ -6256,6 +5916,47 @@ void SettingsRoutes::register_routes(
         // stoul throws on overflow
         return idx_s.size() <= 9 ? static_cast<size_t>(std::stoul(idx_s)) : std::string::npos;
     };
+    // The rule identity a view states with a toggle or remove (hx-vals): `type` and `value`, and
+    // for a toggle the `enabled` state it saw. The list position alone shifts under a concurrent
+    // edit. Every field is optional - a script that sends none keeps the by-index behaviour - and
+    // the engine checks the stated ones against the rule now at that index under its own lock.
+    // A field that is present but malformed cannot be verified: nullopt, refused like a mismatch.
+    auto aa_expectation = [](const httplib::Request& req,
+                             bool with_enabled) -> std::optional<auth::RuleExpectation> {
+        auth::RuleExpectation expect;
+        if (req.has_param("type")) {
+            expect.type = auth::parse_auto_approve_rule_type(req.get_param_value("type"));
+            if (!expect.type)
+                return std::nullopt;
+        }
+        if (req.has_param("value"))
+            expect.value = req.get_param_value("value");
+        if (with_enabled && req.has_param("enabled")) {
+            const auto v = req.get_param_value("enabled");
+            if (v != "0" && v != "1")
+                return std::nullopt;
+            expect.enabled = (v == "1");
+        }
+        return expect;
+    };
+    // True when the caller stated any part of the rule it meant (a view's button always does).
+    auto aa_identity_sent = [](const auth::RuleExpectation& e) {
+        return e.type.has_value() || e.value.has_value() || e.enabled.has_value();
+    };
+    // 409: the rule at that position is no longer the one the operator was looking at, or there
+    // is no rule at that position any more. Nothing changed; the toast says so and the refreshed
+    // list is the fix. `reason` is the audit detail's lead token.
+    auto aa_stale = [this](const httplib::Request& req, httplib::Response& res,
+                           const char* action, const std::string& idx_s, const std::string& by,
+                           const char* reason = "stale_rule_view") {
+        audit_fn_(req, action, "denied", "AutoApproveRule", idx_s,
+                  std::string(reason) + " by=" + by);
+        res.status = 409;
+        res.set_header(
+            "HX-Trigger",
+            R"({"showToast":{"message":"That rule changed since this list was loaded - nothing was changed. Check the list and try again.","level":"warning"}})");
+        res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
+    };
 
     sink.Post("/api/settings/auto-approve",
               [this, origin_safe, aa_refuse, aa_attempt,
@@ -6331,8 +6032,8 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Post(R"(/api/settings/auto-approve/(\d+)/toggle)",
-              [this, origin_safe, aa_attempt, aa_persist_failed, aa_index](
-                  const httplib::Request& req, httplib::Response& res) {
+              [this, origin_safe, aa_attempt, aa_persist_failed, aa_index, aa_expectation,
+               aa_identity_sent, aa_stale](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto session = auth_fn_(req, res);
@@ -6342,21 +6043,39 @@ void SettingsRoutes::register_routes(
                       return;
                   const auto by = audit_token(session->username);
                   const auto idx_s = req.matches[1].str();
+                  const auto expect = aa_expectation(req, /*with_enabled=*/true);
+                  if (!expect) {
+                      aa_stale(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by);
+                      return;
+                  }
                   if (!aa_attempt(req, res, "enrollment.auto_approve.rule_toggle", idx_s,
                                   "by=" + by))
                       return;
                   // The engine toggles and reports the rule it acted on under ONE lock, so the
-                  // audit row can never name a different rule than the one that changed.
-                  const auto edit = auto_approve_->toggle_rule(aa_index(idx_s));
+                  // audit row can never name a different rule than the one that changed, and
+                  // a stated rule identity is verified under that same lock.
+                  const auto edit = auto_approve_->toggle_rule(aa_index(idx_s), *expect);
                   using Status = auth::RuleEdit::Status;
                   if (edit.status == Status::persist_failed) {
                       aa_persist_failed(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by);
                       return;
                   }
+                  if (edit.status == Status::mismatch ||
+                      (edit.status == Status::not_found && aa_identity_sent(*expect))) {
+                      // A view that named a rule whose position no longer exists is as stale as
+                      // one whose position now holds another rule; a caller that named nothing
+                      // keeps the by-index no-op below.
+                      aa_stale(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by,
+                               edit.status == Status::mismatch ? "stale_rule_view"
+                                                               : "rule_not_found");
+                      return;
+                  }
                   if (edit.status == Status::ok) {
                       audit_fn_(req, "enrollment.auto_approve.rule_toggle", "success",
                                 "AutoApproveRule", idx_s,
-                                std::string("enabled=") + (edit.rule.enabled ? "1" : "0") +
+                                "type=" + auth::rule_type_to_string(edit.rule.type) +
+                                    " value=" + audit_token(edit.rule.value) +
+                                    " enabled=" + (edit.rule.enabled ? "1" : "0") +
                                     " by=" + by);
                   } else {
                       audit_fn_(req, "enrollment.auto_approve.rule_toggle", "denied",
@@ -6366,8 +6085,8 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Delete(R"(/api/settings/auto-approve/(\d+))",
-                [this, origin_safe, aa_attempt, aa_persist_failed, aa_index](
-                    const httplib::Request& req, httplib::Response& res) {
+                [this, origin_safe, aa_attempt, aa_persist_failed, aa_index, aa_expectation,
+                 aa_identity_sent, aa_stale](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
                     auto session = auth_fn_(req, res);
@@ -6377,20 +6096,33 @@ void SettingsRoutes::register_routes(
                         return;
                     const auto by = audit_token(session->username);
                     const auto idx_s = req.matches[1].str();
+                    const auto expect = aa_expectation(req, /*with_enabled=*/false);
+                    if (!expect) {
+                        aa_stale(req, res, "enrollment.auto_approve.rule_remove", idx_s, by);
+                        return;
+                    }
                     if (!aa_attempt(req, res, "enrollment.auto_approve.rule_remove", idx_s,
                                     "by=" + by))
                         return;
-                    const auto edit = auto_approve_->remove_rule(aa_index(idx_s));
+                    const auto edit = auto_approve_->remove_rule(aa_index(idx_s), *expect);
                     using Status = auth::RuleEdit::Status;
                     if (edit.status == Status::persist_failed) {
                         aa_persist_failed(req, res, "enrollment.auto_approve.rule_remove", idx_s,
                                           by);
                         return;
                     }
+                    if (edit.status == Status::mismatch ||
+                        (edit.status == Status::not_found && aa_identity_sent(*expect))) {
+                        aa_stale(req, res, "enrollment.auto_approve.rule_remove", idx_s, by,
+                                 edit.status == Status::mismatch ? "stale_rule_view"
+                                                                 : "rule_not_found");
+                        return;
+                    }
                     if (edit.status == Status::ok) {
                         audit_fn_(req, "enrollment.auto_approve.rule_remove", "success",
                                   "AutoApproveRule", idx_s,
-                                  "value=" + audit_token(edit.rule.value) +
+                                  "type=" + auth::rule_type_to_string(edit.rule.type) +
+                                      " value=" + audit_token(edit.rule.value) +
                                       " label=" + audit_token(edit.rule.label) + " by=" + by);
                         spdlog::info("Auto-approve rule {} removed by {}", idx_s, by);
                     } else {

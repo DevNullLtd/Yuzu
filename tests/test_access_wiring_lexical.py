@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Static lexical gate over server/core/src/server.cpp's access::register_access_routes(...) block.
+"""Static lexical gate over server/core/src/server.cpp's production wiring of the Access Users
+page (access::register_access_routes), the Settings enrolment fragments and the Groups page.
 
-The Access route tests stub every dependency, so a permissive admin gate or a swapped account
-source in server.cpp would leave them all green. This gate pins the production wiring:
+The route tests stub every dependency, so a permissive admin gate, a swapped account source or a
+route family that is never installed would leave them all green. This gate pins the production
+wiring.
+
+Access Users (register_access_routes block):
 
   1. `.admin_fn` calls `auth_routes_->probe_admin(req, res)` (the admin decision, denial row
      withheld for cookie sessions only) and never returns a constant.
@@ -10,6 +14,20 @@ source in server.cpp would leave them all green. This gate pins the production w
      `auth_db_->list_users()`; it maps a failure to `std::unexpected`.
   3. The block never reads the in-memory fallback (`AuthManager`, `auth_mgr_`,
      `auth_manager_`) and never returns a literal empty vector as success.
+
+Settings enrolment fragments (settings_routes_ wiring):
+
+  4. `set_read_admin_fn` binds `auth_routes_->probe_admin(req, res)`: the three auto-loading GET
+     fragments (tokens, pending, auto-approve) use the quiet probe so a non-administrator's page
+     view writes no auth.admin_required row per panel (the Users page fix, ef7adec0c).
+  5. `settings_routes_->register_routes(...)` still binds the LOUD `require_admin` as `admin_fn`
+     and never `probe_admin`: every mutating route keeps its denial row.
+
+Groups page (register_groups_routes block):
+
+  6. `groups::register_groups_routes(inline_sink, Deps{.auth_fn = auth_fn})` is called: nothing
+     else installs GET /groups or /static/yuzu-groups.js, and test_groups_page.cpp drives the
+     registrar directly, so a deleted call would leave every unit test green.
 
 `//` comments are stripped and whitespace collapsed before matching. Lexical only: it cannot see
 a relocation that keeps the tokens (review-enforced). The self-test applies in-memory mutations
@@ -33,10 +51,10 @@ def normalise(src):
     return re.sub(r"[ \t\n\r\f\v]+", " ", re.sub(r"//.*", "", src))
 
 
-def block(src):
-    """The balanced-paren text of the register_access_routes( call, or None."""
+def block(src, opener="access::register_access_routes("):
+    """The balanced-paren text of the `opener` call, or None."""
     t = normalise(src)
-    at = t.find("access::register_access_routes(")
+    at = t.find(opener)
     if at < 0:
         return None
     start = t.index("(", at)
@@ -46,6 +64,42 @@ def block(src):
         if depth == 0:
             return t[start:i + 1]
     return None
+
+
+def settings_problems(src):
+    out = []
+    rd = block(src, "settings_routes_->set_read_admin_fn(")
+    if rd is None:
+        out.append("server.cpp no longer calls settings_routes_->set_read_admin_fn( "
+                   "(the enrolment GET fragments lose their quiet probe)")
+    elif "return auth_routes_->probe_admin(req, res);" not in rd:
+        out.append("settings read_admin_fn no longer returns auth_routes_->probe_admin(req, res)")
+    elif re.search(r"return (true|false)|require_admin", rd):
+        out.append("settings read_admin_fn returns a constant or the loud gate")
+    reg = block(src, "settings_routes_->register_routes(")
+    if reg is None:
+        out.append("server.cpp no longer calls settings_routes_->register_routes(")
+    else:
+        if "return require_admin(req, res);" not in reg:
+            out.append("settings register_routes no longer binds the loud require_admin as admin_fn "
+                       "(mutating routes lose their denial row)")
+        if "probe_admin" in reg:
+            out.append("settings register_routes binds probe_admin: mutating routes must stay loud")
+    return out
+
+
+def groups_problems(src):
+    g = block(src, "groups::register_groups_routes(")
+    if g is None:
+        return ["server.cpp no longer calls groups::register_groups_routes( "
+                "(GET /groups and /static/yuzu-groups.js are not installed)"]
+    out = []
+    if not re.match(r"\( ?inline_sink, ", g):
+        out.append("groups register_groups_routes( is no longer installed on inline_sink "
+                   "(the shared route seam)")
+    if "Deps{ .auth_fn = auth_fn" not in g and "Deps{.auth_fn = auth_fn" not in g:
+        out.append("groups register_groups_routes( no longer binds Deps{.auth_fn = auth_fn}")
+    return out
 
 
 def problems(src):
@@ -74,7 +128,7 @@ def problems(src):
         out.append("access block reads the in-memory AuthManager fallback")
     if re.search(r"return (std::vector<auth::UserEntry>\{\}|\{\});", b):
         out.append("access block returns a literal empty list as success")
-    return out
+    return out + settings_problems(src) + groups_problems(src)
 
 
 # (pattern, replacement, expected substring of the first problem)
@@ -89,6 +143,20 @@ MUTATIONS = [
      "AuthDB failure"),
     (r"yuzu::server::access::register_access_routes\(", "yuzu::server::access::register_access_route(",
      "register_access_routes"),
+    # Settings enrolment fragments: the quiet probe is bound ...
+    (r"(set_read_admin_fn\(\s*\[this\]\(const httplib::Request& req, httplib::Response& res\) \{\s*)"
+     r"return auth_routes_->probe_admin\(req, res\);", r"\1return true;", "read_admin_fn"),
+    (r"settings_routes_->set_read_admin_fn\(", "settings_routes_->set_read_admin_fn_gone(",
+     "set_read_admin_fn"),
+    # ... and the mutating routes keep the loud gate.
+    (r"(\[this\]\(const httplib::Request& req, httplib::Response& res\) \{\s*)"
+     r"return require_admin\(req, res\);(\s*\},\s*\[this\]\(const httplib::Request& req, "
+     r"httplib::Response& res,\s*const std::string& securable_type)",
+     r"\1return auth_routes_->probe_admin(req, res);\2", "loud require_admin"),
+    # Groups page: the call that installs /groups and its script.
+    (r"yuzu::server::groups::register_groups_routes\(", "yuzu::server::groups::register_groups_route(",
+     "register_groups_routes"),
+    (r"groups::Deps\{\.auth_fn = auth_fn\}", "groups::Deps{}", "auth_fn"),
 ]
 
 
