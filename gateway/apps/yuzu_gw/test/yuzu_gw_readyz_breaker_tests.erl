@@ -182,7 +182,8 @@ published_state_follows_every_transition() ->
     server_answers(fun(_) -> fail end),
     ok = yuzu_gw_upstream:replay_sessions([S1, S2]),
     await_state(open),
-    ?assertEqual([S1, S2], replayed_sessions()),
+    %% a replay runs its entries in parallel, so their order is not fixed
+    ?assertEqual(lists:sort([S1, S2]), lists:sort(replayed_sessions())),
     same(open),
 
     %% half_open -> open by a failed replay.
