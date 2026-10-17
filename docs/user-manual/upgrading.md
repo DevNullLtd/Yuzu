@@ -110,6 +110,23 @@ customer-distribution lane. Before switching lanes, read the
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: dashboard API-token create and revoke apply MFA step-up
+
+`POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` (the Settings page's
+API-token Create and Revoke buttons) now apply the same step-up check as the REST token routes.
+
+- **SAML sessions** cannot satisfy the check and get `403` on both routes, as they already do on
+  `/api/v1/tokens`. A deployment whose only interactive sign-in is SAML (`--auth-mode=sso-only`)
+  therefore has no Settings-page route to create or revoke tokens. Create or revoke them from a
+  local-account session (keep an MFA-enrolled local administrator for this), or from an API-token
+  or MCP caller, which the step-up check does not apply to.
+- **OIDC sessions** are gated only when the identity provider attests MFA (`amr`) or
+  `--mfa-enforcement` protects the role.
+- **Local MFA-enrolled operators** whose proof is older than `--mfa-step-up-window-secs` must sign
+  in again before creating or revoking a token. The Settings page cannot yet prompt for the code,
+  so the buttons do nothing until the operator re-authenticates.
+- With no MFA enrolled and no SAML sign-in, nothing changes.
+
 ## Behaviour change: web UI wording and layout (Console, Home after sign-in, hidden quarantine controls)
 
 - **"Dashboard" is now "Console".** The navigation item, the Home tile, the page title,
