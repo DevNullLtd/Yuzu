@@ -1013,5 +1013,45 @@ TEST_CASE("OIDC egress: the host WinHTTP cracked must be the host the policy vet
     CHECK_FALSE(cracked_host_is_vetted(L"[]", "[]")); // an empty bracket pair is not a host
     // A wide character is a different host than any ASCII one, even if it looks alike.
     CHECK_FALSE(cracked_host_is_vetted(L"idp.exampl\u0435.test", "idp.example.test"));
-    CHECK_FALSE(cracked_host_is_vetted(L"idp.example.test", "idp.exampl\xC3\xA9.test"));
+    // Equal length and equal numeric value on both sides: only the "non-ASCII is never a match"
+    // guard refuses these (a plain character-by-character compare would call them equal), and the
+    // narrow-only case (a high byte against an ASCII wide character of the same length).
+    CHECK_FALSE(cracked_host_is_vetted(L"idp.exampl\u00C3.test", "idp.exampl\xC3.test"));
+    CHECK_FALSE(cracked_host_is_vetted(L"idp.example.test", "idp.exampl\xE9.test"));
+}
+
+TEST_CASE("OIDC egress: the vetted port comes from the same origin the vet used",
+          "[oidc][oidc_egress][security]") {
+    using yuzu::server::oidc::vetted_port_from_origin;
+    CHECK(vetted_port_from_origin("https://idp.example.test", false) == 443u);
+    CHECK(vetted_port_from_origin("http://idp.example.test", true) == 80u);
+    CHECK(vetted_port_from_origin("https://idp.example.test:8443", false) == 8443u);
+    CHECK(vetted_port_from_origin("http://127.0.0.1:8080", true) == 8080u);
+    CHECK(vetted_port_from_origin("https://idp.example.test:443", false) == 443u);
+    CHECK(vetted_port_from_origin("http://idp.example.test:443", true) == 443u); // explicit wins
+    CHECK(vetted_port_from_origin("https://[::1]", false) == 443u);  // colons inside brackets
+    CHECK(vetted_port_from_origin("https://[::1]:8443", false) == 8443u);
+    CHECK(vetted_port_from_origin("https://[fe80::1]", false) == 443u);
+    // An explicit port that is not 1..65535 in at most five digits is 0, which no real port
+    // equals, so any comparison against it fails closed.
+    CHECK(vetted_port_from_origin("https://idp.example.test:0", false) == 0u);
+    CHECK(vetted_port_from_origin("https://idp.example.test:65536", false) == 0u);
+    CHECK(vetted_port_from_origin("https://idp.example.test:123456", false) == 0u);
+    CHECK(vetted_port_from_origin("https://idp.example.test:", false) == 0u);
+    CHECK(vetted_port_from_origin("https://idp.example.test:80a", false) == 0u);
+    CHECK(vetted_port_from_origin("https://idp.example.test:-1", false) == 0u);
+}
+
+TEST_CASE("OIDC egress: the Windows token POST decision needs the host AND the port to match",
+          "[oidc][oidc_egress][security]") {
+    using yuzu::server::oidc::cracked_endpoint_is_vetted;
+    CHECK(cracked_endpoint_is_vetted(L"idp.example.test", 443, "idp.example.test", 443));
+    CHECK(cracked_endpoint_is_vetted(L"IDP.example.test", 8443, "idp.EXAMPLE.test", 8443));
+    CHECK(cracked_endpoint_is_vetted(L"[::1]", 8443, "::1", 8443));
+    CHECK_FALSE(cracked_endpoint_is_vetted(L"idp.example.test", 8443, "idp.example.test", 443));
+    CHECK_FALSE(cracked_endpoint_is_vetted(L"idp.example.test", 80, "idp.example.test", 443));
+    CHECK_FALSE(cracked_endpoint_is_vetted(L"evil.test", 443, "idp.example.test", 443));
+    // A zero vetted port (an unparseable explicit port) never matches, not even a zero cracked one.
+    CHECK_FALSE(cracked_endpoint_is_vetted(L"idp.example.test", 0, "idp.example.test", 0));
+    CHECK_FALSE(cracked_endpoint_is_vetted(L"idp.example.test", 443, "idp.example.test", 0));
 }

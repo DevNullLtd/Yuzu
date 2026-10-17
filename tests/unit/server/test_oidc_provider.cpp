@@ -38,6 +38,9 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
+#include <shared_mutex>
+#include <future>
 #include <vector>
 
 #ifndef _WIN32
@@ -105,14 +108,24 @@ TEST_CASE("OIDC lease: a provider is not destroyed while a request still holds a
     REQUIRE(lease);
     CHECK(provider->lease_count_for_test() == 1);
 
+    std::atomic<bool> entered{false};
     std::atomic<bool> destroyed{false};
     ScopedThreads threads;
+    // Declared AFTER `threads`, so it runs first on any exit (a failing check included): the
+    // lease is released before ~ScopedThreads joins a thread that is waiting on it.
+    struct ReleaseOnExit {
+        OidcProvider::Lease& l;
+        ~ReleaseOnExit() { l = OidcProvider::Lease{}; }
+    } release_on_exit{lease};
     threads.spawn([&, p = std::move(provider)]() mutable {
+        entered.store(true);
         p.reset(); // blocks in ~OidcProvider until the lease is released
         destroyed.store(true);
     });
-    // A bounded negative check: if the destructor did not wait it would finish within
-    // microseconds, so a slow thread can only make this pass spuriously, never fail it.
+    // The negative check only starts once the thread is running, so thread-start latency cannot
+    // make it pass; if the destructor did not wait it would finish within microseconds.
+    while (!entered.load() && !threads.aborted())
+        std::this_thread::yield();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     CHECK_FALSE(destroyed.load());
 
@@ -153,20 +166,133 @@ TEST_CASE("OIDC lease: the retirement list is bounded", "[oidc][oidc_lease]") {
     // ITS lease (the one case a retirement blocks), so release it from another thread.
     auto extra = lease_test_provider();
     leases.push_back(extra->acquire_lease());
+    std::atomic<bool> entered{false};
     std::atomic<bool> retired_extra{false};
     ScopedThreads threads;
+    // Declared after `threads`, so it runs first on any exit: every lease is released before
+    // ~ScopedThreads joins the retiring thread that is waiting on one of them.
+    struct ReleaseAllOnExit {
+        std::vector<OidcProvider::Lease>& v;
+        ~ReleaseAllOnExit() { v.clear(); }
+    } release_all_on_exit{leases};
     threads.spawn([&, e = std::move(extra)]() mutable {
+        entered.store(true);
         OidcProvider::retire(std::move(e));
         retired_extra.store(true);
     });
+    while (!entered.load() && !threads.aborted())
+        std::this_thread::yield();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     CHECK_FALSE(retired_extra.load()); // blocked on the oldest provider's lease
+
+    // The wait must not hold the list mutex: the destruction happens outside it. While the
+    // retiring thread is blocked, another thread must still be able to read the list. (If the
+    // destroy ran under the mutex this call would block until the lease below is released, the
+    // future would not be ready in time, and the check would fail.)
+    {
+        auto observer = std::async(std::launch::async,
+                                   [] { return OidcProvider::retired_count_for_test(); });
+        const bool ready = observer.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        CHECK(ready);
+        if (ready)
+            CHECK(observer.get() == OidcProvider::kMaxRetired);
+        else
+            leases.front() = OidcProvider::Lease{}; // unblock so the future can finish
+    }
     leases.front() = OidcProvider::Lease{};
     threads.join_all();
     CHECK(retired_extra.load());
     CHECK(OidcProvider::retired_count_for_test() == OidcProvider::kMaxRetired);
 
     leases.clear(); // release every remaining lease, then empty the list
+    OidcProvider::drain_retired();
+    CHECK(OidcProvider::retired_count_for_test() == 0);
+}
+
+static_assert(!std::is_copy_constructible_v<OidcProvider::Lease> &&
+                  !std::is_copy_assignable_v<OidcProvider::Lease> &&
+                  std::is_nothrow_move_constructible_v<OidcProvider::Lease> &&
+                  std::is_nothrow_move_assignable_v<OidcProvider::Lease>,
+              "a Lease is move-only and its moves cannot throw");
+static_assert(!std::is_copy_constructible_v<OidcProvider> &&
+                  !std::is_move_constructible_v<OidcProvider>,
+              "a Lease holds the provider's address, so the provider must never move");
+
+TEST_CASE("OIDC lease: a move transfers the lease, a move-assign releases the old target, a "
+          "self-move keeps it",
+          "[oidc][oidc_lease]") {
+    auto a = lease_test_provider();
+    auto b = lease_test_provider();
+    auto la = a->acquire_lease();
+    CHECK(a->lease_count_for_test() == 1);
+
+    auto moved = std::move(la); // transfer: the count does not change, the source is empty
+    CHECK_FALSE(la);
+    CHECK(a->lease_count_for_test() == 1);
+
+    auto lb = b->acquire_lease();
+    CHECK(b->lease_count_for_test() == 1);
+    moved = std::move(lb); // assigning over a held lease releases the old one first
+    CHECK(a->lease_count_for_test() == 0);
+    CHECK(b->lease_count_for_test() == 1);
+
+    auto& alias = moved;
+    moved = std::move(alias); // self-move-assign must neither release nor double-count
+    CHECK(moved);
+    CHECK(b->lease_count_for_test() == 1);
+
+    moved = OidcProvider::Lease{};
+    CHECK(b->lease_count_for_test() == 0);
+}
+
+TEST_CASE("OIDC lease: concurrent acquire-under-a-shared-lock against swap-and-retire never "
+          "leaves a lease on a destroyed provider",
+          "[oidc][oidc_lease]") {
+    // The route protocol with real providers and no network: readers take the lease under the
+    // shared lock and use it after dropping it; the swapper replaces the provider under the
+    // exclusive lock and retires the old one after releasing it. ASan checks the lifetime and
+    // TSan checks the handoff (this case runs under both: it needs no mock IdP).
+    OidcProvider::drain_retired();
+    std::shared_mutex mu;
+    auto published = lease_test_provider();
+    std::atomic<bool> stop{false};
+    std::atomic<long> acquired{0};
+    constexpr int kReaders = 6;
+    constexpr int kSwaps = 300;
+    {
+        ScopedThreads threads;
+        for (int i = 0; i < kReaders; ++i)
+            threads.spawn([&] {
+                while (!stop.load() && !threads.aborted()) {
+                    OidcProvider::Lease lease;
+                    {
+                        std::shared_lock shared(mu);
+                        lease = published->acquire_lease();
+                    }
+                    std::this_thread::yield(); // "network I/O" with the lock dropped
+                    lease = OidcProvider::Lease{};
+                    acquired.fetch_add(1);
+                }
+            });
+        // Declared after `threads`: stops the readers on any exit before they are joined.
+        struct StopOnExit {
+            std::atomic<bool>& stop;
+            ~StopOnExit() { stop.store(true); }
+        } stop_on_exit{stop};
+        for (int i = 0; i < kSwaps; ++i) {
+            auto next = lease_test_provider();
+            std::unique_ptr<OidcProvider> old;
+            {
+                std::unique_lock exclusive(mu);
+                old = std::move(published);
+                published = std::move(next);
+            }
+            OidcProvider::retire(std::move(old));
+        }
+        stop.store(true);
+        threads.join_all();
+    }
+    CHECK(acquired.load() > 0);
     OidcProvider::drain_retired();
     CHECK(OidcProvider::retired_count_for_test() == 0);
 }
@@ -1066,7 +1192,7 @@ static std::string make_jwt_with_header(const std::string& header_json,
 TEST_CASE("OIDC: verify_jwt_signature fails closed when no signing key is available",
           "[oidc][jwt][security]") {
     // A structurally valid RS256 token, but the provider has no jwks_uri, so the
-    // JWKS cache stays empty and no key can be found. Pre-fix, the Windows build
+    // key set is available (nothing injected, nothing to fetch). Pre-fix, the Windows build
     // returned success here (forged-token acceptance); it must now be rejected.
     OidcConfig cfg;
     cfg.issuer = "https://issuer";
@@ -1124,7 +1250,7 @@ static std::string sign_and_register_rs256(OidcProvider& provider, const std::st
     if (!pk)
         return "";
 
-    // Modulus/exponent → base64url for the JWK the provider will cache.
+    // Modulus/exponent → base64url for the JWK injected as the provider's verifying key.
     BIGNUM* raw_n = nullptr;
     BIGNUM* raw_e = nullptr;
     if (EVP_PKEY_get_bn_param(pk.get(), "n", &raw_n) != 1 ||
@@ -1168,7 +1294,7 @@ static std::string sign_and_register_rs256(OidcProvider& provider, const std::st
 TEST_CASE("OIDC: verify_jwt_signature accepts a valid RS256 signature and rejects tampering",
           "[oidc][jwt][security]") {
     // The load-bearing crypto round-trip: a token genuinely signed by the
-    // private key whose public half is cached MUST verify, and the same token
+    // private key whose public half is injected MUST verify, and the same token
     // with one flipped signature byte MUST be rejected. This exercises the real
     // jwk_to_pkey + EVP_DigestVerify path the #1856 fix now runs on every
     // platform — the earlier rejection-only tests never reach EVP.
@@ -1181,7 +1307,7 @@ TEST_CASE("OIDC: verify_jwt_signature accepts a valid RS256 signature and reject
                                        R"({"sub":"alice","exp":9999999999})");
     REQUIRE_FALSE(jwt.empty()); // OpenSSL keygen/sign succeeded
 
-    // Positive: genuine signature over the cached key verifies.
+    // Positive: genuine signature over the injected key verifies.
     auto ok = provider.verify_jwt_signature(jwt);
     CHECK(ok.has_value());
 
@@ -1682,12 +1808,60 @@ TEST_CASE("OIDC token exchange: the Windows POST checks the cracked host and por
     const auto open_at = text.find("WinHttpOpen(", post_at);
     REQUIRE(open_at != std::string::npos);
     const auto body = text.substr(post_at, open_at - post_at); // everything before it connects
-    CHECK(body.find("cracked_host_is_vetted(std::wstring_view(host, uc.dwHostNameLength), "
-                    "vetted_host)") != std::string::npos);
-    CHECK(body.find("static_cast<unsigned>(uc.nPort) != vetted_port") != std::string::npos);
+    // The DECISION is the pure cracked_endpoint_is_vetted (unit-tested on every platform in
+    // test_oidc_egress_policy.cpp, and against the real WinHttpCrackUrl in the Windows-only case
+    // below); this pin proves winhttp_post calls it, with the cracked host and port, and returns
+    // an empty body when it says no, all before WinHttpOpen.
+    CHECK(body.find("if (!cracked_endpoint_is_vetted(std::wstring_view(host, uc.dwHostNameLength),\n"
+                    "                                    static_cast<unsigned>(uc.nPort), vetted_host, "
+                    "vetted_port)) {") != std::string::npos);
+    const auto refuse_at = body.find("the egress policy");
+    REQUIRE(refuse_at != std::string::npos);
+    CHECK(body.find("return {};", refuse_at) != std::string::npos);
     CHECK(text.find("winhttp_post(*token_endpoint, egress_target->host, vetted_port, form_body,") !=
           std::string::npos);
+    CHECK(text.find("vetted_port_from_origin(egress_target->origin, egress_target->cleartext)") !=
+          std::string::npos);
 }
+
+#ifdef _WIN32
+TEST_CASE("OIDC token exchange (Windows): WinHttpCrackUrl and split_http_url agree on the host and "
+          "port of every legitimate token endpoint shape, and the odd ones are refused",
+          "[oidc][oidc_egress][security]") {
+    // The Windows token POST connects to what WinHttpCrackUrl extracted and the egress policy
+    // vetted what split_http_url extracted. This runs the REAL WinHttpCrackUrl over the shapes
+    // an IdP can legitimately publish, so a differential between the two parsers cannot make
+    // Test Connection (which never uses WinHTTP) pass while every Windows sign-in fails.
+    for (const char* url : {"https://idp.example.test/token",
+                            "https://IDP.Example.TEST/token",
+                            "https://idp.example.test:443/token",
+                            "https://idp.example.test:8443/token",
+                            "http://127.0.0.1:8080/token",
+                            "http://idp.example.test:80/token",
+                            "https://idp.example.test./token",
+                            "https://idp.example.test",
+                            "https://idp.example.test?x=1",
+                            "https://idp.example.test/token?p=b2c_1_signin",
+                            "https://idp.example.test/tenant/oauth2/v2.0/token",
+                            "https://[::1]/token",
+                            "https://[::1]:8443/token"}) {
+        CAPTURE(url);
+        CHECK(OidcProvider::winhttp_url_agrees_for_test(url));
+    }
+    // Shapes that must never reach a POST: refused by the URL grammar before WinHTTP, or a
+    // disagreement. Either way the answer is "do not connect".
+    for (const char* url : {"https://user@idp.example.test/token",
+                            "https://idp.example.test\\@evil.test/token",
+                            "https://idp.example.test:0/token",
+                            "https://idp.example.test:99999/token",
+                            "https://[::1%25eth0]/token",
+                            "ftp://idp.example.test/token",
+                            ""}) {
+        CAPTURE(url);
+        CHECK_FALSE(OidcProvider::winhttp_url_agrees_for_test(url));
+    }
+}
+#endif
 
 TEST_CASE("OIDC discovery: an explicitly configured field is authoritative and is never discovered",
           "[oidc][oidc_discovery]") {
@@ -2013,8 +2187,8 @@ TEST_CASE("OIDC discovery: a caller arriving mid-fetch fails fast instead of wai
 }
 
 TEST_CASE(
-    "OIDC discovery: signature checks use the discovered JWKS - an unknown kid refetches once - "
-    "and a rotated kid then verifies",
+    "OIDC discovery: signature checks use the discovered JWKS - every verification fetches, an "
+    "unknown kid is refused, and a rotated kid then verifies",
     "[oidc][oidc_discovery][jwt]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
@@ -2023,12 +2197,12 @@ TEST_CASE(
     REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
     CHECK(idp.jwks_calls.load() == 1);
 
-    // A kid the IdP never published costs exactly ONE refetch. (Whether such a token is then
-    // refused is #1901's front()-fallback question and is deliberately not pinned here.)
-    (void)provider.verify_jwt_signature(signed_token(cfg, "never-published"));
+    // A kid the IdP never published: still ONE fetch for this verification (there is no cache and
+    // no second refetch), and the token is refused rather than checked against another key.
+    REQUIRE_FALSE(provider.verify_jwt_signature(signed_token(cfg, "never-published")).has_value());
     CHECK(idp.jwks_calls.load() == 2);
 
-    // Rotation: the IdP now publishes kid-2; the first token under it triggers ONE refetch.
+    // Rotation: the IdP now publishes kid-2; the verification under it fetches once and finds it.
     idp.with([](MockIdp& m) { m.token_kid = "mock-kid-2"; });
     REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-2")).has_value());
     CHECK(idp.jwks_calls.load() == 3);
@@ -2145,7 +2319,7 @@ TEST_CASE("OIDC discovery: a trickling JWKS is cut at the total bound",
     // The chunk bound below is kept loose on purpose.
     CHECK(elapsed >= std::chrono::milliseconds(100));
     CHECK(elapsed < std::chrono::milliseconds(3000));
-    CHECK(idp.trickle_chunks_sent.load() < 2 * 250); // neither GET ran to the end
+    CHECK(idp.trickle_chunks_sent.load() < 100); // the one GET was cut, not run to the end (250)
 }
 
 TEST_CASE("OIDC discovery: a discovered endpoint with an absurd host is refused and the process "
@@ -3806,7 +3980,7 @@ TEST_CASE("OIDC discovery: endpoints must be absolute and carry the issuer's own
 TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test - "
           "add_test_pending_flow - set_http_timeouts_for_test - "
           "set_discovery_negative_cache_for_test - set_resolver_for_test - "
-          "add_test_jwks_key - "
+          "add_test_jwks_key - winhttp_url_agrees_for_test - "
           "clear_nat64_discovery_cache_for_test - expire_nat64_discovery_cache_for_test - "
           "vet_egress_target_for_test or pending_flow_count_for_test "
           "(source pin)",
@@ -3821,6 +3995,7 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
                                              "set_discovery_negative_cache_for_test",
                                              "set_resolver_for_test",
                                              "add_test_jwks_key",
+                                             "winhttp_url_agrees_for_test",
                                              "clear_nat64_discovery_cache_for_test",
                                              "expire_nat64_discovery_cache_for_test",
                                              "vet_egress_target_for_test",

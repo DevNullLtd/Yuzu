@@ -37,6 +37,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -889,6 +890,10 @@ TEST_CASE("OIDC route: a provider swap does not wait for an in-flight sign-in st
     DiscoveryRig rig;
     rig.idp.hold_discovery();
     Browser a;
+    // Declared BEFORE the worker and its release guard: if a failing check unwinds the test,
+    // the guard releases the held fetch (so the worker's lease ends) before this provider's
+    // destructor, which waits for that lease, runs.
+    std::unique_ptr<oidc::OidcProvider> unpublished;
     std::atomic<int> start_status{0};
     std::thread worker([&] {
         auto r = rig.fix.sink.dispatch("GET", "/auth/oidc/start", {}, "application/json",
@@ -912,7 +917,6 @@ TEST_CASE("OIDC route: a provider swap does not wait for an in-flight sign-in st
     REQUIRE(rig.idp.discovery_calls.load() == 1); // the request is inside its fetch
 
     // What the Settings save does: take the exclusive lock, swap, release, retire.
-    std::unique_ptr<oidc::OidcProvider> unpublished;
     {
         // try_lock may fail spuriously, so retry for a bounded time; a request that really held
         // the lock for its whole fetch (the old behavior) never lets go while discovery is held.
@@ -931,6 +935,87 @@ TEST_CASE("OIDC route: a provider swap does not wait for an in-flight sign-in st
     rig.idp.release_discovery();
     worker.join();
     CHECK(start_status.load() == 302); // the request finished on the provider it started with
+    oidc::OidcProvider::drain_retired();
+    CHECK(oidc::OidcProvider::retired_count_for_test() == 0);
+}
+
+TEST_CASE("OIDC route: a Settings swap during an in-flight callback does not wait for it, and "
+          "the callback is then refused - no session under the replaced configuration",
+          "[pg][oidc][oidc_discovery][oidc_lease][auth_routes]") {
+    // /auth/callback does the token POST and the JWKS fetch (the long network I/O). Two things
+    // must hold, for each IdP step the callback can be stuck in:
+    //  (1) the route holds a lease, not oidc_mu_, so the exclusive swap of a Settings save is
+    //      not delayed by the callback (this is the callback half of the lock finding);
+    //  (2) a callback that finishes after the save replaced the provider is REFUSED before any
+    //      group, role or session work: the operator changed the configuration (an admin group,
+    //      the issuer), and no session may be minted under the old one after the save returned.
+    DiscoveryRig rig;
+    oidc::OidcProvider::drain_retired();
+    const bool stuck_in_token_post = GENERATE(true, false);
+    CAPTURE(stuck_in_token_post);
+    Browser a;
+    auto start = rig.get(a, "/auth/oidc/start");
+    REQUIRE(start->status == 302);
+    const std::string callback = rig.callback_path(*start);
+
+    // Declared before the worker and its guard (see the start test above for the ordering).
+    std::unique_ptr<oidc::OidcProvider> unpublished;
+    if (stuck_in_token_post)
+        rig.idp.hold_token();
+    else
+        rig.idp.hold_jwks();
+    std::unique_ptr<httplib::Response> callback_res;
+    std::thread worker([&] {
+        callback_res = rig.fix.sink.dispatch("GET", callback, {}, "application/json", a.headers());
+    });
+    struct ReleaseAndJoin {
+        yuzu::server::test::MockIdp& idp;
+        std::thread& t;
+        ~ReleaseAndJoin() {
+            idp.release_token();
+            idp.release_jwks();
+            if (t.joinable())
+                t.join();
+        }
+    } release_and_join{rig.idp, worker};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const auto step_calls = [&] {
+        return stuck_in_token_post ? rig.idp.token_calls.load() : rig.idp.jwks_calls.load();
+    };
+    while (step_calls() < 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    REQUIRE(step_calls() == 1); // the callback is inside the IdP step
+
+    {
+        std::unique_lock exclusive(rig.fix.oidc_mu, std::defer_lock);
+        const auto lock_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!exclusive.try_lock() && std::chrono::steady_clock::now() < lock_deadline)
+            std::this_thread::yield();
+        REQUIRE(exclusive.owns_lock()); // (1) the in-flight callback does not hold the lock
+        unpublished = std::move(rig.fix.oidc_provider);
+        // The "save": a new provider (a changed admin group would live in rig.fix.cfg).
+        rig.fix.cfg.oidc_admin_group = "a-different-admin-group";
+        rig.fix.oidc_provider = std::make_unique<oidc::OidcProvider>(rig.cfg);
+    }
+    oidc::OidcProvider::retire(std::move(unpublished)); // returns although the callback is live
+    CHECK(oidc::OidcProvider::retired_count_for_test() == 1);
+
+    rig.idp.release_token();
+    rig.idp.release_jwks();
+    worker.join();
+    REQUIRE(callback_res != nullptr);
+    CHECK(callback_res->status == 302);
+    CHECK(callback_res->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK_FALSE(has_cookie_named(*callback_res, "yuzu_session=")); // (2) no session was minted
+    const auto events = rig.fix.audit_events(1);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "failure");
+    CHECK(events.front().detail == "reason=provider_replaced");
+    CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
+    CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "ok"}, {"role", "admin"}}) ==
+          0.0);
     oidc::OidcProvider::drain_retired();
     CHECK(oidc::OidcProvider::retired_count_for_test() == 0);
 }

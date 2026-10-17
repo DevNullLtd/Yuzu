@@ -2,7 +2,7 @@
 
 // test_oidc_mock_idp.hpp -- a loopback OIDC IdP plus RS256 signing, so a test can drive
 // `OidcProvider::handle_callback` and `/auth/callback` through their SUCCESS path with no network
-// and no live IdP. Real: the provider's discovery fetch, `fetch_jwks`, `exchange_code`, JWT
+// and no live IdP. Real: the provider's discovery fetch, `fetch_jwks_snapshot`, `exchange_code`, JWT
 // verification and claim validation. Stand-in: the IdP, a loopback httplib server serving
 // /.well-known/openid-configuration (knobs below), /jwks (the shared key under a swappable kid),
 // /authorize (302 back with code and state, remembering the nonce) and POST /token (the
@@ -120,6 +120,8 @@ struct MockIdp {
     std::condition_variable trickle_cv;
     bool trickle_stop{false};
     bool discovery_hold{false}; ///< under trickle_mu: a discovery GET waits until released
+    bool token_hold{false};     ///< under trickle_mu: a POST /token waits until released
+    bool jwks_hold{false};      ///< under trickle_mu: a GET /jwks waits until released
     std::atomic<int> token_calls{0};
     std::atomic<int> discovery_calls{0};
     std::atomic<int> jwks_calls{0};
@@ -189,6 +191,10 @@ struct MockIdp {
         });
         svr.Get("/jwks", [this](const httplib::Request&, httplib::Response& res) {
             jwks_calls.fetch_add(1);
+            {
+                std::unique_lock hold(trickle_mu);
+                trickle_cv.wait(hold, [this] { return !jwks_hold || trickle_stop; });
+            }
             std::string kid, raw;
             int status, key_count;
             bool trickle;
@@ -218,6 +224,11 @@ struct MockIdp {
         });
         const auto token_handler = [this](const httplib::Request& req, httplib::Response& res) {
             token_calls.fetch_add(1);
+            {
+                // Event-driven hold (hold_token / release_token), after the call is counted.
+                std::unique_lock hold(trickle_mu);
+                trickle_cv.wait(hold, [this] { return !token_hold || trickle_stop; });
+            }
             std::string tok;
             std::string location;
             int status;
@@ -345,6 +356,32 @@ struct MockIdp {
         {
             std::lock_guard lk(trickle_mu);
             discovery_hold = false;
+        }
+        trickle_cv.notify_all();
+    }
+
+    /// Same latch for POST /token and GET /jwks: a call the test can keep in flight (the IdP
+    /// "stops answering" at exactly that step) for as long as it needs, with no sleep and no
+    /// wall-clock dependence. The call is counted (`token_calls`, `jwks_calls`) before it waits.
+    void hold_token() {
+        std::lock_guard lk(trickle_mu);
+        token_hold = true;
+    }
+    void release_token() {
+        {
+            std::lock_guard lk(trickle_mu);
+            token_hold = false;
+        }
+        trickle_cv.notify_all();
+    }
+    void hold_jwks() {
+        std::lock_guard lk(trickle_mu);
+        jwks_hold = true;
+    }
+    void release_jwks() {
+        {
+            std::lock_guard lk(trickle_mu);
+            jwks_hold = false;
         }
         trickle_cv.notify_all();
     }

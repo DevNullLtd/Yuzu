@@ -46,11 +46,16 @@
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <httplib.h>
 #include <libpq-fe.h>
 
 #include <filesystem>
+#include <chrono>
+#include <atomic>
+#include <thread>
+#include <future>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -624,6 +629,8 @@ TEST_CASE("Settings OIDC: Test Connection decodes the server's NAT64 declaration
         h.sink.Post("/api/settings/oidc", discovery_form(idp), "application/x-www-form-urlencoded");
     REQUIRE(save);
     CHECK(save->status == 500);
+    // htmx swaps neither 4xx nor 5xx, so the toast is what the operator sees.
+    CHECK(save->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
     CHECK(h.oidc_provider == nullptr);
 }
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
@@ -699,4 +706,129 @@ TEST_CASE("Settings OIDC: an elevated-only session leaves the stored settings un
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(h.runtime_config->get_value("oidc_admin_group") == "group-2");
+}
+
+// ── Issuer / Client ID 400 toast ─────────────────────────────────────────────
+
+TEST_CASE("Settings OIDC: a missing Issuer or Client ID is refused with a 400 and an error toast",
+          "[settings][oidc]") {
+    OidcHarness h{"", /*open_store=*/false};
+    for (const char* body : {"issuer=&client_id=cid&client_secret=s&redirect_uri=https://y/cb",
+                             "issuer=https://idp.example&client_id=&client_secret=s&redirect_uri=https://y/cb"}) {
+        CAPTURE(body);
+        auto res = h.sink.Post("/api/settings/oidc", body, "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        // htmx does not swap a 4xx body, so the toast is the only thing the operator sees. The
+        // header is a hand-built string literal: parse it rather than substring-match it.
+        const auto trigger = nlohmann::json::parse(res->get_header_value("HX-Trigger"), nullptr,
+                                                   /*allow_exceptions=*/false);
+        REQUIRE_FALSE(trigger.is_discarded());
+        CHECK(trigger["showToast"]["level"] == "error");
+        CHECK(trigger["showToast"]["message"].get<std::string>().find("required") !=
+              std::string::npos);
+        CHECK(h.oidc_provider == nullptr); // nothing was built or swapped in
+    }
+}
+
+// ── The save's writer half: a live request does not delay it ─────────────────
+
+TEST_CASE("Settings OIDC: a save returns promptly although a request holds a lease on the live "
+          "provider, and the replaced provider is retired, not destroyed under the lock",
+          "[settings][oidc][oidc_lease]") {
+    // The route test hand-copies what a save does; this drives the REAL handler. A bare
+    // `*oidc_provider_ = std::move(new_provider)` would destroy the old provider inside the
+    // exclusive lock, and ~OidcProvider waits for the lease below - so the save (and every new
+    // sign-in queued behind its pending writer) would hang.
+    OidcHarness h{"", /*open_store=*/false};
+    oidc::OidcProvider::drain_retired();
+    const std::string body =
+        "issuer=https://idp.example&client_id=cid&client_secret=s&redirect_uri="
+        "https://yuzu.example/auth/callback&admin_group=&skip_tls_verify=false";
+    auto first = h.sink.Post("/api/settings/oidc", body, "application/x-www-form-urlencoded");
+    REQUIRE(first);
+    REQUIRE(first->status == 200);
+    REQUIRE(h.oidc_provider != nullptr);
+
+    auto lease = h.oidc_provider->acquire_lease(); // a sign-in in flight on the live provider
+    REQUIRE(lease);
+    std::unique_ptr<httplib::Response> second;
+    std::thread worker([&] {
+        second = h.sink.Post("/api/settings/oidc", body, "application/x-www-form-urlencoded");
+    });
+    // Declared after `worker`: releases the lease, then joins, on any exit.
+    struct ReleaseAndJoin {
+        oidc::OidcProvider::Lease& l;
+        std::thread& t;
+        ~ReleaseAndJoin() {
+            l = oidc::OidcProvider::Lease{};
+            if (t.joinable())
+                t.join();
+        }
+    } release_and_join{lease, worker};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (oidc::OidcProvider::retired_count_for_test() == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    // The replaced provider reached the retirement list while its lease is still held: the save
+    // got past the swap and the retirement without waiting for the sign-in.
+    CHECK(oidc::OidcProvider::retired_count_for_test() == 1);
+    lease = oidc::OidcProvider::Lease{};
+    worker.join();
+    REQUIRE(second);
+    CHECK(second->status == 200);
+    oidc::OidcProvider::drain_retired();
+}
+
+// ── Two saves racing ─────────────────────────────────────────────────────────
+
+TEST_CASE("Settings OIDC: two saves racing leave the live secret equal to the stored one",
+          "[pg][settings][oidc][oidc_save]") {
+    // Save A leaves the secret field blank ("keep the stored secret"); save B sets a new one.
+    // The stored-secret read, the provider build, the swap and the persist are one unit under
+    // the save mutex, so whichever order they run in the live provider's secret (cfg) and the
+    // stored one agree, and A never reinstates the old secret over B's new one.
+    YUZU_REQUIRE_PG_DB_TPL(db, oidc_settings_tpl);
+    OidcHarness h(db.dsn());
+    const auto form = [](const std::string& secret) {
+        return "issuer=https://idp.example&client_id=cid&client_secret=" + secret +
+               "&redirect_uri=https://yuzu.example/auth/callback&admin_group=&skip_tls_verify="
+               "false";
+    };
+    const auto stored_secret = [&] {
+        auto r = h.runtime_config->read_secret("oidc_client_secret");
+        REQUIRE(r.has_value());
+        REQUIRE(r->has_value());
+        const auto sp = (**r).span();
+        return std::string(reinterpret_cast<const char*>(sp.data()), sp.size());
+    };
+    auto seed = h.sink.Post("/api/settings/oidc", form("seed-secret"),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(seed);
+    REQUIRE(seed->status == 200);
+    REQUIRE(stored_secret() == "seed-secret");
+
+    for (int i = 0; i < 60; ++i) {
+        CAPTURE(i);
+        const std::string fresh = "fresh-secret-" + std::to_string(i);
+        std::atomic<int> ready{0};
+        const auto save = [&](const std::string& secret) {
+            ready.fetch_add(1);
+            while (ready.load() < 2)
+                std::this_thread::yield();
+            return h.sink.Post("/api/settings/oidc", form(secret),
+                               "application/x-www-form-urlencoded");
+        };
+        auto a = std::async(std::launch::async, save, std::string{}); // keep the stored secret
+        auto b = std::async(std::launch::async, save, fresh);
+        auto ra = a.get();
+        auto rb = b.get();
+        REQUIRE(ra);
+        REQUIRE(rb);
+        CHECK(ra->status == 200);
+        CHECK(rb->status == 200);
+        CHECK(stored_secret() == fresh);
+        CHECK(h.cfg.oidc_client_secret == fresh); // the live secret is the stored one
+    }
+    oidc::OidcProvider::drain_retired();
 }
