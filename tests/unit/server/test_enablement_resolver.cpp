@@ -13,7 +13,6 @@
 #include "enablement_units.hpp"
 #include "tag_store.hpp"
 
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -179,6 +178,14 @@ using Names = std::vector<std::string>;
 using Matches = std::vector<Match>;
 
 constexpr auto Op = Provenance::Operator;
+
+Rule load_persisted(const std::string& id, std::vector<std::string> units,
+                    std::string_view selector, Provenance prov = Provenance::Operator) {
+    auto r = make_persisted_rule(id, std::move(units), selector, prov, kinds());
+    INFO(id << ": " << (r ? "" : r.error()));
+    REQUIRE(r.has_value());
+    return std::move(*r);
+}
 
 } // namespace
 
@@ -631,14 +638,6 @@ TEST_CASE("enablement resolver: a requirement edge from a unit inapplicable on t
     CHECK(sm->required_off == Names{"p"});
 }
 
-static Rule load_persisted(const std::string& id, std::vector<std::string> units, std::string_view selector,
-          Provenance prov = Provenance::Operator) {
-    auto r = make_persisted_rule(id, std::move(units), selector, prov, kinds());
-    INFO(id << ": " << (r ? "" : r.error()));
-    REQUIRE(r.has_value());
-    return std::move(*r);
-}
-
 TEST_CASE("enablement resolver: a rule naming a vanished unit is reported and switches nothing",
           "[enablement][scope]") {
     // Built through the loader constructor, as a stale persisted rule is after a
@@ -659,7 +658,7 @@ TEST_CASE("enablement resolver: a rule naming a vanished unit is reported and sw
     }
 }
 
-TEST_CASE("enablement resolver: a loaded rule keeps stale units but is validated like an authored one",
+TEST_CASE("enablement resolver: a loaded rule keeps stale units but is validated like authored",
           "[enablement][scope]") {
     // Same result as make_rule on a valid, current rule.
     const Spec s{"same", {"p.x"}, R"(ostype == "linux" AND tag:lab == "y")"};

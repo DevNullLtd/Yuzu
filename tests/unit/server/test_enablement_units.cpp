@@ -136,8 +136,8 @@ TEST_CASE("enablement units: the injected predicate is the canonical protective 
     // The real catalogue cannot tell the canonical set from the narrow quarantine one
     // (its only addition, __guard__.push_rules, is already a reserved name), so the
     // constant is pinned by behaviour: the quarantine-only predicate answers false for
-    // push_rules. This guards the constant itself; a caller must still pass it, which the
-    // caller's own test pins.
+    // push_rules. This guards the constant itself; a caller must still pass it, and the
+    // first production includer's own test must pin that (tracked by #5982).
     CHECK(kProtectivePredicate("__guard__", "push_rules"));
     CHECK(kProtectivePredicate("quarantine", "whitelist"));
     CHECK_FALSE(kProtectivePredicate("tar", "fleet_snapshot"));

@@ -64,8 +64,8 @@
 #include <vector>
 
 #include "command_capability.hpp"
-#include <yuzu/protective_actions.hpp>
 #include "plugin_config_parsers.hpp"
+#include <yuzu/protective_actions.hpp>
 
 namespace yuzu::server::enablement {
 
@@ -117,6 +117,14 @@ struct RequirementEdge {
 };
 
 using ProtectivePredicate = bool (*)(std::string_view plugin, std::string_view action);
+
+/// The plugin half of a unit name: a legal identifier, or a reserved control-channel
+/// name. ONE definition, shared by build_unit_overlay (catalogue rows) and the loader's
+/// is_unit_name_shape (enablement_resolver.hpp), so the two cannot drift apart.
+[[nodiscard]] inline bool is_legal_unit_plugin(std::string_view plugin) {
+    return plugin_config::is_valid_identifier(plugin) ||
+           plugin_config::is_reserved_plugin_name(plugin);
+}
 
 /// The predicate a caller injects: the canonical protective set. Named so the
 /// choice is one checkable line (test_enablement_units.cpp asserts its identity).
@@ -433,8 +441,7 @@ build_unit_overlay(std::initializer_list<std::span<const CommandCapability>> sou
 
     for (const auto& src : sources) {
         for (const auto& row : src) {
-            if (!(plugin_config::is_valid_identifier(row.plugin) ||
-                  plugin_config::is_reserved_plugin_name(row.plugin)) ||
+            if (!is_legal_unit_plugin(row.plugin) ||
                 !plugin_config::is_valid_identifier(row.action))
                 return Err("catalogue pair is not a legal unit name: " + std::string(row.plugin) +
                            "." + std::string(row.action));
