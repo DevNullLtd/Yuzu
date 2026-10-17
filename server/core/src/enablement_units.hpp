@@ -139,8 +139,8 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
     {"app_usage.last_used", "tar"},
 }};
 
-// matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list and pkg_inventory.store_packages
-// added 2026-10-17), 231 rows.
+// matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list and
+// pkg_inventory.store_packages added 2026-10-17), 231 rows.
 inline constexpr std::array<UnitOsRow, 231> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
