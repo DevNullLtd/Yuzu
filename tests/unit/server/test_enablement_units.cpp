@@ -132,16 +132,6 @@ TEST_CASE("enablement units: the real catalogue builds with no missing or stale 
     REQUIRE(r.has_value());
 }
 
-TEST_CASE("enablement units: no unit is protective or reserved", "[enablement][catalogue]") {
-    const auto ov = real_overlay();
-    for (const auto& u : ov.units) {
-        INFO(u.name);
-        CHECK_FALSE(yuzu::protective::is_protective_action(u.plugin, u.action));
-        CHECK_FALSE(plugin_config::is_reserved_plugin_name(u.plugin));
-        CHECK_FALSE(yuzu::agent::is_reserved_plugin_name(u.plugin));
-    }
-}
-
 TEST_CASE("enablement units: every catalogue pair follows the canonical protective predicate",
           "[enablement][catalogue]") {
     // Compared per pair against yuzu::protective::is_protective_action rather than a
@@ -159,6 +149,9 @@ TEST_CASE("enablement units: every catalogue pair follows the canonical protecti
             INFO(name);
             CHECK((ov.find_non_unit(name) != nullptr) == non_unit);
             CHECK((ov.find(name) != nullptr) == !non_unit);
+            // The agent's own reserved list agrees with the server's.
+            CHECK(yuzu::agent::is_reserved_plugin_name(row.plugin) ==
+                  plugin_config::is_reserved_plugin_name(row.plugin));
         }
     }
     CHECK(pairs > 100);
