@@ -502,6 +502,47 @@ TEST_CASE("custom_properties_routes: GET properties degrades to 503 (never a fal
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// An over-length id is the one degenerate shape this harness can send (an empty segment does
+// not match the `[^/]+` capture and the sink does not percent-decode a NUL), so a 257-byte id
+// stands in for all of them. Only the PUT assertions observe the guard itself; DELETE and GET
+// would answer the same without it, so they pin the response contract. The store tests cover
+// the guard directly. The store refuses the id on writes and answers empty on reads, as the
+// tag store does.
+TEST_CASE("custom_properties_routes: a 257-byte agent id is refused on writes (400/404, audited) "
+          "and reads answer empty",
+          "[pg][server][routes][custom_properties_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_props_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::string long_id(257, 'a');
+    const std::string path = "/api/agents/" + long_id + "/properties";
+
+    auto put = h.sink.Put(path + "/role", R"({"value":"web"})");
+    REQUIRE(put);
+    CHECK(put->status == 400);
+    CHECK(put->body == R"j({"error":"invalid agent id (1-256 bytes, no NUL)"})j");
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "custom_property.set");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].target_id == long_id);
+
+    auto del = h.sink.Delete(path + "/role");
+    REQUIRE(del);
+    CHECK(del->status == 404);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].action == "custom_property.delete");
+    CHECK(h.audits[1].result == "not_found");
+
+    auto get = h.sink.Get(path);
+    REQUIRE(get);
+    CHECK(get->status == 200);
+    CHECK(body(get->body)["properties"].empty());
+    CHECK(h.audits.size() == 2); // the read is unaudited
+}
+
 // Wiring tripwire: every case above proves register_custom_properties_routes'
 // OWN handlers are correct, but nothing above reads server.cpp — a future
 // edit that drops the production `register_custom_properties_routes(...)`

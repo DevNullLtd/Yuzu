@@ -38,14 +38,6 @@ class AccessReviewStore;
 class DirectorySync;
 class ScimStore;
 
-/// True when an enrollment token's expiry has passed at `now`. Pure: `now` is injected so
-/// the expired branch can be tested without waiting out a TTL. `expires_at` is
-/// `time_point::max()` for a token that never expires (what `list_tokens` maps a NULL expiry
-/// to). Same comparison the consume path enforces in SQL (`expires_at > now()` must hold to
-/// enrol), so a token the server refuses as expired is never listed Active.
-[[nodiscard]] bool enrollment_token_expired(std::chrono::system_clock::time_point expires_at,
-                                            std::chrono::system_clock::time_point now) noexcept;
-
 /// Settings page routes — all /settings, /fragments/settings/*, /api/settings/* routes.
 class SettingsRoutes {
 public:
@@ -96,6 +88,16 @@ public:
     /// (so no request can race the set). May stay empty (tests) — the
     /// handlers then persist without the live apply.
     void set_dex_alert_apply_fn(std::function<void()> fn) { dex_alert_apply_fn_ = std::move(fn); }
+
+    /// Quiet admin gate for the three auto-loading enrolment GET fragments (tokens, pending,
+    /// auto-approve). The Groups page loads all three on every view and the pending panel
+    /// reloads on every SSE arrival, so the loud `admin_fn` (require_admin) wrote an
+    /// auth.admin_required denial row per panel per view for a non-administrator. server.cpp
+    /// binds `AuthRoutes::probe_admin` here, as it does for the Users page: the same decision,
+    /// the denial row withheld for an interactive cookie session only. Every mutating route
+    /// keeps the loud `admin_fn`. Left unset (tests, other callers) those three GETs fall back
+    /// to `admin_fn`, so an unwired probe can only be louder, never weaker.
+    void set_read_admin_fn(AdminFn fn) { read_admin_fn_ = std::move(fn); }
 
     /// Test seam: directory the cert-upload / cert-paste routes write into.
     /// Empty (production) = auth::default_cert_dir().
@@ -300,6 +302,10 @@ private:
 
     AuthFn auth_fn_;
     AdminFn admin_fn_;
+    AdminFn read_admin_fn_; // see set_read_admin_fn(); empty -> admin_fn_
+    bool read_admin(const httplib::Request& req, httplib::Response& res) const {
+        return read_admin_fn_ ? read_admin_fn_(req, res) : admin_fn_(req, res);
+    }
     PermFn perm_fn_;
     AuditFn audit_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment

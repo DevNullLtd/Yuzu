@@ -1739,6 +1739,9 @@ if build_server
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
       'unit/server/test_settings_security_ui.cpp', # Security and sign-in page: pure panel renderers + page pins + no-PG route cases
+      'unit/server/test_groups_enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
+      'unit/server/test_groups_page.cpp', # Groups and enrolment page: /groups gate, headers, template contract
+      'unit/server/test_groups_js.cpp', # Groups and enrolment page: string pins on yuzu-groups.js
       'unit/server/test_nav_shells.cpp',            # app shell: nav model, renderer, marker swap, per-page active item
       'unit/server/test_integrations_panels.cpp',   # System Integrations: MCP/Gateway panels, MCP form parser + POST handler
       'unit/server/test_integrations_page.cpp',     # System Integrations: page route, page + script pins
@@ -1774,6 +1777,7 @@ if build_server
       'unit/server/test_pg_template_cleanup.cpp',
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_agent_registry_presence.cpp',
+      'unit/server/test_agent_registry_log_neutralisation.cpp',   # #5513: register_agent log lines neutralised
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_catalog_rules.cpp',
