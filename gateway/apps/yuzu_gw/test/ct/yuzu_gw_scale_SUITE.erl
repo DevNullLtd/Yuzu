@@ -29,6 +29,12 @@
 %%%                  (one SendCommand per agent, one management connection, at
 %%%                  most 4096 open, the shipped stream cap); agents answer
 %%%                  after 0-10 s
+%%%   owner_kill     N registered; the owner process (yuzu_gw_agent) of 10% of
+%%%                  them is killed (exit kill, as in Dave Rae's RR3CH cell
+%%%                  ch_x10a). The agent supervisor restarts each owner, which
+%%%                  sends its session's DISCONNECTED and recovers the session on
+%%%                  the agent's still-open stream. Measures time to all
+%%%                  recovered; a command is then sent to each killed agent
 %%%   upstream_conn_loss
 %%%                  N registered; a wave of N/10 (at least 100) more agents
 %%%                  registers at once and, with calls in flight, the server
@@ -64,6 +70,7 @@
 %%% Other knobs (all optional): YUZU_GW_SCALE_RAMP_RATE (agents/s, 100),
 %%% YUZU_GW_SCALE_LATENCY_MS ("20-50", the server's Register latency),
 %%% YUZU_GW_SCALE_OUTAGE_MS (5000), YUZU_GW_SCALE_FLAP_PCT (10),
+%%% YUZU_GW_SCALE_KILL_PCT (10, the owners owner_kill kills),
 %%% YUZU_GW_SCALE_FANOUT_DELAY_MS ("0-10000"), YUZU_GW_SCALE_FANOUT_WINDOW (4096),
 %%% YUZU_GW_SCALE_OUTPUT_BYTES (2048), YUZU_GW_SCALE_HB_MS (30000),
 %%% YUZU_GW_SCALE_BUDGET_MS (60000 + 10 ms per agent), YUZU_GW_SCALE_RESULTS_DIR.
@@ -93,7 +100,8 @@
 %%% CT callbacks
 %%%===================================================================
 
-cases() -> [ramp, storm, server_crash, gateway_crash, planned_stop, fanout, upstream_conn_loss].
+cases() -> [ramp, storm, server_crash, gateway_crash, planned_stop, fanout, upstream_conn_loss,
+            owner_kill].
 
 all() ->
     case os:getenv("YUZU_GW_SCALE_GATE") of
@@ -447,6 +455,90 @@ upstream_conn_loss(Config) ->
             settle => Settle},
     finish(upstream_conn_loss, Config, R).
 
+%% @doc The owner processes of KillPct% of N registered agents are killed with
+%% exit(Pid, kill) (OWNER-RESTART, #5695; Dave Rae's ch_x10a). Each restarted
+%% owner must send the DISCONNECTED for its predecessor's session and recover
+%% the session on the agent's open stream (CONNECTED again, routable), with no
+%% agent reconnecting and no restart of the agent supervisor; a command sent to
+%% every killed agent afterwards must be answered.
+owner_kill(Config) ->
+    N = ?config(n, Config),
+    Pre = setup_registered(Config),
+    PreTruth = lists:sort(truth(Config)),
+    KillN = max(1, N * env_int("YUZU_GW_SCALE_KILL_PCT", 10) div 100),
+    Victims = [Id || {Id, _, _} <- lists:sublist(PreTruth, KillN)],
+    ok = load_call(Config, set_config, [#{reply_delay_ms => {0, 0}}]),
+    #{disconnects := Disc0} = load_call(Config, status, []),
+    SupBefore = gw_call(Config, erlang, whereis, [yuzu_gw_agent_sup]),
+    Restarts0 = owner_restarts(Config),
+    T0 = mark(Config),
+    Killed = gw_call(Config, ?PROBE, kill_owners, [Victims]),
+    Sessions = maps:from_list([{S, Id} || {Id, S} <- Killed]),
+    Progress = fun() ->
+                       P = owner_kill_progress(Config, Sessions, T0),
+                       {maps:get(recovered, P) =:= map_size(Sessions)
+                        andalso maps:get(disconnected, P) =:= map_size(Sessions), P}
+               end,
+    {AllBack, _} = wait_until(Progress, budget(N), 100),
+    TBack = erlang:system_time(millisecond),
+    Settle = settle(Config),
+    #{disconnected := Disc, recovered := Rec, last_connected_ms := LastConn} =
+        owner_kill_progress(Config, Sessions, T0),
+    After = maps:from_list([{Id, S} || {Id, S, _} <- truth(Config)]),
+    SameSession = length([1 || {Id, S} <- Killed, maps:get(Id, After, none) =:= S]),
+    Gw = ?config(gw, Config),
+    Budget = budget(N),
+    Fan = ?PEER:call(?config(load, Config), ?FLEET, fanout,
+                     [#{target => {?LOOPBACK, maps:get(mgmt_port, Gw)}, ids => Victims,
+                        window => mgmt_streams(), budget_ms => Budget, timeout_s => 60}],
+                     Budget + 120000),
+    #{disconnects := Disc1} = load_call(Config, status, []),
+    SupAfter = gw_call(Config, erlang, whereis, [yuzu_gw_agent_sup]),
+    Restarts = maps:map(fun(K, V) -> V - maps:get(K, Restarts0) end, owner_restarts(Config)),
+    R = #{setup => Pre,
+          killed => length(Killed),
+          disconnected_received => Disc,
+          disconnected_lost => length(Killed) - Disc,
+          recovered => Rec,
+          all_recovered => AllBack,
+          time_to_all_recovered_ms => case AllBack of
+                                          true -> LastConn - T0;
+                                          false -> null
+                                      end,
+          waited_ms => TBack - T0,
+          same_session_after => SameSession,
+          agent_disconnects_during => Disc1 - Disc0,
+          agent_sup_restarted => SupBefore =/= SupAfter,
+          owner_restarts => Restarts,
+          fanout => maps:without([latencies_ms], Fan),
+          convergence => convergence(Config),
+          settle => Settle,
+          gateway => gateway_report(Config)},
+    finish(owner_kill, Config, R).
+
+%% For the killed sessions: how many have a DISCONNECTED at the server since
+%% T0, and how many have a CONNECTED after that DISCONNECTED (recovered).
+owner_kill_progress(Config, Sessions, T0) ->
+    Notices = [N || {_, S, _, T} = N <- up_call(Config, notices, []), T >= T0,
+                    maps:is_key(S, Sessions)],
+    Disc = maps:from_list([{S, T} || {_, S, disconnected, T} <- lists:keysort(4, Notices)]),
+    Conn = [{S, T} || {_, S, connected, T} <- Notices,
+                      case Disc of #{S := TD} -> T >= TD; _ -> false end],
+    Recovered = maps:from_list(Conn),
+    #{disconnected => map_size(Disc), recovered => map_size(Recovered),
+      last_connected_ms => lists:max([T0 | maps:values(Recovered)])}.
+
+%% The gateway's own count of restarted owners by outcome (0 for a gateway that
+%% predates the counter, so the scenario reports on it too).
+owner_restarts(Config) ->
+    maps:from_list([{O, case catch gw_call(Config, prometheus_counter, value,
+                                           [yuzu_gw_agent_owner_restarts_total,
+                                            [atom_to_binary(O)]]) of
+                            V when is_integer(V) -> V;
+                            _ -> 0
+                        end}
+                    || O <- [recovered, disconnected_only, gave_up]]).
+
 %% The breaker's transitions so far, read from the gateway's own counter.
 breaker_transitions(Config) ->
     maps:from_list([{S, gw_call(Config, prometheus_counter, value,
@@ -516,6 +608,27 @@ invariants(upstream_conn_loss, R) ->
          "every agent was registered within the scenario budget"),
      inv(every_live_session_connected, maps:get(missing_connected, Conv) =:= 0,
          "the server holds a CONNECTED notice for every live session")];
+invariants(owner_kill, R) ->
+    #{fanout := F} = R,
+    Killed = maps:get(killed, R),
+    [inv(owners_killed, Killed > 0, "at least one owner process was killed"),
+     inv(no_lost_disconnected, maps:get(disconnected_lost, R) =:= 0,
+         "every killed owner's session had its DISCONNECTED reach the server"),
+     inv(all_recovered, maps:get(all_recovered, R),
+         "every killed owner's session was CONNECTED again at the server after its "
+         "DISCONNECTED, before the scenario budget"),
+     inv(no_agent_reconnect, maps:get(same_session_after, R) =:= Killed
+                             andalso maps:get(agent_disconnects_during, R) =:= 0,
+         "no agent lost its stream or registered again: every killed owner's agent kept "
+         "its session"),
+     inv(commands_reach_recovered, maps:get(answered, F) =:= Killed,
+         "a command sent to every killed owner's agent after the recovery was answered"),
+     inv(no_supervisor_restart, not maps:get(agent_sup_restarted, R),
+         "the agent supervisor was not restarted"),
+     inv(every_live_session_connected, maps:get(missing_connected, maps:get(convergence, R)) =:= 0,
+         "the server holds a CONNECTED notice for every live session"),
+     inv(singleton_mailboxes_drain, maps:get(mailboxes_drained, maps:get(settle, R)),
+         "every named singleton's mailbox was back to 0 after the run")];
 invariants(fanout, R) ->
     #{fanout := F} = R,
     [inv(every_command_answered, maps:get(answered, F) =:= maps:get(targets, F),
