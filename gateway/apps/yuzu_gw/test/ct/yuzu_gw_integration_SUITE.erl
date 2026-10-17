@@ -145,10 +145,10 @@ init_per_suite(Config) ->
     meck:new(yuzu_gw_heartbeat_buffer, [non_strict, no_link]),
     meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
-    meck:expect(yuzu_gw_upstream, proxy_register, fun(_) ->
+    meck:expect(yuzu_gw_upstream, proxy_register, fun(_, _Opts) ->
         {ok, #{session_id => <<"test-session">>}}
     end),
-    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_) ->
+    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_, _Opts) ->
         {ok, #{received => true}}
     end),
 
@@ -221,10 +221,10 @@ end_per_group(upstream, Config) ->
     meck:new(yuzu_gw_heartbeat_buffer, [non_strict, no_link]),
     meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
-    meck:expect(yuzu_gw_upstream, proxy_register, fun(_) ->
+    meck:expect(yuzu_gw_upstream, proxy_register, fun(_, _Opts) ->
         {ok, #{session_id => <<"test-session">>}}
     end),
-    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_) ->
+    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_, _Opts) ->
         {ok, #{received => true}}
     end),
     Config;
@@ -268,7 +268,7 @@ end_per_testcase(_TestCase, Config) ->
 
 agent_register_via_service(_Config) ->
     %% Update upstream mock for this specific test.
-    meck:expect(yuzu_gw_upstream, proxy_register, fun(_Req) ->
+    meck:expect(yuzu_gw_upstream, proxy_register, fun(_Req, _Opts) ->
         {ok, #{session_id => <<"test-session-1">>}}
     end),
 
@@ -321,7 +321,7 @@ agent_heartbeat_batching(_Config) ->
     end.
 
 agent_inventory_proxy(_Config) ->
-    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_Report) ->
+    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_Report, _Opts) ->
         {ok, #{received => true}}
     end),
 

@@ -81,7 +81,10 @@ register_carries_the_agent_deadline() ->
     _ = yuzu_gw_test_upstream:start_upstream(),
     _ = yuzu_gw_agent_service:register(ctx(#{<<"grpc-timeout">> => <<"900m">>}), req(<<"a3">>)),
     Opts = receive {opts, O} -> O after 5000 -> error(no_rpc) end,
-    ?assert(maps:get(timeout, Opts) < 900).
+    %% 900 ms less the stream handler's margin (yuzu_grpc_stream_h:deadline_ms/1:
+    %% 90 ms) less the upstream's own 200 ms: at most 610 ms reaches the server.
+    ?assertEqual(810, yuzu_grpc_stream_h:deadline_ms(900)),
+    ?assert(maps:get(timeout, Opts) =< 610).
 
 %%--------------------------------------------------------------------
 

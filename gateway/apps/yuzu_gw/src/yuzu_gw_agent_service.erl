@@ -419,21 +419,18 @@ report_inventory(Ctx, InventoryReport) ->
 
 %% The options of a proxied call: the handler's deadline, so the call upstream,
 %% and any wait for a permit before it, ends before the agent stops waiting. The
-%% stream handler ends the handler at the agent's grpc-timeout less min(1000,
-%% Ms div 10) (yuzu_grpc_stream_h:deadline_ms/1 on the EDGE branch; the same
-%% formula is applied here until that is merged), counted from when it armed
-%% the timer; counting from now instead leans late by the request-receive time,
-%% which the upstream's own margin (DEADLINE_MARGIN_MS) covers. No usable
-%% header: the upstream's default budget applies.
+%% stream handler ends the handler at yuzu_grpc_stream_h:deadline_ms/1 of the
+%% agent's grpc-timeout, counted from when it armed the timer; counting from now
+%% instead leans late by the request-receive time, which the upstream's own
+%% margin (DEADLINE_MARGIN_MS) covers. No usable header: the upstream's default
+%% budget applies.
 upstream_opts(Ctx) ->
     case yuzu_grpc_frame:parse_timeout(maps:get(<<"grpc-timeout">>, yuzu_grpc:headers(Ctx),
                                                 undefined)) of
-        {ok, Ms} -> #{deadline => erlang:monotonic_time(millisecond) + handler_deadline_ms(Ms)};
+        {ok, Ms} -> #{deadline => erlang:monotonic_time(millisecond)
+                                  + yuzu_grpc_stream_h:deadline_ms(Ms)};
         _        -> #{}
     end.
-
-handler_deadline_ms(Ms) ->
-    Ms - min(1000, Ms div 10).
 
 %% A refusal that means "try again later", answered UNAVAILABLE (the retryable
 %% gRPC status the agent backs off on) with a fixed message per reason:
