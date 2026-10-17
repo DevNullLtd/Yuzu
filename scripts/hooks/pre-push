@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# pre-push -- block a push that would publish personal or device-identifying data in a plugin
+# sample capture (docs/plugin-readme-standard.md rule 5). The repository is public, so CI is too
+# late: this runs before anything leaves the machine.
+#
+# Install (once per checkout, macOS, Linux and Git Bash on Windows):
+#     cp scripts/hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#
+# Checks only agents/plugins/*/docs/samples/*.txt files the pushed commits change, as they are in
+# the commit being pushed (not the working tree). Bypass for a reviewed false positive only:
+#     git push --no-verify
+set -u
+
+zero=0000000000000000000000000000000000000000
+root=$(git rev-parse --show-toplevel) || exit 1
+checker="$root/scripts/check-sample-privacy.py"
+[ -f "$checker" ] || exit 0  # a branch without the checker has nothing to enforce
+
+py=$(command -v python3 || command -v python) || {
+    echo "pre-push: no python3/python on PATH; cannot run the sample privacy check" >&2
+    exit 1
+}
+
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+status=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue  # deleting a remote branch
+    if [ "$remote_sha" = "$zero" ]; then
+        # New remote branch: compare with whatever the remote already has.
+        range=$(git rev-list "$local_sha" --not --remotes | tail -n 1)
+        [ -n "$range" ] || continue
+        base="$range^"
+        git rev-parse -q --verify "$base" >/dev/null || base=$(git hash-object -t tree /dev/null)
+    else
+        base=$remote_sha
+    fi
+    files=$(git diff --name-only --diff-filter=AM "$base" "$local_sha" -- 'agents/plugins/*/docs/samples/*.txt')
+    for f in $files; do
+        out="$tmp/$(echo "$f" | tr '/' '_')"
+        git show "$local_sha:$f" > "$out" 2>/dev/null || continue
+        if ! report=$("$py" "$checker" "$out" 2>/dev/null); then
+            printf '%s\n' "${report//$out/$f}" >&2
+            status=1
+        fi
+    done
+done
+
+if [ "$status" -ne 0 ]; then
+    echo "" >&2
+    echo "pre-push: BLOCKED. A plugin sample in this push contains personal or device-identifying" >&2
+    echo "data. Redact it with '(redacted)', note it in the stamp line, amend, and push again." >&2
+fi
+exit "$status"
