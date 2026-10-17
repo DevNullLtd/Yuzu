@@ -289,8 +289,10 @@ std::string render_auth_sample(const std::variant<SampleView, access::Unavailabl
 }
 
 std::string render_retention(int days) {
-    return "<div class=\"kvl\"><div><span>Kept for</span><b>" + std::to_string(days) +
-           " days</b></div><div><span>Cleaned up</span><b>Hourly</b></div></div>"
+    return "<div class=\"kvl\"><div><span>Kept for</span><b>" +
+           (days > 0 ? std::to_string(days) + " days" : std::string("Never")) +
+           "</b></div><div><span>Cleaned up</span><b>" +
+           std::string(days > 0 ? "Hourly" : "Never") + "</b></div></div>"
            "<div class=\"pb\"><p class=\"hint\">Read only. There is no tamper-evidence beyond "
            "access control: no hash chain or signature exists.</p></div>";
 }

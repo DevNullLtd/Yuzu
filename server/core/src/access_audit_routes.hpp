@@ -59,7 +59,9 @@ struct Deps {
     PermFn quiet_perm_fn;
     AuditFn audit_fn;
     QueryFn query_fn;
-    /// `Config::audit_retention_days`, read per call so a runtime change shows.
+    /// The retention the audit store ENFORCES (`AuditStore::retention_days()`), not the live
+    /// config value: the store copies it at construction, so a runtime config change does not
+    /// alter what is cleaned up. Zero or negative means never.
     std::function<int()> retention_days_fn;
     /// Epoch seconds; the time window is now - range. Injected so tests never read a clock.
     std::function<std::int64_t()> now_fn;

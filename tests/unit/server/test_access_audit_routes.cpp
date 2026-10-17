@@ -418,7 +418,7 @@ TEST_CASE("audit sample: an unreadable store is a red box and writes no audit ro
     CHECK(h.audits.empty());
 }
 
-TEST_CASE("audit retention: shows the configured days, read per call", "[access-audit][routes]") {
+TEST_CASE("audit retention: shows the figure the dependency supplies, read per call", "[access-audit][routes]") {
     Harness h;
     h.wire();
     auto res = h.get("/fragments/access/audit/retention");
@@ -428,6 +428,9 @@ TEST_CASE("audit retention: shows the configured days, read per call", "[access-
     h.retention = 30;
     res = h.get("/fragments/access/audit/retention");
     CHECK_THAT(res->body, ContainsSubstring("<b>30 days</b>"));
+    h.retention = 0;  // the store enforces nothing: "Never", not "0 days"
+    res = h.get("/fragments/access/audit/retention");
+    CHECK_THAT(res->body, ContainsSubstring("<span>Kept for</span><b>Never</b>"));
     CHECK(h.query_calls == 0);
 }
 

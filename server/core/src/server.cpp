@@ -15847,7 +15847,13 @@ private:
                         return std::nullopt;
                     return audit_store_->query(q, pool_size);
                 },
-                .retention_days_fn = [this]() { return cfg_.audit_retention_days; },
+                .retention_days_fn =
+                    [this]() {
+                        // The enforced figure (the store copies it at construction), not the
+                        // live config value; without a store, the startup config.
+                        return audit_store_ ? audit_store_->retention_days()
+                                            : cfg_.audit_retention_days;
+                    },
                 .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
             });
 

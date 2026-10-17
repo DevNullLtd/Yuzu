@@ -95,7 +95,8 @@ struct SampleView {
 /// The sample panel result (replaces `#audit-sample`'s innerHTML).
 std::string render_auth_sample(const std::variant<SampleView, access::Unavailable, BadFilter>& state);
 
-/// The retention panel body. The setting is process configuration, so there is no
+/// The retention panel body. `days` is the figure the audit store enforces; zero or negative
+/// means nothing is ever cleaned up and renders as "Never". The setting is process configuration, so there is no
 /// unavailable state; a refusal is the gate's (data-denied note).
 std::string render_retention(int days);
 

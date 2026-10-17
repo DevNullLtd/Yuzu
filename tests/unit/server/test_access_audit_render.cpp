@@ -362,3 +362,14 @@ TEST_CASE("audit retention render: days and the no-tamper-evidence statement, no
     CHECK_THAT(out, ContainsSubstring("no hash chain or signature exists"));
     CHECK_THAT(out, !ContainsSubstring("Events stored"));
 }
+
+TEST_CASE("audit retention render: zero or negative is Never, not a day count",
+          "[access-audit][render]") {
+    for (const int days : {0, -1}) {
+        INFO(days);
+        const auto out = render_retention(days);
+        CHECK_THAT(out, ContainsSubstring("<span>Kept for</span><b>Never</b>"));
+        CHECK_THAT(out, ContainsSubstring("<span>Cleaned up</span><b>Never</b>"));
+        CHECK_THAT(out, !ContainsSubstring(" days"));
+    }
+}

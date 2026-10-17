@@ -9,7 +9,8 @@ access_audit::register_access_audit_routes( ... ):
      `.audit_fn` is the server's `audit_fn`.
   2. `.query_fn` returns std::nullopt for a missing or closed audit store and otherwise returns
      `audit_store_->query(q, pool_size)`; it never returns a literal empty vector.
-  3. `.retention_days_fn` reads cfg_.audit_retention_days.
+  3. `.retention_days_fn` reads the store's enforced `audit_store_->retention_days()` (never the
+     live `cfg_.audit_retention_days`, which the store does not re-read).
 
 `//` comments are stripped and whitespace collapsed before matching. Lexical only: it cannot see
 a relocation that keeps the tokens (review-enforced). The self-test applies in-memory mutations
@@ -70,8 +71,9 @@ def audit_problems(src):
             out.append("audit .query_fn no longer reads audit_store_->query(q, pool_size)")
         if re.search(r"std::vector<AuditEvent>\{\}", body.replace("std::optional<std::vector<AuditEvent>>", "")):
             out.append("audit .query_fn returns a literal empty vector")
-    if ".retention_days_fn = [this]() { return cfg_.audit_retention_days; }," not in b:
-        out.append("audit .retention_days_fn no longer reads cfg_.audit_retention_days")
+    rf = re.search(r"\.retention_days_fn = (.*?), \.now_fn", b)
+    if not rf or "audit_store_->retention_days()" not in rf.group(1):
+        out.append("audit .retention_days_fn no longer reads the enforced audit_store_->retention_days()")
     if re.search(r"\.perm_fn = \[[^\]]*\]\([^)]*\) \{ return (true|false)", b):
         out.append("audit .perm_fn returns a constant")
     return out
@@ -92,7 +94,7 @@ MUTATIONS = [
     (r"if \(!audit_store_ \|\| !audit_store_->is_open\(\)\)\n\s*return std::nullopt;\n(\s*return audit_store_->query\(q, pool_size\);)",
      r"\1", "nullopt"),
     (r"return audit_store_->query\(q, pool_size\);", "return std::vector<AuditEvent>{};", "query"),
-    (r"return cfg_\.audit_retention_days;", "return 365;", "retention_days_fn"),
+    (r"audit_store_ \? audit_store_->retention_days\(\)", "true ? cfg_.audit_retention_days", "retention_days_fn"),
     (r"access_audit::register_access_audit_routes\(", "access_audit::register_access_audit_route(",
      "register_access_audit_routes"),
 ]
