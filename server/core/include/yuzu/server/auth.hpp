@@ -365,6 +365,28 @@ inline Role effective_role(const Session& s) { return is_elevated(s) ? Role::adm
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
 
+/// Epoch milliseconds read from the store -> a clock value, SATURATING. A bare
+/// `time_point{milliseconds{ms}}` multiplies by the clock's ticks-per-millisecond and wraps for a
+/// large `ms`: on a nanosecond system_clock (libstdc++) anything past about year 2262, so a
+/// far-future expiry carried in by the legacy .cfg import (the epoch may be any year up to 9999)
+/// came back negative and rendered as Expired or as a garbage date, while the SQL consume path
+/// still accepted the token. A value above the clock's range is `time_point::max()`, which every
+/// enrolment-token reader treats as the "never expires" sentinel (the list shows "Never"), and a
+/// value below it is `time_point::min()`. In-range values convert exactly.
+[[nodiscard]] inline std::chrono::system_clock::time_point
+epoch_ms_to_time_point(std::int64_t ms) noexcept {
+    using Clock = std::chrono::system_clock;
+    using std::chrono::duration_cast;
+    using std::chrono::milliseconds;
+    constexpr std::int64_t kMaxMs = duration_cast<milliseconds>((Clock::duration::max)()).count();
+    constexpr std::int64_t kMinMs = duration_cast<milliseconds>((Clock::duration::min)()).count();
+    if (ms > kMaxMs)
+        return (Clock::time_point::max)();
+    if (ms < kMinMs)
+        return (Clock::time_point::min)();
+    return Clock::time_point{duration_cast<Clock::duration>(milliseconds{ms})};
+}
+
 struct EnrollmentToken {
     std::string token_id;   // Short display ID (first 8 hex chars)
     std::string token_hash; // SHA-256 hash of the actual token (stored, never raw)
@@ -543,6 +565,18 @@ enum class RemovePendingOutcome : std::uint8_t {
     removed,      ///< The row existed, was `pending`, and was deleted.
     not_found,    ///< No row exists for this agent_id.
     wrong_status, ///< A row exists but is `approved`/`denied` — refused, not deleted.
+};
+
+/// Outcome of `AuthDB::approve_pending`/`deny_pending` (and the `AuthManager` wrappers). Only a
+/// `pending` row is ever moved: the decision is a guarded transition
+/// (`UPDATE .. WHERE status = 'pending'`), like `bulk_transition` and `remove_pending`. An
+/// unguarded UPDATE let a stale Approve on a denied row silently reverse the denial and a stale
+/// Deny on an approved row flip an enrolled agent to denied, with nothing in the audit trail
+/// to say an earlier decision had been overturned.
+enum class PendingTransitionOutcome : std::uint8_t {
+    changed,      ///< The row existed, was `pending`, and moved to the requested status.
+    not_found,    ///< No row exists for this agent_id.
+    wrong_status, ///< A row exists but is already `approved`/`denied` — left untouched.
 };
 
 /// Why `AuthManager::verify_password` refused (#5342 Gate 7, sec-3). The two
@@ -1269,10 +1303,11 @@ public:
     /// All pending-agent rows (any status), newest first (admin UI).
     [[nodiscard]] std::expected<std::vector<PendingAgent>, StoreError> list_pending_agents();
 
-    /// Approve / deny a pending agent. `true` = the row existed.
-    [[nodiscard]] std::expected<bool, StoreError>
+    /// Approve / deny a pending agent. Only a `pending` row moves; an already-decided row is
+    /// `wrong_status` and is left as it was — see `PendingTransitionOutcome`.
+    [[nodiscard]] std::expected<PendingTransitionOutcome, StoreError>
     approve_pending_agent(const std::string& agent_id, const std::string& principal);
-    [[nodiscard]] std::expected<bool, StoreError>
+    [[nodiscard]] std::expected<PendingTransitionOutcome, StoreError>
     deny_pending_agent(const std::string& agent_id, const std::string& principal);
 
     /// Bulk approve / deny: every row that is `pending` AT THE TIME OF THE

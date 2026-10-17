@@ -86,6 +86,7 @@ using yuzu::server::WebhookStore;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::AgentServiceImpl;
 using yuzu::server::detail::EventBus;
+using yuzu::server::auth::PendingTransitionOutcome;
 using yuzu::server::pg::PgPool;
 namespace pg = yuzu::server::pg;
 
@@ -1831,8 +1832,8 @@ TEST_CASE("Register: an id already in the store with unusual characters is never
     const std::string denied_id = "..";
     for (const auto* id : {&pending_id, &approved_id, &denied_id})
         REQUIRE(h.auth_mgr.add_pending_agent(*id, "h", "linux", "x86_64", "1").value());
-    REQUIRE(h.auth_mgr.approve_pending_agent(approved_id, "admin").value());
-    REQUIRE(h.auth_mgr.deny_pending_agent(denied_id, "admin").value());
+    REQUIRE(h.auth_mgr.approve_pending_agent(approved_id, "admin").value() == PendingTransitionOutcome::changed);
+    REQUIRE(h.auth_mgr.deny_pending_agent(denied_id, "admin").value() == PendingTransitionOutcome::changed);
 
     auto run = [&](const std::string& id, apb::RegisterResponse& resp) {
         auto req = make_plain_register(id);
@@ -1886,7 +1887,7 @@ TEST_CASE("ProxyRegister: the same charset gate, new ids only, with the gateway_
     // An id the store already holds keeps working through the gateway.
     const std::string legacy_id = "legacy/enrolled";
     REQUIRE(h.auth_mgr.add_pending_agent(legacy_id, "h", "linux", "x86_64", "1").value());
-    REQUIRE(h.auth_mgr.approve_pending_agent(legacy_id, "admin").value());
+    REQUIRE(h.auth_mgr.approve_pending_agent(legacy_id, "admin").value() == PendingTransitionOutcome::changed);
     auto req = make_plain_register(legacy_id);
     apb::RegisterResponse resp;
     CHECK(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
@@ -3179,7 +3180,7 @@ TEST_CASE("Register: admin-denied agent does not consume the enrollment token (#
     // Mark the attacker's agent_id admin-denied.
     REQUIRE(h.auth_mgr.add_pending_agent("denied-agent", "evil-host", "linux", "x86_64", "0.0.0-test")
                 .has_value());
-    REQUIRE(h.auth_mgr.deny_pending_agent("denied-agent", "admin").value());
+    REQUIRE(h.auth_mgr.deny_pending_agent("denied-agent", "admin").value() == PendingTransitionOutcome::changed);
     REQUIRE(h.auth_mgr.get_pending_status("denied-agent").value() ==
             yuzu::server::auth::PendingStatus::denied);
 
@@ -3268,7 +3269,7 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
         mint_enrollment_token(h.auth_mgr, "gw-dos-test", /*max_uses=*/1, std::chrono::hours(1));
     REQUIRE(h.auth_mgr.add_pending_agent("gw-denied", "evil-host", "linux", "x86_64", "0.0.0-test")
                 .has_value());
-    REQUIRE(h.auth_mgr.deny_pending_agent("gw-denied", "admin").value());
+    REQUIRE(h.auth_mgr.deny_pending_agent("gw-denied", "admin").value() == PendingTransitionOutcome::changed);
 
     apb::RegisterRequest req;
     req.mutable_info()->set_agent_id("gw-denied");
