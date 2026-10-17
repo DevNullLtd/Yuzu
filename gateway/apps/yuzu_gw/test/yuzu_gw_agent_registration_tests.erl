@@ -96,7 +96,13 @@ start_child_does_not_wait_for_the_registry() ->
     ?assert(lists:all(fun({ok, P}) -> is_pid(P); (_) -> false end, Results)),
     %% Once the registry runs again every agent registers.
     ok = wait_until(fun() ->
-        lists:all(fun(Id) -> element(1, yuzu_gw_registry:lookup(Id)) =:= ok end, Ids)
+        %% lookup/1 answers the bare atom `error' until the row is there, so
+        %% the predicate matches instead of taking element/2 of it.
+        lists:all(fun(Id) -> case yuzu_gw_registry:lookup(Id) of
+                                 {ok, _} -> true;
+                                 _ -> false
+                             end
+                  end, Ids)
     end, 5000),
     ?assertEqual(10, yuzu_gw_agent_sup:count()).
 

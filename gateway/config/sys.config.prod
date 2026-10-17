@@ -86,15 +86,18 @@
 
         %% Node-wide memory load shedding (yuzu_gw_memory_shedder). Samples
         %% erlang:memory(total); above the high-water mark it suspends the AGENT
-        %% listener(s) (new connections wait in the kernel backlog, established
+        %% listener(s) (the listen socket closes, so new agent connections are
+        %% refused with ECONNREFUSED and the agents retry, while established
         %% ones are untouched), below the low-water mark it resumes them. The
         %% management listener is never suspended. While shed, /readyz reports
         %% not-ready so a load balancer drains this node.
         %%
-        %% The defaults (high 0.75, low 0.65 of system memory, 1000 ms) apply
-        %% without this key. A fraction needs the system's total memory, read
-        %% from /proc/meminfo; where it cannot be read (no absolute bytes set)
-        %% the shedder runs inactive (the per-connection and per-stream bounds
+        %% The defaults (high 0.75, low 0.65 of the memory limit, 1000 ms) apply
+        %% without this key. The memory limit is the smaller of the host's
+        %% memory (/proc/meminfo) and the cgroup memory limit the gateway runs
+        %% under (a container limit or a systemd MemoryMax=), read at start;
+        %% where neither can be read (no absolute bytes set) the shedder runs
+        %% inactive (the per-connection and per-stream bounds
         %% still apply). To set absolute marks instead of fractions, use
         %% high_water_bytes / low_water_bytes. {enabled, false} turns it off.
         %%   {memory_shedding, #{high_water_fraction => 0.75,

@@ -7969,8 +7969,9 @@ public:
         // B-4 (#1238): the default CA + leaves are 10-year with NO auto-renewal,
         // so their eventual expiry is otherwise a silent outage. Publish the
         // absolute notAfter as a timestamp gauge so the yuzu-tls alert rules
-        // (warn @7d / crit @1d) fire ahead of it. The leaves are sized to the CA's
-        // notAfter, so cert="default-ca" is the binding expiry for the whole set.
+        // (warning from 30 d, critical from 7 d and again from 24 h) fire ahead of
+        // it. The leaves are sized to the CA's notAfter, so cert="default-ca" is
+        // the binding expiry for the whole set.
         if (default_cert_set_.ca_expires_at.time_since_epoch().count() != 0) {
             const auto exp_ts = std::chrono::duration_cast<std::chrono::seconds>(
                                     default_cert_set_.ca_expires_at.time_since_epoch())

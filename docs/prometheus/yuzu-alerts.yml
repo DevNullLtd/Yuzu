@@ -399,10 +399,17 @@ groups:
             resume (or suspend) agent listener(s)" names the reason. For
             eaddrinuse another process took the agent port while it was closed:
             find it with `ss -ltnp 'sport = :50051'` on the gateway host and
-            stop it. For emfile or enfile the gateway is out of file
-            descriptors: raise LimitNOFILE or lower the agent listener's
-            max_connections. Otherwise restart the gateway, which reconnects
-            its agents.
+            stop it; the shedder's next try then succeeds. For emfile or
+            enfile the gateway is out of file descriptors: raise LimitNOFILE or
+            lower the agent listener's max_connections, both of which take
+            effect only when the gateway process starts again. For those, or
+            for any other reason, restart the gateway only if the failure is
+            still logged and this node's agents can take the disconnect: a
+            restart reopens the listener but disconnects every agent the node
+            holds, and agents without the #5183 fix (in no release yet) stay
+            wedged after it, so restart the agent service on any agent that
+            has not reconnected a few minutes later (see "What happens when
+            the server restarts" in docs/user-manual/gateway.md).
 
       # HA WS-4 4.2b — `#4246` item #1's alert-rule half. Emitted by the
       # SERVER (gateway_service_impl.cpp's record_route_store_failure), not
@@ -1007,20 +1014,29 @@ groups:
           summary: "The server is slow for gateway {{ $labels.instance }}"
           description: >-
             For at least half of the last minute, and continuously for 5 minutes,
-            the path from {{ $labels.instance }} to the server was backed up: the
-            upstream process was inside an RPC with work waiting, or every
-            stream-status notification or Guardian forward slot was held.
-            Registrations queue behind the slow call and notifications beyond
-            the cap are dropped (yuzu_gw_upstream_notify_dropped_total). The
-            circuit breaker stays closed, because the calls succeed. FIRST: is it
+            the path from {{ $labels.instance }} to the server was backed up: a
+            live registration or inventory report was waiting for an upstream
+            permit because every permit of its pool was held (the pools are
+            sized from the configured pool sizes and the server's declared
+            stream limit), or every stream-status notification or Guardian forward
+            slot was held. A waiting registration queues until the agent's own
+            deadline; past it, or with the queue full, it is refused
+            UNAVAILABLE and the agent retries
+            (yuzu_gw_upstream_permit_refused_total{class="register"}). A
+            notification is held while its slots are full and lost only when
+            the held store is full (yuzu_gw_upstream_notify_dropped_total); a
+            Guardian forward past its slots is dropped. The circuit breaker
+            stays closed, because the calls succeed. FIRST: is it
             every gateway? avg(yuzu_gw_upstream_slow) near 1 means the server or
             its database is slow (check PostgreSQL, including a failover that
             slowed both servers); one gateway among many at 0 means that gateway
             or its network path. THEN: rate(yuzu_gw_upstream_lane_saturated_seconds_total[5m])
-            by lane says which lane, and yuzu_gw_upstream_rpc_duration_ms says
-            whether the server is slow or the gateway is simply carrying more
-            work than one serial lane drains (a restarted fleet registering at
-            once looks the same). Nothing is wrong with the gateway's readiness;
+            by lane says which lane (permits, notify or guardian),
+            yuzu_gw_upstream_permit_wait_seconds how long registrations wait,
+            and yuzu_gw_upstream_rpc_duration_ms whether the server is slow or
+            the gateway is carrying more work than its permits drain at a
+            healthy server's pace (a restarted fleet registering at once looks
+            the same). Nothing is wrong with the gateway's readiness;
             do not restart it, which disconnects its agents.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md"
 

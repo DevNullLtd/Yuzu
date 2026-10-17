@@ -466,7 +466,16 @@ invariants(ramp, R) -> registration_invariants(R);
 invariants(storm, R) -> registration_invariants(R);
 invariants(server_crash, R) ->
     #{replay := Replay, disconnected_lost := Lost, convergence := Conv} = R,
-    [inv(replay_complete, maps:get(complete, Replay),
+    %% The two waits first: the counts below are read after them, so a wait
+    %% that stalled or hit its cap would leave them describing an unfinished
+    %% run (and a final count can catch up during the settle that follows).
+    [inv(replay_and_agents_back, maps:get(replay_and_agents_back, Replay),
+         "every held session was replayed and every agent was live again before "
+         "that wait stalled or reached its cap"),
+     inv(all_converged, maps:get(all_converged, Replay),
+         "every replay, every live agent and every flapped agent's DISCONNECTED "
+         "reached the server before the second wait stalled or reached its cap"),
+     inv(replay_complete, maps:get(complete, Replay),
          "every session the gateway held was replayed to the restarted server"),
      inv(replay_in_parallel, maps:get(peak_inflight, Replay) > 1,
          "the replay had more than one ProxyRegister in flight at the server at once"),
@@ -489,7 +498,12 @@ invariants(planned_stop, R) ->
          "the gateway node logged no crash or supervisor report during the planned stop")];
 invariants(upstream_conn_loss, R) ->
     #{register := Reg, convergence := Conv} = R,
-    [inv(connection_closed, maps:get(connections_closed, R) >= 1,
+    %% The precondition first: without enough calls on the wire when the
+    %% connection went, breaker_stayed_closed proves nothing.
+    [inv(inflight_reached, maps:get(inflight_reached, R),
+         "at least 8 ProxyRegister calls were in flight at the server when its "
+         "connection was closed"),
+     inv(connection_closed, maps:get(connections_closed, R) >= 1,
          "the server closed at least one gateway connection with calls in flight"),
      inv(breaker_stayed_closed, maps:get(open, maps:get(breaker_transitions, R)) =:= 0,
          "one lost upstream connection did not open the circuit breaker"),
