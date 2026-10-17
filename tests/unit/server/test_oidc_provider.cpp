@@ -87,6 +87,90 @@ private:
 };
 } // namespace
 
+// ── Leases and retirement (#5692: no lock held across IdP network I/O) ───────
+
+namespace {
+std::unique_ptr<OidcProvider> lease_test_provider() {
+    OidcConfig cfg;
+    cfg.issuer = "https://idp.example.test";
+    cfg.client_id = "lease-test-client";
+    return std::make_unique<OidcProvider>(std::move(cfg));
+}
+} // namespace
+
+TEST_CASE("OIDC lease: a provider is not destroyed while a request still holds a lease",
+          "[oidc][oidc_lease]") {
+    auto provider = lease_test_provider();
+    auto lease = provider->acquire_lease();
+    REQUIRE(lease);
+    CHECK(provider->lease_count_for_test() == 1);
+
+    std::atomic<bool> destroyed{false};
+    ScopedThreads threads;
+    threads.spawn([&, p = std::move(provider)]() mutable {
+        p.reset(); // blocks in ~OidcProvider until the lease is released
+        destroyed.store(true);
+    });
+    // A bounded negative check: if the destructor did not wait it would finish within
+    // microseconds, so a slow thread can only make this pass spuriously, never fail it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_FALSE(destroyed.load());
+
+    lease = OidcProvider::Lease{}; // release: the destructor may now finish
+    threads.join_all();
+    CHECK(destroyed.load());
+}
+
+TEST_CASE("OIDC lease: retire() returns at once and destroys the provider after its last lease",
+          "[oidc][oidc_lease]") {
+    OidcProvider::drain_retired(); // a clean slate: the list is process-wide
+    REQUIRE(OidcProvider::retired_count_for_test() == 0);
+
+    auto old = lease_test_provider();
+    auto lease = old->acquire_lease();
+    OidcProvider* const raw = old.get();
+    OidcProvider::retire(std::move(old)); // must not wait for the lease
+    CHECK(OidcProvider::retired_count_for_test() == 1);
+    CHECK(raw->lease_count_for_test() == 1); // still alive and usable
+
+    lease = OidcProvider::Lease{};
+    // The next retirement sweeps: both providers are idle now, so both are destroyed.
+    OidcProvider::retire(lease_test_provider());
+    CHECK(OidcProvider::retired_count_for_test() == 0);
+}
+
+TEST_CASE("OIDC lease: the retirement list is bounded", "[oidc][oidc_lease]") {
+    OidcProvider::drain_retired();
+    std::vector<OidcProvider::Lease> leases;
+    for (std::size_t i = 0; i < OidcProvider::kMaxRetired; ++i) {
+        auto p = lease_test_provider();
+        leases.push_back(p->acquire_lease());
+        OidcProvider::retire(std::move(p));
+    }
+    CHECK(OidcProvider::retired_count_for_test() == OidcProvider::kMaxRetired);
+
+    // One more with a lease: the oldest is destroyed to stay within the cap, and that waits for
+    // ITS lease (the one case a retirement blocks), so release it from another thread.
+    auto extra = lease_test_provider();
+    leases.push_back(extra->acquire_lease());
+    std::atomic<bool> retired_extra{false};
+    ScopedThreads threads;
+    threads.spawn([&, e = std::move(extra)]() mutable {
+        OidcProvider::retire(std::move(e));
+        retired_extra.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_FALSE(retired_extra.load()); // blocked on the oldest provider's lease
+    leases.front() = OidcProvider::Lease{};
+    threads.join_all();
+    CHECK(retired_extra.load());
+    CHECK(OidcProvider::retired_count_for_test() == OidcProvider::kMaxRetired);
+
+    leases.clear(); // release every remaining lease, then empty the list
+    OidcProvider::drain_retired();
+    CHECK(OidcProvider::retired_count_for_test() == 0);
+}
+
 // ── Base64URL ────────────────────────────────────────────────────────────────
 
 TEST_CASE("OIDC: base64url encode/decode roundtrip", "[oidc]") {
@@ -1581,6 +1665,30 @@ TEST_CASE("OIDC token exchange: the response cap in these cases is the one the p
     CHECK(ss.str().find("constexpr std::size_t kHttpMaxBody = 256 * 1024;") != std::string::npos);
 }
 
+TEST_CASE("OIDC token exchange: the Windows POST checks the cracked host and port against the "
+          "vetted ones (source pin)",
+          "[oidc][oidc_egress][source_pin]") {
+    // The Windows branch cannot be built here. Pin the shape that makes the check real: the
+    // exchange passes the VETTED host and port into winhttp_post, which compares them with what
+    // WinHttpCrackUrl extracted before it connects.
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "oidc_provider.cpp",
+                     std::ios::binary);
+    REQUIRE(in.is_open());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const auto text = ss.str();
+    const auto post_at = text.find("static std::string winhttp_post(");
+    REQUIRE(post_at != std::string::npos);
+    const auto open_at = text.find("WinHttpOpen(", post_at);
+    REQUIRE(open_at != std::string::npos);
+    const auto body = text.substr(post_at, open_at - post_at); // everything before it connects
+    CHECK(body.find("cracked_host_is_vetted(std::wstring_view(host, uc.dwHostNameLength), "
+                    "vetted_host)") != std::string::npos);
+    CHECK(body.find("static_cast<unsigned>(uc.nPort) != vetted_port") != std::string::npos);
+    CHECK(text.find("winhttp_post(*token_endpoint, egress_target->host, vetted_port, form_body,") !=
+          std::string::npos);
+}
+
 TEST_CASE("OIDC discovery: an explicitly configured field is authoritative and is never discovered",
           "[oidc][oidc_discovery]") {
     MockIdp idp;
@@ -2685,27 +2793,45 @@ TEST_CASE(YUZU_OIDC_LOWFD_HELPER_CASE, "[.][oidc_lowfd_helper]") {
 
     // Warm up what the fetch initializes lazily and would otherwise spend the spare descriptors
     // on (OpenSSL's config file, the resolver), so the numbers below mean what they say.
+    // Each of these has an owner that releases it when its scope ends, which is before the
+    // descriptors are exhausted below (the earlier manual pairs were a policy-floor finding).
     OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, nullptr);
-    if (SSL_CTX* ctx = SSL_CTX_new(TLS_client_method()))
-        SSL_CTX_free(ctx);
+    {
+        std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(SSL_CTX_new(TLS_client_method()),
+                                                              &SSL_CTX_free);
+    }
     {
         addrinfo hints{};
         hints.ai_socktype = SOCK_STREAM;
-        addrinfo* res = nullptr;
-        if (::getaddrinfo("127.0.0.1", "443", &hints, &res) == 0)
-            ::freeaddrinfo(res);
+        addrinfo* raw = nullptr;
+        if (::getaddrinfo("127.0.0.1", "443", &hints, &raw) == 0) {
+            std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> res(raw, &::freeaddrinfo);
+        }
     }
 
+    // A descriptor opened only to be duplicated onto a closed standard slot: closed by its owner
+    // after the dup2, or given up (release) when the opened descriptor already IS that slot.
+    struct TempFd {
+        int fd;
+        ~TempFd() {
+            if (fd >= 0)
+                ::close(fd);
+        }
+        TempFd(const TempFd&) = delete;
+        TempFd& operator=(const TempFd&) = delete;
+        explicit TempFd(int f) : fd(f) {}
+        void release() { fd = -1; }
+    };
     for (int fd = 0; fd < 3; ++fd) {
         if (::fcntl(fd, F_GETFD) != -1)
             continue;
-        const int n = ::open("/dev/null", O_RDWR);
-        if (n < 0)
+        TempFd n{::open("/dev/null", O_RDWR)};
+        if (n.fd < 0)
             ::_exit(kLowFdSetupFailed);
-        if (n != fd) {
-            ::dup2(n, fd);
-            ::close(n);
-        }
+        if (n.fd == fd)
+            n.release(); // the opened descriptor is the standard one: keep it open
+        else if (::dup2(n.fd, fd) < 0)
+            ::_exit(kLowFdSetupFailed); // otherwise ~TempFd closes the temporary
     }
     for (int fd = 3; fd < 3 + spare + 64; ++fd)
         ::close(fd);

@@ -1,4 +1,5 @@
 #include "oidc_provider.hpp"
+#include "oidc_vetted_host.hpp"
 
 #include "evp_raii.hpp"
 #include "oidc_abandoned_ledger.hpp"
@@ -25,6 +26,7 @@
 #include <optional>
 #include <span>
 #include <sstream>
+#include <cstdlib>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -626,7 +628,13 @@ struct WinHttpHandles {
 };
 } // namespace
 
-static std::string winhttp_post(const std::string& url, const std::string& form_body,
+// `vetted_host` is the host the egress policy classified (split_http_url's, brackets stripped):
+// WinHTTP cannot pin an address, so the one thing this leg can still do is refuse to connect to a
+// host other than the one that was vetted. WinHttpCrackUrl parses the URL a second time and a
+// disagreement between the two parsers must fail closed, as the POSIX paths do (they compare
+// `client->host()` with the vetted host).
+static std::string winhttp_post(const std::string& url, const std::string& vetted_host,
+                                unsigned vetted_port, const std::string& form_body,
                                 const std::string& auth_header = {}) {
     // Parse URL into components
     // Expected: https://host/path
@@ -645,6 +653,16 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
 
     if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) {
         spdlog::error("WinHTTP: failed to crack URL: {}", ::yuzu::log_key_token(url));
+        return {};
+    }
+    if (!cracked_host_is_vetted(std::wstring_view(host, uc.dwHostNameLength), vetted_host)) {
+        spdlog::error("WinHTTP: the URL's host is not the host the egress policy vetted: {}",
+                      ::yuzu::log_key_token(url));
+        return {};
+    }
+    if (static_cast<unsigned>(uc.nPort) != vetted_port) {
+        spdlog::error("WinHTTP: the URL's port is not the port the egress policy vetted: {}",
+                      ::yuzu::log_key_token(url));
         return {};
     }
 
@@ -1409,7 +1427,20 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
         return std::unexpected(std::string("token endpoint request failed: ") + vet.error());
     }
     // Use WinHTTP on Windows — httplib's OpenSSL client fails from handler threads.
-    response_body = winhttp_post(*token_endpoint, form_body, auth_header);
+    // The vetted port, from the same parse the vet used: an explicit ":port" after the host,
+    // else the scheme default. WinHTTP cracks the URL again, and the two must agree.
+    unsigned vetted_port = egress_target->cleartext ? 80u : 443u;
+    {
+        const auto& origin = egress_target->origin;
+        const auto authority = origin.substr(origin.find("://") + 3);
+        const auto colon = authority.rfind(':');
+        const auto bracket = authority.rfind(']');
+        if (colon != std::string::npos && (bracket == std::string::npos || colon > bracket))
+            vetted_port = static_cast<unsigned>(std::strtoul(authority.c_str() + colon + 1,
+                                                             nullptr, 10));
+    }
+    response_body = winhttp_post(*token_endpoint, egress_target->host, vetted_port, form_body,
+                                 auth_header);
     if (response_body.empty()) {
         spdlog::error("OIDC token exchange: WinHTTP POST failed");
         return std::unexpected("token endpoint request failed (WinHTTP)");
@@ -2535,6 +2566,95 @@ std::size_t OidcProvider::pending_flow_count_for_test() const {
 }
 
 // ── OidcProvider ─────────────────────────────────────────────────────────────
+
+OidcProvider::~OidcProvider() {
+    std::unique_lock lock(lease_mu_);
+    lease_cv_.wait(lock, [this] { return leases_ == 0; });
+}
+
+OidcProvider::Lease OidcProvider::acquire_lease() noexcept {
+    std::lock_guard lock(lease_mu_);
+    ++leases_;
+    return Lease(this);
+}
+
+void OidcProvider::release_lease() noexcept {
+    // Notify under the lock: the destructor may be waiting, and it frees `lease_cv_` as soon as
+    // it wakes, so the notify must happen before this thread lets go of `lease_mu_`.
+    std::lock_guard lock(lease_mu_);
+    --leases_;
+    lease_cv_.notify_all();
+}
+
+bool OidcProvider::has_leases() const {
+    std::lock_guard lock(lease_mu_);
+    return leases_ != 0;
+}
+
+std::size_t OidcProvider::lease_count_for_test() const {
+    std::lock_guard lock(lease_mu_);
+    return leases_;
+}
+
+namespace {
+
+/// Providers swapped out by a Settings save that still have a request in flight. Never
+/// destroyed (a function-local pointer, like the abandoned-request ledger) so no static
+/// destructor can wait on a request at exit; `drain_retired` empties it at server stop.
+struct RetiredProviders {
+    std::mutex mu;
+    std::vector<std::unique_ptr<OidcProvider>> list;
+};
+
+RetiredProviders& retired_providers() {
+    static auto* const instance = new RetiredProviders();
+    return *instance;
+}
+
+} // namespace
+
+void OidcProvider::retire(std::unique_ptr<OidcProvider> unpublished) {
+    if (!unpublished)
+        return;
+    std::vector<std::unique_ptr<OidcProvider>> to_destroy; // destroyed after the list mutex drops
+    {
+        auto& r = retired_providers();
+        std::lock_guard lock(r.mu);
+        r.list.push_back(std::move(unpublished));
+        // Sweep: a retired provider with no lease can never gain one (it is unpublished), so
+        // destroying it now cannot block. The others wait for their requests to finish.
+        for (auto it = r.list.begin(); it != r.list.end();) {
+            if (!(*it)->has_leases()) {
+                to_destroy.push_back(std::move(*it));
+                it = r.list.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Bounded: beyond the cap, the oldest is destroyed below, which waits for its leases.
+        while (r.list.size() > kMaxRetired) {
+            to_destroy.push_back(std::move(r.list.front()));
+            r.list.erase(r.list.begin());
+        }
+    }
+    to_destroy.clear();
+}
+
+void OidcProvider::drain_retired() {
+    std::vector<std::unique_ptr<OidcProvider>> to_destroy;
+    {
+        auto& r = retired_providers();
+        std::lock_guard lock(r.mu);
+        to_destroy.swap(r.list);
+    }
+    to_destroy.clear();
+}
+
+std::size_t OidcProvider::retired_count_for_test() {
+    auto& r = retired_providers();
+    std::lock_guard lock(r.mu);
+    return r.list.size();
+}
 
 OidcProvider::OidcProvider(OidcConfig config) : config_(std::move(config)) {
     // No network here: endpoints are discovered lazily by ensure_discovered, so a provider can be

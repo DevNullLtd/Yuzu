@@ -8138,7 +8138,12 @@ public:
         return true;
     }
 
-    ~ServerImpl() override { stop(); }
+    ~ServerImpl() override {
+        stop();
+        // Providers a Settings save swapped out while a sign-in was still using them (#5692).
+        // stop() has ended the web threads, so every lease is released and this cannot wait.
+        oidc::OidcProvider::drain_retired();
+    }
 
     [[nodiscard]] bool startup_failed() const override { return startup_failed_; }
 

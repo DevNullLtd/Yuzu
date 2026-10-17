@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <expected>
 #include <functional>
@@ -11,6 +12,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // OpenSSL is an unconditional server dependency on every platform (vcpkg.json;
@@ -145,6 +147,75 @@ struct CachedJwk {
 class OidcProvider {
 public:
     explicit OidcProvider(OidcConfig config);
+
+    /// Blocks until every outstanding `Lease` is released, so a provider is never destroyed
+    /// under a request that is still using it. The wait lasts as long as the slowest request
+    /// holding a lease: discovery and the JWKS fetch have a total bound, but the token POST has
+    /// only per-operation timeouts (no total bound, #5983). A leaked `Lease` is a bug and would
+    /// hang here.
+    ~OidcProvider();
+    OidcProvider(const OidcProvider&) = delete;
+    OidcProvider& operator=(const OidcProvider&) = delete;
+
+    /// A request's claim on the provider it is using, taken UNDER the route's shared
+    /// `oidc_mu_` and released after the lock is dropped. It exists so a request can run its
+    /// network I/O (discovery, token POST, JWKS) WITHOUT holding the lock: a Settings save
+    /// takes the same lock exclusively to swap the provider, and a lock held across I/O made
+    /// that save (and, behind the pending writer, every new sign-in) wait for the slowest
+    /// in-flight request (#5692, ledger `oidc-shared-lock-held-across-network-fetch`).
+    /// Move-only RAII; an empty Lease owns nothing.
+    class Lease {
+    public:
+        Lease() = default;
+        Lease(Lease&& other) noexcept : p_(std::exchange(other.p_, nullptr)) {}
+        Lease& operator=(Lease&& other) noexcept {
+            if (this != &other) {
+                release();
+                p_ = std::exchange(other.p_, nullptr);
+            }
+            return *this;
+        }
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+        ~Lease() { release(); }
+
+        explicit operator bool() const noexcept { return p_ != nullptr; }
+        OidcProvider* get() const noexcept { return p_; }
+        OidcProvider* operator->() const noexcept { return p_; }
+
+    private:
+        friend class OidcProvider;
+        explicit Lease(OidcProvider* p) noexcept : p_(p) {}
+        void release() noexcept {
+            if (p_ != nullptr)
+                std::exchange(p_, nullptr)->release_lease();
+        }
+        OidcProvider* p_{nullptr};
+    };
+
+    /// Take a lease. MUST be called while the caller holds the route's shared `oidc_mu_` and
+    /// has just observed this provider as the published one: a provider is retired only after
+    /// the exclusive `oidc_mu_` swap unpublished it, so no new lease can start on it afterwards.
+    [[nodiscard]] Lease acquire_lease() noexcept;
+
+    /// Hand a provider that was just unpublished (swapped out under the exclusive lock, which
+    /// the caller has since released) to the process-wide retirement list instead of
+    /// destroying it under the lock. Idle retired providers are destroyed at once; one that
+    /// still has leases is kept until they drain, so a Settings save never waits for a
+    /// sign-in. The list holds at most `kMaxRetired`: beyond that the oldest is destroyed
+    /// here, which waits for ITS leases (the one case a retirement can wait; the save calls this
+    /// last, so only its reply is delayed). Releasing the last lease does not destroy a retired
+    /// provider: the next `retire()` or `drain_retired()` does.
+    static void retire(std::unique_ptr<OidcProvider> unpublished);
+
+    /// Destroy every retired provider, waiting for any leases. Called once at server stop.
+    static void drain_retired();
+
+    static constexpr std::size_t kMaxRetired = 16;
+
+    /// Test seams.
+    [[nodiscard]] std::size_t lease_count_for_test() const;
+    [[nodiscard]] static std::size_t retired_count_for_test();
 
     bool is_enabled() const;
 
@@ -456,6 +527,13 @@ private:
     OidcConfig config_;
     std::atomic<int> http_timeout_ms_{kHttpOperationTimeoutMs}; // test seam only
     mutable std::mutex mu_;
+
+    // Outstanding `Lease`s (see acquire_lease). Guarded by lease_mu_; the destructor waits on it.
+    void release_lease() noexcept;
+    [[nodiscard]] bool has_leases() const;
+    mutable std::mutex lease_mu_;
+    std::condition_variable lease_cv_;
+    std::size_t leases_{0};
 
     // Lazy discovery (ensure_discovered). Guards the four members below.
     std::mutex discovery_mu_;

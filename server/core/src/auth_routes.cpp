@@ -3432,15 +3432,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
     // -- OIDC SSO endpoints ---------------------------------------------------
     sink.Get("/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
-        std::shared_lock oidc_lock(oidc_mu_);
-        if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
-            res.status = 404;
-            res.set_content(detail::a4_error(res, "OIDC not configured"), "application/json");
-            return;
+        // Take a lease on the published provider and copy the settings this request reads,
+        // under the shared lock, then DROP the lock: `start_auth_flow` can run lazy discovery
+        // (network I/O), and a lock held across it makes a Settings save wait for the slowest
+        // in-flight request (#5692). The lease keeps the provider alive after a swap.
+        oidc::OidcProvider::Lease provider;
+        std::string redirect_uri;
+        {
+            std::shared_lock oidc_lock(oidc_mu_);
+            if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "OIDC not configured"), "application/json");
+                return;
+            }
+            redirect_uri = cfg_.oidc_redirect_uri;
+            provider = oidc_provider_->acquire_lease();
         }
         // Use the configured redirect URI only — never derive from the
         // Host header, which can be manipulated for phishing attacks (M3).
-        if (cfg_.oidc_redirect_uri.empty()) {
+        if (redirect_uri.empty()) {
             res.status = 500;
             res.set_content(
                 detail::a4_error(res, "OIDC redirect_uri not configured — set "
@@ -3455,7 +3465,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // answer a plain 500 and set nothing, never a redirect without a binding cookie.
         oidc::OidcProvider::AuthFlowStart flow;
         try {
-            flow = oidc_provider_->start_auth_flow(cfg_.oidc_redirect_uri);
+            flow = provider->start_auth_flow(redirect_uri);
         } catch (const std::exception& e) {
             spdlog::error("OIDC auth flow could not start: {}", e.what());
             res.status = 500;
@@ -3468,11 +3478,22 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     });
 
     sink.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
-        std::shared_lock oidc_lock(oidc_mu_);
-        if (!oidc_provider_) {
-            res.status = 404;
-            res.set_content("OIDC not configured", "text/plain");
-            return;
+        // Lease + settings snapshot under the shared lock, then drop it (see /auth/oidc/start):
+        // `handle_callback` does the token POST and the JWKS fetch, so holding the lock across
+        // it made a Settings save wait behind a sign-in, and every new sign-in behind that save.
+        oidc::OidcProvider::Lease provider;
+        std::string admin_group_setting;
+        std::string scim_link_claim_setting;
+        {
+            std::shared_lock oidc_lock(oidc_mu_);
+            if (!oidc_provider_) {
+                res.status = 404;
+                res.set_content("OIDC not configured", "text/plain");
+                return;
+            }
+            admin_group_setting = cfg_.oidc_admin_group;
+            scim_link_claim_setting = cfg_.oidc_scim_link_claim;
+            provider = oidc_provider_->acquire_lease();
         }
 
         // Check for error response from IdP
@@ -3532,7 +3553,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         bool binding_verified = false;
         auto result =
-            oidc_provider_->handle_callback(code, state, binding_secret, &binding_verified);
+            provider->handle_callback(code, state, binding_secret, &binding_verified);
+        // The provider is not used again: drop the lease now so the session, group-sync and
+        // audit work below does not keep a swapped-out provider alive.
+        provider = oidc::OidcProvider::Lease{};
         // The binding cookie is single-use and is cleared only when THIS visitor's cookie proved
         // a pending flow (a success, or a failure after the match); a success then appends the
         // session cookie after it. A callback that matches no pending flow leaves the cookie in place,
@@ -3585,14 +3609,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // helper, which is also what AuthManager::create_oidc_session uses,
         // so the two mint sites cannot drift apart.
         const std::string username = oidc::oidc_principal_id(claims.iss, claims.sub);
-        auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
+        const auto& admin_gid = admin_group_setting;
 
         // ADR-2001 §4 — the SAME externalId candidate value link formation
         // uses below (`link_oidc_login_to_scim`) — computed once here so the
         // deny-at-login backstop's reprovision check (governance U1) and
         // link formation can never drift onto different values.
         const std::string link_claim_value =
-            cfg_.oidc_scim_link_claim == "oid" ? claims.oid : claims.sub;
+            scim_link_claim_setting == "oid" ? claims.oid : claims.sub;
 
         // ADR-2001 §4 — deny-at-login backstop, PRIMARY check. Runs before
         // every mutation below (group reconcile, session mint,

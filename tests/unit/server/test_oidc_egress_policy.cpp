@@ -9,6 +9,7 @@
 
 #include "oidc_abandoned_ledger.hpp"
 #include "oidc_egress_policy.hpp"
+#include "oidc_vetted_host.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -989,4 +990,28 @@ TEST_CASE("OIDC egress: in-flight resolver lookups count against the ledger and 
     CHECK(ledger.try_reserve());
     CHECK(ledger.try_reserve());
     CHECK_FALSE(ledger.try_reserve());
+}
+
+// ── The Windows token POST's host check (WinHTTP cannot pin) ─────────────────
+
+TEST_CASE("OIDC egress: the host WinHTTP cracked must be the host the policy vetted",
+          "[oidc][oidc_egress][security]") {
+    using yuzu::server::oidc::cracked_host_is_vetted;
+    CHECK(cracked_host_is_vetted(L"idp.example.test", "idp.example.test"));
+    CHECK(cracked_host_is_vetted(L"IDP.Example.TEST", "idp.example.test")); // DNS is case-blind
+    CHECK(cracked_host_is_vetted(L"127.0.0.1", "127.0.0.1"));
+    CHECK(cracked_host_is_vetted(L"[::1]", "::1"));  // brackets around an IPv6 literal
+    CHECK(cracked_host_is_vetted(L"::1", "[::1]"));
+
+    // Two parsers that disagree about the host: refused.
+    CHECK_FALSE(cracked_host_is_vetted(L"evil.example.test", "idp.example.test"));
+    CHECK_FALSE(cracked_host_is_vetted(L"idp.example.test.evil.test", "idp.example.test"));
+    CHECK_FALSE(cracked_host_is_vetted(L"idp.example.tes", "idp.example.test")); // length
+    CHECK_FALSE(cracked_host_is_vetted(L"169.254.169.254", "idp.example.test"));
+    CHECK_FALSE(cracked_host_is_vetted(L"", "idp.example.test"));
+    CHECK_FALSE(cracked_host_is_vetted(L"", ""));
+    CHECK_FALSE(cracked_host_is_vetted(L"[]", "[]")); // an empty bracket pair is not a host
+    // A wide character is a different host than any ASCII one, even if it looks alike.
+    CHECK_FALSE(cracked_host_is_vetted(L"idp.exampl\u0435.test", "idp.example.test"));
+    CHECK_FALSE(cracked_host_is_vetted(L"idp.example.test", "idp.exampl\xC3\xA9.test"));
 }

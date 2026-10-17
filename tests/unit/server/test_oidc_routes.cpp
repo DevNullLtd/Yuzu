@@ -41,6 +41,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <thread>
+#include <chrono>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -876,6 +879,60 @@ TEST_CASE(
     CHECK(ok_rows == 1); // only the control login: the failed one wrote no ok row
     CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
           1.0);
+}
+
+TEST_CASE("OIDC route: a provider swap does not wait for an in-flight sign-in start",
+          "[pg][oidc][oidc_discovery][oidc_lease][auth_routes]") {
+    // /auth/oidc/start runs lazy discovery (network I/O). It used to hold the shared oidc_mu_
+    // for all of it, so a Settings save (exclusive lock) waited for the slowest fetch and every
+    // new sign-in waited behind that save. Now the route holds a lease, not the lock.
+    DiscoveryRig rig;
+    rig.idp.hold_discovery();
+    Browser a;
+    std::atomic<int> start_status{0};
+    std::thread worker([&] {
+        auto r = rig.fix.sink.dispatch("GET", "/auth/oidc/start", {}, "application/json",
+                                       a.headers());
+        start_status.store(r ? r->status : -1);
+    });
+    // Declared after `worker`, so it runs first on any exit (a failing REQUIRE included): the
+    // held fetch is released and the thread joined before anything it captured is destroyed.
+    struct ReleaseAndJoin {
+        yuzu::server::test::MockIdp& idp;
+        std::thread& t;
+        ~ReleaseAndJoin() {
+            idp.release_discovery();
+            if (t.joinable())
+                t.join();
+        }
+    } release_and_join{rig.idp, worker};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (rig.idp.discovery_calls.load() < 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    REQUIRE(rig.idp.discovery_calls.load() == 1); // the request is inside its fetch
+
+    // What the Settings save does: take the exclusive lock, swap, release, retire.
+    std::unique_ptr<oidc::OidcProvider> unpublished;
+    {
+        // try_lock may fail spuriously, so retry for a bounded time; a request that really held
+        // the lock for its whole fetch (the old behavior) never lets go while discovery is held.
+        std::unique_lock exclusive(rig.fix.oidc_mu, std::defer_lock);
+        const auto lock_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!exclusive.try_lock() && std::chrono::steady_clock::now() < lock_deadline)
+            std::this_thread::yield();
+        REQUIRE(exclusive.owns_lock()); // the in-flight request does not hold the lock
+        unpublished = std::move(rig.fix.oidc_provider);
+        rig.fix.oidc_provider = std::make_unique<oidc::OidcProvider>(rig.cfg);
+    }
+    oidc::OidcProvider::drain_retired();
+    oidc::OidcProvider::retire(std::move(unpublished)); // returns although the request is live
+    CHECK(oidc::OidcProvider::retired_count_for_test() == 1);
+
+    rig.idp.release_discovery();
+    worker.join();
+    CHECK(start_status.load() == 302); // the request finished on the provider it started with
+    oidc::OidcProvider::drain_retired();
+    CHECK(oidc::OidcProvider::retired_count_for_test() == 0);
 }
 
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN

@@ -2937,7 +2937,22 @@ std::string SettingsRoutes::render_nvd_fragment() {
 std::string SettingsRoutes::render_directory_fragment() {
     std::string html;
 
-    bool oidc_configured = !cfg_->oidc_issuer.empty() && !cfg_->oidc_client_id.empty();
+    // A Settings save assigns these under the exclusive OIDC lock; read them under the shared
+    // one so a page render never overlaps a save's writes (the callers hold neither lock).
+    std::string snap_issuer, snap_client_id, snap_client_secret, snap_redirect_uri,
+        snap_admin_group;
+    bool snap_skip_tls_verify = false;
+    {
+        std::shared_lock oidc_lock(*oidc_mu_);
+        snap_issuer = cfg_->oidc_issuer;
+        snap_client_id = cfg_->oidc_client_id;
+        snap_client_secret = cfg_->oidc_client_secret;
+        snap_redirect_uri = cfg_->oidc_redirect_uri;
+        snap_admin_group = cfg_->oidc_admin_group;
+        snap_skip_tls_verify = cfg_->oidc_skip_tls_verify;
+    }
+
+    bool oidc_configured = !snap_issuer.empty() && !snap_client_id.empty();
 
     if (oidc_configured) {
         html += "<div style=\"margin-bottom:1rem\">"
@@ -2956,7 +2971,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <label>Issuer URL</label>"
             "  <input type=\"text\" name=\"issuer\" "
             "value=\"" +
-            html_escape(cfg_->oidc_issuer) +
+            html_escape(snap_issuer) +
             "\" "
             "placeholder=\"https://login.microsoftonline.com/&lt;tenant-guid&gt;/v2.0\" "
             "style=\"flex:1;min-width:0\">"
@@ -2966,7 +2981,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <label>Client ID</label>"
             "  <input type=\"text\" name=\"client_id\" "
             "value=\"" +
-            html_escape(cfg_->oidc_client_id) +
+            html_escape(snap_client_id) +
             "\" "
             "placeholder=\"Application (client) ID from Azure portal\" "
             "style=\"flex:1;min-width:0\">"
@@ -2977,7 +2992,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <input type=\"password\" name=\"client_secret\" "
             "value=\"\" "
             "placeholder=\"" +
-            (cfg_->oidc_client_secret.empty() ? std::string("Client secret value")
+            (snap_client_secret.empty() ? std::string("Client secret value")
                                               : std::string("********")) +
             "\" "
             "style=\"flex:1;min-width:0\">"
@@ -2987,7 +3002,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <label>Redirect URI</label>"
             "  <input type=\"text\" name=\"redirect_uri\" "
             "value=\"" +
-            html_escape(cfg_->oidc_redirect_uri) +
+            html_escape(snap_redirect_uri) +
             "\" "
             "placeholder=\"Required: https://&lt;server&gt;/auth/callback, exactly as registered "
             "at the IdP\" "
@@ -2998,13 +3013,13 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <label>Admin Group ID</label>"
             "  <input type=\"text\" name=\"admin_group\" "
             "value=\"" +
-            html_escape(cfg_->oidc_admin_group) +
+            html_escape(snap_admin_group) +
             "\" "
             "placeholder=\"Entra group object ID for admin role mapping\" "
             "style=\"flex:1;min-width:0\">"
             "</div>";
 
-    std::string tls_checked = cfg_->oidc_skip_tls_verify ? " checked" : "";
+    std::string tls_checked = snap_skip_tls_verify ? " checked" : "";
     html += "<div class=\"form-row\">"
             "  <label>Skip TLS Verify</label>"
             "  <label class=\"toggle\">"
@@ -4572,8 +4587,13 @@ void SettingsRoutes::register_routes(
         auto admin_group = extract_form_value(req.body, "admin_group");
         auto skip_tls_verify = extract_form_value(req.body, "skip_tls_verify");
 
+        // The dashboard's htmx config does not swap a 4xx body (see the 503 branch of the DEX
+        // routing save), so each refusal below also carries a toast: without it Save would show
+        // nothing and nothing would be stored.
         if (issuer.empty() || client_id.empty()) {
             res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Issuer URL and Client ID are required","level":"error"}})");
             auto html = render_directory_fragment() +
                         "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
                         "hx-swap-oob=\"true\">Issuer URL and Client ID are required.</div>";
@@ -4585,6 +4605,8 @@ void SettingsRoutes::register_routes(
         // report a saved one. (Only the startup flag path fills in a localhost default.)
         if (redirect_uri.find_first_not_of(" \t\r\n") == std::string::npos) {
             res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Redirect URI is required: enter the callback URL registered at the IdP","level":"error"}})");
             auto html = render_directory_fragment() +
                         "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
                         "hx-swap-oob=\"true\">Redirect URI is required: enter the callback URL "
@@ -4613,7 +4635,12 @@ void SettingsRoutes::register_routes(
         // one, and it covers every other caller (PUT /api/config included).
         if (is_exactly_redaction_placeholder(client_secret))
             client_secret.clear();
-        auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
+        std::string stored_secret;
+        {
+            std::shared_lock oidc_lock(*oidc_mu_);
+            stored_secret = cfg_->oidc_client_secret;
+        }
+        auto effective_secret = client_secret.empty() ? stored_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
 
         std::unique_ptr<oidc::OidcProvider> new_provider;
@@ -4657,6 +4684,19 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // The swap holds the exclusive lock only for these assignments: sign-ins keep the
+        // provider they started with through a lease and run their network I/O without the
+        // lock, so this does not wait for them. The unpublished provider is retired AFTER the
+        // lock drops, and is destroyed by the first later retirement or drain once its last
+        // in-flight request has finished (releasing the last lease does not destroy it).
+        //
+        // The retirement runs when this handler exits, after the settings are persisted and the
+        // response is built, so the one case where it can wait (more than kMaxRetired providers
+        // each still in a request) never delays the save itself, only its reply.
+        struct RetireOnExit {
+            std::unique_ptr<oidc::OidcProvider> unpublished;
+            ~RetireOnExit() { oidc::OidcProvider::retire(std::move(unpublished)); }
+        } retire_on_exit;
         {
             std::unique_lock lock(*oidc_mu_);
             cfg_->oidc_issuer = issuer;
@@ -4665,6 +4705,7 @@ void SettingsRoutes::register_routes(
             cfg_->oidc_redirect_uri = redirect_uri;
             cfg_->oidc_admin_group = admin_group;
             cfg_->oidc_skip_tls_verify = skip_tls;
+            retire_on_exit.unpublished = std::move(*oidc_provider_);
             *oidc_provider_ = std::move(new_provider);
         }
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
