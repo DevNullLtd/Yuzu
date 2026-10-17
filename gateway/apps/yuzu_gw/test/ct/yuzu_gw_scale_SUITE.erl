@@ -27,7 +27,8 @@
 %%%                  DISCONNECTED notices the server received
 %%%   fanout         N registered; the server sends one command to each agent
 %%%                  (one SendCommand per agent, one management connection, at
-%%%                  most 1024 open); agents answer after 0-10 s
+%%%                  most 4096 open, the shipped stream cap); agents answer
+%%%                  after 0-10 s
 %%%
 %%% Each scenario MEASURES and REPORTS (never fails on a timing): registration
 %%% counts and latency percentiles, replay time, notices lost, gateway memory
@@ -42,12 +43,13 @@
 %%% that failed, a complete replay with more than one in flight, zero lost
 %%% DISCONNECTED notices (planned stop and outage), every live session known to
 %%% the server, every command answered, the management connection kept, and the
-%%% singleton mailboxes back to 0. Several FAIL on the gateway as of 29a8e655b
-%%% (the serial upstream lane, the 20 ms replay drip, the planned-stop drain
-%%% that runs after the tree is gone). In the default group `report' a violated
-%%% invariant is recorded (JSON, a ct:pal line, the test case comment) and the
-%%% case passes; in the group `gate' it fails the case. YUZU_GW_SCALE_GATE=1
-%%% selects `gate'; it is meant to be switched on in CI once the fixes merge.
+%%% singleton mailboxes back to 0. Several failed on the gateway as of
+%%% 29a8e655b (the serial upstream lane, the 20 ms replay drip, the planned-stop
+%%% drain that ran after the tree was gone); all pass after the PR #5695 fixes.
+%%% In the default group `report' a violated invariant is recorded (JSON, a
+%%% ct:pal line, the test case comment) and the case passes; in the group `gate'
+%%% it fails the case. YUZU_GW_SCALE_GATE=1 selects `gate'; the Meson `gateway
+%%% ct' test sets it (scripts/test_gateway.py).
 %%%
 %%% Sizes: YUZU_GW_SCALE_AGENTS (default 500, the CI size). 5000 and 25000 are
 %%% on-demand sizes; see docs/testing/gateway-scale-tests.md (file descriptor
@@ -56,7 +58,7 @@
 %%% Other knobs (all optional): YUZU_GW_SCALE_RAMP_RATE (agents/s, 100),
 %%% YUZU_GW_SCALE_LATENCY_MS ("20-50", the server's Register latency),
 %%% YUZU_GW_SCALE_OUTAGE_MS (5000), YUZU_GW_SCALE_FLAP_PCT (10),
-%%% YUZU_GW_SCALE_FANOUT_DELAY_MS ("0-10000"), YUZU_GW_SCALE_FANOUT_WINDOW (1024),
+%%% YUZU_GW_SCALE_FANOUT_DELAY_MS ("0-10000"), YUZU_GW_SCALE_FANOUT_WINDOW (4096),
 %%% YUZU_GW_SCALE_OUTPUT_BYTES (2048), YUZU_GW_SCALE_HB_MS (30000),
 %%% YUZU_GW_SCALE_BUDGET_MS (60000 + 10 ms per agent), YUZU_GW_SCALE_RESULTS_DIR.
 %%%
@@ -159,7 +161,8 @@ init_per_testcase(Case, Config) ->
     LogDir = ?config(priv_dir, Config),
     Fds = 2 * N + 4096,
     Up = start_upstream_node(log(LogDir, upstream, Tag)),
-    {ok, UpPort} = ?PEER:call(Up, ?UP, start, [#{port => 0}]),
+    {ok, UpPort} = ?PEER:call(Up, ?UP, start, [#{port => 0, max_streams => upstream_streams()}]),
+    maybe_trace_upstream(Up),
     Gw = start_gateway(#{log => log(LogDir, gateway, Tag), fds => Fds, upstream_port => UpPort,
                          n => N, agent_port => 0, agent6_port => 0, mgmt_port => 0}),
     {ok, Load} = ?PEER:start(loadgen, #{fds => Fds, log => log(LogDir, loadgen, Tag),
@@ -231,7 +234,9 @@ server_crash(Config) ->
     Up2 = start_upstream_node(log(?config(log_dir, Config), upstream,
                                   ?config(tag, Config) ++ "-2")),
     {ok, _} = ?PEER:call(Up2, ?UP, start, [#{port => ?config(up_port, Config),
+                                            max_streams => upstream_streams(),
                                             register_latency_ms => latency()}]),
+    maybe_trace_upstream(Up2),
     Config2 = lists:keystore(up, 1, Config, {up, Up2}),
     T1 = erlang:system_time(millisecond),
     KeptSessions = [{Id, S} || {Id, S, _} <- Kept],
@@ -366,7 +371,7 @@ fanout(Config) ->
     Live = truth(Config),
     Ids = [Id || {Id, _, _} <- Live],
     Delay = range_env("YUZU_GW_SCALE_FANOUT_DELAY_MS", {0, 10000}),
-    Window = env_int("YUZU_GW_SCALE_FANOUT_WINDOW", 1024),
+    Window = env_int("YUZU_GW_SCALE_FANOUT_WINDOW", mgmt_streams()),
     ok = load_call(Config, set_config, [#{reply_delay_ms => Delay}]),
     #{disconnects := Disc0} = load_call(Config, status, []),
     probe_call(Config, reset_hwm, []),
@@ -482,7 +487,7 @@ registration_report(Config, T0, Reg, Expected0) ->
          fleet => maps:merge(maps:without([by_state], Status),
                              #{by_state => maps:get(by_state, Status),
                                counters => load_call(Config, counters, [])}),
-         upstream => maps:merge(Up, Waste),
+         upstream => maps:merge(Up#{stream_ends => up_call(Config, stream_ends, [])}, Waste),
          convergence => convergence(Config),
          gateway => gateway_report(Config)}.
 
@@ -599,8 +604,10 @@ setup_registered(Config) ->
     _ = settle(Config),
     probe_call(Config, reset_hwm, []),
     probe_call(Config, sched_mark, []),
+    Up = up_call(Config, stats, []),
     Reg#{memory_per_connection_bytes => mem_per_conn(Config),
-         connected_notices => maps:get(connected_notices, up_call(Config, stats, []))}.
+         connected_notices => maps:get(connected_notices, Up),
+         upstream => Up#{stream_ends => up_call(Config, stream_ends, [])}}.
 
 %% Wait until N agents are live (or the cap passes). Returns how long it took.
 await_registered(Config, N, T0) ->
@@ -766,7 +773,7 @@ gateway_env(UpPort, AgentPort, Agent6Port, MgmtPort, Dual) ->
              listen => #{port => MgmtPort, ip => ?LOOPBACK},
              acceptors => 4,
              limits => #{max_connections => 256, max_message_bytes => 4194304},
-             http2 => #{idle_timeout => 600000, max_concurrent_streams => 1024,
+             http2 => #{idle_timeout => 600000, max_concurrent_streams => mgmt_streams(),
                         max_received_frame_rate => {100000, 10000}}},
     Listeners = [Agent(agent, ?LOOPBACK, AgentPort)]
         ++ case Dual of
@@ -783,10 +790,15 @@ gateway_env(UpPort, AgentPort, Agent6Port, MgmtPort, Dual) ->
      {telemetry_gauge_interval_ms, 10000},
      {circuit_breaker_failure_threshold, 5},
      {circuit_breaker_reset_timeout_ms, 10000},
-     {circuit_breaker_max_reset_timeout_ms, 300000},
+     {circuit_breaker_max_reset_timeout_ms, 30000},
+     {notify_pending_max, 180000},
      {backpressure_threshold, 1000},
      {cluster_id, <<"scale">>},
      {cluster_seed_nodes, []}].
+
+%% The management listener's max_concurrent_streams in sys.config.prod (and
+%% the client's default window: the server's client queues past the cap).
+mgmt_streams() -> 4096.
 
 targets(#{agent_port := P, agent6_port := 0}) -> [{?LOOPBACK, P}];
 targets(#{agent_port := P, agent6_port := P6}) -> [{?LOOPBACK, P}, {?LOOPBACK6, P6}].
@@ -891,6 +903,18 @@ wait_progress(Fun, Deadline, StallMs, IntervalMs, {LastP, Since}) ->
         true -> timer:sleep(IntervalMs),
                 wait_progress(Fun, Deadline, StallMs, IntervalMs, {P, Since1})
     end.
+
+%% Diagnostic (YUZU_GW_SCALE_TRACE_UPSTREAM=1): count why the fake server's
+%% streams end abnormally (reported as upstream.stream_ends).
+maybe_trace_upstream(Up) ->
+    case os:getenv("YUZU_GW_SCALE_TRACE_UPSTREAM") of
+        "1" -> ok = ?PEER:call(Up, ?UP, trace_stream_ends, []);
+        _ -> ok
+    end.
+
+%% The fake server's HTTP/2 MAX_CONCURRENT_STREAMS per connection: the C++
+%% server's --grpc-max-concurrent-streams default, 128.
+upstream_streams() -> env_int("YUZU_GW_SCALE_UPSTREAM_STREAMS", 128).
 
 budget(N) -> env_int("YUZU_GW_SCALE_BUDGET_MS", 60000 + 10 * N).
 

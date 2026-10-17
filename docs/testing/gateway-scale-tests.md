@@ -35,8 +35,12 @@ measures:
 - **upstream**: the fake server. It answers `ProxyRegister` after a configurable
   delay (20 to 50 ms by default in the measured phases), records every call, and
   answers `BatchHeartbeat` with the sessions it does not know, as the real server
-  does. A "server crash" is a `kill -9` of this node; the restart is a fresh node
-  with an empty state, on the same port.
+  does. Its listener allows 128 concurrent streams per connection, the C++
+  server's `--grpc-max-concurrent-streams` default, and has no received-frame
+  budget (Cowboy's default of 10,000 frames per 10 s closed the gateway's
+  connection with `ENHANCE_YOUR_CALM` during a 5,000-agent storm; gRPC C++ has
+  no such limit). A "server crash" is a `kill -9` of this node; the restart is a
+  fresh node with an empty state, on the same port.
 - **loadgen**: the simulated agents and the management client.
 
 The nodes are started with the `peer` module's `standard_io` connection and no
@@ -55,9 +59,9 @@ waits 2, 4, 8 ... seconds (capped at 300 s, no jitter) before trying again, as
 `agents/core/src/agent.cpp` does.
 
 The management client is shaped like the server's: one connection, one
-`SendCommand` call per target agent, at most 1024 calls open at once (the
-management listener's stream limit; gun refuses a stream over the limit where
-gRPC C++ queues it, so the client queues).
+`SendCommand` call per target agent, at most 4096 calls open at once (the
+management listener's `max_concurrent_streams` in `sys.config.prod`; gun refuses
+a stream over the limit where gRPC C++ queues it, so the client queues).
 
 ## Scenarios
 
@@ -90,7 +94,10 @@ console, every one in the case's HTML log. The main numbers:
   scopable tag, which the gateway forwards unchanged, so each call is matched to
   its attempt); `CONNECTED` and `DISCONNECTED` counts; live sessions the server
   has no `CONNECTED` for; and sessions it still thinks are connected that no
-  agent holds;
+  agent holds; and the `ProxyRegister` handlers that were stopped before they
+  answered (`register_rpcs_cut`, with the exit reasons: the listener stops a
+  handler whose stream was reset, whose deadline passed or whose connection
+  closed);
 - replay: sessions replayed, time to full replay, peak replays in flight;
 - notices lost on an outage and on a planned stop;
 - fan-out: answers, failures, completion time, per-command latency, management
@@ -132,14 +139,17 @@ below). The suite therefore has two groups with the same cases:
   a `SCALE_INVARIANT_VIOLATED` line and set as the case comment, and the case
   passes;
 - `gate`: a failed invariant fails the case. `YUZU_GW_SCALE_GATE=1` selects it.
-  It is meant to be switched on in CI once the fixes are merged.
+  The Meson `gateway ct` test (`scripts/test_gateway.py`, which CI's `--suite
+  gateway` runs) sets it, so CI fails on a broken invariant at 500 agents. It
+  was switched on after every case passed in `gate` on six consecutive runs
+  with the PR #5695 fixes.
 
 The cases are independent (each starts its own nodes), so a failed case in
 `gate` does not skip the others.
 
-The suite is in `apps/yuzu_gw/test/ct`, so the Meson `gateway ct` test and every
-`rebar3 ct --dir apps/yuzu_gw/test/ct` run include it, at the CI size and in the
-`report` group. A case still fails if the harness itself breaks (a node that
+The suite is in `apps/yuzu_gw/test/ct`, so the Meson `gateway ct` test (in the
+`gate` group) and every `rebar3 ct --dir apps/yuzu_gw/test/ct` run (in the
+`report` group unless `YUZU_GW_SCALE_GATE=1`) include it, at the CI size. A case still fails if the harness itself breaks (a node that
 does not start, a call that times out). It has not been run on Windows yet (the
 peer nodes, the kill path and the port ranges are unverified there), so on
 Windows it skips itself unless `YUZU_GW_SCALE_WINDOWS=1` is set.
@@ -150,7 +160,7 @@ From `gateway/`, with the pinned Erlang/OTP active (see
 `docs/erlang-gateway-build.md`):
 
 ```bash
-# CI size: 500 agents (2 min 40 s on the host in the results below)
+# CI size: 500 agents (about 55 s with the fixes, 2 min 40 s before them)
 rebar3 ct --dir apps/yuzu_gw/test/ct --suite yuzu_gw_scale_SUITE
 
 # 5,000 agents, one case
@@ -174,7 +184,7 @@ Other settings, all optional:
 | `YUZU_GW_SCALE_OUTAGE_MS` | 5000 | how long the server is down in `server_crash` |
 | `YUZU_GW_SCALE_FLAP_PCT` | 10 | percent of agents that drop their connection during that outage |
 | `YUZU_GW_SCALE_FANOUT_DELAY_MS` | `0-10000` | agents' answer delay in `fanout` |
-| `YUZU_GW_SCALE_FANOUT_WINDOW` | 1024 | management calls open at once |
+| `YUZU_GW_SCALE_FANOUT_WINDOW` | 4096 | management calls open at once |
 | `YUZU_GW_SCALE_OUTPUT_BYTES` | 2048 | size of each command answer |
 | `YUZU_GW_SCALE_HB_MS` | 30000 | agent heartbeat interval (0 = none) |
 | `YUZU_GW_SCALE_BUDGET_MS` | 60000 + 10 per agent | the registration budget the invariants use; the suite waits up to three times this before it gives up |
@@ -182,6 +192,8 @@ Other settings, all optional:
 | `YUZU_GW_SCALE_GATE` | unset | `1` selects the `gate` group |
 | `YUZU_GW_SCALE_WINDOWS` | unset | `1` runs the suite on Windows |
 | `YUZU_GW_SCALE_DUAL_STACK_ABOVE` | 14000 | above this many agents half of them use a second agent listener on `::1` |
+| `YUZU_GW_SCALE_UPSTREAM_STREAMS` | 128 | the fake server's concurrent streams per connection |
+| `YUZU_GW_SCALE_TRACE_UPSTREAM` | unset | `1` counts why the fake server's streams end abnormally (`upstream.stream_ends` in the JSON); a diagnostic, it traces every stream end |
 
 ### Large sizes: file descriptors, ports and time
 
@@ -199,10 +211,10 @@ Other settings, all optional:
   The agents close with a reset (linger 0), and the gateway node is stopped
   before the load generator, so no `TIME_WAIT` is left on the load generator's
   ports between cases. Linux has a larger range by default.
-- **Time.** The cases that wait on the serial upstream lane scale with N on the
-  current gateway: at 5,000 agents a full run took 27 minutes on the host in
-  the results below; expect hours at 25,000, and run one case at a time with
-  `--case` there.
+- **Time.** With the fixes a full run at 5,000 agents took 2 minutes on the
+  host in the results below (27 minutes before them, when the cases waited on
+  the serial upstream lane). At 25,000 run the cases one or a few at a time
+  with `--case`.
 - **One host.** All four nodes share the machine, so the load generator's own
   work can show in the gateway's numbers at large sizes; the published practice
   (Tsung, amoc) is to run the generators on separate hosts. Treat the 25,000
@@ -262,3 +274,55 @@ processes, with weighted scheduler utilisation 0.145. Of the 11,800 commands
 sent to the agents live at that point, 6,150 were answered; 5,650 ended with
 no answer, and 13,942 agent sessions ended during the fan-out. The management
 connection stayed up.
+
+## Results after the PR #5695 fixes
+
+The same host and parameters, on the merged branch (`feat/gateway-grpc-client`
+at c5c037e9b: EDGE, REGISTRY, SCALE and UPSTREAM workstreams), with two
+harness changes that follow the shipped configuration: the fan-out client opens
+up to 4096 calls (the management listener's new `max_concurrent_streams`), and
+the gateway runs with `circuit_breaker_max_reset_timeout_ms` 30000 and
+`notify_pending_max` 180000 as `sys.config.prod` now sets them. The fake
+server's listener allows 128 streams per connection and has no frame budget
+(see "How it is built"; the frame budget was found while measuring these
+results). A full run took 55 s at 500 agents and 2 min at 5,000.
+
+| Case | 500 before | 500 after | 5,000 before | 5,000 after |
+|---|---|---|---|---|
+| `ramp` (100/s) | all ok; p99 13.2 s; peak in flight 1 | all ok; p50 37 ms, p99 52 ms; peak in flight 7 | 1,087 of 5,000 first attempts ok; 5,883 wasted calls; not all registered at 330 s | all 5,000 first attempts ok; p99 52 ms; no wasted call |
+| `storm` | all registered in 18.6 s; p99 18.3 s | in 0.5 s; p99 0.44 s; peak in flight 48 | 803 first attempts ok; all registered after 312 s | all 5,000 first attempts ok; all registered in 4.0 s; p99 3.6 s; peak in flight 48 |
+| `server_crash` | serial replay, 33.6 s; 6 to 14 of 50 `DISCONNECTED` lost | replay 6.2 s, 24 in flight; none lost | 286 s serial; 13 of 500 lost | 13.3 s, 24 in flight; none lost |
+| `gateway_crash` | all back in 20.7 s | all back in 2.6 s | 4,892 of 5,000 back at 330 s; 12,937 failed attempts | all back in 6.2 s; no failed attempt |
+| `planned_stop` | stop 15.5 s; 454 of 500 lost | stop 0.06 s; none lost | 15.6 s; 4,527 lost | 0.47 s; none lost |
+| `fanout` | 500 of 500 in 10.0 s | 500 of 500 in 10.0 s | 5,000 of 5,000 in 31.3 s (1024 calls open) | 5,000 of 5,000 in 12.1 s (4096 open) |
+
+Memory per connection, after: 320 to 410 KB (360 to 620 KB before). One agent's
+`yuzu_gw_agent` process now holds 89 KB (143 KB before; it registers after
+`init/1` and keeps only the decoded `RegisterRequest`), its `Subscribe` handler
+89 KB (4 KB after a collection) and its Cowboy connection 66 to 146 KB (14 KB
+after a collection), as before: about 200 KB per agent is heap no process
+uses, and about 90 KB is the request the agent process keeps.
+
+Every invariant passed at 500 agents in the `gate` group on seven consecutive
+runs (three before the fake server's frame budget was removed, three after,
+one through `scripts/test_gateway.py`); the Meson `gateway ct` test now runs the
+`gate` group. At 5,000 every invariant passed in a full run.
+
+At 25,000 agents (`storm`, `planned_stop`, `fanout`, about 9 GB in the gateway
+node, 340 to 350 KB per agent):
+
+- `storm`: all 25,000 registered in 22 s; 11,206 to 11,585 first attempts were
+  answered `UNAVAILABLE` (the permit pool full, the designed refusal) and
+  succeeded on the agents' retry 2 s later. The invariant
+  `no_first_attempt_failures` therefore fails at this size, by design.
+- `planned_stop`: the stop took 5.0 s and the server received all 25,000
+  `DISCONNECTED` notices; the registry's mailbox peaked at 42,861 during it.
+- `fanout`: 25,000 of 25,000 answered in 37.4 s with no connection drop (second
+  run). In the first run the setup never finished: ProxyRegister and
+  NotifyStreamStatus calls were answered `DEADLINE_EXCEEDED` by the fake
+  server (their grpc-timeout is at most `upstream_rpc_timeout_ms`, 5 s), the
+  breaker opened 19 times and failed 18 half-open probes, and only 7,552
+  agents were live after 930 s (the agents' backoff had reached minutes). The
+  run followed the 25,000-agent `storm` case on a host using swap; the fake
+  server's own counters, added since, were not captured in it, so the cause of
+  the first stall is not isolated.

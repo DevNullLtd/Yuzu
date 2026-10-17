@@ -27,7 +27,7 @@
 %%% management client (fanout/1) is the server's GatewayMgmtStubPool shape: one
 %%% HTTP/2 connection, one SendCommand call per target agent, at most `window'
 %%% calls open at once (the gateway's management listener advertises
-%%% max_concurrent_streams 1024; gun refuses a stream over the peer's limit
+%%% max_concurrent_streams 4096; gun refuses a stream over the peer's limit
 %%% where gRPC C++ queues it, so the client queues).
 %%%
 %%% All times are erlang:system_time(millisecond): the suite's nodes share one

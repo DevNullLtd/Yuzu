@@ -26,7 +26,8 @@
 %% `yuzu_gw' is the pg scope, `default_channel' the upstream client channel.
 -spec singletons() -> [atom()].
 singletons() ->
-    [yuzu_gw_upstream, yuzu_gw_registry, yuzu_gw_router, yuzu_gw_agent_sup, yuzu_gw_sup,
+    [yuzu_gw_upstream, yuzu_gw_upstream_regulator, yuzu_gw_registry, yuzu_gw_router,
+     yuzu_gw_agent_sup, yuzu_gw_sup,
      yuzu_gw_heartbeat_buffer, yuzu_gw_upstream_pressure, yuzu_gw, default_channel,
      yuzu_gw_gauge, yuzu_gw_health, logger].
 
