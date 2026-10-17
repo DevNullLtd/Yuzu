@@ -1362,7 +1362,7 @@ TEST_CASE("AuthDB consume_and_enroll(enforce_new_id_charset) still updates an EX
 
     // A denied legacy row is still the admin_denied outcome, not charset_refused.
     REQUIRE(h.db.add_pending(mk_agent("a@b")).value());
-    REQUIRE(h.db.deny_pending("a@b", "admin").value());
+    REQUIRE(h.db.deny_pending("a@b", "admin").value() == PendingTransitionOutcome::changed);
     auto denied = h.db.consume_and_enroll(tok->raw_token, "a@b", "h", "linux", "x86_64", "1", true);
     REQUIRE(denied.has_value());
     CHECK(denied->kind == CEK::admin_denied);
@@ -1414,7 +1414,7 @@ TEST_CASE("AuthDB ensure_enrolled(enforce_new_id_charset) refuses to CREATE a ba
 
     // A denied legacy row keeps answering false (denial), not CharsetRefused.
     REQUIRE(h.db.add_pending(mk_agent("denied id")).value());
-    REQUIRE(h.db.deny_pending("denied id", "admin").value());
+    REQUIRE(h.db.deny_pending("denied id", "admin").value() == PendingTransitionOutcome::changed);
     auto den = h.db.ensure_enrolled(mk_agent("denied id"), "system", true);
     REQUIRE(den.has_value());
     CHECK_FALSE(*den);
