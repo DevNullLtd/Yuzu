@@ -7,6 +7,7 @@
 #include "pg/pg_raii.hpp"
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
@@ -31,6 +32,18 @@ constexpr const char* kStoreName = "custom_properties_store";
 // props.<key> scope resolver's bulk preload (agent_registry.cpp). All can
 // wait a little; none may block unboundedly on a saturated pool.
 constexpr std::chrono::milliseconds kAcquireTimeout{2000};
+
+// agent_id guard (reads AND writes). The same predicate as tag_store.cpp's valid_agent_id
+// (file-local there; duplicated rather than shared so the two stores stay independent): libpq's
+// text binds are C strings, so an id containing a NUL byte cannot be represented at the DB seam.
+// A malformed id has no properties by definition, so the reads below answer empty / nullopt
+// instead of touching the database, and the writes refuse (set_property returns an error,
+// delete_property answers not-found, delete_all_properties is a logged no-op), exactly as
+// TagStore's write seams do. Length cap matches the REST/gRPC agent_id bound (256).
+bool valid_agent_id(const std::string& agent_id) {
+    return !agent_id.empty() && agent_id.size() <= 256 &&
+           agent_id.find('\0') == std::string::npos;
+}
 
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -149,7 +162,7 @@ CustomPropertiesStore::CustomPropertiesStore(pg::PgPool& pool) : pool_(pool) {
     if (!lease) {
         spdlog::error("CustomPropertiesStore: no database connection at construction ({}) — "
                       "custom-properties persistence disabled",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return;
     }
     if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
@@ -222,8 +235,8 @@ CustomPropertiesStore::validate_against_schema(PGconn* conn, const std::string& 
     if (!validation_regex.empty()) {
         RE2 re(validation_regex, RE2::Quiet);
         if (!re.ok()) {
-            spdlog::warn("CustomPropertiesStore: invalid regex for schema key '{}': {}", key,
-                        validation_regex);
+            spdlog::warn("CustomPropertiesStore: invalid regex for schema key '{}': {}",
+                         ::yuzu::log_key_token(key), ::yuzu::log_key_token(validation_regex));
         } else if (!RE2::FullMatch(value, re)) {
             return std::unexpected("value does not match validation pattern for '" + key + "'");
         }
@@ -236,6 +249,8 @@ CustomPropertiesStore::validate_against_schema(PGconn* conn, const std::string& 
 
 std::expected<std::vector<CustomProperty>, CustomPropertiesReadError>
 CustomPropertiesStore::get_properties(const std::string& agent_id) const {
+    if (!valid_agent_id(agent_id))
+        return std::vector<CustomProperty>{};  // see valid_agent_id
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_props_sampler))
             spdlog::warn("CustomPropertiesStore::get_properties: store not open");
@@ -245,7 +260,7 @@ CustomPropertiesStore::get_properties(const std::string& agent_id) const {
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_props_sampler))
             spdlog::warn("CustomPropertiesStore::get_properties: no connection in time ({})",
-                        pool_.last_error());
+                        ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -256,7 +271,7 @@ CustomPropertiesStore::get_properties(const std::string& agent_id) const {
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_props_sampler))
             spdlog::warn("CustomPropertiesStore::get_properties: query failed: {}",
-                        PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     std::vector<CustomProperty> results;
@@ -276,6 +291,8 @@ CustomPropertiesStore::get_properties(const std::string& agent_id) const {
 
 std::expected<std::optional<CustomProperty>, CustomPropertiesReadError>
 CustomPropertiesStore::get_property(const std::string& agent_id, const std::string& key) const {
+    if (!valid_agent_id(agent_id))
+        return std::optional<CustomProperty>{std::nullopt};  // see valid_agent_id
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_prop_sampler))
             spdlog::warn("CustomPropertiesStore::get_property: store not open");
@@ -285,7 +302,7 @@ CustomPropertiesStore::get_property(const std::string& agent_id, const std::stri
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_prop_sampler))
             spdlog::warn("CustomPropertiesStore::get_property: no connection in time ({})",
-                        pool_.last_error());
+                        ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -296,7 +313,7 @@ CustomPropertiesStore::get_property(const std::string& agent_id, const std::stri
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_prop_sampler))
             spdlog::warn("CustomPropertiesStore::get_property: query failed: {}",
-                        PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     if (PQntuples(res.get()) == 0)
@@ -322,6 +339,8 @@ CustomPropertiesStore::get_value(const std::string& agent_id, const std::string&
 
 std::expected<std::unordered_map<std::string, std::string>, CustomPropertiesReadError>
 CustomPropertiesStore::get_property_map(const std::string& agent_id) const {
+    if (!valid_agent_id(agent_id))
+        return std::unordered_map<std::string, std::string>{};  // see valid_agent_id
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_map_sampler))
             spdlog::warn("CustomPropertiesStore::get_property_map: store not open");
@@ -331,7 +350,7 @@ CustomPropertiesStore::get_property_map(const std::string& agent_id) const {
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_map_sampler))
             spdlog::warn("CustomPropertiesStore::get_property_map: no connection in time ({})",
-                        pool_.last_error());
+                        ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -341,7 +360,7 @@ CustomPropertiesStore::get_property_map(const std::string& agent_id) const {
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_map_sampler))
             spdlog::warn("CustomPropertiesStore::get_property_map: query failed: {}",
-                        PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     std::unordered_map<std::string, std::string> result;
@@ -367,7 +386,7 @@ CustomPropertiesStore::get_values_for_keys(const std::vector<std::string>& keys)
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_values_for_keys_sampler))
             spdlog::warn("CustomPropertiesStore::get_values_for_keys: no connection in time ({})",
-                        pool_.last_error());
+                        ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     std::vector<std::string_view> key_views(keys.begin(), keys.end());
@@ -379,7 +398,7 @@ CustomPropertiesStore::get_values_for_keys(const std::vector<std::string>& keys)
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_values_for_keys_sampler))
             spdlog::warn("CustomPropertiesStore::get_values_for_keys: query failed: {}",
-                        PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     const int rows = PQntuples(res.get());
@@ -395,6 +414,8 @@ CustomPropertiesStore::set_property(const std::string& agent_id, const std::stri
                                     const std::string& value, const std::string& type) {
     if (!open_)
         return std::unexpected(std::string(kCustomPropertiesDbErrorPrefix) + "store not open");
+    if (!valid_agent_id(agent_id))
+        return std::unexpected("invalid agent id (1-256 bytes, no NUL)");
     if (!validate_key(key))
         return std::unexpected("invalid property key (1-64 chars, alphanumeric/._:-)");
     if (!validate_value(value))
@@ -449,10 +470,14 @@ CustomPropertiesStore::set_property(const std::string& agent_id, const std::stri
 bool CustomPropertiesStore::delete_property(const std::string& agent_id, const std::string& key) {
     if (!open_)
         return false;
+    // Honest not-found, as TagStore::delete_tag: the write guard means no row can be written
+    // under such an identity.
+    if (!valid_agent_id(agent_id))
+        return false;
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::delete_property: no connection in time ({})",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return false;
     }
     pg::PgResult res = pg::exec_params(
@@ -462,7 +487,7 @@ bool CustomPropertiesStore::delete_property(const std::string& agent_id, const s
         std::vector<std::string>{agent_id, key});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("CustomPropertiesStore::delete_property: query failed: {}",
-                      PQerrorMessage(lease.get()));
+                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return false;
     }
     return PQntuples(res.get()) > 0;
@@ -471,10 +496,15 @@ bool CustomPropertiesStore::delete_property(const std::string& agent_id, const s
 void CustomPropertiesStore::delete_all_properties(const std::string& agent_id) {
     if (!open_)
         return;
+    if (!valid_agent_id(agent_id)) {
+        spdlog::warn("CustomPropertiesStore::delete_all_properties: refused an invalid agent id "
+                     "(1-256 bytes, no NUL)");
+        return;
+    }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::delete_all_properties: no connection in time ({})",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return;
     }
     pg::PgResult res = pg::exec_params(
@@ -482,7 +512,8 @@ void CustomPropertiesStore::delete_all_properties(const std::string& agent_id) {
         std::vector<std::string>{agent_id});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::warn("CustomPropertiesStore::delete_all_properties: delete failed for agent={}: {}",
-                    agent_id, PQerrorMessage(lease.get()));
+                     ::yuzu::log_id_token(agent_id),
+                     ::yuzu::log_key_token(PQerrorMessage(lease.get())));
     }
 }
 
@@ -495,7 +526,7 @@ std::vector<CustomPropertySchema> CustomPropertiesStore::list_schemas() const {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::list_schemas: no connection in time ({})",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return results;
     }
     pg::PgResult res = pg::exec_params(
@@ -505,7 +536,7 @@ std::vector<CustomPropertySchema> CustomPropertiesStore::list_schemas() const {
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("CustomPropertiesStore::list_schemas: query failed: {}",
-                      PQerrorMessage(lease.get()));
+                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return results;
     }
     const int rows = PQntuples(res.get());
@@ -531,7 +562,7 @@ CustomPropertiesStore::get_schema(const std::string& key) const {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::get_schema: no connection in time ({})",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -541,7 +572,7 @@ CustomPropertiesStore::get_schema(const std::string& key) const {
         std::vector<std::string>{key});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("CustomPropertiesStore::get_schema: query failed: {}",
-                      PQerrorMessage(lease.get()));
+                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     if (PQntuples(res.get()) == 0)
@@ -604,7 +635,7 @@ CustomPropertiesStore::delete_schema(const std::string& key) {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::delete_schema: no connection in time ({})",
-                      pool_.last_error());
+                      ::yuzu::log_key_token(pool_.last_error()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -613,7 +644,7 @@ CustomPropertiesStore::delete_schema(const std::string& key) {
         std::vector<std::string>{key});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("CustomPropertiesStore::delete_schema: query failed: {}",
-                      PQerrorMessage(lease.get()));
+                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     return PQntuples(res.get()) > 0;
