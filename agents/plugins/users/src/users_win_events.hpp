@@ -15,7 +15,7 @@
 // document, e.g.:
 //   <Event ...><System>...<EventID>4624</EventID>...
 //     <TimeCreated SystemTime='2026-08-14T20:10:49.4173297Z'/>...</System>
-//   <EventData><Data Name='TargetUserName'>Alex</Data>...</EventData></Event>
+//   <EventData><Data Name='TargetUserName'>jsmith</Data>...</EventData></Event>
 // one-or-more such blocks concatenated (as wevtutil's `/f:xml` capture -- and
 // a batch of individually-rendered EvtRender events fed through this parser
 // one at a time -- both produce).
