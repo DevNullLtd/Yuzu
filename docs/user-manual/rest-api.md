@@ -969,7 +969,8 @@ filter criteria, before creating it (#4033, #2146 API-parity Batch A). REST/MCP/
 twin of `/fragments/create-group-form`'s own live count. This route and its MCP twin call the same
 shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
 dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
-(`DashboardRoutes::parse_filters`), unchanged by this PR — the number it shows and this route's
+(`DashboardRoutes::parse_filters`), except that for an over-bound filter it hides the count and
+shows a static sentence (#5623). The number it shows and this route's
 `agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
 `preview_management_group_agent_count`.
 
@@ -997,7 +998,7 @@ to report, and no store read is made.
 }
 ```
 
-`unindexed_filter_keys` is always present (additive, #5623): the mangled keys, in request order and
+`unindexed_filter_keys` is always present (additive, #5623): the mangled keys, in a stable order (sorted by key) and
 without duplicates, of any filter whose value is longer than 2048 bytes, and an empty array when
 none is. Such a value is not indexed in newly stored responses, so when the array is not empty
 `agent_count` can be 0 or an undercount. The array names keys only, never the values. `agent_count`
