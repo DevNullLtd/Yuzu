@@ -186,10 +186,10 @@ verdict_breaker_test_() ->
         fun queue_depth_is_zero_after_circuit_abort/0)
      ]}.
 
-%% A held-notification cap of 4: a replay waits for notify headroom.
+%% A held-notification cap of 20: a replay waits for notify headroom.
 verdict_notify_headroom_test_() ->
     {foreach,
-     fun() -> setup([{notify_pending_max, 4}]) end,
+     fun() -> setup([{notify_pending_max, 20}]) end,
      fun cleanup/1,
      [t("E19 a full held-notification store holds the replay, unstamped, until it drains",
         fun notify_pressure_holds_the_head_unstamped/0)]}.
@@ -1163,9 +1163,10 @@ triggered_fires_once_per_appending_cast() ->
     ?assertEqual([#{count => 1}], triggers(heartbeat)),
     ?assertEqual(2, length(replay_hdrs())).
 
-%% E19: ten notify workers are held in their rpc and two more notifications are
-%% held, so the store (cap 4) is at half its cap: every adopted replay makes its
-%% agent re-send CONNECTED, so the replay waits for headroom. The queued entry
+%% E19: ten notify workers are held in their rpc (each holds a slot of the cap
+%% back: its event may come back) and ten more notifications are held, so the
+%% store (cap 20) is at half its cap: every adopted replay makes its agent
+%% re-send CONNECTED, so the replay waits for headroom. The queued entry
 %% is not popped and not stamped. Once a worker finishes, a held notification is
 %% sent, the store drops below half and the replay runs.
 notify_pressure_holds_the_head_unstamped() ->
@@ -1188,7 +1189,7 @@ notify_pressure_holds_the_head_unstamped() ->
                    after 3000 -> erlang:error({notify_worker_not_started, I})
                    end
                end || I <- lists:seq(1, 10)],
-    [Notify(I) || I <- [11, 12]],
+    [Notify(I) || I <- lists:seq(11, 20)],
     try
         ok = yuzu_gw_upstream:replay_sessions([sid(A)]),
         sync(),
@@ -1201,7 +1202,7 @@ notify_pressure_holds_the_head_unstamped() ->
         ?assertEqual([sid(A)], replay_hdrs())
     after
         [W ! release || W <- Workers],
-        [receive {notify_entered, W} -> W ! release after 0 -> ok end || _ <- [1, 2]]
+        [receive {notify_entered, W} -> W ! release after 0 -> ok end || _ <- lists:seq(1, 10)]
     end.
 
 %% E20: the server answers OK but with accepted=false. The agent is

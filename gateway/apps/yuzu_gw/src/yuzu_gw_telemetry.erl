@@ -425,7 +425,7 @@ handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Con
 %% every metric.
 handle_event([yuzu, gw, upstream, registration_replay_triggered], #{count := N}, Meta, _Config) ->
     Trigger = case maps:get(trigger, Meta, unknown) of
-        T when T =:= breaker; T =:= heartbeat -> T;
+        T when T =:= breaker; T =:= heartbeat; T =:= notify_loss -> T;
         _ -> unknown
     end,
     prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total,
@@ -550,7 +550,7 @@ permit_classes()      -> [register, replay, inventory].
 permit_refusals()     -> [queue_full, deadline, stopping].
 replay_outcomes()     -> [adopted, superseded, rejected, failed, skipped, aborted].
 notify_events()       -> [connected, disconnected].
-notify_lost_reasons() -> [at_capacity, evicted, rejected, shutdown].
+notify_lost_reasons() -> [at_capacity, evicted, rejected, crashed, shutdown].
 
 closed(Value, Set) when is_atom(Value) ->
     case lists:member(Value, Set) of
@@ -903,7 +903,8 @@ declare_metrics() ->
         {help, "Registration replays started, by trigger (breaker = the upstream "
                "recovered from failures, replaying every agent this node holds; "
                "heartbeat = the server's heartbeat verdict listed sessions it does "
-               "not know, replaying only those)"}]),
+               "not know, replaying only those; notify_loss = a held CONNECTED "
+               "notification was lost, replaying every agent so each re-sends it)"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_heartbeat_unknown_truncated_total},
         {labels, []},
@@ -924,7 +925,7 @@ declare_metrics() ->
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
     [prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total, [T], 0)
-     || T <- [<<"breaker">>, <<"heartbeat">>]],
+     || T <- [<<"breaker">>, <<"heartbeat">>, <<"notify_loss">>]],
     [prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total, [R], 0)
      || R <- [<<"malformed">>, <<"not_local">>, <<"circuit_open">>, <<"queue_full">>]],
     prometheus_counter:declare([
@@ -1161,8 +1162,9 @@ declare_metrics() ->
                "was full), evicted (a held connected notification evicted to admit "
                "a disconnected one; a full registration replay re-sends it), "
                "rejected (the server answered that the notification itself was "
-               "wrong, or it could not be encoded), shutdown (still held or in "
-               "flight when a planned stop's flush ended)"}]),
+               "wrong, or it could not be encoded), crashed (the send's worker "
+               "died before it reported), shutdown (still held or in flight when "
+               "a planned stop's flush ended)"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_notify_requeued_total},
         {labels, []},

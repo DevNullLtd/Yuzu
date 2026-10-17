@@ -192,11 +192,16 @@ proxy_inventory_ok() ->
     ?assertMatch({ok, #{received := true}}, Result).
 
 notify_no_crash() ->
-    %% Make the notify RPC fail — should not crash the upstream process.
+    %% Make the notify RPC fail once — should not crash the upstream process.
+    %% (A failed send is held again and retried, #5695, so failing every call
+    %% would open the breaker for the tests after this one.)
+    Fails = atomics:new(1, []),
+    atomics:put(Fails, 1, 1),
     meck:expect(yuzu_grpc_client, unary, fun(_, Path, _, _, _) ->
-        case binary:match(Path, <<"NotifyStreamStatus">>) of
-            nomatch -> {ok, #{}, #{}};
-            _       -> {error, connection_refused}
+        case binary:match(Path, <<"NotifyStreamStatus">>) =/= nomatch
+             andalso atomics:sub_get(Fails, 1, 1) =:= 0 of
+            false -> {ok, #{}, #{}};
+            true  -> {error, connection_refused}
         end
     end),
     yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>,

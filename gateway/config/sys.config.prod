@@ -63,7 +63,23 @@
         %% Circuit breaker settings (upstream connection protection)
         {circuit_breaker_failure_threshold, 5},
         {circuit_breaker_reset_timeout_ms, 10000},
-        {circuit_breaker_max_reset_timeout_ms, 300000},
+        {circuit_breaker_max_reset_timeout_ms, 30000},
+
+        %% Stream-status notifications (CONNECTED / DISCONNECTED) held while
+        %% they cannot be sent (server down or slow). The cap counts keys (one
+        %% per agent session and stream home), not agents. Shipped value: three
+        %% per connection the agent listener below admits (max_connections
+        %% 60000), which is also the default when this key is unset (and at
+        %% least 15000). Three, because one flap of every agent while notices
+        %% cannot be sent holds two keys per agent (the old session's
+        %% DISCONNECTED and the new one's CONNECTED), plus room for a second
+        %% flap. When full, a DISCONNECTED evicts the oldest held CONNECTED (a
+        %% full registration replay then makes those agents re-send it); a
+        %% DISCONNECTED over a store full of DISCONNECTED is lost and counted
+        %% (yuzu_gw_upstream_notify_lost_total). About 0.9 KB per held key, so
+        %% the cap is a ceiling of about 160 MB, reached only with that many
+        %% agents. Change it together with max_connections.
+        {notify_pending_max, 180000},
 
         %% Stream backpressure threshold (message queue length)
         {backpressure_threshold, 1000},

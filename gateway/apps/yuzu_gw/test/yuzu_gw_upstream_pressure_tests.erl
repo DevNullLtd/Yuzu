@@ -187,6 +187,7 @@ lanes_overlap_so_the_whole_is_not_the_sum_test() ->
 %%--------------------------------------------------------------------
 
 -define(SINK, yuzu_gw_pressure_sink).
+-define(BLOCKED, yuzu_gw_pressure_blocked).
 
 process_test_() ->
     {foreach,
@@ -212,6 +213,8 @@ setup() ->
     %% One Register permit: the second Register waits for it.
     application:set_env(yuzu_gw, upstream_register_concurrency, 1),
     catch meck:unload(yuzu_grpc_client),
+    catch ets:delete(?BLOCKED),
+    ?BLOCKED = ets:new(?BLOCKED, [named_table, public, bag]),
     ok = meck:new(yuzu_grpc_client, [non_strict, no_link]),
     ok = meck:expect(yuzu_grpc_client, unary,
                      fun(_Meta, Path, Req, _Def, _Opts) ->
@@ -219,8 +222,11 @@ setup() ->
                                   #{enrollment := #{token := T}} -> T;
                                   _ -> none
                               end,
+                         %% Recorded so cleanup/1 can end every process still
+                         %% blocked in this mock before the mock is unloaded.
+                         ets:insert(?BLOCKED, {blocked, self()}),
                          sink() ! {rpc, Path, Id, self()},
-                         receive go -> {ok, #{}, #{}} end
+                         receive go -> {ok, #{}, #{}} after 10000 -> {error, timeout} end
                      end),
     #{}.
 
@@ -228,6 +234,8 @@ cleanup(_) ->
     stop_named(yuzu_gw_upstream_pressure),
     stop_named(yuzu_gw_upstream),
     application:unset_env(yuzu_gw, upstream_register_concurrency),
+    [kill(P) || {blocked, P} <- ets:tab2list(?BLOCKED), is_process_alive(P)],
+    catch ets:delete(?BLOCKED),
     catch meck:unload(yuzu_grpc_client),
     ok.
 

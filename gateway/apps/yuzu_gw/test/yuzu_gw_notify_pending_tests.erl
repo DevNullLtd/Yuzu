@@ -117,10 +117,11 @@ closed_test_() ->
         60, fun burst_free_running/0)
      ]}.
 
-%% Cap 3.
+%% Cap 13: the ten sends in flight hold ten slots back (each event may come
+%% back to be retried, #5695), so three keys can be held.
 cap_test_() ->
     {foreach,
-     fun() -> setup([{notify_pending_max, 3}]) end,
+     fun() -> setup([{notify_pending_max, 13}]) end,
      fun cleanup/1,
      [
       t("the cap counts keys: the overflow is dropped and counted, a replacement is not",
@@ -134,7 +135,7 @@ env_test_() ->
      fun() -> setup_logs([]) end,
      fun cleanup_logs/1,
      [
-      t("a bad notify_pending_max warns naming the key and falls back to 10000",
+      t("a bad notify_pending_max warns naming the key and falls back to the derived default (15000 with no agent listener)",
         fun env_invalid_falls_back/0),
       t("a notify_pending_max inside 1..1000000 is kept, logged, and does not warn",
         fun env_valid_is_kept/0),
@@ -146,7 +147,7 @@ env_test_() ->
         fun reset_timeout_invalid_falls_back/0),
       t("a circuit_breaker_reset_timeout_ms inside 100..3600000 is kept and does not warn",
         fun reset_timeout_valid_is_kept/0),
-      t("a bad circuit_breaker_max_reset_timeout_ms warns naming the key and falls back to 300000",
+      t("a bad circuit_breaker_max_reset_timeout_ms warns naming the key and falls back to 30000",
         fun max_reset_timeout_invalid_falls_back/0),
       t("a circuit_breaker_max_reset_timeout_ms inside 100..3600000 is kept and does not warn",
         fun max_reset_timeout_valid_is_kept/0),
@@ -729,7 +730,7 @@ cap_drops_overflow_and_never_a_replacement() ->
     Live0 = fill_slots(),
     [cast_connected(agent(I)) || I <- lists:seq(1, 5)],
     sync(),
-    %% Keys 1..3 held, 4 and 5 over the cap of 3.
+    %% Keys 1..3 held, 4 and 5 over the cap (3 held + 10 in flight = 13).
     ?assertEqual({3, ?INFLIGHT_MAX}, last_gauge()),
     ?assertEqual(3, pending_len()),
     ?assertEqual([<<"at_capacity">>, <<"at_capacity">>], dropped_reasons()),
@@ -1022,7 +1023,7 @@ env_case(Val, Kind) ->
                   binary:match(T, <<"notify_pending_max">>) =/= nomatch],
     case Kind of
         invalid ->
-            ?assertEqual(10000, up_get(notify_pending_max)),
+            ?assertEqual(15000, up_get(notify_pending_max)),
             ?assertNotEqual([], Named);
         valid ->
             ?assertEqual(Val, up_get(notify_pending_max)),
@@ -1059,11 +1060,11 @@ reset_timeout_valid_is_kept() ->
      end || Good <- [100, 101, 10000, 3600000]].
 
 max_reset_timeout_invalid_falls_back() ->
-    %% A base of 100 keeps the default cap (300000) at or above it.
+    %% A base of 100 keeps the default cap (30000, #5695) at or above it.
     [begin
          Named = env_key_case(circuit_breaker_max_reset_timeout_ms, Bad,
                               [{circuit_breaker_reset_timeout_ms, 100}]),
-         ?assertEqual(300000, up_get(cb_max_timeout)),
+         ?assertEqual(30000, up_get(cb_max_timeout)),
          ?assertMatch([_], Named)
      end || Bad <- [0, 1, 99, -1, 3600001, "300000", 2.5, undefined_atom]].
 
@@ -1107,7 +1108,7 @@ max_below_base_is_clamped_with_a_warning() ->
     trip_breaker(),
     ?assertEqual({open, 0, 3, 600000}, breaker()).
 
-%% With no cap set the effective cap is the default (300000), a value the operator
+%% With no cap set the effective cap is the default (30000), a value the operator
 %% never wrote. The warning says the default is what was raised and never prints
 %% it as the configured value of the cap key.
 max_unset_below_base_names_the_default() ->
@@ -1118,7 +1119,7 @@ max_unset_below_base_names_the_default() ->
     ?assertNotEqual(nomatch, binary:match(Warning, <<"circuit_breaker_max_reset_timeout_ms">>)),
     ?assertNotEqual(nomatch, binary:match(Warning, <<"default">>)),
     ?assertNotEqual(nomatch, binary:match(Warning, <<"600000">>)),
-    ?assertEqual(nomatch, binary:match(Warning, <<"circuit_breaker_max_reset_timeout_ms (300000)">>)),
+    ?assertEqual(nomatch, binary:match(Warning, <<"circuit_breaker_max_reset_timeout_ms (30000)">>)),
     ?assertEqual(600000, up_get(cb_max_timeout)).
 
 %% A cap the operator set OUTSIDE 100..3600000 is rejected (one warning naming
@@ -1865,9 +1866,10 @@ replay_local_encode_exception_leaves_the_breaker_alone() ->
     Fresh = breaker(),
     ?assertMatch({closed, 0, 0, _}, Fresh),
     ok = yuzu_gw_upstream:replay_sessions([Sid]),
-    %% The replay runs in a worker: wait until its result has been handled.
-    await_until(fun() -> meck:num_calls(yuzu_grpc_client, unary, '_') >= 1
-                             andalso up_get(replay_pids) =:= #{} end),
+    %% The replay runs in a worker: wait until its result has been handled
+    %% (polled: nothing is logged after the result is handled).
+    ok = wait_until(fun() -> meck:num_calls(yuzu_grpc_client, unary, '_') >= 1
+                                 andalso up_get(replay_pids) =:= #{} end, 5000),
     sync(),
     ?assertEqual([], up_get(replay_queue)),
     ?assertEqual(1, meck:num_calls(yuzu_grpc_client, unary, '_')),

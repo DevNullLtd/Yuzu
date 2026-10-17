@@ -129,6 +129,13 @@ services:
   # ── Erlang Gateway ─────────────────────────────────────────────────────
   gateway:
     image: yuzu-gateway:latest
+    # Planned stop: the gateway ends its agent sessions and sends their
+    # DISCONNECTED notices to the server before it exits, within
+    # shutdown_flush_budget_ms (default 20 s), then stops its processes. The
+    # Docker default (10 s before SIGKILL) would cut that short; 40 s covers the
+    # budget with margin. Raise both together (docs/user-manual/gateway.md,
+    # "Planned stop").
+    stop_grace_period: 40s
     container_name: yuzu-uat-gateway
     environment:
       - YUZU_GW_UPSTREAM_ADDR=server

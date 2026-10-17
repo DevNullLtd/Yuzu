@@ -369,7 +369,7 @@ ${c.tlsMode === 'plaintext'
     y += `              {telemetry_gauge_interval_ms, 10000},\n`;
     y += `              {circuit_breaker_failure_threshold, 5},\n`;
     y += `              {circuit_breaker_reset_timeout_ms, 10000},\n`;
-    y += `              {circuit_breaker_max_reset_timeout_ms, 300000},\n`;
+    y += `              {circuit_breaker_max_reset_timeout_ms, 30000},\n`;
     y += `              {backpressure_threshold, 1000},\n`;
     y += `              {hash_ring_vnodes, 256},\n`;
     y += `              %% #1422 escape hatch: this generated stack's mgmt listener is\n`;
@@ -773,6 +773,10 @@ ${c.tlsMode === 'plaintext'
     y += `    image: ghcr.io/devnullltd/yuzu-gateway:\${YUZU_VERSION:-${c.version}}\n`;
     y += `    container_name: yuzu-gateway\n`;
     y += `    restart: unless-stopped\n`;
+    // #5695: a planned stop sends the sessions' DISCONNECTED notices within
+    // shutdown_flush_budget_ms (20 s); Docker's default 10 s would cut it short.
+    y += `    # Planned stop: DISCONNECTED notices are flushed within 20 s; 40 s covers it.\n`;
+    y += `    stop_grace_period: 40s\n`;
     y += `    ports:\n`;
     y += `      - "${c.gwAgentPort}:50051"   # Agent-facing gRPC (mapped to avoid conflict with server)\n`;
     // #1422: NEVER publish :50063 (management/command fan-out) from this

@@ -30,10 +30,10 @@ notify_result_test_() ->
      fun cleanup/1,
      [t("failed notifications open the breaker, and results that arrive after it opened do not crash",
         fun failed_notifications_open_the_breaker/0),
-      t("one failed CONNECTED, then the server answers a call: the agents are replayed",
+      t("one failed CONNECTED is held again and retried; its success replays the agents",
         fun a_failed_connected_arms_a_replay_on_the_next_success/0),
-      t("one failed CONNECTED, then a successful notification alone: the agents are replayed",
-        fun a_successful_notification_after_a_failure_arms_a_replay/0),
+      t("a notification that keeps failing is retried only until the breaker opens, then held",
+        fun a_failing_notification_is_retried_until_the_breaker_opens/0),
       t("successful notifications on their own replay nothing",
         fun successful_notifications_replay_nothing/0),
       t("a failed notification for a gRPC status error counts the same as a transport error",
@@ -62,51 +62,54 @@ failed_notifications_open_the_breaker() ->
     %% The process survived the late results.
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
 
+%% #5695: a failed send is no longer lost. The CONNECTED is held again and
+%% retried at once; the retry succeeds, and a success after a failure is the
+%% reconnect signal that replays every agent the gateway holds.
 a_failed_connected_arms_a_replay_on_the_next_success() ->
     Agents = register_agents(2),
-    server_answers(fun(<<"NotifyStreamStatus">>) -> {error, noproc};
+    Fails = atomics:new(1, []),
+    atomics:put(Fails, 1, 1),
+    server_answers(fun(<<"NotifyStreamStatus">>) ->
+                           case atomics:sub_get(Fails, 1, 1) of
+                               0 -> {error, noproc};
+                               _ -> ok
+                           end;
                       (_) -> ok
                    end),
     ok = notify(connected, 1),
-    %% Settled alone is also true BEFORE the cast has started its worker, and
-    %% the reset below would then make the first notification succeed: wait for
-    %% the failing call itself first (S1, PR #5695 review).
-    ok = wait_until(fun() -> notify_count() =:= 1 end),
-    ok = wait_until(fun notifications_settled/0),
-    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
-
-    %% The server is back. Any successful call after the failure is the
-    %% reconnect signal.
-    meck:reset(yuzu_grpc_client),
-    server_answers(fun(_) -> ok end),
-    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
-
-    %% The trigger itself, plus one replay per agent the gateway holds.
-    ?assertEqual(ok, wait_until(fun() -> proxy_register_count() =:= 1 + length(Agents) end)),
-    Replayed = proxy_register_requests(),
-    [?assert(lists:member(Req, Replayed)) || {_Id, Req} <- Agents].
-
-a_successful_notification_after_a_failure_arms_a_replay() ->
-    %% No other call reaches the server: an idle fleet sends notifications
-    %% and heartbeats, not registrations.
-    Agents = register_agents(2),
-    server_answers(fun(<<"NotifyStreamStatus">>) -> {error, noproc};
-                      (_) -> ok
-                   end),
-    ok = notify(connected, 1),
-    %% Settled alone is also true BEFORE the cast has started its worker, and
-    %% the reset below would then make the first notification succeed: wait for
-    %% the failing call itself first (S1, PR #5695 review).
-    ok = wait_until(fun() -> notify_count() =:= 1 end),
-    ok = wait_until(fun notifications_settled/0),
-
-    meck:reset(yuzu_grpc_client),
-    server_answers(fun(_) -> ok end),
-    ok = notify(connected, 2),
-
+    ?assertEqual(ok, wait_until(fun() -> notify_count() =:= 2 end)),
     ?assertEqual(ok, wait_until(fun() -> proxy_register_count() =:= length(Agents) end)),
     Replayed = proxy_register_requests(),
-    [?assert(lists:member(Req, Replayed)) || {_Id, Req} <- Agents].
+    [?assert(lists:member(Req, Replayed)) || {_Id, Req} <- Agents],
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
+
+%% The retry is bounded by the breaker: each failure counts, so a notification
+%% the server keeps failing is sent at most the threshold number of times, then
+%% held behind the open breaker (the half_open probe takes it from there).
+a_failing_notification_is_retried_until_the_breaker_opens() ->
+    server_answers(fun(<<"NotifyStreamStatus">>) -> {error, noproc};
+                      (_) -> ok
+                   end),
+    ok = notify(connected, 1),
+    ?assertEqual(ok, wait_until(fun() -> yuzu_gw_upstream:circuit_state() =:= open end)),
+    ok = wait_until(fun notifications_settled/0),
+    ?assertEqual(?THRESHOLD, notify_count()),
+    ?assertMatch(#{notify_inflight := 0}, yuzu_gw_upstream:lane_snapshot()),
+    ?assertEqual(1, yuzu_gw_notify_queue:size(element(notify_pending_index(),
+                                                      sys:get_state(yuzu_gw_upstream)))).
+
+notify_pending_index() ->
+    Src = filename:join([code:lib_dir(yuzu_gw), "src", "yuzu_gw_upstream.erl"]),
+    {ok, Forms} = epp:parse_file(Src, []),
+    [Fs] = [Fs0 || {attribute, _, record, {state, Fs0}} <- Forms],
+    Names = [case F of
+                 {typed_record_field, {record_field, _, {atom, _, N}}, _} -> N;
+                 {typed_record_field, {record_field, _, {atom, _, N}, _}, _} -> N;
+                 {record_field, _, {atom, _, N}} -> N;
+                 {record_field, _, {atom, _, N}, _} -> N
+             end || F <- Fs],
+    [I] = [I || {I, notify_pending} <- lists:zip(lists:seq(2, length(Names) + 1), Names)],
+    I.
 
 successful_notifications_replay_nothing() ->
     _ = register_agents(2),
@@ -174,7 +177,7 @@ setup() ->
     %% Long, so an opened breaker stays open for the length of a test.
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 60000),
     application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 60000),
-    application:set_env(yuzu_gw, registration_replay_spacing_ms, 3),
+    application:set_env(yuzu_gw, registration_replay_start_jitter_ms, 0),
     {ok, UpPid} = yuzu_gw_upstream:start_link(),
     UpPid.
 
@@ -188,6 +191,7 @@ cleanup(UpPid) ->
     meck:unload([yuzu_grpc_client, telemetry, yuzu_gw_agent]),
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 150),
     application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 1000),
+    application:unset_env(yuzu_gw, registration_replay_start_jitter_ms),
     ok.
 
 %% The server's answer by method name: `ok', `{error, Reason}' (a transport
@@ -230,9 +234,6 @@ calls(Method) ->
 notify_count() -> length(calls(<<"NotifyStreamStatus">>)).
 proxy_register_requests() -> calls(<<"ProxyRegister">>).
 proxy_register_count() -> length(proxy_register_requests()).
-
-trigger_req() ->
-    #{info => #{agent_id => <<"__trigger__">>}}.
 
 register_agents(N) ->
     Prefix = list_to_binary(pid_to_list(self())),

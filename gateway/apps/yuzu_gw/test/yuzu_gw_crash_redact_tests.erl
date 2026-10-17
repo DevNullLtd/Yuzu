@@ -93,7 +93,7 @@ crash_is_redacted_through_the_installed_filter() ->
     [Crash] = by_label(Events, {proc_lib, crash}),
     CrashText = formatted(Crash),
     %% The diagnosis survives: what failed, where, and how much was queued.
-    ?assert(contains(CrashText, <<"prune_recent_replays">>)),
+    ?assert(contains(CrashText, <<"notify_counts">>)),
     ?assert(contains(CrashText, <<"function_clause">>)),
     ?assert(contains(CrashText, <<"{redacted,3}">>)).
 
@@ -116,7 +116,7 @@ filter_rewrites_only_upstream_reports() ->
     %% The reason of the supervisor report keeps its atoms and frame arities.
     [Sup] = by_label(Out, {supervisor, child_terminated}),
     SupText = formatted(Sup),
-    ?assert(contains(SupText, <<"prune_recent_replays">>)),
+    ?assert(contains(SupText, <<"notify_counts">>)),
     %% A sibling child of the same supervisor, an unrelated crash, and plain
     %% events are not touched.
     Others = crash_other(),
@@ -191,8 +191,8 @@ crash_upstream() ->
                                                restart => temporary}),
     ok = sys:suspend(Pid),
     %% The first message is the one the crash happens on: a verdict whose
-    %% session id is a marker (handled against the garbage state, it crashes
-    %% with the ids in the last message and in the frame arguments); the three
+    %% session id is a marker (handled against the garbage state, it crashes in
+    %% notify_counts/1, with the ids in the last message); the three
     %% call messages stay queued. Each is queued before the next is sent, so
     %% the order is fixed.
     Pid ! {'$gen_cast', {replay_sessions, [?M_LAST]}},

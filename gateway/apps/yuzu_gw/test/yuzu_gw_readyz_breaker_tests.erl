@@ -121,14 +121,16 @@ published_state_follows_every_transition() ->
     ?assertEqual(0, rpc_count(<<"ProxyRegister">>)),
     same(open),
 
-    %% half_open -> closed by the notification probe: the notification held while
-    %% the breaker was open is sent when it half-opens, and succeeds.
+    %% half_open -> closed by the notification probe: the notifications held
+    %% while the breaker was open (the two that failed, given back, #5695, and a
+    %% third) are sent when it half-opens: the head as the probe, which
+    %% succeeds and closes it, then the other two.
     notify(3),
     meck:reset(yuzu_grpc_client),
     server_answers(fun(_) -> ok end),
     half_open(),
     await_state(closed),
-    ?assertEqual(1, rpc_count(<<"NotifyStreamStatus">>)),
+    ?assertEqual(ok, wait_until(fun() -> rpc_count(<<"NotifyStreamStatus">>) =:= 3 end)),
     ?assertEqual(0, rpc_count(<<"ProxyRegister">>)),
     same(closed),
 
