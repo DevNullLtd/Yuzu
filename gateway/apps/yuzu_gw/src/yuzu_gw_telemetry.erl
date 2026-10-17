@@ -92,6 +92,12 @@
     [yuzu, gw, mgmt_auth, rejected],
     [yuzu, gw, mgmt_auth, pin_unresolved],
 
+    %% Certificate files (yuzu_gw_mgmt_pins' tick, yuzu_gw_cert_files): a
+    %% pinned management key changed, and a configured certificate file's
+    %% readable flag or notAfter changed.
+    [yuzu, gw, mgmt_pins, rotated],
+    [yuzu, gw, cert_file, state],
+
     %% Cluster
     [yuzu, gw, cluster, node_up],
     [yuzu, gw, cluster, node_down],
@@ -293,6 +299,27 @@ handle_event([yuzu, gw, mgmt_auth, rejected], #{count := N}, Meta, _Config) ->
 
 handle_event([yuzu, gw, mgmt_auth, pin_unresolved], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_mgmt_auth_pin_unresolved_total, [], N);
+
+%% A pinned management key changed (yuzu_gw_mgmt_pins): the wall-clock second
+%% it was published. Read by the pin_mismatch alert to tell the rotation window
+%% from a real mismatch.
+handle_event([yuzu, gw, mgmt_pins, rotated], #{system_time := T}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_mgmt_pin_rotated_timestamp_seconds, [], T);
+
+%% A configured certificate file (yuzu_gw_cert_files): `readable' always, and
+%% `not_after' whenever a certificate has ever been read from it -- including
+%% after the file became unreadable, when it is the last value read, so an
+%% expiring certificate stays loud while readable=0 says the value is no longer
+%% confirmed. Never read: no `not_after', no expiry series. role and name are
+%% configuration names.
+handle_event([yuzu, gw, cert_file, state], M, #{role := Role, name := Name}, _Config) ->
+    prometheus_gauge:set(yuzu_gw_cert_file_readable, [Role, Name], maps:get(readable, M)),
+    case M of
+        #{not_after := T} ->
+            prometheus_gauge:set(yuzu_gw_cert_expiry_timestamp_seconds, [Role, Name], T);
+        _ ->
+            ok
+    end;
 
 %% Heartbeat admission. `rejected' counts heartbeats refused because no usable
 %% binding exists, labeled by the closed reason-atom set from
@@ -970,6 +997,35 @@ declare_metrics() ->
         {labels, [node]},
         {help, "NotifyStreamStatus workers tracked by this gateway process (at "
                "most 10)"}]),
+    %% {duration_unit, false} on both _seconds gauges below: the prometheus
+    %% library otherwise reads the suffix as a duration unit and scales every
+    %% value set from native time units (a Unix time would render as about 1.76).
+    prometheus_gauge:declare([
+        {name, yuzu_gw_mgmt_pin_rotated_timestamp_seconds},
+        {labels, []},
+        {duration_unit, false},
+        {help, "Unix time (seconds) at which the management pin watcher last saw a "
+               "pinned {cert_file, Path} certificate change to a different key; 0 "
+               "until the first such change in this process. Not set by the first "
+               "read at start or by a rewrite of the same key"}]),
+    %% 0 = no rotation observed: the pin_mismatch alert is then not suppressed.
+    prometheus_gauge:set(yuzu_gw_mgmt_pin_rotated_timestamp_seconds, [], 0),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_cert_expiry_timestamp_seconds},
+        {labels, [role, name]},
+        {duration_unit, false},
+        {help, "notAfter (Unix seconds) of a certificate file the gateway is "
+               "configured with; for a file holding several certificates, the "
+               "earliest. role: listener | listener_ca | upstream_client | "
+               "upstream_ca | mgmt_peer_pin. If the file stops being readable the "
+               "last value read is kept (see yuzu_gw_cert_file_readable)"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_cert_file_readable},
+        {labels, [role, name]},
+        {help, "1 when the latest read of every certificate file under this role "
+               "and name parsed as PEM certificates, 0 when a stat, read or parse "
+               "failed (for mgmt_peer_pin the key last read stays pinned). "
+               "Checked every mgmt_pin_refresh_ms"}]),
     %% Series at 0 from startup, before yuzu_gw_upstream:init/1 has reported.
     prometheus_gauge:set(yuzu_gw_upstream_notify_pending, [node()], 0),
     prometheus_gauge:set(yuzu_gw_upstream_notify_inflight, [node()], 0),

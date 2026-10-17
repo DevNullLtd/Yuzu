@@ -803,3 +803,57 @@ circuit_transitions_seeded_test_() ->
               <<"yuzu_gw_upstream_circuit_transitions_total{state=\"open\"} 1">>])
        end}
      ]}.
+
+%% Certificate rotation and expiry gauges. The rotation timestamp is seeded at
+%% 0 (the YuzuGatewayMgmtPinMismatch alert reads 0 as "no rotation observed",
+%% so a seeded series must not suppress it); the per-file gauges are set by
+%% the watcher's [yuzu, gw, cert_file, state] event. An event without a
+%% notAfter (nothing has ever been read from the file) leaves the expiry gauge
+%% as it is while the readable gauge drops to 0.
+cert_gauges_test_() ->
+    Labels = [<<"listener">>, <<"telemetry_test">>],
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        catch prometheus_gauge:remove(yuzu_gw_mgmt_pin_rotated_timestamp_seconds, []),
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) ->
+        catch prometheus_gauge:remove(yuzu_gw_cert_expiry_timestamp_seconds, Labels),
+        catch prometheus_gauge:remove(yuzu_gw_cert_file_readable, Labels),
+        catch telemetry:detach(yuzu_gw_prometheus)
+     end,
+     [
+      {"the rotation timestamp exists at 0 straight after setup",
+       fun() ->
+           %% prometheus_gauge stores a float: compare numerically
+           ?assert(0 == prometheus_gauge:value(yuzu_gw_mgmt_pin_rotated_timestamp_seconds, []))
+       end},
+      {"a rotation event sets the rotation timestamp",
+       fun() ->
+           telemetry:execute([yuzu, gw, mgmt_pins, rotated], #{system_time => 1760000000}, #{}),
+           ?assert(1760000000 ==
+                       prometheus_gauge:value(yuzu_gw_mgmt_pin_rotated_timestamp_seconds, []))
+       end},
+      {"a cert_file state event sets readable and expiry; one without notAfter keeps the expiry",
+       fun() ->
+           Meta = #{role => <<"listener">>, name => <<"telemetry_test">>},
+           telemetry:execute([yuzu, gw, cert_file, state],
+                             #{readable => 1, not_after => 1900000000}, Meta),
+           ?assert(1 == prometheus_gauge:value(yuzu_gw_cert_file_readable, Labels)),
+           ?assert(1900000000 ==
+                       prometheus_gauge:value(yuzu_gw_cert_expiry_timestamp_seconds, Labels)),
+           telemetry:execute([yuzu, gw, cert_file, state], #{readable => 0}, Meta),
+           ?assert(0 == prometheus_gauge:value(yuzu_gw_cert_file_readable, Labels)),
+           ?assert(1900000000 ==
+                       prometheus_gauge:value(yuzu_gw_cert_expiry_timestamp_seconds, Labels)),
+           assert_scrape_has(
+             [<<"# HELP yuzu_gw_mgmt_pin_rotated_timestamp_seconds ">>,
+              <<"# HELP yuzu_gw_cert_expiry_timestamp_seconds ">>,
+              <<"# HELP yuzu_gw_cert_file_readable ">>,
+              <<"yuzu_gw_cert_expiry_timestamp_seconds{role=\"listener\",name=\"telemetry_test\"} 1900000000">>])
+       end}
+     ]}.

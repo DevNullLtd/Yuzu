@@ -99,9 +99,13 @@
         %% (yuzu_gw_authz:check_mgmt_peer/1, wired in grpc_listeners below)
         %% accepts. {cert_file, Path} pins to the SPKI of the cert at Path; the
         %% yuzu_gw_mgmt_pins watcher re-stats it every mgmt_pin_refresh_ms
-        %% (default 5000) and re-reads it when it changed, so server leaf
-        %% rotation self-heals within one interval (the auth_fun itself never
-        %% touches the file);
+        %% (default 5000) and re-reads it when it changed, so a rotated server
+        %% leaf is pinned within one interval (the auth_fun itself never
+        %% touches the file). Commands the server forwards inside that interval
+        %% are refused and NOT retried: they fail as gateway_unauthenticated.
+        %% Once read, a key stays pinned if the file later fails to read or
+        %% parse (yuzu_gw_cert_file_readable{role="mgmt_peer_pin"} reads 0);
+        %% replace the file, do not delete it, to change the pin;
         %% for bring-your-own-cert installs point it at YOUR server cert, or use
         %% {spki_sha256, "hex"} (openssl x509 -in cert.pem -pubkey -noout |
         %% openssl pkey -pubin -outform DER | openssl dgst -sha256). List two

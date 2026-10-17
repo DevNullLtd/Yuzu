@@ -91,6 +91,11 @@ Scraped from the gateway's Prometheus endpoint (default `:9568`). Duration histo
 | `yuzu_gw_upstream_lane_saturated_seconds_total` | counter | The same, per lane (label `lane`: `serial`, `notify`, `guardian`; all three created at 0 at start). The lanes overlap, so never add them: the figure for the gateway as a whole is the counter above |
 | `yuzu_gw_upstream_backpressure_duty_cycle` | gauge | The backpressure duty cycle over the last 60 s, 0 to 1. Reads low for the first minute after a start (the missing seconds count as not saturated) |
 | `yuzu_gw_upstream_slow` | gauge | 1 when the duty cycle above is 0.5 or more (a slow server, as this gateway sees it), else 0. Not a readiness input |
+| `yuzu_gw_mgmt_auth_rejected_total` | counter | Management-listener (`:50063`) streams refused by the SPKI peer pin, labeled by `reason` (closed set of seven, all created at 0 at start) |
+| `yuzu_gw_mgmt_auth_pin_unresolved_total` | counter | Management auth attempts during which a configured `mgmt_peer_pins` entry did not resolve |
+| `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` | gauge | Unix time the pin watcher last published a different key for a `{cert_file, Path}` pin; 0 until the first change in the process |
+| `yuzu_gw_cert_expiry_timestamp_seconds` | gauge | `notAfter` (Unix seconds) of each configured certificate file, labeled by `role` (`listener`, `listener_ca`, `upstream_client`, `upstream_ca`, `mgmt_peer_pin`) and `name`; keeps the last value read if the file becomes unreadable |
+| `yuzu_gw_cert_file_readable` | gauge | 1 when the latest read of the certificate file(s) under that `role` and `name` parsed, 0 when it failed |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and queue-length histograms, circuit-breaker and cluster counters) is registered in `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl`.
 

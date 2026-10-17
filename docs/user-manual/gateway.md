@@ -1264,7 +1264,7 @@ through the environment; it takes a `sys.config` edit):
 
 | Key | Default | Valid values | Meaning |
 |---|---|---|---|
-| `mgmt_pin_refresh_ms` | 5000 | 100 to 3600000 | How often the `yuzu_gw_mgmt_pins` process re-stats every `{cert_file, Path}` entry of `mgmt_peer_pins`. It re-reads and parses the PEM only when the file's modification time or size changed, and publishes the pinned key for the management `auth_fun` to read. The `auth_fun` runs once per management stream and does no file I/O itself, so a stalled certificate volume stalls only the watcher, never a connection. The interval bounds how long a rotated server leaf is refused: until the next refresh the gateway still pins the old key, so a connection the server opens with its new leaf in that window gets `UNAUTHENTICATED` (`pin_mismatch`, fail closed) and the server's retry after the refresh succeeds. The pins are resolved once at start, before the listeners, so the first stream never waits for a refresh. A value outside the range, or one that is not an integer, **refuses boot** (`Refusing to start: invalid {yuzu_gw, mgmt_pin_refresh_ms}`). Not present in any shipped `sys.config`. |
+| `mgmt_pin_refresh_ms` | 5000 | 100 to 3600000 | How often the `yuzu_gw_mgmt_pins` process re-stats every `{cert_file, Path}` entry of `mgmt_peer_pins`. It re-reads and parses the PEM only when the file's modification time or size changed, and publishes the pinned key for the management `auth_fun` to read. The `auth_fun` runs once per management stream and does no file I/O itself, so a stalled certificate volume stalls only the watcher, never a connection. The interval bounds how long a rotated server leaf is refused: until the next refresh the gateway still pins the old key, so a stream the server opens with its new leaf in that window gets `UNAUTHENTICATED` (`pin_mismatch`, fail closed). The server does not retry it: the commands it forwards in that window fail as `gateway_unauthenticated`, and commands after the refresh go through. The same tick refreshes the certificate expiry gauges (see [Certificate rotation and expiry](#certificate-rotation-and-expiry)). The pins are resolved once at start, before the listeners, so the first stream never waits for a refresh. A value outside the range, or one that is not an integer, **refuses boot** (`Refusing to start: invalid {yuzu_gw, mgmt_pin_refresh_ms}`). Not present in any shipped `sys.config`. |
 
 **Heartbeat batching interval** (read by the heartbeat buffer at start; unlike
 the replay keys above, it also has an environment override):
@@ -1788,6 +1788,102 @@ Verify: the gateway boot log shows `tls` posture (not `plaintext`); an agent
 connects and enrolls; `openssl s_client -connect gateway:50051` presents the
 `default-gateway` leaf. Direct agent→server connections (no gateway) use TLS and
 need none of this.
+
+### Certificate rotation and expiry
+
+**What the gateway watches.** The management-pin watcher (`yuzu_gw_mgmt_pins`)
+checks every certificate file the gateway is configured with every
+`mgmt_pin_refresh_ms` (default 5 s). It reads a file again only when its
+modification time or size changed, so a quiet volume costs one `stat` per file
+per interval and no management call ever touches the file system. The files,
+and the `role` and `name` labels they are reported under:
+
+| `role` | File | `name` |
+|---|---|---|
+| `listener` | `tls.certfile` of a `grpc_listeners` entry | the listener's `name` |
+| `listener_ca` | `tls.cacertfile` of the same entry | the listener's `name` |
+| `upstream_client` | `certfile` of an `upstream_client` channel endpoint | the channel name |
+| `upstream_ca` | `cacertfile` of the same endpoint | the channel name |
+| `mgmt_peer_pin` | the `Path` of a `{cert_file, Path}` entry of `mgmt_peer_pins` (the **server's** certificate) | the file name |
+
+Inline certificates (`cert`, `cacerts`) are not files and are not reported.
+
+**Metrics.** `yuzu_gw_cert_expiry_timestamp_seconds{role,name}` is the
+certificate's `notAfter` in Unix seconds (for a file holding several
+certificates, the earliest). `yuzu_gw_cert_file_readable{role,name}` is 1 while
+the latest read of the file parsed as PEM certificates and 0 when the stat, the
+read or the parse failed. When a file becomes unreadable the expiry gauge keeps
+the last value read from it, so an expiring certificate keeps alerting; a file
+that was never readable has no expiry series. Two certificates under one
+`role` and `name` (two endpoints of one channel with different files) are
+reported as one series: the earliest `notAfter`, and readable only if both are.
+`yuzu_gw_mgmt_pin_rotated_timestamp_seconds` is the Unix time at which the
+watcher last published a **different** key for a `{cert_file, Path}` pin. It is
+0 until the first such change in the gateway process; reading the file at start,
+or a rewrite of the same key, does not set it.
+
+**A management pin file that cannot be read.** Once a `{cert_file, Path}` pin has
+been read, the gateway keeps the key it read if a later read fails (the file is
+missing, unreadable, not a PEM certificate, or caught half-written). Commands
+keep flowing, `yuzu_gw_cert_file_readable{role="mgmt_peer_pin"}` reads 0, the
+log says `the key last read from it stays pinned until the file is readable
+again`, and `YuzuGatewayMgmtPinUnresolved` fires after 2 minutes. Fix the file:
+until it is readable again the gateway cannot pick up the server's next
+rotation, which it would then refuse. Deleting the file does **not** withdraw
+the pin. To change the pinned key, replace the file with the new certificate
+(picked up within one interval). Removing the entry from `mgmt_peer_pins` also
+withdraws it, but only at the next gateway restart, which disconnects every
+agent on the node; agents without the #5183 fix stay wedged after it, so
+prefer replacing the file unless the entry itself must go. A pin file that is unreadable when the gateway starts pins
+nothing, as before (fail closed): every management stream is refused
+`no_pins_resolved` unless another pin admits the server.
+
+**A routine rotation of the server's certificate.** When the server replaces its
+leaf at the pinned path, the gateway pins the new key at its next refresh. In
+the window between the two (at most one `mgmt_pin_refresh_ms`, 5 s by default)
+the server's management streams carry the new key while the gateway still pins
+the old one, and they are refused `pin_mismatch`. **The server does not retry
+these**: each command it forwards to this gateway in that window fails
+terminally as `gateway_unauthenticated`, is counted in the server's
+`yuzu_server_gateway_forward_total{status="unauthenticated"}` and shows as a
+failed command. Commands sent after the refresh go through, and nothing needs to
+be done about the gateway. If a failed command matters, run it again. To make
+the window empty, pre-stage the new key as a second pin (`{spki_sha256, Hex}` of
+the new certificate) before the server rotates, and remove it after. Each change
+to `mgmt_peer_pins` applies only at a gateway restart, which disconnects every
+agent on the node (agents without the #5183 fix stay wedged after it), so weigh
+that against re-running the few commands a rotation drops.
+
+**Alerts** (group `yuzu-gateway` and `yuzu-tls` of
+`docs/prometheus/yuzu-alerts.yml`; scrape the gateway). Each fires only when
+someone has something to do:
+
+| Alert | Fires when | What to do |
+|---|---|---|
+| `YuzuGatewayMgmtAuthRejected` (warning) | a management peer was refused for any reason **other than** `pin_mismatch`, in the last hour | `missing_server_auth_eku`, `bad_peer_cert`: a holder of an install-CA certificate that is not the server reached `:50063`, or the server's leaf lacks the serverAuth usage; investigate the source, fix the server certificate. `no_pins_resolved`, `no_pins_configured`, `bad_pin_config`: the pins admit nobody and every forwarded command fails; restore the pinned file or correct `mgmt_peer_pins`. `internal_error`: collect the log, report it. A rotation never produces these. |
+| `YuzuGatewayMgmtPinMismatch` (critical) | `pin_mismatch` rejections that no pin rotation on this gateway explains: rejections are read one minute late and ignored for 4 minutes after `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` moves | Commands to this gateway's agents are failing. If the server's certificate changed, update the pinned file (picked up within one interval). If it did not change, someone is presenting another serverAuth certificate (for example the gateway's own key) to the command plane: treat it as a security incident. |
+| `YuzuGatewayMgmtPinUnresolved` (warning, 2 m) | a configured pin has never resolved, or a pin file's latest read failed (`yuzu_gw_cert_file_readable{role="mgmt_peer_pin"} == 0`) | Correct the fingerprint, or restore the pinned file (owner, mode, contents). The fix is picked up within one interval. |
+| `YuzuGatewayCertificateFileUnreadable` (warning, 10 m) | a listener or upstream certificate file cannot be read or parsed | Restore it before the gateway restarts or redials: until then it keeps the certificate it loaded, but anything that reads the file again fails. |
+| `YuzuGatewayCertificateExpiringSoon` (warning, 1 h) | a configured certificate expires in 7 to 30 days | Schedule the renewal. |
+| `YuzuGatewayCertificateExpiryImminent` (critical, 10 m) | it expires in 1 to 7 days | Renew it today. |
+| `YuzuGatewayCertificateExpiryCritical` (critical, 5 m) | it expires in under 24 hours, or has expired | Renew it now. |
+
+The three expiry bands do not overlap, so one renewal pages once at a time. For
+`mgmt_peer_pin` the certificate is the server's: renew it on the server, and the
+gateway pins the new key on its own. Renewing the gateway's own leaf
+(`listener`, `upstream_client`) over a **new key** needs the server's gateway
+peer pin updated first: see "Rotation" in [Gateway upstream peer
+authorization](server-admin.md#gateway-upstream-peer-authorization).
+
+**Limits.** The rotation suppression assumes the scrape interval plus
+`mgmt_pin_refresh_ms` is at most one minute; with a longer refresh interval the
+refused window is longer and a rotation can fire `YuzuGatewayMgmtPinMismatch`.
+The rotation timestamp lives in the gateway process and starts at 0: a gateway
+that starts after the server rotated reads the new key at start and records no
+rotation, which is correct because it never refuses the new key. The `notAfter` comes from the
+file, not from the certificate a listener or connection loaded: after replacing a
+file, the new date is reported within one interval even if a long-lived
+connection still presents the old certificate.
 
 ### Client addresses behind a proxy
 
@@ -2367,9 +2463,12 @@ do not.
 | gateway | metric | `yuzu_gw_session_limit_rejected_total` rising | A `Register` or `Subscribe` was refused because one gRPC connection already holds `max_sessions_per_connection` agent sessions (default 8; see "Per-connection session cap" for what counts). A stock agent holds one session per connection (INFERRED), so a rise means an L4 balancer, forwarder or client is carrying several agents on one connection (see "Per-connection session cap" under Configuration). A refused `Register` is answered `UNAVAILABLE` (14); a refused `Subscribe` is also answered `UNAVAILABLE` (14) and is counted the same. The agent retries either way. If the topology is legitimate, raise the key in `sys.config`; the key is read once when the registry starts, so the change needs a gateway restart, which disconnects every agent the node holds, so plan it. The metric has no agent label. A refused `Register` leaves nothing on the server and no row on the gateway. Rows of a connection that closed stay counted for the dead connection key only, which no new connection uses, until `dead_connection_grace_ms` (default 15 s) has passed, so a reconnecting client is not refused because of them. |
 | gateway | WARN | `Register failed: registry_unavailable` | The agent was answered `INTERNAL` (13) "Registration failed: registry unavailable". The gateway's registry process could not be reached for this `Register`: its table is missing, a call timed out, or the registry restarted and lost the row (see the `Registration replay aborted: registry unavailable` row). This line no longer covers a superseded `Register` (see the next row). The agent registers again with its reconnect backoff (read from the agent code). A sustained run of lines is not expected: check `/readyz` and the registry process. |
 | gateway | INFO | `Register superseded by a newer registration` | Two `Register` calls of one agent id overlapped on one connection and the newer one committed first. The older one was answered `UNAVAILABLE` (14) and left no row; the registry is healthy. No action: the agent retries a non-OK `Register` with its reconnect backoff (read from the agent code). An occasional line is expected; a sustained run would mean an agent or forwarder keeps repeating `Register` for one agent id on one connection (INFERRED from the code, not observed). |
-| gateway | WARN | `mgmt-plane peer rejected: <reason> (CA-issued cert is not authorization to command the fleet — see mgmt_peer_pins)` | A management-listener (`:50063`) stream was refused `UNAUTHENTICATED` by the SPKI pin (#1422). `<reason>` is one of the closed set counted on `yuzu_gw_mgmt_auth_rejected_total{reason}` (`pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `internal_error`); no certificate contents are logged. At most one line per reason per second (any holder of an install-CA certificate that reaches the port can provoke one per stream, N4); a line that follows suppressed ones ends `(N similar line(s) suppressed since the last)`. The counter counts every rejection; read it, not the log, for how many there were. A `pin_mismatch` burst right after the server rotated its leaf that stops within `mgmt_pin_refresh_ms` is the rotation window, not an attack. |
-| gateway | WARN | `mgmt_peer_pins: the certificate at <path> cannot be read or is not a PEM certificate; it pins nothing until it is fixed (fail closed)` | The pin watcher (`yuzu_gw_mgmt_pins`) could not stat, read or parse a `{cert_file, Path}` pin, at start or on a refresh. That entry admits nothing until the file is readable and holds a certificate again (picked up within `mgmt_pin_refresh_ms`); with no other pin resolved every management stream is refused `no_pins_resolved`. One line per change of state, not per stream. |
-| gateway | NOTICE | `mgmt_peer_pins: the certificate at <path> changed; the new key is pinned` | The pin watcher picked up a rotated server leaf. Management streams made with the old leaf are refused from now on (`pin_mismatch`). |
+| gateway | WARN | `mgmt-plane peer rejected: <reason> (CA-issued cert is not authorization to command the fleet — see mgmt_peer_pins)` | A management-listener (`:50063`) stream was refused `UNAUTHENTICATED` by the SPKI pin (#1422). `<reason>` is one of the closed set counted on `yuzu_gw_mgmt_auth_rejected_total{reason}` (`pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `internal_error`); no certificate contents are logged. At most one line per reason per second (any holder of an install-CA certificate that reaches the port can provoke one per stream, N4); a line that follows suppressed ones ends `(N similar line(s) suppressed since the last)`. The counter counts every rejection; read it, not the log, for how many there were. A `pin_mismatch` burst right after the server rotated its leaf that stops within `mgmt_pin_refresh_ms` is the rotation window, not an attack; the server does not retry those streams, so the commands it forwarded in that window failed as `gateway_unauthenticated` (see [Certificate rotation and expiry](#certificate-rotation-and-expiry)). |
+| gateway | WARN | `mgmt_peer_pins: the certificate at <path> cannot be read or is not a PEM certificate; it pins nothing until it is fixed (fail closed)` | The pin watcher (`yuzu_gw_mgmt_pins`) could not stat, read or parse a `{cert_file, Path}` pin that has never been read since the gateway started. That entry admits nothing until the file is readable and holds a certificate (picked up within `mgmt_pin_refresh_ms`); with no other pin resolved every management stream is refused `no_pins_resolved`. One line per change of state, not per stream. |
+| gateway | WARN | `mgmt_peer_pins: the certificate at <path> cannot be read or is not a PEM certificate; the key last read from it stays pinned until the file is readable again (fix the file; replace it with a different certificate to change the pin)` | The same failure on a pin file that was read before. The key last read stays pinned, so commands still flow; `yuzu_gw_cert_file_readable{role="mgmt_peer_pin"}` reads 0 and `YuzuGatewayMgmtPinUnresolved` fires after 2 minutes. Fix the file before the server's next rotation, which would otherwise be refused. Deleting the file does not withdraw the pin. |
+| gateway | INFO | `mgmt_peer_pins: the certificate at <path> is readable again; the pinned key is unchanged` | A pin file that had failed is readable again with the key already pinned. No action. |
+| gateway | NOTICE | `mgmt_peer_pins: the certificate at <path> changed; the new key is pinned` | The pin watcher picked up a rotated server leaf and set `yuzu_gw_mgmt_pin_rotated_timestamp_seconds`. Management streams made with the old leaf are refused from now on (`pin_mismatch`). |
+| gateway | WARN | `certificate expiry refresh failed: <class>:<reason>; the expiry gauges keep their last values` | The expiry refresh on the pin watcher's tick raised. The pins are unaffected; the expiry and readable gauges stop updating until it succeeds. Not expected: collect the log line and report it. |
 | gateway | WARN | `gateway grpc handler <Method> failed: class=<class> at <frame>` | A service handler raised, and the call was answered `INTERNAL` (13). The line names only the method, the exception class and the top stack frame, never a request, headers or the exception term. At most one line is written per second per node (`{yuzu_gw, grpc_runner_warn_interval_ms}`, default 1000, `0` logs every failure, an invalid value reads as 1000 silently and one above 3600000 as 3600000); a line that follows suppressed ones ends `(N similar failures not logged since the last line)`. The number of failed calls is not in the log: it is in the status the calls were answered with. |
 | gateway | INFO | `Upstream channel <name> connection <n> down (<word>); retrying in <ms> ms` | One of the channel's connections to the server went down or could not be opened; the channel reopens it after the delay (100 ms doubling to 5 s, with up to 20% jitter). `<word>` is a socket error such as `econnrefused` or `closed`, a TLS alert name, or `bad_tls_options`. A call made while no connection is up and none is connecting fails at once with the last such word (see [The upstream client](#the-upstream-client)); the circuit breaker counts it. One line per failed attempt, so a server that is down for a minute writes a line per connection every 5 to 6 s once the delay has reached its cap. Expected while the server restarts; a persistent TLS alert word means the certificate, the CA or the hostname is wrong (see the runbooks in [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)). Read from the code, not run. |
 | gateway | CRITICAL | `Refusing to start: the upstream channel configuration {yuzu_gw, upstream_client} is unusable (<Why>)` | `<Why>` names the shape of the first defect (`bad_client_config`, `bad_channel`, `bad_endpoint`, `bad_host`, `bad_socket_options`), never a value. Fix that entry; the pre-flight in [Upgrading](upgrading.md#the-upstream-channel-moves-to-upstream_client--breaking) finds it offline. |
@@ -3975,6 +4074,11 @@ that are actually emitted are listed.
 | `yuzu_gw_upstream_backpressure_duty_cycle` | gauge | The backpressure duty cycle over the last 60 s, 0 to 1. Reads low for the first minute after a start (the missing seconds count as not saturated) |
 | `yuzu_gw_upstream_slow` | gauge | 1 when the duty cycle above is 0.5 or more (a slow server, as this gateway sees it), else 0. Not a readiness input |
 | `yuzu_gw_session_limit_rejected_total` | counter | Registrations refused because one connection already holds the configured number of agent sessions, pending plus live (`max_sessions_per_connection`, default 8). Unlabelled, created at 0 at start. A `Register` over the cap is answered `UNAVAILABLE` (14); a `Subscribe` over the cap is also answered `UNAVAILABLE` (14) and is counted the same. A stock agent holds one session per connection (INFERRED), so a rise points to an L4 balancer, forwarder or client that carries several agents on one connection; see "Per-connection session cap" under Configuration. |
+| `yuzu_gw_mgmt_auth_rejected_total` | counter | Management-listener (`:50063`) streams refused by the SPKI peer pin, by `reason` (closed set: `pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `internal_error`; all created at 0 at start). Alerts: `YuzuGatewayMgmtAuthRejected` (every reason but `pin_mismatch`), `YuzuGatewayMgmtPinMismatch` |
+| `yuzu_gw_mgmt_auth_pin_unresolved_total` | counter | Management auth attempts during which at least one configured `mgmt_peer_pins` entry did not resolve (a typo'd fingerprint, or a pin file never readable since start) |
+| `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` | gauge | Unix time at which the pin watcher last published a different key for a `{cert_file, Path}` pin; 0 until the first such change in the process (created at 0 at start). Used by `YuzuGatewayMgmtPinMismatch` to stay quiet through a rotation |
+| `yuzu_gw_cert_expiry_timestamp_seconds` | gauge | `notAfter` in Unix seconds of each configured certificate file, the earliest for a file with several certificates (labels `role` = `listener`, `listener_ca`, `upstream_client`, `upstream_ca`, `mgmt_peer_pin`; `name` = listener or channel name, or the pin file's name). Keeps the last value read if the file becomes unreadable; absent for a file never read. Alerts: the `YuzuGatewayCertificateExpir*` ladder |
+| `yuzu_gw_cert_file_readable` | gauge | 1 when the latest read of every certificate file under that `role` and `name` parsed, 0 when a stat, read or parse failed. Alerts: `YuzuGatewayMgmtPinUnresolved` (`mgmt_peer_pin`), `YuzuGatewayCertificateFileUnreadable` (the other roles) |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and
 queue-length histograms, circuit-breaker and cluster counters) is registered in

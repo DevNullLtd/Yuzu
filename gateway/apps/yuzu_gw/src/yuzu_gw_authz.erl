@@ -23,9 +23,9 @@
 %%%                             is watched by yuzu_gw_mgmt_pins, NOT read here:
 %%%                             that process re-stats it every
 %%%                             mgmt_pin_refresh_ms (default 5 s) and publishes
-%%%                             its SPKI hash, so server leaf rotation self-heals
-%%%                             within one interval without a gateway restart,
-%%%                             and this check does no file I/O; or
+%%%                             its SPKI hash, so a rotated server leaf is
+%%%                             pinned within one interval without a gateway
+%%%                             restart, and this check does no file I/O; or
 %%%   {spki_sha256, Hex}      — a literal SHA-256 of the peer's DER-encoded
 %%%                             SubjectPublicKeyInfo (64 hex chars; for
 %%%                             bring-your-own-cert installs / split hosts
@@ -35,11 +35,14 @@
 %%% No file I/O on the stream path (M1(b), #5696): this callback runs in the
 %%% Cowboy connection process, once per stream, and a stat there (through the
 %%% node-wide file server) would let a stalled cert volume stall the decoding
-%%% of every stream on the connection. A `cert_file' pin resolves to what
-%%% yuzu_gw_mgmt_pins last published (a persistent_term read); a path it has
-%%% not published, or published as unreadable, contributes no pin. Between a
-%%% rotation and the watcher's next tick the new server leaf is refused (fail
-%%% closed); the server's retry after the tick succeeds.
+%%% of every stream on the connection. A `cert_file' pin resolves to the key
+%%% yuzu_gw_mgmt_pins last read from the file (a persistent_term read): it is
+%%% kept if the file later fails to read or parse (the watcher flags the source
+%%% unhealthy), and a path that has never resolved contributes no pin. Between
+%%% a rotation and the watcher's next tick the new server leaf is refused (fail
+%%% closed). The server does not retry that refusal: the commands it forwards
+%%% in that window fail terminally (`gateway_unauthenticated'); commands after
+%%% the tick go through.
 %%%
 %%% Why SPKI and not the subject CN: `agent_id` is only length-checked and
 %%% is chosen by the endpoint (`--agent-id`), and sign_agent_csr puts it in

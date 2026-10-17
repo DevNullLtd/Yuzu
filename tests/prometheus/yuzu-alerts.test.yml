@@ -4099,3 +4099,320 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
         eval_time: 30m
         exp_samples: []
+
+  # -- Gateway mgmt-plane rejections: rotation must not page (owner policy,
+  #    2026-10-17: "a page should only happen when someone needs to do
+  #    something") -------------------------------------------------------------
+  #
+  # A routine server-leaf rotation produces a few pin_mismatch rejections just
+  # BEFORE the gateway's pin watcher publishes the new key and sets
+  # yuzu_gw_mgmt_pin_rotated_timestamp_seconds. YuzuGatewayMgmtPinMismatch
+  # reads the counter one minute late and is suppressed for 240 s after the
+  # timestamp; YuzuGatewayMgmtAuthRejected no longer counts pin_mismatch. The
+  # old single rule (increase()[1h] > 0 over every reason) fires on case A for
+  # an hour; these cases go red against it.
+
+  # CASE A -- the rotation race at a 1m scrape: the rejections (t = 8m57s) are
+  # scraped at 9m, the watcher publishes the new key at 9m02s (542 s), and the
+  # timestamp is scraped one interval later, at 10m. Neither rule may be
+  # pending or firing at any evaluation.
+  - interval: 1m
+    name: gateway mgmt pin_mismatch - rotation rejections scraped before the rotation stay quiet
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="pin_mismatch"}'
+        values: "0x8 3x40"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="bad_peer_cert"}'
+        values: "0x48"
+      - series: 'yuzu_gw_mgmt_pin_rotated_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "0x9 542x39"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 13m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuGatewayMgmtPinMismatch|YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE A2 -- the same race at a 15 s scrape (rejections scraped at 9m00s,
+  # key published at 9m02s, timestamp scraped at 9m15s), checked every 15 s
+  # across the whole window the rejections can be counted in.
+  - interval: 15s
+    name: gateway mgmt pin_mismatch - rotation at a 15s scrape stays quiet
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="pin_mismatch"}'
+        values: "0x35 2x100"
+      - series: 'yuzu_gw_mgmt_pin_rotated_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "0x36 542x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 9m15s
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 10m15s
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 11m45s
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 13m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE B -- the rotation happened (542 s) but rejections keep coming every
+  # minute: the server presents a key the gateway still does not pin. Quiet
+  # while suppressed (to 782 s), firing at the first evaluation after.
+  - interval: 1m
+    name: gateway mgmt pin_mismatch - rejections continuing after a rotation fire
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="pin_mismatch"}'
+        values: "0x8 3+1x40"
+      - series: 'yuzu_gw_mgmt_pin_rotated_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "0x9 542x39"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 13m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 14m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch", alertstate="firing", instance="g1", job="yuzu-gateway", reason="pin_mismatch", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 14m
+        exp_samples: []
+
+  # CASE C -- pin_mismatch and the rotation gauge was never set (absent: an
+  # older gateway, or the series not scraped). Fires a minute after the
+  # rejection is scraped (the offset), not before.
+  - interval: 1m
+    name: gateway mgmt pin_mismatch - no rotation gauge fires
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="pin_mismatch"}'
+        values: "0x5 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch", alertstate="firing", instance="g1", job="yuzu-gateway", reason="pin_mismatch", severity="critical"}'
+            value: 1
+
+  # CASE C2 -- pin_mismatch with the gauge at its seeded 0 (no rotation in
+  # this gateway process): 0 must not suppress, so it fires too. A one-off
+  # rejection is enough (the pinned file was never updated, or a key holder
+  # probed once).
+  - interval: 1m
+    name: gateway mgmt pin_mismatch - seeded zero rotation gauge does not suppress
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="pin_mismatch"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_mgmt_pin_rotated_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "0x36"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch", alertstate="firing", instance="g1", job="yuzu-gateway", reason="pin_mismatch", severity="critical"}'
+            value: 1
+
+  # CASE D -- any other reason fires at once, rotation or not, and only under
+  # the old name.
+  - interval: 1m
+    name: gateway mgmt rejection - another reason fires promptly even during a rotation
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="missing_server_auth_eku"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_mgmt_pin_rotated_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "0x5 330x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="missing_server_auth_eku", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 8m
+        exp_samples: []
+
+  # -- Gateway pin file and certificate files unreadable --------------------
+  #
+  # A pin file whose latest read failed keeps its last key (commands still
+  # flow), so this is a warning that waits out one half-written file.
+
+  # CASE E -- the pin file stays unreadable: pending at 6m, firing at 8m.
+  - interval: 1m
+    name: gateway pin file unreadable - fires after 2m
+    input_series:
+      - series: 'yuzu_gw_cert_file_readable{job="yuzu-gateway",instance="g1",role="mgmt_peer_pin",name="default-server.pem"}'
+        values: "1x5 0x20"
+      - series: 'yuzu_gw_mgmt_auth_pin_unresolved_total{job="yuzu-gateway",instance="g1"}'
+        values: "0x25"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing", instance="g1", job="yuzu-gateway", name="default-server.pem", role="mgmt_peer_pin", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayCertificateFileUnreadable"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE E2 -- one scrape caught a half-written pin file: no page.
+  - interval: 1m
+    name: gateway pin file unreadable - a single bad read does not fire
+    input_series:
+      - series: 'yuzu_gw_cert_file_readable{job="yuzu-gateway",instance="g1",role="mgmt_peer_pin",name="default-server.pem"}'
+        values: "1x5 0 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+
+  # CASE E3 -- a listener certificate file unreadable for 10m fires the
+  # other rule (and not the pin rule).
+  - interval: 1m
+    name: gateway listener certificate file unreadable - fires after 10m
+    input_series:
+      - series: 'yuzu_gw_cert_file_readable{job="yuzu-gateway",instance="g1",role="listener",name="agent"}'
+        values: "1x5 0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayCertificateFileUnreadable", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayCertificateFileUnreadable", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayCertificateFileUnreadable", alertstate="firing", instance="g1", job="yuzu-gateway", name="agent", role="listener", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved"}'
+        eval_time: 16m
+        exp_samples: []
+
+  # -- Certificate expiry ladder (server and gateway) ------------------------
+  #
+  # promtool's clock starts at 0, so a gauge holding N seconds has N - t left
+  # at evaluation time t. One band fires at a time: 30d..7d warning
+  # (ExpiringSoon, for 1h), 7d..24h critical (ExpiryImminent, for 10m),
+  # under 24h critical (ExpiryCritical: gateway for 5m, server for 10m).
+
+  # 40 days left: nothing, at any band.
+  - interval: 1m
+    name: cert expiry ladder - 40 days left is quiet (gateway and server)
+    input_series:
+      - series: 'yuzu_gw_cert_expiry_timestamp_seconds{job="yuzu-gateway",instance="g1",role="listener",name="agent"}'
+        values: "3456000x180"
+      - series: 'yuzu_server_cert_expiry_timestamp_seconds{job="yuzu-server",instance="s1",cert="default-ca"}'
+        values: "3456000x180"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)"}'
+        eval_time: 150m
+        exp_samples: []
+
+  # 20 days left: ExpiringSoon only, firing after its hour.
+  - interval: 1m
+    name: cert expiry ladder - 20 days left warns (gateway and server)
+    input_series:
+      - series: 'yuzu_gw_cert_expiry_timestamp_seconds{job="yuzu-gateway",instance="g1",role="upstream_client",name="default_channel"}'
+        values: "1728000x180"
+      - series: 'yuzu_server_cert_expiry_timestamp_seconds{job="yuzu-server",instance="s1",cert="default-ca"}'
+        values: "1728000x180"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)", alertstate="firing"}'
+        eval_time: 59m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)"}'
+        eval_time: 61m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayCertificateExpiringSoon", alertstate="firing", instance="g1", job="yuzu-gateway", name="default_channel", role="upstream_client", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCertificateExpiringSoon", alertstate="firing", instance="s1", job="yuzu-server", cert="default-ca", severity="warning"}'
+            value: 1
+
+  # 5 days left: ExpiryImminent only (critical), firing after 10m.
+  - interval: 1m
+    name: cert expiry ladder - 5 days left is imminent (gateway and server)
+    input_series:
+      - series: 'yuzu_gw_cert_expiry_timestamp_seconds{job="yuzu-gateway",instance="g1",role="mgmt_peer_pin",name="default-server.pem"}'
+        values: "432000x60"
+      - series: 'yuzu_server_cert_expiry_timestamp_seconds{job="yuzu-server",instance="s1",cert="default-ca"}'
+        values: "432000x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayCertificateExpiryImminent", alertstate="firing", instance="g1", job="yuzu-gateway", name="default-server.pem", role="mgmt_peer_pin", severity="critical"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCertificateExpiryImminent", alertstate="firing", instance="s1", job="yuzu-server", cert="default-ca", severity="critical"}'
+            value: 1
+
+  # 12 hours left: ExpiryCritical only. The gateway rule fires after 5m, the
+  # server rule after 10m.
+  - interval: 1m
+    name: cert expiry ladder - 12 hours left is critical (gateway and server)
+    input_series:
+      - series: 'yuzu_gw_cert_expiry_timestamp_seconds{job="yuzu-gateway",instance="g1",role="listener_ca",name="mgmt"}'
+        values: "43200x60"
+      - series: 'yuzu_server_cert_expiry_timestamp_seconds{job="yuzu-server",instance="s1",cert="default-ca"}'
+        values: "43200x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)", alertstate="firing"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayCertificateExpiryCritical", alertstate="firing", instance="g1", job="yuzu-gateway", name="mgmt", role="listener_ca", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname=~"Yuzu(Gateway)?Certificate(ExpiringSoon|ExpiryImminent|ExpiryCritical)"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayCertificateExpiryCritical", alertstate="firing", instance="g1", job="yuzu-gateway", name="mgmt", role="listener_ca", severity="critical"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCertificateExpiryCritical", alertstate="firing", instance="s1", job="yuzu-server", cert="default-ca", severity="critical"}'
+            value: 1

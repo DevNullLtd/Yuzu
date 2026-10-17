@@ -16,9 +16,13 @@
 -module(yuzu_gw_mgmt_pins_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+-export([forward/4]).
+
 -define(KEY, {yuzu_gw_mgmt_pins, resolved}).
 -define(ENV_KEYS, [mgmt_peer_pins, mgmt_pin_refresh_ms]).
 -define(WAIT_MS, 5000).
+-define(HANDLER, {?MODULE, events}).
+-define(EVENTS, [[yuzu, gw, mgmt_pins, rotated], [yuzu, gw, cert_file, state]]).
 
 pins_test_() ->
     {foreach,
@@ -36,8 +40,17 @@ pins_test_() ->
                  fun() -> rotation_picked_up_by_the_timer(F) end}} end,
       fun(F) -> {"an unchanged file is not re-read and nothing is re-published",
                  fun() -> unchanged_file_not_reread(F) end} end,
-      fun(F) -> {"a file that disappears, or is garbage, stops admitting (fail closed)",
-                 fun() -> unreadable_or_garbage_fails_closed(F) end} end,
+      fun(F) -> {"a resolved pin survives a failed read; the source is flagged unhealthy",
+                 fun() -> failed_read_keeps_last_good_pin(F) end} end,
+      fun(F) -> {"a readable file with a different key replaces the pin",
+                 fun() -> replacement_swaps_the_pin(F) end} end,
+      fun(F) -> {"a file unreadable from the start pins nothing (fail closed)",
+                 fun() -> unreadable_at_boot_fails_closed(F) end} end,
+      fun(F) -> {"a key change emits the rotation event; a same-key rewrite, the first "
+                 "resolve and a recovery do not",
+                 fun() -> rotation_event_only_on_key_change(F) end} end,
+      fun(F) -> {"the watcher publishes certificate expiry when it starts",
+                 fun() -> watcher_publishes_expiry_at_start(F) end} end,
       fun(F) -> {"a literal spki_sha256 pin needs nothing published",
                  fun() -> literal_pin_unaffected(F) end} end,
       fun(F) -> {"a malformed pin list publishes nothing and does not crash the refresh",
@@ -54,12 +67,15 @@ setup() ->
     PrevPublished = persistent_term:get(?KEY, undefined),
     persistent_term:erase(?KEY),
     catch meck:unload(file),
+    catch telemetry:detach(?HANDLER),
     Certs = yuzu_gw_authz_tests:setup_certs(),
     #{certs => Certs, saved => Saved, prev => PrevPublished}.
 
 cleanup(#{certs := Certs, saved := Saved, prev := Prev}) ->
     stop_watcher(),
     catch meck:unload(file),
+    catch telemetry:detach(?HANDLER),
+    flush_events(),
     [case V of
          {ok, Val} -> application:set_env(yuzu_gw, K, Val);
          undefined -> application:unset_env(yuzu_gw, K)
@@ -94,6 +110,28 @@ file_calls_from(Pid) ->
     [{F, A} || {CallerPid, {file, F, A}, _} <- meck:history(file), CallerPid =:= Pid].
 
 srv(Certs) -> yuzu_gw_authz_tests:der(Certs, srv_pem).
+
+%% The test's telemetry handler, attached by a case with the case's own pid as
+%% the receiver (a foreach setup runs in another process) and detached in
+%% cleanup. It runs in the process that emits: the case for a direct
+%% refresh/1, the watcher for a tick or init/1.
+listen() ->
+    catch telemetry:detach(?HANDLER),
+    ok = telemetry:attach_many(?HANDLER, ?EVENTS, fun ?MODULE:forward/4, self()).
+
+forward(Event, Measurements, Meta, Pid) ->
+    Pid ! {telemetry_event, Event, Measurements, Meta},
+    ok.
+
+rotations() ->
+    receive {telemetry_event, [yuzu, gw, mgmt_pins, rotated], M, _} -> [M | rotations()]
+    after 0 -> []
+    end.
+
+flush_events() ->
+    receive {telemetry_event, _, _, _} -> flush_events()
+    after 0 -> ok
+    end.
 
 %%%-------------------------------------------------------------------
 %%% Cases
@@ -211,28 +249,145 @@ unchanged_file_not_reread(F) ->
         ?assert(persistent_term:get(?KEY) =:= Published)
     end).
 
-unreadable_or_garbage_fails_closed(F) ->
+%% Once a pin has resolved, a failed stat, a failed read (any errno, enoent
+%% included) or a file that does not parse keeps the last key read from it: a
+%% transient failure of the cert volume, or a writer caught half-way, must not
+%% refuse every management stream while /readyz stays green. The source is
+%% flagged unhealthy (healthy/1, and the yuzu_gw_cert_file_readable gauge) so
+%% the operator is told to fix the file.
+failed_read_keeps_last_good_pin(F) ->
     with_certs(F, fun(#{dir := Dir, srv_pem := SrvPem} = Certs) ->
         Path = filename:join(Dir, "going.pem"),
         {ok, _} = file:copy(SrvPem, Path),
         Pins = [{cert_file, Path}],
         ok = yuzu_gw_mgmt_pins:refresh(Pins),
-        ?assertEqual({true, <<"yuzu-server">>}, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
-        %% removed: the next refresh withdraws the pin
+        Admitted = {true, <<"yuzu-server">>},
+        ?assertEqual(Admitted, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
+        ?assert(yuzu_gw_mgmt_pins:healthy(Path)),
+        %% removed: the last good key stays pinned, the source is unhealthy
         ok = file:delete(Path),
         ok = yuzu_gw_mgmt_pins:refresh(Pins),
-        ?assertEqual(error, yuzu_gw_mgmt_pins:lookup(Path)),
-        ?assertEqual(false, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
-        %% replaced by something that is not a PEM certificate: still no pin
+        ?assertMatch({ok, _}, yuzu_gw_mgmt_pins:lookup(Path)),
+        ?assertEqual(Admitted, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
+        ?assertNot(yuzu_gw_mgmt_pins:healthy(Path)),
+        %% replaced by something that is not a PEM certificate, or by a PEM
+        %% cut off half-way: the same
         ok = file:write_file(Path, <<"not a certificate">>),
         ok = yuzu_gw_mgmt_pins:refresh(Pins),
-        ?assertEqual(error, yuzu_gw_mgmt_pins:lookup(Path)),
-        ?assertEqual(false, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
-        %% and back: admitted again
+        ?assertEqual(Admitted, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
+        ?assertNot(yuzu_gw_mgmt_pins:healthy(Path)),
+        {ok, Pem} = file:read_file(SrvPem),
+        ok = file:write_file(Path, binary:part(Pem, 0, byte_size(Pem) div 2)),
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        ?assertEqual(Admitted, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
+        ?assertNot(yuzu_gw_mgmt_pins:healthy(Path)),
+        %% a read error other than enoent: the same
+        ok = meck:new(file, [unstick, passthrough, no_link]),
+        ok = meck:expect(file, read_file,
+                         fun(P, _Opts) when P =:= Path -> {error, eio};
+                            (P, Opts) -> meck:passthrough([P, Opts])
+                         end),
         {ok, _} = file:copy(SrvPem, Path),
+        ok = file:change_time(Path, {{2023, 1, 1}, {0, 0, 0}}),
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        ?assertEqual(Admitted, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
+        ?assertNot(yuzu_gw_mgmt_pins:healthy(Path)),
+        ok = meck:unload(file),
+        %% readable again: healthy, still admitted
         ok = file:change_time(Path, {{2022, 1, 1}, {0, 0, 0}}),
         ok = yuzu_gw_mgmt_pins:refresh(Pins),
-        ?assertEqual({true, <<"yuzu-server">>}, yuzu_gw_authz:check_peer(srv(Certs), Pins))
+        ?assert(yuzu_gw_mgmt_pins:healthy(Path)),
+        ?assertEqual(Admitted, yuzu_gw_authz:check_peer(srv(Certs), Pins))
+    end).
+
+%% A file that is read successfully and holds a DIFFERENT key replaces the pin:
+%% that is rotation, and the way to withdraw a key (deleting the file is not).
+replacement_swaps_the_pin(F) ->
+    with_certs(F, fun(#{dir := Dir, srv_pem := SrvPem, gw_pem := GwPem} = Certs) ->
+        Path = filename:join(Dir, "swap.pem"),
+        {ok, _} = file:copy(SrvPem, Path),
+        Pins = [{cert_file, Path}],
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        GwDer = yuzu_gw_authz_tests:der(Certs, gw_pem),
+        ?assertEqual({true, <<"yuzu-server">>}, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
+        %% a failure in between does not matter: the next good read wins
+        ok = file:delete(Path),
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        {ok, _} = file:copy(GwPem, Path),
+        ok = file:change_time(Path, {{2021, 1, 1}, {0, 0, 0}}),
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        ?assert(yuzu_gw_mgmt_pins:healthy(Path)),
+        ?assertEqual({true, <<"yuzu-server">>}, yuzu_gw_authz:check_peer(GwDer, Pins)),
+        ?assertEqual(false, yuzu_gw_authz:check_peer(srv(Certs), Pins))
+    end).
+
+%% With no last good key there is nothing to keep: a file missing or garbage at
+%% the first resolve pins nothing, exactly as before, and the check refuses.
+unreadable_at_boot_fails_closed(F) ->
+    with_certs(F, fun(#{dir := Dir} = Certs) ->
+        Missing = filename:join(Dir, "missing.pem"),
+        ok = yuzu_gw_mgmt_pins:refresh([{cert_file, Missing}]),
+        ?assertEqual(error, yuzu_gw_mgmt_pins:lookup(Missing)),
+        ?assertNot(yuzu_gw_mgmt_pins:healthy(Missing)),
+        ?assertEqual(false, yuzu_gw_authz:check_peer(srv(Certs), [{cert_file, Missing}])),
+        Garbage = filename:join(Dir, "garbage.pem"),
+        ok = file:write_file(Garbage, <<"not a certificate">>),
+        ok = yuzu_gw_mgmt_pins:refresh([{cert_file, Garbage}]),
+        ?assertEqual(error, yuzu_gw_mgmt_pins:lookup(Garbage)),
+        ?assertEqual(false, yuzu_gw_authz:check_peer(srv(Certs), [{cert_file, Garbage}]))
+    end).
+
+%% yuzu_gw_mgmt_pin_rotated_timestamp_seconds is what lets the pin_mismatch
+%% alert stay quiet through a rotation. It must move ONLY when the pinned key
+%% changes: not at the first resolve (boot), not on a rewrite of the same key
+%% (new mtime, same SPKI), not when a source recovers with the key it had.
+rotation_event_only_on_key_change(F) ->
+    with_certs(F, fun(#{dir := Dir, srv_pem := SrvPem, gw_pem := GwPem}) ->
+        listen(),
+        Path = filename:join(Dir, "rot.pem"),
+        {ok, _} = file:copy(SrvPem, Path),
+        ok = file:change_time(Path, {{2020, 1, 1}, {0, 0, 0}}),
+        Pins = [{cert_file, Path}],
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        ?assertEqual([], rotations()),
+        %% same key, new mtime
+        ok = file:change_time(Path, {{2020, 6, 1}, {0, 0, 0}}),
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        ?assertEqual([], rotations()),
+        %% lost and found again with the same key
+        ok = file:delete(Path),
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        {ok, _} = file:copy(SrvPem, Path),
+        ok = file:change_time(Path, {{2020, 7, 1}, {0, 0, 0}}),
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        ?assertEqual([], rotations()),
+        %% a new key: one event, carrying the wall clock in seconds
+        Before = os:system_time(second),
+        {ok, _} = file:copy(GwPem, Path),
+        ok = file:change_time(Path, {{2021, 1, 1}, {0, 0, 0}}),
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        After = os:system_time(second),
+        [#{system_time := T}] = rotations(),
+        ?assert(T >= Before andalso T =< After)
+    end).
+
+%% init/1 publishes the expiry of the configured certificate files before
+%% start_link returns, through the same event the ticks use.
+watcher_publishes_expiry_at_start(F) ->
+    with_certs(F, fun(#{srv_pem := SrvPem}) ->
+        listen(),
+        application:set_env(yuzu_gw, mgmt_peer_pins, [{cert_file, SrvPem}]),
+        application:set_env(yuzu_gw, mgmt_pin_refresh_ms, 3600000),
+        {ok, Pid} = yuzu_gw_mgmt_pins:start_link(),
+        unlink(Pid),
+        Name = list_to_binary(filename:basename(SrvPem)),
+        receive
+            {telemetry_event, [yuzu, gw, cert_file, state], M,
+             #{role := <<"mgmt_peer_pin">>, name := Name}} ->
+                ?assertMatch(#{readable := 1, not_after := N} when is_integer(N), M)
+        after 0 ->
+            error(no_expiry_published_at_start)
+        end
     end).
 
 literal_pin_unaffected(F) ->

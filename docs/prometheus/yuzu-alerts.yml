@@ -139,41 +139,155 @@ groups:
             Disconnections" in docs/operations/troubleshooting.md). While it is down, agents through this
             gateway are stranded and command forwarding is dead.
 
-      # #1422 mgmt-plane peer pin: any rejection is either a probing CA-cert
-      # holder (a compromised endpoint's leaf replayed against the command
-      # plane) or a misrotated pin silently killing command forwarding.
+      # #1422 mgmt-plane peer pin, every rejection reason EXCEPT pin_mismatch
+      # (that one has its own rule below, because a routine server-leaf
+      # rotation produces a few of it). None of these reasons is produced by a
+      # rotation: missing_server_auth_eku, bad_peer_cert = a CA-cert holder
+      # that is not the server reached the command plane (or the server
+      # presents a leaf without the serverAuth EKU); no_pins_resolved,
+      # no_pins_configured, bad_pin_config = the gateway's pin configuration
+      # admits nobody (a pin file unreadable since the gateway started; once a
+      # pin has been read it stays pinned, see YuzuGatewayMgmtPinUnresolved);
+      # internal_error = a defect. Each one needs a person, so no `for:`. The
+      # name is the pre-split rule's, so existing silences and routes keep
+      # applying to the non-rotation reasons.
       - alert: YuzuGatewayMgmtAuthRejected
         expr: |
-          increase(yuzu_gw_mgmt_auth_rejected_total[1h]) > 0
+          increase(yuzu_gw_mgmt_auth_rejected_total{reason!="pin_mismatch"}[1h]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "Gateway mgmt-plane peer rejections ({{ $value }} in 1h)"
+          summary: "Gateway mgmt-plane peer rejected: {{ $labels.reason }} ({{ $value }} in 1h)"
           description: >-
-            The gateway's :50063 SPKI peer pin rejected one or more peers
-            (reason label on yuzu_gw_mgmt_auth_rejected_total). pin_mismatch
-            plus failing command forwarding means the server leaf and
-            mgmt_peer_pins diverged (rotation?); other reasons indicate a
-            CA-cert holder that is not the server probing the command plane.
-            A few pin_mismatch rejections that stop within
-            mgmt_pin_refresh_ms (default 5 s) of the server rotating its leaf
-            are the pin watcher's refresh window (#5696): the gateway refuses
-            the new leaf until its next refresh, and the server's retry
-            succeeds. Rejections that continue past it are not.
+            The gateway's :50063 management listener refused one or more peers
+            with reason {{ $labels.reason }}. Investigate now:
+            missing_server_auth_eku or bad_peer_cert means a holder of an
+            install-CA certificate that is not the server reached the command
+            plane (find it from the gateway's network logs; treat it as a
+            compromised certificate) or the server presents a leaf without the
+            serverAuth extended key usage (fix the server certificate);
+            no_pins_resolved, no_pins_configured or bad_pin_config means the
+            gateway's mgmt_peer_pins admits nobody and every command forwarded
+            to this gateway is failing (restore the pinned file the gateway log
+            names, which is picked up within mgmt_pin_refresh_ms; a correction
+            to mgmt_peer_pins in sys.config applies only at the next gateway
+            restart, which disconnects every agent on the node, and agents
+            without the #5183 fix stay wedged after it); internal_error is a
+            gateway defect (collect the gateway log and report it). Rotation
+            never produces these reasons.
 
+      # pin_mismatch: the peer's key is not the pinned key. A routine rotation
+      # produces a few: the server presents its new leaf up to one
+      # mgmt_pin_refresh_ms (default 5 s) before the gateway's pin watcher
+      # reads the new pin file, and the streams opened in that window are
+      # refused. The server does not retry them, so the commands forwarded in
+      # that window fail as gateway_unauthenticated; the next commands go
+      # through and nobody has to act, so this must not page.
+      # How the rule tells the two apart: the watcher sets
+      # yuzu_gw_mgmt_pin_rotated_timestamp_seconds when it publishes a changed
+      # key (0 until then, so a gateway that never saw a rotation is never
+      # suppressed). The rotation's rejections PRECEDE that timestamp by up to
+      # one refresh interval, and a scrape can land between them, so the
+      # counter is read one minute late (`offset 1m`): by the time a rejection
+      # is evaluated, the rotation that explains it has been scraped, provided
+      # scrape interval + mgmt_pin_refresh_ms is at most one minute (15-30 s
+      # scrapes and the 5 s default leave room). The 2m window read 1m late
+      # can count the rotation's rejections until at most rotation + 3m; the
+      # suppression lasts 4m (240 s), a minute of margin for scrape and
+      # evaluation jitter. Rejections that continue after that, or that occur
+      # with no rotation observed, fire, about a minute after they are scraped.
+      # With a refresh interval that pushes past the minute the race can leak
+      # and such a rotation can fire (the refused window is that much longer).
+      - alert: YuzuGatewayMgmtPinMismatch
+        expr: |
+          (
+            increase(yuzu_gw_mgmt_auth_rejected_total{reason="pin_mismatch"}[2m] offset 1m) > 0
+          )
+          unless on (job, instance)
+          (
+            time() - yuzu_gw_mgmt_pin_rotated_timestamp_seconds < 240
+          )
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway mgmt-plane pin does not match the presented server key ({{ $labels.instance }})"
+          description: >-
+            The gateway's :50063 management listener refused peers whose key
+            is not in mgmt_peer_pins, and no pin rotation on this gateway
+            explains it. Every command the server forwards to this gateway's
+            agents fails as gateway_unauthenticated until it is fixed (the
+            server does not retry). Act now: if the server's certificate was
+            changed, make the gateway pin its new key: update the pinned file
+            the {cert_file, Path} entry points at (it is picked up within
+            mgmt_pin_refresh_ms, no restart). Only if no pinned file can be
+            updated, add the new key's {spki_sha256, Hex} to mgmt_peer_pins,
+            which applies at the next gateway restart (that disconnects every
+            agent on the node, and agents without the #5183 fix stay wedged
+            after it). If the server's certificate did not change, a holder of another
+            certificate with the serverAuth usage (for example the gateway's
+            own key) is presenting it to the command plane: treat it as a
+            security incident. A routine rotation does not fire this: its
+            rejections are suppressed for 4 minutes after
+            yuzu_gw_mgmt_pin_rotated_timestamp_seconds moves.
+
+      # A configured pin that does not resolve or a pin file that cannot be
+      # read. Two shapes, one action (fix the pin): the counter moves on every
+      # management call while a configured entry has NEVER resolved (a typo'd
+      # fingerprint, or a pin file unreadable since the gateway started); the
+      # gauge reads 0 while the pin file's latest read failed. In the second
+      # case the gateway keeps the key it last read from the file, so commands
+      # still work today; the file must be fixed before the server's next
+      # rotation, which would otherwise be refused. `for: 2m` keeps a single
+      # half-written file seen on one refresh tick from paging; it delays the
+      # counter half by two minutes and does not require a sustained episode
+      # of it (increase()[1h] stays true for an hour after one increment).
       - alert: YuzuGatewayMgmtPinUnresolved
         expr: |
           increase(yuzu_gw_mgmt_auth_pin_unresolved_total[1h]) > 0
+          or
+          yuzu_gw_cert_file_readable{role="mgmt_peer_pin"} == 0
+        for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "Gateway mgmt_peer_pins has an unresolvable entry"
+          summary: "Gateway mgmt_peer_pins has an unresolvable entry or an unreadable pin file"
           description: >-
-            At least one configured mgmt_peer_pins entry cannot be resolved
-            (typo'd fingerprint or unreadable cert file). A dead pin is
-            invisible while another pin still admits the server — and becomes
-            a full command-plane outage at rotation cutover. Fix it now (the
-            gateway log names the entry).
+            A configured mgmt_peer_pins entry cannot be resolved, or a pinned
+            certificate file ({{ $labels.name }}, when named) cannot be read or
+            is not a PEM certificate. Fix it now: correct the fingerprint, or
+            restore the file at the {cert_file, Path} the gateway log names
+            (owner, mode, contents). A file that was read before keeps its last
+            key pinned, so commands still flow, but the next server
+            certificate rotation will be refused; an entry that never resolved
+            admits nothing and is invisible while another pin still admits the
+            server. The gateway picks up the fixed file within
+            mgmt_pin_refresh_ms; no restart.
+
+      # Certificate files the gateway is configured with other than the
+      # management pins (listener certfile/cacertfile, upstream client
+      # certfile/cacertfile): the latest read failed. The gateway keeps using
+      # what it loaded, but anything that reads the file again fails: an
+      # upstream redial, a restart, and new listener connections once OTP's
+      # certificate cache refreshes (about 2 minutes). The expiry gauge keeps
+      # the last notAfter read, so the expiry alerts below still fire.
+      - alert: YuzuGatewayCertificateFileUnreadable
+        expr: |
+          yuzu_gw_cert_file_readable{role!="mgmt_peer_pin"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway cannot read its {{ $labels.role }} certificate file ({{ $labels.name }})"
+          description: >-
+            The gateway's {{ $labels.role }} certificate file for
+            {{ $labels.name }} cannot be read or does not hold a PEM certificate
+            (role listener / listener_ca: the tls certfile / cacertfile of that
+            grpc_listeners entry; upstream_client / upstream_ca: the certfile /
+            cacertfile of that upstream_client channel, in the gateway's
+            sys.config). Restore the file (path, owner, mode, contents) before
+            the gateway restarts or redials the server: until then it keeps the
+            certificate it loaded, but a restart or reconnect that reads the
+            file again fails.
 
       # #4632: a request the gateway could not encode never leaves it, so the
       # server never sees it and the circuit breaker is not touched (request
@@ -2167,22 +2281,53 @@ groups:
 
   - name: yuzu-tls
     rules:
+      # Expiry ladder (server and gateway alike): one rule fires at a time,
+      # each naming the action and growing more urgent as the date nears.
+      #   ExpiringSoon   30d > left >= 7d   warning   schedule the renewal
+      #   ExpiryImminent  7d > left >= 24h  critical  renew today
+      #   ExpiryCritical       left <  24h  critical  renew now (also after expiry)
+      # The bands are disjoint so a certificate is never paged twice for one
+      # renewal; at a band edge the lower alert resolves and the next one
+      # becomes pending for its own `for:`.
       - alert: YuzuCertificateExpiringSoon
         expr: |
-          yuzu_server_cert_expiry_timestamp_seconds - time() < 604800
+          yuzu_server_cert_expiry_timestamp_seconds - time() < 2592000
+          and
+          yuzu_server_cert_expiry_timestamp_seconds - time() >= 604800
         for: 1h
         labels:
           severity: warning
         annotations:
-          summary: "Yuzu server TLS certificate expires in less than 7 days"
+          summary: "Yuzu server TLS certificate expires in less than 30 days"
           description: >-
             The {{ $labels.cert }} certificate expires in
-            {{ $value | humanizeDuration }}. Renew it and place the new PEM files
-            at the configured path (hot-reload picks up HTTPS automatically).
+            {{ $value | humanizeDuration }}. Schedule its renewal now, inside a
+            maintenance window: renew it and place the new PEM files at the
+            configured path (hot-reload picks up HTTPS automatically).
             Built-in default certs (cert="default-ca") do NOT auto-renew — replace
             them with operator-provided certs, or follow the clean re-root in
             docs/pki-architecture.md "Operator runbook". Never clear the whole
             cert directory: it also holds the secrets KEK (#5370).
+
+      - alert: YuzuCertificateExpiryImminent
+        expr: |
+          yuzu_server_cert_expiry_timestamp_seconds - time() < 604800
+          and
+          yuzu_server_cert_expiry_timestamp_seconds - time() >= 86400
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Yuzu server TLS certificate expires in less than 7 days"
+          description: >-
+            The {{ $labels.cert }} certificate expires in
+            {{ $value | humanizeDuration }}. Renew it today: place the new PEM
+            files at the configured path (hot-reload picks up HTTPS
+            automatically). Built-in default certs (cert="default-ca") do NOT
+            auto-renew — replace them with operator-provided certs, or follow
+            the clean re-root in docs/pki-architecture.md "Operator runbook".
+            Never clear the whole cert directory: it also holds the secrets
+            KEK (#5370).
 
       - alert: YuzuCertificateExpiryCritical
         expr: |
@@ -2194,8 +2339,84 @@ groups:
           summary: "Yuzu server TLS certificate expires in less than 24 hours"
           description: >-
             The {{ $labels.cert }} certificate expires in
-            {{ $value | humanizeDuration }}. Immediate action required to prevent
-            service disruption.
+            {{ $value | humanizeDuration }} (a negative value means it has
+            already expired). Renew it now to prevent an outage: agents,
+            gateways and operators stop connecting when it expires. Built-in
+            default certs (cert="default-ca"): follow the clean re-root in
+            docs/pki-architecture.md "Operator runbook".
+
+      # The gateway's own certificate files (yuzu_gw_cert_files, refreshed on
+      # the pin watcher's tick). role: listener / listener_ca (a
+      # grpc_listeners entry's tls certfile / cacertfile, name = listener),
+      # upstream_client / upstream_ca (an upstream_client channel's certfile /
+      # cacertfile, name = channel), mgmt_peer_pin (a mgmt_peer_pins
+      # {cert_file, Path}, name = file name: that is the SERVER's leaf as the
+      # gateway sees it). The value is the earliest notAfter in the file; if
+      # the file stops being readable the last value read is kept
+      # (YuzuGatewayCertificateFileUnreadable / YuzuGatewayMgmtPinUnresolved
+      # cover the unreadable file itself). Same ladder as above.
+      - alert: YuzuGatewayCertificateExpiringSoon
+        expr: |
+          yuzu_gw_cert_expiry_timestamp_seconds - time() < 2592000
+          and
+          yuzu_gw_cert_expiry_timestamp_seconds - time() >= 604800
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway {{ $labels.role }} certificate {{ $labels.name }} expires in less than 30 days"
+          description: >-
+            The gateway's {{ $labels.role }} certificate for {{ $labels.name }}
+            on {{ $labels.instance }} expires in {{ $value | humanizeDuration }}.
+            Schedule its renewal now. Where it is configured (gateway
+            sys.config): listener / listener_ca = the tls certfile / cacertfile
+            of the grpc_listeners entry named {{ $labels.name }};
+            upstream_client / upstream_ca = the certfile / cacertfile of the
+            upstream_client channel named {{ $labels.name }}; mgmt_peer_pin =
+            the {cert_file, Path} pin whose file is {{ $labels.name }}, which
+            is the server's certificate (renew it on the server). Renewing the
+            gateway leaf over a new key needs the server's gateway peer pin
+            updated first (docs/user-manual/server-admin.md "Gateway upstream
+            peer authorization").
+
+      - alert: YuzuGatewayCertificateExpiryImminent
+        expr: |
+          yuzu_gw_cert_expiry_timestamp_seconds - time() < 604800
+          and
+          yuzu_gw_cert_expiry_timestamp_seconds - time() >= 86400
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway {{ $labels.role }} certificate {{ $labels.name }} expires in less than 7 days"
+          description: >-
+            The gateway's {{ $labels.role }} certificate for {{ $labels.name }}
+            on {{ $labels.instance }} expires in {{ $value | humanizeDuration }}.
+            Renew it today. listener / listener_ca = the tls certfile /
+            cacertfile of the grpc_listeners entry {{ $labels.name }};
+            upstream_client / upstream_ca = the certfile / cacertfile of the
+            upstream_client channel {{ $labels.name }}; mgmt_peer_pin = the
+            server's certificate at the pinned file {{ $labels.name }} (renew
+            it on the server). See docs/user-manual/gateway.md "Certificate
+            rotation and expiry".
+
+      - alert: YuzuGatewayCertificateExpiryCritical
+        expr: |
+          yuzu_gw_cert_expiry_timestamp_seconds - time() < 86400
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway {{ $labels.role }} certificate {{ $labels.name }} expires in less than 24 hours"
+          description: >-
+            The gateway's {{ $labels.role }} certificate for {{ $labels.name }}
+            on {{ $labels.instance }} expires in {{ $value | humanizeDuration }}
+            (negative: already expired). Renew it now: when it expires, the
+            connections that use it fail -- agents and the server's commands
+            (listener, listener_ca, mgmt_peer_pin) or the gateway's calls to
+            the server (upstream_client, upstream_ca). See docs/user-manual/gateway.md
+            "Certificate rotation and expiry" for where each role is
+            configured.
 
       # yuzu_server_cert_reload_failures_total is a gauge holding the running
       # count of failed hot-reloads, so use delta() (not rate()) to detect a
