@@ -89,7 +89,7 @@ namespace {
     capdecls::core_dispatch_capabilities()
 
 UnitOverlay real_overlay() {
-    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, &yuzu::protective::is_protective_action);
+    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, kProtectivePredicate);
     REQUIRE(r.has_value());
     return std::move(*r);
 }
@@ -127,9 +127,20 @@ constexpr CommandCapability cap(std::string_view plugin, std::string_view action
 
 TEST_CASE("enablement units: the real catalogue builds with no missing or stale os row",
           "[enablement][catalogue]") {
-    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, &yuzu::protective::is_protective_action);
+    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, kProtectivePredicate);
     INFO(std::string(r.has_value() ? "" : r.error()));
     REQUIRE(r.has_value());
+}
+
+TEST_CASE("enablement units: the injected predicate is the canonical protective one",
+          "[enablement][catalogue]") {
+    // The real catalogue cannot tell the canonical set from the narrow quarantine one
+    // (its only addition, __guard__.push_rules, is already a reserved name), so the
+    // choice is pinned by identity. A swap back to the quarantine predicate fails here.
+    CHECK(kProtectivePredicate == &yuzu::protective::is_protective_action);
+    CHECK(kProtectivePredicate("__guard__", "push_rules"));
+    CHECK(kProtectivePredicate("quarantine", "whitelist"));
+    CHECK_FALSE(kProtectivePredicate("tar", "fleet_snapshot"));
 }
 
 TEST_CASE("enablement units: every catalogue pair follows the canonical protective predicate",
@@ -239,7 +250,7 @@ TEST_CASE("enablement units: a catalogue row with no os row fails the build - na
     static constexpr std::array<CommandCapability, 1> extra{CommandCapability{
         .plugin = "zz", .action = "new", .execute_gate = ExecuteGate::None}};
     auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS, std::span<const CommandCapability>{extra}},
-                                &yuzu::protective::is_protective_action);
+                                kProtectivePredicate);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().find("zz.new") != std::string::npos);
     CHECK(r.error().find("enablement_units.hpp") != std::string::npos);
@@ -249,7 +260,7 @@ TEST_CASE("enablement units: a stale os row fails the build - naming it",
           "[enablement][catalogue]") {
     std::vector<UnitOsRow> rows(kUnitOs.begin(), kUnitOs.end());
     rows.push_back({"zz", "gone", kAllOs});
-    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, &yuzu::protective::is_protective_action, rows);
+    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, kProtectivePredicate, rows);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().find("zz.gone") != std::string::npos);
 }
@@ -272,8 +283,8 @@ TEST_CASE("enablement units: the protective predicate is the caller's and not a 
             CHECK(r->find(name) == nullptr);
         }
     }
-    SECTION("the quarantine predicate leaves the same fragment switchable") {
-        auto r = build_unit_overlay({src}, &yuzu::protective::is_protective_action, os, {});
+    SECTION("the canonical protective predicate leaves the same fragment switchable") {
+        auto r = build_unit_overlay({src}, kProtectivePredicate, os, {});
         REQUIRE(r.has_value());
         CHECK(r->non_units.empty());
         for (const auto* name : {"zz", "zz.a", "zz.b"})
@@ -293,7 +304,7 @@ TEST_CASE("enablement units: build_unit_overlay refuses malformed inputs - namin
     };
     const auto ok_rows = std::vector<CommandCapability>{cap("zz", "a"), cap("zz", "b")};
     const std::vector<UnitOsRow> ok_os{{"zz", "a", kAllOs}, {"zz", "b", kAllOs}};
-    auto pred = &yuzu::protective::is_protective_action;
+    auto pred = kProtectivePredicate;
     const std::vector<Case> cases{
         {"duplicate catalogue pair",
          {cap("zz", "a"), cap("zz", "a")},

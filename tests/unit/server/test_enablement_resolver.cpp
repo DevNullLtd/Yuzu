@@ -98,7 +98,7 @@ constexpr std::array<RequirementEdge, 9> kFixtureEdges{{
 const UnitOverlay& overlay() {
     static const UnitOverlay ov = [] {
         auto r = build_unit_overlay({std::span<const CommandCapability>{kFixtureRows}},
-                                    &yuzu::protective::is_protective_action, kFixtureOs, kFixtureEdges);
+                                    kProtectivePredicate, kFixtureOs, kFixtureEdges);
         REQUIRE(r.has_value());
         return std::move(*r);
     }();
@@ -611,7 +611,7 @@ TEST_CASE("enablement resolver: a requirement edge from a unit inapplicable on t
     // and absent (not even a required_off entry) on linux.
     const std::array<RequirementEdge, 1> edges{{{"s.m", "p"}}};
     auto ov = build_unit_overlay({std::span<const CommandCapability>{kFixtureRows}},
-                                 &yuzu::protective::is_protective_action, kFixtureOs, edges);
+                                 kProtectivePredicate, kFixtureOs, edges);
     REQUIRE(ov.has_value());
     auto rule = make_rule("r", {"p"}, "__all__", Op, *ov, kinds());
     REQUIRE(rule.has_value());
@@ -633,7 +633,7 @@ TEST_CASE("enablement resolver: a requirement edge from a unit inapplicable on t
     CHECK(sm->required_off == Names{"p"});
 }
 
-static Rule load(const std::string& id, std::vector<std::string> units, std::string_view selector,
+static Rule load_persisted(const std::string& id, std::vector<std::string> units, std::string_view selector,
           Provenance prov = Provenance::Operator) {
     auto r = make_persisted_rule(id, std::move(units), selector, prov, kinds());
     INFO(id << ": " << (r ? "" : r.error()));
@@ -646,9 +646,9 @@ TEST_CASE("enablement resolver: a rule naming a vanished unit is reported and sw
     // Built through the loader constructor, as a stale persisted rule is after a
     // unit was removed: make_rule would refuse these names today.
     std::vector<Rule> rules;
-    rules.push_back(load("g1", {"gone.x", "p.y"}, "__all__"));
-    rules.push_back(load("g2", {"p.x", "gone.z", "gone.x"}, R"(ostype == "windows")"));
-    rules.push_back(load("g3", {"quarantine"}, "__all__"));
+    rules.push_back(load_persisted("g1", {"gone.x", "p.y"}, "__all__"));
+    rules.push_back(load_persisted("g2", {"p.x", "gone.z", "gone.x"}, R"(ostype == "windows")"));
+    rules.push_back(load_persisted("g3", {"quarantine"}, "__all__"));
 
     // g2's selector does not match a linux endpoint, yet its stale name is
     // reported: the answer is the same on every endpoint.
@@ -673,6 +673,27 @@ TEST_CASE("enablement resolver: a loaded rule keeps stale units but is validated
     CHECK(loaded->units == authored->units);
     CHECK(loaded->provenance == authored->provenance);
     CHECK(loaded->selector.has_value());
+    // Same meaning, not just a non-null selector: identical resolution on a matching
+    // and a non-matching endpoint. Rule is move-only, so build fresh ones each time.
+    const auto authored_rules = [&] {
+        std::vector<Rule> v;
+        v.push_back(std::move(*make_rule(s.id, s.units, s.selector, s.prov, overlay(), kinds())));
+        return v;
+    };
+    const auto loaded_rules = [&] {
+        std::vector<Rule> v;
+        v.push_back(std::move(*make_persisted_rule(s.id, s.units, s.selector, s.prov, kinds())));
+        return v;
+    };
+    for (const char* os : {"linux", "windows"}) {
+        INFO(os);
+        const Attrs attrs{{"ostype", os}, {"tag:lab", "y"}};
+        CHECK(run_rules(authored_rules(), os, attrs) == run_rules(loaded_rules(), os, attrs));
+    }
+    CHECK_FALSE(
+        run_rules(loaded_rules(), "linux", {{"ostype", "linux"}, {"tag:lab", "y"}}).off.empty());
+    CHECK(run_rules(loaded_rules(), "windows", {{"ostype", "windows"}, {"tag:lab", "y"}})
+              .off.empty());
 
     // The unit-name check is the only thing the loader skips.
     CHECK_FALSE(make_rule("g", {"gone.x"}, "__all__", Provenance::Operator, overlay(), kinds()));

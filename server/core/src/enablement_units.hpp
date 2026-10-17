@@ -23,9 +23,9 @@
  * so tar.fleet_snapshot and asset_tags.sync are ordinary units.
  *
  * PROTECTIVE SEAM (one line): the caller injects the predicate, and it is the
- * canonical protective set, `&yuzu::protective::is_protective_action`
- * (common/include/yuzu/protective_actions.hpp): the quarantine control actions
- * plus `__guard__.push_rules`. One predicate, never a second list, so a future
+ * canonical protective set, `kProtectivePredicate`, which is
+ * `&yuzu::protective::is_protective_action` (common/include/yuzu/protective_actions.hpp):
+ * the quarantine control actions plus `__guard__.push_rules`. One predicate, never a second list, so a future
  * widening of that set removes the new action from the switchable units with no
  * edit here. `__guard__.push_rules` is also caught by the reserved-name rule
  * (the control channel), which is checked first. There is no default, so a
@@ -64,6 +64,7 @@
 #include <vector>
 
 #include "command_capability.hpp"
+#include <yuzu/protective_actions.hpp>
 #include "plugin_config_parsers.hpp"
 
 namespace yuzu::server::enablement {
@@ -116,6 +117,10 @@ struct RequirementEdge {
 };
 
 using ProtectivePredicate = bool (*)(std::string_view plugin, std::string_view action);
+
+/// The predicate a caller injects: the canonical protective set. Named so the
+/// choice is one checkable line (test_enablement_units.cpp asserts its identity).
+inline constexpr ProtectivePredicate kProtectivePredicate = &yuzu::protective::is_protective_action;
 
 // Requirement edges, per action. app_usage.summary and app_usage.last_used
 // open tar.db read-only (app_usage_plugin.cpp:112-160). app_usage.foreground
