@@ -33,7 +33,11 @@
 %%% /readyz stayed green. A file that IS read successfully and holds a
 %%% DIFFERENT key replaces the pin: that is rotation, and it is how a key is
 %%% withdrawn (deleting the file is not; to withdraw a key, replace the file
-%%% with the new certificate, or remove the pin and restart the gateway).
+%%% with the new certificate). Removing the pin from the configuration also
+%%% withdraws it, but only at a gateway restart, which disconnects every agent
+%%% on the node: released agents without the #5183 fix may not re-register
+%%% after it, and their agent service must then be restarted. Prefer replacing
+%%% the file.
 %%%
 %%% Fail closed. A path that has never resolved (missing, unreadable or not a
 %%% certificate since start, or not yet published) contributes no pin; with no
