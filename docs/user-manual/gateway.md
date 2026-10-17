@@ -3662,8 +3662,9 @@ env keys with defaults, which a reverted build ignores.
   request and is never logged or returned. The wrapper logs at most one warning per
   second for each called process on a node, and the warning names only the class of
   the exit (`noproc`, `timeout` or `other`). The Register handler answers a gRPC
-  `INTERNAL` status for any `{error, _}` from `proxy_register/1` (the same status it
-  gives for `circuit_open`), and the agent retries registration on any non-OK
+  `UNAVAILABLE` status for `upstream_unavailable`, as for `circuit_open` and the
+  other refusals the gateway makes itself (#5695; it answered `INTERNAL` before),
+  and `INTERNAL` for any other `{error, _}`, and the agent retries registration on any non-OK
   status (read in `yuzu_gw_agent_service.erl` and `agents/core/src/agent.cpp`; not
   run). The third site matters because a failed registry call in the per-agent
   process's init used to exit that init with a reason that embedded the

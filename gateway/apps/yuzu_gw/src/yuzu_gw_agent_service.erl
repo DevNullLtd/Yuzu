@@ -45,8 +45,11 @@
 %% must change this one.
 -define(MAX_AGENT_ID_BYTES, 256).
 %% The proxied-call refusals answered UNAVAILABLE (see retryable_error/2).
+%% upstream_unavailable: the upstream client or its permit regulator is not
+%% running (restarting under its supervisor); no RPC was made.
 -define(RETRYABLE(Reason), (Reason =:= circuit_open orelse Reason =:= overloaded orelse
-                            Reason =:= deadline orelse Reason =:= stopping)).
+                            Reason =:= deadline orelse Reason =:= stopping orelse
+                            Reason =:= upstream_unavailable)).
 
 %%--------------------------------------------------------------------
 %% Register — proxy to C++ server
@@ -438,14 +441,18 @@ upstream_opts(Ctx) ->
 %%   overloaded    every permit is held and the wait queue is full
 %%   deadline      the agent's deadline passed while it waited for a permit
 %%   stopping      this gateway is stopping (planned)
+%%   upstream_unavailable  the upstream client or its regulator is not running
+%%                 (restarting under its supervisor; no RPC was made)
 %% Not logged per request: the regulator counts them
-%% (yuzu_gw_upstream_permit_refused_total) and the breaker logs its own moves.
+%% (yuzu_gw_upstream_permit_refused_total), the breaker logs its own moves, and
+%% a restarting upstream client is logged by its supervisor.
 retryable_error(What, Reason) ->
     Why = case Reason of
               circuit_open -> <<"the server is unreachable">>;
               overloaded   -> <<"the gateway is busy">>;
               deadline     -> <<"the gateway could not reach the server in time">>;
-              stopping     -> <<"the gateway is stopping">>
+              stopping     -> <<"the gateway is stopping">>;
+              upstream_unavailable -> <<"the gateway's upstream client is restarting">>
           end,
     {grpc_error, {?GRPC_STATUS_UNAVAILABLE, <<What/binary, " not forwarded: ", Why/binary,
                                               "; retry">>}}.

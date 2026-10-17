@@ -4449,6 +4449,25 @@ tests:
         eval_time: 20m
         exp_samples: []
 
+  # CASE E1 -- the counter half: a configured pin that has never resolved
+  # counts a management call; the file gauge stays 1 (another entry reads).
+  - interval: 1m
+    name: gateway pin never resolved - the counter fires after 2m
+    input_series:
+      - series: 'yuzu_gw_cert_file_readable{job="yuzu-gateway",instance="g1",role="mgmt_peer_pin",name="default-server.pem"}'
+        values: "1x25"
+      - series: 'yuzu_gw_mgmt_auth_pin_unresolved_total{job="yuzu-gateway",instance="g1"}'
+        values: "0x5 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtPinUnresolved", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
   # CASE E2 -- one scrape caught a half-written pin file: no page.
   - interval: 1m
     name: gateway pin file unreadable - a single bad read does not fire

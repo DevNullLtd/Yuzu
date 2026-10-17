@@ -27,7 +27,9 @@ refusal_status_test_() ->
       {timeout, 30, {"Register refused by a full permit queue is UNAVAILABLE",
                      fun register_overloaded_is_unavailable/0}},
       {timeout, 30, {"the agent's grpc-timeout bounds the upstream Register",
-                     fun register_carries_the_agent_deadline/0}}]}.
+                     fun register_carries_the_agent_deadline/0}},
+      {timeout, 30, {"Register and inventory with the upstream client not running are UNAVAILABLE",
+                     fun upstream_not_running_is_unavailable/0}}]}.
 
 setup() ->
     {ok, _} = application:ensure_all_started(telemetry),
@@ -85,6 +87,19 @@ register_carries_the_agent_deadline() ->
     %% 90 ms) less the upstream's own 200 ms: at most 610 ms reaches the server.
     ?assertEqual(810, yuzu_grpc_stream_h:deadline_ms(900)),
     ?assert(maps:get(timeout, Opts) =< 610).
+
+%% The upstream client restarting (its supervisor brings it back) is a refusal
+%% to retry, not an internal error: the agent is told UNAVAILABLE, like the
+%% other gateway-side refusals, and no RPC is made.
+upstream_not_running_is_unavailable() ->
+    ok = meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> error(no_rpc_expected) end),
+    ?assertEqual(undefined, whereis(yuzu_gw_upstream)),
+    ?assertMatch({error, upstream_unavailable}, yuzu_gw_upstream:proxy_register(req(<<"a4">>))),
+    ?assertMatch({grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}},
+                 yuzu_gw_agent_service:register(ctx(#{}), req(<<"a4">>))),
+    ?assertMatch({grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}},
+                 yuzu_gw_agent_service:report_inventory(ctx(#{}), #{agent_id => <<"a4">>})),
+    ?assertEqual(0, meck:num_calls(yuzu_grpc_client, unary, '_')).
 
 %%--------------------------------------------------------------------
 
