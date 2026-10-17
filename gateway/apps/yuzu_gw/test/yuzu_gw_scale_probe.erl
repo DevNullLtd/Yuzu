@@ -20,6 +20,8 @@
          memory/0, mailboxes/0, singletons/0, footprint/1]).
 %% Crash and supervisor reports logged in this node (planned_stop counts them).
 -export([count_crash_reports/0, crash_reports/0]).
+%% Kill agent owner processes (owner_kill, OWNER-RESTART #5695).
+-export([kill_owners/1]).
 -export([log/2]).  %% logger handler callback
 %% The upstream as the gateway's own telemetry sees it (upstream_trace/0).
 -export([upstream_trace/0, upstream_trace_reset/0, handle_event/4]).
@@ -63,6 +65,19 @@ log(#{msg := {report, #{label := {supervisor, _}}}}, #{config := #{counter := C}
     counters:add(C, 1, 1);
 log(_Event, _Config) ->
     ok.
+
+%% @doc Kill (exit kill: no terminate, no cleanup) the owner process of each
+%% agent id this node routes, as an untrappable crash would. Returns the
+%% {AgentId, SessionId} of each owner killed; an id with no local owner is
+%% left out.
+-spec kill_owners([binary()]) -> [{binary(), binary() | undefined}].
+kill_owners(Ids) ->
+    lists:filtermap(fun(Id) ->
+                            case yuzu_gw_registry:lookup_local_session(Id) of
+                                {ok, {Pid, Session}} -> exit(Pid, kill), {true, {Id, Session}};
+                                _ -> false
+                            end
+                    end, Ids).
 
 %% @doc What the gateway's own telemetry saw of the upstream since start/1 (or
 %% upstream_trace_reset/0): every breaker transition with its time (ms since the

@@ -1184,6 +1184,43 @@ groups:
             lists the steps per process.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md#gateway-runtime-metrics-5695"
 
+      # yuzu_gw_agent_owner_restarts_total{outcome} (OWNER-RESTART, #5695): an
+      # agent's owner process (yuzu_gw_agent) that dies abnormally is restarted
+      # by the agent supervisor, which sends the session's DISCONNECTED and
+      # recovers the session on the agent's open stream. A recovered restart
+      # needs nobody: the agent kept its session (`recovered`), or reconnects
+      # by itself (`disconnected_only`). An owner that is restarted more than 3
+      # times in 60 s gives up (`gave_up`): that is a crash loop, a gateway
+      # defect that will recur for that agent at its next connection, and
+      # someone has to read the crash reports. So it fires on gave_up only,
+      # for 30 minutes after the last one. The series is pre-seeded at 0
+      # (yuzu_gw_telemetry.erl), so the first gave_up of a gateway process is a
+      # 0 -> 1 step that increase() sees. No alert for the agent supervisor
+      # escalating (a crash of most owners): it restarts the agent supervisor,
+      # and a fault that persists stops the gateway, which the gateway's own
+      # down alerts cover.
+      - alert: YuzuGatewayAgentOwnerCrashLoop
+        expr: |
+          sum by (job, instance) (increase(yuzu_gw_agent_owner_restarts_total{outcome="gave_up"}[30m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway {{ $labels.instance }}: an agent's owner process crashed in a loop and gave up"
+          description: >-
+            On {{ $labels.instance }} an agent's owner process (yuzu_gw_agent)
+            was restarted more than 3 times within 60 s and gave up: the
+            gateway ended that agent's session (the agent reconnects by itself)
+            instead of crashing again. That is a defect in the gateway, likely
+            triggered by something that agent sends or holds, and it recurs
+            each time the agent connects. ACTION: find the crash reports of
+            yuzu_gw_agent in the gateway log around the time this fired (one
+            per crash, redacted: no credentials), and the WARN "owner process
+            restarted more than 3 times" naming the agent id; open a bug with
+            them, and say whether it started after a gateway upgrade (it is then
+            a regression of that release). The alert clears 30 minutes after
+            the last give-up.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md#when-an-agents-owner-process-crashes"
+
   - name: yuzu-security
     rules:
       - alert: YuzuOnBehalfAssertionRejected

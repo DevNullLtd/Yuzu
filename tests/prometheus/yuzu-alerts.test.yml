@@ -4696,3 +4696,38 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayProcessBacklogged", instance="g2"}'
         eval_time: 15m
         exp_samples: []
+
+  # YuzuGatewayAgentOwnerCrashLoop (OWNER-RESTART, #5695). CASE A (g1) -- one
+  # owner gives up at t5 (the series is pre-seeded at 0, so it is a 0 -> 1
+  # step): firing at once, still firing at 30m, quiet at 40m. CASE B (g2) --
+  # 50 restarted owners that recovered and 3 that ended with the agent
+  # reconnecting, none that gave up: never fires. RED if the outcome filter
+  # went (case B would fire) or the window shrank below 30m.
+  - interval: 1m
+    name: gateway agent owner crash loop - a give-up fires for 30m, recovered restarts do not
+    input_series:
+      - series: 'yuzu_gw_agent_owner_restarts_total{job="yuzu-gateway",instance="g1",outcome="gave_up"}'
+        values: "0x4 1x40"
+      - series: 'yuzu_gw_agent_owner_restarts_total{job="yuzu-gateway",instance="g2",outcome="gave_up"}'
+        values: "0x45"
+      - series: 'yuzu_gw_agent_owner_restarts_total{job="yuzu-gateway",instance="g2",outcome="recovered"}'
+        values: "0x4 50x40"
+      - series: 'yuzu_gw_agent_owner_restarts_total{job="yuzu-gateway",instance="g2",outcome="disconnected_only"}'
+        values: "0x4 3x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop"}'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayAgentOwnerCrashLoop"}'
+        eval_time: 40m
+        exp_samples: []

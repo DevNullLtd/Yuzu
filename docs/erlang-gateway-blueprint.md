@@ -213,15 +213,21 @@ streaming(info, {grpc_closed, _StreamRef}, Data) ->
 ```erlang
 %% Child spec
 #{id       => agent,
-  start    => {yuzu_gw_agent, start_link, []},
-  restart  => temporary,       % agent procs are ephemeral
+  start    => {yuzu_gw_agent, start_link_async, []},
+  restart  => transient,       % restarted after an abnormal exit only
   shutdown => 5000,
   type     => worker}.
 ```
 
-`temporary` restart: if an agent process crashes, the agent will reconnect
-naturally via a new Register → Subscribe cycle. No point restarting a process
-whose stream is already broken.
+`transient` restart (#5695; it was `temporary`): an agent process that crashes
+does not break the agent's stream (the Subscribe handler is a separate process
+that monitors it), so the supervisor restarts it. The restarted process sends
+the `DISCONNECTED` for its predecessor's session, re-attaches to the stream if
+it is still open and re-establishes the session; otherwise the agent
+reconnects by itself. A per-process budget (3 restarts in 60 s) ends a crash
+loop, and the fleet-wide restart intensity (`agent_restart_intensity`, 2000 in
+10 s) escalates only a crash of most agent processes. The full description is
+in the gateway manual, "When an agent's owner process crashes".
 
 ### 3. `yuzu_gw_router` — Command Fanout Coordinator
 

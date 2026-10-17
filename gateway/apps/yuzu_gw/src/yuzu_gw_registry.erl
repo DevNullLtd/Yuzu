@@ -134,6 +134,7 @@
          register_agent/5,
          register_agent/6,
          register_agent/7,
+         recover_agent/7,
          deregister_agent/1,
          deregister_agent/3,
          lookup/1,
@@ -262,6 +263,22 @@ register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq) ->
 register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey) ->
     yuzu_gw_safe_call:call(?SERVER,
                            {register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq,
+                            ConnKey},
+                           30000, registry_unavailable).
+
+%% @doc Register a RESTARTED agent owner under the session its predecessor
+%% held (OWNER-RESTART, #5695): register_agent/7, except that it never replaces
+%% a live registration by another process. The predecessor is dead, so a row
+%% held by a live process belongs to a newer registration of the agent (it
+%% reconnected while its old owner was being restarted): the answer is then
+%% `{error, superseded}' and nothing is changed. A row of a dead process (the
+%% predecessor's, not yet removed by its DOWN) is replaced as usual.
+-spec recover_agent(binary(), pid(), binary() | undefined, [binary()], binary(), map(),
+                    yuzu_gw_conn:key()) ->
+          ok | {error, registry_unavailable | session_limit | superseded}.
+recover_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey) ->
+    yuzu_gw_safe_call:call(?SERVER,
+                           {recover, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq,
                             ConnKey},
                            30000, registry_unavailable).
 
@@ -1005,6 +1022,20 @@ handle_call({admitted_register, AgentId, Pid, SessionId, Plugins, Hostname, Regi
     MonRef = monitor(process, Pid),
     {reply, ok, add_agent_monitor(AgentId, MonRef, State1)};
 
+handle_call({recover, AgentId, Pid, _SessionId, _Plugins, _Hostname, _RegisterReq, _ConnKey}
+            = Request, From, State) ->
+    case ets:lookup(?TABLE, AgentId) of
+        [{_, Other, _, _, _, _, _, _}] when Other =/= Pid, node(Other) =/= node() ->
+            {reply, {error, superseded}, State};
+        [{_, Other, _, _, _, _, _, _}] when Other =/= Pid ->
+            case is_process_alive(Other) of
+                true  -> {reply, {error, superseded}, State};
+                false -> handle_call(setelement(1, Request, register), From, State)
+            end;
+        _ ->
+            handle_call(setelement(1, Request, register), From, State)
+    end;
+
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -1112,6 +1143,8 @@ format_status(Status) ->
                 (_Key, Value)  -> Value
              end, Status).
 
+redact_message({recover, AgentId, Pid, SessionId, Plugins, Hostname, _RegisterReq, ConnKey}) ->
+    {recover, AgentId, Pid, SessionId, Plugins, Hostname, '$redacted', ConnKey};
 redact_message({register, AgentId, Pid, SessionId, Plugins, Hostname, _RegisterReq, ConnKey}) ->
     {register, AgentId, Pid, SessionId, Plugins, Hostname, '$redacted', ConnKey};
 redact_message({'$gen_call', From, Msg}) -> {'$gen_call', From, redact_message(Msg)};

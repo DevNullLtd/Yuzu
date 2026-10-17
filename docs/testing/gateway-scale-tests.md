@@ -73,6 +73,7 @@ a stream over the limit where gRPC C++ queues it, so the client queues).
 | `gateway_crash` | N agents registered; the gateway node is killed and a new one started on the same ports. Every agent comes back by its own retry rule |
 | `planned_stop` | N agents registered; `application:stop(yuzu_gw)`. Counts the `DISCONNECTED` notices the server received |
 | `fanout` | N agents registered; one command to each agent over one management connection; agents answer after a random 0 to 10 s |
+| `owner_kill` | N agents registered; the owner process (`yuzu_gw_agent`) of 10% of them is killed at once with `exit(Pid, kill)` (no clean-up runs; modelled on an independent tester's cell ch_x10a). Each restarted owner must send its session's `DISCONNECTED` and recover the session on the agent's open stream; then one command is sent to every killed agent. Measures the time until every killed session is `CONNECTED` again |
 | `upstream_conn_loss` | N agents registered; a wave of N/10 more (at least 100) registers at once, and once at least 8 `ProxyRegister` calls are open at the server it closes the gateway's upstream connection (kills its connection process) and keeps running with everything it knows. Counts breaker openings, replayed registrations and repeated `CONNECTED` notices |
 
 The crash, stop and fan-out cases first register the N agents with the server
@@ -133,6 +134,7 @@ Each case also checks invariants that involve no timing:
 | `planned_stop` | the server receives a `DISCONNECTED` for every session; the gateway node logs no crash or supervisor report during the stop |
 | `fanout` | every command is answered; the management connection is never closed; no agent loses its session |
 | `upstream_conn_loss` | at least 8 `ProxyRegister` calls were in flight at the server when the connection was closed (without that, the next invariant proves nothing); the server closed at least one connection; the circuit breaker never opened; no registration was replayed; at most 10 sessions got a second `CONNECTED` (the notifications in flight when the connection went are sent again, their answers were lost with it); every agent registers within the budget; the server holds a `CONNECTED` for every live session |
+| `owner_kill` | at least one owner was killed; every killed owner's session had its `DISCONNECTED` reach the server; every one was `CONNECTED` again after that `DISCONNECTED` within the budget; no agent lost its stream or registered again (every killed owner's agent kept its session, and the fleet saw no disconnect); a command to every killed agent afterwards was answered; the agent supervisor was not restarted; the server holds a `CONNECTED` for every live session; every singleton mailbox is back to 0 |
 | every case that registers its agents first | no registration is replayed during that setup (the server lost nothing) |
 
 Several of these fail on the gateway as of commit 29a8e655b (see the numbers
@@ -186,6 +188,7 @@ Other settings, all optional:
 | `YUZU_GW_SCALE_LATENCY_MS` | `20-50` | the server's `Register` latency in the measured phases |
 | `YUZU_GW_SCALE_OUTAGE_MS` | 5000 | how long the server is down in `server_crash` |
 | `YUZU_GW_SCALE_FLAP_PCT` | 10 | percent of agents that drop their connection during that outage |
+| `YUZU_GW_SCALE_KILL_PCT` | 10 | percent of agents whose owner process `owner_kill` kills |
 | `YUZU_GW_SCALE_FANOUT_DELAY_MS` | `0-10000` | agents' answer delay in `fanout` |
 | `YUZU_GW_SCALE_FANOUT_WINDOW` | 4096 | management calls open at once |
 | `YUZU_GW_SCALE_OUTPUT_BYTES` | 2048 | size of each command answer |
@@ -427,3 +430,22 @@ backlogged (at most 32 messages when a call started), so the gateway side of
 the connection (gun's single connection process, or HTTP/2 flow control) is the
 remaining suspect, and the C++ server's own connection handling is not the
 same as the fake's.
+
+## Owner processes killed (`owner_kill`)
+
+Added with the OWNER-RESTART change (#5695): before it, a killed agent owner
+process (`yuzu_gw_agent`, the one process that holds an agent's session) was
+not restarted and sent nothing to the server. Same host as above.
+
+| | 500 agents, 50 owners killed, before | 500 agents, 50 killed, after | 5,000 agents, 500 killed, after |
+|---|---|---|---|
+| `DISCONNECTED` received for the killed sessions | 0 | 50 | 500 |
+| Sessions `CONNECTED` again after their `DISCONNECTED` | 0 (the agents registered new sessions after their heartbeat was refused, about 65 s) | 50, the last 22 ms after the kill | 500, the last 147 ms after the kill |
+| Agents that lost their stream or registered again | 50 | 0 | 0 |
+| Commands to the killed agents answered afterwards | 50 (on their new sessions) | 50 | 500 |
+| Agent supervisor restarted | no | no | no |
+| Invariants violated | `no_lost_disconnected`, `all_recovered`, `no_agent_reconnect` | none | none |
+
+500 restarts within a second is a quarter of the agent supervisor's default
+restart intensity (2000 in 10 s), so it does not escalate.
+
