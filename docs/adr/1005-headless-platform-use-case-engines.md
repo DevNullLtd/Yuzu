@@ -180,7 +180,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        one-call, unrecoverable data-loss primitive. The twin is withheld
        until an MCP destructive-operation gate exists (human confirmation /
        tier ceiling) that makes a guarded twin safe. Tracked as **#2102**;
-       **revisit by 2027-01-13**.
+       **revisit by 2027-01-13**. #2102 is the closed recording issue (closed
+       2026-07-14) and there is no open tracker. The fragment that probes the
+       `Decommission:Delete` gate, `get.fragments-hardware-ci-stored-data`, is
+       ledgered as `exception:#2102 revisit:2027-01-13`.
      - **Scoped to the destructive verb only — the capability's read half
        has its twin from day one.** `GET /api/v1/sle/agents/{id}` ships
        alongside the MCP twin `query_software_licenses` (ADR-0024
@@ -315,32 +318,39 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        265 → 257) and recording the #520 decision nowhere this ADR's own
        exception-ledger mechanism could see it — an adversarial two-model
        review (`/home/dgr/advrev-4028`) caught the mislabel independently of
-       the credential-leak finding on the same branch. The rows are now
-       `status: "exception:#520"`, `BASELINE_UNTWINNED` is restored to 265,
+       the credential-leak finding on the same branch. The rows were then
+       `status: "exception:#520"`, `BASELINE_UNTWINNED` was restored to 265,
        and this entry is the exception-ledger record ADR-1005's own
        Decision 1 requires for it.
-     - **Not a tracked follow-up — revisit only if #520 itself is amended.**
+     - **Not a tracked follow-up: the dated revisit is a re-confirmation
+       date only, and the decision changes only if #520's boundary is
+       amended.**
        Unlike the SCIM entry above, there is no scoped MCP-surface work
        item to point at: adding an MCP twin here means amending #520's
        fleet-management/server-administration boundary, which
-       `docs/mcp-server.md:21` already states explicitly requires "its own
+       the `docs/mcp-server.md` bullet "Server administration surfaces stay
+       REST-only (#520)" already states explicitly requires "its own
        security-guardian-reviewed amendment... not a side effect of a
        routine REST-twin PR." This stands as a standing exception until
-       that amendment happens, not a numbered issue with a revisit date. (#4031
-       required a per-route decision and its implementing PR #4176 made the
-       identical call for three REST-only reads: enrollment
-       auto-approve-rules, enrollment pending-agents and settings/oidc,
-       ledgered as `get.fragments-settings-auto-approve`,
+       that amendment happens. As of 2026-10-17 the eight rows are ledgered as
+       `exception:#520 revisit:2027-04-30`: the date is a re-confirmation of
+       the same standing decision, not a work-item deadline, so the dated
+       form does not reverse this entry. (#4031 required a per-route decision
+       and its implementing PR #4176 made the identical call for three
+       REST-only reads: enrollment auto-approve-rules, enrollment
+       pending-agents and settings/oidc, ledgered as
+       `get.fragments-settings-auto-approve`,
        `get.fragments-settings-pending` and
        `get.fragments-settings-directory`. They were previously ledgered
-       `twinned`; this change makes them `exception:#520 revisit:2027-04-30`.
-       #520 is the closed security issue whose fix drew the MCP-tier
-       boundary, not a decision record: the decision of record is
+       `twinned` and carry the same `exception:#520 revisit:2027-04-30` as of
+       2026-10-17.) #520 is the closed security issue whose fix drew the
+       MCP-tier boundary, not a decision record: the decision of record is
        `mcp_policy.hpp`'s `tier_allows` and the `docs/mcp-server.md` bullet
-       "Server administration surfaces stay REST-only (#520)". #4031 is still
-       open and carries no re-confirmation date, so no open item tracks the
-       2027-04-30 re-confirmation; #5955 covers only its own 13 rows. The
-       eight #4028 rows keep their undated legacy form.)
+       "Server administration surfaces stay REST-only (#520)". No open item
+       owns the 2027-04-30 re-confirmation of these eleven rows or the
+       2027-01-13 re-confirmation of the stored-data row; the dates were set
+       by the author and are not machine-checked. #5955 covers only its own
+       13 rows.
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -560,7 +570,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        twin to build takes no password argument: a server-generated
        temporary password with a must-change-at-next-sign-in flag (auth
        schema v3). Tracked as **#5357**; **revisit by 2027-01-04**. Until it
-       lands, this row stands as the open exception.
+       lands, this row stands as the open exception; it is ledgered as
+       `exception:#5357 revisit:2027-01-04`.
      - **The exception relaxes no control.** Both routes accept interactive
        dashboard sessions only, require a same-site `Origin`/`Referer` and
        `Content-Type: application/json`, pass MFA step-up, and commit the
@@ -638,11 +649,16 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      cap how many there are. Growth is review-enforced for now, as is
      re-dating, re-pointing or relabelling an existing exception row. A
      revisit date that has passed is not machine-checked (#5955 is the
-     reminder). The #520 dating of the #4031 rows (see the #4028 entry) is not
-     part of the 2026-10-15 acceptance. The 17 older
-     `exception:` rows at the time of writing are undated legacy rows in a size-pinned set: plain
-     growth is machine-caught, while growth paired with a raise of the pin, a
-     swap or a rebind to a row with the same slug is review-only. They are a
+     reminder). The #520 dating of the eleven #520 rows (three #4031, eight
+     #4028; see the #4028 entry) is not part of the 2026-10-15 acceptance.
+     Seven free-form `exception:` rows remain, in a size-pinned set; each
+     has no committed date or owner yet: the two NVD rows, the self-service
+     password row, the two api-tokens rows (a known gate mismatch with their v1
+     twins, recorded in the api-tokens rows of
+     `scripts/ci/api-parity/rbac.json`, with no tracker or date as of
+     2026-10-17) and the two TAR process-tree rows. Plain growth of the set
+     is machine-caught, while growth paired with a raise of the pin, a swap
+     or a rebind to a row with the same slug is review-only. They are a
      disclosed residual not covered by #5955. The eight `twinned-rest-only`
      rows are open gaps counted by the ratchet and tracked by #5963 (the two
      hardware rows also by #4456).
