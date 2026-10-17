@@ -38,8 +38,8 @@
 %%%
 %%% It CHECKS INVARIANTS (no timing in any of them; see invariants/2 for each):
 %%% zero first-attempt Register failures, more than one Register in flight at
-%%% the server at once, no Register served for an attempt that had already
-%%% given up, a complete replay with more than one in flight, zero lost
+%%% the server at once, no session created at the server for a Register attempt
+%%% that failed, a complete replay with more than one in flight, zero lost
 %%% DISCONNECTED notices (planned stop and outage), every live session known to
 %%% the server, every command answered, the management connection kept, and the
 %%% singleton mailboxes back to 0. Several FAIL on the gateway as of 29a8e655b
@@ -432,8 +432,8 @@ registration_invariants(R) ->
          "every agent was registered within the scenario budget"),
      inv(upstream_register_in_parallel, maps:get(register_peak_inflight, Up) > 1,
          "more than one ProxyRegister was in flight at the server at once"),
-     inv(no_stale_upstream_registers, maps:get(stale_register_rpcs, Up) =:= 0,
-         "no ProxyRegister reached the server for an attempt the agent had already given up"),
+     inv(no_wasted_upstream_registers, maps:get(wasted_register_rpcs, Up) =:= 0,
+         "no ProxyRegister created a session at the server for an attempt that failed"),
      inv(every_live_session_connected, maps:get(missing_connected, Conv) =:= 0,
          "the server holds a CONNECTED notice for every live session"),
      inv(singleton_mailboxes_drain, maps:get(mailboxes_drained, Settle),
@@ -492,8 +492,9 @@ registration_report(Config, T0, Reg, Expected0) ->
 %%   wasted  the server created a session the agent never got: the attempt did
 %%           not succeed;
 %%   stale   of those, the call reached the server after the attempt had
-%%           already ended (100 ms slack for the shared clock): work done for a
-%%           caller that had given up.
+%%           already ended: work started for a caller that had given up. (Every
+%%           node reads the same OS clock, so no slack is needed; a call that
+%%           started just before the agent gave up is wasted but not stale.)
 upstream_waste(Registers, Attempts, T0) ->
     ByKey = maps:from_list([{{Id, N}, {End, Outcome}} || {Id, N, _S, End, Outcome} <- Attempts]),
     Fresh = [{Id, Recv, Att} || {Id, fresh, Recv, _Done, _S, Att} <- Registers, Recv >= T0],
@@ -502,7 +503,7 @@ upstream_waste(Registers, Attempts, T0) ->
                              Outcome =/= ok],
     #{fresh_register_rpcs => length(Fresh),
       wasted_register_rpcs => length(Wasted),
-      stale_register_rpcs => length([1 || {Recv, End} <- Wasted, is_integer(End), Recv > End + 100])}.
+      stale_register_rpcs => length([1 || {Recv, End} <- Wasted, is_integer(End), Recv > End])}.
 
 group_attempts(Attempts) ->
     G = lists:foldl(fun({Id, _, _, _, _} = A, Acc) ->
@@ -730,7 +731,7 @@ start_gateway(#{log := Log, fds := Fds, upstream_port := UpPort, n := N,
             "-env", "ERL_FULLSWEEP_AFTER", "20", "+zdbbl", "32768"],
     {ok, Peer} = ?PEER:start(gateway, #{fds => Fds, log => Log, args => Args}),
     track(gateway, Peer),
-    Dual = N > ?DUAL_STACK_ABOVE,
+    Dual = N > env_int("YUZU_GW_SCALE_DUAL_STACK_ABOVE", ?DUAL_STACK_ABOVE),
     ok = ?PEER:call(Peer, application, load, [yuzu_gw]),
     [ok = ?PEER:call(Peer, application, set_env, [yuzu_gw, K, V])
      || {K, V} <- gateway_env(UpPort, AgentPort, Agent6Port, MgmtPort, Dual)],
