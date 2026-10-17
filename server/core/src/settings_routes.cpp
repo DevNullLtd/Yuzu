@@ -5702,6 +5702,9 @@ void SettingsRoutes::register_routes(
             return;
         if (!api_token_store_ || !api_token_store_->is_open()) {
             res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
@@ -5763,9 +5766,9 @@ void SettingsRoutes::register_routes(
             }
         }
 
-        // An MCP-tier token needs an expiry and at most 90 days. Refuse here, as POST
+        // An MCP-tier token needs an expiry of at most 90 days. Refuse here, as POST
         // /api/v1/tokens does, so a plain input error is not reported below as a CSPRNG failure
-        // (503, a false yuzu_secure_random_failure_total page and a false csprng_unavailable
+        // (503, a false yuzu_secure_random_failure_total increment and a false csprng_unavailable
         // audit row).
         if (!mcp_tier.empty()) {
             if (expires_at <= 0) {
@@ -5778,8 +5781,8 @@ void SettingsRoutes::register_routes(
                                  std::chrono::system_clock::now().time_since_epoch())
                                  .count();
             if (expires_at - now > 90LL * 24 * 3600) {
-                res.set_content("<span class=\"feedback-error\">MCP token TTL cannot exceed 90 "
-                                "days.</span>",
+                res.set_content("<span class=\"feedback-error\">An MCP-tier token TTL cannot "
+                                "exceed 90 days.</span>",
                                 "text/html; charset=utf-8");
                 return;
             }
@@ -5893,6 +5896,9 @@ void SettingsRoutes::register_routes(
             return;
         if (!api_token_store_ || !api_token_store_->is_open()) {
             res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }

@@ -1682,7 +1682,8 @@ TEST_CASE("SettingsRoutes api-tokens: the step-up gate runs before form validati
     SettingsAdr2001Harness h;
     h.step_up_refuse = true;
 
-    for (const char* body : {"name=", "name=t1&ttl_hours=0x5", "name=t1&mcp_tier=bogus"}) {
+    for (const char* body : {"name=", "name=t1&ttl_hours=0x5", "name=t1&mcp_tier=bogus",
+                             "name=t1&mcp_tier=operator"}) {
         INFO(body);
         h.step_up_labels.clear();
         auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
@@ -1746,4 +1747,28 @@ TEST_CASE("SettingsRoutes POST api-tokens: an MCP tier without a usable TTL is a
     const auto listed = h.token_store->list_tokens();
     REQUIRE(listed.has_value());
     CHECK(listed->size() == 1);
+}
+
+// With no token store behind the routes, both token mutations answer 503 with an A4 envelope and an
+// error toast, before reaching any store call. SettingsRoutesHarness registers the routes with a
+// null ApiTokenStore, so this needs no Postgres.
+TEST_CASE("SettingsRoutes api-tokens: both mutations answer 503 when the token store is unavailable",
+          "[settings][api_tokens]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+
+    auto created = h.Post("/api/settings/api-tokens", "name=t1&ttl_hours=24",
+                          "application/x-www-form-urlencoded");
+    REQUIRE(created);
+    CHECK(created->status == 503);
+    CHECK(created->get_header_value("HX-Trigger").find("Token store unavailable") !=
+          std::string::npos);
+    CHECK(nlohmann::json::parse(created->body).contains("error"));
+
+    auto revoked = h.Delete("/api/settings/api-tokens/some-token");
+    REQUIRE(revoked);
+    CHECK(revoked->status == 503);
+    CHECK(revoked->get_header_value("HX-Trigger").find("Token store unavailable") !=
+          std::string::npos);
+    CHECK(nlohmann::json::parse(revoked->body).contains("error"));
 }
