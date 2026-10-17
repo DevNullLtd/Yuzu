@@ -18,7 +18,10 @@
 
 #include <cctype>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -273,4 +276,26 @@ TEST_CASE("kek fragment: the REST twin is untouched and still answers JSON", "[k
     REQUIRE(r);
     CHECK(r->status == 200);
     CHECK_THAT(r->get_header_value("Content-Type"), ContainsSubstring("application/json"));
+}
+
+// ── Production wiring ───────────────────────────────────────────────────────
+
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+
+TEST_CASE("pki page: the shipped server registers the page", "[pki_page][pki]") {
+    // The route tests above register the helper straight onto a TestRouteSink, so deleting
+    // the production call would leave them green and ship a Settings nav entry that 404s.
+    // Same source-scan precedent as the plugins page and test_body_cap_route_inventory.cpp.
+    std::ifstream f(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(f);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    CHECK_THAT(ss.str(), ContainsSubstring("pki::register_pki_routes("));
+    std::ifstream r(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "pki_routes.cpp");
+    REQUIRE(r);
+    std::stringstream rs;
+    rs << r.rdbuf();
+    CHECK_THAT(rs.str(), ContainsSubstring("\"/settings/pki\""));
 }
