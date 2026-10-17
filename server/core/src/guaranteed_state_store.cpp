@@ -619,7 +619,7 @@ void GuaranteedStateStore::notify_rule_mutation() noexcept {
     try {
         on_rule_mutation_();
     } catch (const std::exception& e) {
-        spdlog::warn("GuaranteedStateStore: rule-mutation hook threw: {}", e.what());
+        spdlog::warn("GuaranteedStateStore: rule-mutation hook threw: {}", ::yuzu::log_key_token(e.what()));
     } catch (...) {
         spdlog::warn("GuaranteedStateStore: rule-mutation hook threw a non-std exception");
     }

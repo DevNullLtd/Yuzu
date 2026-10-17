@@ -152,8 +152,10 @@ public:
         // horizon) so the table does not rehash under mu_ on the heartbeat path; a rehash of
         // a 500k-entry table is a ~50 ms stall with the mutex held.
         const auto per_s = static_cast<std::size_t>(budget_.config().max_per_s);
-        const auto horizon = static_cast<std::size_t>(std::max<long long>(
-            1, static_cast<long long>(2 * min_interval_.count())));
+        // Clamp before doubling: a pathological interval must not overflow the signed multiply.
+        const long long interval_s = std::min<long long>(
+            static_cast<long long>(min_interval_.count()), 1LL << 40);
+        const auto horizon = static_cast<std::size_t>(std::max<long long>(1, 2 * interval_s));
         claims_.reserve(std::min<std::size_t>(per_s * horizon, opts_.max_reserve));
     }
 
