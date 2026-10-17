@@ -1330,8 +1330,10 @@ groups:
         # (UNAUTHENTICATED), a non-transport error: it logs `BatchHeartbeat failed
         # (N in chunk)` (yuzu_gw_heartbeat_buffer.erl) or `Failed to notify stream
         # status for <agent>` (yuzu_gw_upstream.erl) and counts the failure in
-        # yuzu_gw_upstream_rpc_errors_total{rpc_name,code="16"}. A refused
-        # NotifyStreamStatus is not retried by the gateway.
+        # yuzu_gw_upstream_rpc_errors_total{rpc_name,code="16"}. A gateway that
+        # includes #5695 holds a refused NotifyStreamStatus and sends it again
+        # (each refusal counts against its circuit breaker while closed); an
+        # older gateway does not retry it.
         expr: |
           sum by (instance, reason) (increase(yuzu_server_gateway_peer_denied_total{reason=~"bad_cert|no_server_auth_eku|not_pinned|outside_validity|internal_error"}[5m])) > 0
         for: 1m

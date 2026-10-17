@@ -1625,7 +1625,8 @@ earlier text of this section is left as written; the points below say what it no
 - **Residuals** are the ones listed under Known limits in `docs/user-manual/gateway.md`, among them: a probe
   success proves only the notification path, not registration; the synchronous RPCs still run inside the one
   upstream process, so casts queue in its mailbox while one runs; retry or breaker feedback for an ordinary
-  notification worker that fails is a follow-up.
+  notification worker that fails was a follow-up (since done in #5695: a failed send is held again and
+  retried, and counts against the breaker while it is closed).
 The measured evidence (rig runs against the previous build and with TLS, the governance run and the
 adversarial review) is `docs/security-reviews/gateway-notify-pending-store-2026-10-05.md`.
 
