@@ -13,6 +13,12 @@
 -module(yuzu_gw_memory_shedder_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+%% How long a connect to a suspended (closed) listener may take to be refused.
+%% Linux and macOS refuse a closed loopback port at once; Windows retries the
+%% SYN after the RST and refuses after about 2.02-2.04 s, so a 2000 ms timeout
+%% there reads `timeout'. The tests assert the refusal, never a timing.
+-define(REFUSAL_TIMEOUT_MS, 10000).
+
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(MGMT_SVC, 'yuzu.server.v1.ManagementService').
 -define(HEARTBEAT, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).
@@ -125,11 +131,14 @@ shed_and_resume() ->
         ?assert(counter(yuzu_gw_memory_shedding_suspensions_total, []) > Susp0),
 
         %% A NEW agent connection is REFUSED while shed: the listen socket is
-        %% closed, so the TCP connect fails at once with ECONNREFUSED (an agent
-        %% backs off immediately, a balancer retries another node). It does not
-        %% sit in a kernel backlog waiting for an accept.
+        %% closed, so the TCP connect fails with ECONNREFUSED (an agent backs
+        %% off immediately, a balancer retries another node). It does not sit
+        %% in a kernel backlog waiting for an accept. The outcome is asserted,
+        %% not its speed: Windows retries the SYN after the RST and reports the
+        %% refusal only after about 2 s, so the timeout leaves room for that.
         ?assertEqual({error, econnrefused},
-                     gen_tcp:connect("127.0.0.1", AgentPort, [binary, {active, false}], 2000)),
+                     gen_tcp:connect("127.0.0.1", AgentPort, [binary, {active, false}],
+                                     ?REFUSAL_TIMEOUT_MS)),
         {ok, C} = gun:open("127.0.0.1", AgentPort, #{protocols => [http2], retry => 0}),
         ?assertMatch({error, _}, gun:await_up(C, 1500)),
         gun:close(C),
@@ -199,7 +208,7 @@ resume_failure_is_retried() ->
         %% The resume failed: still suspended, still refusing, and visible.
         ?assertEqual(suspended, ranch:get_status(Ref)),
         ?assertEqual({error, econnrefused},
-                     gen_tcp:connect("127.0.0.1", AgentPort, [binary], 2000)),
+                     gen_tcp:connect("127.0.0.1", AgentPort, [binary], ?REFUSAL_TIMEOUT_MS)),
         ?assertMatch(#{shed := false, failing := #{resume := 1, suspend := 0}},
                      yuzu_gw_memory_shedder:status(Pid)),
         ?assertEqual(1, gauge(yuzu_gw_memory_shedding_transition_failing, [<<"resume">>])),
