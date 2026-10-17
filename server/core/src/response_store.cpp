@@ -1204,7 +1204,9 @@ void append_facet_filters(std::string& sql, std::vector<std::string>& binds, int
                "::integer AND value = $" + std::to_string(p3) + ")";
         binds.push_back(instruction_id);
         binds.push_back(std::to_string(f.col_idx));
-        binds.push_back(f.value);
+        // The stored form: facets are indexed after sanitize_pg_text, and a raw NUL would end the
+        // bind at the NUL (libpq takes a C string) while invalid UTF-8 would be refused outright.
+        binds.push_back(sanitize_pg_text(f.value));
     }
 }
 } // namespace
@@ -1294,7 +1296,7 @@ ResponseStore::facet_line_count(const std::string& instruction_id,
         "SELECT SUM(line_count) FROM response_store.response_facets WHERE instruction_id = $1 "
         "AND col_idx = $2::integer AND value = $3",
         std::vector<std::string>{instruction_id, std::to_string(filters[0].col_idx),
-                                 filters[0].value});
+                                 sanitize_pg_text(filters[0].value)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::nullopt;
     return to_i64(PQgetvalue(res.get(), 0, 0));

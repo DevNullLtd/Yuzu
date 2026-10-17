@@ -732,6 +732,16 @@ TEST_CASE("create-group-form route: a filter value over kMaxFacetValueBytes repl
         CHECK(contains(res->body, "Create Static Group"));
     }
 
+    SECTION("short raw, over the bound once stored (683 NUL bytes): the static sentence") {
+        std::string nuls;
+        for (std::size_t i = 0; i < 683; ++i)
+            nuls += "%00";
+        auto res = h.sink.Get(base + nuls);
+        REQUIRE(res != nullptr);
+        CHECK(contains(res->body, "<span class=\"form-hint\">" + sentence + "</span>"));
+        CHECK_FALSE(contains(res->body, "will be added"));
+    }
+
     SECTION("exactly the bound: the ordinary count") {
         const std::string value(kMaxFacetValueBytes, 'z');
         auto res = h.sink.Get(base + value);

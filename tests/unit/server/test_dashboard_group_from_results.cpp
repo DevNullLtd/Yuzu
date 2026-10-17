@@ -392,6 +392,17 @@ TEST_CASE("group-from-results: a 422 for an over-bound filter value explains the
         CHECK_FALSE(h.mg.find_group_by_name("overbound-group").has_value());
     }
 
+    SECTION("a value that is short raw but over the bound once stored: 422 with the explanation") {
+        // 683 NUL bytes (%00) are 2049 stored bytes: each becomes a 3-byte U+FFFD at ingest.
+        std::string nuls;
+        for (std::size_t i = 0; i < 683; ++i)
+            nuls += "%00";
+        auto res = h.post(body_with("nul-overbound-group", nuls));
+        CHECK(res->status == 422);
+        CHECK(res->body == over_bound);
+        CHECK_FALSE(h.mg.find_group_by_name("nul-overbound-group").has_value());
+    }
+
     SECTION("exactly the bound: the plain body (nothing changed for a value that is indexed)") {
         const std::string value(kMaxFacetValueBytes, 'z');
         auto res = h.post(body_with("atbound-group", value));

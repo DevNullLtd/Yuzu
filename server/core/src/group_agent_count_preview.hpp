@@ -54,7 +54,8 @@ std::vector<FacetFilter> resolve_group_preview_filters(
 
 /// PURE (#5623): the MANGLED column keys (see `mangle_column_key`, resolved
 /// from `columns_for_plugin(plugin)[col_idx + 1]`) of every filter whose value
-/// is longer than `kMaxFacetValueBytes` (response_store.hpp) -- a value that is
+/// is longer than `kMaxFacetValueBytes` (response_store.hpp) in its stored form
+/// (`facet_filter_value_over_bound`: a NUL or invalid UTF-8 byte counts as 3) -- a value that is
 /// not indexed in newly stored responses, so `group_agent_count_preview` can
 /// answer 0 or an undercount for it. In input order, de-duplicated; a filter
 /// whose `col_idx` does not resolve against `plugin`'s columns is skipped. Key
@@ -77,7 +78,7 @@ std::vector<std::string> unindexed_filter_keys(const std::string& plugin,
 /// off); engaged (including empty) = filter to exactly these agents.
 ///
 /// Count semantics are unchanged by #5623: an exact-match value longer than
-/// `kMaxFacetValueBytes` (response_store.hpp) is not indexed in newly stored
+/// `kMaxFacetValueBytes` (response_store.hpp), measured in its stored form, is not indexed in newly stored
 /// responses, so for such a value this count can be 0 or an undercount. It does
 /// not say so itself; callers pair it with `unindexed_filter_keys` (above) and
 /// report that additively.

@@ -920,14 +920,15 @@ static const ToolDef kTools[] = {
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
      "though this tool itself performs no mutation. When unindexed_filter_keys is "
      "non-empty, agent_count can be 0 or an undercount because filter values over "
-     "2048 bytes are not indexed in newly stored responses; its keys are in a stable "
+     "2048 bytes (measured as ingest stores it: a NUL or invalid UTF-8 byte counts as 3) "
+     "are not indexed in newly stored responses; its keys are in a stable "
      "order (sorted by key) without duplicates.",
      R"j({"type":"object","properties":{)j"
      R"j("command_id":{"type":"string","minLength":1,"maxLength":256,"description":"The response set's instruction/command id to count against"},)j"
      R"j("plugin":{"type":"string","minLength":1,"maxLength":256,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
      R"j("filters":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
      R"j(},"required":["command_id","plugin"]})j",
-     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"},"unindexed_filter_keys":{"type":"array","items":{"type":"string"},"description":"Mangled keys of filters whose value is longer than 2048 bytes (not indexed in newly stored responses); empty when none. When non-empty, agent_count can be 0 or an undercount"}},"required":["agent_count","unindexed_filter_keys"]})j"},
+     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"},"unindexed_filter_keys":{"type":"array","items":{"type":"string"},"description":"Mangled keys of filters whose value is longer than 2048 bytes as ingest stores it (a NUL or invalid UTF-8 byte counts as 3; not indexed in newly stored responses); empty when none. When non-empty, agent_count can be 0 or an undercount"}},"required":["agent_count","unindexed_filter_keys"]})j"},
 
     // B4 (#2146 API-parity Batch B4) — six MCP twins of the remaining
     // /api/v1/management-groups* CRUD/membership/role surface. list_management_groups
@@ -10577,6 +10578,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // fleet_read_fn_ (that chokepoint is for per-agent LIST reads;
             // this route's scope is the D3 Response:Read-visible set, a
             // different resolver entirely).
+            // The served inputSchema maxLength values (command_id/plugin 256, a filter value 65536) are
+            // enforced only by the approval-gated pre-validation; this handler does not bound them (the
+            // tool is not in kFieldBoundTools), so off that path a value is limited by the 4 MiB body cap.
             if (tool_name == "preview_management_group_agent_count") {
                 if (!tier_allows(tier, "ManagementGroup", "Write")) {
                     res.set_content(

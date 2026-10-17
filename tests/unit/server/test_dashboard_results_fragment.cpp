@@ -758,7 +758,10 @@ TEST_CASE("/fragments/results: a filter that sanitizes past the bound shows the 
             out += unit;
         return out;
     };
-    // 683 x 3 = 2049 bytes once scrubbed; 682 x 3 = 2046.
+    // 683 x 3 = 2049 bytes once scrubbed; 682 x 3 = 2046. NOTE: an UNDECODED "%00" is also 3
+    // bytes, so these four assertions would read the same if the request decoder stopped turning
+    // %00/%FF into real bytes; the helper case in test_group_agent_count_preview.cpp uses real
+    // NUL and 0xFF bytes and is the one that pins the rule itself.
     CHECK(contains(h.get(base + "&f_key=" + repeat("%00", 683))->body, kTooLongMarker));
     CHECK(contains(h.get(base + "&f_key=" + repeat("%FF", 683))->body, kTooLongMarker));
     CHECK_FALSE(contains(h.get(base + "&f_key=" + repeat("%00", 682))->body, kTooLongMarker));

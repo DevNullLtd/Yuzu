@@ -127,6 +127,21 @@ TEST_CASE("unindexed_filter_keys: the bound is measured on the stored (sanitized
           std::vector<std::string>{"pid"});
     CHECK(unindexed_filter_keys("procfetch", {{0, std::string(682, '\0')}}).empty());
     CHECK(unindexed_filter_keys("procfetch", {{0, std::string(682, '\xFF')}}).empty());
+    // Mixed: one NUL (3 stored bytes) plus 1024 two-byte characters (2048) is 2051 stored bytes.
+    std::string mixed(1, '\0');
+    for (int i = 0; i < 1024; ++i)
+        mixed += "\xC3\xA9";
+    CHECK(unindexed_filter_keys("procfetch", {{0, mixed}}) == std::vector<std::string>{"pid"});
+    // A truncated multibyte lead (lone E2 82) is two invalid bytes: 6 stored bytes, so 341 of them
+    // are 2046 (indexed) and 342 are 2052 (not).
+    const auto trunc = [](int n) {
+        std::string out;
+        for (int i = 0; i < n; ++i)
+            out += "\xE2\x82";
+        return out;
+    };
+    CHECK(unindexed_filter_keys("procfetch", {{0, trunc(341)}}).empty());
+    CHECK(unindexed_filter_keys("procfetch", {{0, trunc(342)}}) == std::vector<std::string>{"pid"});
     // The raw-size shortcut: nothing at or under a third of the bound can reach it.
     CHECK_FALSE(facet_filter_value_over_bound(std::string(kMaxFacetValueBytes / 3, '\0')));
     CHECK(facet_filter_value_over_bound(std::string(kMaxFacetValueBytes / 3 + 1, '\0')));

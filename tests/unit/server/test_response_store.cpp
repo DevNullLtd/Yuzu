@@ -2355,6 +2355,39 @@ TEST_CASE("ResponseStore: the facet value bound counts sanitized bytes, not char
 // SAME observable value as a genuine zero-match answer. The group-creation
 // dashboard flow this feeds must be able to tell "0 agents match" from
 // "the count could not be determined".
+// #5623: a typed filter is looked up in the stored (sanitized) form. A raw NUL would end the
+// libpq bind at the NUL (a different, shorter value) and invalid UTF-8 would be refused, so the
+// lookup would count the wrong rows or degrade; the value the caller typed must find the facet
+// ingest stored for the same bytes.
+TEST_CASE("ResponseStore: a filter with a NUL or invalid UTF-8 byte finds the stored facet",
+          "[pg][response_store][facets]") {
+    using namespace std::string_literals;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    const std::string nul_cat = "a\0b"s;
+    const std::string bad_cat = "bad\xFFx"s;
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facet-typed-bytes";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    // No plain "a" category is stored: a bind cut at the NUL would look up "a" and find nothing.
+    resp.output = "high|"s + nul_cat + "|t1|d1\nhigh|"s + bad_cat + "|t2|d2\n"s;
+    store.store(resp);
+
+    for (const auto& cat : {nul_cat, bad_cat}) {
+        FacetFilter f{/*col_idx=*/1, cat};
+        auto agents = store.facet_agent_count("cmd-facet-typed-bytes", {f});
+        REQUIRE(agents.has_value()); // not a degrade
+        CHECK(*agents == 1);
+        auto lines = store.facet_line_count("cmd-facet-typed-bytes", {f});
+        REQUIRE(lines.has_value());
+        CHECK(*lines == 1);
+    }
+}
+
 TEST_CASE("ResponseStore: facet_agent_count and facet_line_count distinguish degrade from zero",
           "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
