@@ -833,7 +833,7 @@ namespace {
 constexpr const char* kMfaCredentialChangedMsg =
     "Your password changed during enrolment — sign in again";
 
-/// B5: an enrolment secret, or a list that sits next to one, must not be stored by a cache
+/// An enrolment secret, or a list that sits next to one, must not be stored by a cache
 /// or replayed from history. `Vary: Cookie` keeps a shared cache from crossing operators.
 void no_store_private(httplib::Response& res) {
     res.set_header("Cache-Control", "no-store, private");

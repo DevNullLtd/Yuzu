@@ -99,7 +99,7 @@ const char* rule_suffix(AutoApproveRuleType t) {
     return "";
 }
 
-// Static-confirm copy for one rule's Enable / Disable and Remove, by match mode AND by how many
+// Confirm copy (the hx-confirm text) for one rule's Enable / Disable and Remove, by match mode AND by how many
 // rules are enabled (`enabled_count`). In "all" mode every enabled rule is REQUIRED, so enabling
 // narrows and disabling or removing widens, with one exception at each end: with ZERO enabled
 // rules the engine matches nobody (auto_approve.cpp evaluate), so enabling the first rule WIDENS

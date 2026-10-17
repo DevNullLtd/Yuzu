@@ -906,7 +906,7 @@ TEST_CASE("settings enrollment: the Active token pill is not the green OK pill",
     CHECK(res->body.find("pill ok") == std::string::npos);
 }
 
-// B5: the raw token is in the create response (and the batch response), so neither may be
+// The raw token is in the create response (and the batch response), so neither may be
 // cached or replayed from history; the list fragments sit next to a secret and follow suit.
 TEST_CASE("settings enrollment: token responses are no-store and private",
           "[pg][settings_routes][enrollment]") {
@@ -1564,6 +1564,10 @@ TEST_CASE("settings enrollment: an API token with a far-future expiry renders wi
     CHECK(row_of("yuzu_test_fmt_huge").find(" UTC</td>") != std::string::npos);
 }
 
+// A lapsed token cannot be minted without waiting out a TTL, so the store row's expiry is
+// pushed into the past the way test_auth.cpp does for the consume path. It must list Expired
+// (warn pill), not Active; an exhausted-and-lapsed token keeps Exhausted, and a token that
+// never expires stays Active.
 TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as Active",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;
@@ -1578,10 +1582,6 @@ TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as
             lease.get(),
             "UPDATE auth.enrollment_tokens SET expires_at = now() - interval '1 hour' "
             "WHERE token_id = $1",
-// A lapsed token cannot be minted without waiting out a TTL, so the store row's expiry is
-// pushed into the past the way test_auth.cpp does for the consume path. It must list Expired
-// (warn pill), not Active; an exhausted-and-lapsed token keeps Exhausted, and a token that
-// never expires stays Active.
             std::vector<std::string>{lapsed->token_id});
         REQUIRE(upd.status() == PGRES_COMMAND_OK);
     }

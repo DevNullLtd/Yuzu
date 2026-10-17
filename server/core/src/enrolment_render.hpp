@@ -6,8 +6,9 @@
 ///
 /// No I/O, no logging, no store handles, no clock: the route reads the store and hands a
 /// finished value in (and `now`, so "Expired" is decidable in a test). The mutation routes,
-/// element ids (`#token-section`, `#pending-section`, `#auto-approve-section`), form field
-/// names and audit rows are unchanged; only the markup is re-classed onto `yuzu.css`.
+/// element ids (`#token-section`, `#pending-section`, `#auto-approve-section`) and form field
+/// names are unchanged; the markup is re-classed onto `yuzu.css`. Audit rows keep their action
+/// names; a few detail strings gained fields (see the routes).
 ///
 /// Three states stay distinct: populated, genuinely empty, and "the store did not answer"
 /// (a failbox, never an empty table).
