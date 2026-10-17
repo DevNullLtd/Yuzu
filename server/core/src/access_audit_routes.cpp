@@ -89,7 +89,7 @@ void register_access_audit_routes(HttpRouteSink& sink, Deps deps) {
                  AuditQuery q;
                  q.principal = v.principal;
                  q.action = v.action;
-                 // since is inclusive and 0 means unbounded, so never let a tiny clock reach 0.
+                 // since is inclusive; keep it positive so a tiny clock never reaches 0.
                  q.since = std::max<std::int64_t>(1, deps.now_fn() - range_seconds(v.range));
                  q.limit = kPageSize + 1; // limit is NEVER read from the client
                  q.offset = v.offset;

@@ -217,7 +217,7 @@ TEST_CASE("audit log: default request reads the last 24 hours, 51 rows, nothing 
     CHECK(q.action_prefixes.empty());
     CHECK_FALSE(q.random_sample);
     CHECK(q.since == kNow - 86400);
-    CHECK(q.until == 0);
+    CHECK_FALSE(q.until.has_value());
     CHECK(q.limit == 51);
     CHECK(q.offset == 0);
     CHECK(h.last_pool_ptr == nullptr);
@@ -361,8 +361,8 @@ TEST_CASE("audit sample: scope, limit bounds and the one audit row", "[access-au
           std::vector<std::string>{"auth.", "mfa.", "session.", "engine_principal."});
     CHECK(q.random_sample);
     CHECK(q.limit == 100);
-    CHECK(q.since == 0);
-    CHECK(q.until == 0);
+    CHECK_FALSE(q.since.has_value());
+    CHECK_FALSE(q.until.has_value());
     CHECK(h.last_pool_ptr != nullptr);
     CHECK_THAT(res->body, ContainsSubstring("3 rows drawn from 842 candidates"));
     // Exactly the twin's audit tuple.
