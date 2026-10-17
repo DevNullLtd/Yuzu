@@ -276,6 +276,10 @@ one. The seam inventory is normative:
 | **B5** | Engine → `uce` database | The engine role connects only to `uce`. A `uce_system` schema holds host state; each module gets its own schema and migration ledger. Core has no grant here. Carries: `module_schema · migration_version · journal_id · derived_state_version · retention_class`. |
 | **B6** | Core → `yuzu` database | Identity, authorisation, fleet truth, execution state, audit. The engine has no grant here. Cross-application data is exposed through a **core capability**, never a SQL view shared across roles. Carries: `principal · grants · fleet_fact · execution · pending_command · retry · audit_event`. |
 | **B7** | Core → gateway → agent | Core sends already-authorised commands with stable identities, deadlines and idempotency keys. The gateway routes and applies backpressure without becoming durable. The agent suppresses duplicates and returns correlated results. Carries: `execution_id · command_id · idempotency_key · target_agent · deadline · payload_schema · result_schema`. |
+| **B8** | Core → network collector | *Added by ADR-0068 (2026-10-04, PR #5367).* Core consumes element state from the network collector's single gNMI endpoint as its sole client (mTLS, `read-only`) and publishes the collector's target list over the public API as a collector principal (that half is B4-shaped and needs no row of its own). Contract: the pinned collector image digest, the ADR-0068 D10 fact table that drives both subscriptions and reads, read-only posture. The collector is a separately deployed, non-Yuzu process — not an engine (no `uce` access, no grant minting) and never a `/readyz` input. Carries: `element_id` · `address` · `adapter` · `credential` · `subscriptions[]` (names) · `event_tags` · `image_digest` · `fact` · `notification` · `element_timestamp`. |
+
+
+> **Update (2026-10-04, ADR-0068 / PR #5367).** The seam inventory gains **B8 core → network collector** — the first southbound seam to a non-agent, non-Yuzu process. Registered here because Decision 8 makes the inventory normative; the seam's contract and invariants are stated in ADR-0068 D3/D10.
 
 ## Invariants
 
