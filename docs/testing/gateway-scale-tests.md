@@ -127,12 +127,13 @@ Each case also checks invariants that involve no timing:
 
 | Case | Invariant |
 |---|---|
-| `ramp`, `storm` | every first `Register` succeeds; every agent registers within the budget; more than one `ProxyRegister` is in flight at the server at some point; no `ProxyRegister` creates a session at the server for an attempt that failed ("wasted" above); the server holds a `CONNECTED` for every live session; every singleton mailbox is back to 0 |
+| `ramp`, `storm` | no registration is replayed (the server lost nothing); every first `Register` succeeds; every agent registers within the budget; more than one `ProxyRegister` is in flight at the server at some point; no `ProxyRegister` creates a session at the server for an attempt that failed ("wasted" above); the server holds a `CONNECTED` for every live session; every singleton mailbox is back to 0 |
 | `server_crash` | every held session is replayed; more than one replay is in flight at some point; every `DISCONNECTED` raised during the outage reaches the server; the new server holds a `CONNECTED` for every live session |
 | `gateway_crash` | every agent registers again; no `Register` to the new gateway fails; the server holds a `CONNECTED` for every live session |
 | `planned_stop` | the server receives a `DISCONNECTED` for every session; the gateway node logs no crash or supervisor report during the stop |
 | `fanout` | every command is answered; the management connection is never closed; no agent loses its session |
 | `upstream_conn_loss` | the server closed at least one connection; the circuit breaker never opened; no registration was replayed; at most 10 sessions got a second `CONNECTED` (the notifications in flight when the connection went are sent again, their answers were lost with it); every agent registers within the budget; the server holds a `CONNECTED` for every live session |
+| every case that registers its agents first | no registration is replayed during that setup (the server lost nothing) |
 
 Several of these fail on the gateway as of commit 29a8e655b (see the numbers
 below). The suite therefore has two groups with the same cases:
@@ -326,8 +327,9 @@ node, 340 to 350 KB per agent):
   breaker opened 19 times and failed 18 half-open probes, and only 7,552
   agents were live after 930 s (the agents' backoff had reached minutes). The
   run followed the 25,000-agent `storm` case on a host using swap; the fake
-  server's own counters, added since, were not captured in it, so the cause of
-  the first stall is not isolated.
+  server's own counters, added since, were not captured in it. See "The
+  25,000-agent stall" below for the loop that most likely drove it and the
+  change that removes it.
 
 ## One lost upstream connection
 
@@ -367,3 +369,59 @@ could not link to it. The `planned_stop` case now counts crash and supervisor
 reports logged in the gateway node during the stop and fails on any: 67 at 500
 agents before the fix (the endpoint is now stopped in `yuzu_gw_app:stop/1`), 0
 after.
+
+## The 25,000-agent stall
+
+One earlier 25,000-agent `fanout` run never finished its setup (see "Results
+after the PR #5695 fixes": the breaker opened 19 times and only 7,552 agents
+were live after 930 s). It followed a 25,000-agent `storm` on a host that was
+swapping, and a rerun did not reproduce it. After the change under "One lost
+upstream connection", the 25,000-agent `storm` and `fanout` cases were run back
+to back twice with `YUZU_GW_SCALE_TRACE_UPSTREAM=1` on a quiet host (no other
+Erlang node or test running; 3.1 GB of the 4 GB swap file still held stale pages
+from earlier work, but the swap-out counter did not move during any of the runs
+and memory was 92 to 94% free), then twice more with the gateway source of
+c318b1e5a (before that change) for comparison. The harness now also records the
+gateway's own view of the upstream (breaker transitions, `BatchHeartbeat` flush
+times, RPC errors by code, replays by trigger) and the live-agent count every
+5 s.
+
+| | after, run 1 | after, run 2 | before, run 1 | before, run 2 |
+|---|---|---|---|---|
+| `storm`: all registered | 22.2 s | 21.7 s | 22.8 s | 23.3 s |
+| `storm`: breaker transitions, upstream RPC errors | none | none | none | none |
+| `fanout` setup: all 25,000 live | 19.2 s | 8.6 s | 14.3 s | 9.3 s |
+| setup: `ProxyRegister` / `NotifyStreamStatus` answered `DEADLINE_EXCEEDED` | 16 / 2 | 0 / 0 | 19 / 3 | 9 / 1 |
+| setup: replays started | none | none | 1 (`breaker`) | 1 (`breaker`) |
+| setup: replayed registrations | 0 | 0 | 16,214 | 24,677 |
+| setup: `CONNECTED` notices for 25,000 agents | 25,000 | 25,000 | 30,740 | 40,901 |
+| setup: slowest `BatchHeartbeat` flush | 0.9 s | 3 ms | 1.4 s | 2.7 s |
+| setup: smallest `grpc-timeout` a `ProxyRegister` arrived with | 3.9 s | 5.0 s | 5.0 s | 5.0 s |
+| setup: fake server's connection mailbox, longest | 25 | 32 | 29 | 31 |
+| `fanout`: answered, connection drops, agent disconnects | 25,000, 0, 0 | 25,000, 0, 0 | 25,000, 0, 0 | 25,000, 0, 0 |
+| breaker transitions in any phase | none | none | none | none |
+
+The stall did not reproduce in the four quiet runs, but the runs show the loop
+that can turn a few slow answers into one. During the setup, with the fake
+server answering at once, a few calls were answered `DEADLINE_EXCEEDED` before
+their handler started (in the first run after the change the fake handled
+exactly 25,000 `ProxyRegister` calls for 25,000 agents, 16 attempts having
+failed that way, and stopped no handler at a deadline, so each of those calls spent most of
+its 5 s between its headers reaching the fake and the rest of it arriving on the
+one connection all upstream calls share). Before the change, the next success
+after one such failure started a full replay of every agent registered so far,
+in the middle of the registration storm: 16,214 and 24,677 extra
+`ProxyRegister` calls and 5,740 and 15,901 repeated `CONNECTED` notices on that
+same connection. On the quiet host the extra load was absorbed; on a host that
+was swapping, more calls would time out, five in a row open the breaker, and
+every close of the breaker started the full replay again, which matches the
+19 openings and the timed-out heartbeat flushes of the stalled run. After the
+change the same failures replay nothing (the server lost nothing, so no
+heartbeat verdict lists a session). The setup of every case now fails on any
+replay (`no_replay_in_setup`), as do `ramp` and `storm`
+(`no_replay_during_registration`). What delays a call's body on the shared
+connection at this load is not isolated: the fake's connection process was not
+backlogged (at most 32 messages when a call started), so the gateway side of
+the connection (gun's single connection process, or HTTP/2 flow control) is the
+remaining suspect, and the C++ server's own connection handling is not the
+same as the fake's.

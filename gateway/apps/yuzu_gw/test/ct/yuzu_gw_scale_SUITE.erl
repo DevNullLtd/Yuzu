@@ -513,7 +513,9 @@ invariants(fanout, R) ->
 
 registration_invariants(R) ->
     #{register := Reg, upstream := Up, convergence := Conv, settle := Settle} = R,
-    [inv(no_first_attempt_failures, maps:get(first_attempt_failed, Reg) =:= 0,
+    [inv(no_replay_during_registration, maps:get(replay_rpcs, Up) =:= 0,
+         "no registration was replayed to a server that lost nothing"),
+     inv(no_first_attempt_failures, maps:get(first_attempt_failed, Reg) =:= 0,
          "every agent's first Register succeeded (inside the agent's 30 s deadline)"),
      inv(all_registered_within_budget, maps:get(unregistered_at_budget, Reg) =:= 0,
          "every agent was registered within the scenario budget"),
@@ -525,6 +527,16 @@ registration_invariants(R) ->
          "the server holds a CONNECTED notice for every live session"),
      inv(singleton_mailboxes_drain, maps:get(mailboxes_drained, Settle),
          "every named singleton's mailbox was back to 0 after the run")].
+
+%% Every case that registers its agents first (setup_registered/1) does so
+%% against a server that loses nothing: a replay there is the gateway replaying
+%% for a reason the server never gave (#5695: one failed call and a success
+%% replayed the fleet in the middle of a 25,000-agent setup).
+setup_invariants(#{setup := #{upstream := #{replay_rpcs := Replays}}}) ->
+    [inv(no_replay_in_setup, Replays =:= 0,
+         "no registration was replayed while the agents registered before the case")];
+setup_invariants(_) ->
+    [].
 
 inv(Name, Ok, What) ->
     #{name => Name, ok => Ok, what => list_to_binary(What)}.
@@ -720,7 +732,7 @@ await_registered(Config, N, T0) ->
 
 finish(Scenario, Config, R0) ->
     N = ?config(n, Config),
-    Invs = invariants(Scenario, R0),
+    Invs = invariants(Scenario, R0) ++ setup_invariants(R0),
     Violated = [I || #{ok := false} = I <- Invs],
     R = R0#{scenario => Scenario, agents => N, invariants => Invs,
             time => list_to_binary(calendar:system_time_to_rfc3339(erlang:system_time(second)))},
