@@ -5,7 +5,7 @@ The `cpp-expert` and `cpp-safety` agents load this document on any C++ source ch
 ## Language
 
 - **C++23 throughout.** Use `std::expected<T, E>` for errors, `std::span` for contiguous ranges, `std::string_view` for non-owning string refs, `std::format` for string formatting.
-- Cross-compiler matrix: GCC 13+, Clang 18+, MSVC 19.38+, Apple Clang 15+. See `docs/ci-cpp23-troubleshooting.md` for known feature divergences.
+- Cross-compiler matrix: GCC 15+, Clang 21+, MSVC 19.44+ (VS 2022 17.14), Apple Clang 21+ — exactly what CI builds and tests (`docs/build-guide.md` "Compiler floor", #5929). See `docs/ci-cpp23-troubleshooting.md` for historical feature divergences on older compilers.
 
 ## Naming
 

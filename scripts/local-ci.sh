@@ -2,9 +2,11 @@
 # Yuzu Local CI — run the same CI checks as GitHub Actions locally
 #
 # Usage:
-#   bash scripts/local-ci.sh                  # gcc-13 debug (default)
-#   bash scripts/local-ci.sh gcc-13 release   # gcc-13 release + LTO
-#   bash scripts/local-ci.sh clang-18 debug   # clang-18 debug
+#   bash scripts/local-ci.sh                  # gcc-15 debug (default)
+#   bash scripts/local-ci.sh gcc-15 release   # gcc-15 release + LTO
+#   bash scripts/local-ci.sh clang-21 debug   # clang-21 debug
+#   (Dockerfile.ci / ci-entrypoint.sh accept only gcc-15 and clang-21 — the
+#   compilers CI builds and tests, which are also the supported floor.)
 #   bash scripts/local-ci.sh build            # build the CI image only
 #   bash scripts/local-ci.sh shell            # interactive shell in CI image
 #
@@ -24,7 +26,7 @@ export PATH="/c/Program Files/Docker/Docker/resources/bin:$PATH"
 IMAGE_NAME="yuzu-ci"
 CCACHE_VOLUME="yuzu-ci-ccache"
 
-COMPILER="${1:-gcc-13}"
+COMPILER="${1:-gcc-15}"
 BUILD_TYPE="${2:-debug}"
 
 # ── Build image if needed ────────────────────────────────────────────────

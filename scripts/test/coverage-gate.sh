@@ -196,17 +196,17 @@ fi
 
 if [[ ! -d "$BUILD_DIR" ]]; then
     echo "coverage-gate: fresh meson setup $BUILD_DIR" | tee -a "$GATE_LOG"
-    # bci-S5: mirror CI's native file so branch instrumentation matches
-    # Codecov numbers post-merge. .github/workflows/ci.yml coverage job
-    # uses `--native-file meson/native/linux-gcc13.ini`; if it exists in
-    # the current tree we apply it unconditionally. If the operator wants
-    # a different compiler they can set CC/CXX and drop the native-file,
-    # but the gate's default must match CI.
+    # bci-S5: apply a Linux native file so the C++ standard matches CI.
+    # linux-gcc13.ini sets only cpp_std (no [binaries], no linker), so the
+    # compiler is whatever CC/CXX or the host default resolves to — the
+    # nightly coverage job (nightly.yml "Coverage (GCC 15)") uses GCC 15,
+    # the supported floor, so run this gate with gcc-15 for comparable
+    # numbers. The file's name is historical. linux-gcc15.ini is NOT used
+    # here because it forces -fuse-ld=mold, which a dev box may lack.
     MESON_SETUP_EXTRA=()
-    # The Linux native-file pins gcc-13 for parity with CI's coverage job.
-    # On macOS the host toolchain is Apple Clang 15 and gcc-13 isn't on PATH,
-    # so applying the Linux native-file resolves grpc/grpc++ against the wrong
-    # pkg-config tree and the configure step fails. Only apply on Linux. (#1009)
+    # On macOS applying the Linux native-file resolves grpc/grpc++ against
+    # the wrong pkg-config tree and the configure step fails. Only apply on
+    # Linux. (#1009)
     if [[ "$(uname -s)" == "Linux" ]]; then
         NATIVE_FILE="$YUZU_ROOT/meson/native/linux-gcc13.ini"
         if [[ -f "$NATIVE_FILE" ]]; then

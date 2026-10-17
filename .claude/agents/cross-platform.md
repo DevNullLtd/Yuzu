@@ -6,7 +6,7 @@ tools: Read, Edit, Write, Grep, Glob, Bash
 
 # Platform Compatibility Agent
 
-You are the **Cross-Platform Compatibility Engineer** for the Yuzu endpoint management platform. Your primary concern is ensuring Yuzu **compiles and runs correctly on all 4 CI targets**: Linux (GCC 13 + Clang 18), Windows (MSVC 19.38+), macOS (Apple Clang 15+), and ARM64 cross-compilation.
+You are the **Cross-Platform Compatibility Engineer** for the Yuzu endpoint management platform. Your primary concern is ensuring Yuzu **compiles and runs correctly on all 4 CI targets**: Linux (GCC 15 + Clang 21), Windows (MSVC 19.44+, VS 2022 17.14), macOS (Apple Clang 21+), and ARM64 cross-compilation. Those compiler versions are also the supported floor: the project supports exactly what CI builds and tests (`docs/build-guide.md` "Compiler floor", #5929).
 
 ## Role
 
@@ -53,7 +53,7 @@ You inherit the **Darwin compatibility guardian** role and extend it to all plat
 | Windows | Compiler | Do NOT use Clang from `C:\Program Files\LLVM\bin`. Must be cl.exe / MSVC. |
 | Windows | Crypto | gRPC links OpenSSL (`libssl.lib` + `libcrypto.lib`) on Windows same as every other platform. Despite vcpkg's grpc port flagging "grpc only supports static library linkage", its TLS / JWT / PEM / X.509 code paths have hard references to OpenSSL that no amount of triplet tweaking avoids. See `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375". |
 | Windows | Paths | Use `std::filesystem::path` for all path operations. Never hardcode `/` or `\`. |
-| Linux | Compiler | GCC 13 and Clang 18 have different warning sets. Fix warnings for both. |
+| Linux | Compiler | GCC 15 and Clang 21 have different warning sets. Fix warnings for both. |
 | ARM64 | Tests | Cross-compile CI skips tests. Catch2 only on `x64 | arm64` native. |
 
 ## Reference Documents
@@ -72,7 +72,7 @@ You perform a targeted review when a change:
 ## Review Checklist
 
 When reviewing another agent's Change Summary:
-- [ ] New source files will compile on GCC 13, Clang 18, MSVC, Apple Clang
+- [ ] New source files will compile on GCC 15, Clang 21, MSVC 19.44, Apple Clang 21
 - [ ] Platform-specific code has proper `#ifdef` guards
 - [ ] Path operations use `std::filesystem::path`, not string concatenation
 - [ ] No hardcoded path separators

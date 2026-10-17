@@ -15,7 +15,7 @@ You ensure the Meson build system, vcpkg dependency management, GitHub Actions C
 ## Responsibilities
 
 - **Meson build files** — Every new, renamed, or deleted source file must be reflected in the appropriate `meson.build`. Build must succeed on all targets.
-- **CI matrix** — Maintain the GitHub Actions CI matrix: Linux (GCC 13, Clang 18), Windows (MSVC), macOS (Apple Clang), ARM64 cross-compile.
+- **CI matrix** — Maintain the GitHub Actions CI matrix: Linux (GCC 15, Clang 21), Windows (MSVC 19.44), macOS (Apple Clang 21). The matrix compilers ARE the supported compiler floor (`docs/build-guide.md` "Compiler floor", #5929): never add a CI leg on a compiler below it, and raise the documented floor in the same change that moves a leg.
 - **vcpkg manifest** — Keep `vcpkg.json` baseline pinning and platform filters in sync. Manage the `builtin-baseline` for version constraints.
 - **Build performance** — Optimize ccache hit rates, build parallelism, and CI cache strategies. **Cache pattern is fixed: split `actions/cache/restore` + paired `actions/cache/save` gated on `if: always() && steps.<id>.outputs.cache-hit != 'true'`.** Never use `save-always: true` — it's deprecated by the cache maintainers as "does not work as intended" and the `Guard — no save-always on actions/cache` step in `.github/workflows/zizmor.yml` will fail the workflow audit if it reappears. Self-hosted runners skip the GHA cache entirely and pin to `runner.tool_cache` instead. Both patterns documented in `.claude/skills/ci-cache/SKILL.md` — read it before adding any new cache step.
 - **Proto codegen** — Maintain `proto/meson.build` and `proto/gen_proto.py`. Ensure `#include` path rewriting works on all platforms.
@@ -47,11 +47,13 @@ You ensure the Meson build system, vcpkg dependency management, GitHub Actions C
 
 | Job | Runner | Compiler | Triplet | Notes |
 |-----|--------|----------|---------|-------|
-| linux-gcc | ubuntu-24.04 | GCC 13 | x64-linux | Primary target |
-| linux-clang | ubuntu-24.04 | Clang 18 | x64-linux | Alternate compiler |
-| windows | windows-2022 | MSVC 17 2022 | x64-windows | Uses `setup_msvc_env.sh` |
-| macos | macos-14 | Apple Clang | arm64-osx | Apple Silicon |
-| arm64-cross | ubuntu-24.04 | aarch64-linux-gnu | arm64-linux | Tests skipped |
+| `Linux gcc-15 *` | Big Tam (`yuzu-bigtam-linux`, Ubuntu 26.04) | GCC 15 | x64-linux | Primary target; `linux-gcc15.ini` (mold) |
+| `Linux clang-21 *` | Big Tam (`yuzu-bigtam-linux`, Ubuntu 26.04) | Clang 21 | x64-linux | Alternate compiler; `linux-clang21.ini` (mold) |
+| `Windows MSVC *` | Wee Tam (`yuzu-weetam-windows`) | MSVC 19.44 (VS 2022 17.14) | x64-windows | See `docs/windows-build.md` |
+| `macOS *` | BigMags (`yuzu-bigmags-macos`) | Apple Clang 21 | arm64-osx | Apple Silicon |
+| Workflow canary | GitHub-hosted `ubuntu-26.04` | GCC 15 | x64-linux | Compile-only; runs only when CI infrastructure changes |
+
+The authoritative, current matrix is `docs/ci-architecture.md`; this table is a summary.
 
 ## Reference Documents
 

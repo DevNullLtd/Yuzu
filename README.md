@@ -200,7 +200,10 @@ The stack publishes ports 8443 (dashboard and REST API), 8080 (plain HTTP: redir
 
 - Meson 1.12.0 (the CI pin in `requirements-ci.txt`), Ninja
 - CMake (required by Meson's cmake dependency method)
-- C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
+- C++23 compiler: GCC 15+, Clang 21+, MSVC 19.44+ (Visual Studio 2022 17.14), or
+  Apple Clang 21+ — the set CI builds and tests. Older compilers are unsupported;
+  see "Compiler floor" in [`docs/build-guide.md`](docs/build-guide.md) for the
+  RHEL 9 and Ubuntu 24.04 / Debian 13 options.
 - [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set
 - Optional, for the Erlang gateway: Erlang/OTP 28.4 or any later 28.x, plus
   rebar3. `meson setup` finds it (kerl, asdf, mise, Homebrew `erlang@28`,
