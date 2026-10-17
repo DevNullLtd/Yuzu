@@ -1685,23 +1685,15 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
     }
 }
 
-bool OidcProvider::fetch_jwks() {
-    {
-        // Stamp every attempt, success or not (#1900): the age gate in verify_jwt_signature
-        // applies to every token, so while the cache holds keys a failing IdP is retried once
-        // per TTL, not once per login. An EMPTY cache and every kid miss still refetch on every
-        // call (#1900). Cached keys are trusted until the next SUCCESSFUL fetch replaces them
-        // (not "one more TTL": the failed fetch leaves the cache untouched, as it did before
-        // discovery), but only until kJwksMaxKeyAge after the last success: verify_jwt_signature
-        // drops an older cache, so a retired key cannot keep verifying through a long outage
-        // (#1901 UP-5). The alternative to stamping here is hammering a dead IdP on every request.
-        std::lock_guard lock(jwks_mu_);
-        jwks_fetched_at_ = std::chrono::steady_clock::now();
-    }
+std::expected<std::vector<CachedJwk>, std::string> OidcProvider::fetch_jwks_snapshot() {
+    // A fresh fetch on every call, returned to the caller and kept nowhere: a key the IdP no
+    // longer publishes must stop verifying at the next sign-in, not after a cache expires
+    // (#1901 UP-19). There is deliberately no cache and no stale-key fallback; a failed or
+    // empty answer fails the sign-in closed.
     auto jwks_uri = ensure_discovered(Need::Jwks);
     if (!jwks_uri) {
         spdlog::warn("OidcProvider: discovery is unavailable, cannot fetch signing keys");
-        return false;
+        return std::unexpected(std::string(kJwksUnavailable));
     }
 
     spdlog::info("OidcProvider: fetching JWKS from {}", ::yuzu::log_key_token(*jwks_uri));
@@ -1709,28 +1701,15 @@ bool OidcProvider::fetch_jwks() {
                                  http_timeout_ms_.load(), config_.nat64_prefixes);
     if (!body) {
         spdlog::error("OidcProvider: JWKS fetch failed: {}", body.error());
-        return false;
+        return std::unexpected(std::string(kJwksUnavailable));
     }
     auto keys = parse_jwks(*body);
     if (!keys) {
         spdlog::error("OidcProvider: {}", ::yuzu::log_key_token(keys.error()));
-        return false;
+        return std::unexpected(std::string(kJwksUnavailable));
     }
-    std::lock_guard lock(jwks_mu_);
-    // A document with zero usable keys (a transient or hostile empty set, or one whose members
-    // all failed to parse) must not displace a good cached set: it is treated as a failed fetch
-    // and the cache stays as it was. An already-empty cache just stays empty, as before.
-    if (keys->empty() && !jwks_cache_.empty()) {
-        spdlog::error("OidcProvider: JWKS document held no usable signing keys, keeping the {} "
-                      "cached keys",
-                      jwks_cache_.size());
-        return false;
-    }
-    jwks_cache_ = std::move(*keys);
-    jwks_fetched_at_ = std::chrono::steady_clock::now();
-    jwks_last_success_ = jwks_fetched_at_;
-    spdlog::info("OidcProvider: cached {} JWKS signing keys", jwks_cache_.size());
-    return true;
+    spdlog::info("OidcProvider: fetched {} JWKS signing keys", keys->size());
+    return keys;
 }
 
 std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::string& jwt) {
@@ -1775,66 +1754,36 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
     if (alg != "RS256" && alg != "RS384" && alg != "RS512")
         return std::unexpected("unsupported JWT algorithm: " + ::yuzu::log_key_token(alg));
 
-    // Ensure JWKS is cached and fresh
-    bool fetch_failed = false;
+    // The key set for THIS verification: a fresh fetch (or the keys a test injected), never a
+    // set kept from an earlier sign-in.
+    std::vector<CachedJwk> keys;
     {
         std::lock_guard lock(jwks_mu_);
-        const auto now = std::chrono::steady_clock::now();
-        // Hard maximum key age: keys not refreshed by a SUCCESSFUL fetch within kJwksMaxKeyAge are
-        // no longer trusted, however recently a failed attempt re-armed the retry timer. Dropping
-        // the cache makes it empty, so the fetch below runs on this and every later login until
-        // the IdP answers (#1901 UP-5).
-        if (!jwks_cache_.empty() && now - jwks_last_success_ > kJwksMaxKeyAge) {
-            spdlog::info("OidcProvider: the {} cached signing keys were last fetched more than {} "
-                         "minutes ago; dropping them and fetching a fresh set",
-                         jwks_cache_.size(),
-                         std::chrono::duration_cast<std::chrono::minutes>(kJwksMaxKeyAge).count());
-            jwks_cache_.clear();
-        }
-        auto age = now - jwks_fetched_at_;
-        if (jwks_cache_.empty() || age > kJwksCacheTtl) {
-            // Need to fetch — release lock first (fetch acquires its own)
-        } else {
-            goto find_key; // cache is fresh, skip fetch
-        }
+        keys = test_jwks_keys_;
     }
-    fetch_failed = !fetch_jwks();
+    if (keys.empty()) {
+        auto fetched = fetch_jwks_snapshot();
+        if (!fetched)
+            return std::unexpected(fetched.error());
+        keys = std::move(*fetched);
+    }
 
-find_key:;
-    // Find the key matching kid
+    // A token that names a kid is checked against the key with that kid only; one that names a
+    // kid the key set does not hold is refused, never checked against another key. A token with
+    // NO kid member uses the first key (some IdPs do not set kid).
     std::shared_ptr<EVP_PKEY> pkey;
-    {
-        std::lock_guard lock(jwks_mu_);
-        for (const auto& k : jwks_cache_) {
-            if (!kid.empty() && k.kid == kid) {
-                pkey = k.pkey;
-                break;
-            }
+    for (const auto& k : keys) {
+        if (!kid.empty() && k.kid == kid) {
+            pkey = k.pkey;
+            break;
         }
     }
-    // If kid didn't match, re-fetch JWKS once (key rotation)
-    if (!pkey && !kid.empty()) {
-        spdlog::info("OidcProvider: kid={} not in cache, re-fetching JWKS",
-                     ::yuzu::log_key_token(kid));
-        fetch_failed = !fetch_jwks();
-        std::lock_guard lock(jwks_mu_);
-        for (const auto& k : jwks_cache_) {
-            if (k.kid == kid) {
-                pkey = k.pkey;
-                break;
-            }
-        }
-    }
-    // If the token carries NO kid, use the first key (some IdPs don't set kid). A token that names
-    // a kid the (refetched) key set does not hold is refused, never checked against another key.
-    if (!pkey && kid.empty()) {
-        std::lock_guard lock(jwks_mu_);
-        if (!jwks_cache_.empty())
-            pkey = jwks_cache_.front().pkey;
-    }
+    if (!pkey && kid.empty() && !keys.empty())
+        pkey = keys.front().pkey;
     if (!pkey) {
-        if (fetch_failed)
-            return std::unexpected(std::string(kJwksUnavailable));
+        spdlog::warn("OidcProvider: the token names kid={}, which the fetched key set does not "
+                     "hold",
+                     ::yuzu::log_key_token(kid));
         return std::unexpected("no matching JWKS key found for kid=" + ::yuzu::log_key_token(kid));
     }
 
@@ -1896,24 +1845,11 @@ bool OidcProvider::add_test_jwks_key(const std::string& kid, const std::string& 
     cached.alg = "RS256";
     cached.pkey = std::move(pkey);
 
+    // While any injected key exists, verify_jwt_signature uses exactly the injected keys and
+    // makes no network fetch.
     std::lock_guard lock(jwks_mu_);
-    jwks_cache_.push_back(std::move(cached));
-    // Mark the cache fresh so verify_jwt_signature uses the injected key without
-    // attempting a (test-absent) network fetch.
-    jwks_fetched_at_ = std::chrono::steady_clock::now();
-    jwks_last_success_ = jwks_fetched_at_;
+    test_jwks_keys_.push_back(std::move(cached));
     return true;
-}
-
-void OidcProvider::set_jwks_key_age_for_test(std::chrono::seconds age) {
-    std::lock_guard lock(jwks_mu_);
-    jwks_fetched_at_ = std::chrono::steady_clock::now();
-    jwks_last_success_ = jwks_fetched_at_ - age;
-}
-
-void OidcProvider::age_jwks_keys_for_test(std::chrono::seconds more) {
-    std::lock_guard lock(jwks_mu_);
-    jwks_last_success_ -= more;
 }
 
 // ── Discovery (#5692) ────────────────────────────────────────────────────────

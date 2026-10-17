@@ -1830,90 +1830,50 @@ TEST_CASE(
     CHECK(idp.discovery_calls.load() == 3);
 }
 
-TEST_CASE("OIDC discovery: a failing JWKS refetch keeps the keys already cached",
+TEST_CASE("OIDC discovery: every verification fetches a fresh key set - a failing fetch fails "
+          "the sign-in closed and no earlier key is used",
           "[oidc][oidc_discovery][jwt]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
     OidcProvider provider(cfg);
     REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    CHECK(idp.jwks_calls.load() == 1);
+    // No cache: the same key is fetched again for the next verification.
+    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    CHECK(idp.jwks_calls.load() == 2);
+
     idp.with([](MockIdp& m) { m.jwks_status = 503; }); // an outage begins
-    (void)provider.verify_jwt_signature(signed_token(cfg, "never-published")); // failed refetch
-    CHECK(idp.jwks_calls.load() == 2);
-    // The failed attempt neither emptied the cache nor forces another fetch: known keys verify.
+    auto down = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+    REQUIRE_FALSE(down.has_value()); // the key it verified a moment ago is NOT reused
+    CHECK(down.error() == std::string(OidcProvider::kJwksUnavailable));
+    CHECK(idp.jwks_calls.load() == 3);
+
+    idp.with([](MockIdp& m) { m.jwks_status = 200; }); // the IdP recovers
     CHECK(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
-    CHECK(idp.jwks_calls.load() == 2);
+    CHECK(idp.jwks_calls.load() == 4);
 }
 
-TEST_CASE("OIDC discovery: cached keys are dropped after the hard maximum key age when the JWKS "
-          "endpoint stays down - and come back when it answers",
+TEST_CASE("OIDC discovery: a key the IdP stops publishing stops verifying at the very next "
+          "sign-in (#1901 UP-19)",
           "[oidc][oidc_discovery][jwt]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
     OidcProvider provider(cfg);
-    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
-    CHECK(idp.jwks_calls.load() == 1);
-    idp.with([](MockIdp& m) { m.jwks_status = 503; }); // the IdP's JWKS endpoint goes away
+    const auto jwt = signed_token(cfg, "mock-kid-1");
+    REQUIRE(provider.verify_jwt_signature(jwt).has_value());
 
-    // Inside the ceiling the cached key still verifies and nothing is refetched (a failed
-    // attempt re-arms the retry timer, which the seam keeps fresh).
-    provider.set_jwks_key_age_for_test(std::chrono::minutes(50));
-    CHECK(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
-    CHECK(idp.jwks_calls.load() == 1);
+    // The IdP retires every key (an emergency revocation): a token signed by the old key is
+    // refused on the next verification, with no waiting for any cache to expire.
+    idp.with([](MockIdp& m) { m.jwks_body = R"({"keys":[]})"; });
+    auto revoked = provider.verify_jwt_signature(jwt);
+    REQUIRE_FALSE(revoked.has_value());
+    CHECK(revoked.error().find("no matching JWKS key found") != std::string::npos);
 
-    // Past it the key is no longer trusted, even though the retry timer is fresh: the fetch is
-    // tried (and fails), and the verification is refused with the fixed unavailable token.
-    provider.set_jwks_key_age_for_test(std::chrono::minutes(70));
-    auto stale = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
-    REQUIRE_FALSE(stale.has_value());
-    CHECK(stale.error() == std::string(OidcProvider::kJwksUnavailable));
-    const int after_drop = idp.jwks_calls.load();
-    CHECK(after_drop > 1); // the dropped cache was refetched (and the fetch failed)
-
-    // While the IdP stays down every login tries again (the cache is empty now) and is refused.
-    CHECK_FALSE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
-    const int while_down = idp.jwks_calls.load();
-    CHECK(while_down > after_drop);
-
-    // The IdP answers again: the next login refetches, verifies, and the key is trusted anew,
-    // so a further login is served from the cache without another GET.
-    idp.with([](MockIdp& m) { m.jwks_status = 200; });
-    CHECK(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
-    const int recovered = idp.jwks_calls.load();
-    CHECK(recovered > while_down);
-    CHECK(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
-    CHECK(idp.jwks_calls.load() == recovered);
-}
-
-TEST_CASE("OIDC discovery: a fetch that adopts no keys does not renew the cached keys' age",
-          "[oidc][oidc_discovery][jwt]") {
-    // A kid miss forces a refetch while the cache is 50 minutes old. Neither an empty key set
-    // nor an unparseable body is a stored key set, so neither may renew the last-success stamp:
-    // 20 minutes later the keys are 70 minutes old and are refused. (Red if the stamp is
-    // written before the empty-set return in fetch_jwks, or on any non-adopting outcome.)
-    const std::pair<const char*, const char*> kAnswers[] = {
-        {"an empty key set", R"({"keys":[]})"},
-        {"an unparseable 200 body", "this is not json"},
-    };
-    for (const auto& [what, body] : kAnswers) {
-        CAPTURE(what);
-        MockIdp idp;
-        const auto cfg = discovery_cfg(idp);
-        OidcProvider provider(cfg);
-        REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
-        CHECK(idp.jwks_calls.load() == 1);
-
-        provider.set_jwks_key_age_for_test(std::chrono::minutes(50));
-        idp.with([body](MockIdp& m) { m.jwks_body = body; });
-        (void)provider.verify_jwt_signature(signed_token(cfg, "never-published"));
-        CHECK(idp.jwks_calls.load() == 2); // the kid miss really refetched
-        // Non-vacuity: the cached key survived the answer (inside the ceiling, no new fetch).
-        REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
-        CHECK(idp.jwks_calls.load() == 2);
-
-        // 70 minutes after the last real success: the key is no longer trusted.
-        provider.age_jwks_keys_for_test(std::chrono::minutes(20));
-        CHECK_FALSE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
-    }
+    // An unparseable answer is a failed fetch, not an empty key set, and is refused the same.
+    idp.with([](MockIdp& m) { m.jwks_body = "this is not json"; });
+    auto garbage = provider.verify_jwt_signature(jwt);
+    REQUIRE_FALSE(garbage.has_value());
+    CHECK(garbage.error() == std::string(OidcProvider::kJwksUnavailable));
 }
 
 TEST_CASE(
@@ -1925,8 +1885,8 @@ TEST_CASE(
     OidcProvider provider(cfg);
     REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
 
-    // The kid is not published and the refetch cannot fix that (the endpoint is down): the cached
-    // key must NOT be tried for a token that names a different key.
+    // The kid is not published and the endpoint is down: no key is tried for a token that names
+    // a different key (and none is reused from the verification above).
     idp.with([](MockIdp& m) { m.jwks_status = 503; });
     auto unknown = provider.verify_jwt_signature(signed_token(cfg, "never-published"));
     REQUIRE_FALSE(unknown.has_value());
@@ -2995,8 +2955,7 @@ TEST_CASE("OIDC: IdP-controlled JWT header values reach the log and the error wi
     yuzu::test::LogCapture cap;
 
     SECTION("a kid that matches no JWKS key") {
-        // A non-empty cache falls back to its first key whatever the kid, so the error is only
-        // reachable when the served key set is empty.
+        // The served key set is empty, so no key can match the kid.
         idp.with([](MockIdp& m) { m.jwks_key_count = 0; });
         const std::string kid = std::string("k") + kUnicodeBreaks + "x";
         auto r = provider.verify_jwt_signature(signed_token(cfg, kid));
@@ -3005,7 +2964,7 @@ TEST_CASE("OIDC: IdP-controlled JWT header values reach the log and the error wi
         CHECK(r.error().starts_with("no matching JWKS key found for kid=k"));
         check_no_unicode_breaks(r.error());
         const auto logs = cap.text();
-        CHECK(logs.find("not in cache, re-fetching JWKS") != std::string::npos);
+        CHECK(logs.find("which the fetched key set does not hold") != std::string::npos);
         check_no_unicode_breaks(logs);
     }
     SECTION("the kid of a JWK that does not parse") {
@@ -3846,7 +3805,6 @@ TEST_CASE("OIDC discovery: endpoints must be absolute and carry the issuer's own
 TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test - "
           "add_test_pending_flow - set_http_timeouts_for_test - "
           "set_discovery_negative_cache_for_test - set_resolver_for_test - "
-          "set_jwks_key_age_for_test - age_jwks_keys_for_test - "
           "clear_nat64_discovery_cache_for_test - expire_nat64_discovery_cache_for_test - "
           "vet_egress_target_for_test or pending_flow_count_for_test "
           "(source pin)",
@@ -3860,8 +3818,6 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
                                              "set_http_timeouts_for_test",
                                              "set_discovery_negative_cache_for_test",
                                              "set_resolver_for_test",
-                                             "set_jwks_key_age_for_test",
-                                             "age_jwks_keys_for_test",
                                              "clear_nat64_discovery_cache_for_test",
                                              "expire_nat64_discovery_cache_for_test",
                                              "vet_egress_target_for_test",
@@ -3978,8 +3934,6 @@ TEST_CASE(
     STATIC_REQUIRE(OidcProvider::kHttpOperationTimeoutMs == 5000);
     STATIC_REQUIRE(OidcProvider::kHttpTotalBoundMultiplier == 2);
     STATIC_REQUIRE(OidcProvider::kDiscoveryNegativeCacheMs == 30000);
-    STATIC_REQUIRE(OidcProvider::kJwksMaxKeyAge == std::chrono::hours(1));
-    STATIC_REQUIRE(OidcProvider::kJwksCacheTtl == OidcProvider::kJwksMaxKeyAge);
 
     const auto read = [](const char* name) {
         std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / name, std::ios::binary);
@@ -4169,9 +4123,10 @@ TEST_CASE("OIDC callback: anything else that throws while processing the IdP's a
     CHECK(cap.text().find("unexpected") != std::string::npos); // non-vacuity: the catch ran
 }
 
-// ── An empty key set never replaces a good one (#5692 UP-3) ──────────────────
+// ── An empty or later key set is used as served (#5692 UP-19) ────────────────
 
-TEST_CASE("OIDC JWKS: a document with no usable keys does not displace the cached keys",
+TEST_CASE("OIDC JWKS: a later key set is used as served - an empty one refuses, a good one is adopted "
+          "at once",
           "[oidc][oidc_discovery][security]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
@@ -4179,22 +4134,22 @@ TEST_CASE("OIDC JWKS: a document with no usable keys does not displace the cache
     REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
     CHECK(idp.jwks_calls.load() == 1);
 
-    // The IdP now serves an empty key set (a transient fault, or a hostile answer). A token under a
-    // kid the cache does not hold forces a refetch: the empty answer is a failed fetch.
+    // The IdP now serves an empty key set (a transient fault, or a hostile answer). Nothing
+    // earlier is kept to fall back on, so the verification is refused, with the fixed no-match
+    // error rather than the unavailable token (the fetch itself succeeded).
     idp.with([](MockIdp& m) { m.jwks_key_count = 0; });
-    (void)provider.verify_jwt_signature(signed_token(cfg, "never-published"));
+    auto empty = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error().find("no matching JWKS key found") != std::string::npos);
     CHECK(idp.jwks_calls.load() == 2);
 
-    // The good key is still there: it verifies WITHOUT another fetch.
-    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
-    CHECK(idp.jwks_calls.load() == 2);
-
-    // A later good answer is adopted as usual.
+    // A later good answer is used by the very next verification.
     idp.with([](MockIdp& m) {
         m.jwks_key_count = 1;
         m.token_kid = "mock-kid-2";
     });
     REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-2")).has_value());
+    CHECK(idp.jwks_calls.load() == 3);
 }
 
 // (Still inside the !YUZU_OIDC_MOCK_IDP_TSAN region opened above: this case uses the MockIdp

@@ -270,15 +270,6 @@ public:
     static constexpr int kHttpTotalBoundMultiplier = 2;
     static constexpr int kDiscoveryNegativeCacheMs = 30000;
 
-    /// How long a fetched JWKS is reused before the next sign-in refetches it.
-    static constexpr auto kJwksCacheTtl = std::chrono::hours(1);
-    /// Hard ceiling on how long cached keys are trusted without a successful refetch. Equal to
-    /// the cache TTL on purpose: a refresh that fails once the TTL has passed fails closed. A
-    /// sign-in needs the IdP's token endpoint anyway, so keeping stale keys through a JWKS
-    /// outage buys almost no availability and extends the window for a retired key. Pinned by
-    /// name in tests/unit/server/test_oidc_provider.cpp.
-    static constexpr auto kJwksMaxKeyAge = std::chrono::hours(1);
-
     /// What `start_auth_flow` hands the route: the IdP redirect and the initiating-browser
     /// binding secret. The route sets the secret as a cookie on the SAME response and requires
     /// it back at the callback; the provider retains only its SHA-256, so the secret is never
@@ -336,7 +327,7 @@ public:
     /// `start_auth_flow`, so the stored-hash validation can be driven with a value no honest
     /// flow stores. TEST-ONLY: none of the test seams in this block (these two,
     /// `set_http_timeouts_for_test`, `set_discovery_negative_cache_for_test`,
-    /// `set_resolver_for_test`, `set_jwks_key_age_for_test`, `age_jwks_keys_for_test`,
+    /// `set_resolver_for_test`,
     /// `clear_nat64_discovery_cache_for_test` and `pending_flow_count_for_test`) has
     /// a production caller, and tests/unit/server/ test_oidc_provider.cpp pins (source scan) that
     /// no other file in server/core/src references them.
@@ -358,15 +349,6 @@ public:
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);
-    /// Test-only seam: pretends the cached signing keys were last fetched successfully `age`
-    /// ago, while the retry timer stays fresh (as after a failed refetch), so a test can drive
-    /// the hard maximum key age without waiting. Same source-scan pin.
-    void set_jwks_key_age_for_test(std::chrono::seconds age);
-    /// Test-only seam: makes the cached signing keys `more` OLDER than they are now (shifts the
-    /// last-success stamp back, nothing else). Unlike `set_jwks_key_age_for_test` it does not
-    /// overwrite the stamp, so a test can tell whether an intervening fetch outcome renewed it.
-    /// Same source-scan pin.
-    void age_jwks_keys_for_test(std::chrono::seconds more);
     /// Test-only seam: forgets the process-wide cache of NAT64 prefixes learned from
     /// `ipv4only.arpa`, so the next eligible fetch looks them up again. Same source-scan pin.
     static void clear_nat64_discovery_cache_for_test();
@@ -386,12 +368,12 @@ public:
     /// and a refused callback leaves the count unchanged). Same source-scan pin.
     std::size_t pending_flow_count_for_test() const;
 
-    /// Test-only seam (#1856): inject an RSA verifying key into the JWKS cache
-    /// directly, bypassing the network fetch, so verify_jwt_signature can be
-    /// exercised end-to-end (jwk_to_pkey + EVP_DigestVerify) without a live IdP.
+    /// Test-only seam (#1856): inject an RSA verifying key that verify_jwt_signature uses
+    /// INSTEAD of fetching, so it can be exercised end-to-end (jwk_to_pkey + EVP_DigestVerify)
+    /// without a live IdP.
     /// `n_b64url`/`e_b64url` are the base64url RSA modulus/exponent (JWK form).
     /// Returns false if the key material does not parse. NOT for production use —
-    /// this mutates the trusted signing-key cache and has no production callers.
+    /// this replaces the trusted signing keys and has no production callers.
     bool add_test_jwks_key(const std::string& kid, const std::string& n_b64url,
                            const std::string& e_b64url);
 
@@ -515,14 +497,13 @@ private:
     /// Cleanup expired pending challenges (must hold mu_).
     void cleanup_expired_states_locked();
 
-    /// Fetch and cache JWKS from the IdP's jwks_uri endpoint. True when a key set was stored.
-    /// Stamps `jwks_fetched_at_` on EVERY attempt, so while the cache holds keys a failing IdP is
-    /// retried once per cache TTL rather than once per login. An EMPTY cache and every kid miss
-    /// still refetch on every call (#1900). Cached keys are trusted until the next SUCCESSFUL
-    /// fetch replaces them, but never for longer than `kJwksMaxKeyAge` after the last success
-    /// (#1901 UP-5): past that the cache is dropped and every login refetches until the IdP
-    /// answers, so a key the IdP retired cannot keep verifying through an outage.
-    bool fetch_jwks();
+    /// Fetch the IdP's signing keys, FRESH on every call, and return them. Nothing is cached:
+    /// each verification works from the answer it just obtained, so a key the IdP has retired or
+    /// revoked stops verifying at the next sign-in (#1901 UP-19). A failed discovery, fetch or
+    /// parse returns `kJwksUnavailable` (the details are logged); there is no stale-key
+    /// fallback, so a JWKS outage fails sign-in closed. An answer with zero usable keys is a
+    /// successful, empty snapshot (verification then finds no matching key).
+    [[nodiscard]] std::expected<std::vector<CachedJwk>, std::string> fetch_jwks_snapshot();
 
     OidcConfig config_;
     std::atomic<int> http_timeout_ms_{kHttpOperationTimeoutMs}; // test seam only
@@ -545,11 +526,10 @@ private:
     std::unordered_map<std::string, PkceChallenge> pending_challenges_;
     std::atomic<bool> binding_digest_forced_failure_{false}; // test seam only
 
-    // JWKS cache for JWT signature verification (G2-SEC-A1-001)
+    // Signing keys injected by tests (add_test_jwks_key). Production never fills it and keeps
+    // no key cache: every verification fetches a fresh set.
     mutable std::mutex jwks_mu_;
-    std::vector<CachedJwk> jwks_cache_;
-    std::chrono::steady_clock::time_point jwks_fetched_at_;     // last ATTEMPT (retry timer)
-    std::chrono::steady_clock::time_point jwks_last_success_{}; // last stored key set
+    std::vector<CachedJwk> test_jwks_keys_;
 
     static constexpr auto kChallengeTtl = std::chrono::minutes(10);
 };
