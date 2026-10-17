@@ -26,6 +26,7 @@
 /// still match).
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,23 @@ struct GuaranteedStateRuleRow {
     std::string created_by;
     std::string updated_by;
 };
+
+/// Largest accepted Guard rule `version`. An update bumps the stored version by one and
+/// the agent push casts it to uint64, so a caller-chosen value near INT64_MAX would
+/// overflow the signed increment (UB) and wrap on the wire. Enforced at every writer:
+/// `GuaranteedStateStore::create_rule` / `update_rule` (the latter on a version CHANGE only, so a
+/// legacy out-of-range row can still be disabled), the REST create + update handlers
+/// and the MCP create + update tools, all against these two helpers.
+inline constexpr int64_t kMaxRuleVersion = std::numeric_limits<int>::max();
+inline constexpr bool rule_version_in_range(int64_t v) noexcept {
+    return v >= 1 && v <= kMaxRuleVersion;
+}
+/// True when the next update bump (`version + 1`) would leave the accepted range. Reachable
+/// only for a row stored before the bound existed (or written out of band): refuse the
+/// update instead of overflowing.
+inline constexpr bool rule_version_exhausted(int64_t v) noexcept {
+    return v >= kMaxRuleVersion;
+}
 
 struct GuaranteedStateEventRow {
     std::string event_id;          // UUID

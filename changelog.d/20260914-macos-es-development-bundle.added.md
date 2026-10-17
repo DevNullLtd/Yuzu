@@ -1,0 +1,2 @@
+- **macOS Endpoint Security development bundle.** Adds an opt-in signed app-package lane with strict profile preflight, immutable-runtime updater safeguards, external plugins, and recoverable installer transitions.
+- Added a macOS development foundation runbook, private-evidence build-context exclusions, Provisioning UDID helper, and opt-in single-target installed-agent ES smoke check for subsequent Spark, Guardian, DEX and Reflex development; no consumer cutover or production-readiness claim.

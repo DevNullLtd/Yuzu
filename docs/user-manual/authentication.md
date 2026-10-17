@@ -257,7 +257,7 @@ Example:
   --https-key /etc/yuzu/server.key
 ```
 
-When `--https` is enabled, plain HTTP requests are redirected to HTTPS by default. Pass `--no-https-redirect` to serve both protocols independently.
+When HTTPS is enabled (the default), plain HTTP requests are redirected to HTTPS by default, except `GET`/`HEAD` on the four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`), which are served directly. Pass `--no-https-redirect` to not start the HTTP listener at all (HTTPS only; see server-admin.md).
 
 ```bash
 # Verify HTTPS is working
@@ -655,11 +655,11 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -H "Content-Type: application/json" \
   -d '{
     "name": "ci-pipeline",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 
-The `expires_at` field is a Unix epoch timestamp in seconds. Pass `0` or omit it for a non-expiring token.
+The `expires_at` field is a Unix epoch timestamp in seconds and must be in the future (the example value is 1 January 2030; use your own). Pass `0` or omit it for a non-expiring token. A negative, past or non-integer value is `400`.
 
 ```json
 {
@@ -754,7 +754,7 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -d '{
     "name": "finance-svc-token",
     "scope_service": "finance",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 
@@ -1149,13 +1149,18 @@ The `supervised` tier marks destructive operations as approval-gated, and the be
 MCP tokens are created via the same `POST /api/v1/tokens` endpoint as regular API tokens, with the addition of the `mcp_tier` field. MCP tokens **require** an expiration date, with a maximum lifetime of 90 days.
 
 ```bash
+# expires_at: unix epoch seconds, in the future and at most 90 days out (here, 30 days).
+# macOS: EXPIRES_AT=$(date -v+30d +%s)
+EXPIRES_AT=$(date -d '+30 days' +%s)
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "claude-desktop-readonly",
-    "mcp_tier": "readonly",
-    "expires_at": 1750185000
-  }'
+  -d @- <<EOF
+{
+  "name": "claude-desktop-readonly",
+  "mcp_tier": "readonly",
+  "expires_at": $EXPIRES_AT
+}
+EOF
 ```
 
 ```json
@@ -1180,7 +1185,7 @@ MCP tokens have the following restrictions:
 }
 ```
 
-The `mcp_tier` field accepts `"readonly"`, `"operator"`, or `"supervised"`. If `expires_at` is omitted or set to `0` for an MCP token, the server rejects the request. Maximum expiration is 90 days from creation.
+The `mcp_tier` field accepts `"readonly"`, `"operator"`, or `"supervised"`. If `expires_at` is omitted or set to `0` for an MCP token, the server rejects the request, and so does a past or negative value. Maximum expiration is 90 days from creation.
 
 MCP tokens can also be created via the Settings UI under the API Tokens section, which provides an MCP tier dropdown when creating a new token.
 
@@ -1218,7 +1223,7 @@ The following audit actions are emitted for authentication and authorization eve
 
 | Action | Result | Description |
 |---|---|---|
-| `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin). Not written for an interactive cookie session refused on an auto-loading dashboard panel (Access Users); token and engine callers always are |
+| `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin). Not written for an interactive cookie session refused on an auto-loading dashboard panel (Access Users; the Enrollment Tokens, Pending Agent Approvals and Auto-Approve Policies fragments, whether shown on Settings or on Groups and enrolment). A refused token or engine caller, and every refused write, always writes a row |
 | `auth.permission_required` | `denied` | Token blocked from permission-gated operation. Not written for an interactive cookie session refused on an auto-loading dashboard panel (the probe-gated Dashboard and Access panels), though `yuzu_auth_topology_floor_denied_total` still counts a floored refusal; token and engine callers always are |
 | `auth.scoped_permission_required` | `denied` | Token blocked from agent-scoped operation |
 | `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from an approval-gated operation **on a non-MCP (REST) transport**. On the MCP `/mcp/v1/` transport there is no such denial — the operation runs through the ticket-then-recall approval flow (the first call mints JSON-RPC `-32006` `ApprovalRequired`; a recall with the approved `approval_id` executes). See `mcp.md`. |

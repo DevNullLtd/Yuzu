@@ -863,6 +863,37 @@ TEST_CASE("route: POST .../sync — audit-store degrade fails CLOSED, no dispatc
     REQUIRE(h.sync_dispatch_calls == 0);
 }
 
+// #4644: offset/limit/await_since are ONE base-10 integer or a 400. `await_since` is
+// the freshness bound a sync poll waits past: a malformed one used to read as "no bound" and
+// the poll could serve a STALE snapshot as fresh.
+TEST_CASE("route: hardware list and JSON list and sync poll refuse malformed numeric params",
+          "[hardware][route][numeric_params]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "HOST-1", "linux", true)};
+    // A NEGATIVE offset/limit is malformed too (it used to be silently clamped to 0).
+    for (const char* bad : {"limit=3abc", "limit=0x10", "limit=1e1", "limit=", "offset=2x",
+                            "limit=99999999999999999999", "offset=-1", "limit=-5"}) {
+        INFO(bad);
+        auto frag = h.sink.Get(std::string("/fragments/hardware/list?results_only=1&") + bad);
+        REQUIRE(frag);
+        CHECK(frag->status == 400);
+        auto json = h.sink.Get(std::string("/api/v1/hardware?") + bad);
+        REQUIRE(json);
+        CHECK(json->status == 400);
+    }
+    auto ok = h.sink.Get("/fragments/hardware/list?results_only=1&limit=3&offset=0");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+
+    for (const char* bad : {"1000abc", "0x10", "1e3", "", "-"}) {
+        INFO("await_since=" << bad);
+        auto res = h.sink.Get(std::string(
+            "/fragments/hardware/ci?id=agent-1&lens=overview&lens_only=1&await_since=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+}
+
 // ───────────────────────── #5531: failed roster read is never an empty fleet ───
 
 namespace {

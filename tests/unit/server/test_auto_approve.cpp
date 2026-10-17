@@ -251,6 +251,16 @@ TEST_CASE("CIDR: malformed or out-of-range prefix never throws and never matches
     }
 }
 
+TEST_CASE("CIDR: a blank ip_subnet value never matches, including an empty peer IP",
+          "[auto_approve][cidr][hardening]") {
+    // The gateway-proxied Register path sets no peer IP, so an empty rule value used to equal it
+    // and auto-approve every such agent. load() accepts the line; the match is the last guard.
+    AutoApproveEngine engine;
+    engine.add_rule({AutoApproveRuleType::ip_subnet, "", "blank"});
+    CHECK(engine.evaluate(make_ctx("", "")).empty());
+    CHECK(engine.evaluate(make_ctx("", "10.1.2.3")).empty());
+}
+
 TEST_CASE("validate_auto_approve_rule: accepts well-formed rules",
           "[auto_approve][hardening]") {
     using T = AutoApproveRuleType;
@@ -394,6 +404,39 @@ TEST_CASE("mutations persist through a temp file + rename, and report the rule a
     REQUIRE(rules.size() == 1);
     CHECK(rules[0].value == "aws");
     CHECK_FALSE(rules[0].enabled);
+}
+
+TEST_CASE("toggle and remove verify a stated rule identity under the engine lock",
+          "[auto_approve][crud]") {
+    AutoApproveEngine engine;
+    REQUIRE(engine.add_rule({AutoApproveRuleType::hostname_glob, "a.corp", "A"}));
+    REQUIRE(engine.add_rule({AutoApproveRuleType::ip_subnet, "10.0.0.0/8", "B"}));
+
+    RuleExpectation wrong_value;
+    wrong_value.value = "b.corp";
+    RuleExpectation wrong_type;
+    wrong_type.type = AutoApproveRuleType::ip_subnet;
+    RuleExpectation stale_state;
+    stale_state.enabled = false;
+    for (const auto& e : {wrong_value, wrong_type, stale_state}) {
+        CHECK(engine.toggle_rule(0, e).status == RuleEdit::Status::mismatch);
+        CHECK(engine.remove_rule(0, e).status == RuleEdit::Status::mismatch);
+    }
+    REQUIRE(engine.list_rules().size() == 2);
+    CHECK(engine.list_rules()[0].enabled); // nothing changed
+
+    // Every stated field matches: it acts. A not_found index stays not_found, whatever is stated.
+    RuleExpectation right;
+    right.type = AutoApproveRuleType::hostname_glob;
+    right.value = "a.corp";
+    right.enabled = true;
+    CHECK(engine.toggle_rule(0, right).status == RuleEdit::Status::ok);
+    CHECK_FALSE(engine.list_rules()[0].enabled);
+    CHECK(engine.toggle_rule(7, right).status == RuleEdit::Status::not_found);
+    right.enabled = std::nullopt;
+    CHECK(engine.remove_rule(0, right).status == RuleEdit::Status::ok);
+    REQUIRE(engine.list_rules().size() == 1);
+    CHECK(engine.list_rules()[0].value == "10.0.0.0/8");
 }
 
 TEST_CASE("validate_auto_approve_rule: bounds the text and refuses match-everything rules",

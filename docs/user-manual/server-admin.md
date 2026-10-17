@@ -39,7 +39,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the platform default: `/etc/yuzu/yuzu-server.cfg` on Linux (and on macOS as root), `~/Library/Application Support/Yuzu/yuzu-server.cfg` on macOS as a non-root user, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows. |
 | `--data-dir` | *(config dir)* | Directory for runtime state files (auto-approve rules) and the NVD CVE cache `nvd_cves.db`, the one remaining server SQLite store, plus the `agent-updates/` (unless `--update-dir` is set) and `upload-blobs/` file directories. All other server data is in PostgreSQL — enrollment tokens and pending agents are PostgreSQL-authoritative (WS-6 6.2), not `--data-dir` files; see the blockquote below. Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but state files need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
 | `--postgres-dsn-file` | *(none)* | Read the PostgreSQL connection string from this file instead of `--postgres-dsn`, which puts it, password included, on the command line where every local user can read it. The whole file is the connection string; trailing whitespace (including the final newline) and a UTF-8 byte-order mark are ignored. Fails at startup if the file is missing, empty or larger than 64 KiB, and cannot be combined with `--postgres-dsn` / `YUZU_POSTGRES_DSN`. The file's own permissions are not checked (a Docker or Kubernetes secret is mounted world-readable inside its container): keep it where only the server's account can read it. The Windows installer stores it in the locked `%ProgramData%\Yuzu Server\postgres.dsn` and passes this flag. Env: `YUZU_POSTGRES_DSN_FILE`. |
-| `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
+| `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. When HTTPS is on this port is the HTTP→HTTPS redirect listener, which still answers `GET`/`HEAD` on the four health-probe paths directly (see [Probing a TLS-enabled server](#probing-a-tls-enabled-server)). |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
 | `--shutdown-drain-seconds` | `0` | On `SIGTERM`, keep serving for at least this many seconds after `/readyz` turns `503 draining`, so a load balancer stops routing here before the listener closes (HA WS-8). Range 0–60; `0` keeps the listener-closes-at-once behaviour a single server has always had. Set it to at least the load balancer's health-check interval × unhealthy threshold, plus one interval — see "Load balancers and shutdown drain" below. Env: `YUZU_SHUTDOWN_DRAIN_SECONDS`. |
 | `--no-https` | off | Disable HTTPS (insecure, for development only). HTTPS is **enabled by default**; provide `--https-cert` and `--https-key`, or pass `--no-https` to disable. Env: `YUZU_NO_HTTPS`. |
@@ -64,7 +64,9 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--https-port` | `8443` | HTTPS listen port. |
 | `--https-cert` | *(auto)* | Path to PEM-encoded TLS certificate for the dashboard. **A per-install default cert is auto-generated when omitted** (unless `--no-default-certs`); `--no-https` disables HTTPS entirely. |
 | `--https-key` | *(auto)* | Path to PEM-encoded TLS private key. Auto-generated default used when omitted (unless `--no-default-certs`). The file must not be world-readable (Unix: `chmod 600`). |
-| `--no-https-redirect` | off | When HTTPS is enabled, do not redirect HTTP requests to HTTPS. By default, HTTP requests are redirected. |
+| `--no-https-redirect` | off | When HTTPS is enabled, do not start the HTTP listener at all (no redirect, and no plain-HTTP health probes). By default, HTTP requests are redirected, except `GET`/`HEAD` on `/livez`, `/readyz`, `/health` and `/api/health`, which are served directly. |
+| `--healthcheck` | off | Probe this server's own health endpoint and exit `0` (HTTP 200) or non-zero, without starting the server. Uses the same listener flags and environment as the server (`--no-https`, `--https-port`, `--web-port`, `--web-address`, `--https-cert`, `--ca-dir`). Has no environment variable and never reads `yuzu-server.cfg`. See [Probing a TLS-enabled server](#probing-a-tls-enabled-server). |
+| `--healthcheck-path` | `/readyz` | With `--healthcheck`: the path to probe, `/readyz` or `/livez`. |
 | `--no-cert-reload` | off | Disable automatic certificate hot-reload. By default, the server polls cert/key files and hot-swaps the SSL context when they change. Env: `YUZU_NO_CERT_RELOAD`. |
 | `--cert-reload-interval` | `60` | Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
 | `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. **Warning:** enabling this exposes fleet composition data (OS, architecture, version counts) — and, when the cohort metrics export is enabled, **operator tag values** as `cohort` labels — to any network client. See [Metrics Security](metrics.md#security-considerations). Env: `YUZU_METRICS_NO_AUTH`. |
@@ -614,7 +616,7 @@ Guardian T_server event_id=… agent=… rule=… recv_ns=… committed_ns=… a
 
 The agent writes `Guardian T_wire event_id=… domain=… sent=… wire_wall_ns=…` for every Guardian event it attempts to send over the Subscribe stream on the legacy detection path (`domain=legacy`; `sent=0` means the link was down or the local write failed, and that event was dropped and is not retried). Ruleless DEX observations are not logged. Only once the Spark path is the live backend (`prefer_spark`, off by default) does it also write `Guardian T_detect …` for each outbox entry an evaluation pass stages (a pass evaluates every rule on the watched key and stages up to two entries for each, so a key shared by several rules can produce several lines, and a pass that stages nothing produces none), plus the same `T_wire` line for the Spark outbox path (there `sent=0` means the local write failed and the entry is retried; a down stream logs nothing). They exist to measure detect-to-deliver latency for the Spark cutover benchmark (#4606); they are plain log lines, not metrics or audit events, and no shipped component consumes them. If you do consume them, join on the agent and `event_id` (the agent-side lines carry no agent field, so take the agent from which log the line came from and from the server line's `agent=`), and never on log-file line order: a `T_wire` line can appear before its own `T_detect` line.
 
-**What the lines contain.** Only identifiers, times and a few flags and counters: the event id, the agent id, the rule id, instants or elapsed times, and fields such as `sent`, `accepted` and `seq`. They contain no event detail, no detected or expected value, no user name, process name or path. Ids are neutralised before they are written: every byte outside printable ASCII, and any space, `=` or `,` (a line break included), becomes `_`, and an id longer than 256 bytes is shortened to 256 by keeping its head and its last 24 bytes (the part that tells two events apart), identically on the agent and the server and on the server's Guardian ingest replay, conflict, error, oversized-detail and parse-failure lines, so an operator-chosen rule id such as `Disk Full` appears as `Disk_Full` and a non-ASCII rule name appears as underscores. The event id printed on the server's replay, conflict and oversized-detail lines is this neutralised form, so to find that event in the store, match on the agent, the rule and the time rather than pasting the id. This covers the lines named here. **#4665 closed the rest of this list**: every other rule-id, Spark-key, path, hive, service-name and unit-name print site across the Guardian/Spark subsystem — the legacy file, registry and service guards, SparkEngine, the Guardian engine's arm/baseline/rule-parsing messages, the Spark runtime's own lines that name only a watched key, the server's Guardian push enforce-downgrade warning, and the event store's own error lines — is now neutralised too. A rule id on any of these lines is wrapped the same way as on the lines above (`log_id_token`: control bytes, DEL, space, `=`, `,` and every non-ASCII byte fold to `_`, then a 256-byte head/tail shorten), so the same `Disk_Full`-style search still finds it. A path, registry hive/key, service or unit name embedded in a `'...'`-quoted fragment is wrapped with the newer, more permissive `log_key_token` (`common/include/yuzu/log_token.hpp`): it preserves spaces and non-ASCII bytes, so a real Windows path or a non-ASCII name still reads naturally, and folds only control bytes, DEL, and three Unicode line-separator sequences (NEL, LINE SEPARATOR, PARAGRAPH SEPARATOR) to `_` — the minimum needed to stop a forged physical log line. A log pipeline may now treat an id or key on any of these lines as forge-resistant. A regression-net test (`tests/test_guardian_spark_log_injection_tripwire.py`) fails the build on a future unwrapped call site in this subsystem — a lexical scanner with one documented, permanent, non-closable blind spot (it cannot trace a value wrapped several lines above its print site through local-variable construction; see the test's own header comment). They are ordinary log output, so how long they are kept is decided by your log pipeline, not by the Guardian event retention period, and they are not an audit record.
+**What the lines contain.** Only identifiers, times and a few flags and counters: the event id, the agent id, the rule id, instants or elapsed times, and fields such as `sent`, `accepted` and `seq`. They contain no event detail, no detected or expected value, no user name, process name or path. (The one exception among the lines named here is the server's Guardian ingest error warning, which also prints the store's error message; it has control bytes and line separators folded, keeps its spaces, and is shortened to 256 bytes. Two further server lines print their agent and one other name neutralised: the observer-threw warning prints the observation type and the agent, and the line for an ignored `__guard__` action prints the action name and the agent. The observer-threw warning also prints the exception text, which is not neutralised.) Ids are neutralised before they are written: every byte outside printable ASCII, and any space, `=` or `,` (a line break included), becomes `_`, and an id longer than 256 bytes is shortened to 256 by keeping its head and its last 24 bytes (the part that tells two events apart), identically on the agent and the server and on the server's Guardian ingest replay, conflict, error, oversized-detail and parse-failure lines, so an operator-chosen rule id such as `Disk Full` appears as `Disk_Full` and a non-ASCII rule name appears as underscores. The event id printed on the server's replay, conflict and oversized-detail lines is this neutralised form, so to find that event in the store, match on the agent, the rule and the time rather than pasting the id. This covers the lines named here. It does not extend to the server's other log lines that print an agent id read back from the session table or the enrollment store (the Heartbeat, BatchHeartbeat, ReportInventory and ProxyInventory ingest paths and the shared ingestion modules they call, the Subscribe stream open and close lines, the agent registry's other log lines that print a session-table id (removal, rollback, session-timeout, sweep and dispatch-routing lines), and the enrollment store's own agent-id log lines in auth_db.cpp (the admin-denied warnings and the consumed, added-to-pending, approved, denied and removed-from-queue lines) and the server's command-forward, asset-tag push and quarantine dispatch-denied lines in server.cpp): those print the id as stored. The enrollment store has already refused control bytes and `,` in it, so it cannot add a newline-delimited line, but an id enrolled or imported before the new-id character check may still contain a space, `=` or a non-ASCII byte, and so can add same-line `key=value` tokens. AuthDB's agent-id check also accepts U+0085, U+2028 and U+2029, which a log reader that splits on Unicode line breaks (a `splitlines()`-style reader) treats as line breaks, so such an id can still appear to start a new line to that reader. The exception text of the ingest catch-alls on those paths is printed as is. **#4665 closed the rest of this list**: every other rule-id, Spark-key, path, hive, service-name and unit-name print site across the Guardian/Spark subsystem — the legacy file, registry and service guards, SparkEngine, the Guardian engine's arm/baseline/rule-parsing messages, the Spark runtime's own lines that name only a watched key, the server's Guardian push enforce-downgrade warning, and the event store's own error lines — is now neutralised too. A rule id on any of these lines is wrapped the same way as on the lines above (`log_id_token`: control bytes, DEL, space, `=`, `,` and every non-ASCII byte fold to `_`, then a 256-byte head/tail shorten), so the same `Disk_Full`-style search still finds it. A path, registry hive/key, service or unit name embedded in a `'...'`-quoted fragment is wrapped with the newer, more permissive `log_key_token` (`common/include/yuzu/log_token.hpp`): it preserves spaces and non-ASCII bytes, so a real Windows path or a non-ASCII name still reads naturally, and folds only control bytes, DEL, and three Unicode line-separator sequences (NEL, LINE SEPARATOR, PARAGRAPH SEPARATOR) to `_` — the minimum needed to stop a forged physical log line. On any of these lines a new physical line cannot be forged from an id or key. The agent's hostname on the "Agent registered" line is not wrapped this way: it takes the same closed-set fold as an id (control bytes, space, `=`, `,` and every non-ASCII byte become `_`, 256-byte head/tail shorten), so a hostname such as `x' plugins=0 id=victim '` appears as `x'_plugins_0_id_victim_'` and cannot add a same-line token. The registration-path lines that fold agent-supplied values are the registration, update-check and update-download request logs, the agent certificate signing logs on the registration path, and the agent registry's registration and revoke logs; the update-download admission and identity-rejection lines fold control characters only, as described below. A same-line `key=value` token can still be forged where a value is wrapped with `log_key_token` (paths, registry keys, service and unit names, the Guardian ingest error text, and on the registration lines tag keys and store error text), and likewise where the control-byte-only fold is used (gateway node names, cluster ids, session ids and plugin names on the gateway stream-status, heartbeat and inventory lines, and the update-download admission and identity-rejection lines), because that wrapper keeps spaces and `=`. The control-byte-only fold also leaves U+0085, U+2028 and U+2029 in place, so a log reader that splits on Unicode line breaks can still see a line break in those gateway node names, cluster ids, session ids, plugin names and update-download lines (the exception is the session ids on the `ProxyRegister` adopted, lost-race and success lines and on four stream-status lines, which are wrapped with `log_key_token` and so have those three code points folded too). Store and database error text in these log lines is shortened to 256 bytes (head and tail kept), so the later hosts of a multi-host libpq message can be cut from the log line; the connection pool keeps the full text in memory for its last-error accessor. A regression-net test (`tests/test_guardian_spark_log_injection_tripwire.py`) fails the build on a future unwrapped call site in this subsystem — a lexical scanner with documented blind spots (for example it cannot trace a value wrapped several lines above its print site through local-variable construction, nor a value copied into a renamed local; the full list is in the test's own header comment). They are ordinary log output, so how long they are kept is decided by your log pipeline, not by the Guardian event retention period, and they are not an audit record.
 
 **Impact.** Log volume only. There is no API, schema, metric, alert or wire change, and no change to any detection, dispatch or ingest decision. Nothing to do on upgrade.
 
@@ -2937,9 +2939,9 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
 | User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. The accounts are also listed, read-only, on the **Users** page (`/access/users`) in the Access section of the sidebar. |
 | Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
-| Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
-| Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
-| Auto-Approval Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). |
+| Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. Also shown on the **Groups and enrolment** page (`/groups`, **Estate** group), from the same fragment. |
+| Pending Agent Approvals | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. Also shown on **Groups and enrolment**. |
+| Auto-Approve Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). Also shown on **Groups and enrolment**. |
 | API Tokens | `/fragments/settings/api-tokens` | Create and revoke bearer tokens for REST API automation. |
 | Plugin Code Signing | `/fragments/settings/plugin-signing` | Upload a PEM trust bundle for agent plugin CMS signature verification, toggle the require-signed-plugins flag, and remove the bundle. The trust bundle persists at `<cert-dir>/plugin-trust-bundle.pem`; the require flag persists in `runtime_config` under key `plugin_signing_required`. Distribution to agents is operator-driven today (curl into a local file referenced by `--plugin-trust-bundle`); automatic agent-side fetch is a forthcoming change. See the user-manual *Agent Plugins → Plugin Code Signing* section. |
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. The upload form also takes an optional detached CMS **Signature** (`.sig`, max 64 KB), stored as a sidecar beside the binary and served to agents on `CheckForUpdate` — see *Signing update binaries*. The server stores but never verifies it. |
@@ -3111,7 +3113,7 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 1. Navigate to **Settings > TLS Configuration**.
 2. Toggle **Enable HTTPS**.
 3. Upload PEM-encoded certificate and private key files using the **Upload PEM** button, or paste PEM content directly using the **Paste PEM** button.
-4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS.
+4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS, except GET/HEAD on the four health-probe paths (see Probing a TLS-enabled server).
 
 ### Certificate Requirements
 
@@ -3599,28 +3601,38 @@ and the response clears the session cookie via `Set-Cookie: Max-Age=0`.
 
 Yuzu uses a tiered enrollment model. Each tier provides a different balance of security and convenience.
 
+Enrollment is managed on the **Groups and enrolment** page (**Estate** group, `/groups`; see [Groups and enrolment page](#groups-and-enrolment-page)) or, equivalently, in the **Settings** panels **Pending Agent Approvals**, **Enrollment Tokens** and **Auto-Approve Policies**. Both places show the same lists and use the same routes. The page and its navigation entry use the UK spelling "enrolment"; the existing Settings panel names keep the US spelling "enrollment".
+
 ### Tier 1: Manual Approval
 
 The default enrollment method. No pre-shared token is required.
 
 1. The agent starts and sends a `RegisterRequest` to the server.
 2. The server places the agent in the **pending queue**.
-3. An admin reviews pending agents in **Settings > Pending Agents**.
+3. An admin reviews pending agents in **Estate > Groups and enrolment** (panel **Agents waiting for approval**) or in **Settings > Pending Agent Approvals**; both show the same queue.
 4. The admin approves or denies each agent.
 5. Approved agents complete registration on their next heartbeat.
-6. Denied agents are removed from the queue. They can re-register if restarted.
+6. A denied agent stays in the queue as **Denied** ("denial recorded") as a durable record. **The page offers no way to reverse a denial, and the product has no reinstate action today:** Approve on a denied agent is refused (`409`), **Forget** is offered only for waiting agents, and the same agent id stays denied whatever else it presents, including a valid enrollment token or a matching auto-approve rule. If the agent registers again, the server answers `enrollment_status` `denied` (reason "enrollment denied by administrator") and it is not enrolled. The **Deny** and **Deny all** confirmations say so; deny only when you mean it.
+
+   If a machine was denied by mistake, the only way back is for it to register as a *new* agent. Reinstall it or wipe its agent data directory (default `<data-dir>`, which holds the agent id in `agent.db` and, by default, its client certificate in `certs/`), so that it generates a new id and a new certificate. Setting a different `--agent-id` / `YUZU_AGENT_ID` is not enough on its own on a server that requires client certificates: the agent keeps presenting the old certificate (CN = old id), and the server refuses a Register whose id does not match it ("agent_id must match client certificate identity"). Use `--agent-id` only together with a wiped data directory (or a different `--data-dir`).
+
+   The new id is an ordinary first registration, not a special case. A valid enrollment token it presents enrolls it at once, an enabled auto-approve rule it matches approves it, and otherwise it waits in the pending queue. The denial is keyed on the old agent id only, so if you meant to keep that machine out, remove or tighten the token or rule that would admit it. The old id stays listed as **Denied**. There is no reinstate action and no supported way to delete a denied row.
 
 ### Tier 2: Pre-Shared Token
 
 For automated or bulk deployment. Agents present a token at startup for instant enrollment.
 
 **Server side:**
-1. Navigate to **Settings > Enrollment Tokens**.
-2. Click **Generate Token**.
-3. Configure token properties:
-   - **Expiry** -- time limit (e.g., 24 hours, 7 days).
-   - **Max uses** -- how many agents can use this token (1 for single-device, unlimited for bulk).
-4. Copy the generated token string.
+1. Navigate to **Estate > Groups and enrolment** (panel **Enrolment tokens**) or **Settings > Enrollment Tokens**; both show the same tokens.
+2. Fill in the **Generate token** form:
+   - **Label** -- free text shown in the list.
+   - **Max uses** -- how many agents can use this token. Empty or `0` is unlimited; any other value must be one whole number. A typo such as `0x5` or `5abc` is refused with `400` and no token is minted (it used to be read as `0`, which means unlimited).
+   - **Expires after (hours)** -- time limit. Empty or `0` is no expiry; the same whole-number rule applies, and a negative value is refused with `400` too, because it used to compute to "never expires".
+
+   With both limits empty or `0` the token never stops working, and the form shows "Unlimited uses and no expiry" until one of them is a real limit.
+3. Click **Generate token** and copy the string shown. It is shown once. The reveal sits inside the token panel, so navigating away, clicking **Done**, revoking a token, generating another or anything else that reloads the panel removes it for good; if you did not copy it, revoke that token and generate a new one. **Copy to Clipboard** needs HTTPS or `localhost`. On **Groups and enrolment**, over plain HTTP or if the browser refuses, the button says "Copy failed. Select the text." and you copy the token by hand. The Settings panel keeps its older copy button, which has no failure message: without HTTPS or `localhost` the button does nothing, and if the browser refuses the copy it still says "Copied!". Check the clipboard (or select the token by hand) before you leave the panel. The response is sent with `Cache-Control: no-store, private`.
+
+The list shows each token's ID, label, uses, expiry (UTC) and status: **Active**, **Expired**, **Exhausted** or **Revoked**, with active tokens first. Only a token that is not revoked has a **Revoke** button.
 
 **Agent side:**
 ```bash
@@ -3640,9 +3652,9 @@ Reserved protocol fields (`machine_certificate`, `attestation_signature`, `attes
 
 For environments that need something between manual approval and pre-shared tokens, auto-approval policies can automatically approve agents that match defined criteria:
 
-1. Navigate to **Settings > Auto-Approval Policies**.
-2. Create a rule with conditions (e.g., hostname matches `prod-web-*`, source IP in `10.0.0.0/8`).
-3. Agents matching any active policy are approved automatically at registration time.
+1. Navigate to **Estate > Groups and enrolment** (panel **Auto-approve rules**) or **Settings > Auto-Approve Policies**.
+2. Create a rule with conditions (e.g., hostname matches `prod-web-*`, source IP in `10.0.0.0/8`). The Add rule confirmation asks before it saves; see [Auto-Approval Policies](device-management.md#auto-approval-policies) for what each rule type matches, what the server refuses and which rules the page flags.
+3. Agents matching any active policy are approved automatically at registration time. In "all" match mode every enabled rule must match, so an enabled `trusted_ca` rule (which never matches at this release) means no agent is auto-approved.
 
 ---
 
@@ -3802,7 +3814,7 @@ editing the unit:
 | Platform | How |
 |---|---|
 | Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
-| macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
+| macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. Package upgrades keep every `YUZU_*` variable there, except `YUZU_PLUGIN_DIR` and `YUZU_DATA_DIR`, which the package sets. |
 | Windows | Set them in the service's own environment, a `REG_MULTI_SZ` value named `Environment` under the service's registry key, then restart the service. **Not in its binary path:** every installer run rewrites that path and drops them, and signing is then silently off (#5196). See *Windows: the service's `Environment` value* below for the commands and the cases that remove the value. |
 
 Every flag below has the environment variable shown beside it:
@@ -5145,33 +5157,51 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/fragments/settings/tokens` | Render the enrollment tokens fragment (HTMX). |
-| `POST` | `/api/settings/enrollment-tokens` | Generate a new enrollment token. Body: `{ "expiry", "max_uses" }`. |
-| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. |
-| `DELETE` | `/api/settings/enrollment-tokens/{id}` | Revoke a token by ID. |
+| `GET` | `/fragments/settings/tokens` | Render the enrollment tokens fragment (HTMX); also the **Enrolment tokens** panel of `/groups`. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`. |
+| `POST` | `/api/settings/enrollment-tokens` | Generate a new enrollment token. Form fields: `label`, `max_uses` (empty or `0` = unlimited), `ttl_hours` (empty or `0` = never). A malformed or negative number is a `400` and nothing is minted. The response is the token-list fragment with the raw token shown once; it carries `Cache-Control: no-store, private`. |
+| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. Defaults when a field is empty or omitted: `count` 10 (allowed 1 to 10000), `max_uses` 1, `ttl_hours` 0 (no expiry). Each number may be a JSON integer or a numeric string. A malformed, fractional, boolean, `null` or negative number, one outside the 32-bit range, a `count` outside 1 to 10000, or a body that is not one JSON object, is a `400` and nothing is minted. The response carries `Cache-Control: no-store, private`. |
+| `DELETE` | `/api/settings/enrollment-tokens/{id}` | Revoke a token by ID. An unknown ID revokes nothing: the response carries a warning toast ("Token not found - nothing revoked") and the audit row is `denied`. |
 
 ### Pending Agents
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/fragments/settings/pending` | Render the pending agents fragment (HTMX). |
-| `POST` | `/api/settings/pending-agents/{id}/approve` | Approve a pending agent. |
-| `POST` | `/api/settings/pending-agents/{id}/deny` | Deny a pending agent. |
+| `GET` | `/fragments/settings/pending` | Render the pending agents fragment (HTMX); also the **Agents waiting for approval** panel of `/groups`. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`. |
+| `POST` | `/api/settings/pending-agents/{id}/approve` | Approve a pending agent. Only a `pending` row is moved: `409` if the agent was already approved or denied (an approve never reverses a denial), with the refreshed list in the body and an error toast. An unknown id changes nothing and answers with a warning toast; the audit row is `denied` in both cases. |
+| `POST` | `/api/settings/pending-agents/{id}/deny` | Deny a pending agent. Same rule as approve: `409` if the agent was already approved or denied (a deny never flips an enrolled agent). |
 | `DELETE` | `/api/settings/pending-agents/{id}` | Remove a pending agent from the queue. `409` if the row is no longer `pending` (already `approved`/`denied`) — removal only succeeds against a genuinely pending row, by design (WS-6 6.2). |
 
 The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin routes) may not contain an ASCII control character or a comma — both are rejected before the row is ever created, closing an audit-log injection path (WS-6 6.2). A UUID, hostname, or MAC-derived id is unaffected.
 
-An agent id seen for the first time must also use only letters, digits, `.`, `_`, `:` and `-`, and must not consist only of dots; otherwise `Register` (and the gateway's `ProxyRegister`) answers `INVALID_ARGUMENT` and no row is created. The check applies only when the enrollment store holds no row for the id: an agent that is already enrolled, pending or denied keeps registering under its existing id. The agent generates a UUID, so only an operator-chosen `--agent-id` / `YUZU_AGENT_ID` is affected. In the pending list, an id that is empty or is `.` or `..` is shown without row actions and the approve, deny and remove routes answer `400` for it; the Approve All / Deny All buttons are shown for such a row (even when it is the only pending one), and they act on every pending agent, so review the queue first.
+An agent id seen for the first time must also use only letters, digits, `.`, `_`, `:` and `-`, and must not consist only of dots; otherwise `Register` (and the gateway's `ProxyRegister`) answers `INVALID_ARGUMENT` and no row is created. The check applies only when the enrollment store holds no row for the id: an agent that is already enrolled, pending or denied keeps registering under its existing id. The agent generates a UUID, so only an operator-chosen `--agent-id` / `YUZU_AGENT_ID` is affected. In the pending list, an id that is empty or is `.` or `..` is shown without row actions and the approve, deny and remove routes answer `400` for it; the Approve all / Deny all buttons are shown for such a row (even when it is the only pending one), and they act on every pending agent, so review the queue first.
 
 ### Auto-Approval Policies
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/fragments/settings/auto-approve` | Render the auto-approval policies fragment (HTMX). |
+| `GET` | `/fragments/settings/auto-approve` | Render the auto-approval policies fragment (HTMX); also the **Auto-approve rules** panel of `/groups`. |
 | `POST` | `/api/settings/auto-approve` | Create a new auto-approval rule. Returns `400` and saves nothing for an unknown type, an empty value, a value over 253 or a label over 128 characters, a `:` or control character in value or label, a malformed `ip_subnet`, a `trusted_ca` that is not 64 hex characters, or a match-everything rule (`*`, `/0`). The four rule writes are refused with `403` when `Origin`/`Referer` names another site, and are refused with `503` if their audit row cannot be stored. |
 | `POST` | `/api/settings/auto-approve/mode` | Set the match mode (`any` or `all`); any other value returns `400`. |
-| `POST` | `/api/settings/auto-approve/{index}/toggle` | Toggle an auto-approval rule on or off. |
-| `DELETE` | `/api/settings/auto-approve/{index}` | Delete an auto-approval rule. |
+| `POST` | `/api/settings/auto-approve/{index}/toggle` | Toggle an auto-approval rule on or off. Optional form fields `type`, `value` and `enabled` (`0` or `1`) state the rule the caller saw at that position; the dashboard always sends them. If the rule now at `{index}` differs, there is no rule at `{index}` any more, or a stated `type` or `enabled` is malformed, nothing changes and the answer is `409` with the refreshed list, a warning toast and a `denied` audit row (`stale_rule_view`, or `rule_not_found` when the index is gone). A request that states none of them acts on the position, as before (an unknown index is a `200` no-op). |
+| `DELETE` | `/api/settings/auto-approve/{index}` | Delete an auto-approval rule. Optional query parameters `type` and `value` state the rule the caller saw; same `409` rule as toggle. |
+
+### Groups and enrolment page
+
+`/groups` (first entry of the **Estate** group in the navigation) puts the three enrolment panels on one page: **Agents waiting for approval**, **Auto-approve rules** and **Enrolment tokens**. A fourth panel, **Management groups**, only points to Settings, where management groups are still managed. The panels are the Settings fragments below, served by the same routes; the page adds no endpoint of its own beyond the page and its script.
+
+The page opens for every signed-in user and redirects to `/login` without a session. Each panel needs the Administrator account role, so a user without it sees "Not available to your account" and the reason in each panel instead of a list. A refused browser session writes no denied-access audit row for any of the three panels (they load automatically, and the queue reloads whenever an agent arrives, so a page view must not fill the audit log); a refused API or MCP token that reaches a fragment URL does, and so does every refused write.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/groups` | The page. Redirects to `/login` without a session. Sent with `Cache-Control: no-store`. |
+| `GET` | `/static/yuzu-groups.js` | The page's script (clipboard copy, the unlimited-token warning, failure toasts, the Add rule confirmation). Sent with `Cache-Control: no-cache, no-store, must-revalidate`. |
+| `GET` | `/fragments/settings/tokens` | **Enrolment tokens** panel, also the Settings **Enrollment Tokens** panel. Administrator only. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`. |
+| `GET` | `/fragments/settings/pending` | **Agents waiting for approval** panel, also the Settings **Pending Agent Approvals** panel. Administrator only. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`; the page refreshes it when an agent arrives. |
+| `GET` | `/fragments/settings/auto-approve` | **Auto-approve rules** panel, also the Settings **Auto-Approve Policies** panel. Administrator only. |
+
+Each list shows at most 200 rows. Tokens are listed active first, then in the store's newest-first order; waiting agents are listed first, then denied ones. Rows past the limit are not listed. The tokens panel says "Showing 200 of N tokens". The waiting-agents panel says "Showing 200 of N" when more than 200 agents are waiting, and, when every waiting agent is listed but denied ones are cut off, "Showing 200 of N agents. Every waiting agent is listed; the K other denied agents are not." **Approve all** and **Deny all** act on every waiting agent, including the ones not shown and any that arrive after the page loaded, so they are disabled while more than 200 agents are waiting; approve or deny the listed agents one at a time. Their confirmation gives the total and the first ten hostnames.
+
+A store that does not answer is shown as an unavailable panel, never as an empty list. If a panel cannot load, the page says so and offers **Retry**. A click that the server refuses, that fails with a server error, or that is lost on the network leaves the list as it was and shows an error message that stays until closed. A click on a row that had already changed (approve or deny on a decided agent, a rule that moved or was removed) is answered with `409`: the list is replaced by the refreshed one and the server's message is shown.
 
 ### API Tokens
 
@@ -5219,7 +5249,7 @@ DEX alerting is configured on the **DEX page, Alerts tab** (it moved out of Sett
 | `GET` | `/fragments/dex/alerts` | The Alerts tab: DEX sub-nav, role note and the configuration form (HTMX). Any signed-in viewer may load it; the form renders for administrators only. Composed of the settings fragment below. |
 | `GET` | `/fragments/settings/dex-alerts` | Render the DEX alerts configuration form body only (HTMX). Admin-only. |
 | `POST` | `/api/settings/dex-alerts/routing` | Update the routed signal types. Body: form-encoded `types=<obs_type>` repeated per checked type; values are allow-listed against the signal catalogue. Persisted to `runtime_config` key `dex_alert_routing` (sorted JSON array). Applied live. Audit: `settings.dex_alerts.routing` (detail records the full routed set). |
-| `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
+| `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (a malformed value is `400` and nothing is saved; a well-formed integer is clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
 | `POST` | `/api/settings/dex-alerts/cohort-export` | Set (or clear) the cohort metrics export tag key. Body: `export_key` (tag-key alphabet `[A-Za-z0-9_.:-]`, max 64; empty disables — the default). When set, the per-cohort `yuzu_fleet_perf_cohort_*` Prometheus gauges are published for that key's cohorts (top 50 by population, the one-device floor — an empty cohort is withheld —, `yuzu_fleet_perf_cohort_clipped` makes capping visible). Persisted to `dex_cohort_export_key`. Applied on the next gauge sweep. Audit: `settings.dex_alerts.cohort_export`. |
 
 **New `runtime_config` keys.** All are runtime-set via the DEX Alerts tab and applied live (and re-applied at boot):
@@ -5407,9 +5437,12 @@ management-group-confined principal, or rate-limit the export routes at the prox
 pool-acquire timeout on a response read surfaces as `503` `response store degraded`.
 
 **Malformed filters.** `yuzu_server_response_param_rejected_total{surface}` counts requests refused
-for a malformed numeric parameter on the response routes and MCP `query_responses` only. A steady
+for a malformed numeric parameter on the response routes, MCP `query_responses` and MCP `list_issued_certs` only (both MCP tools count under `surface="mcp"`). A steady
 non-zero rate on one surface is a client sending fractional timestamps, `null`s or trailing
-characters; it is not a server fault.
+characters; it is not a server fault. The same strict parsing now answers `400` (or `-32602` on
+MCP) on about a dozen other route families and on MCP `query_audit_log`, and those rejections have
+no counter of their own: after an upgrade, a rise in 4xx on those routes is visible only in the
+generic request metrics.
 
 ## File Logging
 
@@ -5447,6 +5480,76 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 - **A sustained overload also reds every replica together, and that is deliberate (#4944).** If the probe's one-row, no-table `SELECT` misses its 2 s deadline twice in a row, the database cannot answer real requests within their deadlines either (nearly every request validates a session and writes an audit row), so the replica is truthfully unable to serve — and, from the client side, a hopelessly slow backend and a frozen one look the same. There is **no server-side hysteresis** by decision: the rule stays two failures to go red, one success to recover, and your load balancer's thresholds are the damping — see "Load balancers and shutdown drain" below for the recommended values. A *brief* stall never evicts: one failed probe is a blip (`scripts/ha/ha-readyz-scenarios.sh`, scenario M holds a 3 s pause green; scenario L shows a CPU-starved database going red and recovering within one probe of the limit being lifted).
 - **The store rows are startup checks.** Every other row (`response_store`, `session_store`, ...) reports whether that store opened and migrated when the server started. They do not re-check a running store — a runtime problem with one store (a revoked grant, a dropped table) shows up as `503`s on that store's routes and in metrics, not on `/readyz`, because every replica shares the same database and moving traffic elsewhere would not help.
 - **Leadership is not readiness.** A replica that is not the background-work leader is fully ready.
+
+### Probing a TLS-enabled server
+
+The shipped images contain no `curl` (the chiselled image ships a static busybox with `wget`, see `deploy/docker/Dockerfile.server.chisel`), and images built before `--healthcheck` existed (#5906) answer every request on the HTTP port with a redirect when HTTPS is on. Two mechanisms let an orchestrator probe such a server.
+
+**1. The HTTP port answers the four probes directly, in cleartext.** With HTTPS on, the redirect listener (`--web-port`, `8080` by default) serves `/livez`, `/readyz`, `/health` and `/api/health` without redirecting. The port is **unencrypted and unauthenticated**: `/health` returns the version, the store names, `agents.online` and the `tls` block (whether default certificates are active, the install CA fingerprint and its expiry), and a failing `/readyz` names the failed stores and the Postgres state. Publish it only to the orchestrator network or `127.0.0.1`, or remove it with `--no-https-redirect`. `--web-address 127.0.0.1` binds the HTTPS dashboard to loopback too (both listeners share that address), so it is not a way to restrict only the plain port: for that, use network placement or `--no-https-redirect`. The rules:
+
+- `GET` and `HEAD` only, on those exact paths. Every other path, any other method, and a probe that declares a request body (`Content-Length`, even `0`, or `Transfer-Encoding`) still receives the `301` to HTTPS; the HTTPS listener does answer a probe with `Content-Length: 0`.
+- No session is ever resolved on this port. `/health` and `/api/health` always return the unauthenticated shape here (no `agents.pending`, `executions.*` or `system.*`), even when the request carries a valid session cookie.
+- Every answer is `503 {"status":"not ready","reason":"https_listener_not_serving"}` while the HTTPS listener is not bound or has exited. The check means "bound and not yet exited", not "accepting": if the HTTPS listener hits a fatal accept error, requests it had already accepted keep answering normally until they finish, while new connections are refused. A broken certificate reload that leaves the socket open is not seen by this check; use `--healthcheck` for that. A failed HTTPS bind logs an error and turns plain `/livez` into `503` as well, so a liveness probe on this port restarts the server: that is intended, the port never reports healthy for a server whose HTTPS listener is down.
+- The listener has a fixed worker pool (at most 64 threads, created at boot; count them in any `pids`/`TasksMax` budget) and no request deadline, so many idle or trickling connections can make plain-port probes time out while the server itself is fine. Keep it on the orchestrator network, and use `--healthcheck` for any check that restarts the container.
+- A server started with `--no-https-redirect` has no HTTP listener, so there is nothing to probe on this port.
+
+**2. `yuzu-server --healthcheck`.** Probes the real HTTPS listener from inside the container and exits `0` only on HTTP 200:
+
+| Aspect | Behaviour |
+|---|---|
+| Target | `https://<web-address>:<https-port>/readyz` (a wildcard bind, `0.0.0.0` or `::`, is dialled over loopback); with `--no-https`, `http://<web-address>:<web-port>/readyz`. `--healthcheck-path /livez` selects liveness. |
+| Trust | The certificate chain is verified against **only** a trust anchor, never the system trust store. Default-certs mode: `<ca-dir>/default-ca.pem` (the install CA). Operator certificate (`--https-cert`): the first certificate in that file (the server certificate itself); certificates after it are not trusted, and a first certificate that is not a `-----BEGIN CERTIFICATE-----` block (for example `X509 CERTIFICATE` or `TRUSTED CERTIFICATE`) is refused with an `SSL certificate loading failed` error, never the whole file. In operator-certificate mode the anchor must resolve to a regular file of at most 64 KiB; a larger, missing or unreadable file is refused with the same error. The host name is not checked. |
+| Redirects | Not followed. A `301` is a failure. |
+| Time | Each phase is bounded: TCP connect 1 s, each TLS handshake step 1 s, the request as a whole 3 s; and the whole probe, name resolution and handshake included, is cut at 4 s with the reason `timed out after 4000 ms`. A plain or post-handshake server that accepts but never answers is reported in about 2 s, a TLS peer that accepts and never starts the handshake in about 1 s, one that trickles a response in about 3 s, one that trickles its TLS handshake at 4 s. |
+| Output | Nothing on success. Exit status `0` is healthy, non-zero otherwise (`1` is a failed probe; a bad flag exits with CLI11's own code). On failure one stderr line naming the target, the HTTP status or TLS reason (for example `certificate has expired`), and the trust anchor used. It never prints a key path or a response body. `docker inspect --format '{{json .State.Health}}' <container>` shows the last lines; for a `503`, the server's `docker logs` carry the `[readyz]` line that says why. |
+| Inputs | The server's own flags and environment variables, with the server's defaults. It does not read `yuzu-server.cfg`. |
+
+A compose `healthcheck:` does not inherit the container's `CMD` arguments, so repeat any listener flags the server was started with. Default certificates:
+
+```yaml
+healthcheck:
+  test: ["CMD", "yuzu-server", "--healthcheck"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+```
+
+Operator certificate (the same `--https-cert` the server uses; the probe trusts the first certificate in that file as its anchor, which must be a `-----BEGIN CERTIFICATE-----` block in a regular file of at most 64 KiB, and refuses anything else rather than trusting the whole file):
+
+```yaml
+healthcheck:
+  test: ["CMD", "yuzu-server", "--healthcheck", "--https-cert", "/etc/yuzu/tls/server.pem"]
+  interval: 30s
+  timeout: 5s
+  retries: 4
+  start_period: 30s
+```
+
+Kubernetes `exec` probe. `timeoutSeconds` defaults to 1, which is under the probe's own 4 s bound, so always set it to 5 or more. The `startupProbe` holds the liveness probe off for up to 5 minutes, because a large upgrade's first boot builds an index before anything answers (see `docs/user-manual/upgrading.md`):
+
+```yaml
+startupProbe:
+  exec:
+    command: ["yuzu-server", "--healthcheck", "--healthcheck-path", "/livez"]
+  failureThreshold: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+livenessProbe:
+  exec:
+    command: ["yuzu-server", "--healthcheck", "--healthcheck-path", "/livez"]
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+```
+
+Notes:
+
+- A check that restarts the container (Kubernetes liveness, Swarm, autoheal) should use `--healthcheck-path /livez`: a database outage turns `/readyz` red on every replica, and restarting them all fixes nothing. Keep the default `/readyz` for readiness and Compose `depends_on: condition: service_healthy`. Never set `timeout` below 5 s.
+- If the server runs with a non-default `--ca-dir` or `--https-port`, repeat them on the healthcheck line.
+- Once `--https-cert` is set, a `default-ca.pem` left in the certificate directory by an earlier default-certs boot is **not** used. Omitting `--https-cert` from the healthcheck line while the server uses an operator certificate makes the probe anchor on that stale file and report `SSL server verification failed`.
+- After you rotate the `--https-cert` file, the probe anchors on the new certificate while the server keeps serving the old one until its next reload (`--cert-reload-interval`, 60 s by default), and reports `SSL server verification failed` in between. A check turns unhealthy on its `retries`-th (Kubernetes: `failureThreshold`-th) consecutive failure, so the time it tolerates is (`retries` − 1) × `interval` in Compose and (`failureThreshold` − 1) × `periodSeconds` in Kubernetes. Make that longer than the reload interval (the `interval: 30s`, `retries: 4` snippet above tolerates 90 s; on Kubernetes with `periodSeconds: 10` set `failureThreshold: 8`, which tolerates 70 s), or restart the server after rotating. The server's reload watches the file the path resolves to when it starts, so a rotation that replaces a symlink instead of rewriting the file (a certbot `live/` link, a Kubernetes Secret volume) is never reloaded: restart the server after such a rotation, or the probe keeps failing. An expired certificate fails the probe with `certificate has expired`, and a restart cannot fix that: renew the certificate.
+- Images built before `--healthcheck` existed (#5906) exit on the unknown argument; keep their existing probes.
 
 ### Load balancers and shutdown drain
 
@@ -5514,7 +5617,8 @@ A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first s
 
 | Port | Service | Deployment |
 |---|---|---|
-| 8080 | Web dashboard + REST API | Always |
+| 8080 | HTTP→HTTPS redirect + cleartext health probes with HTTPS on (`--no-https-redirect` removes it); the dashboard and REST API in plain HTTP with `--no-https` | Always |
+| 8443 | Web dashboard + REST API (HTTPS) | Always when HTTPS is on (the default) |
 | 50051 | gRPC (agent connections) | Always -- server in standalone, gateway in scaled |
 | 50052 | gRPC (management) | Always |
 | 50055 | gRPC (gateway upstream) | Gateway deployments only |

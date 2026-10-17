@@ -612,3 +612,25 @@ TEST_CASE("execution_routes: wiring -- server.cpp still calls register_execution
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_execution_routes(") != std::string::npos);
 }
+
+// ── #4644: the legacy list reads `limit` strictly ────────────────────
+
+TEST_CASE("execution_routes: GET /api/executions rejects a trailing-garbage or overflowing "
+          "limit with 400 instead of reading its numeric prefix (#4644)",
+          "[pg][server][routes][execution_routes]") {
+    yuzu::test::ExecutionTrackerPg tracker;
+    Harness h;
+    h.execution_tracker = tracker.get();
+    h.wire();
+
+    for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=", "limit=4294967296"}) {
+        INFO(bad);
+        auto res = h.sink.Get(std::string("/api/executions?") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(body(res->body)["error"]["message"] == "invalid numeric query parameter");
+    }
+    auto ok = h.sink.Get("/api/executions?limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}

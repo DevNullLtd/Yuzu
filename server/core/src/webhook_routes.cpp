@@ -1,4 +1,5 @@
 #include "webhook_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "outbound_url_policy.hpp"
 
@@ -243,8 +244,15 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                 }
                 int limit = 50;
                 auto limit_str = req.get_param_value("limit");
-                if (!limit_str.empty()) {
-                    try { limit = std::stoi(limit_str); } catch (...) {}
+                if (req.has_param("limit")) {
+                    const auto v = yuzu::server::parse_query_int<int>(limit_str);
+                    if (!v) {
+                        res.status = 400;
+                        res.set_content(detail::a4_error(res, "invalid numeric query parameter: limit"),
+                                        "application/json");
+                        return;
+                    }
+                    limit = *v;
                 }
                 auto deliveries = webhook_store->get_deliveries(webhook_id, limit);
                 nlohmann::json arr = nlohmann::json::array();

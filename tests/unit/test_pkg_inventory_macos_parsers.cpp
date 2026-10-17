@@ -49,6 +49,7 @@
 
 #include "local_dispatcher.hpp"
 
+#include "pkg_inventory_test_support.hpp"
 #include "test_helpers.hpp" // yuzu::test::TempDir
 
 #include <cstddef>
@@ -69,6 +70,13 @@
 #endif
 
 namespace fs = std::filesystem;
+
+using yuzu::test::pkg_inventory_support::captured_rows;
+using yuzu::test::pkg_inventory_support::split_fields_escape_aware;
+#if !defined(_WIN32)
+using yuzu::test::pkg_inventory_support::ModeGuard;
+using yuzu::test::pkg_inventory_support::open_fd_count;
+#endif
 
 namespace {
 
@@ -282,45 +290,6 @@ bool build_macos_tree(const fs::path& root, std::string& error) {
     return load_tree_manifest(entries, error) && materialize(root, entries, error);
 }
 
-/// Escape-aware field split (safe_output_field escapes a literal '|' as '\|').
-std::vector<std::string> split_fields_escape_aware(const std::string& row) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (std::size_t i = 0; i < row.size(); ++i) {
-        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
-            cur += '|';
-            ++i;
-        } else if (row[i] == '|') {
-            out.push_back(cur);
-            cur.clear();
-        } else {
-            cur += row[i];
-        }
-    }
-    out.push_back(cur);
-    return out;
-}
-
-/// Restores a directory's mode on scope exit so TempDir's remove_all can run
-/// even when a REQUIRE unwinds. Declared AFTER the TempDir so it is destroyed
-/// first.
-struct ModeGuard {
-    fs::path path;
-    mode_t restore;
-    ~ModeGuard() { ::chmod(path.string().c_str(), restore); }
-};
-
-std::vector<std::string> captured_rows(const std::string& captured) {
-    std::vector<std::string> out;
-    std::istringstream ss(captured);
-    std::string line;
-    while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) out.push_back(line);
-    }
-    return out;
-}
-
 // ── CommandContext-level harness ─────────────────────────────────────────
 // Drives the PRODUCTION leg body (mac::run_macos_at) through a real
 // yuzu::CommandContext via LocalDispatcher (the synthetic-descriptor precedent
@@ -362,15 +331,6 @@ yuzu::agent::LocalDispatcher::Result run_leg(const fs::path& root, yuzu::pkg_inv
     g_leg_root = nullptr;
     g_leg_via = Via::at;
     return result;
-}
-
-/// Number of open file descriptors of this process (fd numbers, machine
-/// independent: only a before/after difference is ever asserted).
-std::size_t open_fd_count() {
-    std::size_t n = 0;
-    for (int fd = 0; fd < 1024; ++fd)
-        if (::fcntl(fd, F_GETFD) != -1) ++n;
-    return n;
 }
 
 } // namespace
@@ -776,9 +736,9 @@ TEST_CASE("pkg_inventory macos seam: a same-action dispatch while a walk is in f
     REQUIRE(build_macos_tree(dir.path, err));
 
     {
-        const auto held = mac::WalkSlot::try_acquire(Action::managers);
+        const auto held = WalkSlot::try_acquire(Action::managers);
         REQUIRE(held.has_value());
-        CHECK_FALSE(mac::WalkSlot::try_acquire(Action::managers).has_value()); // single-flight
+        CHECK_FALSE(WalkSlot::try_acquire(Action::managers).has_value()); // single-flight
 
         const auto busy = run_leg(dir.path, Action::managers, Via::guarded);
         CHECK(busy.rc == 0); // a busy answer is a degraded read, not a failed command
@@ -805,8 +765,8 @@ TEST_CASE("pkg_inventory macos seam: a same-action dispatch while a walk is in f
         CHECK(rows[0] == "status|managers|supported|-");
         CHECK(again.result_status == YUZU_RESULT_STATUS_OK);
     }
-    CHECK(mac::WalkSlot::try_acquire(Action::managers).has_value());
-    CHECK(mac::WalkSlot::try_acquire(Action::packages).has_value());
+    CHECK(WalkSlot::try_acquire(Action::managers).has_value());
+    CHECK(WalkSlot::try_acquire(Action::packages).has_value());
 }
 
 #if defined(__APPLE__)
@@ -816,7 +776,7 @@ TEST_CASE("pkg_inventory macos seam: the plugin's own run_macos entry point walk
     // run_macos is what execute() calls in production (pkg_inventory_macos.cpp). Holding
     // the slot proves THAT call site is the guarded one, without walking this host's
     // real "/" tree. MUTATION: calling run_macos_at from run_macos walks instead.
-    const auto held = mac::WalkSlot::try_acquire(Action::packages);
+    const auto held = WalkSlot::try_acquire(Action::packages);
     REQUIRE(held.has_value());
     const auto busy = run_leg(fs::path{"/"}, Action::packages, Via::entry);
     CHECK(busy.rc == 0);

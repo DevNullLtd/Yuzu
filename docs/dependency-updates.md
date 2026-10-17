@@ -267,6 +267,7 @@ Yuzu embeds third-party JavaScript at build time via `embed_js.py` (chunked raw-
 | Yuzu fleet renderer | `yuzu_viz_js_bundle.cpp` (generated at build time from `server/core/static/yuzu-viz.js`) | `kYuzuVizJs` | first-party | n/a |
 | Yuzu access page glue | `yuzu_access_js_bundle.cpp` (generated at build time from `server/core/static/yuzu-access.js`) | `kYuzuAccessJs` | first-party | n/a |
 | Yuzu tokens page glue | `yuzu_tokens_js_bundle.cpp` (generated at build time from `server/core/static/yuzu-tokens.js`) | `kYuzuTokensJs` | first-party | n/a |
+| Yuzu groups page glue | `yuzu_groups_js_bundle.cpp` (generated at build time from `server/core/static/yuzu-groups.js`) | `kYuzuGroupsJs` | first-party | n/a |
 
 ### Refresh procedure (vendored vendor JS only)
 

@@ -7,34 +7,6 @@
 
 namespace yuzu::server {
 
-namespace {
-
-// Machine (snake_case) values, matching settings_routes.cpp's auto-approve
-// POST-body parser (~line 5210) and byte-identical to auto_approve.cpp's own
-// internal-linkage rule_type_to_string() (used for on-disk persistence) —
-// NOT render_auto_approve_fragment()'s dashboard labels, which are Title
-// Case display strings ("Trusted CA", "Hostname Glob") for a different
-// audience. Three independent hand-synced copies of this mapping now exist
-// (auto_approve.cpp's persistence pair, settings_routes.cpp's UI labels,
-// this one); auto_approve.cpp's pair could be exported from auto_approve.hpp
-// and reused here instead of a third switch — not done in this pass. A
-// future new rule type must update all three.
-const char* auto_approve_rule_type_str(auth::AutoApproveRuleType t) {
-    switch (t) {
-    case auth::AutoApproveRuleType::trusted_ca:
-        return "trusted_ca";
-    case auth::AutoApproveRuleType::hostname_glob:
-        return "hostname_glob";
-    case auth::AutoApproveRuleType::ip_subnet:
-        return "ip_subnet";
-    case auth::AutoApproveRuleType::cloud_provider:
-        return "cloud_provider";
-    }
-    return "unknown";
-}
-
-} // namespace
-
 nlohmann::json directory_user_row_json(const DirectoryUser& u) {
     nlohmann::json groups = nlohmann::json::array();
     for (const auto& g : u.groups)
@@ -70,7 +42,7 @@ nlohmann::json directory_status_json(const SyncStatus& status,
 
 nlohmann::json auto_approve_rule_row_json(const auth::AutoApproveRule& rule, std::size_t index) {
     return {{"index", static_cast<int64_t>(index)},
-           {"type", auto_approve_rule_type_str(rule.type)},
+           {"type", auth::rule_type_to_string(rule.type)},
            {"value", rule.value},
            {"label", rule.label},
            {"enabled", rule.enabled}};

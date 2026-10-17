@@ -71,7 +71,9 @@
 /// them): the detached per-dispatch gateway-forward thread, FleetTopologyStore's
 /// request-path refill, ExecutionEventBus inline gc, `shutdown_watcher.hpp`'s
 /// signal self-pipe watcher, per-request SSE `wait_for` loops, and boot-time
-/// one-shot poll loops (`default_certs.cpp`, `nvd_client.cpp`).
+/// one-shot poll loops (`default_certs.cpp`, `nvd_client.cpp`), and
+/// `healthcheck_probe.cpp`'s probe_bounded worker (`--healthcheck`: one-shot, pre-init, the
+/// process exits with it).
 
 #include <array>
 #include <cstddef>

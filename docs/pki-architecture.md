@@ -520,7 +520,7 @@ auto-discovery) **shipped as #1314** (the original "PR5b" branch, #1271, was
 closed and this work re-landed there). A container off the published image is now
 encrypted + mutually authenticated out of the box: `Dockerfile.server`/`.chisel`
 and `Dockerfile.agent.chisel` no longer bake `--no-tls`/`--no-https`; the server
-serves HTTPS on 8443 (8080 → redirect) + (m)TLS gRPC; and the agent, given TLS
+serves HTTPS on 8443 (8080 → redirect, plus the health probes in cleartext) + (m)TLS gRPC; and the agent, given TLS
 with no `--ca-cert`, discovers the install CA at `/etc/yuzu/certs/default-ca.pem`
 before grpc falls back to system roots. `docker-compose.reference-gateway.yml` is
 the worked end-to-end example. The container-integration requirements the flip
@@ -532,7 +532,9 @@ boots the `deploy/docker/*.yml` composes** — were:
   `0700` volume) or first-boot cert generation fails.
 - **HTTPS healthcheck** — the compose healthchecks use a bash `/dev/tcp`
   plaintext HTTP GET against `/readyz`, which cannot complete a TLS handshake;
-  switch to a TCP-connect liveness check or add `openssl s_client`.
+  switch to a TCP-connect liveness check or add `openssl s_client` (a
+  TLS-verifying probe is available with `yuzu-server --healthcheck`, #5906;
+  the shipped composes still TCP-connect).
 - **Cert SAN ↔ dial name** — every name a client dials (e.g. the gateway dialing
   `server`, or an agent dialing `gateway`) must be in the dialled server's cert SAN.
   The default SAN is `localhost`/loopback/`gethostname()`; set the service `hostname:`
@@ -635,7 +637,7 @@ images** historically baked `--no-tls`/`--no-https` into their default CMD, so a
 container off the published image was plaintext. #1289 flips that: the
 `yuzu-server(-chisel)` and `yuzu-agent(-chisel)` images drop those flags, so a
 container is encrypted + mutually authenticated with zero configuration —
-dashboard over **HTTPS:8443** (8080 → HTTP→HTTPS redirect), agent/management/
+dashboard over **HTTPS:8443** (8080 → HTTP→HTTPS redirect, plus the health probes), agent/management/
 gateway listeners over (m)TLS. Demo/UAT/test composes keep `--no-tls`
 deliberately; native installs (deb/systemd, the Windows installer's opt-in
 disable checkbox) were already secure-by-default.

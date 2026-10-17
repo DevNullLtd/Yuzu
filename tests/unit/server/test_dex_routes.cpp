@@ -3161,3 +3161,38 @@ TEST_CASE("DEX perf/apps picker route: q/platform/sort params reach the render "
         CHECK(r->body.find("chrome.exe") < r->body.find("sshd")); // c before s
     }
 }
+
+// #4644: the perf-devices fragment `limit` is ONE base-10 integer or a 400; it used to
+// fall back to 50 silently on `5x`, `0x10`, `1e2`.
+TEST_CASE("DEX perf devices fragment: a malformed limit is a 400 and a valid one is served",
+          "[pg][dex][perf][routes][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+    yuzu::server::DexPerfFn perf_fn = [](const std::string&) {
+        return yuzu::server::DexPerfSnapshot{};
+    };
+    test::TestRouteSink sink;
+    DexRoutes routes;
+    auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+        perf_fn, yuzu::server::test::FnDexPerfApi::Providers{});
+    routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                           /*responses_fn=*/{}, {}, {}, dex_perf_api);
+    for (const char* bad : {"5x", "0x10", "1e2", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto r = sink.Get(std::string("/fragments/dex/perf/devices?metric=cpu&limit=") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
+    auto ok = sink.Get("/fragments/dex/perf/devices?metric=cpu&limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status != 400);
+}

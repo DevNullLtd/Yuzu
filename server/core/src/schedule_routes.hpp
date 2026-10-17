@@ -163,19 +163,17 @@ struct Deps {
 /// Register all 4 Schedules API routes against `sink`.
 void register_schedule_routes(HttpRouteSink& sink, Deps deps);
 
-/// Parses the `enabled` field of a `POST /api/schedules/{id}/enable` body.
-/// Extracted from the inline server.cpp lambda (guardian-confinement-2298
-/// hardening sweep) so the parsing has direct unit coverage — accepts BOTH
-/// a genuine JSON boolean and the legacy string encoding
-/// (`"true"`/`"false"`); a missing key or a body that fails to parse
-/// defaults to `true`, matching the pre-existing contract (disable is an
-/// explicit opt-in, never inferred from absence). A real JSON boolean used
-/// to fall through this default silently — `extract_json_string` only
-/// matches a JSON *string* value — so `{"enabled": false}`, the encoding
-/// every standards-compliant JSON client library produces for a boolean
-/// field, computed to `enabled=true`: inverting the request and, worse,
-/// defeating the disable-always-reachable kill switch (H-01, #1806) for any
-/// such caller.
-bool parse_schedule_enabled(const std::string& body);
+/// Parses the `enabled` field of a `POST /api/schedules/{id}/enable` body (#4644 made it strict).
+/// Accepts a JSON boolean, the integers 0 / 1 or the exact strings "true" / "false" (the last
+/// keeps the disable kill switch reachable for text-encoding clients); a missing key or a BLANK (empty or
+/// whitespace-only) body defaults to `true` (disable is an explicit opt-in, never inferred from
+/// absence). Anything else returns nullopt and
+/// the route answers 400 without arming or changing the schedule: any other string (`"True"`,
+/// `"0"`, empty), another number, null, an array or object,
+/// or a body that is truncated / not a JSON object. `{"enabled":0}` used to ARM the schedule.
+/// A real JSON boolean once fell through to the "absent" default (`{"enabled": false}` computed
+/// `true`), defeating the disable-always-reachable kill switch (H-01, #1806); the boolean arm
+/// stays first for that reason.
+[[nodiscard]] std::optional<bool> parse_schedule_enabled(const std::string& body);
 
 } // namespace yuzu::server::schedule

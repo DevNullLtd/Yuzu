@@ -71,9 +71,12 @@ cleanup(_) ->
     catch logger:remove_handler(?HANDLER),
     ok = yuzu_gw_crash_redact:remove(),
     stop_upstream(),
+    %% Wait for the killed supervisor to be gone: it is registered under ?SUP, and the next
+    %% scenario's supervisor:start_link({local, ?SUP}, ...) answers {error, {already_started, _}}
+    %% while the old one is still dying (a flake seen on three unrelated CI runs).
     case whereis(?SUP) of
         undefined -> ok;
-        Sup -> catch unlink(Sup), catch exit(Sup, kill)
+        Sup -> catch unlink(Sup), catch exit(Sup, kill), wait_down(Sup)
     end,
     flush_events(),
     ok.
