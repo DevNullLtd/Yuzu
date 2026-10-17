@@ -733,6 +733,9 @@ TEST_CASE("create-group-form route: a filter value over kMaxFacetValueBytes repl
     }
 
     SECTION("short raw, over the bound once stored (683 NUL bytes): the static sentence") {
+        // NOTE: an undecoded "%00" is also 3 bytes, so this reads the same if the request decoder
+        // stopped producing real NUL bytes; the real-byte helper case in
+        // test_group_agent_count_preview.cpp pins the rule itself.
         std::string nuls;
         for (std::size_t i = 0; i < 683; ++i)
             nuls += "%00";

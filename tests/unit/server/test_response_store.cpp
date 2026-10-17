@@ -2350,11 +2350,6 @@ TEST_CASE("ResponseStore: the facet value bound counts sanitized bytes, not char
     CHECK(dropped_count(metrics, "batch_failed") == 0.0);
 }
 
-// #2691 (Doomgoose finding #7): facet_agent_count/facet_line_count were a
-// plain int64_t degrading silently to 0 on a store/pool/query failure — the
-// SAME observable value as a genuine zero-match answer. The group-creation
-// dashboard flow this feeds must be able to tell "0 agents match" from
-// "the count could not be determined".
 // #5623: a typed filter is looked up in the stored (sanitized) form. A raw NUL would end the
 // libpq bind at the NUL (a different, shorter value) and invalid UTF-8 would be refused, so the
 // lookup would count the wrong rows or degrade; the value the caller typed must find the facet
@@ -2373,11 +2368,16 @@ TEST_CASE("ResponseStore: a filter with a NUL or invalid UTF-8 byte finds the st
     resp.agent_id = "agent-1";
     resp.status = 1;
     resp.plugin = "vuln_scan";
+    // Stored forms of 2048 bytes (682 bad bytes plus "ab": indexed) and 2049 bytes (683 bad bytes:
+    // excluded at ingest), so the lookups are pinned on both sides of the bound in stored form.
+    const std::string at_bound = std::string(682, '\xFF') + "ab";
+    const std::string over_bound(683, '\xFF');
     // No plain "a" category is stored: a bind cut at the NUL would look up "a" and find nothing.
-    resp.output = "high|"s + nul_cat + "|t1|d1\nhigh|"s + bad_cat + "|t2|d2\n"s;
+    resp.output = "high|"s + nul_cat + "|t1|d1\nhigh|"s + bad_cat + "|t2|d2\nhigh|"s + at_bound +
+                  "|t3|d3\nhigh|"s + over_bound + "|t4|d4\n"s;
     store.store(resp);
 
-    for (const auto& cat : {nul_cat, bad_cat}) {
+    for (const auto& cat : {nul_cat, bad_cat, at_bound}) {
         FacetFilter f{/*col_idx=*/1, cat};
         auto agents = store.facet_agent_count("cmd-facet-typed-bytes", {f});
         REQUIRE(agents.has_value()); // not a degrade
@@ -2385,9 +2385,27 @@ TEST_CASE("ResponseStore: a filter with a NUL or invalid UTF-8 byte finds the st
         auto lines = store.facet_line_count("cmd-facet-typed-bytes", {f});
         REQUIRE(lines.has_value());
         CHECK(*lines == 1);
+        // The other binders share append_facet_filters; pin them individually too.
+        auto ids = store.facet_agent_ids("cmd-facet-typed-bytes", {f});
+        REQUIRE(ids.has_value());
+        CHECK(*ids == std::vector<std::string>{"agent-1"});
+        auto rids = store.facet_response_ids("cmd-facet-typed-bytes", {f});
+        REQUIRE(rids.has_value());
+        CHECK(rids->size() == 1);
     }
+
+    // A value over the bound in stored form was not indexed: a clean zero, not a degrade.
+    FacetFilter over{/*col_idx=*/1, over_bound};
+    auto none = store.facet_agent_count("cmd-facet-typed-bytes", {over});
+    REQUIRE(none.has_value());
+    CHECK(*none == 0);
 }
 
+// #2691 (Doomgoose finding #7): facet_agent_count/facet_line_count were a
+// plain int64_t degrading silently to 0 on a store/pool/query failure — the
+// SAME observable value as a genuine zero-match answer. The group-creation
+// dashboard flow this feeds must be able to tell "0 agents match" from
+// "the count could not be determined".
 TEST_CASE("ResponseStore: facet_agent_count and facet_line_count distinguish degrade from zero",
           "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

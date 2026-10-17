@@ -10578,9 +10578,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // fleet_read_fn_ (that chokepoint is for per-agent LIST reads;
             // this route's scope is the D3 Response:Read-visible set, a
             // different resolver entirely).
-            // The served inputSchema maxLength values (command_id/plugin 256, a filter value 65536) are
-            // enforced only by the approval-gated pre-validation; this handler does not bound them (the
-            // tool is not in kFieldBoundTools), so off that path a value is limited by the 4 MiB body cap.
+            // The served inputSchema maxLength values (command_id/plugin 256, a filter value
+            // 65536) are enforced only by the approval-gated pre-validation; this handler does
+            // not bound them (the tool is not in kFieldBoundTools), so off that path a value is
+            // limited by the 4 MiB body cap.
             if (tool_name == "preview_management_group_agent_count") {
                 if (!tier_allows(tier, "ManagementGroup", "Write")) {
                     res.set_content(

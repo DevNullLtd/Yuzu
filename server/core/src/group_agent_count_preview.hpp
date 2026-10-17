@@ -60,7 +60,11 @@ std::vector<FacetFilter> resolve_group_preview_filters(
 /// answer 0 or an undercount for it. In input order, de-duplicated; a filter
 /// whose `col_idx` does not resolve against `plugin`'s columns is skipped. Key
 /// NAMES only, never the values. REST and MCP report this additively as
-/// `unindexed_filter_keys`.
+/// `unindexed_filter_keys`. The published order is sorted by key only because both callers
+/// supply filters from a sorted container (REST `req.params`, a multimap; MCP `args["filters"]`,
+/// a `std::map`). Tests in test_mcp_server.cpp ("preview agent count: two over-bound keys come
+/// back sorted by key on REST and MCP ...") and test_rest_devices.cpp ("two over-bound keys come
+/// back sorted by key") pin that; a caller with another container must sort first.
 std::vector<std::string> unindexed_filter_keys(const std::string& plugin,
                                                const std::vector<FacetFilter>& filters);
 
@@ -78,8 +82,8 @@ std::vector<std::string> unindexed_filter_keys(const std::string& plugin,
 /// off); engaged (including empty) = filter to exactly these agents.
 ///
 /// Count semantics are unchanged by #5623: an exact-match value longer than
-/// `kMaxFacetValueBytes` (response_store.hpp), measured in its stored form, is not indexed in newly stored
-/// responses, so for such a value this count can be 0 or an undercount. It does
+/// `kMaxFacetValueBytes` (response_store.hpp), measured in its stored form, is not indexed in
+/// newly stored responses, so for such a value this count can be 0 or an undercount. It does
 /// not say so itself; callers pair it with `unindexed_filter_keys` (above) and
 /// report that additively.
 std::optional<std::int64_t>

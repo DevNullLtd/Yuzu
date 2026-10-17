@@ -393,6 +393,9 @@ TEST_CASE("group-from-results: a 422 for an over-bound filter value explains the
     }
 
     SECTION("a value that is short raw but over the bound once stored: 422 with the explanation") {
+        // NOTE: an undecoded "%00" is also 3 bytes, so this reads the same if the request decoder
+        // stopped producing real NUL bytes; the real-byte helper case in
+        // test_group_agent_count_preview.cpp pins the rule itself.
         // 683 NUL bytes (%00) are 2049 stored bytes: each becomes a 3-byte U+FFFD at ingest.
         std::string nuls;
         for (std::size_t i = 0; i < 683; ++i)

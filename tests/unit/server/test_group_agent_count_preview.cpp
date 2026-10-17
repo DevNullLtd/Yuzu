@@ -132,6 +132,11 @@ TEST_CASE("unindexed_filter_keys: the bound is measured on the stored (sanitized
     for (int i = 0; i < 1024; ++i)
         mixed += "\xC3\xA9";
     CHECK(unindexed_filter_keys("procfetch", {{0, mixed}}) == std::vector<std::string>{"pid"});
+    // Exactly on the bound with a sanitized part: 682 NULs are 2046 stored bytes, so two more
+    // plain bytes make 2048 (indexed) and three make 2049 (not).
+    CHECK(unindexed_filter_keys("procfetch", {{0, std::string(682, '\0') + "ab"}}).empty());
+    CHECK(unindexed_filter_keys("procfetch", {{0, std::string(682, '\0') + "abc"}}) ==
+          std::vector<std::string>{"pid"});
     // A truncated multibyte lead (lone E2 82) is two invalid bytes: 6 stored bytes, so 341 of them
     // are 2046 (indexed) and 342 are 2052 (not).
     const auto trunc = [](int n) {

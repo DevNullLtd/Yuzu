@@ -314,6 +314,10 @@ server binary. What differs during a rollout:
 - **Every replica reads the same table.** Every replica reads the same `response_facets` rows, so a group
   built from a response that an OLD replica ingested is short whichever replica builds the group.
   Upgrading the replica that serves the group does not repair it; use the workaround above.
+- **A typed filter with a NUL or invalid UTF-8 byte.** A new replica matches such a filter in the form it
+  is stored in; an old replica cuts a NUL filter short at the database (so it can match a different
+  value) and fails the read for invalid UTF-8, which shows as an unavailable count. During a rollout the
+  same request can therefore answer differently on different replicas.
 
 See [`response-store.md`](response-store.md) (Facets are bounded).
 
