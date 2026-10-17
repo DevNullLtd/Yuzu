@@ -109,7 +109,17 @@ const char* rule_suffix(AutoApproveRuleType t) {
 std::string quoted(const std::string& value) {
     return "\"" + value + "\"";
 }
-std::string enable_confirm(bool require_all, std::size_t enabled_count, const std::string& value) {
+// In "all" mode every enabled rule must match, and a CA fingerprint rule never matches at this
+// release (Register does not populate the fingerprint), so while one is enabled no agent is ever
+// auto-approved. Said where the operator creates that state and on the page while it holds.
+constexpr std::string_view kCaBlocksAll =
+    "A CA fingerprint rule never matches at this release, so while all enabled rules must match "
+    "no agent is auto-approved.";
+
+std::string enable_confirm(bool require_all, std::size_t enabled_count, const std::string& value,
+                           AutoApproveRuleType type) {
+    if (require_all && type == AutoApproveRuleType::trusted_ca)
+        return "Require rule " + quoted(value) + " as well? " + std::string(kCaBlocksAll);
     if (!require_all || enabled_count == 0)
         return "Enable rule " + quoted(value) + "? Matching agents will join without approval.";
     return "Require rule " + quoted(value) + " as well? Fewer agents will join without approval.";
@@ -449,7 +459,10 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
     // and a cancelled confirm leaves nothing half-switched.
     html += "<div class=\"pad\"><div class=\"fld\"><span class=\"lb\">Match mode</span>"
             "<div class=\"seg\" role=\"group\" aria-label=\"Match mode\">";
-    const auto mode_btn = [&](bool all, const char* label, const char* confirm) {
+    const bool ca_enabled = std::any_of(rules.begin(), rules.end(), [](const auto& r) {
+        return r.enabled && r.type == AutoApproveRuleType::trusted_ca;
+    });
+    const auto mode_btn = [&](bool all, const char* label, const std::string& confirm) {
         const bool current = all == require_all;
         if (current)
             return std::string("<button class=\"on\" type=\"button\" aria-pressed=\"true\" "
@@ -467,8 +480,9 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
                      "Approve an agent when any enabled rule matches? More agents may join "
                      "without approval.");
     html += mode_btn(true, "All enabled rules must match",
-                     "Require every enabled rule to match? Fewer agents will join without "
-                     "approval.");
+                     ca_enabled ? "Require every enabled rule to match? " + std::string(kCaBlocksAll)
+                                : std::string("Require every enabled rule to match? Fewer agents "
+                                              "will join without approval."));
     html += "</div></div></div>";
 
     if (rules.empty()) {
@@ -492,7 +506,7 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
                     "</td><td class=\"acts\">";
             // Enabling widens (any mode) or narrows (all mode); the copy says which.
             const std::string q = r.enabled ? disable_confirm(require_all, enabled_count, r.value)
-                                            : enable_confirm(require_all, enabled_count, r.value);
+                                            : enable_confirm(require_all, enabled_count, r.value, r.type);
             html += "<button class=\"btn link\" type=\"button\" hx-post=\"" + base +
                     "/toggle\" hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\"" +
                     attr_rule_vals(r, /*with_enabled=*/true) + attr_confirm(q) + ">" +
@@ -506,6 +520,8 @@ std::string render_auto_approve(const std::vector<auth::AutoApproveRule>& rules,
             html += "</td></tr>";
         }
         html += "</tbody></table></div>";
+        if (require_all && ca_enabled)
+            html += "<div class=\"note warn\" role=\"note\">" + std::string(kCaBlocksAll) + "</div>";
     }
 
     // An agent enrolling through a gateway reaches the server with no peer address

@@ -804,6 +804,44 @@ TEST_CASE("enrolment rules: a hostile value stays inside its hx-vals string and 
     CHECK(count_of(html, " hx-vals=\"") == 3); // mode switch + Toggle + Remove
 }
 
+// In "all" mode every enabled rule must match, and a CA fingerprint rule never matches at this
+// release, so an enabled one means no agent is ever auto-approved. The page says so where the
+// operator creates that state (the mode switch, the Enable) and while it holds.
+TEST_CASE("enrolment rules: an enabled CA fingerprint rule in all mode says nobody is auto-approved",
+          "[groups][enrolment][render]") {
+    using T = auth::AutoApproveRuleType;
+    const std::string sentence =
+        "A CA fingerprint rule never matches at this release, so while all enabled rules must "
+        "match no agent is auto-approved.";
+    const std::vector<auth::AutoApproveRule> enabled_ca = {
+        {T::hostname_glob, "a.corp", "", true}, {T::trusted_ca, std::string(64, 'a'), "", true}};
+    const std::vector<auth::AutoApproveRule> disabled_ca = {
+        {T::hostname_glob, "a.corp", "", true}, {T::trusted_ca, std::string(64, 'a'), "", false}};
+
+    // The note is on the page only while it is true: all mode AND an enabled CA rule. (The
+    // sentence also rides in the confirms below, so the note is told apart by its element.)
+    const std::string note = "<div class=\"note warn\" role=\"note\">" + sentence;
+    const auto all = render_auto_approve(enabled_ca, true);
+    CHECK_THAT(all, ContainsSubstring(note));
+    CHECK_THAT(render_auto_approve(enabled_ca, false), !ContainsSubstring("role=\"note\""));
+    CHECK_THAT(render_auto_approve(disabled_ca, true), !ContainsSubstring("role=\"note\""));
+    CHECK_THAT(render_auto_approve({{T::hostname_glob, "a.corp", "", true}}, true),
+               !ContainsSubstring(sentence));
+
+    // Switching to all mode with a CA rule enabled warns in the confirm.
+    const auto any = render_auto_approve(enabled_ca, false);
+    CHECK_THAT(any, ContainsSubstring("hx-confirm=\"Require every enabled rule to match? " + sentence));
+    CHECK_THAT(render_auto_approve(disabled_ca, false),
+               !ContainsSubstring("Require every enabled rule to match? A CA"));
+
+    // Enabling the CA rule in all mode warns instead of the generic narrowing text.
+    CHECK(toggle_confirm(render_auto_approve(disabled_ca, true), 1) ==
+          "Require rule \"" + std::string(64, 'a') + "\" as well? " + sentence);
+    // ... and a non-CA rule keeps its own copy.
+    CHECK(toggle_confirm(render_auto_approve(rules_with(1, 1), true), 1) ==
+          enable_narrows(off(0)));
+}
+
 TEST_CASE("enrolment rules: add form keeps the field names; blocks colons; no inline handlers",
           "[groups][enrolment][render]") {
     const std::vector<auth::AutoApproveRule> none;
