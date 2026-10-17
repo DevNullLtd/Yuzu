@@ -1367,8 +1367,9 @@ metric_specs() ->
             {labels, [outcome]},
             {help, "Agent owner processes restarted after an abnormal exit, by what the "
                    "restarted owner did: recovered (the session was re-established on the "
-                   "agent's open stream), disconnected_only (its DISCONNECTED was sent and "
-                   "the session ended; the agent reconnects), gave_up (more than 3 restarts "
+                   "agent's open stream), disconnected_only (the session ended without "
+                   "recovery; its DISCONNECTED was sent if it had been announced; the "
+                   "agent reconnects), gave_up (more than 3 restarts "
                    "in 60 s: the session ended)"}]},
 
         %% -- NOTIFY-ACK workstream (#5695) ---------------------------------
