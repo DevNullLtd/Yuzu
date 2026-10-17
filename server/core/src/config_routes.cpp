@@ -8,6 +8,7 @@
 #include "runtime_config_view.hpp" // build_overrides_json
 #include "web_utils.hpp"          // browser_write_is_cross_site
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/server/server.hpp> // struct Config (forward-declared in the header)
 
 #include <nlohmann/json.hpp>
@@ -58,7 +59,8 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         }
         auto overrides_result = deps.runtime_config_store->get_all();
         if (!overrides_result.has_value()) {
-            spdlog::error("GET /api/config: read failed: {}", overrides_result.error());
+            spdlog::error("GET /api/config: read failed: {}",
+                          ::yuzu::log_key_token(overrides_result.error()));
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
@@ -226,7 +228,8 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             // value shape, the redaction-placeholder guard) is a 400 with
             // the store's own message, which is written for an operator.
             if (result.error().starts_with(kRuntimeConfigDbErrorPrefix)) {
-                spdlog::error("PUT /api/config/{}: write failed: {}", key, result.error());
+                spdlog::error("PUT /api/config/{}: write failed: {}", ::yuzu::log_key_token(key),
+                              ::yuzu::log_key_token(result.error()));
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"runtime config store unavailable"},)"

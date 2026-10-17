@@ -97,9 +97,11 @@ namespace yuzu::server {
 /// to UNAVAILABLE — NOT `accepted=false`/`reject_reason`, which the agent treats
 /// as a PERMANENT rejection (agent.cpp:1649-1657, #3401) — so the agent retries
 /// on its normal reconnect backoff. The PG failure detail stays server-side.
-/// Bad caller input (oversize / NUL / empty field) is INVALID_ARGUMENT.
+/// Bad caller input (oversize / NUL / empty field) is INVALID_ARGUMENT. A
+/// `CharsetRefused` is also caller input; the Register handlers answer it with the
+/// charset-specific message themselves, this is only the safe default.
 [[nodiscard]] inline grpc::Status enrollment_store_status(StoreError e) {
-    if (e == StoreError::InvalidInput)
+    if (e == StoreError::InvalidInput || e == StoreError::CharsetRefused)
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid enrollment request");
     return grpc::Status(grpc::StatusCode::UNAVAILABLE, "enrollment temporarily unavailable");
 }

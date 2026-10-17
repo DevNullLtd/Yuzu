@@ -26,7 +26,7 @@ yuzu-agent --server yuzu-server:50051 --no-tls --log-level debug
 |-------|-----|
 | Server not running | `systemctl status yuzu-server` |
 | Port conflict | `ss -tlnp | grep 8080` — kill conflicting process |
-| HTTPS redirect loop | Use `--no-https-redirect` if HTTPS cert is not set up |
+| HTTPS redirect loop | `--no-https-redirect` removes the HTTP listener altogether (no redirect, no plain-port health probes); use it if the HTTPS cert is not set up |
 | Draining/shutdown | Check if `/readyz` returns 503 — server may be shutting down |
 
 ## All API/Dashboard Requests Return 403 (Probes Stay Healthy)

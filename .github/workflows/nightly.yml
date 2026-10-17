@@ -272,7 +272,7 @@ jobs:
         # timeout, which GitHub Actions reports as CANCELLED, not FAILED - a bare
         # `failure()` would silently drop exactly the artifact this fix adds.
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-testlog-asan
           path: |
@@ -499,7 +499,7 @@ jobs:
         # would throw away the very stack capture the step above just took for
         # the stuck-test case. An `always()` here would also upload on green runs.
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-testlog-tsan
           path: |
@@ -730,7 +730,7 @@ jobs:
         # The always() half separately lets a `jobs=windows-asan` recurrence
         # dispatch record a clean run's timings, not only a failing/cancelled one.
         if: failure() || cancelled() || (always() && inputs.jobs == 'windows-asan')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-testlog-windows-asan
           path: |
@@ -909,7 +909,7 @@ jobs:
           fail_ci_if_error: false
 
       - name: Upload HTML coverage report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-report
           path: build-linux-coverage/coverage-html/
@@ -922,7 +922,7 @@ jobs:
         # see the same line's comment on the asan leg - a stall here rides the JOB's own
         # timeout, reported as CANCELLED not FAILED, which the deleted step never covered.
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-testlog-coverage
           path: |

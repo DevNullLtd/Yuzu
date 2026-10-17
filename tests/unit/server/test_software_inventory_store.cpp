@@ -2418,7 +2418,7 @@ TEST_CASE("Installs-by-OS is exact and the CASE SQL mirrors the C++ table",
     std::string values;
     for (const auto& e : sc::kEcosystemFamilies)
         values += "('" + std::string(e.ecosystem) + "'),";
-    values += "(''),('snap')";
+    values += "(''),('zypper')"; // snap is a published spelling; zypper is not
     auto r = run_sql(pool, "SELECT ecosystem, " + sc::os_family_case_sql() + " FROM (VALUES " +
                                values + ") v(ecosystem)");
     const int published = static_cast<int>(sc::kEcosystemFamilies.size());

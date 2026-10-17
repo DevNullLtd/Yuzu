@@ -3171,8 +3171,12 @@ paths (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt — a
 mesh/SSO proxy that stamps a reserved header on every request must not be
 able to fail the probes and crash-loop the server (governance CH-3/UP-5); a
 probe performs no identity-bearing action and nothing consumes the header on
-that path. This exception is recorded in ADR-1005's exception ledger on
-acceptance. **gRPC** — a single server interceptor on the
+that path. The same four paths are also served (GET and HEAD only, no
+request body) on the plaintext HTTP→HTTPS redirect listener, with session
+resolution bound to none there: `/health` and `/api/health` always return the
+unauthenticated shape, no on-behalf-of guard runs on that listener either, and
+every other request 301s to the guarded main listener. This exception is
+recorded in ADR-1005's exception ledger (2026-07-07, amended 2026-10-15). **gRPC** — a single server interceptor on the
 one `ServerBuilder` (`grpc_on_behalf_interceptor.hpp`) covers the agent,
 management, and gateway-upstream services and every future RPC method by
 construction; a call carrying a reserved metadata key is cancelled via
@@ -4252,7 +4256,7 @@ through-gateway binding is the gRPC gateway-hop identity design, #5578, ADR-0066
 
 ## HTTP security response headers (SOC2-C1)
 
-All HTTP responses (dashboard, REST API, MCP, metrics, health probes) carry six headers: `Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy` (deny-all baseline for camera/mic/geo/usb/etc.), and `Strict-Transport-Security: max-age=31536000; includeSubDomains` (HTTPS only, per RFC 6797).
+All HTTP responses (dashboard, REST API, MCP, metrics, health probes) carry six headers (the plain-HTTP redirect listener sends the first five): `Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy` (deny-all baseline for camera/mic/geo/usb/etc.), and `Strict-Transport-Security: max-age=31536000; includeSubDomains` (HTTPS only, per RFC 6797).
 
 The CSP is fully `'self'`-only with no external CDN allowance because the HTMX runtime and SSE extension are embedded in the server binary (`server/core/src/static_js_bundle.cpp`) and served from `/static/htmx.js` and `/static/sse.js` — the dashboard works in air-gapped deployments.
 
