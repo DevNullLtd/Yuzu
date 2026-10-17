@@ -14,8 +14,9 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_cert_files_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("kernel/include/file.hrl").
 
--export([forward/4]).
+-export([forward/4, equal_size_rsa_pems/2, replace_keeping_mtime/2]).
 
 -define(PIN_KEY, {yuzu_gw_mgmt_pins, resolved}).
 -define(HANDLER, {?MODULE, cert_file_state}).
@@ -131,7 +132,7 @@ refresh_test_() ->
      fun cleanup/1,
      [fun(F) -> {"the first refresh publishes readable=1 and notAfter for each role/name",
                  fun() -> first_refresh_publishes(F) end} end,
-      fun(F) -> {"an unchanged file is not re-read and publishes nothing",
+      fun(F) -> {"an unchanged file is read, not parsed again, and publishes nothing",
                  fun() -> unchanged_publishes_nothing(F) end} end,
       fun(F) -> {"a renewed certificate publishes its new notAfter",
                  fun() -> renewal_publishes_new_not_after(F) end} end,
@@ -142,7 +143,9 @@ refresh_test_() ->
       fun(F) -> {"two files under one role/name report the earlier notAfter",
                  fun() -> one_name_two_files(F) end} end,
       fun(F) -> {"a mgmt pin file is reported from the pin watcher's state, not read again",
-                 fun() -> pin_role_follows_the_watcher(F) end} end]}.
+                 fun() -> pin_role_follows_the_watcher(F) end} end,
+      fun(F) -> {"a different key of the same size, written with the same mtime, is re-read",
+                 fun() -> same_size_same_mtime_rotation_is_read(F) end} end]}.
 
 setup() ->
     {ok, _} = application:ensure_all_started(telemetry),
@@ -195,11 +198,17 @@ unchanged_publishes_nothing(#{dir := Dir}) ->
     S1 = yuzu_gw_cert_files:refresh(Sources, yuzu_gw_cert_files:new()),
     [_] = events(),
     ok = meck:new(file, [unstick, passthrough, no_link]),
-    _ = yuzu_gw_cert_files:refresh(Sources, S1),
-    Calls = [F || {Pid, {file, F, _}, _} <- meck:history(file), Pid =:= self()],
-    ?assert(lists:member(read_file_info, Calls)),
-    ?assertNot(lists:member(read_file, Calls)),
-    ?assertEqual([], events()).
+    ok = meck:new(public_key, [passthrough, no_link]),
+    try
+        S2 = yuzu_gw_cert_files:refresh(Sources, S1),
+        Calls = [F || {Pid, {file, F, _}, _} <- meck:history(file), Pid =:= self()],
+        ?assert(lists:member(read_file, Calls)),
+        ?assertEqual(0, meck:num_calls(public_key, pem_decode, '_')),
+        ?assertEqual(S1, S2),
+        ?assertEqual([], events())
+    after
+        meck:unload(public_key)
+    end.
 
 renewal_publishes_new_not_after(#{dir := Dir}) ->
     listen(),
@@ -286,9 +295,65 @@ pin_role_follows_the_watcher(#{dir := Dir}) ->
                    #{readable => 0, not_after => unix({{2030, 6, 1}, {13, 0, 0}})}}],
                  events()).
 
+%% Gate 8 #2. A rotation to a new key of the same type produces a PEM of the
+%% same size (RSA-2048 DER has a fixed length), and copy tools that preserve
+%% the mtime (cp -p, rsync -a, tar -p) or a rewrite within the same second
+%% leave {mtime, size} unchanged. The new certificate must still be read: its
+%% SPKI and its notAfter are what the gauges and the pin report.
+same_size_same_mtime_rotation_is_read(#{dir := Dir}) ->
+    listen(),
+    {PemA, PemB} = equal_size_rsa_pems({2030, 6, 1}, {2031, 6, 1}),
+    Path = filename:join(Dir, "gw.pem"),
+    ok = file:write_file(Path, PemA),
+    Sources = [{<<"listener">>, <<"agent">>, Path}],
+    S1 = yuzu_gw_cert_files:refresh(Sources, yuzu_gw_cert_files:new()),
+    [_] = events(),
+    E1 = yuzu_gw_cert_files:step(Path, none),
+    ok = replace_keeping_mtime(Path, PemB),
+    _ = yuzu_gw_cert_files:refresh(Sources, S1),
+    ?assertEqual([{<<"listener">>, <<"agent">>,
+                   #{readable => 1, not_after => unix({{2031, 6, 1}, {13, 0, 0}})}}],
+                 events()),
+    #{good := #{spki := SpkiA}} = E1,
+    #{good := #{spki := SpkiB}} = yuzu_gw_cert_files:step(Path, E1),
+    ?assertNotEqual(SpkiA, SpkiB).
+
 %%%-------------------------------------------------------------------
 %%% Helpers
 %%%-------------------------------------------------------------------
+
+%% Two PEMs of self-signed RSA-2048 certificates with different keys and the
+%% given notAfter dates (both before 2049, so both UTCTime), of EXACTLY the
+%% same byte size. RSA-2048 makes the DER length fixed in practice; the size is
+%% checked, and minting is retried, so the case never passes vacuously.
+equal_size_rsa_pems(DateA, DateB) ->
+    equal_size_rsa_pems(DateA, DateB, 20).
+
+equal_size_rsa_pems(_, _, 0) ->
+    error(could_not_mint_equal_size_certificates);
+equal_size_rsa_pems(DateA, DateB, N) ->
+    Mint = fun(Date) ->
+                   #{cert := Der} = public_key:pkix_test_root_cert(
+                                      "yuzu-cert-files-test",
+                                      [{validity, {{2020, 1, 1}, Date}},
+                                       {key, {rsa, 2048, 65537}}]),
+                   pem([Der])
+           end,
+    A = Mint(DateA),
+    B = Mint(DateB),
+    case byte_size(A) =:= byte_size(B) andalso A =/= B of
+        true -> {A, B};
+        false -> equal_size_rsa_pems(DateA, DateB, N - 1)
+    end.
+
+%% Overwrite Path with Bin and put its previous mtime back, so a stat sees the
+%% same {mtime, size} as before when Bin has the old size.
+replace_keeping_mtime(Path, Bin) ->
+    {ok, #file_info{mtime = M, atime = A, size = S}} = file:read_file_info(Path, [{time, posix}]),
+    ok = file:write_file(Path, Bin),
+    ok = file:write_file_info(Path, #file_info{mtime = M, atime = A}, [{time, posix}]),
+    {ok, #file_info{mtime = M, size = S}} = file:read_file_info(Path, [{time, posix}]),
+    ok.
 
 %% A self-signed EC certificate whose notAfter is Date at 13:00:00 UTC (the
 %% time pkix_test_root_cert/2 writes).

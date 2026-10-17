@@ -9,12 +9,12 @@
 %%% cert volume would stall the connection. This process takes the file system
 %%% off that path. The stream check reads what it publishes and nothing else.
 %%%
-%%% What it does. Every `mgmt_pin_refresh_ms' (default 5000) it stats each
+%%% What it does. Every `mgmt_pin_refresh_ms' (default 5000) it reads each
 %%% `{cert_file, Path}' entry of `{yuzu_gw, mgmt_peer_pins}' with `raw' file
-%%% operations (no file server), re-reads and parses the PEM only when the
-%%% file's {mtime, size} changed (yuzu_gw_cert_files:step/2), and publishes the
-%%% result to persistent_term: one put per actual change, none when nothing
-%%% changed. The published term maps each Path to a yuzu_gw_cert_files entry:
+%%% operations (no file server), parses the PEM again only when the SHA-256 of
+%%% its bytes changed (yuzu_gw_cert_files:step/2; the file's {mtime, size} is
+%%% not trusted as a change token, see that module), and publishes the result
+%%% to persistent_term: one put per actual change, none when nothing changed. The published term maps each Path to a yuzu_gw_cert_files entry:
 %%%   obs    the latest observation of the file (parsed, not a certificate, or
 %%%          unreadable)
 %%%   good   what the last observation that parsed held: the SPKI SHA-256 of
@@ -47,11 +47,12 @@
 %%% retry that refusal: it fails the command terminally (`gateway_unauthenticated',
 %%% counted in yuzu_server_gateway_forward_total{status="unauthenticated"}), so
 %%% commands forwarded in that window are dropped and show as terminal
-%%% failures; commands after the tick go through. Granularity: a same-second,
-%%% same-size rewrite keeps its token and is not re-read (a re-minted same-type
-%%% key usually has the same DER length); the token is also compared after the
-%%% read, so a file replaced while it was being read is not cached. The miss
-%%% direction is fail-closed and a gateway restart recovers.
+%%% failures; commands after the tick go through. Every tick compares the
+%%% file's bytes, so a new key is picked up even when the new PEM has the same
+%%% size and mtime as the old one (a re-minted same-type key usually has the
+%%% same DER length, and cp -p / rsync -a keep the mtime). A file whose
+%%% {mtime, size} changed while it was being read is not cached: the previous
+%%% value stands and the next tick reads it again.
 %%%
 %%% Rotation timestamp. When a path's pinned key changes from one key to a
 %%% different one, this process emits [yuzu, gw, mgmt_pins, rotated] with the
@@ -131,8 +132,8 @@ source(Path) ->
 refresh() ->
     refresh(application:get_env(yuzu_gw, mgmt_peer_pins, [])).
 
-%% @doc Stat every `{cert_file, Path}' entry of Pins, re-read the ones whose
-%% {mtime, size} changed, and publish the result if anything changed; emit the
+%% @doc Read every `{cert_file, Path}' entry of Pins, parse the ones whose
+%% bytes changed, and publish the result if anything changed; emit the
 %% rotation event if a pinned key changed. Runs in the calling process (this
 %% server, or a test). A malformed pin list publishes nothing for it (the boot
 %% guard refuses it before the listeners start; the stream check rejects it as

@@ -1408,7 +1408,7 @@ through the environment; it takes a `sys.config` edit):
 
 | Key | Default | Valid values | Meaning |
 |---|---|---|---|
-| `mgmt_pin_refresh_ms` | 5000 | 100 to 3600000 | How often the `yuzu_gw_mgmt_pins` process re-stats every `{cert_file, Path}` entry of `mgmt_peer_pins`. It re-reads and parses the PEM only when the file's modification time or size changed, and publishes the pinned key for the management `auth_fun` to read. The `auth_fun` runs once per management stream and does no file I/O itself, so a stalled certificate volume stalls only the watcher, never a connection. The interval bounds how long a rotated server leaf is refused: until the next refresh the gateway still pins the old key, so a stream the server opens with its new leaf in that window gets `UNAUTHENTICATED` (`pin_mismatch`, fail closed). The server does not retry it: the commands it forwards in that window fail as `gateway_unauthenticated`, and commands after the refresh go through. The same tick refreshes the certificate expiry gauges (see [Certificate rotation and expiry](#certificate-rotation-and-expiry)). The pins are resolved once at start, before the listeners, so the first stream never waits for a refresh. A value outside the range, or one that is not an integer, **refuses boot** (`Refusing to start: invalid {yuzu_gw, mgmt_pin_refresh_ms}`). Not present in any shipped `sys.config`. |
+| `mgmt_pin_refresh_ms` | 5000 | 100 to 3600000 | How often the `yuzu_gw_mgmt_pins` process re-reads every `{cert_file, Path}` entry of `mgmt_peer_pins`. It parses the PEM again only when the file's bytes changed (it compares a SHA-256 of the contents, not the modification time or size, so a new key of the same size copied with `cp -p` is still picked up), and publishes the pinned key for the management `auth_fun` to read. The `auth_fun` runs once per management stream and does no file I/O itself, so a stalled certificate volume stalls only the watcher, never a connection. The interval bounds how long a rotated server leaf is refused: until the next refresh the gateway still pins the old key, so a stream the server opens with its new leaf in that window gets `UNAUTHENTICATED` (`pin_mismatch`, fail closed). The server does not retry it: the commands it forwards in that window fail as `gateway_unauthenticated`, and commands after the refresh go through. The same tick refreshes the certificate expiry gauges (see [Certificate rotation and expiry](#certificate-rotation-and-expiry)). The pins are resolved once at start, before the listeners, so the first stream never waits for a refresh. A value outside the range, or one that is not an integer, **refuses boot** (`Refusing to start: invalid {yuzu_gw, mgmt_pin_refresh_ms}`). Not present in any shipped `sys.config`. |
 
 **Heartbeat batching interval** (read by the heartbeat buffer at start; unlike
 the replay keys above, it also has an environment override):
@@ -1937,9 +1937,14 @@ need none of this.
 
 **What the gateway watches.** The management-pin watcher (`yuzu_gw_mgmt_pins`)
 checks every certificate file the gateway is configured with every
-`mgmt_pin_refresh_ms` (default 5 s). It reads a file again only when its
-modification time or size changed, so a quiet volume costs one `stat` per file
-per interval and no management call ever touches the file system. The files,
+`mgmt_pin_refresh_ms` (default 5 s). It reads every file on every check and
+parses it again only when its bytes changed (a SHA-256 of the contents is
+compared). The modification time and size are not enough: a new certificate
+with a key of the same type usually has exactly the same size, and `cp -p`,
+`rsync -a` or `tar -p` keep the old modification time, so a check on those
+alone would keep the old key. Certificate files are a few kilobytes, so this
+costs one small read per file per interval, on the watcher's own timer; no
+management call ever touches the file system. The files,
 and the `role` and `name` labels they are reported under:
 
 | `role` | File | `name` |
