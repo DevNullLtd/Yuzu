@@ -152,7 +152,9 @@
 %%%       once: the record is cleared by whichever of result or 'DOWN' comes
 %%%       first, and a result is always delivered before the 'DOWN' of its
 %%%       sender.
-%%%   Ordinary workers never report to the breaker.
+%%%   Ordinary workers report too (notify_result): a result counts only
+%%%   while the breaker is closed and in the generation the worker started
+%%%   in; see the held-notice section above.
 %%%
 %%% Notices the server did not acknowledge (#5695, NOTIFY-ACK):
 %%%   The server answers NotifyStreamStatus with gRPC OK and a StreamStatusAck;
