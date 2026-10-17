@@ -106,7 +106,7 @@ TEST_CASE("developer script: the (plugin, action) pairs are a fixed table keyed 
     const auto& js = yuzu::server::kYuzuDeveloperJs;
     CHECK(has(js, "'dev-chargen-start': { plugin: 'chargen', action: 'chargen_start', confirm: true },"));
     CHECK(has(js, "'dev-chargen-stop': { plugin: 'chargen', action: 'chargen_stop', confirm: false }"));
-    CHECK(has(js, "Object.prototype.hasOwnProperty.call(TABLE, id)"));
+    CHECK(has(js, "Object.prototype.hasOwnProperty.call(TABLE, btn.id)"));
     // The pair is read only from the table; never from an attribute, the URL or a response.
     CHECK_FALSE(has(js, "getAttribute('data-plugin')"));
     CHECK_FALSE(has(js, "getAttribute('data-action')"));

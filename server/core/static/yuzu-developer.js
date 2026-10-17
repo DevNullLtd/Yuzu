@@ -32,8 +32,6 @@
 
   function $(id) { return document.getElementById(id); }
 
-  function hasEntry(id) { return Object.prototype.hasOwnProperty.call(TABLE, id); }
-
   function setButtons(disabled, reason) {
     Object.keys(TABLE).forEach(function (id) {
       var b = $(id);
@@ -126,11 +124,9 @@
 
   document.addEventListener('click', function (e) {
     var btn = e.target && e.target.closest ? e.target.closest('button') : null;
-    if (!btn || btn.disabled || !hasEntry(btn.id)) return;
+    if (!btn || btn.disabled || !Object.prototype.hasOwnProperty.call(TABLE, btn.id)) return;
     run(btn.id);
   });
 
   readOnline();
-
-  window.YuzuDeveloper = { sentLine: sentLine };
 })();
