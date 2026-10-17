@@ -2037,6 +2037,20 @@ TEST_CASE("epoch_ms_to_time_point saturates instead of wrapping", "[auth][enroll
     CHECK(duration_cast<milliseconds>(epoch_ms_to_time_point(-86'400'000).time_since_epoch())
               .count() == -86'400'000);
 
+    // The exact edges, derived from the clock so they hold on every tick size: the limit
+    // converts exactly, one millisecond past it saturates, and the same on the negative side.
+    // (lim is the number of whole milliseconds the clock holds, so lim + 1 and -lim - 1 cannot
+    // overflow the int64 for any clock coarser than a nanosecond.)
+    constexpr std::int64_t lim =
+        duration_cast<milliseconds>((Clock::duration::max)()).count();
+    static_assert(lim < kMax - 1 && lim > 0);
+    CHECK(duration_cast<milliseconds>(epoch_ms_to_time_point(lim).time_since_epoch()).count() ==
+          lim);
+    CHECK(epoch_ms_to_time_point(lim + 1) == (Clock::time_point::max)());
+    CHECK(duration_cast<milliseconds>(epoch_ms_to_time_point(-lim).time_since_epoch()).count() ==
+          -lim);
+    CHECK(epoch_ms_to_time_point(-lim - 1) == (Clock::time_point::min)());
+
     // Far past the range: the max / min sentinel, never a negative or a wrapped value.
     CHECK(epoch_ms_to_time_point(kMax) == (Clock::time_point::max)());
     CHECK(epoch_ms_to_time_point(kMin) == (Clock::time_point::min)());
