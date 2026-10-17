@@ -399,10 +399,17 @@ groups:
             resume (or suspend) agent listener(s)" names the reason. For
             eaddrinuse another process took the agent port while it was closed:
             find it with `ss -ltnp 'sport = :50051'` on the gateway host and
-            stop it. For emfile or enfile the gateway is out of file
-            descriptors: raise LimitNOFILE or lower the agent listener's
-            max_connections. Otherwise restart the gateway, which reconnects
-            its agents.
+            stop it; the shedder's next try then succeeds. For emfile or
+            enfile the gateway is out of file descriptors: raise LimitNOFILE or
+            lower the agent listener's max_connections, both of which take
+            effect only when the gateway process starts again. For those, or
+            for any other reason, restart the gateway only if the failure is
+            still logged and this node's agents can take the disconnect: a
+            restart reopens the listener but disconnects every agent the node
+            holds, and agents without the #5183 fix (in no release yet) stay
+            wedged after it, so restart the agent service on any agent that
+            has not reconnected a few minutes later (see "What happens when
+            the server restarts" in docs/user-manual/gateway.md).
 
       # HA WS-4 4.2b — `#4246` item #1's alert-rule half. Emitted by the
       # SERVER (gateway_service_impl.cpp's record_route_store_failure), not
