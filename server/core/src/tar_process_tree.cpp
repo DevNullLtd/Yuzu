@@ -510,6 +510,23 @@ std::optional<std::int64_t> parse_ts_param_strict(const std::string& s) {
         if (shape[i] == 'd' ? !digit(s[i]) : s[i] != shape[i])
             return std::nullopt;
     }
+    // The lenient parser only range-checks the day as 1..31 and days_from_civil rolls the
+    // overflow into the next month (31 Feb reads as 3 Mar), so check the day against the
+    // month length here. The shape is validated above, so the digits are safe to read.
+    const auto num = [&](std::size_t pos, std::size_t len) {
+        int n = 0;
+        for (std::size_t i = pos; i < pos + len; ++i)
+            n = n * 10 + (s[i] - '0');
+        return n;
+    };
+    const int year = num(0, 4);
+    const int month = num(5, 2);
+    const int day = num(8, 2);
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    constexpr int kDaysInMonth[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    // A month outside 1..12 is left to the range check below; this guards the table index.
+    if (month >= 1 && month <= 12 && day > kDaysInMonth[month - 1] + (month == 2 && leap ? 1 : 0))
+        return std::nullopt;
     const auto v = parse_ts_param(s);
     if (v == 0) // range-checked inside: invalid month, year outside [1970,9999], ...
         return std::nullopt;

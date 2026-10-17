@@ -77,8 +77,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <initializer_list>
@@ -134,46 +132,6 @@ inline constexpr std::array<std::string_view, 2> kTapsFlat{"Library", "Taps"};
 [[nodiscard]] inline std::string logical(std::string_view prefix) {
     return "/" + std::string{prefix};
 }
-
-/// Whole-ACTION budget (entries read, output bytes, wall clock), one per action
-/// (constructed once, before the prefix loop) and threaded by reference through
-/// every listing that action performs. Each directory listing is bounded on its
-/// own by lim.max_entries_per_dir, but nothing else bounds how many such
-/// listings a whole action performs: a tree of max_entries_per_dir id/org
-/// directories x max_entries_per_dir entries each (or a Cellar full of plain
-/// files that never classify as a version directory, so row_cap never trips)
-/// would otherwise be read in full on every call. Not agents/core/include/yuzu/
-/// agent/confined_fs_rules.hpp's `EnumBudget`: that type is scoped, by its own
-/// banner, to confined recursive DELETE (a different subsystem) -- this is a
-/// small pkg_inventory-local equivalent of the same shape, not a shared import.
-struct WalkBudget {
-    std::size_t remaining_entries;
-    std::size_t remaining_bytes;
-    std::chrono::steady_clock::time_point deadline;
-
-    [[nodiscard]] static WalkBudget from(const Limits& lim) {
-        return {lim.max_walk_entries, lim.max_output_bytes,
-                std::chrono::steady_clock::now() + std::chrono::seconds(lim.max_walk_seconds)};
-    }
-    /// The wall-clock half alone: what a loop over ALREADY-charged entries checks
-    /// (the entries were paid for when their listing was charged).
-    [[nodiscard]] bool timed_out() const noexcept {
-        return std::chrono::steady_clock::now() >= deadline;
-    }
-    [[nodiscard]] bool exhausted() const noexcept { return remaining_entries == 0 || timed_out(); }
-    void charge(std::size_t n) noexcept { remaining_entries -= std::min(n, remaining_entries); }
-    /// Charges one emitted row; false when it would exceed the output-byte
-    /// allowance, which is then spent for good (like row_cap, once the cap trips no
-    /// later, shorter row slips in).
-    [[nodiscard]] bool charge_row(std::size_t n) noexcept {
-        if (n > remaining_bytes) {
-            remaining_bytes = 0;
-            return false;
-        }
-        remaining_bytes -= n;
-        return true;
-    }
-};
 
 /// The result of opening a marker chain, plus whether the (failed or absent)
 /// hop was the prefix ROOT itself.
@@ -429,21 +387,6 @@ append_package_rows(const std::filesystem::path& root, const Prefix& prefix, std
     return false;
 }
 
-/// Folds `from`'s comma-joined tokens into `into` (ConstraintAccumulator has no
-/// merge; tokens never contain a comma, so the split is lossless).
-inline void merge_tokens(yuzu::shared::ConstraintAccumulator& into,
-                         const yuzu::shared::ConstraintAccumulator& from) {
-    const std::string joined = from.reason();
-    std::size_t pos = 0;
-    while (pos < joined.size()) {
-        const auto comma = joined.find(',', pos);
-        const auto end = comma == std::string::npos ? joined.size() : comma;
-        into.add_failure(std::string_view{joined}.substr(pos, end - pos));
-        pos = end + 1;
-    }
-    if (from.incomplete()) into.mark_incomplete();
-}
-
 } // namespace detail
 
 /// One `manager|homebrew|...` row per Homebrew prefix detected under `root`
@@ -459,7 +402,7 @@ macos_manager_rows_at(const std::filesystem::path& root, std::optional<std::stri
     token.reset();
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> rows;
-    auto budget = detail::WalkBudget::from(lim);
+    auto budget = WalkBudget::from(lim);
     for (const auto& prefix : detail::kPrefixes) {
         // Per-prefix accumulator: an `unavailable` row's reason must name only
         // this prefix's failures, while the status row sees every prefix's.
@@ -470,7 +413,7 @@ macos_manager_rows_at(const std::filesystem::path& root, std::optional<std::stri
                                                    lim, pacc, budget);
         const auto casks = detail::count_marker(root, prefix, "Caskroom", "homebrew_caskroom", state,
                                                 lim, pacc, budget);
-        detail::merge_tokens(acc, pacc);
+        merge_tokens(acc, pacc);
         if (!state.exists) continue; // no Homebrew marker under this prefix
         Facts f;
         if (taps) f.add("taps", *taps);
@@ -502,7 +445,7 @@ macos_package_rows_at(const std::filesystem::path& root, std::optional<std::stri
     token.reset();
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> rows;
-    auto budget = detail::WalkBudget::from(lim);
+    auto budget = WalkBudget::from(lim);
     // `walk_budget` is recorded once: by append_package_rows when it trips inside a
     // container, otherwise here, at the first container the exhausted budget makes
     // us skip (a budget that dies exactly at a container boundary, or on a listing
@@ -546,48 +489,21 @@ inline int run_macos_at(yuzu::CommandContext& ctx, Action a, const std::filesyst
     switch (a) {
     case Action::managers: rows = macos_manager_rows_at(root, constraint); break;
     case Action::packages: rows = macos_package_rows_at(root, constraint); break;
+    case Action::store_packages:
+        // Reads nothing: installed_apps owns the macOS application list.
+        emit_unsupported(ctx, a, kTokenMacosStoreOwned);
+        return 0;
     }
     emit_result(ctx, a, rows, constraint);
     return 0;
 }
 
-/// Process-wide single-flight slot, one per action, held for the duration of a
-/// walk. The walk's wall clock is cooperative (it cannot interrupt a syscall
-/// that blocks on a stalled mount inside the tree) and the agent has no
-/// per-command timeout, so without this every further dispatch of the action
-/// would pin another pool worker behind the stalled one, starving unrelated
-/// commands (quarantine among them). With it a stall pins at most one worker per
-/// action; a concurrent dispatch is answered at once with the visible,
-/// retryable `macos:<action>:busy` constraint. No thread is involved: the slot
-/// is released by the walking worker itself when it returns.
-class WalkSlot {
-public:
-    [[nodiscard]] static std::optional<WalkSlot> try_acquire(Action a) noexcept {
-        auto& flag = flag_for(a);
-        if (flag.exchange(true, std::memory_order_acquire)) return std::nullopt;
-        return WalkSlot{&flag};
-    }
-    WalkSlot(const WalkSlot&) = delete;
-    WalkSlot& operator=(const WalkSlot&) = delete;
-    WalkSlot& operator=(WalkSlot&&) = delete;
-    WalkSlot(WalkSlot&& o) noexcept : flag_(std::exchange(o.flag_, nullptr)) {}
-    ~WalkSlot() {
-        if (flag_ != nullptr) flag_->store(false, std::memory_order_release);
-    }
-
-private:
-    explicit WalkSlot(std::atomic<bool>* flag) noexcept : flag_(flag) {}
-    [[nodiscard]] static std::atomic<bool>& flag_for(Action a) noexcept {
-        static std::atomic<bool> flags[2]{};
-        static_assert(std::size(flags) == 2, "one slot per Action value; add one before adding a leg");
-        return flags[static_cast<std::size_t>(a)];
-    }
-    std::atomic<bool>* flag_;
-};
-
 /// run_macos_at behind the single-flight slot: the shape production runs.
 inline int run_macos_guarded(yuzu::CommandContext& ctx, Action a,
                              const std::filesystem::path& root) {
+    // `store_packages` is unsupported by design and walks nothing: answer it without the slot
+    // so an overlapping dispatch is never told `busy` for an action that cannot be in flight.
+    if (a == Action::store_packages) return run_macos_at(ctx, a, root);
     const auto slot = WalkSlot::try_acquire(a);
     if (!slot) {
         emit_result(ctx, a, {}, make_token(detail::kOs, action_name(a), "busy"));

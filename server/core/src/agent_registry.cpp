@@ -890,6 +890,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "Management-plane posture, facts only: which plane controls the device (none/ad/ipa on "
          "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
          "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
+        {"shares.list",
+         "Shares this host serves over SMB/NFS as configured: name, path, ro/rw, anonymous access "
+         "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
+         "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
+         "/etc/exports.d and /etc/samba/smb.conf, macOS and Windows are planned; read-only"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -1079,11 +1084,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // pkg_inventory
         {"pkg_inventory.managers",
          "List package managers present on the host with manager-level config facts "
-         "(macOS Homebrew prefixes with tap/formula/cask counts; read-only, no subprocess; "
-         "macOS only today, Linux and Windows report unsupported)"},
+         "(macOS Homebrew prefixes; Linux dpkg/apt/rpm/dnf/pacman/apk/snap/flatpak presence "
+         "with apt/snap/flatpak counts; read-only, no subprocess; Windows planned)"},
         {"pkg_inventory.packages",
-         "List macOS Homebrew formulae and casks by name, version and kind (macOS only "
-         "today; the Linux package roster is owned by installed_apps)"},
+         "List macOS Homebrew formulae and casks by name, version and kind (macOS only; "
+         "Linux unsupported by design; installed_apps owns the roster)"},
+        {"pkg_inventory.store_packages",
+         "List installed snaps and flatpak apps/runtimes from the system store (Linux; "
+         "read-only, no subprocess; macOS unsupported by design, Windows planned)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture

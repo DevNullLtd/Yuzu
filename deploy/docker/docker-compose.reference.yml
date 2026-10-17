@@ -125,7 +125,7 @@ services:
     # only to bring your own certs or change ports — see the header.
     ports:
       - "8443:8443"     # Dashboard + REST API (HTTPS)
-      - "8080:8080"     # HTTP → HTTPS redirect
+      - "8080:8080"     # HTTP → HTTPS redirect (+ health probes)
       - "50051:50051"   # Agent gRPC (mTLS; direct-connect agents)
       - "50052:50052"   # Management gRPC (mTLS)
     # File-descriptor headroom mirrors deploy/systemd/yuzu-server.service. The

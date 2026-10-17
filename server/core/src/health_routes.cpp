@@ -66,6 +66,8 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server::health {
@@ -87,6 +89,10 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     if (!deps.deny_service_scoped_fn)
         throw std::invalid_argument(
             "register_health_routes: deps.deny_service_scoped_fn must be bound");
+    if (deps.plaintext_probe_sink && !deps.main_listener_serving_fn)
+        throw std::invalid_argument(
+            "register_health_routes: deps.main_listener_serving_fn must be bound when "
+            "plaintext_probe_sink is set");
 
     // -- Prometheus metrics endpoint ----------------------------------------
     // Per-scrape serialization lock for the NVD failure-count delta loop
@@ -165,8 +171,13 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     // Mounted on both /health and /api/health (issue #620). The /api alias
     // exists so monitoring integrations that prefix every REST call with
     // /api/ keep working — a side-effect of #401's move from /api/health → /health.
-    auto health_handler = [deps](const httplib::Request& req, httplib::Response& res) {
-        // Resolve auth FIRST so we can gate expensive work on it.
+    //
+    // `health_body` is the ONE body behind every /health alias; its callers
+    // decide `is_authenticated` (main sink: a non-blocking session resolve;
+    // plaintext sink: hard false, #5906).
+    auto health_body = [deps](const httplib::Request&, httplib::Response& res,
+                              bool is_authenticated) {
+        // `is_authenticated` gates the expensive work below.
         // Governance Gate 7 round 2 (security MEDIUM): /health and
         // /api/health are rate-limit-exempt for monitoring stability;
         // the bounded but non-trivial work below (a pending-agents scan
@@ -178,7 +189,6 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // registry, store ok flags from is_open() (constant-time member
         // checks), and version. Authed callers additionally get
         // pending-agent count, execution stats, and process sampler.
-        bool is_authenticated = static_cast<bool>(deps.resolve_session_fn(req));
 
         auto now = std::chrono::steady_clock::now();
         auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
@@ -502,20 +512,26 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
 
         res.set_content(health.dump(), "application/json");
     };
-    // Both URLs MUST be served by the SAME handler instance — do not split
-    // into two lambda bodies. The unauthenticated `system.*` gating above
-    // is load-bearing and must run identically on both routes; forking the
-    // body invites a future regression where the alias diverges in subtle
-    // ways. Governance Gate 7, architect NICE-2.
+    auto health_handler = [deps, health_body](const httplib::Request& req, httplib::Response& res) {
+        health_body(req, res, static_cast<bool>(deps.resolve_session_fn(req)));
+    };
+    // Every /health alias — main-sink /health and /api/health via health_handler,
+    // plaintext-sink via plain_health — MUST route through the ONE health_body
+    // above; the thin closures differ only in how is_authenticated is derived
+    // (session resolved vs. hard false). Do not fork the body: the
+    // unauthenticated `system.*` gating is load-bearing and must run identically
+    // on every alias. Governance Gate 7, architect NICE-2; extended for the
+    // plaintext sink in #5906.
     sink.Get("/health", health_handler);
     sink.Get("/api/health", health_handler);
 
     // -- Kubernetes probe endpoints (/livez, /readyz) -------------------------
-    sink.Get("/livez", [](const httplib::Request&, httplib::Response& res) {
+    auto livez_handler = [](const httplib::Request&, httplib::Response& res) {
         res.set_content(R"({"status":"ok"})", "application/json");
-    });
+    };
+    sink.Get("/livez", livez_handler);
 
-    sink.Get("/readyz", [deps](const httplib::Request&, httplib::Response& res) {
+    auto readyz_handler = [deps](const httplib::Request&, httplib::Response& res) {
         // NOTE (Gate 3/Gate 2 governance, #2542 PR-10): unlike every other
         // graceful-degrade Deps field in this file, a null `draining` fails
         // OPEN here (falls through to the normal store sweep, i.e. "not
@@ -873,7 +889,34 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             body += "}";
             res.set_content(body, "application/json");
         }
-    });
+    };
+    sink.Get("/readyz", readyz_handler);
+
+    // Plaintext redirect listener probes (#5906): the posture, the no-session rule, the 503
+    // gate and the drain-window caveat are in the AUTH POSTURE banner in health_routes.hpp.
+    if (deps.plaintext_probe_sink) {
+        auto plain_health = [health_body](const httplib::Request& req, httplib::Response& res) {
+            health_body(req, res, /*is_authenticated=*/false);
+        };
+        auto gated = [serving = deps.main_listener_serving_fn](HttpRouteSink::Handler h) {
+            return HttpRouteSink::Handler{
+                [serving, h = std::move(h)](const httplib::Request& req, httplib::Response& res) {
+                    if (!serving()) {
+                        res.status = 503;
+                        res.set_content(
+                            R"({"status":"not ready","reason":"https_listener_not_serving"})",
+                            "application/json");
+                        return;
+                    }
+                    h(req, res);
+                }};
+        };
+        auto& ps = *deps.plaintext_probe_sink;
+        ps.Get("/livez", gated(livez_handler));
+        ps.Get("/readyz", gated(readyz_handler));
+        ps.Get("/health", gated(plain_health));
+        ps.Get("/api/health", gated(plain_health));
+    }
 
     // -- Dashboard "Server health" panel (HM-2; on Home until the 2026-10-14 delta) --
     // Lives here so it can call the registered `health_handler` in-process: one
@@ -1051,6 +1094,55 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         html += "</div>";
         res.set_content(html, "text/html; charset=utf-8");
     });
+}
+
+void install_plaintext_redirect_pre_routing(httplib::Server& srv, std::string web_address,
+                                            int https_port) {
+    srv.set_pre_routing_handler(
+        [web_address = std::move(web_address),
+         https_port](const httplib::Request& req,
+                     httplib::Response& res) -> httplib::Server::HandlerResponse {
+            if (is_plaintext_probe_request(req))
+                return httplib::Server::HandlerResponse::Unhandled;
+            auto host = req.get_header_value("Host");
+            // Strip port from host if present
+            auto colon = host.find(':');
+            if (colon != std::string::npos) {
+                host = host.substr(0, colon);
+            }
+            if (host.empty())
+                host = web_address;
+            auto location = "https://" + host + ":" + std::to_string(https_port) + req.path;
+            if (!req.params.empty()) {
+                location += "?";
+                bool first = true;
+                for (const auto& [k, v] : req.params) {
+                    if (!first)
+                        location += "&";
+                    location += k + "=" + v;
+                    first = false;
+                }
+            }
+            // set_redirect (void in httplib 0.37.1) silently ignores a location carrying a
+            // CR/LF/control byte (a decoded %00 in the path) and leaves the status unset, which
+            // would answer an empty 200.
+            res.set_redirect(location, 301);
+            if (res.status != 301)
+                res.status = 400;
+            return httplib::Server::HandlerResponse::Handled;
+        });
+}
+
+void install_plaintext_post_routing(
+    httplib::Server& srv, security::HeaderBundle headers,
+    std::function<void(const httplib::Request&, const httplib::Response&)> on_response) {
+    srv.set_post_routing_handler(
+        [headers = std::move(headers), on_response = std::move(on_response)](
+            const httplib::Request& req, httplib::Response& res) {
+            headers.apply(res);
+            if (on_response)
+                on_response(req, res);
+        });
 }
 
 } // namespace yuzu::server::health
