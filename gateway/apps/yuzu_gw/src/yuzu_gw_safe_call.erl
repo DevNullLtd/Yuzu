@@ -47,8 +47,11 @@
 %% The warning kinds warn_limited/3 limits: one stamp each, created at
 %% application start too. Each is a line a registration can make
 %% the gateway write once per request.
+%% notify_unacknowledged: the server answered a stream-status notice
+%% acknowledged=false (yuzu_gw_upstream, NOTIFY-ACK #5695); a refusing server
+%% answers every registration's CONNECTED that way.
 -define(KINDS, [register_refused, register_peer_addr, register_failed, inventory_failed,
-                rpc_raised, rpc_answered_error]).
+                rpc_raised, rpc_answered_error, notify_unacknowledged]).
 
 -type kind() :: atom() | {mgmt_peer_rejected, atom()}.
 -export_type([kind/0]).

@@ -41,6 +41,14 @@
 %%%                  closes the gateway's upstream connection once and keeps
 %%%                  running with its state. Counts breaker openings, replayed
 %%%                  ProxyRegisters and repeated CONNECTED notices
+%%%   unacknowledged N agents register at once into a server that answers every
+%%%                  CONNECTED acknowledged=false (it does not record it) for
+%%%                  YUZU_GW_SCALE_UNACK_MS (10000) from the start of the case,
+%%%                  then records them (the independent tester's ch_xa stub,
+%%%                  which held 60 s: YUZU_GW_SCALE_UNACK_MS=60000). Every live
+%%%                  session must be recorded within YUZU_GW_SCALE_UNACK_BOUND_MS
+%%%                  (90000: the gateway's 60 s longest resend backoff plus
+%%%                  30 s) after the switch, and the breaker must not open
 %%%
 %%% Each scenario MEASURES and REPORTS (never fails on a timing): registration
 %%% counts and latency percentiles, replay time, notices lost, gateway memory
@@ -101,7 +109,7 @@
 %%%===================================================================
 
 cases() -> [ramp, storm, server_crash, gateway_crash, planned_stop, fanout, upstream_conn_loss,
-            owner_kill].
+            owner_kill, unacknowledged].
 
 all() ->
     case os:getenv("YUZU_GW_SCALE_GATE") of
@@ -539,6 +547,56 @@ owner_restarts(Config) ->
                         end}
                     || O <- [recovered, disconnected_only, gave_up]]).
 
+%% @doc The server refuses every CONNECTED (acknowledged=false) for the first
+%% RefuseMs of the case, then records them, while N agents register at once
+%% (#5695 NOTIFY-ACK; the ch_xa stub). A refused CONNECTED is not delivered:
+%% the gateway must send it again until it is recorded. Before the fix every
+%% agent registered in the window stayed unknown for good (one CONNECTED each,
+%% never sent again; the heartbeat verdict does not list a session the server
+%% knows). A refusal is an answer, not a failure: the breaker must not open.
+unacknowledged(Config) ->
+    N = ?config(n, Config),
+    Refuse = env_int("YUZU_GW_SCALE_UNACK_MS", 10000),
+    Bound = env_int("YUZU_GW_SCALE_UNACK_BOUND_MS", 90000),
+    Opens0 = breaker_transitions(Config),
+    T0 = mark(Config),
+    Switch = T0 + Refuse,
+    set_upstream(Config, #{register_latency_ms => latency(),
+                           notify_refuse_connected_until => Switch}),
+    ok = load_call(Config, spawn_agents, [#{from => 1, count => N, mode => storm}]),
+    Reg = await_registered(Config, N, T0),
+    RefusedBySwitch = maps:get(refused_connected_notices, up_call(Config, stats, [])),
+    %% Every live session recorded, waited for up to the bound after the switch.
+    {AllRecorded, Missing} =
+        wait_until(fun() ->
+                           #{missing_connected := M} = convergence(Config),
+                           {M =:= 0, M}
+                   end, max(0, Switch + Bound - erlang:system_time(millisecond)), 1000),
+    Settle = settle(Config),
+    Live = [S || {_, S, _} <- truth(Config)],
+    FirstRecorded = lists:foldl(fun({_, S, connected, T}, Acc) ->
+                                        maps:update_with(S, fun(Prev) -> min(Prev, T) end, T, Acc);
+                                   (_, Acc) -> Acc
+                                end, #{}, up_call(Config, notices, [])),
+    Times = [maps:get(S, FirstRecorded) || S <- Live, maps:is_key(S, FirstRecorded)],
+    LastAfterSwitch = case length(Times) =:= length(Live) andalso Times =/= [] of
+                          true -> lists:max(Times) - Switch;
+                          false -> null
+                      end,
+    Opens = maps:map(fun(K, V) -> V - maps:get(K, Opens0) end, breaker_transitions(Config)),
+    #{refused_connected_notices := Refused} = up_call(Config, stats, []),
+    R0 = registration_report(Config, T0, Reg),
+    R = R0#{refuse_ms => Refuse,
+            bound_ms => Bound,
+            refused_connected_by_switch => RefusedBySwitch,
+            refused_connected => Refused,
+            all_recorded_within_bound => AllRecorded,
+            missing_at_bound => Missing,
+            last_recorded_after_switch_ms => LastAfterSwitch,
+            breaker_transitions => Opens,
+            settle => Settle},
+    finish(unacknowledged, Config, R).
+
 %% The breaker's transitions so far, read from the gateway's own counter.
 breaker_transitions(Config) ->
     maps:from_list([{S, gw_call(Config, prometheus_counter, value,
@@ -629,6 +687,16 @@ invariants(owner_kill, R) ->
          "the server holds a CONNECTED notice for every live session"),
      inv(singleton_mailboxes_drain, maps:get(mailboxes_drained, maps:get(settle, R)),
          "every named singleton's mailbox was back to 0 after the run")];
+invariants(unacknowledged, R) ->
+    %% The precondition first: with no refusal the case proves nothing.
+    [inv(connected_refused, maps:get(refused_connected, R) > 0,
+         "the server refused at least one CONNECTED (acknowledged=false)"),
+     inv(every_live_session_recorded, maps:get(all_recorded_within_bound, R),
+         "every live session's CONNECTED was recorded at the server within the bound "
+         "after the server started accepting them"),
+     inv(breaker_stayed_closed, maps:get(open, maps:get(breaker_transitions, R)) =:= 0,
+         "refused notices did not open the circuit breaker")]
+    ++ registration_invariants(R);
 invariants(fanout, R) ->
     #{fanout := F} = R,
     [inv(every_command_answered, maps:get(answered, F) =:= maps:get(targets, F),

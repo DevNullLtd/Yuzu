@@ -3864,6 +3864,73 @@ tests:
         eval_time: 100m
         exp_samples: []
 
+  # ── YuzuGatewayNotifyUnacknowledged (NOTIFY-ACK, #5695) ─────────────────
+  #
+  # The gauge counts refused notices the gateway still holds to send again.
+  # The rule asks that refusals HOLD for 10 minutes (ten times the longest
+  # backoff): a route store that cannot be read for a few minutes must stay
+  # quiet, a server that keeps refusing must fire, and a dip to 0 (everything
+  # acknowledged) starts the ten minutes again.
+
+  # CASE A -- refusals from minute 2 that never stop: quiet at 11m (pending),
+  # firing at 13m, for that gateway only; g2 sits at 0. RED if `> 0` were
+  # dropped (g2 would fire) or `for:` shortened (11m would fire).
+  - interval: 1m
+    name: gateway notify unacknowledged - persistent refusals fire after for, for that gateway only
+    input_series:
+      - series: 'yuzu_gw_upstream_notify_unacked_keys{job="yuzu-gateway",instance="g1"}'
+        values: "0x1 500x40"
+      - series: 'yuzu_gw_upstream_notify_unacked_keys{job="yuzu-gateway",instance="g2"}'
+        values: "0x42"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 13m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
+  # CASE B -- a brief blip: 500 refused for 4 minutes (a route store that
+  # could not be read), then every resend acknowledged. Never fires. RED if
+  # `for:` were 3m or less (firing at 4m).
+  - interval: 1m
+    name: gateway notify unacknowledged - a brief blip stays quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_notify_unacked_keys{job="yuzu-gateway",instance="g1"}'
+        values: "0 500x3 0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE C -- a dip to 0 starts the ten minutes again: refused from minute 1
+  # to minute 8, all acknowledged at minutes 9 and 10, refused again from
+  # minute 11. Quiet at 18m (the second run is 7 minutes old), firing at 21m.
+  # RED if the rule smoothed the gauge over a window (it would fire at 11m or
+  # soon after, the first run plus the dip lasting ten minutes).
+  - interval: 1m
+    name: gateway notify unacknowledged - a dip to 0 starts the for period again
+    input_series:
+      - series: 'yuzu_gw_upstream_notify_unacked_keys{job="yuzu-gateway",instance="g1"}'
+        values: "0 3x7 0 0 3x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing"}'
+        eval_time: 21m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayNotifyUnacknowledged", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
   # YuzuGatewayUpstreamEncodeErrors (#4632 rounds 4 and 5)
   #
   # A systematic local encode failure (every Register answered INTERNAL, breaker

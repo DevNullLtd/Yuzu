@@ -75,6 +75,7 @@ a stream over the limit where gRPC C++ queues it, so the client queues).
 | `fanout` | N agents registered; one command to each agent over one management connection; agents answer after a random 0 to 10 s |
 | `owner_kill` | N agents registered; the owner process (`yuzu_gw_agent`) of 10% of them is killed at once with `exit(Pid, kill)` (no clean-up runs; modelled on an independent tester's cell ch_x10a). Each restarted owner must send its session's `DISCONNECTED` and recover the session on the agent's open stream; then one command is sent to every killed agent. Measures the time until every killed session is `CONNECTED` again |
 | `upstream_conn_loss` | N agents registered; a wave of N/10 more (at least 100) registers at once, and once at least 8 `ProxyRegister` calls are open at the server it closes the gateway's upstream connection (kills its connection process) and keeps running with everything it knows. Counts breaker openings, replayed registrations and repeated `CONNECTED` notices |
+| `unacknowledged` | N agents register at once while the server answers every `CONNECTED` with `acknowledged=false` (it does not record it) for the first `YUZU_GW_SCALE_UNACK_MS` (10 s) of the case, then records them: the independent tester's ch_xa stub, which held 60 s. Measures how long after the switch the last live session is recorded |
 
 The crash, stop and fan-out cases first register the N agents with the server
 answering at once, then switch to the measured behaviour.
@@ -135,6 +136,7 @@ Each case also checks invariants that involve no timing:
 | `fanout` | every command is answered; the management connection is never closed; no agent loses its session |
 | `upstream_conn_loss` | at least 8 `ProxyRegister` calls were in flight at the server when the connection was closed (without that, the next invariant proves nothing); the server closed at least one connection; the circuit breaker never opened; no registration was replayed; at most 10 sessions got a second `CONNECTED` (the notifications in flight when the connection went are sent again, their answers were lost with it); every agent registers within the budget; the server holds a `CONNECTED` for every live session |
 | `owner_kill` | at least one owner was killed; every killed owner's session had its `DISCONNECTED` reach the server; every one was `CONNECTED` again after that `DISCONNECTED` within the budget; no agent lost its stream or registered again (every killed owner's agent kept its session, and the fleet saw no disconnect); a command to every killed agent afterwards was answered; the agent supervisor was not restarted; the server holds a `CONNECTED` for every live session; every singleton mailbox is back to 0 |
+| `unacknowledged` | the server refused at least one `CONNECTED` (without that, the case proves nothing); every live session's `CONNECTED` is recorded within `YUZU_GW_SCALE_UNACK_BOUND_MS` (90 s: the gateway's 60 s longest resend backoff plus 30 s) after the server starts accepting them; the circuit breaker never opened; and the `ramp`/`storm` invariants |
 | every case that registers its agents first | no registration is replayed during that setup (the server lost nothing) |
 
 Several of these fail on the gateway as of commit 29a8e655b (see the numbers
@@ -189,6 +191,8 @@ Other settings, all optional:
 | `YUZU_GW_SCALE_OUTAGE_MS` | 5000 | how long the server is down in `server_crash` |
 | `YUZU_GW_SCALE_FLAP_PCT` | 10 | percent of agents that drop their connection during that outage |
 | `YUZU_GW_SCALE_KILL_PCT` | 10 | percent of agents whose owner process `owner_kill` kills |
+| `YUZU_GW_SCALE_UNACK_MS` | 10000 | `unacknowledged`: ms from the start of the case during which the server refuses every `CONNECTED` (60000 reproduces ch_xa) |
+| `YUZU_GW_SCALE_UNACK_BOUND_MS` | 90000 | `unacknowledged`: ms after the switch by which every live session must be recorded |
 | `YUZU_GW_SCALE_FANOUT_DELAY_MS` | `0-10000` | agents' answer delay in `fanout` |
 | `YUZU_GW_SCALE_FANOUT_WINDOW` | 4096 | management calls open at once |
 | `YUZU_GW_SCALE_OUTPUT_BYTES` | 2048 | size of each command answer |

@@ -162,7 +162,14 @@
 
     %% OWNER-RESTART workstream (#5695): a restarted agent owner's outcome
     %% (yuzu_gw_agent's recovering state).
-    [yuzu, gw, agent, owner_restart]
+    [yuzu, gw, agent, owner_restart],
+
+    %% NOTIFY-ACK workstream (#5695): stream-status notices the server answered
+    %% acknowledged=false (yuzu_gw_upstream): each refusal, the keys awaiting a
+    %% resend, and how each awaiting key ended.
+    [yuzu, gw, upstream, notify_unacknowledged],
+    [yuzu, gw, upstream, notify_unacked],
+    [yuzu, gw, upstream, notify_unacked_ended]
 ]).
 
 %%--------------------------------------------------------------------
@@ -629,6 +636,19 @@ handle_event([yuzu, gw, agent, owner_restart], #{count := N}, Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_agent_owner_restarts_total,
                            [closed(maps:get(outcome, Meta, unknown), owner_restart_outcomes())], N);
 
+%% NOTIFY-ACK workstream (#5695). `event' and `outcome' are closed sets;
+%% anything else folds to `unknown', so a bug can neither widen a label set nor
+%% crash this handler.
+handle_event([yuzu, gw, upstream, notify_unacknowledged], #{count := N}, Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_upstream_notify_unacknowledged_total,
+                           [closed(maps:get(event, Meta, unknown), notify_events())], N);
+handle_event([yuzu, gw, upstream, notify_unacked], #{keys := N}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_upstream_notify_unacked_keys, [], N);
+handle_event([yuzu, gw, upstream, notify_unacked_ended], #{count := N}, Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_upstream_notify_unacked_ended_total,
+                           [closed(maps:get(outcome, Meta, unknown), notify_unacked_outcomes())],
+                           N);
+
 handle_event(_Event, _Measurements, _Meta, _Config) ->
     ok.
 
@@ -638,7 +658,10 @@ permit_classes()      -> [register, replay, inventory].
 permit_refusals()     -> [queue_full, deadline, stopping].
 replay_outcomes()     -> [adopted, superseded, rejected, failed, skipped, aborted].
 notify_events()       -> [connected, disconnected].
-notify_lost_reasons() -> [at_capacity, evicted, rejected, crashed, shutdown].
+notify_lost_reasons() -> [at_capacity, evicted, rejected, crashed, shutdown, unacknowledged].
+
+%% NOTIFY-ACK workstream (#5695): how a notice awaiting a resend ended.
+notify_unacked_outcomes() -> [acknowledged, superseded, session_gone, lost].
 
 %% METRICS workstream (#5695): the closed label sets of its families.
 process_labels() -> [L || {L, _} <- yuzu_gw_gauge:sampled_processes()].
@@ -1197,7 +1220,11 @@ metric_specs() ->
                    "rejected (the server answered that the notification itself was "
                    "wrong, or it could not be encoded), crashed (the send's worker "
                    "died before it reported), shutdown (still held or in flight when "
-                   "a planned stop's flush ended)"}]},
+                   "a planned stop's flush ended, or a refused connected notice still "
+                   "waiting for its resend when the flush began), unacknowledged (the "
+                   "server answered acknowledged=false and the gateway gave up: a "
+                   "disconnected notice past its resend window, any refusal during a "
+                   "planned stop's flush, or a full retry set)"}]},
         {counter, [
             {name, yuzu_gw_upstream_notify_requeued_total},
             {labels, []},
@@ -1342,7 +1369,31 @@ metric_specs() ->
                    "restarted owner did: recovered (the session was re-established on the "
                    "agent's open stream), disconnected_only (its DISCONNECTED was sent and "
                    "the session ended; the agent reconnects), gave_up (more than 3 restarts "
-                   "in 60 s: the session ended)"}]}
+                   "in 60 s: the session ended)"}]},
+
+        %% -- NOTIFY-ACK workstream (#5695) ---------------------------------
+        %% Stream-status notices the server answered acknowledged=false: not
+        %% delivered, held and sent again with backoff (yuzu_gw_upstream,
+        %% "Notices the server did not acknowledge").
+        {counter, [
+            {name, yuzu_gw_upstream_notify_unacknowledged_total},
+            {labels, [event]},
+            {help, "Stream-status notices the server answered with acknowledged=false "
+                   "(it did not record them), by event (connected, disconnected). Each "
+                   "answer counts, the refusals of a resend included"}]},
+        {gauge, [
+            {name, yuzu_gw_upstream_notify_unacked_keys},
+            {labels, []},
+            {help, "Stream-status notices the server refused (acknowledged=false) that "
+                   "the gateway still holds to send again, one per agent session"}]},
+        {counter, [
+            {name, yuzu_gw_upstream_notify_unacked_ended_total},
+            {labels, [outcome]},
+            {help, "Refused stream-status notices that stopped waiting for a resend, by "
+                   "outcome: acknowledged (a resend was recorded), superseded (a newer "
+                   "notice for the session replaced it), session_gone (a connected "
+                   "notice whose session ended at the gateway), lost (given up, counted "
+                   "in yuzu_gw_upstream_notify_lost_total)"}]}
     ].
 
 %% @doc The names of every metric metric_specs/0 declares.
@@ -1502,6 +1553,13 @@ seed_metrics() ->
     %% OWNER-RESTART workstream (#5695).
     [prometheus_counter:inc(yuzu_gw_agent_owner_restarts_total, [O], 0)
      || O <- [atom_to_binary(O0, utf8) || O0 <- owner_restart_outcomes()] ++ [<<"unknown">>]],
+
+    %% NOTIFY-ACK workstream (#5695).
+    [prometheus_counter:inc(yuzu_gw_upstream_notify_unacknowledged_total, [E], 0)
+     || E <- [atom_to_binary(E0, utf8) || E0 <- notify_events()]],
+    prometheus_gauge:set(yuzu_gw_upstream_notify_unacked_keys, [], 0),
+    [prometheus_counter:inc(yuzu_gw_upstream_notify_unacked_ended_total, [O], 0)
+     || O <- [atom_to_binary(O0, utf8) || O0 <- notify_unacked_outcomes()]],
 
     ok.
 
