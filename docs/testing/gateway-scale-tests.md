@@ -128,11 +128,11 @@ Each case also checks invariants that involve no timing:
 | Case | Invariant |
 |---|---|
 | `ramp`, `storm` | no registration is replayed (the server lost nothing); every first `Register` succeeds; every agent registers within the budget; more than one `ProxyRegister` is in flight at the server at some point; no `ProxyRegister` creates a session at the server for an attempt that failed ("wasted" above); the server holds a `CONNECTED` for every live session; every singleton mailbox is back to 0 |
-| `server_crash` | every held session is replayed; more than one replay is in flight at some point; every `DISCONNECTED` raised during the outage reaches the server; the new server holds a `CONNECTED` for every live session |
+| `server_crash` | both waits finish before they stall or reach their cap (every held session replayed and every agent live again; then every flapped agent's `DISCONNECTED` received as well); every held session is replayed; more than one replay is in flight at some point; every `DISCONNECTED` raised during the outage reaches the server; the new server holds a `CONNECTED` for every live session |
 | `gateway_crash` | every agent registers again; no `Register` to the new gateway fails; the server holds a `CONNECTED` for every live session |
 | `planned_stop` | the server receives a `DISCONNECTED` for every session; the gateway node logs no crash or supervisor report during the stop |
 | `fanout` | every command is answered; the management connection is never closed; no agent loses its session |
-| `upstream_conn_loss` | the server closed at least one connection; the circuit breaker never opened; no registration was replayed; at most 10 sessions got a second `CONNECTED` (the notifications in flight when the connection went are sent again, their answers were lost with it); every agent registers within the budget; the server holds a `CONNECTED` for every live session |
+| `upstream_conn_loss` | at least 8 `ProxyRegister` calls were in flight at the server when the connection was closed (without that, the next invariant proves nothing); the server closed at least one connection; the circuit breaker never opened; no registration was replayed; at most 10 sessions got a second `CONNECTED` (the notifications in flight when the connection went are sent again, their answers were lost with it); every agent registers within the budget; the server holds a `CONNECTED` for every live session |
 | every case that registers its agents first | no registration is replayed during that setup (the server lost nothing) |
 
 Several of these fail on the gateway as of commit 29a8e655b (see the numbers
