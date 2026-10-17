@@ -152,13 +152,9 @@ struct MountEntry {
     std::string fstype;
 };
 
-/// The shared deny-list plus the macOS client names it lacks: `webdav`, `afpfs` and the macFUSE
-/// FUSE-over-anything family (`macfuse`, `osxfuse`) -- a user-run FUSE daemon serving a home can
-/// hang exactly like a dead server.
-[[nodiscard]] inline bool is_network_mount_fstype(std::string_view fstype) noexcept {
-    return yuzu::shared::is_network_fstype(fstype) || fstype == "webdav" || fstype == "afpfs" ||
-           fstype == "macfuse" || fstype == "osxfuse";
-}
+/// The shared deny-list plus the macOS client names it lacks (webdav, afpfs, macfuse, osxfuse),
+/// defined in agents/shared/network_fstype.hpp and re-exported here so call sites keep the name.
+using yuzu::shared::is_network_mount_fstype;
 
 /// A mount under the firmlinked read-write volume that the system creates itself (autofs's `/home`)
 /// is listed with this prefix (`/System/Volumes/Data/home`); a mount a user makes is listed under

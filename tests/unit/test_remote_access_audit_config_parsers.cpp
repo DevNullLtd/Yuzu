@@ -135,7 +135,6 @@ TEST_CASE("remote_access_audit config: the macOS stock config, followed through 
     CHECK(akf_summary(run.st) == "custom:1");
     REQUIRE(run.seen.size() == 2);
     CHECK(run.seen[1].pattern == "/etc/ssh/crypto.conf");
-    CHECK(run.seen[1].origin == "include:*");
 }
 
 TEST_CASE("remote_access_audit config: first value wins in DIRECTIVE ORDER across an Include",

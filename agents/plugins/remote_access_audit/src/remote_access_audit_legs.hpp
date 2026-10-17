@@ -72,20 +72,13 @@ inline std::string_view status_token(StatusState s) {
     return "unsupported";
 }
 
-inline std::string format_status_row(StatusState s, std::string_view reason) {
-    std::string r = "status|list|";
-    r += status_token(s);
-    r += '|';
-    r += reason.empty() ? std::string{"-"} : yuzu::util::safe_output_field(reason);
-    return r;
-}
-
 /// Writes the status row FIRST, then the data rows, then the paired result status.
 /// `unsupported` (a leg that read nothing) pairs with UNAVAILABLE/UNKNOWN; every other
 /// state is a read that ran.
 inline void report_list(yuzu::CommandContext& ctx, const std::vector<std::string>& data_rows,
                         StatusState status, std::string_view reason) {
-    ctx.write_output(format_status_row(status, reason));
+    ctx.write_output("status|list|" + std::string{status_token(status)} + '|' +
+                     (reason.empty() ? std::string{"-"} : yuzu::util::safe_output_field(reason)));
     for (const auto& r : data_rows)
         ctx.write_output(r);
     switch (status) {
@@ -267,17 +260,12 @@ struct Tally {
         }
     }
 
-    /// Charges one row's size BEFORE it is materialised. false => refused (row_cap).
-    bool charge(std::size_t row_bytes) {
-        if (!budget.charge(row_bytes + kRowOverhead)) {
+    /// Charges the row's size BEFORE it is materialised. false => refused (row_cap).
+    bool emit(std::vector<std::string>& rows, std::string row) {
+        if (!budget.charge(row.size() + kRowOverhead)) {
             truncated = true;
             return false;
         }
-        return true;
-    }
-    bool emit(std::vector<std::string>& rows, std::string row) {
-        if (!charge(row.size()))
-            return false;
         rows.push_back(std::move(row));
         return true;
     }

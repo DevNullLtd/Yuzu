@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -201,20 +202,14 @@ inline void put_mpint(std::string& out, std::string_view magnitude) {
 inline std::size_t bit_length(std::string_view magnitude) {
     if (magnitude.empty())
         return 0;
-    unsigned v = static_cast<unsigned char>(magnitude[0]);
-    std::size_t bits = 0;
-    while (v != 0) {
-        ++bits;
-        v >>= 1;
-    }
-    return (magnitude.size() - 1) * 8 + bits;
+    return (magnitude.size() - 1) * 8 +
+           static_cast<std::size_t>(std::bit_width(static_cast<unsigned char>(magnitude[0])));
 }
 
 } // namespace detail
 
 struct KeyFacts {
-    Family family = Family::ed25519;
-    TypeInfo info;
+    TypeInfo info; ///< info.family is the decoded family
     std::size_t bits = 0;
     std::string plain_blob; ///< string(plain type) + public fields, certificate framing removed
 };
@@ -239,7 +234,6 @@ inline std::optional<KeyFacts> decode_blob(std::string_view blob, bool allow_cer
     KeyFacts out;
     out.info = *ti;
     out.info.cert = false;
-    out.family = ti->family;
     std::string fields;
     switch (ti->family) {
     case Family::ed25519:
@@ -392,14 +386,10 @@ struct KeyOptions {
 namespace detail {
 
 inline bool starts_with_ci(std::string_view s, std::string_view prefix) {
-    if (s.size() < prefix.size())
-        return false;
-    for (std::size_t i = 0; i < prefix.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(s[i])) !=
-            std::tolower(static_cast<unsigned char>(prefix[i])))
-            return false;
-    }
-    return true;
+    return s.size() >= prefix.size() &&
+           std::ranges::equal(s.substr(0, prefix.size()), prefix, [](char a, char b) {
+               return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+           });
 }
 
 /// misc.c opt_dequote: `s[at]` must be '"'; only `\"` is an escape; the value runs to the
@@ -542,7 +532,7 @@ inline std::optional<ReadKey> try_read_key(std::string_view s, std::size_t at) {
         auto facts = decode_key_blob(*blob);
         if (!facts)
             return std::nullopt;
-        const bool same = facts->family == ti->family && facts->info.cert == ti->cert &&
+        const bool same = facts->info.family == ti->family && facts->info.cert == ti->cert &&
                           (ti->family != Family::ecdsa || facts->info.curve_bits == ti->curve_bits);
         if (!same)
             return std::nullopt;
@@ -576,21 +566,7 @@ struct KeysParse {
                                          std::string_view type, std::string_view fingerprint,
                                          std::string_view bits, std::string_view flags,
                                          std::string_view options, bool& oversized) {
-    std::string r = "key|";
-    r += wire_field(account, oversized);
-    r += '|';
-    r += wire_field(kind, oversized);
-    r += '|';
-    r += wire_field(type, oversized);
-    r += '|';
-    r += wire_field(fingerprint, oversized);
-    r += '|';
-    r += wire_field(bits, oversized);
-    r += '|';
-    r += wire_field(flags, oversized);
-    r += '|';
-    r += wire_field(options, oversized);
-    return r;
+    return pipe_row("key", {account, kind, type, fingerprint, bits, flags, options}, oversized);
 }
 
 [[nodiscard]] inline std::string file_row(std::string_view account, std::string_view kind, SourceState state,
@@ -598,19 +574,8 @@ struct KeysParse {
                                           std::optional<std::size_t> malformed,
                                           std::optional<std::size_t> oversized, bool& field_oversized) {
     const auto num = [](std::optional<std::size_t> n) { return n ? std::to_string(*n) : std::string{"-"}; };
-    std::string r = "file|";
-    r += wire_field(account, field_oversized);
-    r += '|';
-    r += wire_field(kind, field_oversized);
-    r += '|';
-    r += state_token(state);
-    r += '|';
-    r += num(keys);
-    r += '|';
-    r += num(malformed);
-    r += '|';
-    r += num(oversized);
-    return r;
+    return pipe_row("file", {account, kind, state_token(state), num(keys), num(malformed), num(oversized)},
+                    field_oversized);
 }
 
 /// Parses one authorized_keys file's text into `out.rows` (one `key|...` row per accepted

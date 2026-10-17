@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <dirent.h>
+#include <filesystem>
 #include <fnmatch.h>
 #include <memory>
 #include <optional>
@@ -83,61 +84,12 @@ inline FileReadLike hop_failure(int err) {
     return out;
 }
 
-inline std::string unescape_mountinfo(std::string_view s) {
-    std::string out;
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\\' && i + 3 < s.size() && s[i + 1] >= '0' && s[i + 1] <= '3' &&
-            s[i + 2] >= '0' && s[i + 2] <= '7' && s[i + 3] >= '0' && s[i + 3] <= '7') {
-            out += static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0'));
-            i += 3;
-        } else {
-            out += s[i];
-        }
-    }
-    return out;
-}
-
-/// Mount points of the network filesystems in a /proc/self/mountinfo text: field 5 is the
-/// mount point (octal-escaped), the filesystem type is the first field after the standalone
-/// `-` separator that closes the optional fields (runtimes_linux_parsers.hpp's rule).
-inline std::vector<std::string> mountinfo_network_prefixes(std::string_view text) {
-    std::vector<std::string> out;
-    std::size_t at = 0;
-    while (at < text.size()) {
-        const auto nl = text.find('\n', at);
-        const auto line = nl == std::string_view::npos ? text.substr(at) : text.substr(at, nl - at);
-        at = nl == std::string_view::npos ? text.size() : nl + 1;
-        std::vector<std::string_view> f;
-        std::size_t b = 0;
-        while (b < line.size()) {
-            const auto sp = line.find(' ', b);
-            f.push_back(line.substr(b, sp == std::string_view::npos ? std::string_view::npos : sp - b));
-            if (sp == std::string_view::npos)
-                break;
-            b = sp + 1;
-        }
-        std::size_t sep = 6;
-        while (sep < f.size() && f[sep] != "-")
-            ++sep;
-        if (f.size() < 7 || sep + 1 >= f.size())
-            continue;
-        if (yuzu::shared::is_network_fstype(f[sep + 1]))
-            out.push_back(unescape_mountinfo(f[4]));
-    }
-    return out;
-}
-
 /// The Linux mount table via the bounded no-follow reader; nullopt when it cannot be read in full.
 inline std::optional<std::vector<std::string>> linux_mountinfo_prefixes(const std::string& path) {
     const auto r = yuzu::shared::read_file_no_follow(path, 1024 * 1024);
     if (!r.ok())
         return std::nullopt;
-    return mountinfo_network_prefixes(r.data);
-}
-
-inline std::string basename_of(const std::string& p) {
-    const auto slash = p.find_last_of('/');
-    return slash == std::string::npos ? p : p.substr(slash + 1);
+    return yuzu::shared::network_mount_points(r.data);
 }
 
 inline PosixFs make_posix_fs(const Paths& p) {
@@ -191,7 +143,7 @@ inline PosixFs make_posix_fs(const Paths& p) {
         bool any_listed = false;
         for (const auto& root : roots) {
             if (std::ranges::find(singles, root) != singles.end()) {
-                homes.push_back({basename_of(root), root});
+                homes.push_back({std::filesystem::path(root).filename().string(), root});
                 any_listed = true;
                 continue;
             }

@@ -34,7 +34,9 @@
 #include <array>
 #include <cctype>
 #include <cstddef>
+#include <filesystem>
 #include <functional>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -102,6 +104,22 @@ inline std::string wire_field(std::string_view v, bool& oversized) {
     if (s.empty())
         return "-";
     return yuzu::util::safe_output_field(s);
+}
+
+/// `prefix|f1|f2|...` with every field through wire_field. `prefix` is the literal row kind. The
+/// fields the row builders once appended raw (the config key, a file row's state token, the
+/// counts) are lowercase-ASCII literals or digits or `-`, with no NUL, pipe or backslash and far
+/// under kMaxFieldBytes, so wire_field is the identity on them. Callers may pass temporaries:
+/// they live to the end of the full expression that calls this.
+[[nodiscard]] inline std::string pipe_row(std::string_view prefix,
+                                          std::initializer_list<std::string_view> fields,
+                                          bool& oversized) {
+    std::string r(prefix);
+    for (const auto f : fields) {
+        r += '|';
+        r += wire_field(f, oversized);
+    }
+    return r;
 }
 
 [[nodiscard]] inline std::string source_row(std::string_view kind, SourceState state,
@@ -273,7 +291,6 @@ struct SshdConfigState {
 struct IncludeDirective {
     std::string pattern;
     bool in_match = false;
-    std::string origin;
 };
 using IncludeSink = std::function<void(const IncludeDirective&)>;
 
@@ -308,7 +325,7 @@ inline void parse_sshd_config(std::string_view text, std::string_view origin, Ss
             for (const auto& a : args) {
                 if (a.empty())
                     break; // sshd: "keyword Include empty argument", rest of the directive dropped
-                include(IncludeDirective{a, in_match, std::string(origin)});
+                include(IncludeDirective{a, in_match});
             }
             continue;
         }
@@ -376,9 +393,7 @@ inline void parse_sshd_config(std::string_view text, std::string_view origin, Ss
 
 /// `include:<basename>` for a file reached through an Include, `sshd_config` for the main one.
 inline std::string include_origin(std::string_view path) {
-    const auto slash = path.rfind('/');
-    std::string base(slash == std::string_view::npos ? path : path.substr(slash + 1));
-    return "include:" + base;
+    return "include:" + std::filesystem::path(std::string(path)).filename().string();
 }
 
 // ---------------------------------------------------------------------------
@@ -424,13 +439,7 @@ inline IncludeSpec expand_include_pattern(std::string_view arg) {
 
 [[nodiscard]] inline std::string config_row(std::string_view key, std::string_view value,
                                             std::string_view origin, bool& oversized) {
-    std::string r = "config|";
-    r += key;
-    r += '|';
-    r += wire_field(value, oversized);
-    r += '|';
-    r += wire_field(origin, oversized);
-    return r;
+    return pipe_row("config", {key, value, origin}, oversized);
 }
 
 /// `default` (unset), `none`, or `custom:<n>` (n tokens). The tokens are paths and are NEVER
@@ -546,13 +555,7 @@ inline LaunchState parse_print_disabled_label(std::string_view output, std::stri
 [[nodiscard]] inline std::string service_row(std::string_view unit, std::string_view state,
                                              std::string_view mechanism) {
     bool ignored = false;
-    std::string r = "service|";
-    r += wire_field(unit, ignored);
-    r += '|';
-    r += wire_field(state, ignored);
-    r += '|';
-    r += wire_field(mechanism, ignored);
-    return r;
+    return pipe_row("service", {unit, state, mechanism}, ignored);
 }
 
 } // namespace yuzu::remote_access_audit

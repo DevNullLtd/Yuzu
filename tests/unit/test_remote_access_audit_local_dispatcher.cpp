@@ -46,8 +46,6 @@ std::vector<std::string> captured_rows(const std::string& captured) {
     return out;
 }
 
-bool starts_with(const std::string& s, const std::string& p) { return s.rfind(p, 0) == 0; }
-
 /// Under `meson test` (MESON_BUILD_ROOT is always set) a missing plugin means the
 /// build is genuinely broken and must NOT report "All tests passed".
 #if defined(_MSC_VER)
@@ -229,21 +227,21 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     const auto rows = captured_rows(result.captured);
     REQUIRE_FALSE(rows.empty());
     INFO("status row: " << rows[0]);
-    REQUIRE(starts_with(rows[0], "status|list|"));
-    CHECK(std::ranges::count_if(rows, [](const std::string& r) { return starts_with(r, "status|"); }) == 1);
+    REQUIRE(rows[0].starts_with("status|list|"));
+    CHECK(std::ranges::count_if(rows, [](const std::string& r) { return r.starts_with("status|"); }) == 1);
 
     // The paired result status follows the status row's state.
-    if (starts_with(rows[0], "status|list|supported|")) {
+    if (rows[0].starts_with("status|list|supported|")) {
         CHECK(result.result_status == YUZU_RESULT_STATUS_OK);
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
-    } else if (starts_with(rows[0], "status|list|constrained|")) {
+    } else if (rows[0].starts_with("status|list|constrained|")) {
         CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-    } else if (starts_with(rows[0], "status|list|permission_denied|")) {
+    } else if (rows[0].starts_with("status|list|permission_denied|")) {
         CHECK(result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     } else {
-        REQUIRE(starts_with(rows[0], "status|list|unsupported|"));
+        REQUIRE(rows[0].starts_with("status|list|unsupported|"));
         CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
     }
@@ -256,9 +254,9 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     CHECK(result.result_provenance == "windows:planned");
 #else
     REQUIRE(rows.size() >= 1 + 3 + 13);
-    CHECK(starts_with(rows[1], "source|sshd_config|"));
-    CHECK(starts_with(rows[2], "source|homes|"));
-    CHECK(starts_with(rows[3], "source|service|"));
+    CHECK(rows[1].starts_with("source|sshd_config|"));
+    CHECK(rows[2].starts_with("source|homes|"));
+    CHECK(rows[3].starts_with("source|service|"));
     for (std::size_t i = 1; i <= 3; ++i)
         CHECK(in(fields(rows[i])[2], {"read", "absent", "refused", "failed"}));
 
@@ -268,7 +266,7 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
         "denyusers_count", "denygroups_count", "match_blocks"};
     for (const char* k : kConfigKeys) {
         const auto n = std::ranges::count_if(rows, [&](const std::string& r) {
-            return starts_with(r, std::string{"config|"} + k + "|");
+            return r.starts_with(std::string{"config|"} + k + "|");
         });
         INFO("config key " << k);
         CHECK(n == 1); // every allowlisted key exactly once
@@ -289,7 +287,7 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
             REQUIRE(f.size() == 8);
             // SHA256: plus 43 unpadded base64 characters, exactly as ssh-keygen -l prints it
             CHECK(f[4].size() == 7 + 43);
-            CHECK(starts_with(f[4], "SHA256:"));
+            CHECK(f[4].starts_with("SHA256:"));
             CHECK(f[4].find('=') == std::string::npos);
         } else {
             FAIL("unexpected row kind: " << f[0]);

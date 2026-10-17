@@ -22,14 +22,6 @@ namespace yuzu::remote_access_audit {
 
 namespace {
 
-/// The shared deny-list plus the macOS client names it lacks: `webdav`, `afpfs` and the
-/// macFUSE FUSE-over-anything family (a user-run FUSE daemon serving a home can hang like a
-/// dead server).
-bool is_network_mount_fstype(std::string_view t) {
-    return yuzu::shared::is_network_fstype(t) || t == "webdav" || t == "afpfs" || t == "macfuse" ||
-           t == "osxfuse";
-}
-
 std::optional<std::vector<std::string>> macos_network_prefixes() {
     struct statfs* raw = nullptr;
     const int n = ::getmntinfo_r_np(&raw, MNT_NOWAIT);
@@ -38,7 +30,7 @@ std::optional<std::vector<std::string>> macos_network_prefixes() {
         return std::nullopt;
     std::vector<std::string> out;
     for (int i = 0; i < n; ++i) {
-        if (is_network_mount_fstype(mnt.get()[i].f_fstypename))
+        if (yuzu::shared::is_network_mount_fstype(mnt.get()[i].f_fstypename))
             out.emplace_back(mnt.get()[i].f_mntonname);
     }
     return out;

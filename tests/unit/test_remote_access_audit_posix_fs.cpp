@@ -254,10 +254,10 @@ TEST_CASE("remote_access_audit posix fs: network mount points come from the moun
         "43 36 0:38 / /srv/fuse rw - fuse.sshfs u@h:/ rw\n"
         "44 36 0:39 / /srv/localfuse rw - fuse x rw\n"
         "garbage line\n";
-    const auto m = mountinfo_network_prefixes(table);
+    const auto m = yuzu::shared::network_mount_points(table);
     CHECK(m == std::vector<std::string>{"/home/remote", "/mnt/with space", "/srv/fuse"});
-    CHECK(mountinfo_network_prefixes("").empty()); // a table with no lines is empty, not unreadable
-    CHECK(mountinfo_network_prefixes("36 35 98:0 / /only rw - tmpfs none rw\n").empty());
+    CHECK(yuzu::shared::network_mount_points("").empty()); // a table with no lines is empty, not unreadable
+    CHECK(yuzu::shared::network_mount_points("36 35 98:0 / /only rw - tmpfs none rw\n").empty());
 
     Tree t;
     t.write(t.at("mountinfo"), table);
@@ -265,7 +265,6 @@ TEST_CASE("remote_access_audit posix fs: network mount points come from the moun
     REQUIRE(read.has_value());
     CHECK(read->size() == 3);
     CHECK_FALSE(linux_mountinfo_prefixes(t.at("absent").string()).has_value()); // unreadable != empty
-    CHECK(unescape_mountinfo("a\\040b\\134c") == "a b\\c");
 }
 
 namespace {
