@@ -429,6 +429,7 @@ agent_test_exe = executable(
                                                 # the above -- real staged/copied executable payload, real
                                                 # runner spawn (Windows-only TU guard)
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
+    'unit/test_certificates_crypto_profile.cpp', # pure OID -> key/signature algorithm naming (certificates_crypto_profile.hpp), every OS
     'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
     'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
     'unit/test_quarantine_serialization.cpp', # Wave 2 P4: MutationGate bounded-wait serialization (#3286)
@@ -3211,6 +3212,13 @@ test('mgmt_posture definition columns',
 test('shares definition columns',
   _python3_test,
   args: [files('test_shares_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+test('certificates definition columns',
+  _python3_test,
+  args: [files('test_certificates_definition.py')],
   suite: 'docs',
   timeout: 30,
 )

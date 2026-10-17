@@ -16,7 +16,7 @@ kind: InstructionDefinition
 metadata:
   id: security.certificates.list
   displayName: List Certificates
-  version: 1.1.0
+  version: 1.2.0
   description: >
     Enumerate certificates in system certificate stores. On Windows this
     queries the CryptoAPI stores (MY, ROOT, CA, Trust). On Linux it parses
@@ -115,6 +115,24 @@ spec:
           Comma-separated X.509 Key Usage extension names, or "(none)" when the extension is absent, empty, or could not be read. Values: comma-separated usage names, or "(none)".
         example: "Digital Signature"
         platforms: [windows, linux, darwin]
+      - name: key_algorithm
+        type: string
+        description: >-
+          The certificate's public-key algorithm, named from its SubjectPublicKeyInfo algorithm OID through one table shared by every OS leg, so the same certificate reports the same value on Windows, Linux and macOS. EC keys carry their named curve (e.g. "EC P-256"); post-quantum keys are named by parameter set (e.g. "ML-DSA-65"). An OID the table does not name is reported in dotted form rather than as "(unknown)". Values: RSA, RSASSA-PSS, DSA, EC <curve>, EC (no named curve), Ed25519, Ed448, X25519, X448, ML-DSA-44/65/87, ML-KEM-512/768/1024, a dotted OID, or "(unknown)" when the field could not be read.
+        example: "RSA"
+        platforms: [windows, linux, darwin]
+      - name: key_bits
+        type: string
+        description: >-
+          Public-key size in bits. RSA, RSASSA-PSS and DSA report the OS crypto library's own key length; EC reports the named curve's size from the shared table (never the library's), so it cannot differ between OSes. "(implied)" for algorithms whose size is fixed by the name in key_algorithm (Ed25519, X25519, ML-DSA-65, ...). Values: decimal bits, "(implied)", or "(unknown)" when the key could not be sized or the EC curve is not named.
+        example: "2048"
+        platforms: [windows, linux, darwin]
+      - name: signature_algorithm
+        type: string
+        description: >-
+          The algorithm the issuer signed this certificate with, named from its signature OID through the same shared table (standard ASN.1 identifier names). Weak algorithms are reported as-is (e.g. "sha1WithRSAEncryption", "md5WithRSAEncryption") -- this column states what is present, it does not judge it. Values: e.g. sha256WithRSAEncryption, ecdsa-with-SHA384, RSASSA-PSS, Ed25519, ML-DSA-65, a dotted OID for an unnamed algorithm, or "(unknown)" when it could not be read.
+        example: "sha256WithRSAEncryption"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy: [store, issuer]
       operations: [count]
@@ -155,7 +173,7 @@ kind: InstructionDefinition
 metadata:
   id: security.certificates.details
   displayName: Certificate Details
-  version: 1.1.0
+  version: 1.2.0
   description: >
     Retrieve full details for a specific certificate identified by its
     SHA-1 thumbprint. Searches all available certificate stores on the
@@ -244,6 +262,24 @@ spec:
         description: >-
           Comma-separated X.509 Key Usage extension names, or "(none)" when the extension is absent, empty, or could not be read. Values: comma-separated usage names, or "(none)".
         example: "Digital Signature, Key Encipherment, Data Encipherment"
+        platforms: [windows, linux, darwin]
+      - name: key_algorithm
+        type: string
+        description: >-
+          The certificate's public-key algorithm, named from its SubjectPublicKeyInfo algorithm OID through one table shared by every OS leg, so the same certificate reports the same value on Windows, Linux and macOS. EC keys carry their named curve (e.g. "EC P-256"); post-quantum keys are named by parameter set (e.g. "ML-DSA-65"). An OID the table does not name is reported in dotted form rather than as "(unknown)". Values: RSA, RSASSA-PSS, DSA, EC <curve>, EC (no named curve), Ed25519, Ed448, X25519, X448, ML-DSA-44/65/87, ML-KEM-512/768/1024, a dotted OID, or "(unknown)" when the field could not be read.
+        example: "RSA"
+        platforms: [windows, linux, darwin]
+      - name: key_bits
+        type: string
+        description: >-
+          Public-key size in bits. RSA, RSASSA-PSS and DSA report the OS crypto library's own key length; EC reports the named curve's size from the shared table (never the library's), so it cannot differ between OSes. "(implied)" for algorithms whose size is fixed by the name in key_algorithm (Ed25519, X25519, ML-DSA-65, ...). Values: decimal bits, "(implied)", or "(unknown)" when the key could not be sized or the EC curve is not named.
+        example: "2048"
+        platforms: [windows, linux, darwin]
+      - name: signature_algorithm
+        type: string
+        description: >-
+          The algorithm the issuer signed this certificate with, named from its signature OID through the same shared table (standard ASN.1 identifier names). Weak algorithms are reported as-is (e.g. "sha1WithRSAEncryption", "md5WithRSAEncryption") -- this column states what is present, it does not judge it. Values: e.g. sha256WithRSAEncryption, ecdsa-with-SHA384, RSASSA-PSS, Ed25519, ML-DSA-65, a dotted OID for an unnamed algorithm, or "(unknown)" when it could not be read.
+        example: "sha256WithRSAEncryption"
         platforms: [windows, linux, darwin]
 
   readablePayload: "Get certificate details (thumbprint=${thumbprint})"

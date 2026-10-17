@@ -27,6 +27,7 @@
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (BR-07)
 
+#include "certificates_crypto_profile.hpp" // pure OID -> key/signature algorithm naming, shared by every OS leg
 #include "certificates_macos_parsers.hpp" // pure parse/validate/classify/verdict helpers (shared with the unit test)
 
 #include <spdlog/spdlog.h> // degraded-subprocess WARN (SRE S1 observability)
@@ -138,6 +139,16 @@ namespace {
 
 // ── Certificate record ───────────────────────────────────────────────────────
 
+/// Column header written before the rows of `list` and `details`. The three
+/// crypto-profile columns are APPENDED after key_usage, never inserted: the
+/// server maps row fields to columns by position, so a newer agent's row is
+/// still read correctly by an older server and vice versa (the extra trailing
+/// fields simply render as extra cells), and the definition's
+/// `visualization.labelField: 1` (issuer) keeps its index.
+constexpr std::string_view kCertRowHeader =
+    "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|key_algorithm|key_bits|"
+    "signature_algorithm";
+
 struct CertRecord {
     std::string subject;
     std::string issuer;
@@ -147,6 +158,9 @@ struct CertRecord {
     std::string serial;
     std::string store;
     std::string key_usage;
+    std::string key_algorithm = "(unknown)";
+    std::string key_bits = "(unknown)";
+    std::string signature_algorithm = "(unknown)";
 
     std::string to_row() const {
         // subject/issuer/serial/key_usage come from parsed certificate data
@@ -163,11 +177,19 @@ struct CertRecord {
         // entirely by this
         // file's own date formatting, and store is always one of this
         // plugin's own fixed literal labels -- none of the four can carry
-        // attacker-controlled bytes.
-        return std::format("{}|{}|{}|{}|{}|{}|{}|{}", yuzu::util::safe_output_field(subject),
+        // attacker-controlled bytes. The three crypto-profile fields are a
+        // table name, a dotted OID that passed is_dotted_oid(), a decimal
+        // number, or a parenthesised sentinel (certificates_crypto_profile.hpp)
+        // -- digits, dots and fixed ASCII only -- but they are escaped as well
+        // for the same defense-in-depth reason as serial/key_usage.
+        return std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                           yuzu::util::safe_output_field(subject),
                            yuzu::util::safe_output_field(issuer), thumbprint, not_before,
                            not_after, yuzu::util::safe_output_field(serial), store,
-                           yuzu::util::safe_output_field(key_usage));
+                           yuzu::util::safe_output_field(key_usage),
+                           yuzu::util::safe_output_field(key_algorithm),
+                           yuzu::util::safe_output_field(key_bits),
+                           yuzu::util::safe_output_field(signature_algorithm));
     }
 };
 
@@ -234,6 +256,9 @@ CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std
     rec.serial = fields.serial;
     rec.thumbprint = fields.thumbprint;
     rec.key_usage = fields.key_usage;
+    rec.key_algorithm = fields.key_algorithm;
+    rec.key_bits = fields.key_bits;
+    rec.signature_algorithm = fields.signature_algorithm;
     return rec;
 }
 #endif
@@ -327,6 +352,41 @@ std::string get_key_usage(PCCERT_CONTEXT cert) {
     return result;
 }
 
+/// key_algorithm / key_bits / signature_algorithm from the CERT_INFO CryptoAPI
+/// already decoded -- no further allocation, nothing to free. The algorithm
+/// OIDs are dotted strings CryptoAPI owns for the life of `cert`; the EC
+/// namedCurve parameter is raw DER, decoded by the shared pure
+/// der_oid_to_dotted rather than a CryptDecodeObjectEx LocalAlloc round trip.
+/// CertGetPublicKeyLength returns 0 when it cannot size the key, which
+/// describe() reports as "(unknown)" -- and it is only consulted for
+/// RSA/RSASSA-PSS/DSA (see describe()).
+yuzu::certificates_crypto::CryptoProfile get_crypto_profile(PCCERT_CONTEXT cert) {
+    const CERT_INFO* info = cert->pCertInfo;
+    const auto& spki = info->SubjectPublicKeyInfo;
+    const std::string_view key_oid =
+        spki.Algorithm.pszObjId ? std::string_view(spki.Algorithm.pszObjId) : std::string_view{};
+
+    std::string curve_oid;
+    if (spki.Algorithm.Parameters.pbData && spki.Algorithm.Parameters.cbData > 0) {
+        if (auto dotted = yuzu::certificates_crypto::der_oid_to_dotted(std::span<const unsigned char>(
+                spki.Algorithm.Parameters.pbData, spki.Algorithm.Parameters.cbData)))
+            curve_oid = std::move(*dotted);
+    }
+
+    // const_cast: CertGetPublicKeyLength's prototype takes a non-const
+    // PCERT_PUBLIC_KEY_INFO but only reads it (it sizes the encoded key); the
+    // structure stays owned by `cert` and is not retained past the call.
+    const DWORD bits = CertGetPublicKeyLength(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                              const_cast<PCERT_PUBLIC_KEY_INFO>(&spki));
+
+    const std::string_view sig_oid = info->SignatureAlgorithm.pszObjId
+                                         ? std::string_view(info->SignatureAlgorithm.pszObjId)
+                                         : std::string_view{};
+
+    return yuzu::certificates_crypto::describe(key_oid, curve_oid, static_cast<int>(bits),
+                                               sig_oid);
+}
+
 enum class StoreLocation { kLocalMachine, kCurrentUser };
 enum class StoreReadFailure { kNone, kOpen, kEnumeration };
 
@@ -383,6 +443,10 @@ StoreEnumeration enumerate_store(const char* store_name) {
         rec.serial = get_cert_serial(cert);
         rec.store = store_name;
         rec.key_usage = get_key_usage(cert);
+        auto profile = get_crypto_profile(cert);
+        rec.key_algorithm = std::move(profile.key_algorithm);
+        rec.key_bits = std::move(profile.key_bits);
+        rec.signature_algorithm = std::move(profile.signature_algorithm);
         result.records.push_back(std::move(rec));
     }
     // CertEnumCertificatesInStore returns NULL both at genuine end-of-store
@@ -412,7 +476,7 @@ StoreEnumeration enumerate_store(const char* store_name) {
 void list_certs_win(yuzu::CommandContext& ctx, std::string_view store_filter, int expiring_days) {
     static const char* kStores[] = {"MY", "ROOT", "CA", "Trust"};
 
-    ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
+    ctx.write_output(kCertRowHeader);
 
     for (const auto* store_name : kStores) {
         if (store_filter != "all" && store_filter != store_name)
@@ -460,7 +524,7 @@ void list_certs_win(yuzu::CommandContext& ctx, std::string_view store_filter, in
 void details_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint) {
     static const char* kStores[] = {"MY", "ROOT", "CA", "Trust"};
 
-    ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
+    ctx.write_output(kCertRowHeader);
 
     auto needle = canonical_thumbprint(thumbprint);
     // Tracks whether every selected store was actually opened AND fully
@@ -756,7 +820,7 @@ CertRecord read_linux_cert_record(yuzu::CommandContext& ctx, int dirfd, const st
 
 void list_certs_linux(yuzu::CommandContext& ctx, std::string_view /*store_filter*/,
                       int expiring_days) {
-    ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
+    ctx.write_output(kCertRowHeader);
 
     auto dir = open_cert_dir(kDefaultCertDir);
     if (dir.state == CertDirOpen::kAbsent) {
@@ -787,7 +851,7 @@ void list_certs_linux(yuzu::CommandContext& ctx, std::string_view /*store_filter
 }
 
 void details_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint) {
-    ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
+    ctx.write_output(kCertRowHeader);
 
     auto dir = open_cert_dir(kDefaultCertDir);
     if (dir.state == CertDirOpen::kAbsent) {
@@ -1279,6 +1343,20 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
     rec.thumbprint = std::move(parsed.thumbprint);
     rec.key_usage = std::move(parsed.key_usage);
 
+    // The crypto profile comes from the in-process libcrypto parse of the
+    // same PEM block, NOT from the `-text` dump above: /usr/bin/openssl is
+    // LibreSSL here, whose algorithm text differs from OpenSSL's, and the
+    // in-process path names algorithms through the same OID table as every
+    // other leg (certificates_crypto_profile.hpp). Only the first block is
+    // read, matching the one certificate this function's subprocess parsed.
+    // A block libcrypto cannot parse keeps the "(unknown)" defaults.
+    auto x509 = yuzu::certificates_x509::parse_pem_certs(pem_block);
+    if (!x509.empty()) {
+        rec.key_algorithm = std::move(x509.front().key_algorithm);
+        rec.key_bits = std::move(x509.front().key_bits);
+        rec.signature_algorithm = std::move(x509.front().signature_algorithm);
+    }
+
     return rec;
 }
 
@@ -1534,7 +1612,7 @@ ConsoleOwnerSnapshot snapshot_console_owner() {
 
 void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                       int expiring_days) {
-    ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
+    ctx.write_output(kCertRowHeader);
 
     // Whole-action budget across EVERYTHING this call does, including
     // console-user resolution (BR-03, mirrors installed_apps_plugin.cpp's
@@ -1708,7 +1786,7 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
 
 void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                         std::string_view store_filter) {
-    ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
+    ctx.write_output(kCertRowHeader);
 
     // Whole-action budget across EVERYTHING this call does, including
     // console-user resolution -- see list_certs_macos's matching comment
@@ -2305,7 +2383,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class CertificatesPlugin final : public yuzu::Plugin {
 public:
     static constexpr const char* kName = "certificates";
-    static constexpr const char* kVersion = "1.0.0";
+    static constexpr const char* kVersion = "1.1.0";
 
     std::string_view name() const noexcept override { return kName; }
     std::string_view version() const noexcept override { return kVersion; }

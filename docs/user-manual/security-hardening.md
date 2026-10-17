@@ -781,6 +781,8 @@ The `certificates` plugin enumerates certificates in system stores for complianc
 
 Execute the `certificates.list` action to get all certificates with subject, issuer, thumbprint, and expiry date. Use `certificates.details` with a thumbprint parameter for full certificate details including key usage, serial number, and chain information.
 
+Both actions also report each certificate's crypto profile: `key_algorithm` (for example `RSA`, `EC P-256`, `Ed25519` or `ML-DSA-65`), `key_bits`, and `signature_algorithm` (for example `sha256WithRSAEncryption` or `sha1WithRSAEncryption`). Every OS names these through one shared OID table, so the same certificate reports the same values on Windows, Linux and macOS. Use them to find RSA-1024 keys, SHA-1 or MD5 signatures, and keys that are not quantum-safe; the columns report what is present and do not grade it.
+
 ### Certificate Deletion
 
 Execute the `certificates.delete` action with a thumbprint parameter to remove a certificate from the system store. This is useful for revoking compromised certificates or cleaning up expired entries.

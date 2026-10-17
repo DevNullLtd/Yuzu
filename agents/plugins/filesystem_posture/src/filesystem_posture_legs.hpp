@@ -160,7 +160,7 @@ inline void write_snapshot_row(yuzu::CommandContext& ctx, std::string_view mount
 
 /**
  * Report a degraded-but-partial read (verbatim-shape copy of
- * certificates_plugin.cpp:207-215). Every degradation logs a WARN
+ * certificates_plugin.cpp's mark_result_partial()). Every degradation logs a WARN
  * regardless of how many times it's called in one execute(); `set_result_status`
  * itself ASSIGNS -- last writer wins (peer M3, verified at
  * agents/core/src/agent.cpp:553-555) -- so when multiple degradations occur

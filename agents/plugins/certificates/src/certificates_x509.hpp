@@ -57,6 +57,8 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include "certificates_crypto_profile.hpp"
+
 namespace yuzu::certificates_x509 {
 
 /// One certificate's worth of operator-visible fields, in the exact shape
@@ -73,6 +75,11 @@ struct CertFields {
     std::string serial = "(unknown)";
     std::string thumbprint = "(unknown)";
     std::string key_usage = "(none)";
+    // Crypto profile -- named by certificates_crypto_profile.hpp from the
+    // OIDs extract_crypto_profile() reads, so these match the Windows leg.
+    std::string key_algorithm = "(unknown)";
+    std::string key_bits = "(unknown)";
+    std::string signature_algorithm = "(unknown)";
 };
 
 namespace detail {
@@ -251,6 +258,63 @@ inline std::string extract_key_usage(X509* x) {
     return last_line.empty() ? "(none)" : last_line;
 }
 
+/// Dotted form of an ASN1_OBJECT via OBJ_obj2txt(..., no_name=1), which
+/// always prints numerically -- never OpenSSL's own short/long name, so the
+/// naming stays with certificates_crypto_profile.hpp. Empty on a null object,
+/// a failed render, or a render that would not fit the buffer (OBJ_obj2txt
+/// returns the FULL length, like snprintf); describe() treats empty as absent.
+inline std::string obj_to_dotted(const ASN1_OBJECT* obj) {
+    if (!obj)
+        return {};
+    char buf[yuzu::certificates_crypto::kMaxDottedOidLength + 1]{};
+    const int n = OBJ_obj2txt(buf, static_cast<int>(sizeof(buf)), obj, 1);
+    if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(buf))
+        return {};
+    return std::string(buf, static_cast<std::size_t>(n));
+}
+
+/// key_algorithm / key_bits / signature_algorithm. Reads the OIDs straight
+/// from the certificate's SubjectPublicKeyInfo and TBS signature
+/// AlgorithmIdentifier rather than decoding the key, so an algorithm this
+/// libcrypto cannot load (a post-quantum key on an older OpenSSL) is still
+/// identified by its OID. EVP_PKEY_get_bits is consulted for the length, and
+/// describe() uses it only for RSA/RSASSA-PSS/DSA. X509_get0_pubkey returns a
+/// pointer the X509 owns (no free); it queues an error for an undecodable
+/// key, which is cleared so it cannot leak into a later caller's ERR queue.
+inline yuzu::certificates_crypto::CryptoProfile extract_crypto_profile(X509* x) {
+    std::string key_oid;
+    std::string curve_oid;
+    if (X509_PUBKEY* pub = X509_get_X509_PUBKEY(x)) {
+        ASN1_OBJECT* alg = nullptr;
+        X509_ALGOR* params = nullptr;
+        if (X509_PUBKEY_get0_param(&alg, nullptr, nullptr, &params, pub) == 1) {
+            key_oid = obj_to_dotted(alg);
+            int ptype = V_ASN1_UNDEF;
+            const void* pval = nullptr;
+            if (params) {
+                X509_ALGOR_get0(nullptr, &ptype, &pval, params);
+                if (ptype == V_ASN1_OBJECT)
+                    curve_oid = obj_to_dotted(static_cast<const ASN1_OBJECT*>(pval));
+            }
+        }
+    }
+
+    int bits = 0;
+    if (EVP_PKEY* pkey = X509_get0_pubkey(x))
+        bits = EVP_PKEY_get_bits(pkey);
+    else
+        ERR_clear_error();
+
+    std::string sig_oid;
+    if (const X509_ALGOR* sig = X509_get0_tbs_sigalg(x)) {
+        const ASN1_OBJECT* sig_obj = nullptr;
+        X509_ALGOR_get0(&sig_obj, nullptr, nullptr, sig);
+        sig_oid = obj_to_dotted(sig_obj);
+    }
+
+    return yuzu::certificates_crypto::describe(key_oid, curve_oid, bits, sig_oid);
+}
+
 /// Extract every field for one already-parsed X509*. Always sets every
 /// CertFields member (never leaves a partial/default-constructed field for
 /// a certificate that parsed successfully as an X509 object) -- an
@@ -266,6 +330,10 @@ inline CertFields extract_all(X509* x) {
     f.serial = extract_serial(X509_get_serialNumber(x));
     f.thumbprint = extract_thumbprint(x);
     f.key_usage = extract_key_usage(x);
+    auto profile = extract_crypto_profile(x);
+    f.key_algorithm = std::move(profile.key_algorithm);
+    f.key_bits = std::move(profile.key_bits);
+    f.signature_algorithm = std::move(profile.signature_algorithm);
     return f;
 }
 

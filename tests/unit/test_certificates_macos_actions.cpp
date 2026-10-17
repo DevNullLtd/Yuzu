@@ -359,7 +359,8 @@ TEST_CASE("list: System.keychain empty -> header only, UNDECLARED/UNKNOWN, no pr
     CHECK(result.rc == 0);
     auto lines = split_lines(result.captured);
     REQUIRE(lines.size() == 1);
-    CHECK(lines[0] == "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
+    CHECK(lines[0] == "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|"
+                      "key_algorithm|key_bits|signature_algorithm");
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNDECLARED);
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
     CHECK(result.result_provenance.empty());
@@ -447,9 +448,14 @@ TEST_CASE("list: System.keychain with the real root cert -> exactly one data row
     auto lines = split_lines(result.captured);
     REQUIRE(lines.size() == 2); // header + exactly one data row
     auto fields = split_fields(lines[1]);
-    REQUIRE(fields.size() == 8);
+    REQUIRE(fields.size() == 11);
     CHECK(fields[2] == expected->thumbprint);
     CHECK(fields[6] == "System.keychain");
+    // The crypto-profile columns are appended after key_usage; a real root
+    // certificate always has a readable SPKI and signature algorithm, so none
+    // of the three may fall back to the "(unknown)" sentinel here.
+    CHECK(fields[8] != "(unknown)");
+    CHECK(fields[10] != "(unknown)");
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNDECLARED);
 }
 

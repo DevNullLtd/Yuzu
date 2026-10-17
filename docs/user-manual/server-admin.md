@@ -447,6 +447,33 @@ list `role=admin` in the config file, or — for an SSO-only fleet — remove al
 from the config so this check never triggers. The server logs the config's user count and refuses
 to guess; there is no other remediation needed once the config is corrected.
 
+### vNEXT — `certificates list` and `details` rows carry three more fields (breaking)
+
+**What changed.** The `certificates` agent plugin's `list` and `details` actions (definitions
+`security.certificates.list` and `security.certificates.details`) now emit eleven `|`-separated fields per
+row instead of eight: `subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|key_algorithm|key_bits|signature_algorithm`.
+The first eight fields keep their position. The three new fields describe the certificate's public key and
+the issuer's signature, named on every OS through one shared OID table; an unnamed algorithm is reported as
+its dotted OID and an unreadable one as `(unknown)`. `delete` is unchanged.
+
+**Who this affects.** Automation reading `certificates` output from `GET /api/v1/responses/{id}`, its
+`/export`, or MCP `query_responses` that (a) unpacks or anchors exactly eight fields, or (b) treats the last
+field as `key_usage`.
+
+**Mixed fleets.** Upgrade order is server first, so agents keep answering with eight fields until they take
+the release carrying `certificates` plugin 1.1.0 (the definitions' `minAgentVersion` stays `0.1.0`). Accept
+a row with exactly 8 or exactly 11 fields, and read the last three only from agents on plugin 1.1.0 or later.
+
+**Existing deployments keep the old definitions.** The bundled definitions are seeded once and never
+refreshed on an existing server (see the InstructionStore note in [`upgrading.md`](upgrading.md); #2555), so
+`get_definition` and `discover_instructions` keep listing eight columns at version 1.1.0. Row content is
+unaffected. Editing the definitions (dashboard YAML editor or `PUT /api/instructions/{id}`) to declare the
+three new columns is optional.
+
+**Before upgrading, check whether this affects you.** Search your scripts, SIEM parsers and saved exports for
+consumers of `security.certificates.list`/`details` output and change any fixed eight-field pattern to accept
+the three trailing fields.
+
 ### vNEXT — `installed_apps list` rows carry two more fields (breaking)
 
 **What changed.** The `installed_apps` agent plugin's operator `list` action (definition

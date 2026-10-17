@@ -415,6 +415,63 @@ std::vector<unsigned char> pem_to_der(const std::string& pem) {
     return out;
 }
 
+// ── Synthetic: crypto-profile vectors (key_algorithm/key_bits/signature) ────
+//
+// Generated 2026-10-16 with python-cryptography 50.0.1 (bundled OpenSSL), not
+// the openssl CLI: CertificateBuilder, subject/issuer CN=<name>, O=Yuzu,
+// serial 0x10ADBEEF, notBefore 2026-10-16, 3650 days. Each comment records the
+// SPKI algorithm OID, signature OID, key size and curve python-cryptography
+// itself reports for the certificate -- the expected values the tests below
+// assert are derived from those, independently of certificates_x509.hpp.
+//
+// kRsaSha1CertPem is SHA-1 signed, which python-cryptography refuses to
+// produce, so it was assembled by hand: a SHA-256 TBS from CertificateBuilder
+// with its single sha256WithRSAEncryption AlgorithmIdentifier swapped for the
+// same-length sha1WithRSAEncryption one, signed with RSA PKCS#1 v1.5 + SHA-1,
+// wrapped in Certificate ::= SEQUENCE { tbs, algId, BIT STRING }. Its
+// signature was verified (public_key().verify(..., PKCS1v15(), SHA1())) before
+// it was embedded -- it is a valid weak certificate, not a malformed one.
+
+// key_oid=1.3.101.112 sig_oid=1.3.101.112 key_size=None curve=None
+constexpr const char* kEd25519CertPem = R"(-----BEGIN CERTIFICATE-----
+MIH7MIGuoAMCAQICBBCtvu8wBQYDK2VwMCYxFTATBgNVBAMMDGVkMjU1MTktY2Vy
+dDENMAsGA1UECgwEWXV6dTAeFw0yNjEwMTYwMDAwMDBaFw0zNjEwMTMwMDAwMDBa
+MCYxFTATBgNVBAMMDGVkMjU1MTktY2VydDENMAsGA1UECgwEWXV6dTAqMAUGAytl
+cAMhAA8YG4VoLib6SHWBRHru6uOmYvZigBAVkGnTPnlHfrsxMAUGAytlcANBAHV3
+iEpQgsVebXmKZb2s8RwrsUYp68KVtdJMZsI5BKdVg1HpTf5q7rqnHQL3VV0fppph
+2Q9ZXpoR3LekkYe2BAI=
+-----END CERTIFICATE-----
+)";
+
+// key_oid=1.2.840.10045.2.1 sig_oid=1.2.840.10045.4.3.3 key_size=384 curve=secp384r1
+constexpr const char* kEcdsaP384CertPem = R"(-----BEGIN CERTIFICATE-----
+MIIBgDCCAQWgAwIBAgIEEK2+7zAKBggqhkjOPQQDAzApMRgwFgYDVQQDDA9lY2Rz
+YS1wMzg0LWNlcnQxDTALBgNVBAoMBFl1enUwHhcNMjYxMDE2MDAwMDAwWhcNMzYx
+MDEzMDAwMDAwWjApMRgwFgYDVQQDDA9lY2RzYS1wMzg0LWNlcnQxDTALBgNVBAoM
+BFl1enUwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAQgqH+VO/W9odJE5tICQizW8QFo
+BiudstQe79/jCP6i6HRhhFhgANH/v1bTzHuYnNAEWfMd/bTZFWMBES63hma7KfCA
+i5Cbrc+ntTgB0buUIfyUMcSu53g0mLGpmfQrQtAwCgYIKoZIzj0EAwMDaQAwZgIx
+AO4OMEbPSoL0/wfjEjoA96817/vpB+GStRwaw+HqbuZzQxZ0J9KIbS4w0OIomXl/
+6QIxALeMDLCciCyRflsweSyUYYIDwvSa+5DQoO3YU/J90kUh2iwOCw2dSV+Eu19a
+MSTTsA==
+-----END CERTIFICATE-----
+)";
+
+// key_oid=1.2.840.113549.1.1.1 sig_oid=1.2.840.113549.1.1.5 key_size=1024 curve=None
+constexpr const char* kRsaSha1CertPem = R"(-----BEGIN CERTIFICATE-----
+MIIBxTCCAS6gAwIBAgIEEK2+7zANBgkqhkiG9w0BAQUFADAnMRYwFAYDVQQDDA1y
+c2Etc2hhMS1jZXJ0MQ0wCwYDVQQKDARZdXp1MB4XDTI2MTAxNjAwMDAwMFoXDTM2
+MTAxMzAwMDAwMFowJzEWMBQGA1UEAwwNcnNhLXNoYTEtY2VydDENMAsGA1UECgwE
+WXV6dTCBnzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEA5Sih4WrW6P4q37kgTHRt
+ZYbOereSp0lViixy28C1LS4mcwORm/aHrzoWQ0J0YTVTL47o4qVFcL7ESV+a/n37
+A3Vzqwj9tgYFKly4clU4YMJKU7ruQ5JWAuvup7aYirDvNcF6v4hfhJ3IE0Fm3CW+
+KgVZzaILb75xmyCtCC3gkQ0CAwEAATANBgkqhkiG9w0BAQUFAAOBgQBbbcfAglZ/
+RLWkkuH5Toe6ftsPYYTGfQXfaaQgO8dAdXBCqLRP3WERTY3QS7K/l3RthoSLDm8Q
+kqZYzhubVq704MDsbejR+tLj7c8zMQlKd3W5zUqNA9GgunTsfp3rlCrfaZdHhH2H
+xReeqpgI72ykc2+5A0XyEP848EFlfZsYCQ==
+-----END CERTIFICATE-----
+)";
+
 } // namespace
 
 // ── parse_pem_certs: single certificate ──────────────────────────────────────
@@ -662,4 +719,64 @@ TEST_CASE("parse_der_cert: empty/garbage input yields std::nullopt, not a throw"
     std::vector<unsigned char> garbage{0x00, 0x01, 0x02, 0xFF, 0xFE, 0xDE, 0xAD, 0xBE, 0xEF};
     CHECK_FALSE(
         parse_der_cert(std::span<const unsigned char>(garbage.data(), garbage.size())).has_value());
+}
+
+// ── crypto profile: key_algorithm / key_bits / signature_algorithm ───────────
+//
+// Expected values are the python-cryptography readings recorded beside each
+// fixture (key OID, key size, curve, signature OID), named through
+// certificates_crypto_profile.hpp's table -- see that header for the naming.
+
+TEST_CASE("crypto profile: real RSA-2048 capture", "[certificates_x509][crypto_profile]") {
+    auto certs = parse_pem_certs(kRealSystemDefaultCertPem);
+    REQUIRE(certs.size() == 1);
+    CHECK(certs[0].key_algorithm == "RSA");
+    CHECK(certs[0].key_bits == "2048");
+    CHECK(certs[0].signature_algorithm == "sha256WithRSAEncryption");
+}
+
+TEST_CASE("crypto profile: ECDSA P-256 names the curve and takes its size from the curve",
+          "[certificates_x509][crypto_profile]") {
+    auto certs = parse_pem_certs(kEcdsaCertPem);
+    REQUIRE(certs.size() == 1);
+    CHECK(certs[0].key_algorithm == "EC P-256");
+    CHECK(certs[0].key_bits == "256");
+    CHECK(certs[0].signature_algorithm == "ecdsa-with-SHA256");
+}
+
+TEST_CASE("crypto profile: ECDSA P-384 with SHA-384", "[certificates_x509][crypto_profile]") {
+    auto certs = parse_pem_certs(kEcdsaP384CertPem);
+    REQUIRE(certs.size() == 1);
+    CHECK(certs[0].key_algorithm == "EC P-384");
+    CHECK(certs[0].key_bits == "384");
+    CHECK(certs[0].signature_algorithm == "ecdsa-with-SHA384");
+}
+
+TEST_CASE("crypto profile: Ed25519 key size is implied, never libcrypto's 253",
+          "[certificates_x509][crypto_profile]") {
+    auto certs = parse_pem_certs(kEd25519CertPem);
+    REQUIRE(certs.size() == 1);
+    CHECK(certs[0].key_algorithm == "Ed25519");
+    CHECK(certs[0].key_bits == "(implied)");
+    CHECK(certs[0].signature_algorithm == "Ed25519");
+}
+
+TEST_CASE("crypto profile: weak RSA-1024 / SHA-1 certificate is reported as such",
+          "[certificates_x509][crypto_profile]") {
+    auto certs = parse_pem_certs(kRsaSha1CertPem);
+    REQUIRE(certs.size() == 1);
+    CHECK(certs[0].key_algorithm == "RSA");
+    CHECK(certs[0].key_bits == "1024");
+    CHECK(certs[0].signature_algorithm == "sha1WithRSAEncryption");
+}
+
+TEST_CASE("crypto profile: the DER (macOS SecItem) path reports the same profile as PEM",
+          "[certificates_x509][crypto_profile]") {
+    auto der = pem_to_der(kEcdsaP384CertPem);
+    REQUIRE_FALSE(der.empty());
+    auto cert = parse_der_cert(std::span<const unsigned char>(der.data(), der.size()));
+    REQUIRE(cert.has_value());
+    CHECK(cert->key_algorithm == "EC P-384");
+    CHECK(cert->key_bits == "384");
+    CHECK(cert->signature_algorithm == "ecdsa-with-SHA384");
 }
