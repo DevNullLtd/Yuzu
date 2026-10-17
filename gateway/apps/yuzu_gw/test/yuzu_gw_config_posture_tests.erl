@@ -253,6 +253,23 @@ agent_edge_is_bounded_in_the_production_configs_test_() ->
             end}
      || Path <- strict_configs()].
 
+%% The packaged release config (config/sys.config, the relx sys_config, which the
+%% .deb/.rpm and the systemd unit run) carries the production listener ceilings:
+%% each listener's `limits' map is the one sys.config.prod gives the listener of
+%% the same name (agent: 60000 connections; mgmt: 256). Without them Ranch's
+%% max_connections is infinity, which the systemd unit's comment and its
+%% LimitNOFILE sizing do not allow for.
+packaged_config_carries_the_production_ceilings_test() ->
+    Limits = fun(Path) ->
+                 maps:from_list([{maps:get(name, L), maps:get(limits, L, none)}
+                                 || L <- listeners(consult(Path))])
+             end,
+    Prod = Limits("config/sys.config.prod"),
+    Packaged = Limits("config/sys.config"),
+    ?assertMatch(#{agent := #{max_connections := 60000},
+                   mgmt := #{max_connections := 256}}, Prod),
+    ?assertEqual(Prod, Packaged).
+
 %% A rig config must parse, must carry the LITERAL hatch (so the boot guard
 %% warns instead of refusing), and must still pass evaluate_mgmt_posture the
 %% way the running gateway will evaluate it.

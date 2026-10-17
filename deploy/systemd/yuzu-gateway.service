@@ -33,8 +33,9 @@ SyslogIdentifier=yuzu-gateway
 # scrape sockets — the default 1024 limit caps useful fleet size at
 # ~700 agents in practice. 65536 mirrors yuzu-server.service.
 LimitNOFILE=65536
-# The listeners' limits.max_connections ceilings (sys.config: 60000 agent, 256
-# management) are sized to this limit; raise them together with it. Firewall the
+# The listeners' limits.max_connections ceilings (60000 agent, 256 management, set
+# in the packaged release sys.config this unit runs and in sys.config.prod) are
+# sized to this limit; raise them together with it. Firewall the
 # management port (:50063 by default) to the server replicas: the 256 ceiling bounds
 # descriptors, it does not keep a stranger from filling it. See docs/user-manual/
 # gateway.md, "Connection ceilings and the unauthenticated ports".
