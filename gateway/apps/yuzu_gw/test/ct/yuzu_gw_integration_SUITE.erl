@@ -384,9 +384,9 @@ agent_disconnect_cleanup(_Config) ->
     unlink(AgentPid),
     timer:sleep(50),
 
-    %% Verify pg group membership.
-    AllAgents = pg:get_members(yuzu_gw, all_agents),
-    ?assert(lists:member(AgentPid, AllAgents)),
+    %% Verify the agent joined its own cross-node lookup group (the only pg
+    %% group an agent is in).
+    ?assertEqual([AgentPid], pg:get_local_members(yuzu_gw, {agent, AgentId})),
 
     %% Kill the agent process.
     exit(AgentPid, kill),

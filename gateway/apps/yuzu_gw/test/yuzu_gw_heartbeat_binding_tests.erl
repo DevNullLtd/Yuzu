@@ -169,18 +169,18 @@ holder() ->
     Pid.
 
 %% Fixture teardown: kill every holder this module spawned and wait until the
-%% registry's `all_agents' / per-agent pg groups no longer list one. A holder
-%% that outlives the module stays a member of the VM-wide pg group, where it
-%% never answers `yuzu_gw_agent' calls: a later module's `yuzu_gw_app:stop/1'
-%% would then spend a second per member in its drain loop.
+%% registry's routing table no longer lists one, so a later module does not
+%% inherit them.
 reap_holders() ->
     Pids = try [P || {P} <- ets:tab2list(?HOLDERS_TAB)] catch error:badarg -> [] end,
     Mons = [monitor(process, P) || P <- Pids],
     [exit(P, kill) || P <- Pids],
     [receive {'DOWN', M, process, _, _} -> ok after 5000 -> ok end || M <- Mons],
     _ = wait_until(fun() ->
-            Members = try pg:get_members(yuzu_gw, all_agents) catch _:_ -> [] end,
-            [] =:= [P || P <- Pids, lists:member(P, Members)]
+            Routed = try [element(2, R) || R <- ets:tab2list(yuzu_gw_agents)]
+                     catch error:badarg -> []
+                     end,
+            [] =:= [P || P <- Pids, lists:member(P, Routed)]
         end, 5000),
     ok.
 

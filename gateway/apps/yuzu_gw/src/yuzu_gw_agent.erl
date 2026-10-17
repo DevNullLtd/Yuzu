@@ -150,7 +150,7 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
         stream_home_id = StreamHomeId
     },
 
-    %% Register in routing table and join pg groups. The RegisterRequest
+    %% Register in the routing table. The RegisterRequest
     %% is stashed in the registry so yuzu_gw_upstream can re-proxy it
     %% when the upstream connection re-establishes.
     Hostname = maps:get(<<"hostname">>, AgentInfo,
@@ -158,6 +158,9 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     case yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
                                          Hostname, RegisterReq, ConnKey) of
         ok ->
+            %% The cross-node lookup group, joined here and not by the registry
+            %% (yuzu_gw_registry's module doc).
+            ok = yuzu_gw_registry:join_agent_group(AgentId),
             announce_connected(Data);
         {error, registry_unavailable} ->
             %% A fixed reason: an init failure is printed by the supervisor and
@@ -228,6 +231,9 @@ connecting(info, {'DOWN', MonRef, process, _Pid, _Reason},
 
 connecting(cast, disconnect, Data) ->
     {next_state, disconnected, Data};
+
+connecting(info, {yuzu_gw_registry, unrouted, Id}, Data) ->
+    leave_if_own(Id, Data);
 
 connecting(cast, {upstream_reannounced, SessionId},
            #data{session_id = SessionId, agent_id = AgentId, peer_addr = PeerAddr,
@@ -314,6 +320,9 @@ streaming({call, From}, get_info, Data) ->
 
 streaming({call, From}, pending_count, #data{pending = Pending}) ->
     {keep_state_and_data, [{reply, From, maps:size(Pending)}]};
+
+streaming(info, {yuzu_gw_registry, unrouted, Id}, Data) ->
+    leave_if_own(Id, Data);
 
 streaming(cast, disconnect, Data) ->
     #data{stream_pid = StreamPid} = Data,
@@ -483,12 +492,23 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
             keep_state_and_data
     end.
 
+%% The registry no longer routes AgentId to this process (a newer registration
+%% replaced it): leave `{agent, AgentId}' so the cross-node lookup fallback
+%% cannot pick this process. The process keeps running until its stream ends.
+leave_if_own(AgentId, #data{agent_id = AgentId}) ->
+    _ = yuzu_gw_registry:leave_agent_group(AgentId),
+    keep_state_and_data;
+leave_if_own(_OtherId, _Data) ->
+    keep_state_and_data.
+
 do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                   connected_at = ConnectedAt, pending = Pending,
                   peer_addr = PeerAddr, stream_home_id = StreamHomeId}) ->
-    %% Deregister from routing table and pg groups. Fenced on this process
-    %% and its own session: if the agent already reconnected under a newer
-    %% session, only this session's index entry goes.
+    %% Leave the cross-node lookup group first (pg would also drop this
+    %% process when it exits), then deregister from the routing table. Fenced
+    %% on this process and its own session: if the agent already reconnected
+    %% under a newer session, only this session's index entry goes.
+    _ = yuzu_gw_registry:leave_agent_group(AgentId),
     yuzu_gw_registry:deregister_agent(AgentId, self(), SessionId),
 
     %% Notify pending command waiters that the agent disconnected,

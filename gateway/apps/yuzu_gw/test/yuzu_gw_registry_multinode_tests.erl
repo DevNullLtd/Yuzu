@@ -53,8 +53,8 @@ remote_lookup_test_() ->
             AgentId = <<"multinode-remote-lookup">>,
             PeerAgentPid = spawn_holder(PeerNode),
 
-            ok = erpc:call(PeerNode, yuzu_gw_registry, register_agent,
-                           [AgentId, PeerAgentPid, undefined, [], <<"peerhost">>]),
+            ok = register_on_peer(PeerNode, AgentId, PeerAgentPid,
+                                  [AgentId, PeerAgentPid, undefined, [], <<"peerhost">>]),
 
             %% Not in THIS node's ETS — must come back via the pg fallback.
             %% `pg' group-membership replication across a real distributed
@@ -149,8 +149,9 @@ remote_session_not_admitted_test_() ->
             SessionId = <<"multinode-remote-session">>,
             AgentId = <<"multinode-remote-session-agent">>,
             PeerAgentPid = spawn_holder(PeerNode),
-            ok = erpc:call(PeerNode, yuzu_gw_registry, register_agent,
-                           [AgentId, PeerAgentPid, SessionId, [], <<"peerhost">>, #{}, conn_a]),
+            ok = register_on_peer(PeerNode, AgentId, PeerAgentPid,
+                                  [AgentId, PeerAgentPid, SessionId, [], <<"peerhost">>, #{},
+                                   conn_a]),
             %% The peer holds the session under the very key presented here.
             ?assertMatch({ok, #{conn_key := conn_a}},
                          erpc:call(PeerNode, yuzu_gw_registry, lookup_session, [SessionId])),
@@ -198,8 +199,8 @@ cross_node_fanout_completes_promptly_test_() ->
             %% the real fix, not a re-implementation of it.
             RemoteAgentPid = erpc:call(PeerNode, erlang, spawn,
                                        [fun remote_agent_loop/0]),
-            ok = erpc:call(PeerNode, yuzu_gw_registry, register_agent,
-                           [AgentId, RemoteAgentPid, undefined, [], <<"peerhost">>]),
+            ok = register_on_peer(PeerNode, AgentId, RemoteAgentPid,
+                                  [AgentId, RemoteAgentPid, undefined, [], <<"peerhost">>]),
 
             %% Same pg cross-node propagation-delay accommodation as the
             %% other tests in this module: wait for THIS node's pg scope
@@ -426,6 +427,14 @@ stop_peer(Peer) ->
 
 %% A trivial process to register as an agent pid — never needs to do
 %% anything except exist and be alive for `is_process_alive/1' checks.
+%% Register a stand-in agent on the peer the way a real agent process does:
+%% the registry call, then the stand-in joining `{agent, AgentId}' (the agent
+%% process joins it itself; the registry makes no pg call). pg:join/3 run on
+%% the peer for a pid local to it.
+register_on_peer(PeerNode, AgentId, Pid, RegisterArgs) ->
+    ok = erpc:call(PeerNode, yuzu_gw_registry, register_agent, RegisterArgs),
+    erpc:call(PeerNode, pg, join, [?PG_SCOPE, {agent, AgentId}, Pid]).
+
 spawn_holder(PeerNode) ->
     erpc:call(PeerNode, erlang, spawn, [fun() -> receive stop -> ok end end]).
 
