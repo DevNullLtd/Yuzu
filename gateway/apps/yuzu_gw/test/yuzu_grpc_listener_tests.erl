@@ -671,12 +671,14 @@ http2_frame_rate_default_test_() ->
      {"an explicit http2 value applies on the agent listener",
       ?_assertEqual({20000, 10000},
                     frame_rate(entry(#{http2 => #{max_received_frame_rate => {20000, 10000}}})))},
-     {"the other defaults are the same on both, and an override leaves the rest",
+     {"the other defaults are the same on both (the management stream cap aside), "
+      "and an override leaves the rest",
       fun() ->
           Base = #{idle_timeout => 600000, max_concurrent_streams => 1024,
                    max_frame_size_received => 16384, linger_timeout => 1000},
           ?assertEqual(Base, yuzu_grpc_listener:http2_opts(entry())),
-          ?assertEqual(Base#{max_received_frame_rate => {100000, 10000}},
+          ?assertEqual(Base#{max_received_frame_rate => {100000, 10000},
+                             max_concurrent_streams => 4096},
                        yuzu_grpc_listener:http2_opts(mgmt_entry())),
           ?assertEqual(Base#{max_received_frame_rate => {100000, 10000},
                              max_concurrent_streams => 32},
