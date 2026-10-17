@@ -2,9 +2,13 @@
 
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "rest_a4_envelope_http.hpp" // detail::a4_error
+#include "rest_audit.hpp"        // detail::try_persist_audit / emit_behavioral_audit
 #include "runtime_config_store.hpp"
 #include "runtime_config_view.hpp" // build_overrides_json
+#include "web_utils.hpp"          // browser_write_is_cross_site
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/server/server.hpp> // struct Config (forward-declared in the header)
 
 #include <nlohmann/json.hpp>
@@ -55,7 +59,8 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         }
         auto overrides_result = deps.runtime_config_store->get_all();
         if (!overrides_result.has_value()) {
-            spdlog::error("GET /api/config: read failed: {}", overrides_result.error());
+            spdlog::error("GET /api/config: read failed: {}",
+                          ::yuzu::log_key_token(overrides_result.error()));
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
@@ -85,6 +90,24 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(
                 R"({"error":{"code":503,"message":"runtime config store unavailable"},"meta":{"api_version":"v1"}})",
                 "application/json");
+            return;
+        }
+
+        // Same-site gate for the cookie-authorised write the General page calls (API, MCP and
+        // engine token callers are exempt). After the permission gate, so an unauthorised caller
+        // still gets the 403 it always did, and before the body is read. auth_fn writes its own
+        // 401 when there is no session.
+        auto session = deps.auth_fn(req, res);
+        if (!session)
+            return;
+        if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
+                                        req.get_header_value("Origin"),
+                                        req.get_header_value("Referer"),
+                                        deps.cfg->csrf_trusted_origins)) {
+            (void)detail::try_persist_audit(deps.audit_fn, req, "csrf.denied", "denied", "Endpoint",
+                                            "config", "cross-site or header-less browser write refused");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
             return;
         }
 
@@ -144,20 +167,69 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
-        // Get username from session
-        auto session = deps.auth_fn(req, res);
-        if (!session)
+        // An unknown key is refused here, before any audit row, so a junk key leaves no
+        // attempted/failure pair. The store repeats the check as the authority.
+        if (!RuntimeConfigStore::is_allowed_key(key)) {
+            res.status = 400;
+            res.set_content(
+                nlohmann::json({{"error", "key '" + key + "' is not a configurable runtime setting"}})
+                    .dump(),
+                "application/json");
             return;
+        }
+
+        // The oidc_* keys decide who becomes an administrator at an SSO login (oidc_admin_group
+        // is read from the stored value at the next start). perm_fn admits a JIT-elevated
+        // session and an MCP-tier token, so require the caller's own administrator role from an
+        // interactive session, as POST /api/settings/oidc does (require_admin). Every other key
+        // stays writable under Infrastructure:Write. Refused before the audit-first `attempted`
+        // row so a denial leaves one `denied` row, not a dangling `attempted` (outcome unknown).
+        if (key.starts_with("oidc_") &&
+            (session->role != auth::Role::admin || !session->mcp_tier.empty())) {
+            (void)deps.audit_fn(req, "config.update", "denied", "RuntimeConfig", key,
+                                auth::is_elevated(*session)
+                                    ? "elevated_session_oidc_setting_blocked"
+                                    : "admin_role_required_oidc_setting_blocked");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "changing sign-in provider settings needs your own "
+                                                  "administrator role"),
+                            "application/json");
+            return;
+        }
+
+        // ADR-0033 section 9, "no audit row, no mutation": an `attempted` row is written before
+        // anything is changed, and a row that cannot be stored refuses the change. The outcome
+        // row follows. The attempted row carries no value (a secret key's value never reaches an
+        // audit detail; the outcome row below redacts it).
+        if (!detail::emit_behavioral_audit(deps.audit_fn, req, res, "config.update", "attempted",
+                                           "RuntimeConfig", key, "")) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "audit log unavailable; the change was not made",
+                                             detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                                 .remediation = "retry the request"}),
+                            "application/json");
+            return;
+        }
 
         auto result = deps.runtime_config_store->set(key, value, session->username);
         if (!result) {
+            // Best effort: the attempted row is already durable, and the response does not change.
+            // A refusal of the value is operator-written text (no value, no secret); a database
+            // failure may have committed before the acknowledgement was lost, so it is not
+            // recorded as "not applied".
+            const bool db_failure = result.error().starts_with(kRuntimeConfigDbErrorPrefix);
+            (void)detail::try_persist_audit(deps.audit_fn, req, "config.update", "failure",
+                                            "RuntimeConfig", key,
+                                            db_failure ? "store error; outcome unknown"
+                                                       : result.error());
             // A genuine DB/crypto failure (kRuntimeConfigDbErrorPrefix) is a
             // 503 with a generic message -- never echo the internal detail
             // to the caller; caller-input validation (unknown key, bad
             // value shape, the redaction-placeholder guard) is a 400 with
             // the store's own message, which is written for an operator.
             if (result.error().starts_with(kRuntimeConfigDbErrorPrefix)) {
-                spdlog::error("PUT /api/config/{}: write failed: {}", key, result.error());
+                spdlog::error("PUT /api/config/{}: write failed: {}", ::yuzu::log_key_token(key),
+                              ::yuzu::log_key_token(result.error()));
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
@@ -189,10 +261,13 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         // readable by every role seeded AuditLog:Read (Operator among them) -- so
         // writing a credential here is a worse sink than the log and the API this
         // branch already fixed, and it is not rotatable away afterwards.
-        (void)deps.audit_fn(req, "config.update", "success", "RuntimeConfig", key,
-                            "value=" + (RuntimeConfigStore::is_secret_key(key)
-                                            ? std::string(RuntimeConfigStore::redacted_placeholder())
-                                            : value));
+        // The attempted row already exists, so a lost outcome row does not undo the change; it is
+        // surfaced the way the other audited routes do (Sec-Audit-Failed), so a caller can show it.
+        (void)detail::emit_behavioral_audit(
+            deps.audit_fn, req, res, "config.update", "success", "RuntimeConfig", key,
+            "value=" + (RuntimeConfigStore::is_secret_key(key)
+                            ? std::string(RuntimeConfigStore::redacted_placeholder())
+                            : value));
 
         res.set_content(
             nlohmann::json(RuntimeConfigStore::is_secret_key(key)

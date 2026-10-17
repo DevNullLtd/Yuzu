@@ -259,13 +259,13 @@ struct FakeBackend : ISparkBackend {
         arm_park.maybe_park(lane);
         if (throw_arm.load()) throw std::runtime_error("arm boom");
         if (fail_arm.load()) return std::unexpected(std::string{"no mechanism"});
-        arms.fetch_add(1);
         const std::uint64_t id = next.fetch_add(1);
         {
             std::lock_guard<std::mutex> lk{ids_mu_};
             armed_ids_.push_back(id);
             id_lane_[id] = lane;
         }
+        arms.fetch_add(1); // after the id is recorded: a reader that saw the count sees the id
         return id;
     }
     void disarm(std::uint64_t sub) override {
@@ -417,6 +417,15 @@ RuleAssertion file_exists_rule(const std::string& rule_id, bool present = true) 
     a.kind = AssertionKind::FileExists;
     a.rule_id = rule_id;
     a.expect_present = present;
+    return a;
+}
+// #4415: an identical re-attach of a healthy rule is a skip (see
+// test_guardian_spark_reapply_skip_runtime.cpp), so a test that needs a REPLACEMENT of a rule on
+// the same key (the Case 0 withdraw-and-requeue, a redeploy, a supersede) must change its content.
+// The name is content (RuleAssertion::rule_name) but not part of the spark key.
+RuleAssertion file_exists_rule_redeployed(const std::string& rule_id) {
+    RuleAssertion a = file_exists_rule(rule_id);
+    a.rule_name = "redeployed";
     return a;
 }
 // #4045: a file-hash-equals rule. Empty `expected_hash` = baseline-on-arm (the capture the
@@ -907,6 +916,219 @@ TEST_CASE("drain does NOT let a stuck lifecycle head block compliance (Gate 4 UP
     CHECK(got[1] == OutboxDomain::Compliance); // then compliance, NOT blocked
 }
 
+// ── #3972 C1: per-entry sequence + empty-transition epochs ───────────────────
+// seq is stamped under outbox_mu_ at every enqueue site and read by nothing yet except
+// these tests; the cross-lane launch hold (a later commit) is its consumer.
+
+namespace {
+// Every entry a full drain would send, in send order (all domains), WITHOUT the
+// compliance/health-only filtering drain_all applies.
+std::vector<OutboxEntry> drain_everything(GuardianSparkRuntime& rt) {
+    std::vector<OutboxEntry> got;
+    rt.drain([&](const OutboxEntry& e) {
+        got.push_back(e);
+        return SendResult::Sent;
+    });
+    return got;
+}
+} // namespace
+
+TEST_CASE("#3972: seq is monotonic across lanes (armed < verdict < disarmed)",
+          "[spark][runtime][outbox]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    CHECK_FALSE(rt->lifecycle_front_seq().has_value());
+    CHECK_FALSE(rt->outbox_front_seq().has_value());
+
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // Lifecycle "armed"
+    rt->evaluate_key(key, EvalReason::Initial);                           // Compliance edge
+    const auto armed_seq = rt->lifecycle_front_seq();
+    const auto verdict_seq = rt->outbox_front_seq();
+    REQUIRE(armed_seq.has_value());
+    REQUIRE(verdict_seq.has_value());
+    CHECK(*armed_seq > 0);
+    CHECK(*armed_seq < *verdict_seq);
+
+    // Both lanes drain empty, then a disarm lands later in enqueue order than the verdict.
+    REQUIRE(drain_everything(*rt).size() == 2);
+    CHECK_FALSE(rt->lifecycle_front_seq().has_value());
+    rt->detach_rule("r1"); // Lifecycle "disarmed"
+    const auto disarmed_seq = rt->lifecycle_front_seq();
+    REQUIRE(disarmed_seq.has_value());
+    CHECK(*disarmed_seq > *verdict_seq);
+}
+
+TEST_CASE("#3972: a coalesce re-stamps the entry and keeps its position",
+          "[spark][runtime][outbox]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key_a = spark_key(file_spec("/a"));
+    const auto key_b = spark_key(file_spec("/b"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+    rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2", /*present=*/true), true);
+    REQUIRE(drain_lifecycle(*rt).size() == 2); // out of the way: only compliance left
+
+    r->file = read_known(FileSnapshot{.exists = true}); // compliant
+    rt->evaluate_key(key_a, EvalReason::Initial);       // r1 verdict, queued first
+    rt->evaluate_key(key_b, EvalReason::Initial);       // r2 verdict, queued second
+    REQUIRE(rt->outbox_size() == 2);
+    const auto first_seq = rt->outbox_front_seq();
+    REQUIRE(first_seq.has_value());
+
+    r->file = read_known(FileSnapshot{.exists = false}); // r1 now drifts
+    rt->evaluate_key(key_a, EvalReason::Event);          // coalesces over r1's queued verdict
+    REQUIRE(rt->outbox_size() == 2);                     // coalesce: no growth
+
+    const auto got = drain_everything(*rt);
+    REQUIRE(got.size() == 2);
+    CHECK(got[0].rule_id == "r1");        // position kept: still the head
+    CHECK_FALSE(got[0].drift.compliant);  // ... but carrying the latest observation
+    CHECK(got[1].rule_id == "r2");
+    CHECK(got[0].seq > got[1].seq);       // re-stamped: "enqueue order" is the LATEST observation
+    CHECK(got[0].seq > *first_seq);
+}
+
+TEST_CASE("#3972: a replay page is stamped above any live seq, and stamps overwrite",
+          "[spark][runtime][outbox]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    rt->evaluate_key(key, EvalReason::Initial); // live verdict, enqueued BEFORE the page
+    const auto live_verdict = rt->outbox_front_seq();
+    REQUIRE(live_verdict.has_value());
+
+    auto p1 = lc_entry("old1", "p1");
+    auto p2 = lc_entry("old2", "p2");
+    p1.seq = 1; // a hand-set seq must not survive paging
+    p2.seq = 1;
+    REQUIRE(rt->try_page_batch({std::move(p1), std::move(p2)}).added == 2);
+
+    const auto got = drain_everything(*rt);
+    REQUIRE(got.size() == 4); // armed, p1, p2 (lifecycle first), then the verdict
+    std::vector<std::uint64_t> paged;
+    for (const auto& e : got)
+        if (e.event_id == "p1" || e.event_id == "p2")
+            paged.push_back(e.seq);
+    REQUIRE(paged.size() == 2);
+    CHECK(paged[0] > *live_verdict);
+    CHECK(paged[1] > paged[0]); // monotonic within the page
+}
+
+TEST_CASE("#3972 tripwire: every production enqueue path yields seq > 0",
+          "[spark][runtime][outbox]") {
+    // seq == 0 is "unstamped" and is FAIL-OPEN for the (later) cross-lane hold: an unstamped
+    // entry is never held and never blocks. A production enqueue path that forgets to stamp
+    // would silently exempt its entries from the ordering guarantee, so each of the five
+    // sites is exercised here and every entry it produces is checked.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+
+    SECTION("armed (enqueue_lifecycle_locked, arm branch)") {
+        rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        const auto got = drain_everything(*rt);
+        REQUIRE(got.size() == 1);
+        CHECK(got[0].lifecycle_kind == "armed");
+        CHECK(got[0].seq > 0);
+    }
+    SECTION("disarmed (enqueue_lifecycle_locked, disarm branch)") {
+        rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        (void)drain_everything(*rt);
+        rt->detach_rule("r1");
+        const auto got = drain_everything(*rt);
+        REQUIRE(got.size() == 1);
+        CHECK(got[0].lifecycle_kind == "disarmed");
+        CHECK(got[0].seq > 0);
+    }
+    SECTION("verdict, health and recovery pair (evaluate_key enqueue_all)") {
+        rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+        (void)drain_everything(*rt);
+        r->file = read_unknown<FileSnapshot>("io"); // errored -> Health(false)
+        rt->evaluate_key(key, EvalReason::Initial);
+        auto got = drain_everything(*rt);
+        REQUIRE(got.size() == 1);
+        CHECK(got[0].domain == OutboxDomain::Health);
+        CHECK(got[0].seq > 0);
+
+        r->file = read_known(FileSnapshot{.exists = false}); // recovery to a drift: pair
+        rt->evaluate_key(key, EvalReason::Event);
+        got = drain_everything(*rt);
+        REQUIRE(got.size() == 2);
+        for (const auto& e : got)
+            CHECK(e.seq > 0);
+        CHECK(got[0].seq < got[1].seq); // the pair is stamped in vector order
+    }
+    SECTION("subscription fault health (on_subscription_faulted enqueue_all)") {
+        REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+        (void)drain_everything(*rt);
+        REQUIRE(b->armed_ids().size() == 1);
+        rt->on_event(SparkEvent{.key = key,
+                                .kind = SparkEventKind::Faulted,
+                                .subscription_id = b->armed_ids().front(),
+                                .detail = "boom"});
+        const auto got = drain_everything(*rt);
+        REQUIRE(got.size() == 1);
+        CHECK(got[0].domain == OutboxDomain::Health);
+        CHECK(got[0].seq > 0);
+    }
+    SECTION("errored (on_subscription_lost -> detach -> lifecycle)") {
+        REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+        (void)drain_everything(*rt);
+        b->set_health_for_test(b->armed_ids().front(), SubscriptionHealth::Dead);
+        rt->revalidate_subscriptions();
+        const auto got = drain_everything(*rt);
+        REQUIRE_FALSE(got.empty());
+        for (const auto& e : got)
+            CHECK(e.seq > 0);
+    }
+    SECTION("replay page (try_page_batch)") {
+        REQUIRE(rt->try_page_batch({lc_entry("old1", "p1"), lc_entry("old2", "p2")}).added == 2);
+        const auto got = drain_everything(*rt);
+        REQUIRE(got.size() == 2);
+        for (const auto& e : got)
+            CHECK(e.seq > 0);
+    }
+}
+
+TEST_CASE("#3972: the empty-transition epochs advance only on removal-to-empty",
+          "[spark][runtime][outbox]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    CHECK(rt->lifecycle_empty_epoch() == 0);
+    CHECK(rt->outbox_empty_epoch() == 0);
+
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(key, EvalReason::Initial);
+    r->file = read_known(FileSnapshot{.exists = false});
+    rt->evaluate_key(key, EvalReason::Event); // coalesces over the queued verdict
+    REQUIRE(rt->outbox_size() == 1);
+    CHECK(rt->lifecycle_empty_epoch() == 0); // enqueue and coalesce never bump
+    CHECK(rt->outbox_empty_epoch() == 0);
+
+    REQUIRE(drain_everything(*rt).size() == 2); // each lane popped to empty once
+    CHECK(rt->lifecycle_empty_epoch() == 1);
+    CHECK(rt->outbox_empty_epoch() == 1);
+
+    // drop_rule emptying the compliance/health list (detach with a verdict still queued)
+    // advances only that lane's epoch here; the disarmed lifecycle entry is an enqueue.
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(rt->outbox_size() == 1);
+    rt->detach_rule("r1");
+    CHECK(rt->outbox_size() == 0);
+    CHECK(rt->outbox_empty_epoch() == 2);
+    CHECK(rt->lifecycle_empty_epoch() == 1);
+}
+
 TEST_CASE("drain counts a send that throws and retains the head (item 4 hardening)",
           "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
@@ -976,8 +1198,9 @@ TEST_CASE("re-attach supersedes the old generation and purges its stale entry", 
     rt->evaluate_key(key, EvalReason::Initial);
     REQUIRE(rt->outbox_size() == 1);
 
-    // Re-attach (same rule) -> a new generation; the stale gen-1 entry is purged.
-    const auto gen2 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    // Re-attach (same rule, changed content: an identical one is a skip, #4415) -> a new
+    // generation; the stale gen-1 entry is purged.
+    const auto gen2 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule_redeployed("r1"), true);
     REQUIRE(gen2.value() > gen1.value());
     REQUIRE(rt->outbox_size() == 0);
 
@@ -6048,8 +6271,8 @@ TEST_CASE("rung 9c R5.2: a same-key REDEPLOY queues its own rearm behind its own
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
 
     b->hang_next_disarm.store(true);
-    QueuedAttach re1; // r1 re-pushed onto the SAME key
-    re1.t = std::thread{[&] { re1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    QueuedAttach re1; // r1 re-pushed onto the SAME key, with changed content (an identical one is a skip, #4415)
+    re1.t = std::thread{[&] { re1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule_redeployed("r1"), true); }};
     struct Cleanup {
         FakeBackend* backend;
         ~Cleanup() { backend->release_disarm_hang(); }
@@ -6496,9 +6719,10 @@ TEST_CASE("rung 9c R5.2 (adversarial review C1/K1'): an adopted commit is publis
     rt->detach_rule("r2");
     // rung 9c PR-2 Unit 3: the ->0 edge's disarm dispatches off-lock through
     // non-blocking submit_disarm_off_lock() - observed asynchronously.
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarm_entries.load() == 1; },
+    // Spin on the recorded id itself: disarm_entries is bumped on ENTRY, before the id is
+    // pushed, so a reader that saw entries == 1 could still find disarmed_ids() empty.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarmed_ids().size() == 1; },
                                    std::chrono::seconds(10)));
-    REQUIRE(b->disarmed_ids().size() == 1);
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
     CHECK(rt->armed_key_count() == 0);
 }
@@ -8644,8 +8868,9 @@ TEST_CASE("#5322: a same-rule re-attach under the sticky seam leaves no residue 
     f.rt->set_index_remove_fault_count_for_test(-1);
     const auto failures_before = f.rt->claim_index_release_failures();
     // Case 0 withdraws generation 1 in place (its release fails: 1), generation 2 queues and
-    // add() transfers the mapping to it.
-    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    // add() transfers the mapping to it. Generation 2 carries changed content: an identical
+    // attach re-observes generation 1's live claim instead (#4415).
+    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule_redeployed("r"), true);
     REQUIRE(g2.has_value());
     CHECK(f.rt->claim_index_release_failures() == failures_before + 1);
 
@@ -8677,8 +8902,9 @@ TEST_CASE("#5322: releasing a claim that no longer owns its mapping cannot fail"
     f.rt->set_index_remove_fault_count_for_test(-1);
     const auto failures_before = f.rt->claim_index_release_failures();
     // Case 0 withdraws generation 1 in the MIDDLE of the fifo (its release fails: 1),
-    // generation 2 queues behind it and the mapping transfers.
-    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    // generation 2 queues behind it and the mapping transfers. Generation 2 carries changed
+    // content: an identical attach re-observes generation 1's queued claim instead (#4415).
+    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule_redeployed("r"), true);
     REQUIRE(g2.has_value());
     CHECK(f.rt->claim_index_release_failures() == failures_before + 1);
 

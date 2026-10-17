@@ -57,9 +57,9 @@ an earlier revision missed eight of these; later additions are recorded in that 
   `consteval` lookup that makes removing/renaming its table entry a **build failure**
   (the `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
   DisabledUntilFixed passes (incl. the concurrency reconciler), plus the load-bearing
-  ReplicaSafe ones (the event-outbox poll, the three retention prunes, the app_perf
-  rollup upsert, and the must-run-per-replica / shared-PG-writing passes the sweep
-  added: cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
+  ReplicaSafe ones (the event-outbox poll, the four retention prunes (incl.
+  `offline_endpoint_store.run_retention_prune`, #5678), the app_perf rollup upsert,
+  and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
   projector, MCP bridge sweep + session gc, the Guardian reconcile claim sweep
   `guardian_reconcile_gate.sweep` (#5513), store-worker delivery pools, the HA WS-8
   Postgres reachability probe).
@@ -77,7 +77,9 @@ The three formerly-bare wall-clock prunes — `app_perf_fleet_store`,
 `preflight_run_store`, `deployment_run_store` — now run through the shared
 `pg::run_clock_guarded_prune` helper (`server/core/src/pg/pg_retention_guard.hpp`):
 the full seven-part clock guard + a `pg_try_advisory_xact_lock` making it
-SINGLE-WRITER-safe, reading Postgres `now()` in-SQL (the shared clock). The
+SINGLE-WRITER-safe, reading Postgres `now()` in-SQL (the shared clock). A fourth,
+`offline_endpoint_store.run_retention_prune` (#5678), adopts the same helper on
+`preflight_runner_thread_` (keyed on the PG-authored `last_seen_at`). The
 `concurrency_claims` reconciler gained the same advisory lock, but **not** the shared
 clock — its clock authority stays replica-local and its part-3 sanitiser is
 floors-only, so it is **DisabledUntilFixed**, not ReplicaSafe, until the

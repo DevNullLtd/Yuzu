@@ -2,6 +2,8 @@
 
 #include "pg_raii.hpp"
 
+#include <yuzu/log_token.hpp>
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -323,7 +325,7 @@ PGconn* PgPool::connect_one() {
         // host/port and the failure cause, never credentials. The malformed
         // case never reaches here (rejected at construction).
         std::string err = conn ? PQerrorMessage(conn.get()) : "out of memory";
-        spdlog::warn("PgPool: connection attempt failed: {}", err);
+        spdlog::warn("PgPool: connection attempt failed: {}", ::yuzu::log_key_token(err));
         set_error(std::move(err));
         // Observer runs here: connect_one is always called WITHOUT mu_ held.
         if (observer_.on_connect_failure)
@@ -397,7 +399,8 @@ bool PgPool::run_in_txn(Lease lease, const std::function<bool(PGconn*)>& fn) {
 
     PgResult begin{PQexec(lease.get(), "BEGIN")};
     if (begin.status() != PGRES_COMMAND_OK) {
-        spdlog::error("PgPool: BEGIN failed: {}", PQerrorMessage(lease.get()));
+        spdlog::error("PgPool: BEGIN failed: {}",
+                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return false;
     }
     // Declared after `lease` so unwind order is txn-rollback first, then the

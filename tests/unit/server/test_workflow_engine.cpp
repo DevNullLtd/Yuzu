@@ -13,6 +13,9 @@
  * list_executions, the degrade path (migration failure → is_open()==false → every method reports
  * a typed kDbErrorPrefix failure), and the schema-level FK invariant (workflow_executions →
  * workflows has no cascade — a direct hard DELETE while history exists is rejected).
+ *
+ * The `query_executions_page` list read (keyset walk, SQL builder text, confinement predicate
+ * differential, latest-per-workflow) is covered in the "Execution list" section at the end.
  */
 
 #include "workflow_engine.hpp"
@@ -22,17 +25,21 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
+#include "workflow_model.hpp" // workflow_execution_visible: the differential oracle for the list predicate
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -905,6 +912,10 @@ TEST_CASE("WorkflowEngine reports !is_open on a migration failure and every meth
     REQUIRE_FALSE(list_exec_result.has_value());
     CHECK(list_exec_result.error().starts_with(kDbErrorPrefix));
 
+    auto page_result = engine.query_executions_page({}, std::nullopt);
+    REQUIRE_FALSE(page_result.has_value());
+    CHECK(page_result.error().starts_with(kDbErrorPrefix));
+
     auto cancel_result = engine.cancel_execution("anything");
     REQUIRE_FALSE(cancel_result.has_value());
     CHECK(cancel_result.error().starts_with(kDbErrorPrefix));
@@ -1009,4 +1020,653 @@ TEST_CASE("WorkflowEngine: cancel_execution on an already-terminal execution rep
     REQUIRE(exec.has_value());
     REQUIRE(exec->has_value());
     CHECK((*exec)->status == "completed"); // never overwritten to "cancelled"
+}
+
+// ── Execution list (query_executions_page) ───────────────────────────────────
+//
+// Rows are seeded by direct INSERT: the list needs exact started_at ties, malformed
+// agent_ids_json and ids execute() would never mint, none of which the engine can produce.
+
+namespace {
+
+constexpr const char* kListSelectHead =
+    "SELECT e.id, e.workflow_id, w.name, (w.deleted_at <> 0), e.status, e.current_step, "
+    "e.started_at, e.completed_at FROM workflow_engine.workflow_executions e "
+    "JOIN workflow_engine.workflows w ON w.id = e.workflow_id WHERE 1=1";
+
+// The guarded-jsonb expression the confinement clause iterates (nested CASE, see the builder).
+constexpr const char* kGuardedJsonb =
+    "CASE WHEN pg_input_is_valid(e.agent_ids_json, 'jsonb') "
+    "THEN (CASE WHEN jsonb_typeof(e.agent_ids_json::jsonb) = 'array' "
+    "THEN e.agent_ids_json::jsonb ELSE '[]'::jsonb END) ELSE '[]'::jsonb END";
+
+std::string wf_yaml(const std::string& name) {
+    return "kind: Workflow\nmetadata:\n  displayName: " + name +
+           "\nspec:\n  steps:\n    - instruction: inst-1\n      label: step one\n";
+}
+
+void seed_run(PGconn* conn, const std::string& id, const std::string& workflow_id, int64_t started,
+              const std::string& agent_ids_json, const std::string& status = "completed") {
+    PgResult r = yuzu::server::pg::exec_params(
+        conn,
+        "INSERT INTO workflow_engine.workflow_executions "
+        "(id, workflow_id, status, agent_ids_json, started_at, completed_at, current_step) "
+        "VALUES ($1, $2, $3, $4, $5::bigint, $5::bigint, 1)",
+        std::vector<std::string>{id, workflow_id, status, agent_ids_json, std::to_string(started)});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+std::vector<std::string> ids_of(const WorkflowExecutionPage& p) {
+    std::vector<std::string> out;
+    for (const auto& r : p.rows)
+        out.push_back(r.id);
+    return out;
+}
+
+using Scope = std::optional<std::vector<std::string>>;
+
+} // namespace
+
+TEST_CASE("build_execution_page_sql: the unfiltered newest-first statement is pinned",
+          "[workflow_engine][list][sql]") {
+    const auto b = build_execution_page_sql(WorkflowExecutionListQuery{}, std::nullopt);
+    CHECK(b.sql == std::string(kListSelectHead) +
+                       " ORDER BY e.started_at DESC, e.id DESC LIMIT $1::bigint");
+    CHECK(b.params == std::vector<std::string>{"51"}); // limit 50 + the sentinel row
+    // The read's statement bound comes from the builder, not from a literal in the shell. This
+    // pins the text only: that the shell RUNS it is pinned by the lock-held read case below
+    // ("a read blocked behind an exclusive lock ...", [timeout]), which needs a real connection.
+    CHECK(b.statement_timeout_sql == "SET LOCAL statement_timeout = '1500ms'");
+}
+
+TEST_CASE("build_execution_page_sql: every filter binds a parameter and nothing is spliced",
+          "[workflow_engine][list][sql]") {
+    WorkflowExecutionListQuery q;
+    q.workflow_id = "wf-1' OR '1'='1";
+    q.status = "failed";
+    q.since = 100;
+    q.until = 200;
+    q.limit = 7;
+    q.after = keyset::Position{150, "run-9"};
+    const auto b = build_execution_page_sql(q, std::nullopt);
+    CHECK(b.sql == std::string(kListSelectHead) +
+                       " AND e.workflow_id = $1 AND e.status = $2 AND e.started_at >= $3::bigint"
+                       " AND e.started_at < $4::bigint"
+                       " AND (e.started_at < $5::bigint OR (e.started_at = $5::bigint AND e.id < $6))"
+                       " ORDER BY e.started_at DESC, e.id DESC LIMIT $7::bigint");
+    CHECK(b.params == std::vector<std::string>{"wf-1' OR '1'='1", "failed", "100", "200", "150",
+                                               "run-9", "8"});
+    CHECK(b.sql.find("OR '1'='1") == std::string::npos);
+}
+
+TEST_CASE("build_execution_page_sql: the confinement clause precedes ORDER BY and LIMIT",
+          "[workflow_engine][list][sql][confinement]") {
+    // ADR-0017 INV-3 tripwire: applied after LIMIT an invisible run would consume a page slot.
+    WorkflowExecutionListQuery q;
+    q.workflow_id = "wf-1";
+    q.after = keyset::Position{150, "run-9"};
+    const Scope scope{std::vector<std::string>{"a\"1", "b\\2"}};
+    const auto b = build_execution_page_sql(q, scope);
+    CHECK(b.sql == std::string(kListSelectHead) +
+                       " AND e.workflow_id = $1"
+                       " AND (e.started_at < $2::bigint OR (e.started_at = $2::bigint AND e.id < $3))"
+                       " AND EXISTS (SELECT 1 FROM jsonb_array_elements(" +
+                       kGuardedJsonb +
+                       ") AS a(v) WHERE jsonb_typeof(a.v) = 'string' AND (a.v #>> '{}') = "
+                       "ANY($4::text[]))"
+                       " ORDER BY e.started_at DESC, e.id DESC LIMIT $5::bigint");
+    // The visible set is ONE array bind however large it is (no per-agent placeholder cap), with
+    // quote and backslash escaped for the array literal.
+    // Spelled as an ordinary literal outside the macro: MSVC's preprocessor mis-lexes a raw string
+    // that carries quotes and backslashes when it sits inside a macro argument (C2017).
+    const std::string visible_array = "{\"a\\\"1\",\"b\\\\2\"}";
+    CHECK(b.params == std::vector<std::string>{"wf-1", "150", "run-9", visible_array, "51"});
+    const auto scope_at = b.sql.find("jsonb_array_elements");
+    REQUIRE(scope_at != std::string::npos);
+    CHECK(scope_at < b.sql.find("ORDER BY"));
+    CHECK(scope_at < b.sql.find("LIMIT"));
+}
+
+TEST_CASE("build_execution_page_sql: an engaged-empty scope can never become an unfiltered read",
+          "[workflow_engine][list][sql][confinement]") {
+    const auto b = build_execution_page_sql(WorkflowExecutionListQuery{}, Scope{std::vector<std::string>{}});
+    CHECK(b.sql == std::string(kListSelectHead) +
+                       " AND 1=0 ORDER BY e.started_at DESC, e.id DESC LIMIT $1::bigint");
+}
+
+TEST_CASE("build_execution_page_sql: latest-per-workflow orders by workflow and ignores the cursor",
+          "[workflow_engine][list][sql]") {
+    WorkflowExecutionListQuery q;
+    q.latest_per_workflow = true;
+    q.status = "failed";
+    q.limit = 3;
+    q.after = keyset::Position{150, "run-9"}; // never combined with a cursor upstream; ignored here
+    const auto b = build_execution_page_sql(q, std::nullopt);
+    CHECK(b.sql == std::string("SELECT DISTINCT ON (e.workflow_id) ") +
+                       std::string(kListSelectHead).substr(7) + " AND e.status = $1"
+                       " ORDER BY e.workflow_id, e.started_at DESC, e.id DESC LIMIT $2::bigint");
+    CHECK(b.params == std::vector<std::string>{"failed", "4"});
+}
+
+TEST_CASE("build_execution_page_sql: limit is clamped to 1..500 before the sentinel is added",
+          "[workflow_engine][list][sql]") {
+    // One field feeds both bounds: the statement selects `limit + 1`, the store trims to `limit`.
+    for (const auto& [asked, want] : std::vector<std::pair<int, int>>{
+             {0, 1}, {-5, 1}, {1, 1}, {500, 500}, {501, 500}, {100000, 500}}) {
+        INFO("asked " << asked);
+        WorkflowExecutionListQuery q;
+        q.limit = asked;
+        const auto b = build_execution_page_sql(q, std::nullopt);
+        CHECK(b.limit == want);
+        CHECK(b.params.back() == std::to_string(want + 1));
+    }
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: a keyset walk over same-second ties skips and "
+          "repeats nothing",
+          "[workflow_engine][pg][list]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf = *engine.create_workflow(wf_yaml("walk"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    // Three runs share t=200, three share t=100, one is older: id is the tiebreak.
+    for (const auto& [id, t] : std::vector<std::pair<std::string, int64_t>>{
+             {"r-a", 200}, {"r-c", 200}, {"r-b", 200}, {"r-e", 100},
+             {"r-d", 100}, {"r-f", 100}, {"r-g", 50}})
+        seed_run(conn.get(), id, wf, t, R"(["agent-1"])");
+    const std::vector<std::string> expected{"r-c", "r-b", "r-a", "r-f", "r-e", "r-d", "r-g"};
+
+    WorkflowExecutionListQuery q;
+    q.limit = 2;
+    std::vector<std::string> walked;
+    std::vector<std::size_t> page_sizes;
+    for (int guard = 0; guard < 10; ++guard) {
+        auto page = engine.query_executions_page(q, std::nullopt);
+        REQUIRE(page.has_value());
+        page_sizes.push_back(page->rows.size());
+        for (const auto& id : ids_of(*page))
+            walked.push_back(id);
+        if (!page->next)
+            break;
+        // The cursor position is the last row returned, never the sentinel.
+        CHECK(page->next->id == page->rows.back().id);
+        CHECK(page->next->key == page->rows.back().started_at);
+        q.after = page->next;
+    }
+    CHECK(walked == expected);
+    CHECK(page_sizes == std::vector<std::size_t>{2, 2, 2, 1});
+
+    // Exactly `limit` rows left is NOT "more": the sentinel row is what says there is more.
+    q.after.reset();
+    q.limit = 7;
+    auto all = engine.query_executions_page(q, std::nullopt);
+    REQUIRE(all.has_value());
+    CHECK(ids_of(*all) == expected);
+    CHECK_FALSE(all->next.has_value());
+    q.limit = 6;
+    auto six = engine.query_executions_page(q, std::nullopt);
+    REQUIRE(six.has_value());
+    CHECK(six->rows.size() == 6);
+    REQUIRE(six->next.has_value());
+    CHECK(six->next->id == "r-d");
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: a soft-deleted workflow's runs still list and "
+          "say so",
+          "[workflow_engine][pg][list]") {
+    WORKFLOW_ENGINE(engine);
+    const auto kept = *engine.create_workflow(wf_yaml("kept-wf"));
+    const auto gone = *engine.create_workflow(wf_yaml("gone-wf"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    seed_run(conn.get(), "run-kept", kept, 20, "[]");
+    seed_run(conn.get(), "run-gone", gone, 10, "[]", "failed");
+    REQUIRE(engine.delete_workflow(gone).has_value());
+
+    auto page = engine.query_executions_page({}, std::nullopt);
+    REQUIRE(page.has_value());
+    REQUIRE(page->rows.size() == 2);
+    CHECK(page->rows[0].id == "run-kept");
+    CHECK(page->rows[0].workflow_name == "kept-wf");
+    CHECK_FALSE(page->rows[0].workflow_deleted);
+    CHECK(page->rows[1].id == "run-gone");
+    CHECK(page->rows[1].workflow_name == "gone-wf");
+    CHECK(page->rows[1].workflow_deleted);
+    CHECK(page->rows[1].status == "failed");
+    CHECK(page->rows[1].current_step == 1);
+    CHECK(page->rows[1].started_at == 10);
+    CHECK(page->rows[1].completed_at == 10);
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: filters narrow exactly and combine with AND",
+          "[workflow_engine][pg][list]") {
+    WORKFLOW_ENGINE(engine);
+    const auto w1 = *engine.create_workflow(wf_yaml("filter-one"));
+    const auto w2 = *engine.create_workflow(wf_yaml("filter-two"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    seed_run(conn.get(), "r1", w1, 100, "[]", "completed");
+    seed_run(conn.get(), "r2", w1, 200, "[]", "failed");
+    seed_run(conn.get(), "r3", w2, 300, "[]", "failed");
+    seed_run(conn.get(), "r4", w2, 400, "[]", "running");
+
+    const auto run = [&](WorkflowExecutionListQuery q) {
+        auto page = engine.query_executions_page(q, std::nullopt);
+        REQUIRE(page.has_value());
+        return ids_of(*page);
+    };
+    WorkflowExecutionListQuery q;
+    q.workflow_id = w1;
+    CHECK(run(q) == std::vector<std::string>{"r2", "r1"});
+    q = {};
+    q.status = "failed";
+    CHECK(run(q) == std::vector<std::string>{"r3", "r2"});
+    q = {};
+    q.since = 200; // inclusive
+    CHECK(run(q) == std::vector<std::string>{"r4", "r3", "r2"});
+    q = {};
+    q.until = 300; // exclusive
+    CHECK(run(q) == std::vector<std::string>{"r2", "r1"});
+    q = {};
+    q.since = 200;
+    q.until = 400;
+    q.status = "failed";
+    CHECK(run(q) == std::vector<std::string>{"r3", "r2"});
+    q.workflow_id = w2;
+    CHECK(run(q) == std::vector<std::string>{"r3"});
+    q = {};
+    q.workflow_id = "no-such-workflow";
+    CHECK(run(q).empty());
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: the SQL visibility predicate equals "
+          "workflow_execution_visible over a corpus",
+          "[workflow_engine][pg][list][confinement]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf = *engine.create_workflow(wf_yaml("corpus"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+    // (label, agent_ids_json). Labels are the run ids so a failure names the shape.
+    const std::vector<std::pair<std::string, std::string>> corpus{
+        {"one-in", R"(["a1"])"},
+        {"two-one-in", R"(["z9","a1"])"},
+        {"two-none-in", R"(["z9","y8"])"},
+        {"other-only", R"(["b1"])"},
+        {"both-scopes", R"(["a1","b1"])"},
+        {"empty-array", "[]"},
+        {"empty-text", ""},
+        {"not-json", "not json at all"},
+        {"truncated", R"(["a1")"},
+        {"object", R"({"agent":"a1"})"},
+        {"object-numeric-keys", R"({"0":"a1"})"},
+        {"null-scalar", "null"},
+        {"string-scalar", R"("a1")"},
+        {"number-scalar", "7"},
+        {"numbers-only", "[1,2,3]"},
+        {"mixed-types", R"([1,null,true,"a1",{"x":"a1"}])"},
+        {"nested-array", R"([["a1"]])"},
+        {"duplicates", R"(["a1","a1","a1"])"},
+        {"leading-space-id", R"([" a1"])"},
+        {"case-differs", R"(["A1"])"},
+        // A raw string keeps the backslashes, so the JSON text really holds \u0061\u0031; both
+        // parsers decode it to "a1". (A plain string literal would need the backslashes doubled.)
+        {"unicode-escape-in", R"(["\u0061\u0031"])"},
+        {"surrogate-pair-in", R"(["\uD83D\uDE00"])"}, // one astral id, U+1F600, as a surrogate pair
+        {"lone-surrogate", R"(["a1","\uD83D"])"},      // both parsers refuse the WHOLE document
+        {"unicode-id-in", "[\"\xc3\xa9" "1\"]"},        // "e-acute 1", also an in-scope id below
+        {"quote-and-backslash-in", R"(["a\"b","c\\d"])"},
+        {"whitespace-padded-json", " \n[ \"a1\" ]\t"},
+        {"nul-only", R"(["\u0000"])"}, // jsonb refuses \u0000; both sides still say not visible
+        // Non-string elements are ignored even when their TEXT equals an in-scope id ("7", "true"):
+        // dropping the SQL jsonb_typeof(...) = 'string' test would admit these.
+        {"number-element", "[7]"},
+        {"bool-element", "[true]"},
+        {"string-seven", R"(["7"])"},
+    };
+    int64_t t = 1000;
+    for (const auto& [label, json] : corpus)
+        seed_run(conn.get(), label, wf, t++, json);
+
+    const std::vector<std::vector<std::string>> scopes{
+        {"a1"},
+        {"b1"},
+        {"a1", "b1"},
+        {"nobody"},
+        {"a\"b"},
+        {"c\\d", "z9"},
+        {"\xc3\xa9" "1"},
+        {"\xF0\x9F\x98\x80"}, // U+1F600
+        {"7", "true"},
+        {"a1", "b1", "z9", "y8", "A1", " a1", "a\"b", "c\\d", "\xc3\xa9" "1", "\xF0\x9F\x98\x80"},
+    };
+    for (const auto& scope_vec : scopes) {
+        authz::VisibleSet vs{std::unordered_set<std::string>(scope_vec.begin(), scope_vec.end())};
+        std::set<std::string> expected;
+        for (const auto& [label, json] : corpus) {
+            WorkflowExecution we;
+            we.agent_ids_json = json;
+            if (workflow_execution_visible(we, vs))
+                expected.insert(label);
+        }
+        WorkflowExecutionListQuery q;
+        q.limit = 500;
+        auto page = engine.query_executions_page(q, Scope{scope_vec});
+        INFO("scope of " << scope_vec.size() << " ids, first " << scope_vec.front());
+        // One malformed row must never error the whole statement.
+        REQUIRE(page.has_value());
+        const auto got = ids_of(*page);
+        CHECK(std::set<std::string>(got.begin(), got.end()) == expected);
+        CHECK(got.size() == expected.size()); // no duplicates either
+    }
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: a NUL escape is refused by the SQL side (stricter "
+          "than the C++ predicate and fails closed)",
+          "[workflow_engine][pg][list][confinement]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf = *engine.create_workflow(wf_yaml("nul"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    // jsonb rejects \u0000 outright, so the whole document is "invalid" to the SQL predicate while
+    // nlohmann parses it and would admit the in-scope "a1": the list hides a run the detail route
+    // would show (the safe direction). The other divergences, including the one that goes the
+    // other way, are pinned in the divergence case below.
+    const std::string json = R"(["a1","\u0000"])";
+    seed_run(conn.get(), "nul-mixed", wf, 10, json);
+    WorkflowExecution we;
+    we.agent_ids_json = json;
+    REQUIRE(workflow_execution_visible(we, authz::VisibleSet{std::unordered_set<std::string>{"a1"}}));
+    auto page = engine.query_executions_page({}, Scope{std::vector<std::string>{"a1"}});
+    REQUIRE(page.has_value());
+    CHECK(page->rows.empty());
+    // Unconfined callers are unaffected.
+    auto open = engine.query_executions_page({}, std::nullopt);
+    REQUIRE(open.has_value());
+    CHECK(ids_of(*open) == std::vector<std::string>{"nul-mixed"});
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: the documented SQL-vs-C++ visibility "
+          "divergences keep their direction",
+          "[workflow_engine][pg][list][confinement]") {
+    // jsonb and nlohmann accept different JSON, so these cannot sit in the equality corpus above.
+    // Only a write that bypasses the engine can store either shape (execute() dumps a
+    // vector<string>). Each row names the direction; if a probe shows PostgreSQL decides
+    // differently, the row's expectation is what is wrong, not the predicate.
+    struct Divergence {
+        std::string label;
+        std::string json;
+        bool sql_shows;    // the list admits the run to a caller whose scope is {"a1"}
+        bool oracle_shows; // workflow_execution_visible() admits it to the same caller
+    };
+    const std::vector<Divergence> rows{
+        // jsonb takes any number numeric can hold; nlohmann rejects a double overflow and
+        // discards the WHOLE document. The list shows a run whose detail read says not-visible; the
+        // run does name the in-scope "a1", so nothing out of scope is exposed.
+        {"number-past-double-range", R"(["a1",1e400])", true, false},
+        // jsonb refuses a byte-order mark where nlohmann skips it: hidden here, shown there.
+        {"utf8-bom-prefix", "\xEF\xBB\xBF[\"a1\"]", false, true},
+    };
+    WORKFLOW_ENGINE(engine);
+    const auto wf = *engine.create_workflow(wf_yaml("divergence"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    int64_t t = 10;
+    for (const auto& r : rows)
+        seed_run(conn.get(), r.label, wf, t++, r.json);
+
+    const authz::VisibleSet vs{std::unordered_set<std::string>{"a1"}};
+    auto page = engine.query_executions_page({}, Scope{std::vector<std::string>{"a1"}});
+    REQUIRE(page.has_value()); // neither shape may error the statement
+    const auto got = ids_of(*page);
+    for (const auto& r : rows) {
+        INFO(r.label);
+        WorkflowExecution we;
+        we.agent_ids_json = r.json;
+        CHECK(workflow_execution_visible(we, vs) == r.oracle_shows);
+        CHECK((std::find(got.begin(), got.end(), r.label) != got.end()) == r.sql_shows);
+    }
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: the store clamps limit itself, never an empty "
+          "page or the sentinel row",
+          "[workflow_engine][pg][list]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf = *engine.create_workflow(wf_yaml("clamp"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    // 502 runs, so even the largest clamped page (500) has a successor. Ids sort with started_at.
+    for (int i = 0; i < 502; ++i) {
+        const auto n = std::to_string(i);
+        seed_run(conn.get(), "r-" + std::string(3 - n.size(), '0') + n, wf, i, "[]");
+    }
+    for (const auto& [asked, want] :
+         std::vector<std::pair<int, std::size_t>>{{0, 1}, {-1, 1}, {501, 500}, {100000, 500}}) {
+        INFO("asked " << asked);
+        WorkflowExecutionListQuery q;
+        q.limit = asked;
+        auto page = engine.query_executions_page(q, std::nullopt);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == want); // also guards the back() below
+        CHECK(page->rows.front().id == "r-501");
+        REQUIRE(page->next.has_value());
+        // The cursor is the last row RETURNED, never the 501st (sentinel) row.
+        CHECK(page->next->id == page->rows.back().id);
+        CHECK(page->next->key == page->rows.back().started_at);
+    }
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: invisible runs never consume a page slot or "
+          "shape a cursor",
+          "[workflow_engine][pg][list][confinement]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf = *engine.create_workflow(wf_yaml("pageslots"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    // Five NEWER runs the caller cannot see, three older ones it can.
+    for (int i = 0; i < 5; ++i)
+        seed_run(conn.get(), "hidden-" + std::to_string(i), wf, 500 + i, R"(["other"])");
+    seed_run(conn.get(), "vis-c", wf, 300, R"(["mine"])");
+    seed_run(conn.get(), "vis-b", wf, 200, R"(["mine","other"])");
+    seed_run(conn.get(), "vis-a", wf, 100, R"(["mine"])");
+    const Scope scope{std::vector<std::string>{"mine"}};
+
+    WorkflowExecutionListQuery q;
+    q.limit = 2;
+    auto first = engine.query_executions_page(q, scope);
+    REQUIRE(first.has_value());
+    // A post-filter would have returned an empty page here (the 2 newest rows are hidden).
+    CHECK(ids_of(*first) == std::vector<std::string>{"vis-c", "vis-b"});
+    REQUIRE(first->next.has_value());
+    CHECK(first->next->id == "vis-b");
+
+    q.after = first->next;
+    auto second = engine.query_executions_page(q, scope);
+    REQUIRE(second.has_value());
+    CHECK(ids_of(*second) == std::vector<std::string>{"vis-a"});
+    CHECK_FALSE(second->next.has_value());
+
+    // A forged position that names a hidden run reveals nothing: the scope is ANDed with it, so the
+    // answer is exactly the visible runs older than the position, never the hidden ones.
+    q.limit = 10;
+    q.after = keyset::Position{502, "hidden-2"};
+    auto forged = engine.query_executions_page(q, scope);
+    REQUIRE(forged.has_value());
+    CHECK(ids_of(*forged) == std::vector<std::string>{"vis-c", "vis-b", "vis-a"});
+    CHECK_FALSE(forged->next.has_value());
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: an engaged-empty scope answers an empty page "
+          "without touching the database",
+          "[workflow_engine][pg][list][confinement]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf = *engine.create_workflow(wf_yaml("denyall"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    seed_run(conn.get(), "r1", wf, 10, R"(["a1"])");
+
+    auto page = engine.query_executions_page({}, Scope{std::vector<std::string>{}});
+    REQUIRE(page.has_value());
+    CHECK(page->rows.empty());
+    CHECK_FALSE(page->next.has_value());
+
+    // Prove it never reached the table: with the table gone the same call still answers empty,
+    // while an unconfined read of it is a genuine failure.
+    PgResult drop = yuzu::server::pg::exec_params(
+        conn.get(), "DROP TABLE workflow_engine.workflow_step_results, "
+                    "workflow_engine.workflow_executions CASCADE",
+        std::vector<std::string>{});
+    REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    auto again = engine.query_executions_page({}, Scope{std::vector<std::string>{}});
+    REQUIRE(again.has_value());
+    CHECK(again->rows.empty());
+    auto open = engine.query_executions_page({}, std::nullopt);
+    REQUIRE_FALSE(open.has_value());
+    CHECK(open.error().starts_with(kDbErrorPrefix));
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: a query failure is a typed degrade for confined "
+          "and unconfined reads alike and never an empty page",
+          "[workflow_engine][pg][list][degrade]") {
+    WORKFLOW_ENGINE(engine);
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult drop = yuzu::server::pg::exec_params(
+        conn.get(), "DROP TABLE workflow_engine.workflow_step_results, "
+                    "workflow_engine.workflow_executions CASCADE",
+        std::vector<std::string>{});
+    REQUIRE(drop.status() == PGRES_COMMAND_OK);
+
+    for (const Scope& scope : {Scope{}, Scope{std::vector<std::string>{"a1"}}}) {
+        auto page = engine.query_executions_page({}, scope);
+        REQUIRE_FALSE(page.has_value());
+        CHECK(page.error().starts_with(kDbErrorPrefix));
+    }
+    WorkflowExecutionListQuery latest;
+    latest.latest_per_workflow = true;
+    auto lp = engine.query_executions_page(latest, std::nullopt);
+    REQUIRE_FALSE(lp.has_value());
+    CHECK(lp.error().starts_with(kDbErrorPrefix));
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: a read blocked behind an exclusive lock ends at "
+          "the statement timeout as a typed degrade and the pool stays usable",
+          "[workflow_engine][pg][list][timeout]") {
+    // Pins that the shell EXECUTES the builder's `SET LOCAL statement_timeout` (the builder case
+    // pins only its text). A second connection holds ACCESS EXCLUSIVE on the table the read
+    // touches, so the read blocks server-side until the budget fires. With the statement skipped
+    // the read is bounded only by the pool's own `lock_timeout_ms` below and ends as a LOCK
+    // timeout, so asserting the statement-timeout wording fails instead of hanging. No sleeps and
+    // no clock reads: the 100 ms budget is a server-side timer, the lock is held until released.
+    YUZU_REQUIRE_PG_DB_TPL(wf_db_fx_, workflow_engine_tpl);
+    PgPool wf_pool_fx_{{.conninfo = wf_db_fx_.dsn(), .size = 2, .lock_timeout_ms = 5000}};
+    REQUIRE(wf_pool_fx_.valid());
+    WorkflowEngine engine{wf_pool_fx_};
+    REQUIRE(engine.is_open());
+
+    PgConn holder{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    for (const char* sql : {"BEGIN", "LOCK TABLE workflow_engine.workflow_executions "
+                                     "IN ACCESS EXCLUSIVE MODE"}) {
+        PgResult r = yuzu::server::pg::exec_params(holder.get(), sql, std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    auto blocked = engine.query_executions_page({}, std::nullopt, std::chrono::milliseconds{100});
+    REQUIRE_FALSE(blocked.has_value()); // a timeout is a degrade, never an empty or short page
+    CHECK(blocked.error().starts_with(kDbErrorPrefix));
+    CHECK(blocked.error().find("statement timeout") != std::string::npos);
+
+    PgResult release =
+        yuzu::server::pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
+    REQUIRE(release.status() == PGRES_COMMAND_OK);
+    auto after = engine.query_executions_page({}, std::nullopt); // the shipped default budget
+    REQUIRE(after.has_value());
+    CHECK(after->rows.empty());
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: latest-per-workflow is the newest VISIBLE run "
+          "per workflow in workflow order",
+          "[workflow_engine][pg][list][latest]") {
+    WORKFLOW_ENGINE(engine);
+    // Workflow ids are generated, so name the order by what the engine actually minted.
+    const auto w_a = *engine.create_workflow(wf_yaml("latest-a"));
+    const auto w_b = *engine.create_workflow(wf_yaml("latest-b"));
+    const auto w_c = *engine.create_workflow(wf_yaml("latest-c"));
+    std::vector<std::string> wf_order{w_a, w_b, w_c};
+    std::sort(wf_order.begin(), wf_order.end());
+
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    // w_a: an older visible run and a NEWER one the confined caller cannot see.
+    seed_run(conn.get(), "a-old-visible", w_a, 100, R"(["mine"])", "completed");
+    seed_run(conn.get(), "a-new-hidden", w_a, 200, R"(["other"])", "failed");
+    // w_b: only hidden runs. w_c: two visible runs sharing a second (id breaks the tie).
+    seed_run(conn.get(), "b-hidden", w_b, 150, R"(["other"])", "completed");
+    seed_run(conn.get(), "c-1", w_c, 300, R"(["mine"])", "failed");
+    seed_run(conn.get(), "c-2", w_c, 300, R"(["mine"])", "completed");
+
+    WorkflowExecutionListQuery q;
+    q.latest_per_workflow = true;
+
+    // Unconfined: each workflow's newest run, ordered by workflow id.
+    auto open = engine.query_executions_page(q, std::nullopt);
+    REQUIRE(open.has_value());
+    std::vector<std::string> want_open;
+    for (const auto& wf : wf_order)
+        want_open.push_back(wf == w_a ? "a-new-hidden" : wf == w_b ? "b-hidden" : "c-2");
+    CHECK(ids_of(*open) == want_open);
+    CHECK_FALSE(open->truncated_by_cap);
+    CHECK_FALSE(open->next.has_value());
+
+    // Confined: visibility is applied BEFORE the per-workflow pick, so w_a answers its newest
+    // visible run (not a blanked newest one) and w_b, with nothing visible, is absent.
+    auto mine = engine.query_executions_page(q, Scope{std::vector<std::string>{"mine"}});
+    REQUIRE(mine.has_value());
+    std::vector<std::string> want_mine;
+    for (const auto& wf : wf_order) {
+        if (wf == w_a)
+            want_mine.push_back("a-old-visible");
+        else if (wf == w_c)
+            want_mine.push_back("c-2");
+    }
+    CHECK(ids_of(*mine) == want_mine);
+
+    // Other filters apply to the candidate runs before the pick.
+    q.status = "failed";
+    auto failed = engine.query_executions_page(q, std::nullopt);
+    REQUIRE(failed.has_value());
+    std::vector<std::string> want_failed;
+    for (const auto& wf : wf_order)
+        if (wf == w_a)
+            want_failed.push_back("a-new-hidden");
+        else if (wf == w_c)
+            want_failed.push_back("c-1");
+    CHECK(ids_of(*failed) == want_failed);
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: latest-per-workflow flags the cap and never "
+          "returns a cursor",
+          "[workflow_engine][pg][list][latest]") {
+    WORKFLOW_ENGINE(engine);
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    std::vector<std::string> wfs;
+    for (const char* n : {"cap-a", "cap-b", "cap-c"}) {
+        wfs.push_back(*engine.create_workflow(wf_yaml(n)));
+        seed_run(conn.get(), std::string("run-") + n, wfs.back(), 10, "[]");
+    }
+    WorkflowExecutionListQuery q;
+    q.latest_per_workflow = true;
+    q.limit = 2;
+    auto capped = engine.query_executions_page(q, std::nullopt);
+    REQUIRE(capped.has_value());
+    CHECK(capped->rows.size() == 2);
+    CHECK(capped->truncated_by_cap);
+    CHECK_FALSE(capped->next.has_value());
+    q.limit = 3; // exactly as many workflows as the limit: not truncated
+    auto exact = engine.query_executions_page(q, std::nullopt);
+    REQUIRE(exact.has_value());
+    CHECK(exact->rows.size() == 3);
+    CHECK_FALSE(exact->truncated_by_cap);
 }

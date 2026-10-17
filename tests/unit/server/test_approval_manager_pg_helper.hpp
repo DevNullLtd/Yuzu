@@ -12,15 +12,20 @@
 // same skip-vs-fail posture as every other [pg] test (see test_helpers.hpp).
 
 #include "approval_manager.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace yuzu::test {
 
@@ -86,5 +91,26 @@ private:
     std::optional<yuzu::server::pg::PgPool> pool_;
     std::unique_ptr<yuzu::server::ApprovalManager> store_;
 };
+
+/// Bulk-inserts `count` pending approvals directly via SQL (bypassing `submit()`'s own
+/// cap, which would refuse past 1000) so cap-boundary tests stay fast: one INSERT instead
+/// of `count` round-trips through submit(). Every row is `definition_id = 'def-seeded'`,
+/// `submitted_by = 'operator1'`, id `<id_prefix><n>`, aged `age_seconds`.
+inline void seed_pending(yuzu::server::pg::PgPool& pool, const std::string& id_prefix, int count,
+                         int64_t age_seconds) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto sql = std::string("INSERT INTO approval_manager.approvals "
+                           "(id, definition_id, status, submitted_by, submitted_at) "
+                           "SELECT '") +
+               id_prefix +
+               "' || gs, 'def-seeded', 'pending', 'operator1', "
+               "extract(epoch from now())::bigint - $1 "
+               "FROM generate_series(1, $2) AS gs";
+    yuzu::server::pg::PgResult res = yuzu::server::pg::exec_params(
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{std::to_string(age_seconds), std::to_string(count)});
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
+}
 
 } // namespace yuzu::test

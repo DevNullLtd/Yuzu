@@ -101,6 +101,9 @@ struct RtHarness {
     ~RtHarness() { instruction_store.reset(); }
 
     void register_with(bool with_store) {
+        // A browser sends these on every same-origin write; the template mutations refuse a
+        // cookie-session write without them.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -602,3 +605,23 @@ TEST_CASE("REST templates: import_definition_json drops oversized string form (s
 // v1→v2→v3 schema_meta probe-and-stamp dance — no longer exists: the
 // Postgres schema is born fresh in a single v1 migration (no ALTER-table
 // compat dance to test). Nothing analogous applies on Postgres.
+
+TEST_CASE("response templates: a cross-site or header-less cookie-session write is refused, a "
+          "token session is not gated",
+          "[pg][rest][response_templates]") {
+    RtHarness h;
+    const std::string body = R"({"name":"t","columns":["a"]})";
+    const std::string path = "/api/v1/definitions/any-def/response-templates";
+
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}};
+    auto cross = h.sink.Post(path, body);
+    REQUIRE(cross);
+    CHECK(cross->status == 403);
+
+    h.sink.default_headers = {{"Host", "yuzu.test"}}; // a browser always sends one
+    auto bare = h.sink.Post(path, body);
+    REQUIRE(bare);
+    CHECK(bare->status == 403);
+    CHECK(h.audit_log.size() == 2);
+    CHECK(h.audit_log[0].action == "csrf.denied");
+}

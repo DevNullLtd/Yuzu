@@ -38,6 +38,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu {
@@ -71,7 +72,7 @@ struct SoftwareEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat" (agent-side vocabulary)
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature
+    std::string ecosystem; // rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -319,6 +320,15 @@ public:
     /// row yet (never synced). Backs the Hardware CI record's "Sync now" poll.
     [[nodiscard]] std::optional<std::int64_t> source_last_seen(std::string_view agent_id,
                                                                std::string_view source);
+
+    /// `source_last_seen` for a page of agents in one read: agent_id -> server-receipt
+    /// epoch-seconds of its last accepted `source` report (the value the Hardware record
+    /// shows as `software_last_seen`). An agent with no row is ABSENT from the map (never a
+    /// 0). Empty `source`/`agent_ids` -> empty map (precondition miss).
+    /// AUTHORITATIVE read: `std::nullopt` on a degrade. The caller bounds `agent_ids` (the
+    /// Software page passes at most one page, 100 ids); nothing here caps it.
+    [[nodiscard]] std::optional<std::unordered_map<std::string, std::int64_t>>
+    source_last_seen_bulk(std::string_view source, const std::vector<std::string>& agent_ids);
 
     /// Fleet-wide query ("which agents run X"). Capped at a hard ceiling regardless
     /// of `limit`. AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure

@@ -38,9 +38,11 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
   leg (`windows-asan`, agent-only, Wee Tam pool, gated on
   `weetam_pool_healthy`) covering the Windows-only spark mechanisms that the
-  Linux sanitizers can't reach (#1934a). On any leg failure, the `alert` job auto-opens or comments on a
-  `nightly-broken` issue. **Discipline norm: no merge to main while a
-  `nightly-broken` issue is open.**
+  Linux sanitizers can't reach (#1934a). On any leg failure, or a leg ending
+  `cancelled` (a timeout) while the run itself was not cancelled, the `alert`
+  job auto-opens or comments on a `nightly-broken` issue.
+  **Discipline norm: no merge to main while a `nightly-broken` issue is
+  open.**
 
   **Scheduled nightlies always run the DEFAULT branch's copy of the workflow**
   (currently `main`) — `dev` gets zero nightly ASan/TSan/coverage coverage
@@ -278,6 +280,142 @@ If the release cannot be fixed promptly on a stable tag, move `:latest` back
 to the previous release's images. The gate has no override; the naming forms
 it checks are a second copy of the builders' naming, and its header lists
 where each lives.
+
+### Linux ELF floor gate (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)
+
+Every Linux native artifact carries the glibc / libstdc++ floor of the host
+that built it by accident (#5143). The gate makes the floor an explicit,
+committed promise and measures every build against it. It is specified by
+ADR-2003 (Proposed, PR #5631; the ADR is not on `dev` yet). **In S0 it is
+report-only: nothing it finds can fail a build or a release.** S2 turns it on.
+
+- **The script** runs `objdump -T` and `readelf -d` over every ELF under a
+  staging directory and compares the versioned symbols it imports
+  (`GLIBC_x.y`, `GLIBCXX_x.y.z`, `CXXABI_x.y.z`, `LIBSYSTEMD_n`, `BLKID_n`,
+  `OPENSSL_x.y.z`, anything else reported verbatim) with a floor file, by
+  numeric version. It also flags any forbidden symbol (`EVP_sm4_*`) and any
+  `RUNPATH`/`RPATH` entry not anchored at `$ORIGIN`. The header of
+  `scripts/ci/check-elf-floor.sh` is the canonical reference for the flags,
+  exit codes, floor-file schema and baseline schema. Four cases are never read
+  as clean: a directory with no ELF in it, an ELF the tools cannot read (or a
+  stub with the ELF magic and no room for a header), a directory that cannot be
+  listed, and ELFs not reached before the aggregate deadline. Under
+  `--enforce` each is an error; in report-only each is a warning and the exit
+  stays 0.
+- **Modes.** `--report-only` (the default) prints violations, emits
+  `::warning::` annotations and a job-summary table on GitHub Actions, and
+  exits 0. `--enforce` exits 1 on any violation. It is implemented and tested
+  but wired nowhere yet. Usage and configuration errors exit 2 in both modes.
+- **Floor files** are `deploy/packaging/linux-floor-agent.json` (glibc 2.28,
+  `GLIBCXX_3.4.25`, `CXXABI_1.3.11`, `LIBSYSTEMD` 239 plus the Red Hat
+  `LIBSYSTEMD_240` backport, `BLKID_1.0`) and
+  `deploy/packaging/linux-floor-server.json` (glibc 2.34, `GLIBCXX_3.4.29`,
+  `CXXABI_1.3.13`, `OPENSSL_3.0.0`, `LIBSYSTEMD_240`, `BLKID_1.0`, forbidden
+  `EVP_sm4_*`; also the gateway's ERTS and OTP). They state the promise, not a
+  measurement. Changing one is a floor decision (ADR-2003 (Proposed, PR #5631),
+  "Floor review rule"), not a tuning edit. A typo in a family key would silently
+  ungate that family (families absent from `max` are only reported), so the
+  loader requires `GLIBC`, the script reports a measured family one edit away
+  from a listed key, and the test pins the exact key set of both shipped
+  files.
+- **Baseline.** `deploy/packaging/linux-floor-baseline.json` is the measured
+  gap of the v0.14.1 Linux x64 release artifacts (`agent`, `server` and
+  `gateway` sets: per ELF the highest tag per family and the offending
+  symbols). It is evidence, not an input: nothing reads it to decide pass or
+  fail. To regenerate it from a release, download and extract the release
+  tarballs into empty scratch directories (check each against the signed
+  `SHA256SUMS`; the v0.14.1 values are `yuzu-linux-x64.tar.gz`
+  `46e42df0026eb57460414c6c62bf7ab9ef9816e1f8c799286006fde61cc0385f` and
+  `yuzu-gateway-linux-x64.tar.gz`
+  `e4d45e0f256801af5fe28c188431221df87e0274dabaa48e768464706ecae1eb`), then
+  run the script once per set against the same output file (each run replaces
+  only its own set):
+
+  ```bash
+  B=deploy/packaging/linux-floor-baseline.json; rm -f "$B"
+  scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-agent.json \
+    --dir <the yuzu-<VERSION>-linux-x64 directory inside the tarball> \
+    --exclude bin/yuzu-server --set-name agent \
+    --source "v0.14.1 yuzu-linux-x64.tar.gz (all ELFs except bin/yuzu-server)" --emit-baseline "$B"
+  scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-server.json \
+    --dir <the yuzu-<VERSION>-linux-x64 directory inside the tarball> \
+    --include bin/yuzu-server --set-name server \
+    --source "v0.14.1 yuzu-linux-x64.tar.gz (bin/yuzu-server)" --emit-baseline "$B"
+  scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-server.json \
+    --dir <the yuzu-gateway-<VERSION>-linux-x64 directory inside the tarball> \
+    --set-name gateway \
+    --source "v0.14.1 yuzu-gateway-linux-x64.tar.gz (ERTS, NIFs, crypto.so)" --emit-baseline "$B"
+  ```
+
+  Run with the real v0.14.1 tarballs this reproduces the committed file
+  byte-for-byte; for another release change the version in the `--source`
+  labels.
+
+  Point `--dir` at the directory inside the tarball (the one that holds
+  `bin/`), not at its parent, so artifact keys carry no version. Output is
+  deterministic (sorted, no timestamps or paths): a refresh diffs cleanly. A
+  set whose scan was incomplete (a PROBLEM, an unreadable or unscanned ELF)
+  carries an `incomplete` list; the committed baseline has none. The
+  floor-review rule in ADR-2003 (Proposed, PR #5631) says when to refresh it.
+- **Release wiring.** `release.yml`'s `build-linux` job runs the script
+  report-only on the staged tarball contents right after "Package archive"
+  (agent set, then server set) in a `continue-on-error` step, and uploads the
+  per-set text reports, the full per-ELF reports and a `baseline.json` as the
+  `linux-elf-floor-report` artifact (14 days). The artifact deliberately has no
+  `yuzu-` prefix: the `release` job downloads every `yuzu-*` artifact. The
+  step is bounded (`timeout-minutes: 10`, and the script's own aggregate
+  deadline of 240s per run), so a hung `objdump` cannot stall a release for
+  long. The release step does **not** scan the gateway at all until S3; the
+  `gateway` set in the committed baseline was measured by hand from the
+  release tarball.
+- **Pre-release QA.** `pre-release.yml`'s `install-rpm` matrix gained
+  `rockylinux:8` and `amazonlinux:2023` as **non-gating** legs
+  (`continue-on-error` via `matrix.experimental`). They are expected to fail
+  on 0.14.x artifacts until S2. A failure there turns neither the job nor the
+  Pre-release QA report red: a `continue-on-error` leg reports `success` to
+  `needs.install-rpm.result`, so the gap is visible in the run graph and in a
+  step summary the failed leg writes, **not** in the QA report table.
+- **Tests.** `tests/shell/test_check_elf_floor.sh` (in preflight's "Shell gate
+  tests") builds fixture ELFs with `gcc` and a linker version script, so the
+  tags it checks are synthesized and the result does not depend on the host's
+  glibc.
+- **Notes for S2 (the slice that enforces).** (a) Only the agent promotes on
+  `rockylinux:8`: the server and gateway promise glibc 2.34 and are not
+  expected green there, so scope that leg to the agent package or keep it
+  non-gating for the others. (b) The gate scans the `${STAGING}` tarball
+  directory, but `build-deb.sh` and `build-rpm.sh` read `build-linux`
+  directly: point the package builders at the gated directory, or re-run the
+  gate on the extracted `.deb`/`.rpm` payload. (c) Flipping `--enforce` makes
+  this a release gate; add its entry to "Gates outside the tier ladder" (and a
+  routed-concern row) in that change. (d) Remove `continue-on-error: true`
+  from the `release.yml` gate step when `--enforce` is wired: a swallowed exit
+  1 would never gate. `tests/shell/test_check_elf_floor.sh` runs a tripwire
+  (`tests/shell/elf_floor_workflow_tripwire.py`, PyYAML) over every workflow
+  and local composite action. It flags a step that runs, or probably runs
+  (mode chosen through a variable or env, a wrapper script, a composite
+  action), `check-elf-floor.sh --enforce` when the step or its job has any
+  `continue-on-error` other than a literal false, when the run text has
+  `|| true`, `|| :`, `|| exit 0` or `set +e`, or when the gate's output is
+  piped (`| tee`) without `pipefail` (the default `bash -e` would report
+  `tee`'s status); report-only steps are never flagged. It is a guard, not a
+  proof, and it assumes enforcement whenever it cannot tell. **Not caught:**
+  a reusable workflow (`uses: ./.github/workflows/x.yml`) called from a job
+  with `continue-on-error`; a command held in an env var and run through
+  `bash -c "$CMD"` or `eval`; a wrapper outside `scripts/` and
+  `.github/actions/`, or code the repo does not contain; shell-level swallows
+  such as `|| echo`, `; true` or `trap`; and YAML nested so deeply that PyYAML
+  recurses out, which is reported as its own error (exit 4) rather than
+  analysed. It is vacuous today (only `--report-only` is wired); its detector
+  is pinned on synthetic fixtures, one per bypass shape. The test needs PyYAML: `ci.yml`'s
+  preflight installs it hash-pinned, and the test fails (rather than skips)
+  under GitHub Actions if it is missing. (e) The report
+  artifact is kept 14 days and the results are not in CI history: S2 should
+  persist per-release results (commit the baseline diff, or extend the
+  CI-history capture) and consider running the gate on the `ci.yml` Linux
+  package artifact before tagging. (f) The pre-existing "Package archive" step
+  runs `mkdir -p "$STAGING"` without clearing it, so a re-run of the same tag
+  on a reused workspace scans stale ELFs: S2 should `rm -rf "$STAGING"` first.
+  (g) The gateway is not scanned by the release step until S3.
 
 ### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)
 
@@ -563,10 +701,11 @@ than the tag under test (#5150). The other jobs check the following:
   later, and `stop` must succeed. A bare `ping` is not enough: it answers
   once Erlang distribution is up, even when the application refuses to
   start. The legs are ubuntu:22.04/24.04/26.04 and debian:12 for .deb, and
-  fedora:42 and rockylinux:9 for .rpm (installed with `dnf`). If a leg's libc
-  or libstdc++ is older than the build's, the job fails and names the glibc
-  floor (#5143). A gateway whose crypto NIF cannot load is named as #5171. A
-  missing package fails; it is not skipped (#5151).
+  fedora:42 and rockylinux:9 for .rpm (installed with `dnf`); rockylinux:8 and
+  amazonlinux:2023 also run for .rpm but are non-gating (see "Linux ELF floor
+  gate"). If a leg's libc or libstdc++ is older than the build's, the job fails
+  and names the glibc floor (#5143). A gateway whose crypto NIF cannot load is
+  named as #5171. A missing package fails; it is not skipped (#5151).
 - **install-windows**: two install/uninstall passes. With `/NOTLS` the service
   must start and stay Running. With the default TLS posture the agent must
   fail closed because no CA is pinned. The uninstall wait is bounded (#5145).
@@ -1450,6 +1589,27 @@ done here. Response to either trigger is rebalancing/splitting the
 affected shard(s) or reverting to slots=2, never another timeout
 increase. Tracked: #3443.
 
+**Nightly Coverage runs after the sanitizer legs (#4019).** Within a
+single nightly run, `coverage` `needs:` both `sanitize-asan` and
+`sanitize-tsan`, so at most two of that run's three Linux legs share Big
+Tam at once. Running all three together oversubscribed the box, which made
+timing-sensitive sanitizer tests fail far more often; the tests that
+assumed a scheduling order were fixed in the same change, so neither half
+alone is the fix. The `needs:` is for ordering only: Coverage's `if:` leads
+with `!cancelled()`, so it still runs when a sanitizer leg is red.
+
+- Nightly wall time grows by roughly one sanitizer leg, and re-running a
+  failed sanitizer leg also re-runs Coverage.
+- This change does not close #3443. The legs still bypass the slot gate, other
+  workflows can still land on the box alongside them, and a dispatch on
+  another ref can overlap a scheduled run.
+- Related alerting change: the `alert` job also opens `nightly-broken` when
+  a leg ends `cancelled` while the run itself was not cancelled. That covers
+  a leg hitting its
+  `timeout-minutes`, which GitHub reports as cancelled rather than failed.
+  It also fires if a runner goes away mid-job, which is a real
+  infrastructure signal.
+
 **Within-job cap extended to the non-pg step (2026-09-18).** The "3 non-pg
 server tests, both uncapped" status above (now 6 named entries, see the
 count-drift note on `ci.yml`'s comment) turned out to matter even though those
@@ -1531,13 +1691,18 @@ no macOS data yet. `release.yml` build-macos is now self-hosted on BigMags too (
 signing/notarization deferred to Phase B). Only the `pre-release.yml`
 `install-macos` smoke test stays GitHub-hosted (`macos-14`, ephemeral).
 
-The macOS job installs Erlang/OTP 28 + rebar3 per run via `erlef/setup-beam`
-(`ImageOS: macos26`), the same pin as the Linux leg, so the gateway is built and its
-eunit/ct suites run on macOS too. Before #4841 it had no Erlang and Meson silently
-skipped the gateway.
+The macOS job installs Erlang/OTP 28 + rebar3 per run, on the same major/minor line as the
+Linux leg (macOS pins the exact patch, the other legs float), so the gateway is built and
+its eunit/ct suites run on macOS too. It downloads the prebuilt `erlef/otp_builds` OTP
+tarball and the rebar3 escript into `$RUNNER_TEMP` (per agent, per job) and verifies pinned
+SHA-256s, rather than using `erlef/setup-beam`: setup-beam re-copies one
+`/opt/ci/tool_cache/otp/...` tree that both BigMags agents share, and a debug + release
+pair starting together raced on it. Dependabot does not bump these pins; the bump and
+hash-mismatch procedure is in `docs/darwin-compat.md` ("Erlang gateway in macOS CI").
+Before #4841 it had no Erlang and Meson silently skipped the gateway.
 
 Every CI leg that runs tests (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan, and the dispatch-only
-`fork-dynamic-review.yml` Linux leg, which installs Erlang the same way) now runs
+`fork-dynamic-review.yml` Linux leg, which installs Erlang via `erlef/setup-beam` like the other Linux legs) now runs
 `scripts/ci/assert-gateway-tests.py <builddir>` straight after configure (`meson setup`, or `scripts/setup.sh` in the fork review leg), so a missing `rebar3` (gateway tests not registered)
 fails the Configure step rather than skipping. It is deliberately a post-configure check, not the `-Drequire_gateway` project
 option: a non-default project option stored in these persistent, branch-shared build dirs makes every older branch's

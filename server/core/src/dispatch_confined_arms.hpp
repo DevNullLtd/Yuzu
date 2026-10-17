@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cctype>
 #include <array>
 #include <chrono>
 #include <functional>
@@ -9,6 +8,8 @@
 #include <string_view>
 #include <unordered_set>
 #include <vector>
+
+#include <yuzu/protective_actions.hpp>
 
 #include "authz_model.hpp"
 #include "dispatch_target_shape.hpp"
@@ -377,61 +378,10 @@ struct ConfinedDispatchOutcome {
     bool route_unreadable = false;
 };
 
-/// #881: case-insensitive predicate for the quarantine control-channel
-/// exemption. Pure — no store access — so a test can bind it directly without
-/// a live `QuarantineStore`. Normalises to lowercase itself
-/// (`ServerImpl::dispatch_confined` already lowercases the ACTION at its own
-/// call site, never the plugin) so `"Quarantine"`/`"QUARANTINE"` exempt
-/// exactly like `"quarantine"`.
-///
-/// Keyed on the `(plugin, ACTION)` pair against a CLOSED set — not on the
-/// plugin name alone. All four actions the plugin registers today
-/// (quarantine, unquarantine, status, whitelist) are exempt, deliberately:
-/// narrowing it to `unquarantine` alone would break re-isolation (a fresh
-/// `quarantine` action against an already-contained device), whitelist repair
-/// of a contained device's exceptions, and #3127's retry path — all of which
-/// are the plugin managing its OWN containment state, not an operator
-/// reaching a quarantined agent through some other plugin. Keying on the
-/// plugin alone would have let a FIFTH action added later inherit the bypass
-/// silently, with nothing in review to notice; see the closed-set comment in
-/// the body.
-[[nodiscard]] inline bool is_quarantine_control_plugin(std::string_view plugin,
-                                                       std::string_view action) {
-    constexpr std::string_view kQuarantinePlugin{"quarantine"};
-    auto iequals = [](std::string_view a, std::string_view b) {
-        if (a.size() != b.size())
-            return false;
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>(a[i])) != b[i])
-                return false;
-        }
-        return true;
-    };
-    if (!iequals(plugin, kQuarantinePlugin))
-        return false;
-
-    // Keyed on the (plugin, ACTION) pair, not the plugin alone.
-    //
-    // Exempting a whole plugin means a FUTURE action inherits the exemption
-    // silently — the plugin declares exactly four today, and a fifth would
-    // arrive already able to bypass containment with nothing in review to
-    // notice. This set is closed against the plugin's declared actions
-    // (`acts[]` in quarantine_plugin.cpp); anything else is gated.
-    //
-    // Why all four are here rather than release alone: `unquarantine` IS the
-    // release path; `status` is read-only and answering it for a contained host
-    // is the point; `whitelist` is how a management path is repaired, and
-    // gating it would make a host whose whitelist is wrong unrecoverable
-    // remotely — the stranding this control exists to avoid; and `quarantine`
-    // on an already-contained host is the re-dispatch #3127 relies on. An
-    // action NOT on this list gets no exemption even on this plugin.
-    for (const auto allowed : {std::string_view{"quarantine"}, std::string_view{"unquarantine"},
-                               std::string_view{"status"}, std::string_view{"whitelist"}}) {
-        if (iequals(action, allowed))
-            return true;
-    }
-    return false;
-}
+// The closed quarantine-control predicate lives in the shared pure header so the
+// agent dispatch gate, which follows, consumes the identical set; re-exported
+// here so existing server-side callers and tests compile unchanged.
+using yuzu::protective::is_quarantine_control_plugin;
 
 /// The bounded-staleness budget (#881 spec item 6): a `nullopt` read served
 /// from the last-known-good snapshot is trusted only while the snapshot is
@@ -496,11 +446,16 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 /// not by itself enough for anyone reviewing the containment surface:
 ///   - `tar_fleet_snapshot` requests a READ-ONLY topology snapshot.
 ///   - `asset_tags_sync` writes device tags. No execution.
-///   - `inventory_sync_now` asks ONE agent to re-run its daily-sync source(s)
+///   - `inventory_sync_now` asks an agent to re-run its daily-sync source(s)
 ///     and report (`__sync__.now`, ADR-0016 update). Read-only, no execution;
-///     operator-REQUESTED via `POST /api/v1/hardware/{id}/sync` (which gates
-///     the operator on Execution:Execute for that device) but system-DISPATCHED,
-///     so it rides this door. Not quarantine-gated, same as tar_fleet_snapshot.
+///     operator-REQUESTED but system-DISPATCHED, so it rides this door. Not
+///     quarantine-gated, same as tar_fleet_snapshot. Three operator surfaces use it:
+///     `POST /api/v1/hardware/{id}/sync` reaches ONE agent (gated on
+///     Execution:Execute for that device), and `POST /api/v1/hardware/sync` plus the MCP tool
+///     `sync_hardware_software` reach up to 500 on this server process under ONE command id
+///     (gated by the type-level Execution:Execute check, a per-operator cooldown and a single
+///     in-flight run, with WHO IS REACHED decided here by `dispatch_system_reserved_ids`, the
+///     caller's visible-set intersection taken at send time); the 500-target cap is the Runner's.
 ///   - `guardian_push_rules` delivers Guardian baseline rules the agent may
 ///     ENFORCE, and is therefore the one exempt channel that mutates the
 ///     endpoint. It is NOT arbitrary command execution: the assertion
@@ -703,6 +658,8 @@ struct QuarantineDegradationResult {
 /// function) on an agent with no reported inventory at all, so a
 /// freshly-registered or gateway-relayed agent is never wrongly withheld for
 /// absence of DATA rather than absence of the plugin.
+/// The protective set is carved out inside `ids_missing_plugin` (see its
+/// declaration).
 ///
 /// `os_kill_switched` (#5294) follows the identical empty-is-safe argument:
 /// the ids a per-OS kill switch withholds, built once per dispatch by
@@ -905,6 +862,37 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
         break;
     }
     return result;
+}
+
+
+/// The system-reserved FAN-OUT arm: send one already-built system-reserved command to an explicit
+/// id list. Who is reached is decided HERE like every other operator dispatch surface: the id
+/// list is intersected with the caller's `exec_visible` set at send time (`nullopt`/present-empty
+/// semantics as in `dispatch_confined_arms`), so a hidden device is never sent to whatever the
+/// caller's own resolver returned. This arm serves `SystemReservedPush::inventory_sync_now` ONLY,
+/// which is why it takes no push argument: it applies the containment-gate bypass that push
+/// documents (a contained device still answers the read-only sync), and a second push must not
+/// inherit that bypass by being passed in - give it its own arm. `plugin_missing` and `os_kill_switched` stay empty
+/// because a system-reserved command is not a plugin an agent advertises (the registry still
+/// enforces the per-OS kill switch at send time).
+///
+/// `send_to` is the push's own door (`ServerImpl::send_system_reserved`); `forward_gateway_pending`
+/// stays with the caller. Only an `Ids` arm exists: a system-reserved fan-out never names `__all__`
+/// to this function (the caller expands the selector first and bounds the count).
+[[nodiscard]] inline ArmDispatchResult
+dispatch_system_reserved_ids(const std::vector<std::string>& ids,
+                             const authz::VisibleSet& exec_visible,
+                             std::function<bool(const std::string&)> send_to) {
+    ConfinedDispatchSink sink;
+    sink.send_to = std::move(send_to);
+    sink.send_to_all_unfiltered = [] { return 0; }; // never used: only the Ids arm runs
+    sink.known_agent_ids = [] { return std::vector<std::string>{}; };
+    // presence_widens / prepare_route_fallback left unset: the per-id path always runs.
+    ConfinedDispatchTargets targets;
+    targets.agent_ids = &ids;
+    return dispatch_confined_arms(DispatchArm::Ids, targets, exec_visible,
+                                  /*broadcast_on_none=*/false, ContainmentGate::exempt_control_plugin(),
+                                  sink);
 }
 
 } // namespace yuzu::server

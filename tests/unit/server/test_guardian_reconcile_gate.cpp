@@ -208,6 +208,35 @@ TEST_CASE("GuardianReconcileGate: Shed does not rewrite an existing expired clai
     CHECK(gate.decide("a", kBehind, kCurrent) == Decision::Admit);
 }
 
+TEST_CASE("GuardianReconcileGate: an extreme min_interval is clamped, not overflowed",
+          "[guardian][reconcile_gate]") {
+    ManualClock clk;
+    GuardianReconcileBudget budget(roomy(), clk.fn());
+
+    // The largest representable interval used to overflow the sweep's `2 * min_interval`,
+    // sweeping a zero-age claim and admitting the next heartbeat instead of limiting it.
+    {
+        GuardianReconcileGate gate(budget, clk.fn(), std::chrono::seconds::max());
+        REQUIRE(gate.decide("a", kBehind, kCurrent) == Decision::Admit);
+        CHECK(gate.sweep() == 0);  // a fresh claim is not stale
+        CHECK(gate.claims_size() == 1);
+        CHECK(gate.decide("a", kBehind, kCurrent) == Decision::RateLimited);
+    }
+    // The most negative interval is clamped to zero: no overflow, and nothing is limited.
+    {
+        GuardianReconcileGate gate(budget, clk.fn(), std::chrono::seconds::min());
+        REQUIRE(gate.decide("a", kBehind, kCurrent) == Decision::Admit);
+        CHECK(gate.sweep() == 0);
+        CHECK(gate.decide("a", kBehind, kCurrent) == Decision::Admit);
+    }
+    CHECK(GuardianReconcileGate::sanitize_interval(std::chrono::seconds::max()) ==
+          GuardianReconcileGate::kMaxMinInterval);
+    CHECK(GuardianReconcileGate::sanitize_interval(std::chrono::seconds::min()) ==
+          std::chrono::seconds{0});
+    CHECK(GuardianReconcileGate::sanitize_interval(std::chrono::seconds{25}) ==
+          std::chrono::seconds{25});
+}
+
 TEST_CASE("GuardianReconcileGate: Admit writes the claim and the immediate retry is RateLimited",
           "[guardian][reconcile_gate]") {
     ManualClock clk;

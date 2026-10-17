@@ -855,6 +855,50 @@ std::optional<std::int64_t> SoftwareInventoryStore::source_last_seen(std::string
     return std::strtoll(PQgetvalue(res.get(), 0, 0), nullptr, 10);
 }
 
+std::optional<std::unordered_map<std::string, std::int64_t>>
+SoftwareInventoryStore::source_last_seen_bulk(std::string_view source,
+                                              const std::vector<std::string>& agent_ids) {
+    // AUTHORITATIVE read (ADR-0016 §7): a degrade returns nullopt, never a silent empty map.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: source_last_seen_bulk degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    std::unordered_map<std::string, std::int64_t> out;
+    if (source.empty() || agent_ids.empty())
+        return out;
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: source_last_seen_bulk degraded — no connection "
+                         "({}) (occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    const std::vector<std::string_view> ids(agent_ids.begin(), agent_ids.end());
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, last_seen FROM software_inventory_store.inventory_state "
+        "WHERE source = $1 AND agent_id = ANY($2::text[])",
+        std::vector<std::string>{std::string(source), pg::to_text_array(ids)});
+    if (!res.ok()) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: source_last_seen_bulk degraded — query failed: "
+                         "{} (occurrence {})",
+                         PQresultErrorMessage(res.get()), d.occurrence);
+        return std::nullopt;
+    }
+    const int rows = PQntuples(res.get());
+    for (int i = 0; i < rows; ++i)
+        out.emplace(PQgetvalue(res.get(), i, 0), std::strtoll(PQgetvalue(res.get(), i, 1), nullptr, 10));
+    return out;
+}
+
 std::optional<std::vector<SoftwareEntry>>
 SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
     // AUTHORITATIVE read (ADR-0016 §7): a degrade returns nullopt, never a silent

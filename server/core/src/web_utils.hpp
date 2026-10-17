@@ -167,6 +167,78 @@ inline std::string html_escape(const std::string& s) {
     return out;
 }
 
+/// Percent-encode `s` for use as ONE URL path segment (RFC 3986): everything
+/// outside the unreserved set (`A-Za-z0-9-._~`) becomes `%XX`, so `/`, `?`,
+/// `#`, `%`, `&`, `;` and every non-ASCII byte can never end the segment or
+/// start a new URL component. The result contains only unreserved bytes and
+/// `%`, so it is also safe inside an HTML attribute without `html_escape`.
+///
+/// This is NOT sufficient for ids made only of dots: `.` and `..` are
+/// unreserved, and browsers collapse them as dot segments (`%2e` too), so an
+/// emitter must also gate on `path_segment_ok()` and omit the link or action
+/// for an id that fails it. Distinct from the per-file query-value `url_encode`
+/// copies (kept file-local, see settings_routes.cpp) — the names do not collide.
+[[nodiscard]] inline std::string url_path_segment(std::string_view s) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (const char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+                                c == '~';
+        if (unreserved) {
+            out += ch;
+        } else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
+/// Percent-encode `s` as a URL query-parameter VALUE. Identical output to
+/// `url_path_segment` (the RFC 3986 unreserved set is the same for both); the
+/// separate name keeps call sites self-describing and, like `url_path_segment`,
+/// cannot collide with the file-local `url_encode` copies.
+[[nodiscard]] inline std::string url_query_value(std::string_view s) {
+    return url_path_segment(s);
+}
+
+/// True when `s`, after percent-decoding (`%2e` in any case), is `.` or `..`:
+/// the segments WHATWG URL parsing collapses. Conservative on purpose — a
+/// literal id of `%2e%2e` is also reported, which only costs that id its
+/// action buttons.
+[[nodiscard]] inline bool is_dot_segment(std::string_view s) {
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    };
+    std::string decoded;
+    for (std::size_t i = 0; i < s.size() && decoded.size() < 3; ++i) {
+        if (s[i] == '%' && i + 2 < s.size() && hex(s[i + 1]) >= 0 && hex(s[i + 2]) >= 0) {
+            decoded += static_cast<char>(hex(s[i + 1]) * 16 + hex(s[i + 2]));
+            i += 2;
+        } else {
+            decoded += s[i];
+        }
+    }
+    return decoded == "." || decoded == "..";
+}
+
+/// An id an emitter may place in a URL path segment as an actionable link:
+/// non-empty and not a dot segment. Emitters that fail this omit the action
+/// (and say so) rather than render a URL the browser would collapse.
+[[nodiscard]] inline bool path_segment_ok(std::string_view s) {
+    return !s.empty() && !is_dot_segment(s);
+}
+
 /// Sanitize an operator-supplied value (definition id, approval id) before it
 /// goes into a server log line: control characters — CR/LF especially —
 /// would otherwise let a caller forge additional log lines (Gate 8 LOW).
@@ -504,6 +576,25 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     return false;
 }
 
+/// Same-site gate for a dashboard-called MUTATION. Cookie sessions are ambient credentials a
+/// cross-site page can ride, so a browser write must carry an Origin (or Referer) naming this
+/// site: unlike `origin_is_same_site`, whose empty-header case is "a curl/automation client",
+/// a header-less request authorised by a SESSION COOKIE is refused here, because browsers always
+/// send one on a write and a stripped header must not turn the control off. A request
+/// authenticated by an API/MCP/engine TOKEN is not riding a cookie, so it is not gated.
+/// `auth_source` is the resolved session's source ("local"/"oidc"/"saml" for cookie sessions);
+/// an unresolved one (empty) is treated as a cookie session. Returns true when the write must
+/// be refused.
+[[nodiscard]] inline bool browser_write_is_cross_site(
+    std::string_view auth_source, std::string_view host, std::string_view origin,
+    std::string_view referer, std::span<const std::string> trusted_origins = {}) {
+    if (auth_source == "api_token" || auth_source == "mcp_token" || auth_source == "engine_token")
+        return false;
+    if (origin.empty() && referer.empty())
+        return true;
+    return !origin_is_same_site(host, origin, referer, trusted_origins);
+}
+
 /// The MCP transport body-cap decision for the server's pre-routing handler
 /// (#2437) — extracted from `server.cpp`'s `set_pre_routing_handler` lambda
 /// for exactly the reason `is_login_exempt_path` below was: so the decision
@@ -718,8 +809,9 @@ template <typename Req>
 /// handler (H1, 2026-07-08 SCIM review) — extracted from `server.cpp`'s
 /// `set_pre_routing_handler` lambda so the login/SSO/health/PKI/SCIM
 /// exemption list has direct unit coverage instead of only being exercised
-/// by booting a real server. Every existing exempt path is unchanged; the
-/// only addition is the `/scim/v2/` prefix (see below).
+/// by booting a real server. Additions since: the `/scim/v2/` prefix (see
+/// below) and `/home`, the landing and sign-in page a signed-out request is
+/// redirected to.
 ///
 /// Caller contract: this MUST be consulted AFTER the rate limiter and
 /// (once it lands) any on-behalf-of/ADR-1005 rejection in the pre-routing
@@ -727,7 +819,11 @@ template <typename Req>
 /// must stay in effect for every path this allows through unauthenticated.
 /// Returns true iff `path` should skip session/bearer resolution entirely.
 inline bool is_login_exempt_path(std::string_view path) {
-    return path == "/login" || path == "/login/mfa" || path == "/login/mfa/enroll" ||
+    // `/home` is the landing and sign-in page: it must render for a visitor with
+    // no session (it IS where the chokepoint below sends them), and it shows the
+    // signed-in panel itself when a session exists.
+    return path == "/home" || path == "/login" || path == "/login/mfa" ||
+           path == "/login/mfa/enroll" ||
            path == "/health" || path == "/api/health" || path == "/auth/oidc/start" ||
            path == "/auth/callback" ||
            // #2057: /api/v1/openapi.json used to be listed here as
@@ -887,7 +983,7 @@ inline std::string truncate_utf8(std::string_view s, std::size_t max_chars) {
 // scope) the bar renders a single hatched/empty cell so the row doesn't look
 // like a successful zero-agent run.
 //
-// Color tokens: Cisco Momentum success/error/stable/text-tertiary. Theme-
+// Color tokens: Cisco Momentum success/error/info/text-tertiary. Theme-
 // agnostic — light and dark mode both read the same SVG via CSS vars.
 // ============================================================================
 
@@ -936,7 +1032,7 @@ inline std::string render_status_sparkbar(int succeeded, int failed,
     Seg segs[4] = {
         {succeeded, "var(--mds-color-bg-success-emphasis,var(--green))"},
         {failed,    "var(--mds-color-theme-indicator-error,var(--red))"},
-        {running,   "var(--mds-color-theme-indicator-stable,var(--accent))"},
+        {running,   "var(--mds-color-theme-indicator-info,var(--info))"},
         {pending,   "var(--mds-color-theme-text-tertiary,var(--muted))"},
     };
     int widths[4] = {0, 0, 0, 0};

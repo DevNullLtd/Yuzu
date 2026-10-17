@@ -346,8 +346,10 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 }
 
                 const std::string target_id = plugin_config::kill_switch_scope_key(*scope);
+                // A row on a protective pair is stored but never gates dispatch;
+                // the detail labels it so the evidence is never read as proof of a stop.
                 const std::string detail_str =
-                    std::string("enabled=") + (enabled ? "true" : "false");
+                    plugin_config::kill_switch_set_detail(*scope, enabled);
                 if (!audit_or_503(deps.audit_fn, req, res, "plugin_config.kill_switch.set",
                                   "PluginConfig", target_id, detail_str))
                     return;
@@ -362,6 +364,13 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 }
                 audit_outcome(deps.audit_fn, req, res, "plugin_config.kill_switch.set", /*ok=*/true, "PluginConfig",
                               target_id, detail_str);
+                // Warn only once the row is stored, so the log never claims a store
+                // that an audit 503 or a failed write prevented.
+                if (plugin_config::kill_switch_row_covers_protective(*scope)) {
+                    spdlog::warn("plugin_config: kill-switch row {} covers a protective action; "
+                                 "stored, never refuses the protective dispatch",
+                                 target_id);
+                }
                 nlohmann::json out = {{"data", kill_switch_json(*result)},
                                       {"meta", {{"api_version", "v1"}}}};
                 res.set_content(out.dump(), kJson);

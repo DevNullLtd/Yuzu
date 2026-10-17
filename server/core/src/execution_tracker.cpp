@@ -2029,12 +2029,35 @@ int ExecutionTracker::reconcile_stale_concurrency_claims(int64_t now) {
 
 std::vector<AgentExecutionStats>
 ExecutionTracker::get_agent_statistics(const ExecutionStatsQuery& q) const {
+    return try_get_agent_statistics(q).value_or(std::vector<AgentExecutionStats>{});
+}
+
+std::optional<std::vector<AgentExecutionStats>>
+ExecutionTracker::try_get_agent_statistics(const ExecutionStatsQuery& q) const {
     std::vector<AgentExecutionStats> results;
-    if (!open_)
+    // A store that is not open, a pool that timed out and a failed statement are all
+    // DEGRADED reads: nullopt, never an empty page that reads as "no executions".
+    if (!open_) {
+        spdlog::warn("ExecutionTracker::try_get_agent_statistics degraded: tracker not open");
+        return std::nullopt;
+    }
+    // Present-empty visible set is deny-all (ADR-0017): answer an empty page WITHOUT taking a
+    // pool lease or querying (the old `AND 1=0` form paid a round trip for a known-empty answer).
+    // Checked AFTER `open_` so a closed tracker is still a degraded read, never an empty page.
+    if (q.visible_agents && q.visible_agents->empty())
         return results;
+    // Build the array parameter BEFORE the lease: allocation and formatting proportional to the
+    // visible set must not run while a pool connection is held.
+    std::optional<std::string> visible_array;
+    if (q.visible_agents) {
+        std::vector<std::string_view> sv(q.visible_agents->begin(), q.visible_agents->end());
+        visible_array = pg::to_text_array(sv);
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return results;
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::try_get_agent_statistics degraded: pool exhausted");
+        return std::nullopt;
+    }
 
     // C5 fix: use status values actually set by update_agent_status/refresh_counts.
     // consistency-auditor Gate 4 finding (PR #3784 fix round): 'running' was NOT
@@ -2075,20 +2098,30 @@ ExecutionTracker::get_agent_statistics(const ExecutionStatsQuery& q) const {
         sql += " AND e.definition_id = $" + std::to_string(idx++);
         params.push_back(q.definition_id);
     }
-    if (q.since > 0) {
+    if (q.since) {
         sql += " AND a.dispatched_at >= $" + std::to_string(idx++);
-        params.push_back(std::to_string(q.since));
+        params.push_back(std::to_string(*q.since));
     }
-    if (q.until > 0) {
+    if (q.until) {
         sql += " AND a.dispatched_at <= $" + std::to_string(idx++);
-        params.push_back(std::to_string(q.until));
+        params.push_back(std::to_string(*q.until));
+    }
+    // ADR-0017 confinement (#3526): resolve the visible set INTO the WHERE clause so the
+    // GROUP BY and LIMIT only ever see in-scope agents -- a post-fetch filter would hand a
+    // confined caller a short or empty page while visible rows sit past the hidden ones.
+    // Present-empty is deny-all, never "no filter" (answered before the lease above).
+    if (visible_array) {
+        sql += " AND a.agent_id = ANY($" + std::to_string(idx++) + "::text[])";
+        params.push_back(std::move(*visible_array));
     }
     sql += " GROUP BY a.agent_id ORDER BY total DESC LIMIT $" + std::to_string(idx++);
     params.push_back(std::to_string(q.limit > 0 ? q.limit : 50));
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK)
-        return results;
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ExecutionTracker::try_get_agent_statistics degraded: query failed");
+        return std::nullopt;
+    }
 
     const int rows = PQntuples(res.get());
     results.reserve(static_cast<std::size_t>(rows));
@@ -2110,12 +2143,21 @@ ExecutionTracker::get_agent_statistics(const ExecutionStatsQuery& q) const {
 
 std::vector<DefinitionExecutionStats>
 ExecutionTracker::get_definition_statistics(const ExecutionStatsQuery& q) const {
+    return try_get_definition_statistics(q).value_or(std::vector<DefinitionExecutionStats>{});
+}
+
+std::optional<std::vector<DefinitionExecutionStats>>
+ExecutionTracker::try_get_definition_statistics(const ExecutionStatsQuery& q) const {
     std::vector<DefinitionExecutionStats> results;
-    if (!open_)
-        return results;
+    if (!open_) {
+        spdlog::warn("ExecutionTracker::try_get_definition_statistics degraded: tracker not open");
+        return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return results;
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::try_get_definition_statistics degraded: pool exhausted");
+        return std::nullopt;
+    }
 
     // C5 fix: match all terminal execution statuses. NOTE (#3344): this
     // "NOT IN (pending, running)" idiom is deliberately NOT what
@@ -2143,20 +2185,22 @@ ExecutionTracker::get_definition_statistics(const ExecutionStatsQuery& q) const 
         sql += " AND e.definition_id = $" + std::to_string(idx++);
         params.push_back(q.definition_id);
     }
-    if (q.since > 0) {
+    if (q.since) {
         sql += " AND e.dispatched_at >= $" + std::to_string(idx++);
-        params.push_back(std::to_string(q.since));
+        params.push_back(std::to_string(*q.since));
     }
-    if (q.until > 0) {
+    if (q.until) {
         sql += " AND e.dispatched_at <= $" + std::to_string(idx++);
-        params.push_back(std::to_string(q.until));
+        params.push_back(std::to_string(*q.until));
     }
     sql += " GROUP BY e.definition_id ORDER BY total DESC LIMIT $" + std::to_string(idx++);
     params.push_back(std::to_string(q.limit > 0 ? q.limit : 50));
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK)
-        return results;
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ExecutionTracker::try_get_definition_statistics degraded: query failed");
+        return std::nullopt;
+    }
 
     const int rows = PQntuples(res.get());
     results.reserve(static_cast<std::size_t>(rows));
@@ -2172,13 +2216,29 @@ ExecutionTracker::get_definition_statistics(const ExecutionStatsQuery& q) const 
     return results;
 }
 
-FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
+FleetExecutionSummary ExecutionTracker::get_fleet_summary(std::optional<int64_t> since) const {
+    return get_fleet_summary_checked(since).value_or(FleetExecutionSummary{});
+}
+
+std::optional<FleetExecutionSummary>
+ExecutionTracker::try_get_fleet_summary(std::optional<int64_t> since) const {
+    auto r = get_fleet_summary_checked(since);
+    if (!r) {
+        spdlog::warn("ExecutionTracker::try_get_fleet_summary degraded: {}", r.error());
+        return std::nullopt;
+    }
+    return std::move(*r);
+}
+
+std::expected<FleetExecutionSummary, std::string>
+ExecutionTracker::get_fleet_summary_checked(std::optional<int64_t> since,
+                                            bool include_active_agents) const {
     FleetExecutionSummary s;
     if (!open_)
-        return s;
+        return std::unexpected("execution store not open");
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return s;
+        return std::unexpected("pool exhausted");
 
     // Total executions and success rate
     {
@@ -2191,12 +2251,16 @@ FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
             FROM execution_tracker.executions WHERE status NOT IN ('pending','running')
         )";
         std::vector<std::string> params;
-        if (since > 0) {
+        if (since) {
             sql += " AND dispatched_at >= $1";
-            params.push_back(std::to_string(since));
+            params.push_back(std::to_string(*since));
         }
         pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-        if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0) {
+        // Any failed sub-query is a degraded read: a half-populated summary would present
+        // zeros for the failed parts as if they were measurements.
+        if (res.status() != PGRES_TUPLES_OK)
+            return std::unexpected("totals query failed");
+        if (PQntuples(res.get()) > 0) {
             s.total_executions = to_i64(col(res.get(), 0, 0));
             s.overall_success_rate = to_d(col(res.get(), 0, 1));
             s.avg_duration_seconds = to_d(col(res.get(), 0, 2));
@@ -2210,20 +2274,24 @@ FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
         pg::PgResult res = pg::exec_params(
             lease.get(), "SELECT COUNT(*) FROM execution_tracker.executions WHERE dispatched_at >= $1",
             std::vector<std::string>{std::to_string(today_start)});
-        if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0)
+        if (res.status() != PGRES_TUPLES_OK)
+            return std::unexpected("today query failed");
+        if (PQntuples(res.get()) > 0)
             s.executions_today = to_i64(col(res.get(), 0, 0));
     }
 
-    // Active agents
-    {
+    // Active agents (the Operate stats strip does not show it and skips the scan)
+    if (include_active_agents) {
         std::string sql = "SELECT COUNT(DISTINCT agent_id) FROM execution_tracker.agent_exec_status";
         std::vector<std::string> params;
-        if (since > 0) {
+        if (since) {
             sql += " WHERE dispatched_at >= $1";
-            params.push_back(std::to_string(since));
+            params.push_back(std::to_string(*since));
         }
         pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-        if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0)
+        if (res.status() != PGRES_TUPLES_OK)
+            return std::unexpected("active agents query failed");
+        if (PQntuples(res.get()) > 0)
             s.active_agents = to_i64(col(res.get(), 0, 0));
     }
 

@@ -527,7 +527,28 @@ TEST_CASE("guardian ingest: #4606 the server's other id-printing log lines neutr
         cap.stop();
         CHECK(cap.text().find("event ingest error (agent=agent_x_1, rule=rule-err)") !=
               std::string::npos);
+        // The store error text is printed after the id fields, with its spaces kept so the
+        // message stays readable. This only observes that readable text: the store's own message
+        // here holds no control byte, so the case does not drive a hostile store message and does
+        // not show the control-byte fold of the wrap (log_key_token).
+        CHECK(cap.text().find("): event field contains an embedded NUL byte") != std::string::npos);
     }
+    { // an action other than "event" is ignored (debug): the action name and the agent id are
+        // printed
+        apb::CommandResponse other;
+        other.set_action("sta tus=1");
+        yuzu::test::LogCapture cap;
+        ingest_guardian_response(store, "agent x=1", other, nullptr, nullptr);
+        cap.stop();
+        CHECK(cap.text().find("ignoring __guard__ action 'sta_tus_1' from agent agent_x_1") !=
+              std::string::npos);
+        CHECK(cap.text().find("agent x=1") == std::string::npos);
+    }
+    // Not covered here, by decision: the "observer threw" warns in the observation path. The
+    // real BlastRadiusDetector and DexAlertRouter catch exceptions from their own callbacks
+    // internally, so ingest's catch-all is not reachable through them, and a throwing stub
+    // would not exercise the production observers. The wraps on those two lines are held by
+    // review and the lexical log-injection tripwire instead.
     {   // Redelivered (debug): event id, agent id and rule id are printed
         const auto resp = make_rule_event("evt r=1", "rule r=1");
         ingest_guardian_response(store, "agent x=1", resp, nullptr, nullptr);

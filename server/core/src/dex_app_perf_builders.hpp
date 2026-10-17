@@ -61,16 +61,15 @@ namespace yuzu::server {
 /// The single place the fleet mean + percentile + `hist_version` gate AND the
 /// `kDexCohortFloor` suppression are applied, so REST/MCP/UI cannot drift. Rows
 /// with `device_count <= 0` yield zero means (never a divide); rows with
-/// `device_count < kDexCohortFloor` are suppressed (count only) — a sub-floor
-/// fleet aggregate singles out an operator.
+/// `device_count < kDexCohortFloor` are suppressed (count only) — the floor is
+/// one device, so that is the empty row.
 [[nodiscard]] std::vector<AppPerfTrendPoint>
 app_perf_fleet_trend(const std::vector<AppPerfFleetRow>& rows);
 
 /// PURE (over a store-row input): the GROUP variant — the same build + percentile
 /// + `hist_version` gate as the fleet path, with the statistical-floor suppression
-/// applied at the caller's `floor` (the dashboard/REST/MCP pass `kDexCohortFloor`).
-/// A management group is a set of SPECIFIC devices, so a small-N group aggregate
-/// is de-facto individual behaviour (works-council); any point with
+/// applied at the caller's `floor` (the dashboard/REST/MCP pass `kDexCohortFloor`,
+/// one device since the 2026-10-14 ruling); any point with
 /// `device_count < floor` is marked `suppressed` with its means/percentiles
 /// cleared (only the honest `device_count` survives). Shares the build + floor
 /// helpers with `app_perf_fleet_trend`, so the group and fleet percentile +

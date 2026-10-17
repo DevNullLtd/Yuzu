@@ -32,7 +32,7 @@
       "path": "/api/v1/executions/{param}/visualization"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
   },
   {
     "method": "GET",

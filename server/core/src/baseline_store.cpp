@@ -7,6 +7,7 @@
 #include "store_errors.hpp"
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp> // log_key_token
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
@@ -409,7 +410,7 @@ void BaselineStore::notify_baseline_mutation() noexcept {
     try {
         on_baseline_mutation_();
     } catch (const std::exception& e) {
-        spdlog::warn("BaselineStore: baseline-mutation hook threw: {}", e.what());
+        spdlog::warn("BaselineStore: baseline-mutation hook threw: {}", ::yuzu::log_key_token(e.what()));
     } catch (...) {
         spdlog::warn("BaselineStore: baseline-mutation hook threw a non-std exception");
     }

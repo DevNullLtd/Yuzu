@@ -32,7 +32,7 @@
  *     disconnect-mid-call fixture; gov Gate 3 quality-engineer, PR #3563
  *     full-PR review — this file previously overclaimed full coverage of
  *     all three WebhookWriteError arms)
- *   - webhook.create/webhook.delete audit rows carry the URL (create:
+ *   - webhook.create/webhook.delete audit rows carry the destination (scheme+host+fingerprint; create:
  *     success only; delete: a best-effort pre-delete snapshot, matching
  *     offload_routes.cpp's "compliance F-3" precedent), and every REST
  *     failure branch (invalid JSON, missing url, invalid_url, not-found)
@@ -50,6 +50,7 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -68,7 +69,11 @@ struct AuditRecord {
 struct WebhookRouteHarness {
     yuzu::test::WebhookStorePg store;
     bool perm_grant{true};
+    bool audit_persists{true}; // false: the audit sink reports a failed write
+    std::string fail_result;   // non-empty: only rows with this result report a failed write
+    std::string auth_source{"local"}; // the session's source: "local" = cookie, "api_token" = token
     std::vector<AuditRecord> audit_log;
+    std::vector<nlohmann::json> emitted; // "webhook.created" payloads
     yuzu::server::test::TestRouteSink sink;
     WebhookRoutes routes;
 
@@ -92,13 +97,24 @@ struct WebhookRouteHarness {
                                const std::string& r, const std::string& tt,
                                const std::string& ti, const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
-            return true;
+            if (!fail_result.empty() && r == fail_result)
+                return false;
+            return audit_persists;
         };
-        auto emit_event_fn = [](const std::string&, const httplib::Request&,
-                                const nlohmann::json&, const nlohmann::json&) {};
+        auto resolve_fn = [this](const httplib::Request&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "tester";
+            s.auth_source = auth_source; // "local" by default: a cookie session, gate applies
+            return s;
+        };
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+        auto emit_event_fn = [this](const std::string&, const httplib::Request&,
+                                    const nlohmann::json&, const nlohmann::json& payload) {
+            emitted.push_back(payload);
+        };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_event_fn,
-                               with_store ? store.get() : nullptr);
+                               with_store ? store.get() : nullptr, WriteGate{resolve_fn, {}});
     }
 };
 
@@ -130,14 +146,17 @@ TEST_CASE("REST webhooks[pg]: create returns 200, id, and has_secret", "[rest][w
     CHECK(j["status"] == "created");
     CHECK(j["id"].get<int64_t>() > 0);
 
-    REQUIRE(h.audit_log.size() == 1);
+    // Audit-first: an `attempted` row, then the outcome row.
+    REQUIRE(h.audit_log.size() == 2);
     CHECK(h.audit_log[0].action == "webhook.create");
-    CHECK(h.audit_log[0].result == "success");
-    // gov Gate 2 security-guardian / Gate 4 consistency-auditor (PR #3563
-    // full-PR review): the audit detail must carry the URL, not just the
-    // id — a compromise-and-cleanup attacker must not be able to erase the
-    // only durable record of where data was exfiltrated to.
-    CHECK(h.audit_log[0].detail == "https://example.com/hook");
+    CHECK(h.audit_log[0].result == "attempted");
+    CHECK(h.audit_log[1].action == "webhook.create");
+    CHECK(h.audit_log[1].result == "success");
+    // The audit detail records where data goes (a compromise-and-cleanup attacker must not be
+    // able to erase it), as scheme+host and a fingerprint: the URL is a bearer secret and
+    // never reaches the audit column in full (ADR-0010 Decision 4).
+    CHECK(h.audit_log[1].detail == "url=https://example.com url_fp=19f1352238b9");
+    CHECK(h.audit_log[0].detail == h.audit_log[1].detail);
 
     auto list_res = h.sink.Get("/api/webhooks");
     REQUIRE(list_res);
@@ -146,6 +165,59 @@ TEST_CASE("REST webhooks[pg]: create returns 200, id, and has_secret", "[rest][w
     CHECK(lj["webhooks"][0]["has_secret"] == true);
     CHECK_FALSE(lj["webhooks"][0].contains("secret"));
     CHECK(list_res->body.find("s3cret") == std::string::npos);
+}
+
+TEST_CASE("REST webhooks[pg]: the analytics event carries scheme and host only",
+         "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    nlohmann::json body = {{"url", "https://hooks.example.invalid/services/T0/B0/SECRETPATH"}};
+    auto res = h.sink.Post("/api/webhooks", body.dump());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.emitted.size() == 1);
+    CHECK(h.emitted[0]["url"] == "https://hooks.example.invalid");
+    CHECK(h.emitted[0].dump().find("SECRETPATH") == std::string::npos);
+    // The audit rows carry scheme+host and a fingerprint, never the secret path.
+    REQUIRE(h.audit_log.size() == 2);
+    for (const auto& rec : h.audit_log) {
+        CHECK(rec.detail.find("SECRETPATH") == std::string::npos);
+        CHECK(rec.detail.find("/services") == std::string::npos);
+    }
+    CHECK(h.audit_log[1].detail ==
+          "url=https://hooks.example.invalid url_fp=dae61e4ebd0d");
+}
+
+TEST_CASE("REST webhooks[pg]: POST 400 on userinfo and on control bytes and nothing stored",
+         "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    auto a = h.sink.Post("/api/webhooks", R"({"url":"https://user:hunter2@h.example/x"})");
+    REQUIRE(a);
+    CHECK(a->status == 400);
+    nlohmann::json crlf = {{"url", "https://h.example/x\r\nX-Forged: 1"}};
+    auto b = h.sink.Post("/api/webhooks", crlf.dump());
+    REQUIRE(b);
+    CHECK(b->status == 400);
+    nlohmann::json types = {{"url", "https://h.example/x"}, {"event_types", "a\nb"}};
+    auto c = h.sink.Post("/api/webhooks", types.dump());
+    REQUIRE(c);
+    CHECK(c->status == 400);
+    // Each refused create leaves an `attempted` row then a failure row; neither echoes the input.
+    REQUIRE(h.audit_log.size() == 6);
+    for (std::size_t i = 0; i < h.audit_log.size(); ++i) {
+        const auto& rec = h.audit_log[i];
+        CHECK(rec.detail.find("hunter2") == std::string::npos);
+        CHECK(rec.detail.find("X-Forged") == std::string::npos);
+        if (i % 2 == 1) {
+            CHECK(rec.result == "failure");
+            CHECK(rec.detail == "invalid_url");
+        } else {
+            CHECK(rec.result == "attempted");
+        }
+    }
+    auto list = h.sink.Get("/api/webhooks");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["webhooks"].empty());
+    CHECK(h.emitted.empty());
 }
 
 TEST_CASE("REST webhooks[pg]: create without a secret sets has_secret=false",
@@ -169,12 +241,13 @@ TEST_CASE("REST webhooks[pg]: POST 400 on invalid URL scheme, audits invalid_url
     auto res = h.sink.Post("/api/webhooks", R"({"url":"ftp://evil/h"})");
     REQUIRE(res);
     CHECK(res->status == 400);
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "webhook.create");
-    CHECK(h.audit_log[0].result == "failure");
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[0].result == "attempted");
+    CHECK(h.audit_log[1].action == "webhook.create");
+    CHECK(h.audit_log[1].result == "failure");
     // gov Gate 4 consistency-auditor: the audit detail must distinguish
     // invalid_url from a store/db failure, never collapse to one literal.
-    CHECK(h.audit_log[0].detail == "invalid_url");
+    CHECK(h.audit_log[1].detail == "invalid_url");
 }
 
 TEST_CASE("REST webhooks[pg]: POST 400 on missing url, and audits it",
@@ -219,14 +292,15 @@ TEST_CASE("REST webhooks[pg]: DELETE removes and audits, carrying the pre-delete
     CHECK(del->status == 200);
     CHECK(nlohmann::json::parse(del->body)["status"] == "deleted");
 
-    REQUIRE(h.audit_log.size() == 1);
+    REQUIRE(h.audit_log.size() == 2);
     CHECK(h.audit_log[0].action == "webhook.delete");
-    CHECK(h.audit_log[0].result == "success");
-    // gov Gate 2/4/5 (PR #3563 full-PR review): the pre-delete
-    // WebhookStore::get(id) snapshot must land in the audit detail — a
-    // compromise-and-cleanup attacker who deletes the webhook must not
-    // erase the only durable record of where the data was going.
-    CHECK(h.audit_log[0].detail == "https://example.com/hook");
+    CHECK(h.audit_log[0].result == "attempted");
+    CHECK(h.audit_log[1].action == "webhook.delete");
+    CHECK(h.audit_log[1].result == "success");
+    // The pre-delete WebhookStore::get(id) snapshot must land in the audit detail — a
+    // compromise-and-cleanup attacker who deletes the webhook must not erase the only durable
+    // record of where the data was going — as scheme+host and a fingerprint, not the full URL.
+    CHECK(h.audit_log[1].detail == "url=https://example.com url_fp=19f1352238b9");
 
     // Second delete: 404, and — as of this fix round — audited too (this
     // branch previously had no audit_fn call at all, an asymmetry with the
@@ -234,10 +308,11 @@ TEST_CASE("REST webhooks[pg]: DELETE removes and audits, carrying the pre-delete
     auto del2 = h.sink.Delete("/api/webhooks/" + std::to_string(id));
     REQUIRE(del2);
     CHECK(del2->status == 404);
-    REQUIRE(h.audit_log.size() == 2);
-    CHECK(h.audit_log[1].action == "webhook.delete");
-    CHECK(h.audit_log[1].result == "failure");
-    CHECK(h.audit_log[1].detail == "not_found");
+    REQUIRE(h.audit_log.size() == 4);
+    CHECK(h.audit_log[2].result == "attempted");
+    CHECK(h.audit_log[3].action == "webhook.delete");
+    CHECK(h.audit_log[3].result == "failure");
+    CHECK(h.audit_log[3].detail == "not_found");
 }
 
 TEST_CASE("REST webhooks[pg]: DELETE 404 on missing id, and audits it",
@@ -246,10 +321,63 @@ TEST_CASE("REST webhooks[pg]: DELETE 404 on missing id, and audits it",
     auto res = h.sink.Delete("/api/webhooks/999999");
     REQUIRE(res);
     CHECK(res->status == 404);
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "webhook.delete");
-    CHECK(h.audit_log[0].result == "failure");
-    CHECK(h.audit_log[0].detail == "not_found");
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[0].result == "attempted");
+    CHECK(h.audit_log[1].action == "webhook.delete");
+    CHECK(h.audit_log[1].result == "failure");
+    CHECK(h.audit_log[1].detail == "not_found");
+}
+
+TEST_CASE("REST webhooks[pg]: a failed attempted row refuses create and delete 503 and nothing changes "
+          "(mutation: mutate before auditing)",
+          "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    auto made = h.sink.Post("/api/webhooks", R"({"url":"https://example.com/hook"})");
+    REQUIRE(made);
+    const auto id = nlohmann::json::parse(made->body)["id"].get<int64_t>();
+
+    h.audit_persists = false;
+    h.audit_log.clear();
+    auto create = h.sink.Post("/api/webhooks", R"({"url":"https://other.example/hook"})");
+    REQUIRE(create);
+    CHECK(create->status == 503);
+    CHECK(create->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(create->get_header_value("X-Correlation-Id") != "");
+    auto del = h.sink.Delete("/api/webhooks/" + std::to_string(id));
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(del->get_header_value("Sec-Audit-Failed") == "true");
+    REQUIRE(h.audit_log.size() == 2); // each attempted row was tried; nothing followed
+    CHECK(h.audit_log[0].result == "attempted");
+    CHECK(h.audit_log[1].result == "attempted");
+
+    h.audit_persists = true;
+    auto list = h.sink.Get("/api/webhooks");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["webhooks"].size() == 1); // neither write happened
+}
+
+TEST_CASE("REST webhooks[pg]: a cross-site or header-less cookie write is refused 403",
+          "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    using Hdrs = std::unordered_map<std::string, std::string>;
+    for (const auto& headers : {Hdrs{{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}},
+                                Hdrs{{"Host", "yuzu.test"}}}) {
+        h.sink.default_headers = headers;
+        h.audit_log.clear();
+        auto post = h.sink.Post("/api/webhooks", R"({"url":"https://example.com/hook"})");
+        REQUIRE(post);
+        CHECK(post->status == 403);
+        auto del = h.sink.Delete("/api/webhooks/1");
+        REQUIRE(del);
+        CHECK(del->status == 403);
+        REQUIRE(h.audit_log.size() == 2);
+        CHECK(h.audit_log[0].action == "csrf.denied");
+    }
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+    auto list = h.sink.Get("/api/webhooks");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["webhooks"].empty()); // nothing was stored
 }
 
 TEST_CASE("REST webhooks[pg]: 403 when perm_fn denies (read and write)",
@@ -287,7 +415,14 @@ TEST_CASE("REST webhooks: 503 when store is null (list/create/delete/deliveries)
     };
     auto emit_event_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
                             const nlohmann::json&) {};
-    routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_event_fn, nullptr);
+    // A token caller (exempt from the same-site gate) so the store check is what answers.
+    auto resolve_fn = [](const httplib::Request&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.auth_source = "api_token";
+        return s;
+    };
+    routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_event_fn, nullptr,
+                           WriteGate{resolve_fn, {}});
 
     auto get = sink.Get("/api/webhooks");
     REQUIRE(get);
@@ -319,4 +454,134 @@ TEST_CASE("REST webhooks[pg]: GET /:id/deliveries empty list", "[rest][webhook][
     REQUIRE(j.contains("deliveries"));
     CHECK(j["deliveries"].is_array());
     CHECK(j["deliveries"].empty());
+}
+
+// #4644: the delivery-list `limit` is ONE base-10 integer or a 400.
+TEST_CASE("REST webhooks[pg]: GET /:id/deliveries rejects a malformed limit",
+          "[rest][webhook][pg][numeric_params]") {
+    WebhookRouteHarness h;
+    for (const char* bad : {"50abc", "0x10", "1e2", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto res = h.sink.Get(std::string("/api/webhooks/1/deliveries?limit=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto ok = h.sink.Get("/api/webhooks/1/deliveries?limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("REST webhooks[pg]: a token caller needs no Origin",
+          "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    h.auth_source = "api_token";
+    h.sink.default_headers = {{"Host", "yuzu.test"}}; // no Origin, no Referer
+    auto post = h.sink.Post("/api/webhooks", R"({"url":"https://example.com/hook"})");
+    REQUIRE(post);
+    CHECK(post->status == 200);
+    const auto id = nlohmann::json::parse(post->body)["id"].get<int64_t>();
+    auto del = h.sink.Delete("/api/webhooks/" + std::to_string(id));
+    REQUIRE(del);
+    CHECK(del->status == 200);
+}
+
+TEST_CASE("WriteGate: cookie writes need a same-site or trusted Origin and token writes need none",
+          "[rest][webhook][security]") {
+    std::string source = "local";
+    std::vector<std::string> audited;
+    WriteGate gate{[&](const httplib::Request&) -> std::optional<auth::Session> {
+                       auth::Session s;
+                       s.auth_source = source;
+                       return s;
+                   },
+                   {"https://admin.example"}};
+    const WebhookRoutes::AuditFn audit_fn = [&](const httplib::Request&, const std::string& action,
+                                                const std::string&, const std::string&,
+                                                const std::string&, const std::string&) -> bool {
+        audited.push_back(action);
+        return true;
+    };
+    auto refused = [&](std::initializer_list<std::pair<const char*, const char*>> headers) {
+        httplib::Request req;
+        for (const auto& [k, v] : headers)
+            req.set_header(k, v);
+        httplib::Response res;
+        const bool r = gate.refuse_cross_site(audit_fn, req, res, "/x");
+        CHECK((r == (res.status == 403)));
+        return r;
+    };
+    CHECK_FALSE(refused({{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}}));
+    CHECK_FALSE(refused({{"Host", "yuzu.test"}, {"Origin", "https://admin.example"}})); // trusted
+    CHECK(refused({{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}}));
+    CHECK(refused({{"Host", "yuzu.test"}})); // a cookie write with neither header
+    CHECK(audited.size() == 2); // each refusal leaves a csrf.denied row
+    source = "api_token";
+    CHECK_FALSE(refused({{"Host", "yuzu.test"}}));
+    CHECK_FALSE(refused({{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}}));
+    // An unwired resolver reads as a cookie session: the gate stays closed.
+    WriteGate unwired;
+    httplib::Request req;
+    httplib::Response res;
+    CHECK(unwired.refuse_cross_site(audit_fn, req, res, "/x"));
+}
+
+TEST_CASE("REST webhooks[pg]: the attempted-row 503 carries retry_after_ms and a remediation",
+          "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    h.audit_persists = false;
+    auto res = h.sink.Post("/api/webhooks", R"({"url":"https://example.com/hook"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(j["error"]["remediation"].get<std::string>().empty());
+    CHECK(j["error"]["correlation_id"] == res->get_header_value("X-Correlation-Id"));
+}
+
+TEST_CASE("REST webhooks[pg]: a lost outcome row keeps the 2xx and marks Sec-Audit-Failed",
+          "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    h.fail_result = "success"; // the attempted row persists, the outcome row does not
+    auto made = h.sink.Post("/api/webhooks", R"({"url":"https://example.com/hook"})");
+    REQUIRE(made);
+    CHECK(made->status == 200);
+    CHECK(made->get_header_value("Sec-Audit-Failed") == "true");
+    const auto id = nlohmann::json::parse(made->body)["id"].get<int64_t>();
+    auto del = h.sink.Delete("/api/webhooks/" + std::to_string(id));
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(del->get_header_value("Sec-Audit-Failed") == "true");
+    h.fail_result.clear();
+    auto list = h.sink.Get("/api/webhooks");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["webhooks"].empty()); // both changes were made
+}
+
+TEST_CASE("REST webhooks[pg]: an id that overflows int64 answers 404 and the delete is audited",
+          "[rest][webhook][pg]") {
+    WebhookRouteHarness h;
+    auto del = h.sink.Delete("/api/webhooks/99999999999999999999");
+    REQUIRE(del);
+    CHECK(del->status == 404);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "webhook.delete");
+    CHECK(h.audit_log[0].result == "failure");
+    CHECK(h.audit_log[0].detail == "not_found");
+    auto deliveries = h.sink.Get("/api/webhooks/99999999999999999999/deliveries");
+    REQUIRE(deliveries);
+    CHECK(deliveries->status == 404);
+}
+
+TEST_CASE("REST webhooks[pg]: a lost failure row still marks Sec-Audit-Failed on the refusal",
+          "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    h.fail_result = "failure";
+    auto bad = h.sink.Post("/api/webhooks", R"({"url":"ftp://evil/h"})");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    CHECK(bad->get_header_value("Sec-Audit-Failed") == "true");
+    auto gone = h.sink.Delete("/api/webhooks/999999");
+    REQUIRE(gone);
+    CHECK(gone->status == 404);
+    CHECK(gone->get_header_value("Sec-Audit-Failed") == "true");
 }

@@ -12,10 +12,13 @@
 #include <shared_mutex>
 #include <string_view>
 
+#include "admin_gate.hpp"
 #include "authz_topology_floor.hpp"
 #include "body_cap_policy.hpp" // resolve_body_cap — path_class label for the service-scope deny metric (#2298 PR 3)
+#include "default_certs.hpp" // detect_hostname — the server name on the landing page's slim bar
 #include "deprovision_deny_split.hpp" // record_deprovision_deny_split — ADR-2001 #3069 shared split
 #include "engine_principal_store.hpp"
+#include "home_ui.hpp" // the landing and sign-in page (GET /home; GET /login redirects there)
 #include "http_route_sink.hpp"
 #include "legacy_self_service_allow.hpp"
 #include "mcp_policy.hpp"
@@ -31,12 +34,11 @@
 #include "service_scope_policy.hpp" // authz::service_scope_global_safe — #2298 PR 3 default-deny table
 #include "web_utils.hpp" // audit_token — CWE-117 neutralisation for the audit-failure warn
 
+#include <yuzu/version.hpp> // kVersionString — the version on the landing page's slim bar
+
 #include <ctime>
 
 #include <nlohmann/json.hpp>
-
-// Login page HTML (defined in login_ui.cpp)
-extern const char* const kLoginHtml;
 
 namespace yuzu::server {
 
@@ -156,6 +158,20 @@ static std::string oidc_bind_cookie_clear(bool https) {
     return std::string(oidc_bind_cookie_name(https)) +
            "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (https ? "; Secure" : "");
 }
+
+// Probes (`AuthRoutes::has_permission`) in flight on this thread. While it is non-zero
+// `audit_log` is a no-op that reports success: the probe runs `require_permission` unchanged and
+// only its denial audit row is withheld. thread_local because httplib serves a request start to
+// finish on one thread and `require_permission` is synchronous, so a probe never leaks into
+// another request's audit writes.
+thread_local int g_audit_probe_depth = 0;
+
+struct AuditProbeScope {
+    AuditProbeScope() { ++g_audit_probe_depth; }
+    ~AuditProbeScope() { --g_audit_probe_depth; }
+    AuditProbeScope(const AuditProbeScope&) = delete;
+    AuditProbeScope& operator=(const AuditProbeScope&) = delete;
+};
 
 } // namespace
 
@@ -605,12 +621,15 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
     if (!session)
         return false;
 
-    // Service-scoped tokens are limited to ITServiceOwner permissions for one named
-    // service; they must never reach admin routes regardless of the creator's role.
-    // MCP tokens are for fleet management (queries, instruction execution) and must
-    // not be used to administer the server itself (settings, users, TLS, OIDC).
-    // See docs/mcp-server.md and docs/auth-architecture.md (#520).
-    if (!session->token_scope_service.empty()) {
+    // The decision lives in authz::admin_gate_verdict (admin_gate.hpp) so the
+    // /settings gate and /api/me's can_access_settings share one copy. Service-
+    // scoped and MCP tokens never reach admin routes whatever their creator's
+    // role (docs/mcp-server.md, docs/auth-architecture.md #520); otherwise the
+    // EFFECTIVE role counts, so an active JIT elevation is admin for its window.
+    switch (authz::admin_gate_verdict(*session)) {
+    case authz::AdminGate::Admit:
+        return true;
+    case authz::AdminGate::ServiceScoped:
         audit_log(req, "auth.admin_required", "denied", "", "",
                   "service-scoped token blocked from admin route");
         res.status = 403;
@@ -621,32 +640,22 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
             detail::a4_denial(res, 403, "service-scoped tokens cannot perform admin operations"),
             "application/json");
         return false;
-    }
-    if (!session->mcp_tier.empty()) {
+    case authz::AdminGate::McpTier:
         audit_log(req, "auth.admin_required", "denied", "", "",
                   "MCP token blocked from admin route");
         res.status = 403;
         res.set_content(detail::a4_denial(res, 403, "MCP tokens cannot perform admin operations"),
                         "application/json");
         return false;
+    case authz::AdminGate::NotAdmin:
+        break;
     }
-
-    // effective_role(), not the raw role, so an active JIT admin elevation
-    // (POST /api/v1/elevate) is treated as admin for its window and auto-reverts.
-    // Only interactive cookie sessions can be elevated — the MCP/service-token
-    // guards above already rejected those credentials, and elevate_session never
-    // runs for them.
-    if (auth::effective_role(*session) != auth::Role::admin) {
-        // SOC 2 CC7.2: every privileged-endpoint denial must surface in
-        // the audit chain, not just the request log. Emitting here closes
-        // the gap for every caller in one place rather than threading an
-        // audit_fn through dozens of route registrations (governance PR4).
-        audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
-        res.status = 403;
-        res.set_content(detail::a4_denial(res, 403, "admin role required"), "application/json");
-        return false;
-    }
-    return true;
+    // SOC 2 CC7.2: every privileged-endpoint denial must surface in the audit
+    // chain, not just the request log (governance PR4).
+    audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
+    res.status = 403;
+    res.set_content(detail::a4_denial(res, 403, "admin role required"), "application/json");
+    return false;
 }
 
 bool AuthRoutes::service_scope_admits(std::string_view securable_type,
@@ -659,6 +668,37 @@ bool AuthRoutes::service_scope_admits(std::string_view securable_type,
         return false;
     }
     return authz::service_scope_global_safe(securable_type, operation);
+}
+
+bool AuthRoutes::has_permission(const httplib::Request& req, const std::string& securable_type,
+                                const std::string& operation) {
+    httplib::Response discarded; // require_permission writes its 403/503 here, never to the page
+    return probe_permission(req, discarded, securable_type, operation);
+}
+
+bool AuthRoutes::probe_admin(const httplib::Request& req, httplib::Response& res) {
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
+    return require_admin(req, res);
+}
+
+bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response& res,
+                                  const std::string& securable_type,
+                                  const std::string& operation) {
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
+    return require_permission(req, res, securable_type, operation);
+}
+
+std::expected<authz::ListAuthority, authz::GateFailure>
+AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res,
+                             const std::string& securable_type, const std::string& operation) {
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
+    return require_fleet_read(req, res, securable_type, operation);
 }
 
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,
@@ -1488,6 +1528,8 @@ void AuthRoutes::reap_mfa_pending_locked() {
 bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
                            const std::string& target_id, const std::string& detail) {
+    if (g_audit_probe_depth > 0)
+        return true; // a has_permission probe: nothing was attempted, so nothing is recorded
     if (!audit_store_)
         return true; // audit-off deployment — not a failure relative to config
     auto event = make_audit_event(req, action, result);
@@ -1978,17 +2020,71 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
 }
 
 void AuthRoutes::register_routes(HttpRouteSink& sink) {
-    // -- Login page -----------------------------------------------------------
-    sink.Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
-        std::string html(kLoginHtml);
-        // Inject OIDC enablement flag into the page
-        std::shared_lock oidc_lock(oidc_mu_);
-        if (oidc_provider_ && oidc_provider_->is_enabled()) {
-            auto pos = html.find("/*OIDC_CONFIG*/");
-            if (pos != std::string::npos)
-                html.replace(pos, 15, "window.OIDC_ENABLED=true;");
+    // -- Landing and sign-in page ---------------------------------------------
+    // `/home` is the one sign-in page: the form, the TOTP/enrolment steps and
+    // the SSO link all live there (home_ui.cpp). It needs no session — a
+    // signed-out visitor gets the form, a signed-in one the signed-in panel —
+    // and it never redirects after sign-in (the user stays on Home). `next` is
+    // only ever a screen key from the page's own allow-list; anything else is
+    // treated as absent, so it can neither open-redirect nor echo input.
+    sink.Get("/home", [this](const httplib::Request& req, httplib::Response& res) {
+        static const std::string host = detect_hostname();
+        home_ui::LandingView v;
+        v.server_name = host;
+        v.version = yuzu::kVersionString;
+        if (req.has_param("next"))
+            v.next = home_ui::screen_by_key(req.get_param_value("next"));
+        {
+            std::shared_lock oidc_lock(oidc_mu_);
+            if (oidc_provider_ && oidc_provider_->is_enabled())
+                v.sso_href = "/auth/oidc/start";
         }
-        res.set_content(html, "text/html; charset=utf-8");
+        if (v.sso_href.empty() && saml_provider_ && saml_provider_->is_enabled())
+            v.sso_href = "/auth/saml/start";
+        v.mfa_note = cfg_.mfa_enforcement != "optional";
+        // A visitor with no credential at all never reaches the session store: this page
+        // is open to the internet, and resolving an empty token would cost a database
+        // read per view.
+        const bool has_credential = !extract_session_cookie(req).empty() ||
+                                    !req.get_header_value("Authorization").empty() ||
+                                    !req.get_header_value("X-Yuzu-Token").empty();
+        if (auto session = has_credential ? resolve_session(req) : std::nullopt) {
+            v.who = home_ui::SignedIn{
+                .name = session->display_name.empty() ? session->username : session->display_name,
+                .role = session->role == auth::Role::admin ? "Administrator" : "Viewer"};
+        } else if (req.has_param("error")) {
+            v.error_message = home_ui::sso_error_message(req.get_param_value("error"));
+        }
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(home_ui::render_landing(v), "text/html; charset=utf-8");
+    });
+
+    // `/login` is the address every existing redirect, bookmark and SSO error
+    // bounce still uses; it forwards to the landing page, carrying only a
+    // validated `next` key and a known `error` code.
+    sink.Get("/login", [](const httplib::Request& req, httplib::Response& res) {
+        std::string location = "/home";
+        char sep = '?';
+        if (req.has_param("next")) {
+            if (const auto* s = home_ui::screen_by_key(req.get_param_value("next"))) {
+                location += sep;
+                location += "next=";
+                location += s->key;
+                sep = '&';
+            }
+        }
+        if (req.has_param("error")) {
+            const std::string code = req.get_param_value("error");
+            for (std::string_view known : {"sso_denied", "sso_failed", "sso_invalid", "saml"}) {
+                if (code == known) {
+                    location += sep;
+                    location += "error=";
+                    location += code;
+                    break;
+                }
+            }
+        }
+        res.set_redirect(location);
     });
 
     sink.Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
@@ -3325,7 +3421,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Success — the durable row is gone; clear the cookie and finish.
         res.set_header("Set-Cookie", "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
         if (is_htmx) {
-            res.set_header("HX-Redirect", "/login");
+            // Back to the sign-in panel on the landing page.
+            res.set_header("HX-Redirect", "/home");
             res.set_content("", "text/plain");
         } else {
             res.set_content(R"({"status":"ok"})", "application/json");
@@ -3860,7 +3957,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 .increment();
         }
 
-        res.set_redirect("/");
+        // Sign-in stays on Home (the signed-in panel offers "Open Dashboard"): the
+        // landing page is where every sign-in ends, password or federated.
+        res.set_redirect("/home");
     });
 
     // -- SAML 2.0 SSO endpoints ------------------------------------------------
@@ -4503,7 +4602,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             return true;
         };
-        auto target = is_safe_relay_state(relay_state) ? relay_state : std::string{"/"};
+        auto target = is_safe_relay_state(relay_state) ? relay_state : std::string{"/home"};
         res.set_redirect(target);
     });
 
@@ -4645,6 +4744,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
         const bool eligible = body["eligible"].get<bool>();
+        // Granting eligibility is a STANDING right to elevate: an elevated session (admin only
+        // through its own temporary elevation) must not extend it to another account. Revoking
+        // stays open to an elevated session, since that only removes access.
+        if (eligible && session->role != auth::Role::admin) {
+            audit_log(req, "user.elevation_eligibility.set", "denied", "User", target,
+                      "elevated_session_eligibility_grant_blocked");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "granting elevation eligibility needs your "
+                                                       "own administrator role, not an elevation",
+                                                  cid, "another administrator must grant it"),
+                            "application/json");
+            return;
+        }
         if (auto r = db->set_elevation_eligible(target, eligible); !r) {
             const auto err = r.error();
             const int code = err == AuthDBError::UserNotFound ? 404 : 500;

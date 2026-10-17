@@ -1,0 +1,1 @@
+- **The Instructions "Templates" button now visibly opens its panel.** The response-templates panel previously loaded below the whole definitions table; it now opens directly under the library toolbar and scrolls into view, with a heading and a Close button.

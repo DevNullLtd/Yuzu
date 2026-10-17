@@ -379,7 +379,7 @@ TEST_CASE("HeartbeatIngestion: resolved_session_id is recorded on the presence r
     CHECK(row->os == "linux");
 
     // The presence row now carries the RESOLVED session id: the old session
-    // no longer matches, the resolved one does (and the delete is consumed).
+    // no longer matches, the resolved one does (and the clear is consumed).
     CHECK_FALSE(store.remove_if_session("yuzu_test_hb_nonowner", "sess-owner"));
     CHECK(store.remove_if_session("yuzu_test_hb_nonowner", "sess-resolved"));
 }

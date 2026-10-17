@@ -7,8 +7,8 @@
 /// thresholds) → run across a cohort → a go/no-go result GROUPED BY DEVICE
 /// (Pass / Failed / Warn-only / Incomplete, with summary pills + "Failed by"
 /// chips). Interim manual surface for the agentic upgrade-lifecycle; the
-/// orchestrator drives the same checks + thresholds headless later. Reached at
-/// /auto by URL — deliberately NOT a nav tab yet.
+/// orchestrator drives the same checks + thresholds headless later. Reached from
+/// the app shell's Software > Deployments sidebar item, or at /auto by URL.
 ///
 /// Product UI: HTMX, server-rendered, dark-theme only, htmx CORE attrs only (the
 /// dashboard CSP blocks hx-on / unsafe-eval). Reuses the shared full-page shell

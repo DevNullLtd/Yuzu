@@ -31,9 +31,12 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <optional>
+#include <regex>
 #include <stdexcept>
 #include <string>
 
@@ -56,6 +59,9 @@ struct Harness {
     bool session_present{true};
     std::string session_username{"alice"};
     auth::Role session_role{auth::Role::user};
+    std::string session_mcp_tier;
+    std::string session_scope_service;
+    bool session_elevated{false};
 
     RbacStore* rbac_store{nullptr};
     AuditStore* audit_store{nullptr};
@@ -96,6 +102,12 @@ struct Harness {
             auth::Session s;
             s.username = session_username;
             s.role = session_role;
+            s.mcp_tier = session_mcp_tier;
+            s.token_scope_service = session_scope_service;
+            if (session_elevated) {
+                s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
+                s.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
+            }
             return s;
         };
         deps.visible_agents_json_fn = [this](const std::string& username) {
@@ -148,6 +160,50 @@ TEST_CASE("dashboard_api_routes: /api/me reports session info with rbac_enabled:
     CHECK(j["display_name"] == "alice"); // falls back to username when unset
     CHECK(j["rbac_enabled"] == false);
     CHECK(j["rbac_role"] == "Administrator");
+}
+
+TEST_CASE("dashboard_api_routes: /api/me self-description per persona (#5779, #4208)",
+          "[server][routes][dashboard_api_routes]") {
+    struct Row {
+        auth::Role role;
+        bool elevated;
+        const char* mcp_tier;
+        const char* scope;
+        const char* effective;
+        bool can_access;
+    };
+    const Row rows[] = {
+        {auth::Role::admin, false, "", "", "admin", true},
+        {auth::Role::user, false, "", "", "user", false},
+        {auth::Role::user, true, "", "", "admin", true},
+        {auth::Role::admin, false, "operator", "", "admin", false},
+        {auth::Role::user, false, "", "finance", "user", false},
+    };
+    for (const auto& row : rows) {
+        Harness h;
+        h.session_role = row.role;
+        h.session_elevated = row.elevated;
+        h.session_mcp_tier = row.mcp_tier;
+        h.session_scope_service = row.scope;
+        h.wire();
+        auto r = h.sink.Get("/api/me");
+        REQUIRE(r);
+        auto j = json::parse(r->body);
+        CHECK(j["role"] == auth::role_to_string(row.role));
+        CHECK(j["effective_role"] == row.effective);
+        CHECK(j["elevated"] == row.elevated);
+        CHECK(j.contains("elevated_until") == row.elevated);
+        if (row.elevated) {
+            REQUIRE(j["elevated_until"].is_string());
+            CHECK(std::regex_match(j["elevated_until"].get<std::string>(),
+                                   std::regex(R"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")));
+        }
+        CHECK(j["can_access_settings"] == row.can_access);
+        CHECK(r->get_header_value("Cache-Control") == "no-store, private");
+        // perm_fn is never called (the audit-row absence is pinned by the PG
+        // decision-table case in test_auth_routes.cpp, which wires a real store).
+        CHECK(h.last_perm_type.empty());
+    }
 }
 
 TEST_CASE("dashboard_api_routes: /api/me falls back to the legacy-role mapping for a Viewer "
@@ -290,6 +346,49 @@ TEST_CASE("dashboard_api_routes: /api/export/json-to-csv rejects a non-array JSO
     auto r = h.sink.Post("/api/export/json-to-csv", R"({"not":"an array"})");
     REQUIRE(r);
     CHECK(r->status == 400);
+}
+
+TEST_CASE("dashboard_api_routes: /api/export/json-to-csv rejects a body nested deeper than 32 "
+          "with 400 and still accepts a legitimate nested row",
+          "[server][routes][dashboard_api_routes][export]") {
+    Harness h;
+    h.wire();
+
+    // Deeper than kMcpMaxJsonDepth: dump() of this cell would recurse 40 deep
+    // per row; at depth ~100k it kills the process. Must be refused pre-parse.
+    std::string deep = R"([{"a":)" + std::string(40, '[') + std::string(40, ']') + "}]";
+    auto bad = h.sink.Post("/api/export/json-to-csv", deep);
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    CHECK(bad->body.find("request body nests too deeply") != std::string::npos);
+
+    // Depth 3 (array, object, array, array) is a legitimate row.
+    auto ok = h.sink.Post("/api/export/json-to-csv", R"([{"a":[[1,2]]}])");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(ok->body == "a\r\n\"[[1,2]]\"\r\n");
+}
+
+TEST_CASE("dashboard_api_routes: /api/export/json-to-csv quotes non-string cells without "
+          "formula-neutralising them",
+          "[server][routes][dashboard_api_routes][export]") {
+    Harness h;
+    h.wire();
+
+    // A negative number stays a number: neutralize_formula would make it '-5.
+    auto num = h.sink.Post("/api/export/json-to-csv", R"([{"n":-5,"f":-1.5,"b":true}])");
+    REQUIRE(num);
+    CHECK(num->body == "b,f,n\r\ntrue,-1.5,-5\r\n"); // keys sort; -5 untouched
+
+    // A nested object with commas stays in ONE cell (RFC 4180 quoted).
+    auto obj = h.sink.Post("/api/export/json-to-csv", R"([{"o":{"a":1,"b":2},"z":"x"}])");
+    REQUIRE(obj);
+    CHECK(obj->body == "o,z\r\n\"{\"\"a\"\":1,\"\"b\"\":2}\",x\r\n");
+
+    // A free-text string starting with '=' is still neutralised.
+    auto str = h.sink.Post("/api/export/json-to-csv", R"([{"s":"=1+1"}])");
+    REQUIRE(str);
+    CHECK(str->body == "s\r\n'=1+1\r\n");
 }
 
 // ── POST /api/scope/validate: auth_fn only; pure, no store ─────────────────
@@ -445,6 +544,33 @@ TEST_CASE("dashboard_api_routes: /api/me reports the assigned RBAC role when rba
     auto j = json::parse(r->body);
     CHECK(j["rbac_enabled"] == true);
     CHECK(j["rbac_role"] == "PlatformEngineer");
+    // #5779: an RBAC role label never opens /settings (require_admin ignores RBAC
+    // grants); the link predicate must stay false for a non-admin session.
+    CHECK(j["can_access_settings"] == false);
+    CHECK(j["effective_role"] == "user");
+}
+
+TEST_CASE("dashboard_api_routes: /api/me can_access_settings stays false for an RBAC "
+          "Administrator grant on a legacy user session (#5779)",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    REQUIRE(rbac.assign_role({"user", "alice", "Administrator"}).has_value());
+
+    Harness h;
+    h.rbac_store = &rbac;
+    h.wire();
+
+    auto r = h.sink.Get("/api/me");
+    REQUIRE(r);
+    auto j = json::parse(r->body);
+    CHECK(j["rbac_role"] == "Administrator");
+    CHECK(j["role"] == "user");
+    CHECK(j["can_access_settings"] == false);
 }
 
 TEST_CASE("dashboard_api_routes: /api/me falls back to the legacy-role mapping when rbac is "
@@ -561,6 +687,49 @@ TEST_CASE("dashboard_api_routes: /api/audit rejects limit < 1 with 400 against a
     CHECK(r->status == 400);
 }
 
+TEST_CASE("dashboard_api_routes: /api/audit bounds limit and offset like its v1/MCP twins",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    AuditEvent e;
+    e.principal = "alice";
+    e.action = "auth.login";
+    e.result = "success";
+    REQUIRE(audit.log(e));
+    {
+        // One statement seeds 1000 more rows (1001 total) so the cap is observable.
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        PGresult* ins = PQexec(
+            lease.get(),
+            "INSERT INTO audit_store.audit_events (timestamp, principal, principal_role, action, "
+            "result) SELECT g, 'bulk', 'admin', 'bulk.seed', 'success' FROM generate_series(1, "
+            "1000) g");
+        REQUIRE(PQresultStatus(ins) == PGRES_COMMAND_OK);
+        PQclear(ins);
+    }
+
+    Harness h;
+    h.audit_store = &audit;
+    h.wire();
+
+    // An oversized limit is clamped to 1000 before the store: 1001 rows exist,
+    // exactly 1000 come back - not an unbounded fetch and not an error.
+    auto r = h.sink.Get("/api/audit?limit=2147483647");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(json::parse(r->body)["events"].size() == 1000);
+    // offset is capped at kAuditMaxOffset; the cap itself is valid.
+    r = h.sink.Get("/api/audit?offset=10001");
+    REQUIRE(r);
+    CHECK(r->status == 400);
+    r = h.sink.Get("/api/audit?offset=10000");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+}
+
 TEST_CASE("dashboard_api_routes: /api/analytics/status reports real pending/total counts",
           "[pg][server][routes][dashboard_api_routes]") {
     yuzu::test::AnalyticsEventStorePg analytics;
@@ -603,4 +772,91 @@ TEST_CASE("dashboard_api_routes: /api/analytics/recent reports the emitted event
     CHECK(j["events"][0]["event_type"] == "agent.registered");
     CHECK(j["events"][0]["agent_id"] == "agent-001");
     CHECK(j["count"] == 1);
+}
+
+// ── #4644: strict numeric query parameters ──────────────────────────
+
+TEST_CASE("dashboard_api_routes: /api/audit rejects a malformed since/until/limit/offset with "
+          "400 instead of reading its numeric prefix",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+
+    Harness h;
+    h.audit_store = &audit;
+    h.wire();
+
+    for (const char* bad :
+         {"since=1e9", "since=junk", "since=100abc", "until=0x10", "until=", "limit=100abc",
+          "limit=1e3", "offset=5x", "limit=4294967296", "since=99999999999999999999"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/audit?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(json::parse(r->body)["error"]["message"] == "invalid numeric query parameter");
+    }
+    auto ok = h.sink.Get("/api/audit?since=0&until=1&limit=10&offset=0");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("dashboard_api_routes: /api/audit rejects a negative since and until of zero or below "
+          "with 400 while since of zero is accepted",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+
+    Harness h;
+    h.audit_store = &audit;
+    h.wire();
+
+    // The bounds are presence-tracked: a literal -3600 or 0 used to mean "the whole log".
+    for (const char* bad : {"since=-1", "since=-3600", "since=-1&until=5", "since=-5&until=7"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/audit?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(json::parse(r->body)["error"]["message"] == "since must not be negative");
+    }
+    for (const char* bad : {"until=0", "until=000", "until=-1", "since=5&until=0",
+                            "since=0&until=0", "since=0&until=-5"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/audit?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(json::parse(r->body)["error"]["message"] ==
+              "until must be a positive epoch second or omitted");
+    }
+    for (const char* ok : {"since=0", "until=1", "since=0&until=1", "", "since=1700000000"}) {
+        INFO(ok);
+        auto r = h.sink.Get(std::string("/api/audit?") + ok);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+    }
+}
+
+TEST_CASE("dashboard_api_routes: /api/analytics/recent rejects a malformed limit with 400 "
+          "instead of silently ignoring it",
+          "[server][routes][dashboard_api_routes]") {
+    Harness h; // analytics_store stays null: the 400 is decided before the store is touched
+    h.wire();
+
+    for (const char* bad : {"limit=abc", "limit=50x", "limit=1e3", "limit=", "limit=4294967296"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/analytics/recent?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(json::parse(r->body)["error"]["message"] == "invalid numeric query parameter");
+    }
+    // A well-formed value (even a non-positive one, which is clamped) is not an error.
+    for (const char* ok : {"limit=10", "limit=0", "limit=-5"}) {
+        INFO(ok);
+        auto r = h.sink.Get(std::string("/api/analytics/recent?") + ok);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+    }
 }

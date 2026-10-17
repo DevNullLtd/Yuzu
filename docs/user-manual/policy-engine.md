@@ -57,7 +57,7 @@ Each fragment stores:
 
 | Field | Description |
 |---|---|
-| `id` | Auto-generated unique identifier |
+| `id` | Auto-generated unique identifier, or an explicit `id` of letters, digits, `.`, `_` and `-` (1 to 128 characters, not only dots); existing records are unaffected |
 | `name` | Human-readable fragment name |
 | `description` | What this fragment checks and fixes |
 | `yaml_source` | Verbatim YAML source (source of truth) |
@@ -103,7 +103,7 @@ checks run.
 
 | Field | Description |
 |---|---|
-| `id` | Auto-generated unique identifier |
+| `id` | Auto-generated unique identifier, or an explicit `id` of letters, digits, `.`, `_` and `-` (1 to 128 characters, not only dots); existing records are unaffected |
 | `name` | Human-readable policy name |
 | `description` | What this policy enforces |
 | `yaml_source` | Verbatim YAML source (source of truth) |
@@ -318,6 +318,21 @@ displays:
 - Per-policy compliance percentage with drill-down to agent-level detail
 - Per-agent status with last check time and check result
 
+### Managing policies from the Compliance page
+
+The page carries the same actions as the REST API; each control appears only
+when the signed-in role holds the permission (the server re-checks every call).
+
+| Control | Permission | What it does |
+|---|---|---|
+| **On** switch | `Policy:Write` | Enables or disables the policy. Both directions ask for confirmation: a disabled policy stops being re-checked and its last results go stale. |
+| **Evaluate** | `Policy:Execute` | Dispatches a read-only check now. The toast shows the execution id, not a device count. |
+| **Invalidate all** | `Policy:Execute` | Resets every result to unknown; fleet compliance reads 0% until devices check in. Confirmation required. |
+| **New policy** / **New fragment** | `Policy:Write` | Paste YAML (up to 1 MiB); a refused document shows the server's message. Not available in this build: the controls appear only once the shared dialog script (`/static/yuzu-dialog.js`) is shipped, so create policies and fragments with `POST /api/policies` and `POST /api/policy-fragments` until then. |
+| **Remediate** | `Policy:Execute` | Shown only when the policy's fragment has a fix. Runs the fix on whichever devices are non-compliant when you confirm; there is no approval step. |
+| **Invalidate cache** | `Policy:Execute` | Resets one policy's results and its fix attempt counts. Confirmation required. |
+| **Delete** (policy, fragment) | `Policy:Delete` | Confirmation required. A fragment still used by a policy cannot be deleted. |
+
 ---
 
 ## Cache Invalidation
@@ -434,14 +449,21 @@ Both forms produce a 201 with `{"id": "<fragment-id>", "status": "created"}`.
 
 ### HTMX Fragments
 
-> These dashboard fragments are **not** `Policy:*`-gated — they resolve a session and
-> nothing more (`compliance_routes.cpp`). That is a known gap, tracked as #4042; the
-> per-route permissions above apply to the `/api/` surface only.
+> These fragments carry the same gate as their REST v1 twins. After a
+> service-scoped-token deny, the summary requires `Policy:Read` (a global grant: a holder
+> whose grant arrives only through a management group is refused with 403). The
+> per-policy detail uses the fleet-read gate as its only gate, lists only the devices in
+> the caller's scope, and writes a `compliance.agent_statuses.view` audit row per open. If
+> that row cannot be persisted the page still renders and the response carries
+> `Sec-Audit-Failed: true` (the REST twin refuses with 503 instead). A caller whose grant
+> arrives only through a management group sees the device rows and no policy definition
+> (name, scope, check), the same as `GET /api/v1/compliance/{id}`.
 
-| Route | Description |
-|---|---|
-| `/fragments/compliance/summary` | Compliance dashboard summary fragment |
-| `/fragments/compliance/{policy_id}` | Per-policy compliance detail fragment |
+| Route | Gate | Description |
+|---|---|---|
+| `/fragments/compliance/summary` | `Policy:Read` | Compliance dashboard summary fragment |
+| `/fragments/compliance/{policy_id}` | fleet-read `Policy:Read`, confined, audited | Per-policy compliance detail fragment |
+| `/fragments/policy-fragments` | `Policy:Read` | Policy fragments list with used-by counts |
 
 ---
 

@@ -78,7 +78,7 @@ agent_pb::AgentInfo make_agent_info(const std::string& id) {
 // path (fix #5), and one Forensics row (Wave 7 PR7.2's single-target rule)
 // mirroring the shape a real Forensics-securable row takes (a companion
 // package's app_usage.last_used, for one) rather than reclassifying it here.
-inline constexpr std::array<CommandCapability, 3> kFixture{{
+inline constexpr std::array<CommandCapability, 4> kFixture{{
     {
         .plugin = "noop",
         .action = "run",
@@ -111,6 +111,19 @@ inline constexpr std::array<CommandCapability, 3> kFixture{{
         .risk_tier = yuzu::server::authz::RiskTier::Medium,
         .system_reserved = false,
         .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    // A protective pair (the quarantine plugin's read-only status), so the plugin-presence
+    // carve-out can be driven through the route.
+    {
+        .plugin = "quarantine",
+        .action = "status",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Security",
+        .operation = yuzu::server::authz::Operation::Read,
+        .risk_tier = yuzu::server::authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 }};
 
@@ -164,6 +177,8 @@ struct CommandHarness {
 
     // -- dispatch sink --
     std::vector<std::string> send_to_ids_called;
+    int last_stagger = -1; ///< what the route handed the builder (-1 = never built)
+    int last_delay = -1;
     int send_all_calls = 0;
     bool sink_throws = false;
     bool force_zero_sends = false;
@@ -248,9 +263,11 @@ struct CommandHarness {
         deps.build_classified_command_fn =
             [this](const DispatchCaller&, const std::string& plugin, const std::string& action,
                   const std::string& command_id,
-                  const std::unordered_map<std::string, std::string>&, const std::string&, int,
-                  int, const std::string&,
+                  const std::unordered_map<std::string, std::string>&, const std::string&,
+                  int stagger, int delay, const std::string&,
                   const std::string&) -> std::expected<ClassifiedCommand, DispatchDenial> {
+            last_stagger = stagger;
+            last_delay = delay;
             if (classify_deny)
                 return std::unexpected(
                     DispatchDenial{DispatchDenialReason::Unclassified, "", yuzu::server::authz::Operation::Read});
@@ -716,6 +733,32 @@ TEST_CASE("/api/command: targets on a kill-switched OS are withheld and counted"
     CHECK(h.kill_switched_os_audit_counts == std::vector<std::size_t>{1});
 }
 
+// Protective-action exemption: the plugin-presence filter at this route's
+// `ids_missing_plugin` call must receive the wire action, so a protective pair is reached
+// even when the agent's reported inventory lacks its plugin, while an ordinary pair is not.
+TEST_CASE("/api/command: a protective action reaches an agent whose inventory lacks the plugin; "
+          "an ordinary one is withheld as plugin_not_found",
+          "[command_routes][protective]") {
+    CommandHarness h;
+    auto info = make_agent_info("inv-A");
+    info.add_plugins()->set_name("firewall"); // non-empty inventory without quarantine/noop
+    (void)h.registry.register_agent(info);
+
+    auto protective = h.sink.Post(
+        "/api/command", R"({"plugin":"quarantine","action":"status","agent_ids":["inv-A"]})");
+    REQUIRE(protective);
+    CHECK(protective->status == 200);
+    CHECK(h.send_to_ids_called == std::vector<std::string>{"inv-A"});
+
+    h.send_to_ids_called.clear();
+    auto ordinary =
+        h.sink.Post("/api/command", R"({"plugin":"noop","action":"run","agent_ids":["inv-A"]})");
+    REQUIRE(ordinary);
+    CHECK(ordinary->status == 503);
+    CHECK(nlohmann::json::parse(ordinary->body)["error"]["reason"] == "plugin_not_found");
+    CHECK(h.send_to_ids_called.empty());
+}
+
 TEST_CASE("/api/command: only kill-switched-OS targets reports 503 reason=kill_switched_os",
           "[command_routes][5294]") {
     CommandHarness h;
@@ -1034,4 +1077,56 @@ TEST_CASE("/api/command: a body nested past the depth limit is rejected before d
     CHECK(j["error"]["message"].get<std::string>().find("nests too deeply") != std::string::npos);
     CHECK(h.send_to_ids_called.empty());
     CHECK(h.send_all_calls == 0);
+}
+
+// #4644: `stagger` and `delay` were read with `extract_json_int`, which wrapped 4294967297 to 1
+// and read a float, string or null as 0 -- so a command held for a delay dispatched IMMEDIATELY.
+// Both are now strict JSON integers in 0..300 (the agent caps both at 300 s, so a larger value
+// would run after five minutes while the caller believed it was held longer); anything else is a
+// 400 and nothing is built or sent.
+TEST_CASE("/api/command: stagger and delay are strict integers; a bad value dispatches nothing "
+          "(#4644)",
+          "[command_routes][numeric_params]") {
+    CommandHarness h;
+    const std::vector<std::string> bad = {
+        "4294967297", "2147483648", "301",    "9223372036854775808", "18446744073709551615", "-1",
+        "1e3",        "5.5",        "\"7\"",                "\"\"",                 "null",
+        "true",       "[]",         "{}"};
+    for (const char* key : {"stagger", "delay"}) {
+        for (const auto& v : bad) {
+            const std::string body = std::string(R"({"plugin":"noop","action":"run",)") +
+                                     R"("agent_ids":["dev-A"],")" + key + "\":" + v + "}";
+            INFO(body);
+            auto res = h.sink.Post("/api/command", body);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            auto j = nlohmann::json::parse(res->body);
+            CHECK(j["error"]["message"].get<std::string>().find(key) != std::string::npos);
+        }
+        // A truncated body is refused before the field is ever read.
+        auto res = h.sink.Post("/api/command",
+                               std::string(R"({"plugin":"noop","action":"run","agent_ids":["dev-A"],")") +
+                                   key + "\":5");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.send_all_calls == 0);
+    CHECK(h.last_stagger == -1); // the builder was never reached
+
+    // Documented values still dispatch and reach the builder unchanged; absent keeps 0.
+    auto ok = h.sink.Post(
+        "/api/command",
+        R"({"plugin":"noop","action":"run","agent_ids":["dev-A"],"stagger":30,"delay":300})");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.last_stagger == 30);
+    CHECK(h.last_delay == 300); // the agent-side cap is the ceiling
+    auto zero = h.sink.Post("/api/command",
+                            R"({"plugin":"noop","action":"run","agent_ids":["dev-A"],"delay":0})");
+    REQUIRE(zero);
+    CHECK(zero->status == 200);
+    CHECK(h.last_stagger == 0);
+    CHECK(h.last_delay == 0);
+    CHECK(h.send_to_ids_called.size() == 2);
 }

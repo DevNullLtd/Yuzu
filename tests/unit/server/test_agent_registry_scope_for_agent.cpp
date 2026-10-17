@@ -383,7 +383,13 @@ TEST_CASE("evaluate_scope_for_agent: Unresolvable for from_result_set: and for p
          {R"X(from_result_set:rs_abc)X", R"X(NOT (from_result_set:rs_abc))X",
           R"X(ostype == "linux" AND from_result_set:rs_abc)X", R"X(props.owner == "alice")X",
           R"X(NOT (props.owner == "alice"))X", R"X(EXISTS props.tier)X",
-          R"X(LEN(props.tier) > 1)X"}) {
+          R"X(LEN(props.tier) > 1)X",
+          // Synthetic forms (`__len:` / `__startswith:` encodings) of a result-set atom must
+          // abort exactly like the bare atom: a collector that matched the raw attribute
+          // skipped the abort, resolved the atom empty, and NOT turned that into membership.
+          R"X(LEN(from_result_set:rs_abc) > 0)X", R"X(STARTSWITH(from_result_set:rs_abc, "t"))X",
+          R"X(NOT (LEN(from_result_set:rs_abc) > 0))X",
+          R"X(NOT STARTSWITH(from_result_set:rs_abc, "t"))X"}) {
         INFO("scope expression: " << text);
         const auto expr = parse_ok(text);
         auto fleet = registry.evaluate_scope_local(expr, nullptr, nullptr);

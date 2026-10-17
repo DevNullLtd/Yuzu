@@ -58,7 +58,7 @@ You inherit the **Darwin compatibility guardian** role and extend it to all plat
 
 ## Reference Documents
 
-CLAUDE.md no longer carries the Windows toolchain commands or path inventory verbatim. Before reviewing any Windows-touching change, **read `docs/windows-build.md`** — it has the MSYS2 bash activation sequence (`setup_msvc_env.sh` + `scripts/ensure-erlang.sh`), the path table (cl.exe, cmake, ninja, python, meson, vcpkg, protoc, grpc_cpp_plugin), the `vcvars64.bat` failure mode, and the "no Clang" rule. Triggered by: any change to `meson.build` Windows branches, `setup_msvc_env.sh`, `.github/workflows/ci.yml` Windows matrix entries, or `vcpkg.json` `windows`/`!windows` platform filters.
+CLAUDE.md no longer carries the Windows toolchain commands or path inventory verbatim. Before reviewing any Windows-touching change, **read `docs/windows-build.md`** — it has the MSYS2 bash activation sequence (`setup_msvc_env.sh`; Meson resolves the gateway's Erlang/OTP itself, and `scripts/ensure-erlang.sh` is only for hand-run `rebar3`/`erl`), the path table (cl.exe, cmake, ninja, python, meson, vcpkg, protoc, grpc_cpp_plugin), the `vcvars64.bat` failure mode, and the "no Clang" rule. Triggered by: any change to `meson.build` Windows branches, `setup_msvc_env.sh`, `.github/workflows/ci.yml` Windows matrix entries, or `vcpkg.json` `windows`/`!windows` platform filters.
 
 ## Review Triggers
 

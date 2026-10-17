@@ -102,7 +102,7 @@ echarts_embed = custom_target(
   input: 'vendor/echarts.min.js',
   output: 'echarts_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -122,7 +122,7 @@ three_embed = custom_target(
   input: 'vendor/three.module.min.js',
   output: 'three_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -135,7 +135,7 @@ three_orbit_embed = custom_target(
   input: 'vendor/three-orbit-controls.js',
   output: 'three_orbit_controls_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -153,11 +153,41 @@ yuzu_viz_js_embed = custom_target(
   input: 'static/yuzu-viz.js',
   output: 'yuzu_viz_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
     'YuzuVizJs',
+  ],
+)
+
+# Page script for the System > Integrations page (/static/yuzu-integrations.js).
+# Symbol: kYuzuIntegrationsJs (std::string). Routed in integrations_routes.cpp.
+yuzu_integrations_js_embed = custom_target(
+  'yuzu_integrations_js_bundle',
+  input: 'static/yuzu-integrations.js',
+  output: 'yuzu_integrations_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuIntegrationsJs',
+  ],
+)
+
+# System pages (SYS-5): controller for the Integrations webhook / offload /
+# directory-sync panels. Symbol: kYuzuIntegrationsSyncJs (std::string).
+yuzu_integrations_sync_js_embed = custom_target(
+  'yuzu_integrations_sync_js_bundle',
+  input: 'static/yuzu-integrations-sync.js',
+  output: 'yuzu_integrations_sync_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuIntegrationsSyncJs',
   ],
 )
 
@@ -173,11 +203,126 @@ yuzu_viz_host_js_embed = custom_target(
   input: 'static/yuzu-viz-host.js',
   output: 'yuzu_viz_host_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
     'YuzuVizHostJs',
+  ],
+)
+
+# Shared modal dialog + request helper (window.YuzuDialog). Symbol: kYuzuDialogJs
+# (std::string). First consumer: the Operate action dialogs.
+yuzu_dialog_js_embed = custom_target(
+  'yuzu_dialog_js_bundle',
+  input: 'static/yuzu-dialog.js',
+  output: 'yuzu_dialog_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuDialogJs',
+  ],
+)
+
+# Access pages (Phase 2): client glue for /access/*. Symbol: kYuzuAccessJs (std::string).
+yuzu_access_js_embed = custom_target(
+  'yuzu_access_js_bundle',
+  input: 'static/yuzu-access.js',
+  output: 'yuzu_access_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuAccessJs',
+  ],
+)
+
+# Tokens and principals page (Phase 2): client glue. Symbol: kYuzuTokensJs (std::string).
+yuzu_tokens_js_embed = custom_target(
+  'yuzu_tokens_js_bundle',
+  input: 'static/yuzu-tokens.js',
+  output: 'yuzu_tokens_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuTokensJs',
+  ],
+)
+
+# Operate O1: the Executions / Approvals page controller (read-only). Symbol:
+# kYuzuOperateJs (std::string).
+yuzu_operate_js_embed = custom_target(
+  'yuzu_operate_js_bundle',
+  input: 'static/yuzu-operate.js',
+  output: 'yuzu_operate_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuOperateJs',
+  ],
+)
+
+# Operate extras page controllers (Instructions, Dashboard, Result sets). Served at
+# /static/yuzu-operate-extras.js with no-cache, like the other operate scripts.
+yuzu_operate_extras_js_embed = custom_target(
+  'yuzu_operate_extras_js_bundle',
+  input: 'static/yuzu-operate-extras.js',
+  output: 'yuzu_operate_extras_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuOperateExtrasJs',
+  ],
+)
+
+# Device containment / estate controls (window-level delegated listener). Symbol: kYuzuEstateJs.
+yuzu_estate_js_embed = custom_target(
+  'yuzu_estate_js_bundle',
+  input: 'static/yuzu-estate.js',
+  output: 'yuzu_estate_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuEstateJs',
+  ],
+)
+
+# Hardware record "Tags and properties" lens controls. Symbol: kYuzuDeviceDataJs.
+yuzu_device_data_js_embed = custom_target(
+  'yuzu_device_data_js_bundle',
+  input: 'static/yuzu-device-data.js',
+  output: 'yuzu_device_data_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuDeviceDataJs',
+  ],
+)
+
+# Groups and enrolment page: client glue for /groups. Symbol: kYuzuGroupsJs (std::string).
+yuzu_groups_js_embed = custom_target(
+  'yuzu_groups_js_bundle',
+  input: 'static/yuzu-groups.js',
+  output: 'yuzu_groups_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuGroupsJs',
   ],
 )
 
@@ -186,7 +331,7 @@ cytoscape_js_embed = custom_target(
   input: 'static/cytoscape.min.js',
   output: 'cytoscape_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -204,7 +349,7 @@ yuzu_css_embed = custom_target(
   input: 'static/yuzu.css',
   output: 'yuzu_css_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -212,21 +357,32 @@ yuzu_css_embed = custom_target(
   ],
 )
 
-# Build-time embed of vendored Inter variable webfont as a constexpr
-# byte array (woff2 binary; cannot use raw string literals). Symbol:
-# kInterVariableWoff2 — std::string_view of the bytes.
-inter_embed = custom_target(
-  'inter_woff2_bundle',
-  input: 'vendor/inter/InterVariable.woff2',
-  output: 'inter_woff2_bundle.cpp',
-  command: [
-    find_program('python3', 'python'),
-    files('scripts/embed_binary.py'),
-    '@INPUT@',
-    '@OUTPUT@',
-    'InterVariableWoff2',
-  ],
-)
+# Build-time embed of the vendored IBM Plex Latin webfonts (SIL OFL; IBM's
+# prebuilt woff2 files, never re-subset) as constexpr byte arrays (woff2
+# binary; cannot use raw string literals). One symbol per file, each a
+# std::string_view of the bytes: kIbmPlex<Family><Weight>Woff2.
+plex_fonts = {
+  'IbmPlexMono400Woff2': 'ibm-plex-mono-latin-400-normal.woff2',
+  'IbmPlexMono500Woff2': 'ibm-plex-mono-latin-500-normal.woff2',
+  'IbmPlexSans400Woff2': 'ibm-plex-sans-latin-400-normal.woff2',
+  'IbmPlexSans500Woff2': 'ibm-plex-sans-latin-500-normal.woff2',
+  'IbmPlexSans600Woff2': 'ibm-plex-sans-latin-600-normal.woff2',
+}
+plex_embeds = []
+foreach symbol, file : plex_fonts
+  plex_embeds += custom_target(
+    symbol.to_lower() + '_bundle',
+    input: 'vendor/ibm-plex/' + file,
+    output: symbol.to_lower() + '_bundle.cpp',
+    command: [
+      yuzu_python,
+      files('scripts/embed_binary.py'),
+      '@INPUT@',
+      '@OUTPUT@',
+      symbol,
+    ],
+  )
+endforeach
 
 # Build-time YAML→JSON conversion for shipped Yuzu content. The
 # server iterates kBundledDefinitions / kBundledSets on startup and
@@ -239,7 +395,7 @@ inter_embed = custom_target(
 # filesystem fallback at runtime), so a missing PyYAML used to silently
 # produce a binary with an empty Instructions tab. Probe at configure
 # time so the failure surfaces here rather than mid-compile.
-embed_python = find_program('python3', 'python')
+embed_python = yuzu_python
 _yaml_probe = run_command(embed_python, '-c', 'import yaml', check: false)
 if _yaml_probe.returncode() != 0
   error(
@@ -364,8 +520,13 @@ yuzu_key_provider_dep = declare_dependency(
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
-   yuzu_viz_host_js_embed, cytoscape_js_embed,
-   yuzu_css_embed, inter_embed, content_embed, cpe_map_embed,
+   yuzu_viz_host_js_embed, yuzu_access_js_embed, yuzu_tokens_js_embed,
+   cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_dialog_js_embed, yuzu_integrations_js_embed,
+   yuzu_integrations_sync_js_embed, yuzu_operate_extras_js_embed,
+   yuzu_estate_js_embed, yuzu_device_data_js_embed,
+   yuzu_groups_js_embed,
+   yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
     'src/runtime_config_store.cpp',
@@ -389,12 +550,25 @@ yuzu_server_core_lib = static_library(
     'src/auto_approve.cpp',
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
-    'src/chargen_ui.cpp',
-    'src/procfetch_ui.cpp',
+    'src/app_shell.cpp',
+    'src/enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
+    'src/groups_ui.cpp', # Groups and enrolment page: the page template
+    'src/groups_routes.cpp', # Groups and enrolment page: /groups + static glue
+    'src/integrations_render.cpp', # System Integrations: pure MCP/Gateway panels + MCP form parser
+    'src/integrations_routes.cpp',
+    'src/integrations_ui.cpp',
+    'src/access_render.cpp', # Access pages (Phase 2): pure HTML renderers for /access/users
+    'src/access_ui.cpp', # Access pages: the Users page template
+    'src/access_routes.cpp', # Access pages: /access/users + its two fragments + static glue
+    'src/access_tokens_render.cpp', # Tokens and principals page: pure renderers
+    'src/access_tokens_ui.cpp', # Tokens and principals page: template
+    'src/access_tokens_routes.cpp', # Tokens and principals page: /access/tokens + fragments + glue
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
     'src/settings_model.cpp', # #4028 — shared REST/fragment Settings read-twin builders
+    'src/settings_general_routes.cpp', # System "General and appearance": page + 2 UI fragments
+    'src/settings_general_ui.cpp',
     'src/plugin_signing_helpers.cpp',
     'src/nvd_db.cpp',
     'src/nvd_version.cpp',
@@ -429,6 +603,9 @@ yuzu_server_core_lib = static_library(
     'src/execution_model.cpp',
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
+    'src/healthcheck_probe.cpp', # #5906: yuzu-server --healthcheck transport
+    'src/home_panels_render.cpp',
+    'src/home_panels_routes.cpp',
     'src/leader_elector.cpp',
     'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
@@ -446,9 +623,19 @@ yuzu_server_core_lib = static_library(
     'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
     'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
+    'src/home_ui.cpp',     # Home (/home): the sign-in landing page, rendered per request
+    'src/home_render.cpp', # Dashboard panels: pure value structs + renderers
+    'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
+    'src/result_set_extras_render.cpp',
+    'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
+    'src/approvals_ui.cpp',
+    'src/executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
+    'src/executions_ui.cpp',
+    'src/workflows_ui.cpp',
+    'src/workflows_page_render.cpp', # Operate WF-A: the Workflows page's pure definitions and schedules renderers
     'src/rbac_store.cpp',
     'src/rbac_admin_authority_owner.cpp',
     'src/oidc_provider.cpp',
@@ -497,6 +684,8 @@ yuzu_server_core_lib = static_library(
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
     'src/custom_properties_routes.cpp',
+    'src/device_data_render.cpp',
+    'src/device_data_routes.cpp',
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
     'src/instruction_param_schema.cpp',
@@ -529,6 +718,8 @@ yuzu_server_core_lib = static_library(
     'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
     'src/network_routes.cpp',
     'src/network_ui.cpp',
+    'src/discovered_devices_model.cpp',
+    'src/discovered_devices_reader.cpp',
     'src/device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
     'src/device_routes.cpp',
     'src/device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
@@ -538,6 +729,10 @@ yuzu_server_core_lib = static_library(
     'src/inventory_ui.cpp',
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
+    'src/device_containment_render.cpp',
+    'src/device_containment_routes.cpp',
+    'src/device_estate_render.cpp',
+    'src/device_estate_routes.cpp',
     'src/hardware_routes.cpp',
     'src/hardware_ui.cpp',
     'src/hardware_actions_ui.cpp',
@@ -556,6 +751,7 @@ yuzu_server_core_lib = static_library(
     'src/dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
     'src/deployment_routes.cpp',
     'src/deployment_ui.cpp',
+    'src/deployments_render.cpp',
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
     'src/tar_process_tree.cpp',
@@ -572,12 +768,19 @@ yuzu_server_core_lib = static_library(
     'src/diagnostics_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
     'src/legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
     'src/instruction_fragment_routes.cpp', # #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
+    'src/instruction_extras_render.cpp', # Instructions extras: YAML-save merge + library fragment helpers
     'src/approvals_fragment_routes.cpp', # #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
     'src/mcp_disabled_routes.cpp', # #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
+    'src/integrations_sync_render.cpp', # SYS-5: pure webhook / offload / directory-sync panel renderers
+    'src/integrations_sync_routes.cpp', # SYS-5: the six Integrations read fragments + controller JS route
     'src/discovery_routes.cpp',
     'src/discover_routes.cpp', # A2 discovery surface: /api/v1/discover/* (Issue 17.1)
+    'src/settings_data_ui.cpp', # System > Data and retention page template (SYS-4)
+    'src/developer_render.cpp', # System > Developer and API: pure renderers (SYS-4)
+    'src/developer_routes.cpp', # System > Developer and API: page + fragments (SYS-4)
+    'src/developer_ui.cpp', # System > Developer and API page template (SYS-4)
     'src/enrollment_directory_model.cpp', # #4031: shared row builders — directory/enrollment/OIDC-config read twins
     'src/enrollment_directory_routes.cpp', # #4031: REST v1 read twins — /api/v1/{directory,enrollment,settings/oidc}
     'src/viz_routes.cpp',
@@ -588,8 +791,10 @@ yuzu_server_core_lib = static_library(
     'src/guardian_page_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',
+    'src/list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
     'src/workflow_engine.cpp',
     'src/workflow_model.cpp',
+    'src/workflow_execution_list_model.cpp', # shared REST+MCP parser/row builder for the run list
     'src/workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
@@ -600,6 +805,7 @@ yuzu_server_core_lib = static_library(
     'src/app_perf_cohort_reader.cpp',
     'src/app_perf_ingestion.cpp',
     'src/app_perf_rollup.cpp',
+    'src/dex_app_version_failures_owner.cpp',
     'src/inventory_ingestion.cpp',
     'src/inventory_store.cpp',
     'src/data_inventory_routes.cpp',
@@ -628,8 +834,6 @@ yuzu_server_core_lib = static_library(
     'src/device_token_store.cpp',
     'src/software_deployment_store.cpp',
     'src/license_store.cpp',
-    'src/topology_ui.cpp',
-    'src/statistics_ui.cpp',
     # css_bundle.cpp removed in favour of build-time chunked embed (Gate 4
     # cpp-B1: kYuzuCss exceeds MSVC's 16,380-byte raw-string-literal limit).
     # Source CSS lives at server/core/static/yuzu.css; embed_js.py emits
@@ -693,7 +897,7 @@ yuzu_server_core_dep = declare_dependency(
                + saml_deps,
 )
 
-executable(
+yuzu_server_exe = executable(
   'yuzu-server',
   files('src/main.cpp'),
   dependencies: [yuzu_server_core_dep, cli11_dep] + auth_crypto_deps,

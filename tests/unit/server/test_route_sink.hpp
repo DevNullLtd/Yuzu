@@ -127,10 +127,19 @@ public:
                 httplib::detail::parse_query_text(query_text, req.params);
             if (!content_type.empty())
                 req.set_header("Content-Type", content_type);
+            // Headers every request from this sink carries (e.g. a browser's same-site
+            // Origin); per-call extra_headers below still win.
+            for (const auto& [name, value] : default_headers) {
+                req.set_header(name, value);
+            }
             // Inject test-supplied headers. Done AFTER Content-Type so a
             // test that explicitly overrides Content-Type via the map
             // wins (rare, but a valid scenario).
+            // httplib keeps header duplicates (an unordered_multimap) and a read returns
+            // the first one, whose order differs between standard libraries: erase the
+            // existing value so the per-call header wins everywhere.
             for (const auto& [name, value] : extra_headers) {
+                req.headers.erase(name);
                 req.set_header(name, value);
             }
 
@@ -169,6 +178,9 @@ public:
         }
         return nullptr;
     }
+
+    /// Sent with every dispatch before per-call headers (which override by name).
+    std::unordered_map<std::string, std::string> default_headers;
 
     /// Convenience wrappers for common verbs.
     auto Get(const std::string& path) { return dispatch("GET", path); }
@@ -222,5 +234,27 @@ private:
 
     std::vector<Route> routes_;
 };
+
+
+/// Drive a response's chunked content provider ONCE with a capturing DataSink and return what it wrote.
+/// The sink hands back the real `httplib::Response`; an SSE provider writes only through
+/// `DataSink::write`, drains the subscription queue (replayed + live events) and ends with a
+/// heartbeat, so one invocation yields the frames queued so far. Precondition: the response has a
+/// chunked provider (`res.content_provider_` set) and at least one frame is already queued, otherwise
+/// the provider waits out its own 3 s idle timeout. Not modelled: transfer-encoding framing, a second
+/// invocation, or a slow reader.
+inline std::string drain_chunked_provider_once(httplib::Response& res) {
+    std::string out;
+    httplib::DataSink sink;
+    sink.write = [&out](const char* d, size_t n) {
+        out.append(d, n);
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    sink.done = [] {};
+    if (res.content_provider_)
+        res.content_provider_(0, 0, sink);
+    return out;
+}
 
 } // namespace yuzu::server::test

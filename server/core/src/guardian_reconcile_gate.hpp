@@ -141,19 +141,32 @@ public:
     static constexpr std::size_t kDefaultSweepMaxErase = 4096;
     static constexpr std::size_t kDefaultSweepMaxScan = 16384;
 
+    /// The stored `min_interval` is clamped to [0, kMaxMinInterval]. The sweep compares a clock
+    /// age (nanoseconds) with `2 * min_interval`; an unclamped extreme value overflows that
+    /// signed arithmetic (and a huge one makes every claim look fresh forever, or, on a
+    /// platform where the multiply wraps, makes a fresh claim look stale and lets the next
+    /// heartbeat through). One year is far above any realistic interval and keeps both the
+    /// doubling and the conversion to nanoseconds inside 64 bits.
+    static constexpr std::chrono::seconds kMaxMinInterval{365LL * 24 * 3600};
+    [[nodiscard]] static constexpr std::chrono::seconds sanitize_interval(
+        std::chrono::seconds v) noexcept {
+        return std::clamp(v, std::chrono::seconds{0}, kMaxMinInterval);
+    }
+
     /// `budget` must outlive the gate.
     explicit GuardianReconcileGate(GuardianReconcileBudget& budget, Clock clock = {},
                                    std::chrono::seconds min_interval = std::chrono::seconds(25),
                                    Options opts = {})
         : budget_(budget),
           clock_(clock ? std::move(clock) : Clock{[] { return ClockType::now(); }}),
-          min_interval_(min_interval), opts_(opts) {
+          min_interval_(sanitize_interval(min_interval)), opts_(opts) {
         // Sized for the steady state (admissions per second over two intervals, the sweep
         // horizon) so the table does not rehash under mu_ on the heartbeat path; a rehash of
         // a 500k-entry table is a ~50 ms stall with the mutex held.
         const auto per_s = static_cast<std::size_t>(budget_.config().max_per_s);
-        const auto horizon = static_cast<std::size_t>(std::max<long long>(
-            1, static_cast<long long>(2 * min_interval_.count())));
+        // `min_interval_` is already clamped, so the doubling cannot overflow.
+        const auto horizon = static_cast<std::size_t>(
+            std::max<long long>(1, 2 * static_cast<long long>(min_interval_.count())));
         claims_.reserve(std::min<std::size_t>(per_s * horizon, opts_.max_reserve));
     }
 

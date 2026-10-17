@@ -63,12 +63,11 @@ sudo rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in_progress
 CLT SDK is sufficient for CI parity: the ES SDK (`usr/lib/libEndpointSecurity.tbd`
 + `usr/include/EndpointSecurity/`) ships with the Command Line Tools SDK too
 (it is not an `.framework` bundle, and "needs full Xcode" is a myth — see
-`docs/darwin-compat.md`'s EndpointSecurity row); today's build probe is
-mis-formed and never finds it on any SDK (`feat/macos-spark-a0.5-es-probe`
-fixes this), so the real ES client currently compiles as a `required:false`
-no-op regardless of SDK. The `com.apple.developer.endpoint-security.client`
-entitlement + root + a signed/notarized binary are the actual on-device
-gates for the real ES path, not the SDK choice.
+`docs/darwin-compat.md`'s EndpointSecurity row), and the build probe finds it
+on either SDK, so the real ES client compiles with CLT alone. The `com.apple.developer.endpoint-security.client`
+entitlement (granted to a signed app bundle through its provisioning
+profile), root, and Full Disk Access are the actual on-device gates for the
+real ES path, not the SDK choice. Notarization is not one of them.
 
 ### 2. Shared build substrate
 
@@ -108,8 +107,8 @@ install -m 755 "$(git -C /opt/ci/src/Yuzu rev-parse --show-toplevel)/deploy/maco
 The **pinned per-user toolchain (cmake 4.3.4, meson 1.11.2, PyYAML) and vcpkg are
 NOT provisioned at the box level** — the `ci.yml` macOS job installs them itself
 every run (`pipx install cmake==4.3.4`, `pipx install meson==…`, `pip pyyaml`,
-`lukka/run-vcpkg` clones vcpkg into the workspace, and `erlef/setup-beam` installs
-Erlang/OTP 28 + rebar3 for the gateway, with `ImageOS: macos26`; #4841). The box only supplies brew +
+`lukka/run-vcpkg` clones vcpkg into the workspace, and a hash-pinned Erlang/OTP 28 +
+rebar3 is downloaded into `$RUNNER_TEMP` for the gateway; #4841; pins and bump procedure: `docs/darwin-compat.md`). The box only supplies brew +
 CLT + the shared binary cache. (The `/opt/ci/vcpkg` + `/opt/ci/src/Yuzu`
 checkout used for the initial manual cache-warm is optional scaffolding, not a
 runner dependency.)
