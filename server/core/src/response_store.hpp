@@ -95,9 +95,10 @@ inline bool facet_value_over_bound(std::string_view value) noexcept {
 bool facet_filter_value_over_bound(std::string_view raw_value);
 
 /// The stored form of a typed filter value: exactly what ingest would persist for the same
-/// bytes (each NUL or invalid UTF-8 byte becomes a 3-byte U+FFFD). The facet lookups bind this,
-/// and any reader that compares a typed filter against decoded response text in C++ (the
-/// dashboard's per-line re-filter) must compare against this too, never the raw value.
+/// bytes (each NUL or invalid UTF-8 byte becomes a 3-byte U+FFFD). The facet lookups bind the
+/// same scrubbed form (they call the same scrub directly, not this wrapper), and any reader that
+/// compares a typed filter against decoded response text in C++ (the dashboard's per-line
+/// re-filter) must compare against this, never the raw value.
 std::string facet_filter_stored_form(std::string_view raw_value);
 
 /// `yuzu_server_response_facets_dropped_total{reason}`: facet rows (distinct
