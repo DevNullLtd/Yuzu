@@ -120,7 +120,7 @@ constexpr char kPart2[] = R"HTM(<body>
             plugins, so the trust anchors cannot be revoked from here. To issue a code-signing
             certificate, use <code>POST /api/v1/ca/issue-code-signing</code> (or the MCP tool
             <code>issue_code_signing_cert</code>); issued certificates are listed, and can be
-            revoked, under <a href="/settings/pki">Certificates and secrets</a>.</p>
+            revoked, in the Internal CA section of <a href="/settings">Settings</a>.</p>
           <div id="plugin-signing-section"
                hx-get="/fragments/settings/plugin-signing"
                hx-trigger="load, refreshPluginSigning from:body"

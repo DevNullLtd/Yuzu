@@ -132,7 +132,8 @@ TEST_CASE("plugins page: wording does not repeat the artboard's false claims",
     CHECK_THAT(squash(html), ContainsSubstring("Each agent enforces its own"));
     CHECK_THAT(squash(html),
                ContainsSubstring("Agents do not check revocation when loading plugins"));
-    CHECK_THAT(html, ContainsSubstring("href=\"/settings/pki\""));
+    CHECK_THAT(squash(html), ContainsSubstring("Internal CA section of"));
+    CHECK_THAT(html, !ContainsSubstring("/settings/pki"));
     // The PKI page has no issue control: the sentence must name the API route, not send the
     // operator there to issue.
     CHECK_THAT(squash(html), ContainsSubstring("POST /api/v1/ca/issue-code-signing"));
@@ -631,9 +632,27 @@ TEST_CASE("plugins page: the shipped server registers the page and its fragments
     // Same source-scan precedent as test_body_cap_route_inventory.cpp.
     std::ifstream f(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     REQUIRE(f);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    CHECK(has(ss.str(), "settings_plugins::register_settings_plugins_routes("));
+    // Only live code counts: a comment that mentions the call must not satisfy the pin.
+    std::string live;
+    bool in_block = false;
+    for (std::string line; std::getline(f, line);) {
+        if (in_block) {
+            const auto end = line.find("*/");
+            if (end == std::string::npos)
+                continue;
+            line.erase(0, end + 2);
+            in_block = false;
+        }
+        const auto first = line.find_first_not_of(" \t");
+        if (first == std::string::npos || line.compare(first, 2, "//") == 0)
+            continue;
+        if (line.compare(first, 2, "/*") == 0 && line.find("*/") == std::string::npos) {
+            in_block = true;
+            continue;
+        }
+        live += line + "\n";
+    }
+    CHECK(has(live, "settings_plugins::register_settings_plugins_routes("));
     // And the helper itself serves exactly the page plus the three new fragments.
     std::ifstream r(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "settings_plugins_routes.cpp");
     REQUIRE(r);
