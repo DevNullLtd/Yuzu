@@ -415,7 +415,7 @@
       "path": "/api/v1/responses/{param}/export"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
   },
   {
     "method": "GET",
@@ -546,7 +546,7 @@
     "capability_id": "get.fragments-dashboard-activity",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.api-audit"
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-audit; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
   },
   {
     "method": "GET",
@@ -554,7 +554,7 @@
     "capability_id": "get.fragments-dashboard-health",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.api-health"
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-health; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
   },
   {
     "method": "GET",

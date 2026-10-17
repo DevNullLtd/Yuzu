@@ -585,12 +585,34 @@ see §5 for which chokepoints apply.
     own "Adding a tool" checklist, §3).
 11. **Changelog fragment.** One file, `changelog.d/<PR#>-<slug>.added.md`, per
     `changelog.d/README.md`'s format — never a direct `CHANGELOG.md` edit.
-12. **F1 ledger row flip.** Issue #3991 (open at the time of writing; this recipe does not depend on
-    its files existing yet) will add `docs/api-parity-ledger.md` plus per-domain machine files at
-    `scripts/ci/api-parity/<domain>.json`, one row per capability with a `status` of `twinned` /
-    `planned:#N` / `composed-of:<ids>` / `exception:<...>` / `retire`. Once that ledger lands, a
-    twin PR's last step is flipping its domain's row from `planned:#N` to `twinned` — described here
-    in prose only, since the ledger itself is a separate, not-yet-landed deliverable.
+12. **F1 ledger row flip.** The parity ledger (`docs/api-parity-ledger.md` plus the per-domain
+    files at `scripts/ci/api-parity/<domain>.json`, gated by `scripts/ci/check-api-parity.py`) has
+    one row per capability with a `status` of `twinned` (BOTH a REST v1 and an MCP twin; the
+    `mcp_twin` may be `resource:<uri>` for a fixed `kResources[]` entry) / `twinned-rest-only` (for
+    a NEW one, name the tracker for the missing side in an issue or an ADR-1005 entry) /
+    `twinned-mcp-only` / `planned:#N` / `composed-of:<ids>` /
+    `exception:#<issue> revisit:<YYYY-MM-DD> <reason>` / `retire`. A twin PR's last step is
+    flipping its row to `twinned`, then lowering the baselines in the script to the values the
+    checker prints: `BASELINE_UNTWINNED` always, `BASELINE_GENERIC_PLANNED` only if the flipped
+    row was exactly `planned:#2146` (a row with a specific `planned:#N` lowers only
+    `BASELINE_UNTWINNED`). Twinning or retiring a grandfathered (free-form) exception row removes
+    its id from `GRANDFATHERED_LEGACY_EXCEPTIONS` and lowers `GRANDFATHERED_MAX`; converting one to
+    the strict shape does the same. A new exception needs a maintainer ruling named in ADR-1005.
+    Re-tagging a `planned:#2146` row as a strict exception lowers `BASELINE_GENERIC_PLANNED` and
+    leaves `BASELINE_UNTWINNED` unchanged; a NEW exception row (a new route) raises
+    `BASELINE_UNTWINNED`.
+    Then regenerate the doc block: run `python3 scripts/ci/check-api-parity.py --render-doc` and
+    replace the region from the BEGIN line through the END line inclusive, in
+    `docs/api-parity-ledger.md`, with its output. A PR that edits a `BASELINE_*` constant (raise or
+    lower, `BASELINE_GENERIC_PLANNED` included) or the `GRANDFATHERED_MAX` / set-size pair should be
+    rebased immediately before merge: two PRs that each change the same baseline by the same
+    amount merge cleanly yet fail the ratchet on the merged tree, and two PRs that each remove a
+    different grandfathered id and lower the max merge clean and leave the set at 15 with the max
+    at 16. The fix is to set the constants to the values the checker prints, then re-run
+    `--render-doc` and splice the block again. A route rename changes its derived
+    `capability_id`: rename the id in the JSON (a grandfathered row that is renamed must be
+    converted to the strict shape, unless the set is edited, which is review-only, since the set
+    is keyed by id).
 
 ---
 
@@ -821,8 +843,12 @@ the actual regression test for Rule 1 holding.
   parity (api-parity programme, #2146).
 ```
 
-**12. Ledger.** Flip `software-deployments`' row from `planned:#<this-PR>` to `twinned` in the F1
-ledger once #3991 lands.
+**12. Ledger.** Flip `software-deployments`' row from `planned:#<this-PR>` to `twinned`, naming
+BOTH twins (a one-sided row is `twinned-rest-only` / `twinned-mcp-only`). Lower
+`BASELINE_UNTWINNED` in `scripts/ci/check-api-parity.py` to the measured value (the row had a
+specific `planned:#N`, so `BASELINE_GENERIC_PLANNED` is untouched), then regenerate the doc block
+with `python3 scripts/ci/check-api-parity.py --render-doc` and splice it into
+`docs/api-parity-ledger.md`.
 
 </br>
 
