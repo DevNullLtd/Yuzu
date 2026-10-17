@@ -1527,13 +1527,27 @@ TEST_CASE("settings enrollment: a year-9999 expiry is listed Active and never as
 TEST_CASE("settings enrollment: an API token with a far-future expiry renders without a CRT date call",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h(/*with_store=*/true, /*with_api_tokens=*/true);
+    // AuthDbPgShared resets only the `auth` tables; `api_token_store.api_tokens` lives in the
+    // same shared clone and is NOT truncated, so these rows would outlive the case. Remove them
+    // on every exit path (the names are unique to this case, so nothing else is touched).
+    struct Cleanup {
+        EnrollRoutesHarness& h;
+        ~Cleanup() {
+            auto lease = h.auth_db->pool().try_acquire_for(std::chrono::seconds(2));
+            if (lease)
+                yuzu::server::pg::exec_params(
+                    lease.get(),
+                    "DELETE FROM api_token_store.api_tokens WHERE name LIKE 'yuzu_test_fmt_%'",
+                    std::vector<std::string>{});
+        }
+    } cleanup{h};
     const auto make = [&](const char* name, std::int64_t expires_at) {
         auto raw = h.api_tokens->create_token(name, "admin", expires_at);
         REQUIRE(raw.has_value());
     };
-    make("last-second", 253'402'300'799);       // 9999-12-31 23:59:59 UTC
-    make("past-9999", 253'402'300'800);         // year 10000
-    make("huge", 9'000'000'000'000'000'000);    // far past anything gmtime can take
+    make("yuzu_test_fmt_last-second", 253'402'300'799);       // 9999-12-31 23:59:59 UTC
+    make("yuzu_test_fmt_past-9999", 253'402'300'800);         // year 10000
+    make("yuzu_test_fmt_huge", 9'000'000'000'000'000'000);    // far past anything gmtime can take
 
     auto res = h.sink.Get("/fragments/settings/api-tokens");
     REQUIRE(res);
@@ -1543,11 +1557,11 @@ TEST_CASE("settings enrollment: an API token with a far-future expiry renders wi
         REQUIRE(at != std::string::npos);
         return res->body.substr(at, res->body.find("</tr>", at) - at);
     };
-    CHECK(row_of("last-second").find("<td>9999-12-31 23:59 UTC</td>") != std::string::npos);
-    CHECK(row_of("past-9999").find("<td>out of range</td>") != std::string::npos);
-    CHECK(row_of("huge").find("<td>out of range</td>") != std::string::npos);
+    CHECK(row_of("yuzu_test_fmt_last-second").find("<td>9999-12-31 23:59 UTC</td>") != std::string::npos);
+    CHECK(row_of("yuzu_test_fmt_past-9999").find("<td>out of range</td>") != std::string::npos);
+    CHECK(row_of("yuzu_test_fmt_huge").find("<td>out of range</td>") != std::string::npos);
     // The created column is today's date, formatted by the same helper.
-    CHECK(row_of("huge").find(" UTC</td>") != std::string::npos);
+    CHECK(row_of("yuzu_test_fmt_huge").find(" UTC</td>") != std::string::npos);
 }
 
 TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as Active",
