@@ -73,8 +73,10 @@ std::int64_t wall_now_ms() {
         .count();
 }
 
+// Saturating (epoch_ms_to_time_point): a bare time_point{milliseconds{ms}} wraps for a large
+// value on a nanosecond system_clock.
 std::chrono::system_clock::time_point tp_from_ms(std::int64_t ms) {
-    return std::chrono::system_clock::time_point{std::chrono::milliseconds{ms}};
+    return epoch_ms_to_time_point(ms);
 }
 
 std::int64_t ms_from_tp(std::chrono::system_clock::time_point tp) {
