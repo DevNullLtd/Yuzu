@@ -504,6 +504,32 @@ TEST_CASE("agent-count-preview: a filter value over kMaxFacetValueBytes is named
         CHECK(body["data"]["unindexed_filter_keys"].empty());
     }
 
+    SECTION("a plugin whose columns differ from the default layout: the key is resolved "
+            "against THAT plugin") {
+        // procfetch is (Agent, PID, Name, Path, SHA-1); `path` exists only there, so a handler
+        // that passed the wrong plugin string to unindexed_filter_keys would report nothing.
+        const std::string value(kMaxFacetValueBytes + 1, 'z');
+        auto res = h.sink.Get(std::string(kPreviewPath) + "?command_id=" + command_id +
+                              "&plugin=procfetch&path=" + value);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["agent_count"].get<int64_t>() == 0);
+        CHECK(body["data"]["unindexed_filter_keys"] == nlohmann::json::array({"path"}));
+    }
+
+    SECTION("two over-bound keys come back sorted by key, not in request or column order") {
+        // Columns are (PID, Name, ...): `pid` is column 0, `name` column 1, and `pid` is
+        // requested first, so request order and column order both give ["pid","name"].
+        const std::string value(kMaxFacetValueBytes + 1, 'z');
+        auto res = h.sink.Get(std::string(kPreviewPath) + "?command_id=" + command_id +
+                              "&plugin=procfetch&pid=" + value + "&name=" + value);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["unindexed_filter_keys"] == nlohmann::json::array({"name", "pid"}));
+    }
+
     SECTION("an unknown filter key is skipped and never named") {
         const std::string value(kMaxFacetValueBytes + 1, 'z');
         auto res = h.sink.Get(base + "&not_a_column=" + value);
@@ -513,6 +539,21 @@ TEST_CASE("agent-count-preview: a filter value over kMaxFacetValueBytes is named
         CHECK(body["data"]["agent_count"].get<int64_t>() == 0);
         CHECK(body["data"]["unindexed_filter_keys"].empty());
     }
+}
+
+TEST_CASE("agent-count-preview: the OpenAPI text names the bound the constant defines",
+          "[rest][devices][facets]") {
+    DeviceRestHarness h;
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res != nullptr);
+    REQUIRE(res->status == 200);
+    const auto spec = nlohmann::json::parse(res->body);
+    const auto& op = spec["paths"]["/management-groups/agent-count-preview"]["get"];
+    const auto description = op["description"].get<std::string>();
+    // The route text spells the bound out; the static_assert in rest_api_v1.cpp makes a change
+    // to the constant a build break there, and this pins the text to the constant's value.
+    CHECK(description.find("unindexed_filter_keys") != std::string::npos);
+    CHECK(description.find(std::to_string(kMaxFacetValueBytes) + " bytes") != std::string::npos);
 }
 
 TEST_CASE("agent-count-preview: the 503 degrade is unchanged for an over-bound filter",

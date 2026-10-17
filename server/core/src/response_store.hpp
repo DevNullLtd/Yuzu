@@ -46,6 +46,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu {
@@ -80,6 +81,11 @@ namespace yuzu::server {
 /// echoes; the longest the server mints is about 60 bytes); a longer id still fails the
 /// facet batch, which is counted as `batch_failed`.
 inline constexpr std::size_t kMaxFacetValueBytes = 2048;
+
+/// The one over-bound rule: ingest, the dashboard and the preview helper all call this.
+inline bool facet_value_over_bound(std::string_view value) noexcept {
+    return value.size() > kMaxFacetValueBytes;
+}
 
 /// `yuzu_server_response_facets_dropped_total{reason}`: facet rows (distinct
 /// (column, value) pairs) of a response that did not persist, by reason. Counted only

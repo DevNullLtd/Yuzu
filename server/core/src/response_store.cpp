@@ -579,7 +579,7 @@ void ResponseStore::store(const StoredResponse& resp) {
             std::size_t excluded_too_long = 0;
             for (const auto& [col_idx, value_counts] : facets)
                 for (const auto& [value, count] : value_counts) {
-                    if (value.size() > kMaxFacetValueBytes)
+                    if (facet_value_over_bound(value))
                         ++excluded_too_long;
                     else
                         flat.emplace_back(col_idx, value, count);

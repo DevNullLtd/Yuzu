@@ -610,6 +610,11 @@ std::string lower_copy(std::string v) {
 // FAILURE, not a warning. Adding a keyword means extending that catalogue
 // (semantics + operand grammar + tests + docs) in the same change. See
 // docs/mcp-server.md "Adding a tool".
+// The preview_management_group_agent_count description and outputSchema below spell out this
+// bound as "2048 bytes" (a raw-string schema cannot interpolate it); a changed bound must update
+// that text, the OpenAPI text in rest_api_v1.cpp and the docs (the tests pin the text to the constant).
+static_assert(kMaxFacetValueBytes == 2048,
+              "update the preview tool text, the OpenAPI text and the docs");
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})",
@@ -891,7 +896,8 @@ static const ToolDef kTools[] = {
     // agent-count-preview is the REST twin; group_agent_count_preview.hpp
     // is the shared builder this tool and that REST route both call — the
     // dashboard fragment itself keeps its own separate, behaviourally-
-    // equivalent inline implementation, unchanged by this PR). Gated
+    // equivalent inline implementation, except that for an over-bound
+    // filter it hides the count and shows a static sentence). Gated
     // ManagementGroup:Write matching the fragment EXACTLY (only an operator
     // who could create the group may preview it) — NOT ManagementGroup:Read,
     // even though the tool performs no mutation. Consequence: approval-gated
@@ -914,7 +920,8 @@ static const ToolDef kTools[] = {
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
      "though this tool itself performs no mutation. When unindexed_filter_keys is "
      "non-empty, agent_count can be 0 or an undercount because filter values over "
-     "2048 bytes are not indexed in newly stored responses.",
+     "2048 bytes are not indexed in newly stored responses; its keys are in a stable "
+     "order (sorted by key) without duplicates.",
      R"j({"type":"object","properties":{)j"
      R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
      R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
@@ -10563,8 +10570,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // and that REST route call the SAME shared builder
             // (group_agent_count_preview.hpp), so those two cannot drift
             // from each other; the fragment keeps its own separate,
-            // behaviourally-equivalent inline implementation, unchanged by
-            // this PR. Gated ManagementGroup:Write matching the fragment exactly (see
+            // behaviourally-equivalent inline implementation, except that for
+            // an over-bound filter it hides the count and shows a static
+            // sentence. Gated ManagementGroup:Write matching the fragment exactly (see
             // kTools[]'s comment on this tool) — NOT migrated onto
             // fleet_read_fn_ (that chokepoint is for per-agent LIST reads;
             // this route's scope is the D3 Response:Read-visible set, a

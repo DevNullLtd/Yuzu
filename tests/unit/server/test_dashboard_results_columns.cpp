@@ -748,6 +748,51 @@ TEST_CASE("create-group-form route: a filter value over kMaxFacetValueBytes repl
     }
 }
 
+// The degrade text wins over the over-bound sentence: with the store unreadable there is no count
+// to qualify, so the form keeps its existing "unavailable" hint (an over-bound sentence would
+// claim a read that did not happen), and it must never show a count.
+TEST_CASE("create-group-form route: an over-bound filter on a degraded store shows the "
+          "unavailable text, not the over-bound sentence or a count",
+          "[server][dashboard][create_group_form][facets]") {
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_rs{bad_pool};
+    REQUIRE_FALSE(bad_rs.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    DashboardRoutes::AuthFn auth_fn =
+        [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "testuser";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    DashboardRoutes::PermFn perm_fn = [](const httplib::Request&, httplib::Response&,
+                                         const std::string&, const std::string&) { return true; };
+    DashboardRoutes::AuditFn audit_fn = [](const httplib::Request&, const std::string&,
+                                           const std::string&, const std::string&,
+                                           const std::string&, const std::string&) {};
+    struct SinkHarness {
+        DashboardRoutes routes;
+        yuzu::server::test::TestRouteSink sink;
+    } h;
+    h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn, &bad_rs,
+                             /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
+                             /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+                             /*agents_json_fn=*/[] { return std::string{"[]"}; },
+                             DashboardRoutes::DispatchFn{}, DashboardRoutes::CallerFn{},
+                             DashboardRoutes::ResolveFn{}, &metrics, /*instruction_store=*/nullptr,
+                             /*visible_set_fn=*/{});
+
+    const std::string value(kMaxFacetValueBytes + 1, 'z');
+    auto res = h.sink.Get("/fragments/create-group-form?command_id=cmd-degraded-long"
+                          "&plugin=registry&f_output=" + value);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "agent count unavailable (store degraded)"));
+    CHECK_FALSE(contains(res->body, "A filter value is longer than"));
+    CHECK_FALSE(contains(res->body, "will be added"));
+}
+
 // Branch-review finding (Functional CDX-FV-02, MEDIUM): only filter-bar had
 // an elevated-session test; create-group-form's identical elevation bypass
 // (dashboard_routes.cpp) was unexercised -- a deny-all visible_set_fn could

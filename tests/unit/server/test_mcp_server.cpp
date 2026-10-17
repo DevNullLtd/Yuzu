@@ -23462,6 +23462,15 @@ struct PreviewRestTwin {
     }
 };
 
+// Guard before indexing: a missing structuredContent must fail the test cleanly, not throw
+// out of operator[] on a null node.
+const nlohmann::json& preview_structured(const nlohmann::json& body) {
+    REQUIRE(body.contains("result"));
+    CHECK((!body["result"].contains("isError") || body["result"]["isError"] == false));
+    REQUIRE(body["result"].contains("structuredContent"));
+    return body["result"]["structuredContent"];
+}
+
 void store_preview_response(yuzu::server::ResponseStore& rs, const std::string& command_id,
                             const std::string& agent, const std::string& output) {
     yuzu::server::StoredResponse r;
@@ -23492,8 +23501,7 @@ TEST_CASE("MCP preview_management_group_agent_count: unindexed_filter_keys is pr
     auto none = mcp_tool_call(ts, "preview_management_group_agent_count",
                               R"({"command_id":"cmd-mcp-preview","plugin":"registry"})");
     INFO(none.dump());
-    REQUIRE(none.contains("result"));
-    const auto& s0 = none["result"]["structuredContent"];
+    const auto& s0 = preview_structured(none);
     CHECK(s0["agent_count"] == 0);
     REQUIRE(s0.contains("unindexed_filter_keys"));
     CHECK(s0["unindexed_filter_keys"].is_array());
@@ -23502,8 +23510,8 @@ TEST_CASE("MCP preview_management_group_agent_count: unindexed_filter_keys is pr
     auto shortf = mcp_tool_call(
         ts, "preview_management_group_agent_count",
         R"({"command_id":"cmd-mcp-preview","plugin":"registry","filters":{"output":"short output"}})");
-    REQUIRE(shortf.contains("result"));
-    const auto& s1 = shortf["result"]["structuredContent"];
+    INFO(shortf.dump());
+    const auto& s1 = preview_structured(shortf);
     CHECK(s1["agent_count"] == 1);
     REQUIRE(s1.contains("unindexed_filter_keys"));
     CHECK(s1["unindexed_filter_keys"].empty());
@@ -23532,8 +23540,7 @@ TEST_CASE("MCP preview_management_group_agent_count: a filter value over kMaxFac
     SECTION("2049 bytes: named, count 0, no value echo, text == structuredContent") {
         auto body = call(yuzu::server::kMaxFacetValueBytes + 1);
         INFO(body.dump());
-        REQUIRE(body.contains("result"));
-        const auto& sc = body["result"]["structuredContent"];
+        const auto& sc = preview_structured(body);
         CHECK(sc["agent_count"] == 0);
         REQUIRE(sc.contains("unindexed_filter_keys"));
         REQUIRE(sc["unindexed_filter_keys"].is_array());
@@ -23546,9 +23553,26 @@ TEST_CASE("MCP preview_management_group_agent_count: a filter value over kMaxFac
 
     SECTION("2048 bytes: not named") {
         auto body = call(yuzu::server::kMaxFacetValueBytes);
-        REQUIRE(body.contains("result"));
-        REQUIRE(body["result"]["structuredContent"].contains("unindexed_filter_keys"));
-        CHECK(body["result"]["structuredContent"]["unindexed_filter_keys"].empty());
+        INFO(body.dump());
+        const auto& sc = preview_structured(body);
+        REQUIRE(sc.contains("unindexed_filter_keys"));
+        CHECK(sc["unindexed_filter_keys"].empty());
+    }
+
+    SECTION("a plugin whose columns differ from the default layout: the handler resolves the "
+            "key against THAT plugin") {
+        // procfetch is (Agent, PID, Name, Path, SHA-1); `path` exists only there, so a handler
+        // that passed the wrong plugin string to unindexed_filter_keys would report nothing.
+        const nlohmann::json args = {
+            {"command_id", "cmd-mcp-preview-long"},
+            {"plugin", "procfetch"},
+            {"filters", {{"path", std::string(yuzu::server::kMaxFacetValueBytes + 1, 'z')}}}};
+        auto body = mcp_tool_call(ts, "preview_management_group_agent_count", args.dump());
+        INFO(body.dump());
+        const auto& sc = preview_structured(body);
+        CHECK(sc["agent_count"] == 0);
+        REQUIRE(sc.contains("unindexed_filter_keys"));
+        CHECK(sc["unindexed_filter_keys"] == nlohmann::json::array({"path"}));
     }
 }
 
@@ -23568,10 +23592,16 @@ TEST_CASE("MCP preview_management_group_agent_count: tools/list documents uninde
     REQUIRE(tool != nullptr);
     const auto description = (*tool)["description"].get<std::string>();
     CHECK(description.find("unindexed_filter_keys") != std::string::npos);
-    CHECK(description.find("2048 bytes") != std::string::npos);
+    // The strings spell the bound out; they must name the constant's value (the static_assert in
+    // mcp_server.cpp makes a change to it a build break there).
+    const std::string bound_text = std::to_string(yuzu::server::kMaxFacetValueBytes) + " bytes";
+    CHECK(description.find(bound_text) != std::string::npos);
     const auto& out = (*tool)["outputSchema"];
     REQUIRE(out.contains("properties"));
     REQUIRE(out["properties"].contains("unindexed_filter_keys"));
+    REQUIRE(out["properties"]["unindexed_filter_keys"].contains("description"));
+    CHECK(out["properties"]["unindexed_filter_keys"]["description"].get<std::string>().find(
+              bound_text) != std::string::npos);
     CHECK(out["properties"]["unindexed_filter_keys"]["type"] == "array");
     CHECK(out["properties"]["unindexed_filter_keys"]["items"]["type"] == "string");
     for (const auto& req_key : out["required"])
@@ -23606,19 +23636,63 @@ TEST_CASE("preview agent count: REST and MCP report the same count and keys for 
         REQUIRE(rest_res->status == 200);
         const auto rest_data = nlohmann::json::parse(rest_res->body)["data"];
         REQUIRE(rest_data.contains("unindexed_filter_keys"));
+        // Not vacuous: an empty array on both sides would also "agree", so pin the content.
+        const auto expected_keys = value.size() > yuzu::server::kMaxFacetValueBytes
+                                       ? nlohmann::json::array({"output"})
+                                       : nlohmann::json::array();
+        CHECK(rest_data["unindexed_filter_keys"] == expected_keys);
 
         const nlohmann::json args = {{"command_id", command_id},
                                      {"plugin", "registry"},
                                      {"filters", {{"output", value}}}};
         auto mcp_body = mcp_tool_call(ts, "preview_management_group_agent_count", args.dump());
-        REQUIRE(mcp_body.contains("result"));
-        const auto& mcp_data = mcp_body["result"]["structuredContent"];
+        INFO(mcp_body.dump());
+        const auto& mcp_data = preview_structured(mcp_body);
         REQUIRE(mcp_data.contains("unindexed_filter_keys"));
 
         CHECK(rest_data["agent_count"] == mcp_data["agent_count"]);
         CHECK(rest_data["unindexed_filter_keys"] == mcp_data["unindexed_filter_keys"]);
         CHECK(rest_data["unindexed_filter_keys"].is_array());
+        CHECK(mcp_data["unindexed_filter_keys"] == expected_keys);
     }
+}
+
+TEST_CASE("preview agent count: two over-bound keys come back sorted by key on REST and MCP, "
+          "not in request or column order",
+          "[pg][mcp][rest][devices][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+
+    PreviewRestTwin rest{&store};
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start();
+
+    // procfetch columns are (Agent, PID, Name, Path, SHA-1): `pid` is column 0 and `name`
+    // column 1, and the requests below name `pid` FIRST, so request order and column order both
+    // give ["pid","name"]; sorted by key gives ["name","pid"].
+    const std::string value(yuzu::server::kMaxFacetValueBytes + 1, 'z');
+    auto rest_res = rest.sink.Get(
+        "/api/v1/management-groups/agent-count-preview?command_id=cmd-order&plugin=procfetch&pid=" +
+        value + "&name=" + value);
+    REQUIRE(rest_res != nullptr);
+    REQUIRE(rest_res->status == 200);
+    const auto rest_data = nlohmann::json::parse(rest_res->body)["data"];
+
+    // Written as text with `pid` first; nlohmann's object then orders by key on parse, which is
+    // exactly the behaviour the documented "sorted by key" claim rests on.
+    auto mcp_body = mcp_tool_call(
+        ts, "preview_management_group_agent_count",
+        R"({"command_id":"cmd-order","plugin":"procfetch","filters":{"pid":")" + value +
+            R"(","name":")" + value + R"("}})");
+    INFO(mcp_body.dump());
+    const auto& mcp_data = preview_structured(mcp_body);
+
+    const auto expected = nlohmann::json::array({"name", "pid"});
+    CHECK(rest_data["unindexed_filter_keys"] == expected);
+    CHECK(mcp_data["unindexed_filter_keys"] == expected);
 }
 
 // ── B4 (#2146 API-parity) — management-group CRUD/membership/role twins ────
