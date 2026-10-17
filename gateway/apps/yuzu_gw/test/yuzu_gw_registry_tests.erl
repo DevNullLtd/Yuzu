@@ -26,7 +26,12 @@ registry_test_() ->
       {"re-register same agent_id replaces old", fun reregister_replaces/0},
       {"all_agents returns all ids", fun all_agents_list/0},
       {"agent_count is accurate", fun agent_count_accurate/0},
-      {"pg group membership for plugins", fun pg_plugin_groups/0},
+      {"the registry joins no pg group (the agent process joins its own)",
+       fun no_pg_groups_from_registry/0},
+      {"supersede and deregister-by-id tell the old process it is unrouted",
+       fun old_process_told_unrouted/0},
+      {"local_agent_pids lists only live agent processes",
+       fun local_agent_pids_only_agents/0},
       {"pagination returns correct pages", fun pagination_basic/0},
       {"pagination cursor advances correctly", fun pagination_cursor/0},
       {"deregister non-existent is safe", fun deregister_nonexistent/0},
@@ -130,14 +135,53 @@ agent_count_accurate() ->
     ?assertEqual(InitialCount,
                  await(fun yuzu_gw_registry:agent_count/0, InitialCount)).
 
-pg_plugin_groups() ->
+no_pg_groups_from_registry() ->
     Pid = spawn_dummy(),
     ok = yuzu_gw_registry:register_agent(<<"pg-agent">>, Pid, <<"s">>, [<<"svc">>, <<"fs">>], <<>>),
-    %% Agent should be in the plugin groups.
-    SvcMembers = pg:get_members(yuzu_gw, {plugin, <<"svc">>}),
-    FsMembers = pg:get_members(yuzu_gw, {plugin, <<"fs">>}),
-    ?assert(lists:member(Pid, SvcMembers)),
-    ?assert(lists:member(Pid, FsMembers)),
+    %% Neither `all_agents', a per-plugin group nor `{agent, Id}': the registry
+    %% makes no pg call (yuzu_gw_registry's module doc).
+    ?assertEqual([], [G || G <- pg:which_groups(yuzu_gw),
+                           lists:member(Pid, pg:get_local_members(yuzu_gw, G))]),
+    ?assertEqual({ok, Pid}, yuzu_gw_registry:lookup(<<"pg-agent">>)),
+    kill_dummy(Pid).
+
+%% The process a registration replaces, and one removed by the unfenced
+%% deregister_agent/1, gets {yuzu_gw_registry, unrouted, AgentId} (so a real
+%% agent leaves `{agent, Id}'); the process that replaced it gets nothing, and a
+%% process re-registering itself is not told.
+old_process_told_unrouted() ->
+    Self = self(),
+    Fwd = fun() -> spawn(fun() -> forward_loop(Self) end) end,
+    Old = Fwd(), New = Fwd(),
+    Id = <<"unrouted-1">>,
+    ok = yuzu_gw_registry:register_agent(Id, Old, <<"u-s1">>, [], <<>>),
+    ok = yuzu_gw_registry:register_agent(Id, Old, <<"u-s1b">>, [], <<>>),
+    ok = yuzu_gw_registry:register_agent(Id, New, <<"u-s2">>, [], <<>>),
+    ?assertEqual({Old, {yuzu_gw_registry, unrouted, Id}}, receive_forwarded()),
+    yuzu_gw_registry:deregister_agent(Id),
+    registry_barrier(),
+    ?assertEqual({New, {yuzu_gw_registry, unrouted, Id}}, receive_forwarded()),
+    ?assertEqual(none, receive_forwarded()),
+    kill_dummy(Old),
+    kill_dummy(New).
+
+forward_loop(To) ->
+    receive
+        stop -> ok;
+        Msg  -> To ! {forwarded, self(), Msg}, forward_loop(To)
+    end.
+
+receive_forwarded() ->
+    receive {forwarded, From, Msg} -> {From, Msg}
+    after 200 -> none
+    end.
+
+%% A routed pid that is not a yuzu_gw_agent process (this stand-in) is left
+%% out: the shutdown drain calls each one and would wait on a stand-in.
+local_agent_pids_only_agents() ->
+    Pid = spawn_dummy(),
+    ok = yuzu_gw_registry:register_agent(<<"lap-1">>, Pid, <<"lap-s">>, [], <<>>),
+    ?assertNot(lists:member(Pid, yuzu_gw_registry:local_agent_pids())),
     kill_dummy(Pid).
 
 pagination_basic() ->

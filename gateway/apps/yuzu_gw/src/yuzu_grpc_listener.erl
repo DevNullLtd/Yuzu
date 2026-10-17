@@ -51,7 +51,12 @@
 %%%                  (a max_heap_size on the Cowboy connection process counting the
 %%%                  refc buffers its streams hold); a connection that buffers more
 %%%                  half-finished requests than this is killed. Default: four times
-%%%                  max_message_bytes (`infinity' disables it). request_timeout_ms
+%%%                  max_message_bytes (`infinity' disables it), except on a listener
+%%%                  that routes the ManagementService and does not serve the agent
+%%%                  service, where the default is none: its one peer is the pinned
+%%%                  server, and the ceiling killed the server's connection when a
+%%%                  fan-out's responses arrived together (stream_limits/1). An
+%%%                  explicit value applies on any listener. request_timeout_ms
 %%%                  is how long a unary/server-streaming stream may buffer its one
 %%%                  request before it is aborted DEADLINE_EXCEEDED (default 30000,
 %%%                  `infinity' disables it); it never cuts a bidirectional or
@@ -101,8 +106,9 @@
 %%% a fleet sets its own: the agents ping every 60 s, so 180000 for the idle
 %%% timeout, a handful of streams per connection, and more acceptors. A listener
 %%% that routes the ManagementService also gets a received-frame ceiling ten
-%%% times Cowboy's (http2_opts/1), because the server fans every command out
-%%% over the one connection it holds to it.
+%%% times Cowboy's and 4096 concurrent streams (http2_opts/1), because the server
+%%% fans every command out over the one connection it holds to it, and no
+%%% per-connection memory ceiling unless it sets one (stream_limits/1).
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_listener).
@@ -122,7 +128,7 @@
 
 %% Options the layer owns; an entry may not override them.
 -define(RESERVED_HTTP2, [stream_handlers, env, protocols, alpn_default_protocol,
-                         connection_type, middlewares, proxy_header]).
+                         connection_type, middlewares, proxy_header, logger]).
 %% The suites when `tls.ciphers' is unset, by the key type of the certificate:
 %% AEAD suites with ephemeral ECDH only. For an EC certificate (the generated
 %% gateway leaf is EC P-256) the list the gateway's upstream client uses
@@ -182,6 +188,21 @@
 %% per server channel, even with K=8 channels to one gateway, and is still
 %% finite, so a peer that floods the port is still cut off.
 -define(MGMT_FRAME_RATE, {100000, 10000}).
+%% The management listener's concurrent-stream cap. The server sends each
+%% forwarded command as its own call over its one connection, and its client
+%% queues the calls past the cap, so a fan-out takes about
+%%   max(agent answer time, agents x mean answer time / cap).
+%% Measured over one loopback connection with 5,000 agents answering uniformly
+%% in 0 to 10 s: 1024 streams 30.7 s, 2048 18.8 s, 4096 11.9 s, 8192 10.1 s
+%% (25,000 agents: 37.1 s at 4096, 21.7 s at 8192). 4096 brings 5,000 agents
+%% within about 2 s of the answer time itself. It is not set higher because the
+%% responses of the calls in flight can all be waiting to be written at once
+%% (one per stream when agents answer faster than the server reads): 5,000
+%% answers of 256 KiB inside 1 s peaked at about 0.98 GB in the connection at
+%% 4096 and 1.2 GB at 8192, so the cap is also the bound on that, and 8192
+%% doubles it for under 2 s. Beyond 5,000 agents the way forward is more
+%% connections or one message per fan-out (#5956), not a larger cap.
+-define(MGMT_MAX_CONCURRENT_STREAMS, 4096).
 %% Socket options that would move the bind address or port, which `listen' alone
 %% decides (and the management-plane posture guard reads).
 -define(BIND_SOCKET_OPTS, [ip, ifaddr, fd, port, local]).
@@ -369,7 +390,8 @@ transport_opts(Entry, Tls) ->
 %% @doc The Cowboy HTTP/2 options of an entry other than the ones the layer
 %% owns: the defaults, overridden key by key by its `http2' map.
 %%
-%% A listener that routes the ManagementService gets ?MGMT_FRAME_RATE as its
+%% A listener that routes the ManagementService gets ?MGMT_MAX_CONCURRENT_STREAMS
+%% (4096) as its stream cap, and ?MGMT_FRAME_RATE as its
 %% `max_received_frame_rate'; one that does not keeps Cowboy's own, since its
 %% connections are agents' and the stock flood guard is the one to keep there. A
 %% combined agent+management listener gets the raised value: it carries the
@@ -388,16 +410,20 @@ http2_opts(Entry) ->
                  max_frame_size_received => 16384,
                  linger_timeout => 1000},
     RoleDefaults = case routes_service(Entry, ?MGMT_SERVICE) of
-                       true -> Defaults#{max_received_frame_rate => ?MGMT_FRAME_RATE};
+                       true -> Defaults#{max_received_frame_rate => ?MGMT_FRAME_RATE,
+                                         max_concurrent_streams => ?MGMT_MAX_CONCURRENT_STREAMS};
                        false -> Defaults
                    end,
     maps:merge(RoleDefaults, maps:get(http2, Entry, #{})).
 
 protocol_opts(Entry, Routes) ->
-    Limits = maps:get(limits, Entry, #{}),
+    Limits = stream_limits(Entry),
     Origin = maps:get(origin, Entry, #{mode => transport}),
     maps:merge(http2_opts(Entry),
                #{stream_handlers => [yuzu_grpc_stream_h],
+                 %% Cowboy's per-stream warnings (a message or an exit for a
+                 %% stream that has ended), rate-limited and without the term.
+                 logger => yuzu_grpc_cowboy_log,
                  env => #{grpc => Routes,
                           auth_fun => maps:get(auth_fun, Entry, undefined),
                           origin => Origin,
@@ -411,6 +437,31 @@ protocol_opts(Entry, Routes) ->
                  %% a client that sends no ALPN at all is parsed as HTTP/2 too.
                  protocols => [http2],
                  alpn_default_protocol => http2}).
+
+%% The `limits' the stream handler reads. A listener that routes the
+%% ManagementService and does not serve the agent service gets no per-connection
+%% memory ceiling unless its `limits' sets one: max_connection_memory_bytes
+%% exists to bound an ANONYMOUS peer that opens streams and stalls them
+%% half-sent, and the management peer is the pinned server (the auth_fun runs
+%% before any stream of it is served), which holds ONE connection and sends a
+%% whole fan-out over it. On that connection the ceiling killed the server's
+%% connection, every call in flight on it, when the agents of a fan-out answered
+%% together with large responses: the derived 16 MiB equals Cowboy's own
+%% output-buffer alarm (max_connection_buffer_size, 16000000 bytes), so the VM
+%% killed the connection before that alarm could slow the senders, and each
+%% stream holds one more response than the alarm counts. Without the ceiling the
+%% alarm paces the senders; what one connection can then hold is about 16 MB
+%% plus one response per stream in flight (max_concurrent_streams of them). A
+%% combined agent+management listener serves anonymous agents and keeps the
+%% ceiling (it is a lab rig: the boot guard refuses it off loopback unless
+%% allow_insecure_mgmt acknowledges one).
+stream_limits(Entry) ->
+    Limits = maps:get(limits, Entry, #{}),
+    case routes_service(Entry, ?MGMT_SERVICE) andalso not serves_agent(Entry)
+         andalso not maps:is_key(max_connection_memory_bytes, Limits) of
+        true -> Limits#{max_connection_memory_bytes => infinity};
+        false -> Limits
+    end.
 
 %%--------------------------------------------------------------------
 %% Validation

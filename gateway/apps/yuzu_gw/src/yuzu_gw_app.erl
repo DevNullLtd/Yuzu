@@ -322,16 +322,11 @@ agent_listener_refs() ->
             []
     end.
 
-%% The agent processes of this node, read from the registry's routing table.
-%% After the REGISTRY workstream merge, yuzu_gw_registry:local_agent_pids/0 is
-%% the API for this (it also filters to real agent processes); until then the
-%% table is read directly (position 2 of its rows is the agent pid).
+%% The agent processes of this node: the registry's routing table, filtered to
+%% real yuzu_gw_agent processes ([] once the registry, and with it the table,
+%% is down).
 local_agent_pids() ->
-    MS = [{'$1', [{'>=', {size, '$1'}, 2}], [{element, 2, '$1'}]}],
-    try ets:select(yuzu_gw_agents, MS) of
-        Pids -> lists:usort([P || P <- Pids, is_pid(P), node(P) =:= node()])
-    catch error:badarg -> []
-    end.
+    lists:usort(yuzu_gw_registry:local_agent_pids()).
 
 %% @private Wait for pending commands to drain or until Deadline (monotonic
 %% ms). Each agent is asked with a short timeout; the walk stops at the deadline.

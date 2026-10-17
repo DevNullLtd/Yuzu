@@ -19,6 +19,15 @@
 %%% for the listener's status; it does not connect to the port.
 %%%
 %%% Designed to coexist with the Prometheus /metrics endpoint (port 9568).
+%%%
+%%% Each accepted connection is served by its own short-lived process, which
+%%% waits at most ?REQUEST_TIMEOUT_MS for the request and then closes, so a
+%%% client that connects and sends nothing holds up nobody but itself (served
+%%% one at a time with a 5 s wait, one idle connection stalled /healthz and
+%%% /readyz alike). At most ?MAX_HANDLERS connections are served at once; past
+%%% that the endpoint stops accepting until one finishes, and new connections
+%%% wait in the listen backlog. The answers are built from reads that make no
+%%% call into another process, so a handler never waits on the gateway.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_health).
@@ -33,9 +42,20 @@
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_PORT, 8081).
+%% How long a connection may take to send its request. A probe sends it with the
+%% connect; a client that has not after this long is closed.
+-define(REQUEST_TIMEOUT_MS, 2000).
+%% Connections served at once. A probe takes about a millisecond, so only idle
+%% or stalled clients come near this; it bounds the processes they can cost.
+-define(MAX_HANDLERS, 64).
 
 -record(state, {
-    listen_sock :: gen_tcp:socket()
+    listen_sock :: gen_tcp:socket(),
+    %% the monitors of the connection handlers running now
+    handlers = #{} :: #{reference() => true},
+    %% true while an `accept' message is pending; false while the endpoint is
+    %% at ?MAX_HANDLERS and waits for a handler to finish
+    accepting = true :: boolean()
 }).
 
 %%%===================================================================
@@ -87,23 +107,55 @@ handle_cast(_Msg, State) ->
 handle_info(accept, #state{listen_sock = LSock} = State) ->
     case gen_tcp:accept(LSock, 1000) of
         {ok, Sock} ->
-            _ = handle_request(Sock),
-            gen_tcp:close(Sock),
-            self() ! accept,
-            {noreply, State};
+            next_accept(serve(Sock, State));
         {error, timeout} ->
-            self() ! accept,
-            {noreply, State};
+            next_accept(State);
         {error, closed} ->
             {stop, normal, State};
         {error, Reason} ->
             logger:warning("Health endpoint accept error: ~p", [Reason]),
-            self() ! accept,
-            {noreply, State}
+            next_accept(State)
+    end;
+
+%% A connection handler finished: room for another connection.
+handle_info({'DOWN', Ref, process, _Pid, _Reason}, #state{handlers = Handlers} = State)
+  when is_map_key(Ref, Handlers) ->
+    State1 = State#state{handlers = maps:remove(Ref, Handlers)},
+    case State1#state.accepting of
+        true -> {noreply, State1};
+        false -> next_accept(State1)
     end;
 
 handle_info(_Info, State) ->
     {noreply, State}.
+
+%% Hand the connection to a process of its own. The socket's owner becomes the
+%% handler, so it closes with the handler whatever becomes of it.
+serve(Sock, #state{handlers = Handlers} = State) ->
+    {Pid, Ref} = spawn_monitor(fun() ->
+                                       receive {serve, S} -> serve_connection(S) end
+                               end),
+    case gen_tcp:controlling_process(Sock, Pid) of
+        ok ->
+            Pid ! {serve, Sock};
+        {error, _} ->
+            %% the client is already gone
+            gen_tcp:close(Sock),
+            exit(Pid, kill)
+    end,
+    State#state{handlers = Handlers#{Ref => true}}.
+
+serve_connection(Sock) ->
+    _ = handle_request(Sock),
+    gen_tcp:close(Sock).
+
+%% Accept the next connection now, or once a handler finishes when the
+%% endpoint is serving ?MAX_HANDLERS of them.
+next_accept(#state{handlers = Handlers} = State) when map_size(Handlers) >= ?MAX_HANDLERS ->
+    {noreply, State#state{accepting = false}};
+next_accept(State) ->
+    self() ! accept,
+    {noreply, State#state{accepting = true}}.
 
 terminate(_Reason, #state{listen_sock = LSock}) ->
     gen_tcp:close(LSock),
@@ -114,7 +166,7 @@ terminate(_Reason, #state{listen_sock = LSock}) ->
 %%%===================================================================
 
 handle_request(Sock) ->
-    case gen_tcp:recv(Sock, 0, 5000) of
+    case gen_tcp:recv(Sock, 0, ?REQUEST_TIMEOUT_MS) of
         {ok, Data} ->
             Path = extract_path(Data),
             {Status, Body} = route(Path),

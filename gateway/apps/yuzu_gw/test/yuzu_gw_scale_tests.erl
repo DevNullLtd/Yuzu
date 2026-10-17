@@ -123,8 +123,16 @@ fanout_count() ->
 
 bulk_register() ->
     N = scale_count(),
-    %% Spawn N dummy processes and register them.
-    {Pids, Ids} = spawn_and_register(N),
+    %% Spawn N dummy processes and register them, each with the 69 plugins of
+    %% a full agent build (the registry used to make one pg call per plugin).
+    Plugins = yuzu_gw_registry_cost_tests:plugin_names(),
+    {TimeUs, {Pids, Ids}} =
+        timer:tc(fun() -> spawn_and_register_prefixed(N, <<"scale-">>, Plugins) end),
+    ?debugFmt("bulk_register: ~b agents with ~b plugins, ~.1f us per registration",
+              [N, length(Plugins), TimeUs / N]),
+    %% Nothing left queued behind the registrations.
+    ?assertEqual({message_queue_len, 0},
+                 process_info(whereis(yuzu_gw_registry), message_queue_len)),
 
     ?assertEqual(N, length(Pids)),
 
@@ -388,10 +396,13 @@ spawn_and_register(N) ->
     spawn_and_register_prefixed(N, <<"scale-">>).
 
 spawn_and_register_prefixed(N, Prefix) ->
+    spawn_and_register_prefixed(N, Prefix, []).
+
+spawn_and_register_prefixed(N, Prefix, Plugins) ->
     Ids = [iolist_to_binary([Prefix, integer_to_binary(I)]) || I <- lists:seq(1, N)],
     Pids = [spawn(fun() -> receive stop -> ok end end) || _ <- lists:seq(1, N)],
     lists:foreach(fun({Id, Pid}) ->
-        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [], <<>>)
+        ok = yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, Plugins, <<>>)
     end, lists:zip(Ids, Pids)),
     {Pids, Ids}.
 
