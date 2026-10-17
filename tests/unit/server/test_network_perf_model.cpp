@@ -663,6 +663,18 @@ TEST_CASE("REST /network/devices: sort, filters, validation", "[network][rest]")
         REQUIRE(bad);
         CHECK(bad->status == 400);
     }
+    SECTION("a trailing-garbage limit is a 400, not its numeric prefix (#4644)") {
+        // from_chars alone accepted `2abc` as 2 (it only checked ec, not the end pointer).
+        for (const char* q : {"limit=2abc", "limit=1e1", "limit=0x2", "limit=", "limit=2.5"}) {
+            INFO(q);
+            auto bad = h.sink.Get(std::string("/api/v1/network/devices?") + q);
+            REQUIRE(bad);
+            CHECK(bad->status == 400);
+        }
+        auto ok = h.sink.Get("/api/v1/network/devices?limit=2");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
     SECTION("perm denied → 403") {
         h.grant_perms = false;
         auto denied = h.sink.Get("/api/v1/network/fleet");
@@ -689,4 +701,35 @@ TEST_CASE("OpenAPI spec lists the network endpoints (A2 discovery), stays valid 
     REQUIRE_NOTHROW(nlohmann::json::parse(res->body)); // whole doc stays valid JSON
     CHECK(res->body.find(R"("/network/fleet":)") != std::string::npos);
     CHECK(res->body.find(R"("/network/devices":)") != std::string::npos);
+}
+
+// #4644: the devices drill's `limit` is ONE base-10 integer or a 400 (it used to be
+// read with stoi, so `limit=50abc` silently became 50). A well-formed value is still clamped.
+TEST_CASE("network routes: a malformed devices limit is a 400 and a valid one is served",
+          "[network][routes][numeric_params]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto okAudit = [](const httplib::Request&, const std::string&, const std::string&,
+                      const std::string&, const std::string&, const std::string&) { return true; };
+    NetworkRoutes::NetworkApiPtr perf =
+        std::make_shared<yuzu::server::test::FnNetworkApi>([](const std::string&) {
+            NetPerfSnapshot snap;
+            snap.devices.push_back(degraded("deg-dev", 95.0, false));
+            return snap;
+        });
+    yuzu::server::test::TestRouteSink sink;
+    NetworkRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, okAudit, perf);
+    for (const char* bad : {"50abc", "0x10", "1e2", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto res = sink.Get(std::string("/fragments/network/devices?limit=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto ok = sink.Get("/fragments/network/devices?limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }

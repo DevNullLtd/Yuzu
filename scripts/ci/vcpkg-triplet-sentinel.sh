@@ -71,9 +71,9 @@ fi
 # sha256sum reads every input that exists; missing inputs are skipped (they
 # contribute nothing to the digest). The vcpkg-configuration.json is a hard
 # requirement of the manifest layout for our pinned-baseline mode but the
-# overlay triplet is conditional — only x64-linux-asan / x64-linux-tsan /
-# x64-linux-static / x64-windows currently have one. Stock triplets
-# (x64-linux, arm64-osx) do not.
+# overlay triplet is conditional — x64-linux-asan / x64-linux-tsan /
+# x64-linux-static / x64-windows and the macOS target arm64-osx each have one.
+# Stock triplets such as x64-linux do not.
 inputs=(vcpkg.json)
 if [[ -f vcpkg-configuration.json ]]; then
   inputs+=(vcpkg-configuration.json)

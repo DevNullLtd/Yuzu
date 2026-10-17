@@ -430,3 +430,24 @@ TEST_CASE("GET /api/v1/product-packs/{id}: unknown id is 404",
     REQUIRE(res);
     CHECK(res->status == 404);
 }
+
+// #4644: a trailing-garbage limit is a 400, not its numeric prefix.
+TEST_CASE("GET /api/v1/instructions and /product-packs: limit=100abc and an overflowing limit "
+          "are 400",
+          "[rest][v1][instructions][product_pack][pg]") {
+    for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=4294967296"}) {
+        INFO(bad);
+        {
+            IpHarness h;
+            auto res = h.sink.Get(std::string("/api/v1/instructions?") + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        {
+            IpHarness h;
+            auto res = h.sink.Get(std::string("/api/v1/product-packs?") + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+    }
+}

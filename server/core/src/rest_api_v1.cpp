@@ -2,6 +2,7 @@
 
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "pg_error_class.hpp" // is_permanent_pg_error — approval store error classification (PR #4656)
@@ -51,6 +52,7 @@
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "quarantine_visible.hpp" // quarantine_visible_records: shared admit-then-filter read (REST GET + dashboard fragments)
 #include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
+#include "result_set_matcher.hpp" // validate_matcher: admission check of a caller matcher (#4644)
 #include "result_set_model.hpp" // #2146 Batch B2: shared REST v1 + MCP result-set JSON builder
 #include "scope_engine.hpp"     // yuzu::scope::validate — POST /api/v1/scope/validate
 #include "scope_preview.hpp"    // #2146 Batch B2: shared REST v1 + MCP scope-preview builder
@@ -93,6 +95,7 @@
 #include <ctime>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <random>
 #include <regex>
@@ -530,6 +533,37 @@ static std::string access_review_str_field(const nlohmann::json& body, const cha
     return def;
 }
 
+// The OPTIONAL `overlap_secs` of the two credential-rotate routes (#4644), shared so the human
+// token and engine-principal routes cannot drift. A blank (empty or whitespace-only) body keeps
+// `overlap_secs` at the caller's default; any other body must be a JSON object, and a PRESENT
+// `overlap_secs` must be one JSON integer (a string, float, bool, null or a value above INT64_MAX
+// is refused: `body.value` threw on the first four, a float was truncated, the last wrapped). The
+// store still enforces the 24h..10y range. Returns false after writing the A4 400 (nothing has
+// been rotated yet); true with `overlap_secs` set otherwise.
+static bool read_rotate_overlap_secs(const httplib::Request& req, httplib::Response& res,
+                                     int64_t& overlap_secs) {
+    const bool blank = std::all_of(req.body.begin(), req.body.end(),
+                                   [](unsigned char c) { return std::isspace(c) != 0; });
+    if (blank)
+        return true;
+    const auto body = nlohmann::json::parse(req.body, nullptr, false);
+    if (body.is_discarded() || !body.is_object()) {
+        res.status = 400;
+        res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                        "application/json");
+        return false;
+    }
+    const auto v = read_json_int_strict(body, "overlap_secs", overlap_secs);
+    if (!v) {
+        res.status = 400;
+        res.set_content(detail::a4_error(res, "overlap_secs must be an integer (seconds)"),
+                        "application/json");
+        return false;
+    }
+    overlap_secs = *v;
+    return true;
+}
+
 // Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
 // The wire-format parsing (kind table + field extraction) is shared with the
 // dashboard HTML path via live_kinds.hpp so the two cannot drift (governance S2);
@@ -947,10 +981,10 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Revoke an engine principal (terminal) and its active credentials", "tags": ["Security"], "description": "Cross-store ordering invariant: credentials are revoked FIRST (ApiTokenStore::revoke_for_principal), the identity SECOND — never the reverse.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"superseded_by": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked (idempotent — success even if already revoked); {revoked, credentials_revoked}"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal or credential store unavailable"}}}
     },
     "/engine-principals/{id}/credentials": {
-      "post": {"summary": "Mint the first credential for an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"ttl_days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 90}}}}}}, "responses": {"201": {"description": "Minted; {token, token_id, expires_at} — token is the raw secret, shown once (Cache-Control: no-store)"}, "400": {"description": "ttl_days out of range (1-90)"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active, or an active credential already exists — rotate instead of minting a second one"}, "503": {"description": "Store unavailable, or CSPRNG failure"}}}
+      "post": {"summary": "Mint the first credential for an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"ttl_days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 90}}}}}}, "responses": {"201": {"description": "Minted; {token, token_id, expires_at} — token is the raw secret, shown once (Cache-Control: no-store)"}, "400": {"description": "ttl_days present but of the wrong type (string, float, boolean, null) or out of range (1-90), or a non-empty body that is not a JSON object (malformed, array, string, number, null); nothing is minted. An empty or whitespace-only body still mints the 90-day default"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active, or an active credential already exists — rotate instead of minting a second one"}, "503": {"description": "Store unavailable, or CSPRNG failure"}}}
     },
     "/engine-principals/{id}/credentials/rotate": {
-      "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
+      "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days. A non-empty body must be a JSON object and overlap_secs a JSON integer (400 otherwise)"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
     },
     "/engine-principals/{id}/credentials/confirm": {
       "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "Pass the successor token_id the rotate response returned (pins the confirm to that exact rotation; a stale or mismatched id is rejected with no state change) AND the raw successor secret (proof of possession, #3015). Confirm revokes the predecessor only after the presented secret verifies against the stored hash.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id", "secret"], "properties": {"token_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "minLength": 24, "maxLength": 24, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}, "secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after every other admission gate. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id or secret missing, empty, or not a string; more than two active credentials; or a non-engine active credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write, or the presented secret does not verify against the pending successor (#3015)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry): token_id does not match the pending successor; the rotation was already confirmed or otherwise resolved by cutover/sweep/revoke; the sole active credential has unresolved rotation metadata; the grace window elapsed; or the rotation was initiated by a different operator"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, a confirm/revoke/clear persistence failure, or no in-flight rotation to confirm - the last covers zero active credentials (ambiguous with a transient read failure) and an unrecognized two-credential pair; rotate first if genuinely absent"}}}
@@ -968,13 +1002,13 @@ const std::string& openapi_spec() {
         R"json(,
     "/tokens": {
       "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "description": "Owner-scoped to the caller. An item includes rotation_group/supersedes_token_id/overlap_expires_at/confirmed_at only while a rotation is (or was) in flight for that token.", "responses": {"200": {"description": "List of API tokens"}, "503": {"description": "Token store unavailable (service unavailable)"}}},
-      "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
+      "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer", "description": "Unix epoch seconds in the future, or 0/omitted for never expires. A string, float, bool, null, negative or past value, or one above INT64_MAX, is 400"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}, "400": {"description": "Body is not a JSON object, or a field has the wrong type, or expires_at is not 0 or a future epoch integer"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/tokens/{token_id}": {
       "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/tokens/{token_id}/rotate": {
-      "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Rotate and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. Reachable by any non-admin owner under the default RBAC-off config (#2963 legacy self-service allowlist) — ownership, not role, is the actual gate. A caller holding NO standing mcp_tier/scope_service (a plain cookie session) may rotate ANY of its own tokens regardless of that token's own tier/scope (#2963); any other caller's tier/scope must equal the predecessor's exactly. The successor always inherits the predecessor's expires_at AND mcp_tier/scope_service verbatim (rotation is lifetime-neutral and never mints broader authority) — a token within 24h of its own expiry cannot be rotated (see 400).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, more than 2 active credentials in an unrecognized shape, the overlap window would exceed the predecessor's (or successor's) expiry — by design, a token within 24h of expiry cannot be rotated; mint a new one instead — or the caller's tier/scope does not match the predecessor's and the caller holds some standing tier/scope of its own (a caller holding no standing tier/scope at all is instead admitted, #2963; folded into the same store-level 'no such token to rotate' wording as absent/not-owned so this is not an authority-probing oracle)"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
+      "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Rotate and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. Reachable by any non-admin owner under the default RBAC-off config (#2963 legacy self-service allowlist) — ownership, not role, is the actual gate. A caller holding NO standing mcp_tier/scope_service (a plain cookie session) may rotate ANY of its own tokens regardless of that token's own tier/scope (#2963); any other caller's tier/scope must equal the predecessor's exactly. The successor always inherits the predecessor's expires_at AND mcp_tier/scope_service verbatim (rotation is lifetime-neutral and never mints broader authority) — a token within 24h of its own expiry cannot be rotated (see 400).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days. A non-empty body must be a JSON object and overlap_secs a JSON integer (400 otherwise)"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, more than 2 active credentials in an unrecognized shape, the overlap window would exceed the predecessor's (or successor's) expiry — by design, a token within 24h of expiry cannot be rotated; mint a new one instead — or the caller's tier/scope does not match the predecessor's and the caller holds some standing tier/scope of its own (a caller holding no standing tier/scope at all is instead admitted, #2963; folded into the same store-level 'no such token to rotate' wording as absent/not-owned so this is not an authority-probing oracle)"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
     },
     "/tokens/{token_id}/confirm": {
       "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned. The request body MUST carry the raw successor secret (proof of possession, #3015), verified against the stored hash before the predecessor is revoked. Requires ApiToken:Rotate and step-up. Self-service only; reachable by any non-admin owner under the default RBAC-off config (#2963). Any caller who OWNS the token and presents the raw successor secret may confirm — not necessarily the same session that called rotate — provided the caller's CURRENT mcp_tier/scope_service equals the successor's own (or the caller holds no standing tier/scope at all, #2963), or the mismatch check below refuses it. Ownership + the proof-of-possession secret are the actual gates on who may confirm; the tier/scope re-check is defense in depth, not a same-session pin.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["secret"], "properties": {"secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after ownership/step-up. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "400": {"description": "Missing or empty secret (#3015); or terminal client-state conditions the store classifies ClientValidation: the caller's (mcp_tier, scope_service) does not equal the predecessor's (unless the caller holds no standing tier/scope at all, #2963), more than two active credentials share the rotation_group, or the token is not a human-owned credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Rotate, or the presented secret does not verify (#3015)"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or the deliberately-ambiguous no-in-flight-rotation read (a swallowed query failure and a genuinely empty active set are indistinguishable, so it stays retryable). A MALFORMED pair found after a positive two-row read is terminal 409, not this (#2943)."}}}
@@ -986,7 +1020,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Internal CA certificate revocation list (DER, public)", "tags": ["Security"], "responses": {"200": {"description": "DER-encoded CRL", "content": {"application/pkix-crl": {}}}, "503": {"description": "CRL unavailable"}}}
     },
     "/ca/issued": {
-      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then."}, "403": {"description": "Requires Security:Read"}}}
+      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then."}, "400": {"description": "limit or offset is not a single base-10 integer, or is outside limit 1..1000 / offset 0..1000000"}, "403": {"description": "Requires Security:Read"}}}
     },
     "/ca/revoke": {
       "post": {"summary": "Revoke a certificate by serial", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["serial_hex"], "properties": {"serial_hex": {"type": "string"}, "reason": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked; CRL republished"}, "403": {"description": "Requires Security:Delete"}, "404": {"description": "Serial not found or already revoked"}}}
@@ -1068,10 +1102,10 @@ const std::string& openapi_spec() {
       "get": {"summary": "List instruction definitions", "tags": ["Instructions"], "responses": {"200": {"description": "List of instruction definitions"}}}
     },
     "/audit": {
-      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}, {"name": "target_type", "in": "query", "schema": {"type": "string"}}, {"name": "target_id", "in": "query", "description": "Requires target_type", "schema": {"type": "string"}}, {"name": "since", "in": "query", "description": "Inclusive epoch seconds; 0 = unbounded", "schema": {"type": "integer", "minimum": 0}}, {"name": "until", "in": "query", "description": "Inclusive epoch seconds; 0 = unbounded", "schema": {"type": "integer", "minimum": 0}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 10000}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1, malformed since/until/offset, since > until, or target_id without target_type (client errors, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
+      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}, {"name": "target_type", "in": "query", "schema": {"type": "string"}}, {"name": "target_id", "in": "query", "description": "Requires target_type", "schema": {"type": "string"}}, {"name": "since", "in": "query", "description": "Inclusive lower bound, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value or a non-integer is rejected with 400.", "schema": {"type": "integer", "minimum": 0}}, {"name": "until", "in": "query", "description": "Inclusive upper bound, epoch seconds. Omit for no upper bound; 0, a negative value or a non-integer is rejected with 400 (0 is not a way to say unbounded).", "schema": {"type": "integer", "minimum": 1}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 10000}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1, malformed since/until/offset, since > until, or target_id without target_type (client errors, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
     },
     "/audit/auth-sample": {
-      "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
+      "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Window start, epoch seconds (optional, digits only). Omit for no lower bound; 0 is accepted and matches the same rows as omitting it."}, {"name": "to", "in": "query", "schema": {"type": "integer", "minimum": 1}, "description": "Window end, epoch seconds (optional, digits only). Omit for no upper bound; 0 is rejected with 400 (0 is not a way to say unbounded)."}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, to=0, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
     },)json"
         // Split again (MSVC C2026 16,380-byte cap) — A2's rbac/roles/{name}/
         // assignments entries pushed this segment over the limit; concatenated
@@ -1084,10 +1118,10 @@ const std::string& openapi_spec() {
       "get": {"summary": "Get inventory data for a specific agent and plugin", "tags": ["Inventory"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Inventory record"}, "404": {"description": "No inventory data found"}}}
     },
     "/inventory/query": {
-      "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "description": "Only records after this epoch"}, "until": {"type": "integer", "description": "Only records before this epoch"}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
+      "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "minimum": 0, "description": "Inclusive lower bound on collected_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value or a non-integer is rejected with 400."}, "until": {"type": "integer", "minimum": 1, "description": "Inclusive upper bound on collected_at, epoch seconds. Omit for no upper bound; 0, a negative value or a non-integer is rejected with 400 (0 is not a way to say unbounded)."}, "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000, "description": "Max results; an integer above 1000 is clamped to 1000, a value below 1 or a non-integer is rejected with 400."}}}}}}, "responses": {"200": {"description": "Matching inventory records"}, "400": {"description": "Malformed JSON body, a limit below 1 or not an integer, a negative or non-integer since, or an until of 0 or below or non-integer (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/inventory/software": {
-      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app|pkg|feat), ecosystem (rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); the scope is applied in SQL (up to 10000 visible devices) so a confined caller gets COMPLETE pages of its own devices; devices_omitted is 0 under push-down; for a scope wider than that bound the rows are filtered after the read and devices_omitted is the count of distinct out-of-scope devices within the scanned window(s), a bounded and audited signal that out-of-scope matches exist. A denied audit row is written when it is above zero or when the request names an agent_id outside the caller's scope. On a wide scope a page can be empty with a non-null next_cursor; the cursor re-anchors at the last row served and carries a count of the rows scanned since, never a row of another device, and an export reads at most four bounded windows. A correctly-confined service-scoped token gets a real filtered read here (incl. export), unlike the two catalogue routes which deny service-scoped tokens. Each row also carries source (<plugin>.<action>, an open set). Optional filters: version (present-empty selects the empty-version rows), q, kind, ecosystem, source. Keyset pagination: next_cursor is non-null when more rows may exist (result_truncated_by_cap=true, also in export mode); pass it back as cursor — a malformed cursor or one issued for a different filter set is a 400. format=json|csv is an export (limit is the TOTAL cap, default and max 10000; csv adds Content-Disposition, X-Result-Truncated-By-Cap and X-Next-Cursor, and a trailer record when more rows may exist) audited as inventory.software.export. Every served call is audited (inventory.software.query success, inventory.software.export for an export; continuation pages tagged page=continuation). Repeated query parameters keep the first value; a non-integer limit is a 400. On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "version", "in": "query", "schema": {"type": "string"}, "description": "Exact version filter; present-empty selects the empty-version rows"}, {"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over name, publisher, ecosystem and source"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"]}, "description": "Export mode (limit is the total cap, max 10000)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, next_cursor, devices_omitted, result_truncated_by_cap?, audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=software-installs.csv"}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when more rows may exist (the export reached the total cap, or a wide-scope read was cut short)"}, "X-Next-Cursor": {"schema": {"type": "string"}, "description": "format=csv only: the continuation, present with X-Result-Truncated-By-Cap; pass it back as cursor"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when an audit row of the export did not persist (the export is still served)"}}}, "400": {"description": "Non-integer limit, unknown format, text that is not valid UTF-8 or holds a NUL byte, an over-long value, or a refused cursor"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
+      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app|pkg|feat), ecosystem (rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version (rpm/deb/apk/pacman rows only) — fields an ecosystem does not store are empty, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak apps kind app and runtimes kind pkg (ecosystem flatpak). Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); the scope is applied in SQL (up to 10000 visible devices) so a confined caller gets COMPLETE pages of its own devices; devices_omitted is 0 under push-down; for a scope wider than that bound the rows are filtered after the read and devices_omitted is the count of distinct out-of-scope devices within the scanned window(s), a bounded and audited signal that out-of-scope matches exist. A denied audit row is written when it is above zero or when the request names an agent_id outside the caller's scope. On a wide scope a page can be empty with a non-null next_cursor; the cursor re-anchors at the last row served and carries a count of the rows scanned since, never a row of another device, and an export reads at most four bounded windows. A correctly-confined service-scoped token gets a real filtered read here (incl. export), unlike the two catalogue routes which deny service-scoped tokens. Each row also carries source (<plugin>.<action>, an open set). Optional filters: version (present-empty selects the empty-version rows), q, kind, ecosystem, source. Keyset pagination: next_cursor is non-null when more rows may exist (result_truncated_by_cap=true, also in export mode); pass it back as cursor — a malformed cursor or one issued for a different filter set is a 400. format=json|csv is an export (limit is the TOTAL cap, default and max 10000; csv adds Content-Disposition, X-Result-Truncated-By-Cap and X-Next-Cursor, and a trailer record when more rows may exist) audited as inventory.software.export. Every served call is audited (inventory.software.query success, inventory.software.export for an export; continuation pages tagged page=continuation). Repeated query parameters keep the first value; a non-integer limit is a 400. On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "version", "in": "query", "schema": {"type": "string"}, "description": "Exact version filter; present-empty selects the empty-version rows"}, {"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over name, publisher, ecosystem and source"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"]}, "description": "Export mode (limit is the total cap, max 10000)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, next_cursor, devices_omitted, result_truncated_by_cap?, audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=software-installs.csv"}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when more rows may exist (the export reached the total cap, or a wide-scope read was cut short)"}, "X-Next-Cursor": {"schema": {"type": "string"}, "description": "format=csv only: the continuation, present with X-Result-Truncated-By-Cap; pass it back as cursor"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when an audit row of the export did not persist (the export is still served)"}}}, "400": {"description": "Non-integer limit, unknown format, text that is not valid UTF-8 or holds a NUL byte, an over-long value, or a refused cursor"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
     },
     "/policy-fragments": {
       "get": {"summary": "List policy fragments (api-parity #4034)", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/policy-fragments; MCP twin list_policy_fragments. Requires Policy:Read.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Substring name filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}], "responses": {"200": {"description": "{data:[{id,name,description,check_instruction,check_compliance,fix_instruction,post_check_instruction,created_at,updated_at}], pagination}"}, "400": {"description": "Non-integer limit"}, "503": {"description": "Policy store not available/degraded"}}}
@@ -1106,8 +1140,8 @@ const std::string& openapi_spec() {
     },)json"
         // The software catalogue twins. Own segment (MSVC C2026 16,380-byte cap).
         R"json(
-    "/inventory/software/catalogue": {"get": {"summary": "Fleet software title catalogue with totals and KPIs", "tags": ["Inventory"], "description": "One row per software title rolled up across the whole fleet from the precomputed catalogue rollup, ordered by installs descending then name (per-device view: by name). MCP twin query_software_catalogue; both are shaped by one shared model. totals{titles,installs} cover EVERY row matching the filters (not just this page), so a page can say N of M; installs sums each title's distinct-device count. kpis (first page only; null on continuation pages and the per-device view) carries the headline numbers computed by the hourly refresh plus derived percentages, and coverage{reporting,connected,stale} as counts (reporting = devices with stored inventory, connected = devices currently connected, stale = not seen in 48 hours; null when that figure is unavailable). Requires a GLOBAL Inventory:Read for the fleet view: a management-group-confined caller gets 403 with permission Inventory:Read (the rollup is fleet-wide and cannot be scoped); the per-device view (agent_id) is admitted for an in-scope device, an out-of-scope device returns an empty page with devices_omitted 1, and a confined caller sees newest_version blank with newest_omitted true. Service-scoped API tokens are denied (403, no permission field). Pagination is keyset: next_cursor is non-null when the page is full; a cursor presented with a different filter set, a malformed cursor, or one issued before the latest catalogue refresh (1 second generation granularity) is a 400 and the walk must restart from the first page. Every call that serves a page is audited (inventory.software.catalog success, continuation pages tagged page=continuation); an out-of-scope per-device read writes denied only (denied plus an empty-file inventory.software.export success on format=csv). format=csv exports the titles (total cap 10000, X-Result-Truncated-By-Cap when the cap is reached; audited as inventory.software.export). An empty kind, ecosystem or source means no filter. A degraded rows, totals or refresh-metadata read is a 503 with retry_after_ms, never an empty 200. Before the first catalogue refresh the JSON page answers 200 with kpis.building true, while the fleet format=csv export is a 503 with retry_after_ms (an empty file would read as no titles; the per-device export is unaffected).", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over title name, publisher, ecosystems and sources (% and _ are not wildcards); clamped to 128 bytes"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's titles (installs are 1)"}, {"name": "versions_min", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 100000}, "description": "Only titles with at least this many distinct versions"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size, clamped into 1..1000; with format=csv it is the TOTAL export cap (clamped into 1..10000, default 10000)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the filter set and to the catalogue refresh generation"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}, "description": "csv streams a titles export (REST only; audited as inventory.software.export)"}], "responses": {"200": {"description": "{data:{titles[{name,publisher,installs,versions,ecosystems[],kinds[],newest_version}],count,next_cursor,totals{titles,installs},kpis|null,devices_omitted,newest_omitted?,audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=\"software-titles.csv\""}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the walk reached the total export cap (rows may have been left behind)"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the export audit row did not persist, or when only the paired denied row failed to persist (the export is still served)"}}}, "400": {"description": "Repeated or malformed parameter, non-integer limit or versions_min, unknown format, a cursor sent with format=csv, or a refused cursor: invalid cursor, different filter set, or predates the current catalogue refresh (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (no permission field) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Rows, totals or refresh-metadata read degraded, or (fleet format=csv) the catalogue is not built yet: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
-    "/inventory/software/catalogue/versions": {"get": {"summary": "Installs per version for one software title", "tags": ["Inventory"], "description": "Distinct-device install counts per version of one title under the same filters as the catalogue; the newest flag marks the title's fleet-wide newest version. MCP twin get_software_versions. truncated is true when the limit was reached. Same access posture as the catalogue: a global Inventory:Read for the fleet view (a confined caller gets 403), the per-device view for an in-scope device (newest is false on every row and newest_omitted is true for a confined caller; an out-of-scope device returns an empty list with devices_omitted 1), service-scoped tokens denied. Every call that serves a page is audited (inventory.software.versions success); a 400 writes nothing; a confined or service-scoped refusal writes denied; the Inventory:Read gate's own refusal is audited as auth.fleet_read_required. A degraded read is a 503 with retry_after_ms, never an empty 200; so is the unfiltered read (no kind, ecosystem, source or agent_id) before the first catalogue refresh.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 1024}, "description": "Exact title name"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's versions of the title"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}, "description": "Maximum versions returned, clamped into 1..1000"}], "responses": {"200": {"description": "{data:{name,versions[{version,installs,newest}],count,truncated,devices_omitted,newest_omitted?,audit_persisted?}}"}, "400": {"description": "name missing, repeated or malformed parameter, an over-long value, invalid UTF-8 or a NUL byte (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Versions or refresh-metadata read degraded, or the unfiltered read before the first refresh: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
+    "/inventory/software/catalogue": {"get": {"summary": "Fleet software title catalogue with totals and KPIs", "tags": ["Inventory"], "description": "One row per software title rolled up across the whole fleet from the precomputed catalogue rollup, ordered by installs descending then name (per-device view: by name). MCP twin query_software_catalogue; both are shaped by one shared model. totals{titles,installs} cover EVERY row matching the filters (not just this page), so a page can say N of M; installs sums each title's distinct-device count. kpis (first page only; null on continuation pages and the per-device view) carries the headline numbers computed by the hourly refresh plus derived percentages, and coverage{reporting,connected,stale} as counts (reporting = devices with stored inventory, connected = devices currently connected, stale = not seen in 48 hours; null when that figure is unavailable). Requires a GLOBAL Inventory:Read for the fleet view: a management-group-confined caller gets 403 with permission Inventory:Read (the rollup is fleet-wide and cannot be scoped); the per-device view (agent_id) is admitted for an in-scope device, an out-of-scope device returns an empty page with devices_omitted 1, and a confined caller sees newest_version blank with newest_omitted true. Service-scoped API tokens are denied (403, no permission field). Pagination is keyset: next_cursor is non-null when the page is full; a cursor presented with a different filter set, a malformed cursor, or one issued before the latest catalogue refresh (1 second generation granularity) is a 400 and the walk must restart from the first page. Every call that serves a page is audited (inventory.software.catalog success, continuation pages tagged page=continuation); an out-of-scope per-device read writes denied only (denied plus an empty-file inventory.software.export success on format=csv). format=csv exports the titles (total cap 10000, X-Result-Truncated-By-Cap when the cap is reached; audited as inventory.software.export). An empty kind, ecosystem or source means no filter. A degraded rows, totals or refresh-metadata read is a 503 with retry_after_ms, never an empty 200. Before the first catalogue refresh the JSON page answers 200 with kpis.building true, while the fleet format=csv export is a 503 with retry_after_ms (an empty file would read as no titles; the per-device export is unaffected).", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over title name, publisher, ecosystems and sources (% and _ are not wildcards); clamped to 128 bytes"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's titles (installs are 1)"}, {"name": "versions_min", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 100000}, "description": "Only titles with at least this many distinct versions"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size, clamped into 1..1000; with format=csv it is the TOTAL export cap (clamped into 1..10000, default 10000)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the filter set and to the catalogue refresh generation"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}, "description": "csv streams a titles export (REST only; audited as inventory.software.export)"}], "responses": {"200": {"description": "{data:{titles[{name,publisher,installs,versions,ecosystems[],kinds[],newest_version}],count,next_cursor,totals{titles,installs},kpis|null,devices_omitted,newest_omitted?,audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=\"software-titles.csv\""}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the walk reached the total export cap (rows may have been left behind)"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the export audit row did not persist, or when only the paired denied row failed to persist (the export is still served)"}}}, "400": {"description": "Repeated or malformed parameter, non-integer limit or versions_min, unknown format, a cursor sent with format=csv, or a refused cursor: invalid cursor, different filter set, or predates the current catalogue refresh (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (no permission field) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Rows, totals or refresh-metadata read degraded, or (fleet format=csv) the catalogue is not built yet: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
+    "/inventory/software/catalogue/versions": {"get": {"summary": "Installs per version for one software title", "tags": ["Inventory"], "description": "Distinct-device install counts per version of one title under the same filters as the catalogue; the newest flag marks the title's fleet-wide newest version. MCP twin get_software_versions. truncated is true when the limit was reached. Same access posture as the catalogue: a global Inventory:Read for the fleet view (a confined caller gets 403), the per-device view for an in-scope device (newest is false on every row and newest_omitted is true for a confined caller; an out-of-scope device returns an empty list with devices_omitted 1), service-scoped tokens denied. Every call that serves a page is audited (inventory.software.versions success); a 400 writes nothing; a confined or service-scoped refusal writes denied; the Inventory:Read gate's own refusal is audited as auth.fleet_read_required. A degraded read is a 503 with retry_after_ms, never an empty 200; so is the unfiltered read (no kind, ecosystem, source or agent_id) before the first catalogue refresh.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 1024}, "description": "Exact title name"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's versions of the title"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}, "description": "Maximum versions returned, clamped into 1..1000"}], "responses": {"200": {"description": "{data:{name,versions[{version,installs,newest}],count,truncated,devices_omitted,newest_omitted?,audit_persisted?}}"}, "400": {"description": "name missing, repeated or malformed parameter, an over-long value, invalid UTF-8 or a NUL byte (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Versions or refresh-metadata read degraded, or the unfiltered read before the first refresh: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
         // #4029 (api-parity Batch A content/catalog half) — GET /api/v1/instructions*
         // and GET /api/v1/product-packs*. Own segment (MSVC C2026 16,380-byte cap).
         R"json(
@@ -1178,14 +1212,14 @@ const std::string& openapi_spec() {
         R"json(
     "/offload-targets": {
       "get": {"summary": "List configured offload targets", "tags": ["Offload"], "description": "Requires Infrastructure:Read. Returns every registered offload target. The auth_credential is never returned in any response (issue #255, Phase 8.3).", "responses": {"200": {"description": "List of offload targets"}, "503": {"description": "Offload store unavailable"}}},
-      "post": {"summary": "Create an offload target", "tags": ["Offload"], "description": "Requires Infrastructure:Write. Validation: URL must be http(s)://, name must be non-empty and unique, batch_size must be >= 1, auth_credential must not contain control bytes (defends against Authorization header CRLF injection).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["name", "url"], "properties": {"name": {"type": "string", "description": "Unique stable identifier referenced from spec.offload.targets"}, "url": {"type": "string", "description": "http:// or https:// POST endpoint"}, "auth_type": {"type": "string", "enum": ["none", "bearer", "basic", "hmac"], "default": "none"}, "auth_credential": {"type": "string", "description": "Bearer token, user:pass, or shared HMAC secret. Never returned by any read endpoint."}, "event_types": {"type": "string", "default": "*", "description": "Comma-separated event names or *"}, "batch_size": {"type": "integer", "minimum": 1, "default": 1}, "enabled": {"type": "boolean", "default": true}}}}}}, "responses": {"201": {"description": "Target created"}, "400": {"description": "Invalid JSON, missing name/url, bad URL scheme, control bytes in credential, batch_size < 1, or duplicate name"}, "403": {"description": "Cookie-session write with no Origin/Referer or one naming another site (token callers are not gated)"}, "503": {"description": "Offload store unavailable, or the offload_target.create/attempted audit row could not be stored (Sec-Audit-Failed: true; nothing was created)"}}}
+      "post": {"summary": "Create an offload target", "tags": ["Offload"], "description": "Requires Infrastructure:Write. Validation: URL must be http(s)://, name must be non-empty and unique, batch_size must be an integer from 1 to 10000, auth_credential must not contain control bytes (defends against Authorization header CRLF injection).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["name", "url"], "properties": {"name": {"type": "string", "description": "Unique stable identifier referenced from spec.offload.targets"}, "url": {"type": "string", "description": "http:// or https:// POST endpoint"}, "auth_type": {"type": "string", "enum": ["none", "bearer", "basic", "hmac"], "default": "none"}, "auth_credential": {"type": "string", "description": "Bearer token, user:pass, or shared HMAC secret. Never returned by any read endpoint."}, "event_types": {"type": "string", "default": "*", "description": "Comma-separated event names or *"}, "batch_size": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1}, "enabled": {"type": "boolean", "default": true}}}}}}, "responses": {"201": {"description": "Target created"}, "400": {"description": "Invalid JSON, a wrong-typed field (including a non-integer batch_size), missing name/url, bad URL scheme, control bytes in credential, batch_size outside 1 to 10000, or duplicate name"}, "403": {"description": "Cookie-session write with no Origin/Referer or one naming another site (token callers are not gated)"}, "503": {"description": "Offload store unavailable, or the offload_target.create/attempted audit row could not be stored (Sec-Audit-Failed: true; nothing was created)"}}}
     },
     "/offload-targets/{id}": {
       "get": {"summary": "Get a single offload target", "tags": ["Offload"], "description": "Requires Infrastructure:Read. auth_credential is never returned.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}], "responses": {"200": {"description": "Offload target"}, "404": {"description": "Target not found"}, "503": {"description": "Offload store unavailable"}}},
       "delete": {"summary": "Delete an offload target", "tags": ["Offload"], "description": "Requires Infrastructure:Write. Cascades on offload_deliveries; pending buffered events are dropped. Successful deletes audit offload_target.delete/success; 404 paths audit offload_target.delete/denied with detail=not_found.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}], "responses": {"200": {"description": "Target deleted"}, "403": {"description": "Cookie-session write with no Origin/Referer or one naming another site (token callers are not gated)"}, "404": {"description": "Target not found (or numeric overflow on path segment)"}, "503": {"description": "Offload store unavailable, or the offload_target.delete/attempted audit row could not be stored (Sec-Audit-Failed: true; nothing was deleted)"}}}
     },
     "/offload-targets/{id}/deliveries": {
-      "get": {"summary": "List recent offload delivery attempts", "tags": ["Offload"], "description": "Requires Infrastructure:Read. limit query parameter is clamped to [1, 1000]; default 50.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 50}}], "responses": {"200": {"description": "List of delivery records"}, "404": {"description": "Target not found (deleted, never created, or numeric overflow on id)"}, "503": {"description": "Offload store unavailable"}}}
+      "get": {"summary": "List recent offload delivery attempts", "tags": ["Offload"], "description": "Requires Infrastructure:Read. limit query parameter is clamped to [1, 1000]; default 50.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 50}}], "responses": {"200": {"description": "List of delivery records"}, "400": {"description": "limit is present but not a single base-10 integer (for example 10abc); a valid integer is still clamped to [1, 1000]"}, "404": {"description": "Target not found (deleted, never created, or numeric overflow on id)"}, "503": {"description": "Offload store unavailable"}}}
     },
     "/executions/{id}/visualization": {
       "get": {"summary": "Render execution responses as chart-ready JSON", "tags": ["Executions"], "description": "Gated by the ADR-0017 admit-then-filter fleet-read primitive (Response:Read). A management-group-confined caller sees chart data built only from their in-scope agents' responses; the row cap and rows_capped signal reflect the caller's own scoped result, not the raw fleet-wide one. The definition_id query parameter is required and must match [A-Za-z0-9._-]+. Returns chart data shaped by the spec.visualization (or spec.visualizations) block on the InstructionDefinition (see yaml-dsl-spec.md). When a definition declares multiple charts, use the optional index query parameter to select among them; default 0. The response payload includes chart_index and chart_count fields so callers can iterate. Caps the underlying response read at 10000 rows AND at 50 MiB of row payload (output + error_detail, applied in the store query itself, on whole rows, with at least one row always read); when more matching rows exist past the row cap the payload includes rows_capped:true and rows_cap:10000, and when either cap cut the read it includes result_truncated_by_cap:true and truncation_cause (row_cap or byte_cap), because a chart built from a cut read is a wrong picture, not a smaller one. rows_capped is exact: it is not set on a read of exactly 10000 rows. Emits an execution.visualization.fetch audit event on every invocation.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "definition_id", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "index", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}, "description": "Chart index when the definition declares multiple visualizations."}], "responses": {"200": {"description": "Chart data payload"}, "400": {"description": "definition_id not provided or index is not a non-negative integer"}, "404": {"description": "Definition not found, no visualization configured, or index out of range"}, "500": {"description": "Visualization spec is invalid"}, "503": {"description": "Service unavailable"}}}
@@ -1205,7 +1239,7 @@ const std::string& openapi_spec() {
         R"json(,
     "/guaranteed-state/rules": {
       "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "403": {"description": "Service-scoped API token — the rule catalogue isn't owned by any one IT service, so this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Guaranteed-state store degraded, retryable (A4 envelope, retry_after_ms: 5000)"}}},
-      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+. Structured authoring: pass spark/assertion/remediation {type, params} blocks; remediation.params resilience policy is validated (mode persist|backoff|bounded + bounds). Validation failures use the A4 error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields, invalid JSON, or invalid resilience params"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Service-scoped API token — rule authoring cannot be confined to the token's service."}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
+      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+. Structured authoring: pass spark/assertion/remediation {type, params} blocks; remediation.params resilience policy is validated (mode persist|backoff|bounded + bounds). Validation failures use the A4 error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields, invalid JSON, invalid resilience params, or version not a JSON integer from 1 to 2147483647"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Service-scoped API token — rule authoring cannot be confined to the token's service."}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
     },
     "/guaranteed-state/schemas": {
       "get": {"summary": "Guard authoring schema registry", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Static catalog of spark/assertion/remediation types with per-type JSON Schemas (discriminated subschemas for value-dependent formats; resilience policy subschema for remediation). Cacheable via ETag/If-None-Match (304).", "responses": {"200": {"description": "Schema catalog"}, "304": {"description": "Not modified (ETag matched)"}}}
@@ -1244,9 +1278,15 @@ const std::string& openapi_spec() {
     },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
-    },
+    },)json"
+        // Split here (MSVC C2026 ~16,380-byte per-literal cap): the segment
+        // opening at /guaranteed-state/device-compliance reached 16,402 bytes,
+        // over that cap. Adjacent string literals are
+        // concatenated at compile time, so the emitted OpenAPI JSON is
+        // byte-identical to the unsplit form.
+        R"json(
     "/events": {
-      "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined subscriber's agent-transition events are filtered to their in-scope agents, execution-progress is withheld, and execution-completed carries only the real terminal status (no fleet-wide counts). Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). Non-integer `?since` values silently degrade to 0 (no replay). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. Non-integer values silently degrade to 0."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined subscriber's agent-transition events are filtered to their in-scope agents, execution-progress is withheld, and execution-completed carries only the real terminal status (no fleet-wide counts). Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). A `?since` that is not one non-negative base-10 integer is a 400 (answered before the stream budget is touched and before the success audit row); a malformed `Last-Event-ID` header is served live only (nothing replayed). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. A value that is not one non-negative base-10 integer is a 400."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id, or a malformed since", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/executions": {
       "get": {"summary": "List executions, fleet-confined (#4030)", "tags": ["Events"], "description": "REST v1 twin of the dashboard /fragments/executions list fragment and the widened MCP list_executions tool (docs/api-twin-recipe.md Rule 1 — all three call the same execution_list_row_json builder). Gated on the ADR-0017 fleet-read primitive (Execution:Read via fleet_read_fn), the same gate the fragment now uses (#3526). Rows carry the definition name (resolved + memoized per request) and a truncated last_error_detail preview alongside the existing agents_targeted/responded/success/failure split.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Execution list", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "503": {"description": "Execution tracker not initialised or degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
@@ -1307,13 +1347,13 @@ const std::string& openapi_spec() {
         // Fresh literal split (MSVC C2026 16,380-byte cap) before the DEX block.
         R"json(,
     "/dex/signals": {
-      "get": {"summary": "DEX catalogue rollup — every signal in the window", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Machine-readable equivalent of the DEX dashboard catalogue: each entry is one observation type (obs_type) present in the window, with its event count, blast radius (distinct_devices) and last_seen. Fleet aggregate — NOT audited. The window query parameter is one of 24h/7d/30d/all (default 7d; any other value resolves to 7d).", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Narrow the rollup to one OS's own signals; all (or omitted) = every OS (matches the dashboard catalogue OS filter)."}], "responses": {"200": {"description": "Per-signal rollup array (data[].obs_type, count, distinct_devices, last_seen)"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "DEX catalogue rollup — every signal in the window", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Machine-readable equivalent of the DEX dashboard catalogue: each entry is one observation type (obs_type) present in the window, with its event count, blast radius (distinct_devices) and last_seen. Fleet aggregate — NOT audited. The window query parameter is one of 24h/7d/30d/all (default 7d when omitted; an empty or any other value is a 400).", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Narrow the rollup to one OS's own signals; all (or omitted) = every OS (matches the dashboard catalogue OS filter)."}], "responses": {"200": {"description": "Per-signal rollup array (data[].obs_type, count, distinct_devices, last_seen)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/scope": {
-      "get": {"summary": "DEX per-OS signal coverage", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. How many distinct obs_types each platform reports in the window, with total event count — the live cross-OS coverage the dashboard derives. Fleet aggregate — NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-OS scope array (data[].platform, distinct_types, total_events)"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "DEX per-OS signal coverage", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. How many distinct obs_types each platform reports in the window, with total event count — the live cross-OS coverage the dashboard derives. Fleet aggregate — NOT audited. An omitted window is the 7d default; an empty value or any other value outside 24h/7d/30d/all is a 400.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-OS scope array (data[].platform, distinct_types, total_events)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/signals/{obs_type}": {
-      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays. A service-scoped API token is denied outright (403) — the devices[] list is fleet-wide with no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.signal.view audit row cannot persist, so the device list is never served without durable evidence.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Scope subjects[]/devices[]/by_day[] to one OS; all (or omitted) = every OS. by_os[] stays cross-OS (it IS the split). The applied os is echoed in the response."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, os, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.signal.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays. A service-scoped API token is denied outright (403) — the devices[] list is fleet-wide with no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.signal.view audit row cannot persist, so the device list is never served without durable evidence.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Scope subjects[]/devices[]/by_day[] to one OS; all (or omitted) = every OS. by_os[] stays cross-OS (it IS the split). The applied os is echoed in the response."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, os, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type, limit or window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.signal.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/devices/{id}": {
       "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist, so the device's behavioural data is never served without durable evidence. #4855: a DEGRADED signal-summary read (store closed / pool-acquire timeout / query error) also 503s (retry_after_ms 2000, no Sec-Audit-Failed) rather than rendering a fabricated healthy 100 with no signals. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable, the dex.device.view audit row could not persist (Sec-Audit-Failed: true), OR the DEX signal-summary store read degraded (#4855; retryable, retry_after_ms 2000).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
@@ -1489,7 +1529,7 @@ const std::string& openapi_spec() {
         // above sat 12 bytes under it. Upload-grant + chunked-receive paths.
         R"json(
     "/upload-grants": {
-      "post": {"summary": "Mint a one-time upload-grant credential", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Write. Authorises ONE agent to push ONE file back to the server (CC-06 authenticated chunked-receive protocol, docs/adr/3004-artifact-blob-storage.md). grant_secret is returned EXACTLY ONCE in this response — only its digest is persisted. destination_key is SERVER-DERIVED from retention_class + the freshly-minted grant_id only; source_path is stored as informational metadata and never influences it.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}, "source_path": {"type": "string", "description": "Informational only; never used to derive the destination key"}, "expected_sha256": {"type": "string"}, "retention_class": {"type": "string", "enum": ["standard", "extended", "transient"], "default": "standard"}, "declared_max_size": {"type": "integer"}, "ttl_secs": {"type": "integer"}}}}}}, "responses": {"201": {"description": "{grant_id, grant_secret, expires_at, destination_key}"}, "400": {"description": "Invalid input (empty agent_id, non-positive declared_max_size, unrecognized retention_class)"}, "503": {"description": "Upload grant store unavailable, or a CSPRNG/digest failure"}}},
+      "post": {"summary": "Mint a one-time upload-grant credential", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Write. Authorises ONE agent to push ONE file back to the server (CC-06 authenticated chunked-receive protocol, docs/adr/3004-artifact-blob-storage.md). grant_secret is returned EXACTLY ONCE in this response — only its digest is persisted. destination_key is SERVER-DERIVED from retention_class + the freshly-minted grant_id only; source_path is stored as informational metadata and never influences it.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}, "source_path": {"type": "string", "description": "Informational only; never used to derive the destination key"}, "expected_sha256": {"type": "string"}, "retention_class": {"type": "string", "enum": ["standard", "extended", "transient"], "default": "standard"}, "declared_max_size": {"type": "integer"}, "ttl_secs": {"type": "integer", "minimum": 1, "description": "A JSON integer of at least 1, clamped to the 900 s maximum; omit for the default"}}}}}}, "responses": {"201": {"description": "{grant_id, grant_secret, expires_at, destination_key}"}, "400": {"description": "Invalid input (empty agent_id, non-positive declared_max_size, unrecognized retention_class, ttl_secs not a JSON integer of at least 1)"}, "503": {"description": "Upload grant store unavailable, or a CSPRNG/digest failure"}}},
       "get": {"summary": "List upload grants", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Read, routed through the ADR-0017 admit-then-filter list gate: AdmitAll lists every grant; a management-group-confined grant lists only grants for agents in the caller's visible set. No client-selected agent_id filter exists on this surface — the frozen protocol forbids one on every path. A service-scoped API token is refused with 403 whoever minted it (audit action upload_grant.list.access_denied), since the list gate would otherwise evaluate the minter's own grants. Never returns a grant secret or its hash.", "responses": {"200": {"description": "{data: [{grant_id, agent_id, source_path, declared_max_size, expected_sha256, retention_class, destination_key, state, minted_by, created_at, expires_at}]}"}, "403": {"description": "No grant anywhere for UploadGrant:Read, or the caller is a service-scoped API token (refused whoever minted it)"}, "503": {"description": "Upload grant store unavailable"}}}
     },
     "/upload-grants/{grant_id}": {
@@ -1526,13 +1566,13 @@ const std::string& openapi_spec() {
       "post": {"summary": "Grant or revoke JIT-admin-elevation eligibility — SSO-principal query form (SOC 2 CC6.3/CC6.6)", "tags": ["Users"], "description": "Same handler and semantics as POST /users/{username}/elevation-eligibility, registered a second time on this fixed two-segment path because a path SEGMENT cannot carry the '/' and '#' of an oidc:<iss>#<sub> principal (the server percent-decodes the path and strips the URL fragment before route matching, so the path form 404s for a real IdP identity). Required for any durable SSO principal; a local username may use either form. Admin (or an active elevation) + MFA step-up. Self-grant is blocked. Granting (eligible=true) needs the caller's own administrator role: a session that is administrator only through an elevation gets 403. Setting eligible=false terminates any in-flight elevation for that user. UPDATE-only — an SSO principal with no row yet (never logged in) 404s.", "parameters": [{"name": "username", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Local username or SSO principal (oidc:<iss>#<sub>); URL-encode '#' as %23."}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["eligible"], "properties": {"eligible": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "{status: ok}"}, "400": {"description": "Invalid username/principal or non-boolean body"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Not admin, or self-grant"}, "404": {"description": "User not found (for an SSO principal: the operator has never logged in)"}, "503": {"description": "Auth store not configured or unreachable — see --postgres-dsn"}}}
     },
     "/execution-statistics": {
-      "get": {"summary": "Fleet-wide execution summary", "tags": ["Executions"], "description": "Requires Execution:Read. Aggregate counters over the ExecutionTracker fleet summary.", "responses": {"200": {"description": "{total_executions, executions_today, active_agents, overall_success_rate, avg_duration_seconds}"}}}
+      "get": {"summary": "Fleet-wide execution summary", "tags": ["Executions"], "description": "Requires Execution:Read. Aggregate counters over the ExecutionTracker fleet summary.", "responses": {"200": {"description": "{total_executions, executions_today, active_agents, overall_success_rate, avg_duration_seconds}"}, "503": {"description": "Execution statistics store degraded (a failed read is never served as a zeroed measurement); retry shortly (A4 envelope, retry_after_ms 2000)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/execution-statistics/agents": {
-      "get": {"summary": "Per-agent execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read.", "parameters": [{"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single agent"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Unix timestamp — only executions after this time"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per agent: {agent_id, total_executions, success_count, failure_count, success_rate, avg_duration_seconds, last_execution_at}"}}}
+      "get": {"summary": "Per-agent execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read, gated via the ADR-0017 admit-then-filter fleet-read chokepoint (#3526): a management-group-confined caller sees only rows for the agents it can see, filtered in SQL before the limit; a global grant sees every agent. A malformed since or limit is a 400, and a negative since is a 400.", "parameters": [{"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single agent"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}, "description": "Inclusive lower bound on dispatched_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value is rejected with 400."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per agent: {agent_id, total_executions, success_count, failure_count, success_rate, avg_duration_seconds, last_execution_at}"}, "400": {"description": "since or limit is not one base-10 integer, since is negative, or limit is below 1"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "503": {"description": "Execution statistics store degraded (a failed read is never served as a zeroed measurement); retry shortly (A4 envelope, retry_after_ms 2000)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/execution-statistics/definitions": {
-      "get": {"summary": "Per-InstructionDefinition execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single definition"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Unix timestamp — only executions after this time"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per definition: {definition_id, total_executions, total_agents, success_rate, avg_duration_seconds}"}}}
+      "get": {"summary": "Per-InstructionDefinition execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single definition"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}, "description": "Inclusive lower bound on dispatched_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value is rejected with 400."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per definition: {definition_id, total_executions, total_agents, success_rate, avg_duration_seconds}"}, "400": {"description": "since or limit is not one base-10 integer, since is negative, or limit is below 1"}, "503": {"description": "Execution statistics store degraded (a failed read is never served as a zeroed measurement); retry shortly (A4 envelope, retry_after_ms 2000)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — the merge of dev's
         // ROUTES-campaign OpenAPI additions with this branch's own #4027 entries
@@ -1548,7 +1588,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Single host's 3D-visualization topology (host_topology.v1)", "tags": ["Fleet Visualization"], "description": "Requires Response:Read. One MachineNode sliced out of the current fleet_topology.v1 snapshot, for the per-host IPC-graph drill-down page. Same kill-switch/store-availability posture as GET /viz/fleet/topology.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "host_topology.v1 envelope: {schema, schema_minor, generated_at, stale, machine: <MachineNode, same shape as a fleet_topology.v1 machines[] entry>}"}, "403": {"description": "RBAC denied (Response:Read)"}, "404": {"description": "No machine with that agent_id in the current snapshot"}, "500": {"description": "Topology fetch threw or returned null"}, "503": {"description": "Kill switch on (--viz-disable), or the fleet topology store is unavailable"}}}
     },
     "/statistics": {
-      "get": {"summary": "Aggregated fleet execution statistics (capability 22.6)", "tags": ["Statistics"], "description": "Requires Infrastructure:Read. Same underlying ExecutionTracker fleet summary as GET /execution-statistics, reshaped under an executions sub-object.", "responses": {"200": {"description": "{executions: {total, today, success_rate, avg_duration_seconds}, active_agents}"}}}
+      "get": {"summary": "Aggregated fleet execution statistics (capability 22.6)", "tags": ["Statistics"], "description": "Requires Infrastructure:Read. Same underlying ExecutionTracker fleet summary as GET /execution-statistics, reshaped under an executions sub-object.", "responses": {"200": {"description": "{executions: {total, today, success_rate, avg_duration_seconds}, active_agents}"}, "503": {"description": "Execution statistics store degraded (a failed read is never served as a zeroed measurement); retry shortly (A4 envelope, retry_after_ms 2000)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/agent/plugin-policy": {
       "get": {"deprecated": true, "summary": "Plugin trust-bundle distribution endpoint (DEPRECATED — see GET /api/v2/agent/plugin-policy)", "tags": ["Settings"], "description": "#4144 review fix: this v1 shape is FROZEN and deprecated (docs/api-versioning-policy.md deprecation cycle; see docs/user-manual/upgrading.md for the migration and the announced removal window). #4028 originally hardened this route's response shape in place, which was itself a policy violation (a breaking envelope-shape change with no version bump) — corrected by moving the hardened behavior to GET /api/v2/agent/plugin-policy and restoring this v1 route to its exact pre-#4028 shape: admin only (whole-endpoint admin gate, not an RBAC securable — CC6.1 least-privilege: the SHA-256 fingerprint discloses when the trust anchor rotates, useful reconnaissance for a supply-chain attacker). Returns the current PEM trust bundle and the require-signature flag for out-of-band agent-config distribution (operators curl this into --plugin-trust-bundle on each agent host).", "responses": {"200": {"description": "Bundle uploaded: {enabled: true, required, trust_bundle_pem, cert_count, sha256}. No bundle uploaded (still 200, not 404 — a normal operational state): {enabled: false, required, trust_bundle_pem: \"\"}"}, "500": {"description": "Trust bundle exists on disk but is unreadable"}}}
@@ -1595,7 +1635,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "TAR retention-paused source list (API-parity read twin, #4027)", "tags": ["Dashboard TAR"], "description": "Requires Infrastructure:Read. JSON twin of GET /fragments/tar/retention-paused: the CALLING OPERATOR'S most recent tar.status scan (per-username state), filtered to their visible agents (ManagementGroupStore::get_visible_agents), one row per (agent, paused source). scan_id is \"\" when the operator has not dispatched a scan yet -- POST /fragments/tar/retention-paused/scan is dashboard-only today (out of scope for #4027, a mutating dispatch route). result_truncated_by_cap is true when the scan's response read reached its 10,000-row or 50 MiB cap, so rows and the counters are PARTIAL (a dropped response reads as an agent that never answered); store_degraded is then also true so a client that does not know the newer field still sees the result is incomplete, and result_truncated_by_cap tells a cut apart from a failed read. Cache-Control: no-store, private + Vary: Cookie (per-operator-scoped data, same UP-11 posture as the fragment). Unaudited on success -- scan/config metadata, not per-device behavioral content (matches this fragment's own today-unaudited posture).", "responses": {"200": {"description": "{data: {scan_id, scan_count, scan_at, agents_responded, agents_with_no_paused_sources, agents_filtered_out_of_scope, store_degraded, result_truncated_by_cap, rows: [{agent_id, agent_display, source, paused_at, live_rows, oldest_ts, value_error, enabled_raw}]}}"}, "401": {"description": "Not authenticated"}, "403": {"description": "RBAC denied (Infrastructure:Read)"}}}
     },
     "/inventory/evaluate": {
-      "post": {"summary": "Evaluate inventory conditions across agents", "tags": ["Inventory"], "description": "Only available when InventoryStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0037) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read. Returns agents whose generic-inventory data matches the supplied conditions (all/any combine — any value other than \"any\" means all).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"agent_id": {"type": "string", "description": "Scope to a single agent"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all", "description": "Any value other than \"any\" is treated as \"all\" (AND)."}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string", "enum": ["==", "!=", ">", ">=", "<", "<=", "contains", "exists", "version_gte", "version_lte"], "description": "An unrecognized op silently matches nothing for that condition."}, "value": {"type": "string"}}}}}}}}}, "responses": {"200": {"description": "{data: [{agent_id, match, matched_value, plugin, collected_at}]}. Top-level result_truncated_by_cap (bool, optional) is present and true when the underlying read hit its row (5000) or 8 MiB aggregate payload cap — absent devices may simply not have been read, not non-matching."}, "503": {"description": "Inventory store unavailable or degraded"}}}
+      "post": {"summary": "Evaluate inventory conditions across agents", "tags": ["Inventory"], "description": "Only available when InventoryStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0037) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read. Returns agents whose generic-inventory data matches the supplied conditions (all/any combine — any value other than \"any\" means all).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"agent_id": {"type": "string", "description": "Scope to a single agent"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all", "description": "Any value other than \"any\" is treated as \"all\" (AND)."}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string", "enum": ["==", "!=", ">", ">=", "<", "<=", "contains", "exists", "version_gte", "version_lte"], "description": "An unrecognized op silently matches nothing for that condition."}, "value": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}], "description": "A string, or a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically and exactly, and a stored numeric string counts as a number; JSON integers are exact and every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is refused, so send an integer, or the decimal as a string under >, >=, <, <= (at most 15 significant digits, below 2^53, not subnormal); write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as \"1e16\" (read exactly)), or a boolean for == and != only. Null, an array, an object, or a number/boolean under any other op is refused (400)."}}}}}}}}}, "responses": {"200": {"description": "{data: [{agent_id, match, matched_value, plugin, collected_at}]}. Top-level result_truncated_by_cap (bool, optional) is present and true when the underlying read hit its row (5000) or 8 MiB aggregate payload cap — absent devices may simply not have been read, not non-matching."}, "400": {"description": "Invalid JSON, agent_id or combine not a JSON string, conditions larger than 500 entries, or a condition that is not an object, has a non-string plugin/field/op, or has a value of a refused type (see the value schema)"}, "503": {"description": "Inventory store unavailable or degraded"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #3992 F2 backfill
         // continues: device-token / result-set CRUD.
@@ -1608,7 +1648,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Revoke a device token", "tags": ["Device Tokens"], "description": "Only available when DeviceTokenStore is wired — the server does not construct it today (capability 18.8 deliberately shelved, ADR-0052); documented for when a future change re-wires it. Requires DeviceToken:Delete.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{revoked: true}"}, "404": {"description": "No token with this id — \"token not found\""}, "503": {"description": "A genuine database write failure (Retry-After: 2)"}}}
     },
     "/result-sets": {
-      "get": {"summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403) — owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50)"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>], next_cursor}"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — a genuine database read failure (Retry-After present)"}}},
+      "get": {"summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403) — owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50); an integer outside the range uses the default"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>], next_cursor}"}, "400": {"description": "limit is not one base-10 integer"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — a genuine database read failure (Retry-After present)"}}},
       "post": {"summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reasoning as the GET list). Synchronous — lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (governance B2: the parent is owner-checked before the lineage edge is persisted). When device_ids is non-empty, the route additionally gates that field through the admit-then-filter Infrastructure:Read chokepoint (fleet_read_fn, ADR-0017) — a request that omits device_ids (or supplies an empty array) is unaffected and pays no extra cost (#4983).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"}, "parent_id": {"type": "string", "maxLength": 64, "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string", "maxLength": 256}, "description": "The initial member set. Each entry is capped at 256 bytes (400 RESULT_SET_DEVICE_ID_TOO_LONG, checked before the existence/scope lookup below). #4983: every entry must name a device that exists and is visible to the caller's own scope (checked via the Infrastructure:Read fleet_read_fn chokepoint, ADR-0017) -- a nonexistent or out-of-scope id rejects the WHOLE request (400 RESULT_SET_UNKNOWN_DEVICE_ID), never a silent drop or a partial create"}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, a device_ids entry exceeding 256 bytes (RESULT_SET_DEVICE_ID_TOO_LONG), device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS), device_ids contains an id that does not exist or is not visible to the caller (RESULT_SET_UNKNOWN_DEVICE_ID -- rejects the whole request, checked only when device_ids is non-empty), parent_id supplied but empty/non-string (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE -- the device_ids existence/scope check itself is unwired or its backing agent registry is unavailable; only reachable when device_ids is non-empty, a request without it is unaffected"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #4980 fix: the
@@ -1617,13 +1657,13 @@ const std::string& openapi_spec() {
         // idiom as the #3992 F2 / #4540 splits elsewhere in this file.
         R"json(
     "/result-sets/from-inventory-query": {
-      "post": {"summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same securable as GET /api/v1/inventory/software). Service-scoped API tokens are denied outright (403, #4980 — same cross-service-reach reasoning as the other 8 non-dispatch result-set routes; the fleet_read_fn admit-and-confine mechanism this route also uses for management-group confinement does not by itself close the service-scope axis, since the created set is owner-scoped to the minting principal's identity, not the token's own service tag). Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"type": "string"}}}}, "parent_id": {"type": "string", "maxLength": 64}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "403": {"description": "Result-set create denied to a service-scoped token (#4980, checked before any other gate); unlike its 8 non-dispatch siblings, this route also has a real Inventory:Read RBAC gate underneath that check, so a caller past the service-scope check can still be denied here by that gate: no management-group grant for Inventory:Read, an MCP-tier restriction, or, for an ADR-1005 engine principal, RBAC disabled or no grant for Inventory:Read"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set); or, when parent_id is supplied, RESULT_SET_STORE_UNAVAILABLE reading the parent set's own members page mid-pagination (#4306, a distinct cause from the Inventory-store read degrading)"}}}
+      "post": {"summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same securable as GET /api/v1/inventory/software). Service-scoped API tokens are denied outright (403, #4980 — same cross-service-reach reasoning as the other 8 non-dispatch result-set routes; the fleet_read_fn admit-and-confine mechanism this route also uses for management-group confinement does not by itself close the service-scope axis, since the created set is owner-scoped to the minting principal's identity, not the token's own service tag). Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}], "description": "A string, or a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically and exactly, and a stored numeric string counts as a number; JSON integers are exact and every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is refused, so send an integer, or the decimal as a string under >, >=, <, <= (at most 15 significant digits, below 2^53, not subnormal); write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as \"1e16\" (read exactly)), or a boolean for == and != only. Null, an array, an object, or a number/boolean under any other op is refused (400)."}}}}, "parent_id": {"type": "string", "maxLength": 64}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), parent_id exceeds 64 bytes, or a condition that is not an object, has a non-string plugin/field/op, or has a value of a refused type"}, "403": {"description": "Result-set create denied to a service-scoped token (#4980, checked before any other gate); unlike its 8 non-dispatch siblings, this route also has a real Inventory:Read RBAC gate underneath that check, so a caller past the service-scope check can still be denied here by that gate: no management-group grant for Inventory:Read, an MCP-tier restriction, or, for an ADR-1005 engine principal, RBAC disabled or no grant for Inventory:Read"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set); or, when parent_id is supplied, RESULT_SET_STORE_UNAVAILABLE reading the parent set's own members page mid-pagination (#4306, a distinct cause from the Inventory-store read degrading)"}}}
     },
     "/result-sets/from-tar-query": {
       "post": {"summary": "Create a result set from an async dispatched TAR SQL query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the tar plugin in parent_id's scope (or __all__ when parent_id is omitted); SQL is sandboxed agent-side by the read-only TarDatabase::execute_user_query authorizer (#760/#631), the server only length-checks (max 100 KiB). Membership is every agent that returned ≥ 1 row, or every responder when include_empty=true. Async — lands a pending row the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string", "maxLength": 64}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH — a command already dispatched but the store fault persisting the pending row afterward (#4306, previously 400); do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch) — the per-owner quota could not be verified before dispatch (#4306); nothing sent, safe to retry"}}}
     },
     "/result-sets/from-instruction-result": {
-      "post": {"summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-tar-query.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} — selects which responders join the set"}, "parent_id": {"type": "string", "maxLength": 64}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing instruction_id, instruction_id/params exceeds its bound (#4373), parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH — a command already dispatched but the store fault persisting the pending row afterward (#4306, previously 400); do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch) — the per-owner quota could not be verified before dispatch (#4306); nothing sent, safe to retry"}}}
+      "post": {"summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-tar-query.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} — selects which responders join the set. {kind: tar_rows_ge, n} needs n to be a JSON integer from 1 to 2147483647 (#4644)"}, "parent_id": {"type": "string", "maxLength": 64}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing instruction_id, instruction_id/params exceeds its bound (#4373), a matcher that is not an object or whose n or kind is malformed (#4644), parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH — a command already dispatched but the store fault persisting the pending row afterward (#4306, previously 400); do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch) — the per-owner quota could not be verified before dispatch (#4306); nothing sent, safe to retry"}}}
     },
     "/result-sets/{id}": {
       "get": {"summary": "Get one result set's metadata", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped (non-owner is indistinguishable from missing — existence-oracle-safe 404). Service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "403": {"description": "Result-set detail denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}},
@@ -1641,7 +1681,7 @@ const std::string& openapi_spec() {
         // continues: remaining result-set / software-deployment / license CRUD.
         R"json(
     "/result-sets/{id}/members": {
-      "get": {"summary": "List a result set's member device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}, {"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-10000 (default 1000)"}], "responses": {"200": {"description": "{device_ids: [...], next_cursor}"}, "403": {"description": "Result-set members denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}}
+      "get": {"summary": "List a result set's member device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}, {"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-10000 (default 1000); an integer outside the range uses the default"}], "responses": {"200": {"description": "{device_ids: [...], next_cursor}"}, "400": {"description": "limit is not one base-10 integer"}, "403": {"description": "Result-set members denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}}
     },
     "/result-sets/{id}/lineage": {
       "get": {"summary": "Walk a result set's parent chain", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "{chain: [{id, name, source_kind, device_count}, ...]} — root-to-self order"}, "403": {"description": "Result-set lineage denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}}
@@ -1692,7 +1732,7 @@ const std::string& openapi_spec() {
     },
     "/license": {
       "get": {"summary": "Get the active license", "tags": ["License Management"], "description": "Only available when LicenseStore is wired — the server does not construct it today (licensing deliberately shelved, ADR-0048); documented for when a future change re-wires it. Requires License:Read.", "responses": {"200": {"description": "Active license: {id, organization, seat_count, seats_used, issued_at, expires_at, edition, status, days_remaining}. No active license: {status: \"none\"}."}, "503": {"description": "A genuine database read failure"}}},
-      "post": {"summary": "Activate a license", "tags": ["License Management"], "description": "Only available when LicenseStore is wired — the server does not construct it today (licensing deliberately shelved, ADR-0048); documented for when a future change re-wires it. Requires License:Write.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["organization", "seat_count", "license_key"], "properties": {"organization": {"type": "string"}, "seat_count": {"type": "integer"}, "edition": {"type": "string", "default": "community"}, "expires_at": {"type": "integer", "format": "int64"}, "features_json": {"type": "string", "description": "JSON array of enabled feature flags"}, "license_key": {"type": "string"}}}}}}, "responses": {"201": {"description": "{id}"}, "400": {"description": "Invalid JSON, empty license_key/organization, or license_key already activated on another license"}, "503": {"description": "A genuine database write failure"}}}
+      "post": {"summary": "Activate a license", "tags": ["License Management"], "description": "Only available when LicenseStore is wired — the server does not construct it today (licensing deliberately shelved, ADR-0048); documented for when a future change re-wires it. Requires License:Write.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["organization", "seat_count", "license_key"], "properties": {"organization": {"type": "string"}, "seat_count": {"type": "integer", "format": "int64", "minimum": 0, "description": "0 = unlimited seats"}, "edition": {"type": "string", "default": "community"}, "expires_at": {"type": "integer", "format": "int64", "minimum": 0, "description": "0 or omitted = perpetual"}, "features_json": {"type": "string", "description": "JSON array of enabled feature flags"}, "license_key": {"type": "string"}}}}}}, "responses": {"201": {"description": "{id}"}, "400": {"description": "Invalid JSON or a non-object body, seat_count/expires_at not a JSON integer of at least 0 (#4644), empty license_key/organization, or license_key already activated on another license"}, "503": {"description": "A genuine database write failure"}}}
     },
     "/license/{id}": {
       "delete": {"summary": "Remove a license entry", "tags": ["License Management"], "description": "Only available when LicenseStore is wired — the server does not construct it today (licensing deliberately shelved, ADR-0048); documented for when a future change re-wires it. Requires License:Write.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[a-f0-9]+$"}}], "responses": {"200": {"description": "{removed: true}"}, "404": {"description": "No license with this id"}, "503": {"description": "A genuine database write failure"}}}
@@ -4096,9 +4136,45 @@ void RestApiV1::register_routes(
         if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/tokens"))
             return;
 
+        // The body must be one JSON object: a truncated document or a non-object (array,
+        // string, number, null, empty) used to throw out of `body.value` (a bare 500). Within
+        // the object, a present `name`/`scope_service`/`mcp_tier` must be a string, and a present
+        // `expires_at` one JSON integer (#4644): `-1` and a value above INT64_MAX (which wrapped
+        // to -1) minted a token that NEVER expires, and `1e3` minted one already expired.
         auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                            "application/json");
+            return;
+        }
+        for (const char* key : {"name", "scope_service", "mcp_tier"}) {
+            if (body.contains(key) && !body[key].is_string()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, std::string(key) + " must be a string"),
+                                "application/json");
+                return;
+            }
+        }
+        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+        const auto expires_at_opt = read_json_int_strict(body, "expires_at", 0);
+        if (!expires_at_opt) {
+            res.status = 400;
+            res.set_content(
+                detail::a4_error(res, "expires_at must be a JSON integer (unix epoch seconds)"),
+                "application/json");
+            return;
+        }
+        // 0 (or omitted) is the documented "never expires"; anything else must be in the future.
+        if (*expires_at_opt < 0 || (*expires_at_opt > 0 && *expires_at_opt <= now)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "expires_at must be 0 (never expires) or a unix "
+                                                  "epoch second in the future"),
+                            "application/json");
+            return;
+        }
+        const int64_t expires_at = *expires_at_opt;
         auto name = body.value("name", "");
-        auto expires_at = body.value("expires_at", int64_t{0});
         auto scope_service = body.value("scope_service", "");
         // MCP tier (#289 follow-up): create_token already accepts this — the
         // handler had silently dropped it, so a documented `mcp_tier` in the body
@@ -4133,7 +4209,6 @@ void RestApiV1::register_routes(
                 return;
             }
             if (!mcp_tier.empty()) {
-                const int64_t now = static_cast<int64_t>(std::time(nullptr));
                 if (expires_at - now > 90LL * 24 * 3600) {
                     res.status = 400;
                     res.set_content(detail::a4_error(res, "MCP token TTL cannot exceed 90 days"),
@@ -4462,18 +4537,9 @@ void RestApiV1::register_routes(
             // `.value()` call would surface as a bare httplib 500 with no A4
             // envelope on a route whose OpenAPI promises 400 (round-3 review
             // finding).
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
             int64_t overlap_secs = 7 * 24 * 3600; // 7-day default overlap window
-            if (!body.is_discarded() && body.is_object() && body.contains("overlap_secs")) {
-                if (!body["overlap_secs"].is_number_integer()) {
-                    res.status = 400;
-                    res.set_content(
-                        detail::a4_error(res, "overlap_secs must be an integer (seconds)"),
-                        "application/json");
-                    return;
-                }
-                overlap_secs = body["overlap_secs"].get<int64_t>();
-            }
+            if (!read_rotate_overlap_secs(req, res, overlap_secs))
+                return;
 
             const int64_t now = static_cast<int64_t>(std::time(nullptr));
             // requesting_user is the AUTHENTICATED session's own username —
@@ -5103,10 +5169,33 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            // The body is optional ONLY when it is empty or whitespace-only (no ttl_days: the
+            // 90-day default). Any other body must be a JSON object: a truncated document or a
+            // non-object (array, string, number, null) is a 400 that mints nothing, never a
+            // silent fall-through to the default credential. Within an object, ttl_days is
+            // ABSENT-only defaulted (90): a string, float, bool, null or a value above INT64_MAX
+            // is a 400, like the MCP twin, not a thrown type error or a truncated float.
             int64_t ttl_days = 90;
-            if (!body.is_discarded() && body.is_object() && body.contains("ttl_days"))
-                ttl_days = body.value("ttl_days", int64_t{90});
+            const bool body_blank =
+                std::all_of(req.body.begin(), req.body.end(),
+                            [](unsigned char c) { return std::isspace(c) != 0; });
+            if (!body_blank) {
+                const auto body = nlohmann::json::parse(req.body, nullptr, false);
+                if (body.is_discarded() || !body.is_object()) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                                    "application/json");
+                    return;
+                }
+                const auto ttl_opt = read_json_int_strict(body, "ttl_days", 90);
+                if (!ttl_opt) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "ttl_days must be between 1 and 90"),
+                                    "application/json");
+                    return;
+                }
+                ttl_days = *ttl_opt;
+            }
             if (ttl_days < 1 || ttl_days > 90) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "ttl_days must be between 1 and 90"),
@@ -5216,10 +5305,9 @@ void RestApiV1::register_routes(
                 return;
 
             auto principal_id = req.matches[1].str();
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
             int64_t overlap_secs = 7 * 24 * 3600; // 7-day default overlap window
-            if (!body.is_discarded() && body.is_object() && body.contains("overlap_secs"))
-                overlap_secs = body.value("overlap_secs", overlap_secs);
+            if (!read_rotate_overlap_secs(req, res, overlap_secs))
+                return;
 
             const int64_t now = static_cast<int64_t>(std::time(nullptr));
             // G7: requesting_user threads through to ApiTokenStore so the
@@ -7523,7 +7611,7 @@ void RestApiV1::register_routes(
                            req.get_param_value("enabled_only") == "1");
         if (req.has_param("limit")) {
             try {
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
@@ -7627,7 +7715,7 @@ void RestApiV1::register_routes(
             q.name_filter = req.get_param_value("name");
         if (req.has_param("limit")) {
             try {
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
@@ -8213,10 +8301,19 @@ void RestApiV1::register_routes(
 
                  AuditQuery q;
                  auto limit_str = req.get_param_value("limit");
-                 if (!limit_str.empty()) {
+                 // `has_param`, not `!empty()`: a present-but-empty `?limit=` is malformed
+                 // (like every other converted route), not an absent parameter.
+                 if (req.has_param("limit")) {
                      try {
-                         q.limit = std::stoi(limit_str);
-                     } catch (...) {}
+                         q.limit = strict_stoi(limit_str);
+                     } catch (const std::exception&) {
+                         // Not ONE base-10 integer (or overflow): a client error, not a
+                         // silent fall-back to the default page size (#4644).
+                         res.status = 400;
+                         res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                         "application/json");
+                         return;
+                     }
                  }
                  if (q.limit > 1000)
                      q.limit = 1000;
@@ -8243,27 +8340,31 @@ void RestApiV1::register_routes(
                      bad_request("string filters must be valid UTF-8 without NUL");
                      return;
                  }
-                 // since/until: epoch seconds, whole value one non-negative integer;
-                 // absent or 0 = that side unbounded; both bounds inclusive.
+                 // since/until: epoch seconds, the whole value ONE base-10 integer; both bounds
+                 // inclusive and PRESENCE-tracked (#4644): omitted = that side unbounded. A
+                 // present-but-empty value is malformed. `since=0` is a harmless literal bound
+                 // (every stored timestamp is positive); `until` of 0 or below is refused, since
+                 // it would bound the read at the epoch and match nothing.
                  for (const auto& [name, dst] :
-                      {std::pair<const char*, int64_t*>{"since", &q.since},
-                       std::pair<const char*, int64_t*>{"until", &q.until}}) {
-                     const auto s = req.get_param_value(name);
-                     if (s.empty())
+                      {std::pair<const char*, std::optional<int64_t>*>{"since", &q.since},
+                       std::pair<const char*, std::optional<int64_t>*>{"until", &q.until}}) {
+                     if (!req.has_param(name))
                          continue;
-                     const auto v = parse_query_int<int64_t>(s);
-                     if (!v || *v < 0) {
-                         bad_request("since/until must be non-negative epoch seconds");
+                     const auto v = parse_query_int<int64_t>(req.get_param_value(name));
+                     if (!v || *v < 0 || (std::string_view(name) == "until" && *v == 0)) {
+                         bad_request("since must be a non-negative epoch second and until a "
+                                     "positive one (omit a bound to leave it open)");
                          return;
                      }
                      *dst = *v;
                  }
-                 if (q.since > 0 && q.until > 0 && q.since > q.until) {
+                 if (q.since && q.until && *q.since > *q.until) {
                      bad_request("since must be <= until");
                      return;
                  }
-                 if (const auto off = req.get_param_value("offset"); !off.empty()) {
-                     const auto v = parse_query_int<int>(off);
+                 if (req.has_param("offset")) {
+                     // Present-but-empty is malformed, like `limit`, `since` and `until` here.
+                     const auto v = parse_query_int<int>(req.get_param_value("offset"));
                      if (!v || *v < 0 || *v > kAuditMaxOffset) {
                          bad_request("offset must be 0..10000");
                          return;
@@ -8352,9 +8453,9 @@ void RestApiV1::register_routes(
             // std::stoll throws std::out_of_range on overflow (unlike strtoll) — the
             // catch turns that into a 400, so no separate errno/ceiling check is
             // needed. out>=0 rejects negatives.
-            auto parse_epoch = [](const std::string& s, int64_t& out) -> bool {
+            auto parse_epoch = [](const std::string& s, std::optional<int64_t>& out) -> bool {
                 if (s.empty())
-                    return true; // optional — leave default (unbounded that side)
+                    return true; // optional: leave unset (unbounded that side)
                 // Reject leading whitespace / '+' / '-' that std::stoll would
                 // otherwise silently accept (cpp-expert S-1 / UP-9): a strict
                 // digits-only contract, so "non-numeric → 400" is literally true.
@@ -8362,8 +8463,11 @@ void RestApiV1::register_routes(
                     return false;
                 try {
                     size_t consumed = 0;
-                    out = std::stoll(s, &consumed);
-                    return consumed == s.size() && out >= 0; // reject trailing junk
+                    const long long v = std::stoll(s, &consumed);
+                    if (consumed != s.size() || v < 0)
+                        return false; // reject trailing junk and negatives
+                    out = v;
+                    return true;
                 } catch (const std::invalid_argument&) {
                     return false;
                 } catch (const std::out_of_range&) {
@@ -8381,8 +8485,20 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
+            // `to=0` would bound the sample at the epoch and match nothing; a computed window
+            // that collapsed to 0 used to read as "unbounded" (#4644). `from=0` is a harmless
+            // literal bound (every stored timestamp is positive) and matches exactly what an
+            // omitted `from` matches.
+            if (q.until && *q.until == 0) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "to must be a positive epoch second or omitted", cid,
+                                          "omit to for no upper bound, or pass a positive epoch"),
+                    "application/json");
+                return;
+            }
             // Inverted window is a client bug, not "no data" (Hermes L-3).
-            if (q.since > 0 && q.until > 0 && q.since > q.until) {
+            if (q.since && q.until && *q.since > *q.until) {
                 res.status = 400;
                 res.set_content(detail::error_json_a4(400, "from must be <= to", cid,
                                                       "ensure from <= to"),
@@ -8462,8 +8578,8 @@ void RestApiV1::register_routes(
             // the analogous self-auditing export `ca.root_csr.exported` (consistency S1).
             bool audit_emitted = false;
             try {
-                std::string detail = "from=" + std::to_string(q.since) +
-                                     " to=" + std::to_string(q.until) +
+                std::string detail = "from=" + std::to_string(q.since.value_or(0)) +
+                                     " to=" + std::to_string(q.until.value_or(0)) +
                                      " limit=" + std::to_string(q.limit) +
                                      " returned=" + std::to_string(events.size());
                 audit_emitted = audit_fn(req, "audit.auth_sample.exported", "success", "AuditLog",
@@ -9390,20 +9506,30 @@ void RestApiV1::register_routes(
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
+        if (body.is_discarded() || !body.is_object()) {
             res.status = 400;
-            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON: expected an object"), "application/json");
             return;
         }
 
         InventoryQuery q;
         q.agent_id = body.value("agent_id", "");
         q.plugin = body.value("plugin", "");
-        q.since = body.value("since", int64_t{0});
-        q.until = body.value("until", int64_t{0});
-        q.limit = body.value("limit", 100);
-        if (q.limit > 1000)
-            q.limit = 1000;
+        // #4644: since/until are presence-tracked: omitted is unbounded, a supplied value must be
+        // a JSON integer (`since >= 0`, `until >= 1`), else 400. `body.value()` threw on a
+        // wrong-typed value and treated an explicit 0 as "unbounded".
+        if (const auto bound_err = read_json_epoch_window(body, q.since, q.until)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, *bound_err), "application/json");
+            return;
+        }
+        // #4644: `limit` is read as 64 bits and range-checked before narrowing (a JSON
+        // 4294967297 wrapped to 1 through the int read); below 1 or non-integer is a 400.
+        if (const auto limit_err = read_json_page_limit(body, "limit", 100, 1000, q.limit)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, *limit_err), "application/json");
+            return;
+        }
 
         bool inventory_truncated = false;
         auto records = inventory_store->query(q, &inventory_truncated);
@@ -9775,31 +9901,109 @@ void RestApiV1::register_routes(
              [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Execution", "Read"))
                      return;
-                 auto summary = execution_tracker->get_fleet_summary();
+                 if (!execution_tracker) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "execution tracker unavailable",
+                                                      {.retry_after_ms = 5000}),
+                                     "application/json");
+                     return;
+                 }
+                 // try_get_*: a degraded read is a 503, never a zeroed summary served as a
+                 // measurement (#4644).
+                 const auto summary = execution_tracker->try_get_fleet_summary();
+                 if (!summary) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "execution statistics store degraded - please retry",
+                                          {.retry_after_ms = 2000}),
+                         "application/json");
+                     return;
+                 }
                  // #2146 Batch B3: shared builder (execution_statistics_model.hpp) --
                  // the MCP twin get_execution_statistics calls the SAME function.
-                 res.set_content(ok_json(fleet_execution_summary_json(summary)),
+                 res.set_content(ok_json(fleet_execution_summary_json(*summary)),
                                  "application/json");
              });
 
+    // #3526 (ADR-0017): per-agent rows are a fan-out read of per-agent data, so this route
+    // gates on the admit-then-filter fleet-read chokepoint, NOT a bare perm_fn -- a
+    // management-group-confined caller sees only its visible agents' rows. The
+    // /definitions and fleet-summary siblings below carry no agent identity and keep the
+    // plain Execution:Read gate.
     sink.Get("/api/v1/execution-statistics/agents",
-             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Execution", "Read"))
+             [fleet_read_fn, execution_tracker](const httplib::Request& req,
+                                                httplib::Response& res) {
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 // Unwired seam: fail closed with an A4 503, like every sibling fleet-read
+                 // route, instead of an empty std::function throwing out of the handler.
+                 if (!fleet_read_fn) {
+                     spdlog::error("execution-statistics/agents: fleet_read_fn unwired -- "
+                                   "misconfigured call site; failing closed; cid={}",
+                                   cid);
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
                      return;
+                 }
+                 auto gate = fleet_read_fn(req, res, "Execution", "Read");
+                 if (!gate.admitted)
+                     return; // gate already wrote the response.
+                 if (!execution_tracker) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "execution tracker unavailable",
+                                                      {.retry_after_ms = 5000}),
+                                     "application/json");
+                     return;
+                 }
                  ExecutionStatsQuery q;
                  if (req.has_param("agent_id"))
                      q.agent_id = req.get_param_value("agent_id");
-                 if (req.has_param("since"))
-                     try {
-                         q.since = std::stoll(req.get_param_value("since"));
-                     } catch (...) {}
-                 if (req.has_param("limit"))
-                     try {
-                         q.limit = std::stoi(req.get_param_value("limit"));
-                     } catch (...) {}
+                 // #4644: a malformed `since`/`limit` used to be swallowed into the
+                 // default (`?since=junk` meant "from the beginning"), answering a different
+                 // query than the caller asked. Not ONE base-10 integer -> 400.
+                 try {
+                     if (req.has_param("since"))
+                         q.since = strict_stoll(req.get_param_value("since"));
+                     if (req.has_param("limit"))
+                         q.limit = strict_stoi(req.get_param_value("limit"));
+                 } catch (const std::exception&) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                     "application/json");
+                     return;
+                 }
+                 if (q.since && *q.since < 0) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "since must not be negative"),
+                                     "application/json");
+                     return;
+                 }
+                 // A limit below 1 is refused like the MCP twin (-32602); it used to be read as
+                 // the default 50, answering a different query than the caller asked.
+                 if (q.limit < 1) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "limit must be at least 1"),
+                                     "application/json");
+                     return;
+                 }
                  if (q.limit > 1000)
                      q.limit = 1000;
-                 auto stats = execution_tracker->get_agent_statistics(q);
+                 if (gate.scope)
+                     q.visible_agents =
+                         std::vector<std::string>(gate.scope->begin(), gate.scope->end());
+                 // A degraded read (store not open, pool timeout, failed statement) is a 503:
+                 // an empty page here would read as "this scope has no executions".
+                 const auto stats_opt = execution_tracker->try_get_agent_statistics(q);
+                 if (!stats_opt) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "execution statistics store degraded - please retry",
+                                          {.retry_after_ms = 2000}),
+                         "application/json");
+                     return;
+                 }
+                 const auto& stats = *stats_opt;
                  JArr arr;
                  // #2146 Batch B3: shared builder -- the MCP twin
                  // get_execution_statistics_by_agent calls the SAME function.
@@ -9813,20 +10017,54 @@ void RestApiV1::register_routes(
              [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Execution", "Read"))
                      return;
+                 if (!execution_tracker) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "execution tracker unavailable",
+                                                      {.retry_after_ms = 5000}),
+                                     "application/json");
+                     return;
+                 }
                  ExecutionStatsQuery q;
                  if (req.has_param("definition_id"))
                      q.definition_id = req.get_param_value("definition_id");
-                 if (req.has_param("since"))
-                     try {
-                         q.since = std::stoll(req.get_param_value("since"));
-                     } catch (...) {}
-                 if (req.has_param("limit"))
-                     try {
-                         q.limit = std::stoi(req.get_param_value("limit"));
-                     } catch (...) {}
+                 // #4644: a malformed `since`/`limit` used to be swallowed into the
+                 // default (`?since=junk` meant "from the beginning"), answering a different
+                 // query than the caller asked. Not ONE base-10 integer -> 400.
+                 try {
+                     if (req.has_param("since"))
+                         q.since = strict_stoll(req.get_param_value("since"));
+                     if (req.has_param("limit"))
+                         q.limit = strict_stoi(req.get_param_value("limit"));
+                 } catch (const std::exception&) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                     "application/json");
+                     return;
+                 }
+                 if (q.since && *q.since < 0) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "since must not be negative"),
+                                     "application/json");
+                     return;
+                 }
+                 if (q.limit < 1) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "limit must be at least 1"),
+                                     "application/json");
+                     return;
+                 }
                  if (q.limit > 1000)
                      q.limit = 1000;
-                 auto stats = execution_tracker->get_definition_statistics(q);
+                 const auto stats_opt = execution_tracker->try_get_definition_statistics(q);
+                 if (!stats_opt) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "execution statistics store degraded - please retry",
+                                          {.retry_after_ms = 2000}),
+                         "application/json");
+                     return;
+                 }
+                 const auto& stats = *stats_opt;
                  JArr arr;
                  // #2146 Batch B3: shared builder -- the MCP twin
                  // get_execution_statistics_by_definition calls the SAME function.
@@ -9885,7 +10123,7 @@ void RestApiV1::register_routes(
                 q.status = req.get_param_value("status");
             try {
                 if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
+                    q.limit = strict_stoi(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
@@ -10181,7 +10419,7 @@ void RestApiV1::register_routes(
     // CC7.2 evidence, PLUS a "success" row per docs/api-twin-recipe.md §4's
     // REST-JSON posture and the `/api/v1/executions/{id}/responses` REST
     // precedent above) — a judgment call made when v1 was added, when the
-    // legacy routes audited only scope-drops. #4644 Gate 7 has since brought
+    // legacy routes audited only scope-drops. #4644 has since brought
     // all three legacy routes (response_routes.cpp) to the same fail-closed
     // success audit, so the twins are countable together; only the detail
     // string differs.
@@ -11341,7 +11579,7 @@ void RestApiV1::register_routes(
             int chart_index = 0;
             if (req.has_param("index")) {
                 try {
-                    chart_index = std::stoi(req.get_param_value("index"));
+                    chart_index = strict_stoi(req.get_param_value("index"));
                 } catch (...) {
                     res.status = 400;
                     res.set_content(detail::a4_error(res, "index must be a non-negative integer"),
@@ -11433,7 +11671,7 @@ void RestApiV1::register_routes(
                 scope_arg = std::move(in_scope); // engaged-empty means no rows
             }
 
-            // #4644 Gate 7 (row 6a): the same byte-aware fetch the export routes use. The
+            // #4644 (row 6a): the same byte-aware fetch the export routes use. The
             // old unbounded query() materialised up to 10,000 full rows (each output is
             // cut to 2 MiB at ingest) while holding a lease on the shared Postgres pool;
             // query_bounded applies the 50 MiB payload cap in SQL, so the PGresult and the
@@ -11607,16 +11845,12 @@ void RestApiV1::register_routes(
                                       "application/json");
                                   return;
                               }
-                              auto field_str = [&c](const char* key) -> std::string {
-                                  return (c.contains(key) && c[key].is_string())
-                                             ? c[key].get<std::string>()
-                                             : "";
-                              };
                               InventoryCondition cond;
-                              cond.plugin = field_str("plugin");
-                              cond.field = field_str("field");
-                              cond.op = field_str("op");
-                              cond.value = field_str("value");
+                              if (const auto bad = parse_inventory_condition(c, cond)) {
+                                  res.status = 400;
+                                  res.set_content(detail::a4_error(res, *bad), "application/json");
+                                  return;
+                              }
                               eval_req.conditions.push_back(std::move(cond));
                           }
                       }
@@ -12248,11 +12482,15 @@ void RestApiV1::register_routes(
             std::string cursor = req.has_param("cursor") ? req.get_param_value("cursor") : "";
             int limit = 50;
             if (req.has_param("limit")) {
-                const auto lv = req.get_param_value("limit");
-                int v = 0;
-                std::from_chars(lv.data(), lv.data() + lv.size(), v);
-                if (v > 0 && v <= 500)
-                    limit = v;
+                // Not ONE base-10 integer (`10abc`, empty, overflow) is a 400, not its numeric prefix
+                // (#4644); an in-grammar value outside 1..500 keeps the default page size.
+                const auto v = parse_query_int<int>(req.get_param_value("limit"));
+                if (!v) {
+                    rs_err(res, 400, "invalid limit (expected integer)");
+                    return;
+                }
+                if (*v > 0 && *v <= 500)
+                    limit = *v;
             }
             // #4306/#4307 finding 2: a degraded page must never silently
             // read as "empty fleet" — refuse rather than answer 200 with an
@@ -12693,16 +12931,11 @@ void RestApiV1::register_routes(
                                   rs_err(res, 400, "each condition must be a JSON object");
                                   return;
                               }
-                              auto field_str = [&c](const char* key) -> std::string {
-                                  return (c.contains(key) && c[key].is_string())
-                                             ? c[key].get<std::string>()
-                                             : "";
-                              };
                               InventoryCondition cond;
-                              cond.plugin = field_str("plugin");
-                              cond.field = field_str("field");
-                              cond.op = field_str("op");
-                              cond.value = field_str("value");
+                              if (const auto bad = parse_inventory_condition(c, cond)) {
+                                  rs_err(res, 400, *bad);
+                                  return;
+                              }
                               eval_req.conditions.push_back(std::move(cond));
                           }
                       }
@@ -13201,6 +13434,19 @@ void RestApiV1::register_routes(
                               }
                           }
                       }
+                      // #4644: a malformed matcher threshold is a permanent client error, so it
+                      // is refused here with the other input checks (nothing dispatched or stored)
+                      // rather than throwing out of the maintenance tick later.
+                      // A PRESENT matcher that is not a JSON object is refused too: it used to be
+                      // dropped silently, which meant "accept every responder". Absent stays the
+                      // default.
+                      if (body.contains("matcher")) {
+                          if (auto bad = yuzu::server::rs_matcher::validate_matcher_object(
+                                  body["matcher"])) {
+                              rs_err(res, 400, "RESULT_SET_BAD_REQUEST: " + *bad);
+                              return;
+                          }
+                      }
                       // Gate 3 architect finding: moved below the client-input validation
                       // above (instruction_id/params bounds) - same reasoning as the
                       // from-inventory-query route's Gate 4 fix: a malformed/oversized
@@ -13591,11 +13837,15 @@ void RestApiV1::register_routes(
                          req.has_param("cursor") ? req.get_param_value("cursor") : "";
                      int limit = 1000;
                      if (req.has_param("limit")) {
-                         const auto lv = req.get_param_value("limit");
-                         int v = 0;
-                         std::from_chars(lv.data(), lv.data() + lv.size(), v);
-                         if (v > 0 && v <= 10000)
-                             limit = v;
+                         // Not ONE base-10 integer (`10abc`, empty, overflow) is a 400, not its numeric prefix
+                         // (#4644); an in-grammar value outside 1..10000 keeps the default page size.
+                         const auto v = parse_query_int<int>(req.get_param_value("limit"));
+                         if (!v) {
+                             rs_err(res, 400, "invalid limit (expected integer)");
+                             return;
+                         }
+                         if (*v > 0 && *v <= 10000)
+                             limit = *v;
                      }
                      // #4306 finding 3 / #4307 finding 2: never a 200 with an
                      // empty array on a degraded read — indistinguishable
@@ -14579,16 +14829,36 @@ void RestApiV1::register_routes(
             if (!perm_fn(req, res, "License", "Write"))
                 return;
             auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded()) {
+            if (body.is_discarded() || !body.is_object()) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
+            // Both are non-negative JSON integers (#4644), like the MCP twin
+            // activate_platform_license: 0 is the documented unlimited / perpetual sentinel.
+            // body.value() static_cast a float or a wrapped integer to a different number, threw
+            // on a string or null, and a negative expires_at read back as perpetual.
+            const auto seat_count = yuzu::server::read_json_int_strict(body, "seat_count", 0);
+            if (!seat_count || *seat_count < 0) {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res, "seat_count must be a JSON integer of at least 0"),
+                    "application/json");
+                return;
+            }
+            const auto expires_at = yuzu::server::read_json_int_strict(body, "expires_at", 0);
+            if (!expires_at || *expires_at < 0) {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res, "expires_at must be a JSON integer of at least 0"),
+                    "application/json");
+                return;
+            }
             License lic;
             lic.organization = body.value("organization", "");
-            lic.seat_count = body.value("seat_count", int64_t{0});
+            lic.seat_count = *seat_count;
             lic.edition = body.value("edition", "community");
-            lic.expires_at = body.value("expires_at", int64_t{0});
+            lic.expires_at = *expires_at;
             lic.features_json = body.value("features_json", "[]");
             auto key = body.value("license_key", "");
 
@@ -14665,10 +14935,25 @@ void RestApiV1::register_routes(
              [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
-                 auto fleet = execution_tracker->get_fleet_summary();
+                 if (!execution_tracker) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "execution tracker unavailable",
+                                                      {.retry_after_ms = 5000}),
+                                     "application/json");
+                     return;
+                 }
+                 const auto fleet = execution_tracker->try_get_fleet_summary();
+                 if (!fleet) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "execution statistics store degraded - please retry",
+                                          {.retry_after_ms = 2000}),
+                         "application/json");
+                     return;
+                 }
                  // #2146 Batch B3: shared builder (execution_statistics_model.hpp) --
                  // the MCP twin get_fleet_statistics calls the SAME function.
-                 res.set_content(ok_json(fleet_statistics_json(fleet)), "application/json");
+                 res.set_content(ok_json(fleet_statistics_json(*fleet)), "application/json");
              });
 
     // ── File Retrieval (capability 10.13) ────────────────────────────────
@@ -14857,7 +15142,23 @@ void RestApiV1::register_routes(
         GuaranteedStateRuleRow row;
         row.rule_id = body.value("rule_id", "");
         row.name = body.value("name", "");
-        row.version = body.value("version", int64_t{1});
+        // ABSENT defaults to 1; a PRESENT version must be one JSON integer (a string, float,
+        // bool, null or a value above INT64_MAX is nullopt: the old `body.value` threw on the
+        // first four and wrapped the last).
+        const auto version_opt = read_json_int_strict(body, "version", 1);
+        row.version = version_opt.value_or(0);
+        // An update bumps the stored version by one and the agent push casts it to uint64,
+        // so the accepted range is bounded here (and again in create_rule) the same way the
+        // MCP create tool bounds it.
+        if (!version_opt || !rule_version_in_range(row.version)) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "version must be an integer from 1 to 2147483647",
+                                                  cid, "omit version (it defaults to 1) or send 1..2147483647"),
+                            "application/json");
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", audit_token(row.rule_id),
+                     "version out of range");
+            return;
+        }
         row.enabled = body.value("enabled", true);
         row.enforcement_mode = body.value("enforcement_mode", std::string{"enforce"});
         row.severity = body.value("severity", std::string{"medium"});
@@ -14875,7 +15176,7 @@ void RestApiV1::register_routes(
                             "application/json");
             // Audit the reject (sibling-parity with the update handler + the
             // invalid-JSON branch — leave a SIEM trail for a malformed/probe body).
-            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", audit_token(row.rule_id),
                      "invalid enforcement_mode");
             return;
         }
@@ -14893,7 +15194,7 @@ void RestApiV1::register_routes(
             res.set_content(
                 detail::error_json_a4(400, spec.error->message, cid, spec.error->remediation),
                 "application/json");
-            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", audit_token(row.rule_id),
                      spec.error->message);
             return;
         }
@@ -14918,7 +15219,7 @@ void RestApiV1::register_routes(
                          "spark+assertion (or yaml_source)"),
                 "application/json");
             audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState",
-                     row.rule_id, "invalid rule_id, missing name, or missing yaml_source");
+                     audit_token(row.rule_id), "invalid rule_id, missing name, or missing yaml_source");
             return;
         }
         row.created_by = session->username;
@@ -15212,6 +15513,18 @@ void RestApiV1::register_routes(
                  updated.severity = body.value("severity", updated.severity);
                  updated.os_target = body.value("os_target", updated.os_target);
                  updated.scope_expr = body.value("scope_expr", updated.scope_expr);
+                 if (rule_version_exhausted(existing_rule.version)) {
+                     // Reachable only for a row stored before the version bound existed or
+                     // written out of band; refuse rather than overflow the signed increment.
+                     res.status = 409;
+                     res.set_content(
+                         detail::error_json_a4(409, "rule version counter exhausted", cid,
+                                               "create a new rule instead of updating this one"),
+                         "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              "rule version counter exhausted");
+                     return;
+                 }
                  updated.version = existing_rule.version + 1;
 
                  // A structured body re-authors the Guard (contract §8): re-derive the
@@ -15549,6 +15862,30 @@ void RestApiV1::register_routes(
             return;
         }
 
+        // Validate the paging parameters BEFORE the behavioural-PII access audit below: a request
+        // rejected with a 400 serves no device data, so it must not leave a `success` access row
+        // (the audit row would otherwise claim an access that never happened).
+        if (req.has_param("limit")) {
+            // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
+            const auto parsed = parse_query_int<int>(req.get_param_value("limit"));
+            if (!parsed || *parsed < 0) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
+                return;
+            }
+            q.limit = std::min(*parsed, 1000);
+        }
+        if (req.has_param("offset")) {
+            // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
+            const auto parsed = parse_query_int<int>(req.get_param_value("offset"));
+            if (!parsed || *parsed < 0) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid offset"), "application/json");
+                return;
+            }
+            q.offset = *parsed;
+        }
+
         // Behavioral-PII access audit (governance compliance-F1), unconditional on
         // BOTH branches now: the fleet branch's per-row projection carries agent_id +
         // detail_json for every reporting agent, which IS individual-identifying —
@@ -15584,28 +15921,6 @@ void RestApiV1::register_routes(
             spdlog::warn("dex.device.view (events) audit fail-closed (503) agent_id={} cid={}",
                          q.agent_id, cid);
             return;
-        }
-        if (req.has_param("limit")) {
-            int v = 0;
-            auto s = req.get_param_value("limit");
-            [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-            if (ec != std::errc{} || v < 0) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
-                return;
-            }
-            q.limit = std::min(v, 1000);
-        }
-        if (req.has_param("offset")) {
-            int v = 0;
-            auto s = req.get_param_value("offset");
-            [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-            if (ec != std::errc{} || v < 0) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, "invalid offset"), "application/json");
-                return;
-            }
-            q.offset = v;
         }
         // ADR-0031 WS-A4 (ninth family): GuardianApi::list_events — same
         // plain-vector, empty-on-degrade contract as the wrapped store call
@@ -15663,7 +15978,17 @@ void RestApiV1::register_routes(
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
-        const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
+        // An ABSENT window is the 7d default; a present one (including an empty `?window=`) must
+        // be one of the four tokens, like every other DEX route (#4644: junk, `30` or `90d` used
+        // to resolve to 7d under a label saying otherwise).
+        const std::string window =
+            req.has_param("window") ? req.get_param_value("window") : "7d";
+        if (!dex_window_is_valid(window)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid window (expected 24h|7d|30d|all)"),
+                            "application/json");
+            return;
+        }
         // A1 parity: `os=windows|linux|macos` narrows the rollup to one OS's own
         // signals (anything else = all-OS), matching the dashboard catalogue's
         // OS filter so the machine surface can never drift from what the page shows.
@@ -16061,7 +16386,14 @@ void RestApiV1::register_routes(
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
-        const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
+        const std::string window =
+            req.has_param("window") ? req.get_param_value("window") : "7d";
+        if (!dex_window_is_valid(window)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid window (expected 24h|7d|30d|all)"),
+                            "application/json");
+            return;
+        }
         auto rows = dex_api->scope(window);
         JArr arr;
         for (const auto& r : rows) {
@@ -16129,18 +16461,23 @@ void RestApiV1::register_routes(
                  }
                  const std::string window =
                      req.has_param("window") ? req.get_param_value("window") : "7d";
+                 if (!dex_window_is_valid(window)) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::a4_error(res, "invalid window (expected 24h|7d|30d|all)"),
+                         "application/json");
+                     return;
+                 }
                  int limit = 50;
                  if (req.has_param("limit")) {
-                     int v = 0;
-                     auto s = req.get_param_value("limit");
-                     [[maybe_unused]] auto [_, ec] =
-                         std::from_chars(s.data(), s.data() + s.size(), v);
-                     if (ec != std::errc{} || v < 0) {
+                     // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
+                     const auto parsed = parse_query_int<int>(req.get_param_value("limit"));
+                     if (!parsed || *parsed < 0) {
                          res.status = 400;
                          res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
                          return;
                      }
-                     limit = std::min(v, 500);
+                     limit = std::min(*parsed, 500);
                  }
                  // A1 parity: `os=windows|linux|macos` scopes the drilldown detail
                  // lists to one OS (anything else = all-OS), matching the dashboard
@@ -16500,17 +16837,15 @@ void RestApiV1::register_routes(
                      cohort_filter = req.get_param_value("cohort_value");
                  int limit = 50;
                  if (req.has_param("limit")) {
-                     int v = 0;
-                     auto s = req.get_param_value("limit");
-                     [[maybe_unused]] auto [_, ec] =
-                         std::from_chars(s.data(), s.data() + s.size(), v);
-                     if (ec != std::errc{} || v <= 0) {
+                     // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
+                     const auto parsed = parse_query_int<int>(req.get_param_value("limit"));
+                     if (!parsed || *parsed <= 0) {
                          res.status = 400;
                          res.set_content(detail::error_json_a4(400, "invalid limit", cid),
                                          "application/json");
                          return;
                      }
-                     limit = std::min(v, 500);
+                     limit = std::min(*parsed, 500);
                  }
                  // Behavioral-PII access audit: each row below names an agent_id +
                  // its perf metrics, individual-identifying, fleet-wide. FAIL-CLOSED
@@ -17204,11 +17539,18 @@ void RestApiV1::register_routes(
             }
             int window = 7; // days each side
             if (req.has_param("window")) {
-                char* end = nullptr;
-                const std::string w = req.get_param_value("window");
-                const long v = std::strtol(w.c_str(), &end, 10);
-                if (end != w.c_str() && *end == '\0')
-                    window = static_cast<int>(v);
+                // A malformed `window` used to fall back to 7 silently, answering a
+                // different comparison than asked (#4644).
+                const auto v = parse_query_int<int>(req.get_param_value("window"));
+                if (!v) {
+                    res.status = 400;
+                    res.set_content(detail::error_json_a4(
+                                        400, "window must be an integer number of days", cid,
+                                        "pass window as a base-10 integer, or omit it for 7"),
+                                    "application/json");
+                    return;
+                }
+                window = *v;
             }
             window = std::clamp(window, 1, AppPerfDailyStore::kRetentionDays);
 
@@ -17849,16 +18191,14 @@ void RestApiV1::register_routes(
                      cohort_filter = req.get_param_value("cohort_value");
                  int limit = 50;
                  if (req.has_param("limit")) {
-                     int v = 0;
-                     auto s = req.get_param_value("limit");
-                     [[maybe_unused]] auto [_, ec] =
-                         std::from_chars(s.data(), s.data() + s.size(), v);
-                     if (ec != std::errc{} || v <= 0) {
+                     // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
+                     const auto parsed = parse_query_int<int>(req.get_param_value("limit"));
+                     if (!parsed || *parsed <= 0) {
                          res.status = 400;
                          res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
                          return;
                      }
-                     limit = std::min(v, 500);
+                     limit = std::min(*parsed, 500);
                  }
                  // Behavioral-PII access audit: each row below names an agent_id +
                  // its network perf/correlation facts, individual-identifying,
@@ -18555,8 +18895,11 @@ void RestApiV1::register_routes(
     //     `?filter=...` syntax is W5.2.
     //   * Reuses `ExecutionEventBus` (per ladder doc — no new bus).
     //   * Replays via `Last-Event-ID` header OR `?since=<id>` query
-    //     param (query wins). Bad input degrades to 0 (no replay)
-    //     rather than 400, matching the dashboard sibling.
+    //     param (query wins). A malformed `?since` is a 400; a malformed
+    //     `Last-Event-ID` header (browser-supplied inference) is served
+    //     LIVE ONLY: no replay, never a 400 that would fail a reconnect.
+    //     With neither, the cursor is 0 and the ring buffer is replayed
+    //     (every id is > 0), so a late joiner sees the recent history.
     //   * Per-connection queue cap (`kPerConnectionQueueCapDefault`)
     //     with drop-oldest — a slow / blackholed consumer cannot grow
     //     the queue without bound. Drops are surfaced to the client
@@ -18754,6 +19097,36 @@ void RestApiV1::register_routes(
             return;
         }
 
+        // Replay window. `since` query param overrides
+        // `Last-Event-ID` header — explicit operator intent beats
+        // browser auto-reconnect inference. The cursor is ONE non-negative base-10
+        // integer: `stoull` accepted "-1" (wrapping to a cursor past every event) and
+        // "5abc" (as 5), so a typo replayed the wrong window without telling anyone.
+        // A malformed `since` QUERY parameter is the caller's explicit input and is a
+        // 400 (answered before the stream budget is touched). A malformed
+        // `Last-Event-ID` HEADER is browser-supplied inference, so a malformed one is
+        // served LIVE ONLY (no replay, never the whole buffer) rather than failing a
+        // reconnect. The parse runs BEFORE the success audit row so a rejected request
+        // leaves no success row, and before the stream lease.
+        std::uint64_t since_id = 0;
+        bool live_only = false;
+        if (req.has_param("since")) {
+            const auto v = yuzu::server::parse_query_int<long long>(req.get_param_value("since"));
+            if (!v || *v < 0) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter: since"),
+                                "application/json");
+                return;
+            }
+            since_id = static_cast<std::uint64_t>(*v);
+        } else if (req.has_header("Last-Event-ID")) {
+            // A malformed header is LIVE ONLY: since_id 0 would replay the whole ring buffer.
+            const auto cursor =
+                yuzu::server::sse_cursor_from_header(req.get_header_value("Last-Event-ID"));
+            since_id = cursor.since_id;
+            live_only = cursor.live_only;
+        }
+
         // Audit BEFORE the chunked provider takes over — once
         // set_chunked_content_provider runs, headers are sealed.
         // Audit failure surfaces via `Sec-Audit-Failed: true`
@@ -18776,25 +19149,6 @@ void RestApiV1::register_routes(
         // text/event-stream content type. governance round
         // security-guardian LOW-2.
         res.set_header("X-Content-Type-Options", "nosniff");
-
-        // Replay window. `since` query param overrides
-        // `Last-Event-ID` header — explicit operator intent beats
-        // browser auto-reconnect inference. Bad input → 0 (no
-        // replay) rather than 400; matches the dashboard sibling.
-        std::uint64_t since_id = 0;
-        if (req.has_param("since")) {
-            try {
-                since_id = std::stoull(req.get_param_value("since"));
-            } catch (...) {
-                since_id = 0;
-            }
-        } else if (req.has_header("Last-Event-ID")) {
-            try {
-                since_id = std::stoull(req.get_header_value("Last-Event-ID"));
-            } catch (...) {
-                since_id = 0;
-            }
-        }
 
         // Admission control (ADR-0034). This response is about to hold an httplib worker for
         // the life of the subscription, so it leases from the ONE budget every streaming
@@ -18877,7 +19231,7 @@ void RestApiV1::register_routes(
         // `SseSinkState::pre_emit` instead; the content provider
         // drains it on first invocation BEFORE the bounded queue
         // drain. governance R2 fix for unhappy-NEW-1 HIGH.
-        if (since_id > 0) {
+        if (since_id > 0 && !live_only) {
             auto snap = execution_event_bus->snapshot(exec_id);
             if (!snap.empty() && snap.front().id > since_id + 1) {
                 detail::SseEvent gap_sse;

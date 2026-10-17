@@ -472,6 +472,13 @@ TEST_CASE("REST inventory/software: non-integer limit → 400", "[pg][rest][inve
     auto res = h.sink.Get("/api/v1/inventory/software?limit=abc");
     REQUIRE(res);
     CHECK(res->status == 400);
+    // #4644: a numeric prefix is not an integer (`100abc` was read as 100).
+    for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/v1/inventory/software?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
 }
 
 TEST_CASE("REST inventory/software: ?agent_id= narrows to one device",

@@ -971,6 +971,18 @@ TEST_CASE("REST /dex/perf/devices: sort, filters, validation", "[dex][perf][rest
         REQUIRE(bad);
         CHECK(bad->status == 400);
     }
+    SECTION("a trailing-garbage limit is a 400, not its numeric prefix (#4644)") {
+        // from_chars alone accepted `2abc` as 2 (it only checked ec, not the end pointer).
+        for (const char* q : {"limit=2abc", "limit=1e1", "limit=0x2", "limit=", "limit=2.5"}) {
+            INFO(q);
+            auto bad = h.sink.Get(std::string("/api/v1/dex/perf/devices?") + q);
+            REQUIRE(bad);
+            CHECK(bad->status == 400);
+        }
+        auto ok = h.sink.Get("/api/v1/dex/perf/devices?limit=2");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
     SECTION("invalid cohort_key → 400") {
         auto bad = h.sink.Get("/api/v1/dex/perf/devices?cohort_key=bad%20key");
         REQUIRE(bad);

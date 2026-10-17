@@ -10,6 +10,7 @@
 
 #include "compliance_fragments.hpp" // pure HTML renderers for the fragments below
 #include "compliance_model.hpp"      // shared REST/MCP/fragment builders (#4034, recipe Rule 1)
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial/a4_error/ensure_correlation_id — mints/
                                      // reuses X-Correlation-Id so header and body always agree
 #include "rest_audit.hpp"           // detail::emit_behavioral_audit (#1647, #4034 follow-up)
@@ -439,8 +440,12 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             if (req.has_param("name"))
                 q.name_filter = req.get_param_value("name");
             try {
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
+                if (req.has_param("limit")) {
+                    q.limit = strict_stoi(req.get_param_value("limit"));
+                    // Negative: PG rejects `LIMIT -1` (store degrade, a 503 for a client error).
+                    if (q.limit < 0)
+                        throw std::invalid_argument("negative limit");
+                }
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
@@ -489,8 +494,12 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             if (req.has_param("enabled_only"))
                 q.enabled_only = true;
             try {
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
+                if (req.has_param("limit")) {
+                    q.limit = strict_stoi(req.get_param_value("limit"));
+                    // Negative: PG rejects `LIMIT -1` (store degrade, a 503 for a client error).
+                    if (q.limit < 0)
+                        throw std::invalid_argument("negative limit");
+                }
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
@@ -721,7 +730,7 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             std::int64_t want_limit = q.limit; // FragmentQuery's own default (100)
             try {
                 if (req.has_param("limit"))
-                    want_limit = std::stoll(req.get_param_value("limit"));
+                    want_limit = strict_stoll(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
@@ -790,7 +799,7 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             std::int64_t want_limit = q.limit; // PolicyQuery's own default (100)
             try {
                 if (req.has_param("limit"))
-                    want_limit = std::stoll(req.get_param_value("limit"));
+                    want_limit = strict_stoll(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),

@@ -773,3 +773,90 @@ TEST_CASE("dashboard_api_routes: /api/analytics/recent reports the emitted event
     CHECK(j["events"][0]["agent_id"] == "agent-001");
     CHECK(j["count"] == 1);
 }
+
+// ── #4644: strict numeric query parameters ──────────────────────────
+
+TEST_CASE("dashboard_api_routes: /api/audit rejects a malformed since/until/limit/offset with "
+          "400 instead of reading its numeric prefix",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+
+    Harness h;
+    h.audit_store = &audit;
+    h.wire();
+
+    for (const char* bad :
+         {"since=1e9", "since=junk", "since=100abc", "until=0x10", "until=", "limit=100abc",
+          "limit=1e3", "offset=5x", "limit=4294967296", "since=99999999999999999999"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/audit?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(json::parse(r->body)["error"]["message"] == "invalid numeric query parameter");
+    }
+    auto ok = h.sink.Get("/api/audit?since=0&until=1&limit=10&offset=0");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("dashboard_api_routes: /api/audit rejects a negative since and until of zero or below "
+          "with 400 while since of zero is accepted",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+
+    Harness h;
+    h.audit_store = &audit;
+    h.wire();
+
+    // The bounds are presence-tracked: a literal -3600 or 0 used to mean "the whole log".
+    for (const char* bad : {"since=-1", "since=-3600", "since=-1&until=5", "since=-5&until=7"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/audit?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(json::parse(r->body)["error"]["message"] == "since must not be negative");
+    }
+    for (const char* bad : {"until=0", "until=000", "until=-1", "since=5&until=0",
+                            "since=0&until=0", "since=0&until=-5"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/audit?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(json::parse(r->body)["error"]["message"] ==
+              "until must be a positive epoch second or omitted");
+    }
+    for (const char* ok : {"since=0", "until=1", "since=0&until=1", "", "since=1700000000"}) {
+        INFO(ok);
+        auto r = h.sink.Get(std::string("/api/audit?") + ok);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+    }
+}
+
+TEST_CASE("dashboard_api_routes: /api/analytics/recent rejects a malformed limit with 400 "
+          "instead of silently ignoring it",
+          "[server][routes][dashboard_api_routes]") {
+    Harness h; // analytics_store stays null: the 400 is decided before the store is touched
+    h.wire();
+
+    for (const char* bad : {"limit=abc", "limit=50x", "limit=1e3", "limit=", "limit=4294967296"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/analytics/recent?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(json::parse(r->body)["error"]["message"] == "invalid numeric query parameter");
+    }
+    // A well-formed value (even a non-positive one, which is clamped) is not an error.
+    for (const char* ok : {"limit=10", "limit=0", "limit=-5"}) {
+        INFO(ok);
+        auto r = h.sink.Get(std::string("/api/analytics/recent?") + ok);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+    }
+}

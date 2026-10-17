@@ -1,4 +1,5 @@
 #include "dex_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
@@ -2860,9 +2861,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             cohort_filter = req.get_param_value("cohort_value");
         int limit = 50;
         if (req.has_param("limit")) {
-            try {
-                limit = std::clamp(std::stoi(req.get_param_value("limit")), 1, 500);
-            } catch (...) {}
+            const auto parsed = yuzu::server::parse_query_int<int>(req.get_param_value("limit"));
+            if (!parsed) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter: limit"),
+                                "application/json");
+                return;
+            }
+            limit = std::clamp(*parsed, 1, 500);
         }
         const auto vis = resolve_visible(req); // scope the per-device perf list
         // Behavioral-PII access audit — same verb/target as the REST and MCP

@@ -26,27 +26,10 @@
 #include <system_error>
 #include <type_traits>
 
+#include "query_int_parse.hpp"
 #include "response_store.hpp"
 
 namespace yuzu::server {
-
-/// Full-consumption signed-integer parse: the WHOLE string must be one base-10
-/// integer. Rejects empty, trailing garbage ("100abc", "1e9", "0x1"), embedded or
-/// surrounding whitespace, a leading '+', and out-of-range values (no wraparound,
-/// no clamping). A leading '-' is accepted (the range check is the caller's), and
-/// zero-padding ("007") is accepted -- a client legitimately sending `status=007`
-/// is not malformed, unlike a stored value that must round-trip.
-template <typename T>
-[[nodiscard]] std::optional<T> parse_query_int(std::string_view s) {
-    static_assert(std::is_integral_v<T> && std::is_signed_v<T>);
-    T v{};
-    const char* const begin = s.data();
-    const char* const end = begin + s.size();
-    const auto [ptr, ec] = std::from_chars(begin, end, v);
-    if (ec != std::errc{} || ptr != end)
-        return std::nullopt;
-    return v;
-}
 
 /// The `status` filter's domain: -1 is the documented "any status" sentinel
 /// (ResponseQuery's default); 0.. selects one CommandResponse status. Anything
@@ -160,7 +143,7 @@ inline constexpr int kQueryRowLimitCap = 1000;
 /// `GET /api/v1/executions/{id}/responses`: each at most 1000 rows, no byte bound) and the
 /// dashboard `/fragments/results` FILTERED branch (it reads by response id); none of those goes
 /// through `query_bounded`. The execution visualization route, the `/fragments/results`
-/// unfiltered read and the TAR scan-page read DO (#4644 Gate 7, row 6a), each reporting a cut
+/// unfiltered read and the TAR scan-page read DO (#4644, row 6a), each reporting a cut
 /// explicitly. Other internal reads are likewise unbounded by
 /// bytes and take their limit from something other than a request parameter; for example
 /// (not an exhaustive list) server.cpp's fleet visualization snapshot collect poll

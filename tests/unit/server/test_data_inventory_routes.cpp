@@ -247,6 +247,92 @@ TEST_CASE("POST /api/inventory/query: happy path filters by agent_id",
     CHECK(body["results_excluded_by_poison"] == 0);
 }
 
+TEST_CASE("POST /api/inventory/query: since and until are presence-tracked and until of zero and "
+          "malformed bounds are a 400 (#4644)",
+          "[server][routes][data_inventory_routes][rest][pg]") {
+    PgHarness h;
+    h.store->upsert("agent-1", "bound_src", R"({"x":1})", 100);
+    h.store->upsert("agent-2", "bound_src", R"({"x":2})", 200);
+    h.store->upsert("agent-3", "bound_src", R"({"x":3})", 300);
+
+    const auto rows = [&h](const std::string& extra) -> std::size_t {
+        auto res = h.sink.Post("/api/inventory/query",
+                               R"({"plugin":"bound_src")" + extra + "}");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        return body["results"].size();
+    };
+    CHECK(rows("") == 3);
+    CHECK(rows(R"(,"since":0)") == 3); // a literal 0 lower bound matches what omitting it matches
+    CHECK(rows(R"(,"since":200)") == 2);
+    CHECK(rows(R"(,"until":200)") == 2);
+    CHECK(rows(R"(,"since":200,"until":200)") == 1);
+
+    for (const char* bad : {R"({"until":0})", R"({"until":-5})", R"({"since":-1})",
+                            R"({"since":"1"})", R"({"until":null})", R"({"since":1.5})",
+                            R"({"since":0,"until":0})"}) {
+        INFO(bad);
+        auto res = h.sink.Post("/api/inventory/query", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["error"]["code"] == 400);
+    }
+    auto zero = h.sink.Post("/api/inventory/query", R"({"until":0})");
+    REQUIRE(zero);
+    CHECK(json::parse(zero->body)["error"]["message"] ==
+          "until must be a positive epoch second or omitted");
+}
+
+TEST_CASE("POST /api/inventory/query: a body that is valid JSON but not an object is 400, not a 500 "
+          "(#4644)",
+          "[server][routes][data_inventory_routes][numeric_params][rest][pg]") {
+    PgHarness h;
+    for (const char* bad : {"[]", "null", "5", R"("x")", "true"}) {
+        INFO(bad);
+        auto res = h.sink.Post("/api/inventory/query", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+}
+
+TEST_CASE("POST /api/inventory/query: limit is read as 64 bits and a wrapped, zero, negative or "
+          "non-integer value is not silently a different page size (#4644)",
+          "[server][routes][data_inventory_routes][rest][pg]") {
+    PgHarness h;
+    h.store->upsert("agent-1", "limit_src", R"({"x":1})", 100);
+    h.store->upsert("agent-2", "limit_src", R"({"x":2})", 200);
+    h.store->upsert("agent-3", "limit_src", R"({"x":3})", 300);
+
+    const auto rows = [&h](const std::string& limit) -> std::size_t {
+        auto res = h.sink.Post("/api/inventory/query",
+                               R"({"plugin":"limit_src","limit":)" + limit + "}");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        return body["results"].size();
+    };
+    CHECK(rows("2") == 2);
+    // 4294967297 wrapped to 1 through the int read and answered one row.
+    CHECK(rows("4294967297") == 3);
+    CHECK(rows("18446744073709551615") == 3);
+
+    for (const char* bad : {R"({"limit":0})", R"({"limit":-1})", R"({"limit":"5"})",
+                            R"({"limit":5.5})", R"({"limit":null})", R"({"limit":true})"}) {
+        INFO(bad);
+        auto res = h.sink.Post("/api/inventory/query", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["error"]["code"] == 400);
+    }
+}
+
 TEST_CASE("POST /api/inventory/query: invalid JSON body is a 400",
           "[server][routes][data_inventory_routes][rest][pg]") {
     PgHarness h;

@@ -1,5 +1,9 @@
 # UAT Environment (Server ↔ Gateway ↔ Agent)
 
+For an already installed signed macOS agent, use the non-restarting, single-target
+check in [macOS development foundation](macos-development-foundation.md). Do not
+restart a retained UAT stack merely to inspect it.
+
 Reference for the dev-facing rigs that stand up the full Yuzu stack, the port
 map, and gateway command forwarding.
 
