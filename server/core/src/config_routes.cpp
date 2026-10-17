@@ -94,7 +94,7 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         // engine token callers are exempt). After the permission gate, so an unauthorised caller
         // still gets the 403 it always did, and before any refusal or the body is read, so a
         // cross-site write is audited as `csrf.denied` best effort (the row is attempted; the
-        // refusal does not wait on it). auth_fn writes its own 401 when there is no session.
+        // refusal does not depend on its outcome). auth_fn writes its own 401 when there is no session.
         auto session = deps.auth_fn(req, res);
         if (!session)
             return;

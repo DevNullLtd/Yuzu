@@ -223,7 +223,7 @@ TEST_CASE("config_routes: a cross-site cookie PUT to dex_score_policy is a 403 w
 // cross-site browser write is the 403 with its csrf.denied row, never the store 503, and a
 // same-site one still reaches the store 503. Fails if the gate moves below the store check.
 TEST_CASE("config_routes: a cross-site cookie PUT to an ordinary key with a null store is a 403 "
-          "with csrf.denied, a same-site one the store 503",
+          "with csrf.denied and a same-site one the store 503",
           "[server][routes][config_routes][security]") {
     MockHarness h;
     h.auth_source = "local"; // a cookie session
