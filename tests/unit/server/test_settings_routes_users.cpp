@@ -362,6 +362,8 @@ struct SettingsAdr2001Harness {
             step_up_labels.push_back(label);
             if (step_up_refuse) {
                 res.status = 403;
+                res.set_content(R"({"error":{"code":403,"message":"MFA step-up refused for test"}})",
+                                "application/json");
                 return false;
             }
             return true;
@@ -1628,6 +1630,8 @@ TEST_CASE("SettingsRoutes POST api-tokens: a refused MFA step-up mints nothing",
     auto res = h.sink.Post("/api/settings/api-tokens", "name=t1&ttl_hours=24", kFormCt);
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(res->get_header_value("HX-Trigger").find("MFA step-up refused for test") !=
+          std::string::npos);
     REQUIRE(h.step_up_labels.size() == 1);
     CHECK(h.step_up_labels[0] == "POST /api/settings/api-tokens");
     const auto listed = h.token_store->list_tokens();
@@ -1656,6 +1660,8 @@ TEST_CASE("SettingsRoutes DELETE api-tokens: a refused MFA step-up revokes nothi
     auto res = h.sink.Delete("/api/settings/api-tokens/" + id);
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(res->get_header_value("HX-Trigger").find("MFA step-up refused for test") !=
+          std::string::npos);
     REQUIRE(h.step_up_labels.size() == 1);
     CHECK(h.step_up_labels[0] == "DELETE /api/settings/api-tokens/{id}");
     const auto still = h.token_store->list_tokens("admin");

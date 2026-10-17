@@ -117,9 +117,11 @@ API-token Create and Revoke buttons) now apply the same step-up check as the RES
 
 - **SAML sessions** cannot satisfy the check and get `403` on both routes, as they already do on
   `/api/v1/tokens`. A deployment whose only interactive sign-in is SAML (`--auth-mode=sso-only`)
-  therefore has no Settings-page route to create or revoke tokens. Create or revoke them from a
-  local-account session (keep an MFA-enrolled local administrator for this), or from an API-token
-  or MCP caller, which the step-up check does not apply to.
+  therefore has no Settings-page route to create or revoke tokens. Create or revoke them from an
+  API-token or MCP caller (the step-up check does not apply to those), or sign in with the armed
+  break-glass account. If a deployment has neither an existing token nor a break-glass account, it
+  has no route to mint one without a restart; `--mfa-step-up-window-secs 0` disables the check
+  (see Authentication) and is the documented escape hatch.
 - **OIDC sessions** are gated only when the identity provider attests MFA (`amr`) or
   `--mfa-enforcement` protects the role.
 - **Local MFA-enrolled operators** whose proof is older than `--mfa-step-up-window-secs` must sign
