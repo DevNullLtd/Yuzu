@@ -9,7 +9,9 @@
  * provider, so a change reaches all of them within kDexPolicyRefreshMs without
  * any process-local push. The provider owns the failure direction:
  *   - a good read (including "nothing stored", which is the shipped defaults)
- *     is cached for kDexPolicyRefreshMs;
+ *     is cached for kDexPolicyRefreshMs, counted from the moment the read
+ *     COMPLETED (both windows are stamped from the clock sampled after the read,
+ *     so a slow read never lengthens either);
  *   - a stored document that fails to parse or validate is still a GOOD read:
  *     the policy in force is the shipped defaults with `fault` set;
  *   - a failed read serves the last good policy while it is no older than
@@ -18,8 +20,8 @@
  *   - a failed read before any good read is an error at once;
  *   - the store is read by one caller at a time, outside the lock: a caller
  *     arriving mid-refresh is served the last good policy while it is within
- *     the cap, or an error when there is none, and never waits on the read
- *     (the Apps read answers its typed 503 with retry_after_ms 2000).
+ *     the cap, or an error when there is none within the cap, and never waits
+ *     on the read (the Apps read answers its typed 503 with retry_after_ms 2000).
  *
  * No clock or store is touched except through the injected functions, so the
  * behaviour is testable without sleeping.
@@ -31,8 +33,8 @@
 #include <spdlog/spdlog.h>
 
 #include <cstdint>
-#include <expected>
 #include <exception>
+#include <expected>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -69,7 +71,7 @@ public:
         if (refreshing_) {
             if (have_ && now - last_ok_ms_ <= kDexPolicyStaleCapMs)
                 return cached_;
-            return std::unexpected(std::string("score policy refresh in progress, no usable policy yet"));
+            return std::unexpected(std::string("score policy refresh in progress, no usable policy"));
         }
         refreshing_ = true;
         lk.unlock(); // the store read runs unlocked: no caller queues behind it
@@ -80,7 +82,10 @@ public:
     }
 
 private:
-    // A throw from the injected read is a failed read, so refreshing_ is always cleared.
+    // A throw from the injected read is a failed read, so refreshing_ is cleared on every
+    // path the read can take. Not guarded: a bad_alloc building the error string below,
+    // which would leave refreshing_ set; a heap that cannot spare that string cannot
+    // serve the Apps payload either, and the instance restart is the recovery for both.
     std::expected<std::optional<std::string>, std::string> read_guarded() {
         try {
             return read_();
@@ -91,7 +96,8 @@ private:
         }
     }
 
-    // `now` is sampled AFTER the read, so a slow failed read counts against the cap.
+    // `now` is sampled AFTER the read: a slow failed read counts against the cap, and a
+    // slow good read is stamped at its completion, not its start.
     std::expected<DexPolicyInForce, std::string>
     apply_locked(std::expected<std::optional<std::string>, std::string> r, std::int64_t now) {
         if (r) {

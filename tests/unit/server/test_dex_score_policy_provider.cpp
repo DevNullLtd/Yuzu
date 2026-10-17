@@ -8,6 +8,8 @@
  */
 #include "dex_score_policy_provider.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
@@ -46,18 +48,23 @@ struct Fixture {
 };
 
 // A store read that parks inside the read, once armed, until release() opens
-// the gate; every other read returns the document at once.
+// the gate; every other read returns the document at once. release() is
+// idempotent so the tests' ScopeExit can call it after the explicit release.
 struct ParkedRead {
     Fixture& f;
     std::atomic<bool> armed{false};
     std::atomic<int> reads{0};
+    std::atomic<bool> released{false};
     std::promise<void> entered_p;
     std::promise<void> release_p;
     std::future<void> entered = entered_p.get_future();
     std::shared_future<void> gate = release_p.get_future().share();
 
     explicit ParkedRead(Fixture& fx) : f(fx) {}
-    void release() { release_p.set_value(); }
+    void release() {
+        if (!released.exchange(true))
+            release_p.set_value();
+    }
     DexScorePolicyProvider::ReadFn fn() {
         return [this]() -> std::expected<std::optional<std::string>, std::string> {
             ++reads;
@@ -219,6 +226,11 @@ TEST_CASE("policy provider: a caller arriving mid-refresh with no policy yet fai
     DexScorePolicyProvider p(pr.fn(), f.clock());
     std::optional<std::expected<DexPolicyInForce, std::string>> first;
     std::thread a([&] { first = p.current(); }); // parks inside the first store read
+    yuzu::test::ScopeExit finish{[&] { // a thrown assertion must not leave `a` joinable
+        pr.release();
+        if (a.joinable())
+            a.join();
+    }};
     pr.entered.wait();
 
     // The reader is still parked: this call must return without waiting on it.
@@ -246,6 +258,11 @@ TEST_CASE("policy provider: a caller arriving mid-refresh is served the last goo
     f.now += 6000; // past the refresh interval, inside the cap
     pr.armed = true;
     std::thread a([&] { (void)p.current(); }); // parks inside the refresh read
+    yuzu::test::ScopeExit finish{[&] {
+        pr.release();
+        if (a.joinable())
+            a.join();
+    }};
     pr.entered.wait();
 
     const auto lkg = p.current();
@@ -303,6 +320,83 @@ TEST_CASE("policy provider: a throwing read is a failed read and does not wedge 
     CHECK(reads == 4);
 }
 
+TEST_CASE("policy provider: a non-std throw from the read takes the same failed-read path",
+          "[dex][policy_provider]") {
+    Fixture f;
+    f.doc = doc_with_excellent(95.0);
+    int reads = 0;
+    bool boom = true;
+    DexScorePolicyProvider p(
+        [&]() -> std::expected<std::optional<std::string>, std::string> {
+            ++reads;
+            if (boom)
+                throw 7; // not a std::exception: the catch(...) arm
+            return f.doc;
+        },
+        f.clock());
+    const auto none = p.current(); // before any good read: an error at once
+    REQUIRE_FALSE(none);
+    CHECK(none.error().find("read threw") != std::string::npos);
+
+    boom = false;
+    REQUIRE(p.current()); // a good read
+    boom = true;
+    f.now += 6000;
+    const auto lkg = p.current(); // inside the cap: cached
+    REQUIRE(lkg);
+    CHECK(lkg->source == "custom");
+
+    f.now += 55000; // past the cap: refused
+    const auto gone = p.current();
+    REQUIRE_FALSE(gone);
+    CHECK(gone.error().find("read threw") != std::string::npos);
+
+    boom = false; // the flag was cleared each time: the store is asked again
+    REQUIRE(p.current());
+    CHECK(reads == 5);
+}
+
+TEST_CASE("policy provider: a slow good read is stamped when it completes, not when it starts",
+          "[dex][policy_provider]") {
+    Fixture f;
+    f.doc = doc_with_excellent(95.0);
+    const std::int64_t t0 = f.now;
+    std::int64_t read_takes_ms = 3000;
+    bool fail = false;
+    int reads = 0;
+    DexScorePolicyProvider p(
+        [&]() -> std::expected<std::optional<std::string>, std::string> {
+            ++reads;
+            f.now += read_takes_ms; // the read itself advances the clock
+            if (fail)
+                return std::unexpected(std::string("store down"));
+            return f.doc;
+        },
+        f.clock());
+    REQUIRE(p.current()); // starts at t0, completes at t0+3 s
+    const std::int64_t done = t0 + 3000;
+    CHECK(f.now == done);
+    read_takes_ms = 0;
+
+    // The refresh interval runs from the completion: no read at +4999 ms, one at +5000 ms
+    // (stamped at the start, +4999 would already be 7999 ms old and re-read).
+    f.now = done + 4999;
+    REQUIRE(p.current());
+    CHECK(reads == 1);
+    fail = true;
+    f.now = done + 5000;
+    REQUIRE(p.current()); // the refresh fails at once: the completion-stamped policy serves
+    CHECK(reads == 2);
+
+    // The staleness cap also runs from the completion: served at +60 s, refused at +60.001 s.
+    f.now = done + 60000;
+    CHECK(p.current().has_value());
+    f.now = done + 60001;
+    const auto gone = p.current();
+    REQUIRE_FALSE(gone);
+    CHECK(gone.error().find("store down") != std::string::npos);
+}
+
 TEST_CASE("policy provider: the time a failed read takes counts against the staleness cap",
           "[dex][policy_provider]") {
     Fixture f;
@@ -320,16 +414,16 @@ TEST_CASE("policy provider: the time a failed read takes counts against the stal
         f.clock());
     REQUIRE(p.current()); // good read at t0
     fail = true;
+    f.now = t0 + 59000; // each section is one forward-only schedule from here
 
-    // A refresh starts at t0+59 s and the failure lands 1 s later, at the cap: served.
-    f.now = t0 + 59000;
-    read_takes_ms = 1000;
-    CHECK(p.current().has_value());
-
-    // The same refresh failing 10 s later, at t0+69 s: past the cap, refused.
-    f.now = t0 + 59000;
-    read_takes_ms = 10000;
-    const auto gone = p.current();
-    REQUIRE_FALSE(gone);
-    CHECK(gone.error().find("store slow") != std::string::npos);
+    SECTION("a refresh starting at t0+59 s whose failure lands 1 s later, at the cap: served") {
+        read_takes_ms = 1000;
+        CHECK(p.current().has_value());
+    }
+    SECTION("the same refresh failing 10 s later, at t0+69 s: past the cap, refused") {
+        read_takes_ms = 10000;
+        const auto gone = p.current();
+        REQUIRE_FALSE(gone);
+        CHECK(gone.error().find("store slow") != std::string::npos);
+    }
 }
