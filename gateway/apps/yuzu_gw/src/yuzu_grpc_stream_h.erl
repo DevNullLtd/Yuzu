@@ -40,7 +40,11 @@
 %%%     than limits.max_connection_memory_bytes of half-finished requests is
 %%%     killed by the VM (yuzu_gw_conn_watch counts the kill). Without it a peer
 %%%     could open max_concurrent_streams streams and hold a full message short
-%%%     of its last byte on each, for the life of the connection;
+%%%     of its last byte on each, for the life of the connection. The listener
+%%%     leaves it off on a management-only listener unless configured
+%%%     (yuzu_grpc_listener:stream_limits/1): the ceiling also counts the
+%%%     responses waiting to be written, and killed the pinned server's one
+%%%     connection when a fan-out's responses arrived together;
 %%%   - a unary or server-streaming stream that stays in `awaiting_request'
 %%%     (buffering its one request, no handler yet) past limits.request_timeout_ms
 %%%     is aborted with DEADLINE_EXCEEDED and its buffer dropped. It is armed

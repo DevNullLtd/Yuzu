@@ -51,7 +51,12 @@
 %%%                  (a max_heap_size on the Cowboy connection process counting the
 %%%                  refc buffers its streams hold); a connection that buffers more
 %%%                  half-finished requests than this is killed. Default: four times
-%%%                  max_message_bytes (`infinity' disables it). request_timeout_ms
+%%%                  max_message_bytes (`infinity' disables it), except on a listener
+%%%                  that routes the ManagementService and does not serve the agent
+%%%                  service, where the default is none: its one peer is the pinned
+%%%                  server, and the ceiling killed the server's connection when a
+%%%                  fan-out's responses arrived together (stream_limits/1). An
+%%%                  explicit value applies on any listener. request_timeout_ms
 %%%                  is how long a unary/server-streaming stream may buffer its one
 %%%                  request before it is aborted DEADLINE_EXCEEDED (default 30000,
 %%%                  `infinity' disables it); it never cuts a bidirectional or
@@ -394,7 +399,7 @@ http2_opts(Entry) ->
     maps:merge(RoleDefaults, maps:get(http2, Entry, #{})).
 
 protocol_opts(Entry, Routes) ->
-    Limits = maps:get(limits, Entry, #{}),
+    Limits = stream_limits(Entry),
     Origin = maps:get(origin, Entry, #{mode => transport}),
     maps:merge(http2_opts(Entry),
                #{stream_handlers => [yuzu_grpc_stream_h],
@@ -411,6 +416,31 @@ protocol_opts(Entry, Routes) ->
                  %% a client that sends no ALPN at all is parsed as HTTP/2 too.
                  protocols => [http2],
                  alpn_default_protocol => http2}).
+
+%% The `limits' the stream handler reads. A listener that routes the
+%% ManagementService and does not serve the agent service gets no per-connection
+%% memory ceiling unless its `limits' sets one: max_connection_memory_bytes
+%% exists to bound an ANONYMOUS peer that opens streams and stalls them
+%% half-sent, and the management peer is the pinned server (the auth_fun runs
+%% before any stream of it is served), which holds ONE connection and sends a
+%% whole fan-out over it. On that connection the ceiling killed the server's
+%% connection, every call in flight on it, when the agents of a fan-out answered
+%% together with large responses: the derived 16 MiB equals Cowboy's own
+%% output-buffer alarm (max_connection_buffer_size, 16000000 bytes), so the VM
+%% killed the connection before that alarm could slow the senders, and each
+%% stream holds one more response than the alarm counts. Without the ceiling the
+%% alarm paces the senders; what one connection can then hold is about 16 MB
+%% plus one response per stream in flight (max_concurrent_streams of them). A
+%% combined agent+management listener serves anonymous agents and keeps the
+%% ceiling (it is a lab rig: the boot guard refuses it off loopback unless
+%% allow_insecure_mgmt acknowledges one).
+stream_limits(Entry) ->
+    Limits = maps:get(limits, Entry, #{}),
+    case routes_service(Entry, ?MGMT_SERVICE) andalso not serves_agent(Entry)
+         andalso not maps:is_key(max_connection_memory_bytes, Limits) of
+        true -> Limits#{max_connection_memory_bytes => infinity};
+        false -> Limits
+    end.
 
 %%--------------------------------------------------------------------
 %% Validation
