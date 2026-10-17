@@ -86,7 +86,7 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
         for (const auto& it : g.items)
             labels.push_back(it.label);
     CHECK(labels == std::vector<std::string_view>{"Console", "Instructions", "Result sets",
-                                                  "Compliance", "Guardian", "DEX", "TAR",
+                                                  "Compliance", "Guardian", "DEX", "TAR", "Crypto",
                                                   "Groups and enrolment", "Hardware", "Software",
                                                   "Fleet", "Users", "Tokens and principals",
                                                   "Settings"});
@@ -671,6 +671,7 @@ TEST_CASE("the shared detail shell re-targets to every route that reuses it", "[
         {"dex", {"/dex"}},
         {"hardware", {"/hardware"}},
         {"software", {"/software"}},
+        {"crypto", {"/crypto"}},
         {"auto", {"/software", "/auto"}},
         {"network", {"/viz/fleet", "/network"}},
     };

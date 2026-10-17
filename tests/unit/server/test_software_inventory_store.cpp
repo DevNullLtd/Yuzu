@@ -3005,3 +3005,296 @@ TEST_CASE("source_last_seen_bulk: a store that never opened is a degrade", "[pg]
     REQUIRE_FALSE(broken.is_open());
     CHECK_FALSE(broken.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
 }
+
+// ── Name-pattern reads (the /crypto slice's generic store methods) ───────────
+
+namespace {
+
+SoftwareEntry np_entry(std::string name, std::string version, std::string ecosystem = "deb") {
+    SoftwareEntry e;
+    e.name = std::move(name);
+    e.version = std::move(version);
+    e.kind = "package";
+    e.ecosystem = std::move(ecosystem);
+    return e;
+}
+
+void np_seed(SoftwareInventoryStore& store, const std::string& agent,
+             std::vector<SoftwareEntry> rows) {
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software(agent, h, std::move(rows), 1000) ==
+            InventoryIngestOutcome::kStored);
+}
+
+// openssl: a1 (libssl3 + openssl, same version), a2, a3 (older); gnutls: a4; a5 carries neither.
+void np_seed_fleet(SoftwareInventoryStore& store) {
+    np_seed(store, "a1", {np_entry("libssl3", "3.0.13"), np_entry("openssl", "3.0.13")});
+    np_seed(store, "a2", {np_entry("LibSSL3", "3.0.13")});
+    np_seed(store, "a3", {np_entry("libssl3", "1.1.1", "rpm")});
+    np_seed(store, "a4", {np_entry("libgnutls30", "3.7.9")});
+    np_seed(store, "a5", {np_entry("curl", "8.0")});
+}
+
+yuzu::server::NamePatternQuery np_query() {
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl%", "openssl", "libgnutls%"};
+    q.labels = {"openssl", "openssl", "gnutls"};
+    return q;
+}
+
+std::int64_t np_label(const yuzu::server::NamePatternRollup& r, std::string_view label) {
+    for (const auto& l : r.label_counts)
+        if (l.label == label)
+            return l.device_count;
+    return -1;
+}
+
+} // namespace
+
+TEST_CASE("name-pattern rollup: per-version counts and one device counts once per label",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+
+    auto r = store.software_name_pattern_rollup(np_query());
+    REQUIRE(r.has_value());
+    CHECK_FALSE(r->truncated);
+    // a1 carries libssl3 AND openssl: still ONE device for the openssl label.
+    CHECK(np_label(*r, "openssl") == 3);
+    CHECK(np_label(*r, "gnutls") == 1);
+    CHECK(r->total_devices == 4);
+
+    const yuzu::server::NamePatternRollupRow* v3013 = nullptr;
+    const yuzu::server::NamePatternRollupRow* v111 = nullptr;
+    for (const auto& row : r->rows) {
+        if (row.label == "openssl" && row.version == "3.0.13" && row.ecosystem == "deb")
+            v3013 = &row;
+        if (row.label == "openssl" && row.version == "1.1.1" && row.ecosystem == "rpm")
+            v111 = &row;
+    }
+    REQUIRE(v3013);
+    CHECK(v3013->device_count == 2); // a1, a2
+    CHECK(std::ranges::find(v3013->names, "libssl3") != v3013->names.end());
+    CHECK(std::ranges::find(v3013->names, "openssl") != v3013->names.end());
+    // matching is case-insensitive: a2's "LibSSL3" is reported under its stored spelling
+    CHECK(std::ranges::find(v3013->names, "LibSSL3") != v3013->names.end());
+    REQUIRE(v111);
+    CHECK(v111->device_count == 1);
+    CHECK(r->rows.size() == 3); // (openssl,3.0.13,deb) (openssl,1.1.1,rpm) (gnutls,3.7.9,deb)
+    CHECK(r->rows.front().device_count == 2); // most devices first
+
+    SECTION("ecosystem filter narrows every count") {
+        auto q = np_query();
+        q.ecosystem = "rpm";
+        auto f = store.software_name_pattern_rollup(q);
+        REQUIRE(f.has_value());
+        CHECK(np_label(*f, "openssl") == 1);
+        CHECK(np_label(*f, "gnutls") == -1);
+        CHECK(f->total_devices == 1);
+    }
+
+    SECTION("a pattern set matching nothing is an honest zero, not a degrade") {
+        yuzu::server::NamePatternQuery q;
+        q.patterns = {"nosuchpkg%"};
+        q.labels = {"x"};
+        auto f = store.software_name_pattern_rollup(q);
+        REQUIRE(f.has_value());
+        CHECK(f->rows.empty());
+        CHECK(f->label_counts.empty());
+        CHECK(f->total_devices == 0);
+    }
+
+    SECTION("mismatched parallel arrays are refused, not guessed") {
+        auto q = np_query();
+        q.labels.pop_back();
+        CHECK_FALSE(store.software_name_pattern_rollup(q).has_value());
+    }
+}
+
+TEST_CASE("name-pattern rollup: scope is pushed before the grouping",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+
+    auto q = np_query();
+    q.agent_ids = std::vector<std::string>{"a1", "a3", "a5"};
+    auto r = store.software_name_pattern_rollup(q);
+    REQUIRE(r.has_value());
+    CHECK(np_label(*r, "openssl") == 2); // a2 is out of scope
+    CHECK(np_label(*r, "gnutls") == -1); // a4 is out of scope
+    CHECK(r->total_devices == 2);
+    for (const auto& row : r->rows)
+        CHECK(row.device_count <= 2);
+
+    // present-empty = deny-all: an empty VALUE
+    q.agent_ids = std::vector<std::string>{};
+    auto none = store.software_name_pattern_rollup(q);
+    REQUIRE(none.has_value());
+    CHECK(none->rows.empty());
+    CHECK(none->total_devices == 0);
+
+    // coverage denominator follows the same scope rule
+    CHECK(store.count_reporting_agents(std::nullopt) == 5);
+    CHECK(store.count_reporting_agents(std::vector<std::string>{"a1", "zz"}) == 1);
+    CHECK(store.count_reporting_agents(std::vector<std::string>{}) == 0);
+}
+
+TEST_CASE("name-pattern reads: LIKE metacharacters in a pattern are literal when escaped",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed(store, "e1", {np_entry("a_b", "1"), np_entry("axb", "1"), np_entry("100%x", "1"),
+                          np_entry("100zx", "1"), np_entry("a\\b", "1")});
+
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"a\\_b", "100\\%x", "a\\\\b"};
+    q.labels = {"lit", "lit", "lit"};
+    auto r = store.software_name_pattern_rollup(q);
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    std::vector<std::string> names = r->rows[0].names;
+    std::ranges::sort(names);
+    CHECK(names == std::vector<std::string>{"100%x", "a\\b", "a_b"}); // not axb / 100zx
+
+    // an UNescaped underscore would be a wildcard: proves the escape is what keeps it literal
+    q.patterns = {"a_b"};
+    q.labels = {"wild"};
+    auto w = store.software_name_pattern_rollup(q);
+    REQUIRE(w.has_value());
+    REQUIRE(w->rows.size() == 1);
+    CHECK(w->rows[0].names.size() == 3); // a_b, axb and a\\b: `_` matches any one char
+}
+
+TEST_CASE("name-pattern devices: keyset paging, filters and scope",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+    np_seed(store, "a6", {np_entry("libssl3", "")}); // the empty-version bucket
+
+    yuzu::server::NamePatternDevicesQuery q;
+    q.patterns = {"libssl%", "openssl"}; // a1 matches BOTH patterns on different rows
+
+    SECTION("pages walk every row exactly once, in (agent_id, name, install_id) order") {
+        q.limit = 2;
+        std::vector<std::string> seen;
+        int pages = 0;
+        for (;;) {
+            auto page = store.software_name_pattern_devices(q);
+            REQUIRE(page.has_value());
+            REQUIRE(page->rows.size() <= 2);
+            for (const auto& r : page->rows)
+                seen.push_back(r.agent_id + "/" + r.entry.name);
+            ++pages;
+            if (!page->has_more)
+                break;
+            const auto& last = page->rows.back();
+            q.after = yuzu::server::SoftwareCursor{last.entry.name, last.agent_id, last.install_id};
+            REQUIRE(pages < 10);
+        }
+        CHECK(seen == std::vector<std::string>{"a1/libssl3", "a1/openssl", "a2/LibSSL3",
+                                               "a3/libssl3", "a6/libssl3"});
+        CHECK(pages == 3);
+    }
+
+    SECTION("a row matching two patterns is returned once") {
+        q.patterns = {"libssl%", "lib%"};
+        auto page = store.software_name_pattern_devices(q);
+        REQUIRE(page.has_value());
+        CHECK(std::ranges::count_if(page->rows, [](const auto& r) { return r.agent_id == "a1"; }) == 1);
+    }
+
+    SECTION("version filter: exact, and present-empty is the empty bucket") {
+        q.version = "1.1.1";
+        auto page = store.software_name_pattern_devices(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].agent_id == "a3");
+        CHECK(page->rows[0].entry.ecosystem == "rpm");
+        CHECK(page->rows[0].entry.kind == "package");
+
+        q.version = "";
+        page = store.software_name_pattern_devices(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].agent_id == "a6");
+    }
+
+    SECTION("ecosystem filter") {
+        q.ecosystem = "rpm";
+        auto page = store.software_name_pattern_devices(q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.size() == 1);
+    }
+
+    SECTION("scope: a set narrows the rows AND keeps pages full; empty = deny-all") {
+        q.agent_ids = std::vector<std::string>{"a2", "a3", "a4"};
+        q.limit = 2;
+        auto page = store.software_name_pattern_devices(q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.size() == 2);
+        CHECK_FALSE(page->has_more); // a2, a3 only (a4 is gnutls)
+        for (const auto& r : page->rows)
+            CHECK(r.agent_id != "a1");
+
+        q.agent_ids = std::vector<std::string>{};
+        page = store.software_name_pattern_devices(q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.empty());
+        CHECK_FALSE(page->has_more);
+    }
+}
+
+TEST_CASE("name-pattern rollup: the version-row cap sets truncated, never drops silently",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    std::vector<SoftwareEntry> rows;
+    const int n = yuzu::server::kNamePatternRollupRowCap + 5;
+    for (int i = 0; i < n; ++i)
+        rows.push_back(np_entry("libssl3", "v" + std::to_string(i)));
+    np_seed(store, "big", std::move(rows));
+
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl%"};
+    q.labels = {"openssl"};
+    auto r = store.software_name_pattern_rollup(q);
+    REQUIRE(r.has_value());
+    CHECK(r->truncated);
+    CHECK(r->rows.size() == static_cast<std::size_t>(yuzu::server::kNamePatternRollupRowCap));
+    // the totals still count the whole population, not the capped rows
+    CHECK(np_label(*r, "openssl") == 1);
+    CHECK(r->total_devices == 1);
+}
+
+TEST_CASE("name-pattern reads: a backend failure is nullopt, an empty scope still no SQL",
+          "[pg][software_inventory][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    CHECK_FALSE(store.software_name_pattern_rollup(np_query()).has_value());
+    yuzu::server::NamePatternDevicesQuery dq;
+    dq.patterns = {"libssl%"};
+    CHECK_FALSE(store.software_name_pattern_devices(dq).has_value());
+    CHECK_FALSE(store.count_reporting_agents(std::nullopt).has_value());
+
+    // present-empty scope answers before touching the (now broken) database: no SQL ran
+    auto q = np_query();
+    q.agent_ids = std::vector<std::string>{};
+    CHECK(store.software_name_pattern_rollup(q).has_value());
+    dq.agent_ids = std::vector<std::string>{};
+    CHECK(store.software_name_pattern_devices(dq).has_value());
+    CHECK(store.count_reporting_agents(std::vector<std::string>{}).has_value());
+
+    // a store that failed to open degrades too
+    SoftwareInventoryStore broken{pool};
+    REQUIRE_FALSE(broken.is_open());
+    CHECK_FALSE(broken.software_name_pattern_rollup(np_query()).has_value());
+    CHECK_FALSE(broken.software_name_pattern_devices(dq).has_value());
+}

@@ -144,6 +144,15 @@ EXPECTED_FAMILIES = {
             "server/core/src/guardian_api_local.hpp",
         ],
     },
+    "crypto": {
+        "tus": [
+            "server/core/src/crypto_types.hpp",
+            "server/core/src/crypto_library_model.hpp",
+            "server/core/src/crypto_library_model.cpp",
+            "server/core/src/crypto_api.hpp",
+            "server/core/src/crypto_api_local.hpp",
+        ],
+    },
 }
 EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     "*_store.hpp",
@@ -184,6 +193,7 @@ EXPECTED_IMPL_TUS = [
     "server/core/src/dex_app_perf_model.cpp",
     "server/core/src/guardian_api.cpp",
     "server/core/src/guardian_model.cpp",
+    "server/core/src/crypto_api.cpp",
 ]
 EXPECTED_IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}
 # Abstract-header store-type probe (PR #4582 FIX 3).
@@ -197,6 +207,7 @@ EXPECTED_ABSTRACT_API_HEADERS = [
     "server/core/src/schedule_api.hpp",
     "server/core/src/workflow_api.hpp",
     "server/core/src/guardian_api.hpp",
+    "server/core/src/crypto_api.hpp",
 ]
 EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
                                     "AgentRegistry", "ExecutionTracker", "PgPool",

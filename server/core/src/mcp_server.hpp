@@ -32,6 +32,7 @@
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam
+#include "crypto_api.hpp" // ADR-0031 WS-A4 (tenth family): the public in-process crypto-library read API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
@@ -799,6 +800,14 @@ public:
     /// the pre-seam `!guaranteed_state_store` guard's practical behaviour.
     void set_guardian_api(std::shared_ptr<const GuardianApi> a) { guardian_api_ = std::move(a); }
 
+    /// ADR-0031 WS-A4 (tenth family): the SAME in-process crypto-library read seam the
+    /// `/crypto` page and REST `GET /api/v1/crypto/libraries[/devices]` use - server.cpp wires
+    /// the IDENTICAL instance so `get_crypto_libraries` / `list_crypto_library_devices` can
+    /// never disagree with them. A SETTER, not a `build_handler` parameter, like the sibling
+    /// seams above. Unset (null, no software-inventory store) => the tools answer an internal
+    /// error, never an empty result.
+    void set_crypto_api(std::shared_ptr<const CryptoApi> a) { crypto_api_ = std::move(a); }
+
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
     /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
@@ -1258,6 +1267,8 @@ private:
     std::shared_ptr<const WorkflowApi> workflow_api_;
     // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
     std::shared_ptr<const GuardianApi> guardian_api_;
+    // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.
+    std::shared_ptr<const CryptoApi> crypto_api_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

@@ -232,6 +232,7 @@ IMPL_TUS = [
     # fragments that also call it (`guardian_routes.cpp`) reach it as a
     # SIBLING include, not the other way around.
     "server/core/src/guardian_model.cpp",
+    "server/core/src/crypto_api.cpp",
 ]
 # ── Abstract-header store-type probe (ADR-0031 WS-A4, FortitudeEtc / PR #4582) ─
 # The store-HEADER patterns above do NOT catch an abstract seam header that
@@ -253,6 +254,7 @@ ABSTRACT_API_HEADERS = [
     "server/core/src/schedule_api.hpp",
     "server/core/src/workflow_api.hpp",
     "server/core/src/guardian_api.hpp",
+    "server/core/src/crypto_api.hpp",
 ]
 # Most store class names end in "Store" (GuaranteedStateStore, RbacStore, …); the
 # regex catches any of them used as a type. Store/infra type names that do NOT end
@@ -546,6 +548,21 @@ FAMILIES = {
             "server/core/src/guardian_types.hpp",
             "server/core/src/guardian_api.hpp",
             "server/core/src/guardian_api_local.hpp",
+        ],
+    },
+    # `crypto` (ADR-0031 WS-A4, the TENTH family through the seam) - the /crypto
+    # crypto-library-presence READ surface (REST /api/v1/crypto/libraries[/devices], the
+    # /fragments/crypto/* fragments and MCP get_crypto_libraries /
+    # list_crypto_library_devices share ONE CryptoApi). Header-level plus the pure model:
+    # `crypto_library_model.{hpp,cpp}` names no store type (the store-facing mapping lives in
+    # the core-only crypto_api.cpp, an IMPL_TUS member).
+    "crypto": {
+        "tus": [
+            "server/core/src/crypto_types.hpp",
+            "server/core/src/crypto_library_model.hpp",
+            "server/core/src/crypto_library_model.cpp",
+            "server/core/src/crypto_api.hpp",
+            "server/core/src/crypto_api_local.hpp",
         ],
     },
 }

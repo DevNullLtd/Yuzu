@@ -1104,6 +1104,195 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     return parse(res);
 }
 
+std::optional<NamePatternRollup>
+SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) {
+    // AUTHORITATIVE read (ADR-0016 §7): any fault is nullopt, never a silent empty.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_name_pattern_rollup degraded — store "
+                         "not open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    // A size mismatch is a caller bug: surface it as a degrade rather than guess a pairing.
+    if (q.patterns.size() != q.labels.size())
+        return std::nullopt;
+    // ADR-0033 present-empty rule: deny-all -> empty value, no SQL. No patterns = nothing to match.
+    if (q.patterns.empty() || (q.agent_ids && q.agent_ids->empty()))
+        return NamePatternRollup{};
+
+    const std::vector<std::string_view> pats(q.patterns.begin(), q.patterns.end());
+    const std::vector<std::string_view> labs(q.labels.begin(), q.labels.end());
+    std::vector<std::string> params{pg::to_text_array(pats), pg::to_text_array(labs)};
+    int p = 2;
+    std::string sql =
+        "SELECT grouping(p.label, s.version, s.ecosystem) AS g, p.label, s.version, s.ecosystem, "
+        "count(DISTINCT s.agent_id), "
+        "array_to_string((array_agg(DISTINCT s.name))[1:" +
+        std::to_string(kNamePatternNamesPerRow) +
+        "], chr(31)) "
+        "FROM software_inventory_store.installed_software s "
+        "JOIN unnest($1::text[], $2::text[]) AS p(pat, label) "
+        "ON lower(s.name) LIKE p.pat ESCAPE '\\' WHERE 1=1";
+    if (q.ecosystem) {
+        sql += " AND s.ecosystem = $" + std::to_string(++p);
+        params.push_back(*q.ecosystem);
+    }
+    if (q.agent_ids) {
+        // Scope pushed before the GROUP BY: a count can never include an out-of-scope device.
+        const std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
+        sql += " AND s.agent_id = ANY($" + std::to_string(++p) + "::text[])";
+        params.push_back(pg::to_text_array(ids));
+    }
+    // g: 0 = a (label, version, ecosystem) bucket, 3 = a per-label total, 7 = the grand total.
+    // Totals sort first so the row limit can only ever cut version buckets.
+    std::vector<std::string> distinct_labels = q.labels;
+    std::ranges::sort(distinct_labels);
+    distinct_labels.erase(std::ranges::unique(distinct_labels).begin(), distinct_labels.end());
+    const std::size_t limit = static_cast<std::size_t>(kNamePatternRollupRowCap) + 1 +
+                              distinct_labels.size() + 1;
+    sql += " GROUP BY GROUPING SETS ((p.label, s.version, s.ecosystem), (p.label), ()) "
+           "ORDER BY g DESC, count(DISTINCT s.agent_id) DESC, p.label, s.version, s.ecosystem "
+           "LIMIT $" +
+           std::to_string(++p) + "::bigint";
+    params.push_back(std::to_string(limit));
+
+    auto parse = [](const pg::PgResult& res) {
+        NamePatternRollup out;
+        const int n = PQntuples(res.get());
+        for (int i = 0; i < n; ++i) {
+            const auto g = result_i64(res, i, 0);
+            const auto count = result_i64(res, i, 4);
+            if (g == 7) {
+                out.total_devices = count;
+            } else if (g == 3) {
+                out.label_counts.push_back({PQgetvalue(res.get(), i, 1), count});
+            } else if (out.rows.size() >= static_cast<std::size_t>(kNamePatternRollupRowCap)) {
+                out.truncated = true; // one past the cap: drop it, say so
+            } else {
+                NamePatternRollupRow row;
+                row.label = PQgetvalue(res.get(), i, 1);
+                row.version = PQgetvalue(res.get(), i, 2);
+                row.ecosystem = PQgetvalue(res.get(), i, 3);
+                row.device_count = count;
+                const std::string_view joined = PQgetvalue(res.get(), i, 5);
+                for (std::size_t pos = 0; pos <= joined.size() && !joined.empty();) {
+                    const auto sep = joined.find('\x1f', pos);
+                    const auto end = sep == std::string_view::npos ? joined.size() : sep;
+                    row.names.emplace_back(joined.substr(pos, end - pos));
+                    pos = end + 1;
+                }
+                out.rows.push_back(std::move(row));
+            }
+        }
+        return out;
+    };
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "software_name_pattern_rollup", samplers, sql, params,
+                         parse);
+}
+
+std::optional<NamePatternDevicesPage>
+SoftwareInventoryStore::software_name_pattern_devices(const NamePatternDevicesQuery& q) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_name_pattern_devices degraded — store "
+                         "not open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (q.patterns.empty() || (q.agent_ids && q.agent_ids->empty()))
+        return NamePatternDevicesPage{};
+    const int limit = std::clamp(q.limit, 1, kNamePatternPageMax);
+
+    const std::vector<std::string_view> pats(q.patterns.begin(), q.patterns.end());
+    std::vector<std::string> params{pg::to_text_array(pats)};
+    int p = 1;
+    std::string sql =
+        "SELECT s.agent_id, s.name, s.version, s.release, s.ecosystem, s.kind, s.install_id "
+        "FROM software_inventory_store.installed_software s "
+        "WHERE lower(s.name) LIKE ANY($1::text[])";
+    if (q.version) {
+        // Present (even "") is an exact bucket; nullopt = any version.
+        sql += " AND s.version = $" + std::to_string(++p);
+        params.push_back(*q.version);
+    }
+    if (q.ecosystem) {
+        sql += " AND s.ecosystem = $" + std::to_string(++p);
+        params.push_back(*q.ecosystem);
+    }
+    if (q.agent_ids) {
+        const std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
+        sql += " AND s.agent_id = ANY($" + std::to_string(++p) + "::text[])";
+        params.push_back(pg::to_text_array(ids));
+    }
+    if (q.after) {
+        const int a = p + 1;
+        sql += " AND (s.agent_id, s.name, s.install_id) > ($" + std::to_string(a) + ", $" +
+               std::to_string(a + 1) + ", $" + std::to_string(a + 2) + "::bigint)";
+        p += 3;
+        params.push_back(q.after->agent_id);
+        params.push_back(q.after->name);
+        params.push_back(std::to_string(q.after->install_id));
+    }
+    // limit + 1: the extra row only proves another page exists and is never returned.
+    sql += " ORDER BY s.agent_id, s.name, s.install_id LIMIT $" + std::to_string(++p) + "::bigint";
+    params.push_back(std::to_string(limit + 1));
+
+    auto parse = [limit](const pg::PgResult& res) {
+        NamePatternDevicesPage out;
+        const int n = PQntuples(res.get());
+        for (int i = 0; i < n; ++i) {
+            if (i >= limit) {
+                out.has_more = true;
+                break;
+            }
+            SoftwareFleetRow row;
+            row.agent_id = PQgetvalue(res.get(), i, 0);
+            row.entry.name = PQgetvalue(res.get(), i, 1);
+            row.entry.version = PQgetvalue(res.get(), i, 2);
+            row.entry.release = PQgetvalue(res.get(), i, 3);
+            row.entry.ecosystem = PQgetvalue(res.get(), i, 4);
+            row.entry.kind = PQgetvalue(res.get(), i, 5);
+            row.install_id = result_i64(res, i, 6);
+            out.rows.push_back(std::move(row));
+        }
+        return out;
+    };
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "software_name_pattern_devices", samplers, sql, params,
+                         parse);
+}
+
+std::optional<std::int64_t> SoftwareInventoryStore::count_reporting_agents(
+    const std::optional<std::vector<std::string>>& agent_ids) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: count_reporting_agents degraded — store not "
+                         "open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (agent_ids && agent_ids->empty())
+        return 0;
+    std::vector<std::string> params{kSourceInstalledSoftware};
+    std::string sql = "SELECT count(*) FROM software_inventory_store.inventory_state "
+                      "WHERE source = $1";
+    if (agent_ids) {
+        const std::vector<std::string_view> ids(agent_ids->begin(), agent_ids->end());
+        sql += " AND agent_id = ANY($2::text[])";
+        params.push_back(pg::to_text_array(ids));
+    }
+    auto parse = [](const pg::PgResult& res) {
+        return PQntuples(res.get()) == 1 ? result_i64(res, 0, 0) : std::int64_t{0};
+    };
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "count_reporting_agents", samplers, sql, params, parse);
+}
+
 // The WHOLE catalogue predicate (everything between FROM <table> and the keyset/ORDER BY),
 // shared by software_catalog and software_catalog_totals so a filtered total can never diverge
 // from the rows it counts. Fleet: WHERE grain/kind/eco/src [versions_min] [q arms]. Host: WHERE

@@ -217,6 +217,8 @@
 #include "auth_routes.hpp"
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
+#include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
+#include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
 #include "dex_alert_router.hpp"
@@ -18665,6 +18667,21 @@ private:
                 },
                 .audit_fn = audit_fn});
 
+        // CryptoRoutes — /crypto, /fragments/crypto/*, GET /api/v1/crypto/* (slice 1:
+        // crypto-library presence from the installed_software inventory). ONE CryptoApi
+        // instance backs the page, the REST routes and the MCP twins (set_crypto_api below).
+        // Built only when the software-inventory store exists; without it the routes are
+        // registered with a null seam and answer 503 / the degrade banner, never an empty page.
+        if (software_inventory_store_) {
+            crypto_device_api_ = device_api;
+            crypto_api_ = make_local_crypto_api(*software_inventory_store_, crypto_device_api_.get());
+        }
+        crypto_routes_ = std::make_unique<CryptoRoutes>();
+        crypto_routes_->register_routes(*web_server_, CryptoRoutes::Deps{.auth_fn = auth_fn,
+                                                                         .fleet_read_fn = fleet_read_fn,
+                                                                         .api = crypto_api_,
+                                                                         .audit_fn = audit_fn});
+
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
         // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
@@ -21090,6 +21107,11 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, so
+            // get_crypto_libraries / list_crypto_library_devices cannot disagree with the
+            // page or the REST twins. Null (no inventory store) -> the tools answer an
+            // internal error, never an empty result.
+            mcp_server_->set_crypto_api(crypto_api_);
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -22432,6 +22454,12 @@ private:
     // Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
     std::unique_ptr<SoftwareCatalogRollup> software_catalog_rollup_;
+    // /crypto slice 1 (the CryptoApi seam over software_inventory_store_). Declared AFTER the
+    // store so they destruct BEFORE it; crypto_api_ borrows the store and crypto_device_api_
+    // (hostnames for the drill) and crypto_routes_ borrows crypto_api_.
+    std::shared_ptr<DeviceApi> crypto_device_api_;
+    std::shared_ptr<CryptoApi> crypto_api_;
+    std::unique_ptr<CryptoRoutes> crypto_routes_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
