@@ -961,3 +961,12 @@ td .sub { display: block; overflow: hidden; text-overflow: ellipsis; color: var(
 .pager { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; border-top: 1px solid var(--line); }
 .pager .end { margin-left: auto; display: flex; gap: 8px; }
 /* -- end Audit and reviews page --------------------------------------------------------- */
+/* -- Groups and enrolment page ----------------------------------------------------------- */
+.panel .acts { white-space: nowrap; text-align: right; }
+.btn.link:disabled { color: var(--faint); cursor: not-allowed; text-decoration: none; }
+.pad { padding: 12px 16px; margin: 0; }
+.revealrow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+.revealrow code { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; user-select: all; padding: 6px 8px;
+                  background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl); }
+#token-section > .note { margin: 16px 16px 0; }
+/* -- end Groups and enrolment ------------------------------------------------------------ */

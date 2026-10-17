@@ -8,7 +8,7 @@
 |-------|-----|
 | Wrong server address | Verify `--server host:port` matches server's `--listen` address |
 | TLS mismatch | Ensure agent has `--ca-cert` pointing to the server's CA |
-| Enrollment not approved | Check Settings > Pending Agents in the dashboard |
+| Enrollment not approved | Check Estate > Groups and enrolment (or Settings > Pending Agent Approvals) in the dashboard |
 | Firewall | Verify port 50051 is open between agent and server |
 | Gateway mode | If using gateway, agent connects to gateway port (50051), not server directly |
 

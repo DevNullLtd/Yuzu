@@ -392,7 +392,7 @@ TEST_CASE("REST enrollment/directory: pending-agents returns pending+denied only
     h.attach_auth_db();
     REQUIRE(h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3").has_value());
     REQUIRE(h.auth_mgr.add_pending_agent("agent-2", "host2.example.com", "windows", "x86_64", "1.2.3").has_value());
-    REQUIRE(h.auth_mgr.approve_pending_agent("agent-2", "tester").value());
+    REQUIRE(h.auth_mgr.approve_pending_agent("agent-2", "tester").value() == auth::PendingTransitionOutcome::changed);
 
     auto res = h.sink.Get("/api/v1/enrollment/pending-agents");
     REQUIRE(res);
@@ -427,7 +427,7 @@ TEST_CASE("REST enrollment/directory: pending-agents includes denied agents (onl
     EnrollmentDirectoryRouteHarness h;
     h.attach_auth_db();
     REQUIRE(h.auth_mgr.add_pending_agent("agent-3", "host3.example.com", "macos", "arm64", "1.2.3").has_value());
-    REQUIRE(h.auth_mgr.deny_pending_agent("agent-3", "tester").value());
+    REQUIRE(h.auth_mgr.deny_pending_agent("agent-3", "tester").value() == auth::PendingTransitionOutcome::changed);
 
     auto res = h.sink.Get("/api/v1/enrollment/pending-agents");
     REQUIRE(res);

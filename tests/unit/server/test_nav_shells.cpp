@@ -38,6 +38,7 @@ extern const char* const kComplianceHtml;
 extern const char* const kGuardianHtml;
 extern const char* const kGuardianDetailPageHtml;
 extern const char* const kSettingsHtml;
+extern const char* const kGroupsHtml;
 extern const char* const kSettingsIntegrationsHtml;
 extern const char* const kSettingsGeneralHtml;
 extern const char* const kSettingsDataHtml;
@@ -87,8 +88,8 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
             labels.push_back(it.label);
     CHECK(labels == std::vector<std::string_view>{"Console", "Instructions", "Result sets",
                                                   "Compliance", "Guardian", "DEX", "TAR",
-                                                  "Hardware", "Software", "Fleet", "Users",
-                                                  "Tokens and principals", "Audit and reviews",
+                                                  "Groups and enrolment", "Hardware", "Software",
+                                                  "Fleet", "Users", "Tokens and principals", "Audit and reviews",
                                                   "Settings"});
 }
 
@@ -584,6 +585,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"guardian detail (shared shell default)", kGuardianDetailPageHtml, {"/guardian"}},
         {"tar", kTarPageHtml, {"/tar"}},
         {"settings", kSettingsHtml, {"/settings"}},
+        {"groups and enrolment", kGroupsHtml, {"/groups"}},
         // A sub-item: its own link is the current page and the parent is lit as the family.
         {"settings general", kSettingsGeneralHtml, {"/settings", "/settings/general"}},
         {"settings integrations", kSettingsIntegrationsHtml, {"/settings", "/settings/integrations"}},
