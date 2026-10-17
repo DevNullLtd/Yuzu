@@ -1520,6 +1520,8 @@ if build_server
       'unit/server/test_operator_surface_twins.cpp',
       'unit/server/test_schedule_params.cpp',
       'unit/server/test_plugin_config_parsers.cpp',
+      'unit/server/test_enablement_resolver.cpp',
+      'unit/server/test_enablement_units.cpp',
       'unit/server/test_plugin_config_store_pg.cpp',
       'unit/server/test_plugin_config_routes.cpp',
       'unit/server/test_upload_grant_parsers.cpp',
@@ -3119,6 +3121,15 @@ test('changelog order',
 test('capability catalogue completeness',
   _python3_test,
   args: [files('test_capability_catalogue_complete.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# ADR-3006: kUnitOs in enablement_units.hpp == the os-capability-matrix generated block,
+# both directions. Hermetic - reads sources only.
+test('enablement os applicability',
+  _python3_test,
+  args: [files('test_enablement_os_applicability.py')],
   suite: 'docs',
   timeout: 30,
 )
