@@ -565,6 +565,8 @@ yuzu_server_core_lib = static_library(
     'src/access_tokens_routes.cpp', # Tokens and principals page: /access/tokens + fragments + glue
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
+    'src/settings_security_ui.cpp',  # Security and sign-in page (System group)
+    'src/settings_security_render.cpp', # pure SSO / 2FA / HTTPS / mTLS panel renderers
     'src/settings_routes.cpp',
     'src/settings_model.cpp', # #4028 — shared REST/fragment Settings read-twin builders
     'src/settings_general_routes.cpp', # System "General and appearance": page + 2 UI fragments

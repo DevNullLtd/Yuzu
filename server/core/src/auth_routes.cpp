@@ -5000,8 +5000,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         "no MFA enrolled (a second factor is required to elevate)");
                 res.status = 403;
                 res.set_content(detail::error_json_a4(403, "elevation requires an enrolled second factor",
-                                                      cid, "enroll MFA (Settings -> Multi-Factor "
-                                                           "Authentication) before you can elevate"),
+                                                      cid, "enroll MFA (Settings -> Security and "
+                                                           "sign-in -> Two-factor sign-in) before you "
+                                                           "can elevate"),
                                 "application/json");
                 return;
             }
