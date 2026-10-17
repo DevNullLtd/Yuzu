@@ -265,7 +265,7 @@
     {
       "grant": "**None** for `list`/`query` (`docs/agent-privilege-model.md:82`); `list_hashed`/`list_tree`'s `proc_pidpath` resolved every one of 817 processes in the unprivileged capture, including root-owned system daemons",
       "if_refused": "no typed status; PID 0 (`kernel_task`) is skipped by the enumerator itself (`processes_plugin.cpp:168`), never emitted as a row",
-      "measured": "2026-09-07 on macOS 26.6.2, Apple silicon, unprivileged (euid 501, alex)",
+      "measured": "2026-09-07 on macOS 26.6.2, Apple silicon, unprivileged (euid 501, jsmith)",
       "os": "macOS",
       "runs_as": "agent daemon, root by default (`docs/agent-privilege-model.md:14`) — this capture ran unprivileged at euid 501"
     },
