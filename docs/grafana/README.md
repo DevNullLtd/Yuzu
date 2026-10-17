@@ -96,6 +96,17 @@ Scraped from the gateway's Prometheus endpoint (default `:9568`). Duration histo
 | `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` | gauge | Unix time the pin watcher last published a different key for a `{cert_file, Path}` pin; 0 until the first change in the process |
 | `yuzu_gw_cert_expiry_timestamp_seconds` | gauge | `notAfter` (Unix seconds) of each configured certificate file, labeled by `role` (`listener`, `listener_ca`, `upstream_client`, `upstream_ca`, `mgmt_peer_pin`) and `name`; keeps the last value read if the file becomes unreadable |
 | `yuzu_gw_cert_file_readable` | gauge | 1 when the latest read of the certificate file(s) under that `role` and `name` parsed, 0 when it failed |
+| `yuzu_gw_process_mailbox_len` | gauge | Messages waiting in the mailbox of a named gateway process, labeled by `process` (closed set: `upstream`, `upstream_regulator`, `registry`, `router`, `heartbeat_buffer`, `agent_sup`, `pg`, `upstream_channel`, `logger`; all created at 0). Sampled every `telemetry_gauge_interval_ms`. Alert: `YuzuGatewayProcessBacklogged` (over 10,000 for 10 minutes) |
+| `yuzu_gw_process_queue_wait_seconds` | gauge | How long a message sent to that process waited before it was handled (a probe's round trip each sample; while a probe is unanswered, the time since it was sent), labeled by `process` |
+| `yuzu_gw_listener_connections` | gauge | Connections a gRPC listener holds (Ranch active connections), labeled by `listener` role (`agent`, `management`, `other`; all created at 0) |
+| `yuzu_gw_listener_max_connections` | gauge | That role's `limits.max_connections`; no series without a ceiling (the default). Alert: `YuzuGatewayListenerNearConnectionCeiling` (over 90% for 10 minutes) |
+| `yuzu_gw_mgmt_streams_inflight` | gauge | Calls the management listener is running a handler for |
+| `yuzu_gw_router_fanouts_inflight` | gauge | Command fan-outs the router is tracking, set by the router whenever the number changes |
+| `yuzu_gw_beam_ports` | gauge | Ports open in the gateway VM (each TCP connection is one). Alert: `YuzuGatewayFileDescriptorsNearLimit` (over 90% of either limit below for 10 minutes) |
+| `yuzu_gw_beam_port_limit` | gauge | The most ports the VM can open (`+Q`) |
+| `yuzu_gw_beam_fd_limit` | gauge | The open-files limit the VM found at start; no series where the VM does not report one |
+| `yuzu_gw_beam_run_queue` | gauge | Processes waiting for a scheduler (`total_run_queue_lengths`) |
+| `yuzu_gw_grpc_connections_closed_total` | counter | Connections the gateway's HTTP/2 server closed itself, labeled by `listener` role and `reason` (`idle_timeout`, `enhance_your_calm`, `protocol_error`; every pair created at 0); counted once per connection that had a call open. A memory-ceiling kill is counted in `yuzu_gw_grpc_connection_killed_total` |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and queue-length histograms, circuit-breaker and cluster counters) is registered in `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl`.
 

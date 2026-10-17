@@ -34,6 +34,9 @@
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_config_files_tests).
+
+%% The repository root, for other modules that read shipped files.
+-export([repo_root/0]).
 -include_lib("eunit/include/eunit.hrl").
 
 %% Every shipped Erlang config, relative to the repository root. test.config is

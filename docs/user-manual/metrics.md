@@ -113,6 +113,131 @@ alert ships for these; a sustained rise of
 `yuzu_gw_upstream_permit_refused_total{class="register",reason="queue_full"}` with
 a healthy server is worth a look.
 
+## Gateway runtime metrics (#5695)
+
+Scraped from the GATEWAY (job `yuzu-gateway`). These say whether the gateway
+itself is keeping up: whether one of the processes every agent's traffic passes
+through is backing up, whether a listener or the process is close to the most
+connections it can hold, and how often the HTTP/2 server closed a connection on
+its own. They are sampled every `telemetry_gauge_interval_ms` (10 s by default)
+by `yuzu_gw_gauge`, at a cost that does not grow with the fleet: a fixed list
+of nine named processes, one `ranch:info/1` per listener, one call per
+management connection, never a walk of every process or connection. The router's
+fan-out gauge is set by the router itself whenever the number changes, and the
+close counter is incremented when the close happens. Every label is a closed
+set, and every series of a closed label set exists at 0 from start.
+
+| Metric | Type | Meaning | When it is high |
+|---|---|---|---|
+| `yuzu_gw_process_mailbox_len{process}` | gauge | Messages waiting in the mailbox of a named process. `process` is one of `upstream` (stream-status notifications, Guardian forwards, replays), `upstream_regulator` (the upstream call permits), `registry` (every registration and disconnect), `router` (command fan-outs), `heartbeat_buffer`, `agent_sup` (starts every agent process), `pg` (the process-group scope each registration joins), `upstream_channel` (the connection pool to the server) and `logger` (OTP's log handler). 0 while a process is not running | A burst that drains within a few samples is normal (a fleet reconnecting fills `registry` and `agent_sup`). Held high: see the per-process actions below. `YuzuGatewayProcessBacklogged` fires above 10,000 for 10 minutes |
+| `yuzu_gw_process_queue_wait_seconds{process}` | gauge | How long a message sent to that process waited before it was handled: each sample sends a probe (a standard OTP system message, answered in mailbox order) and this is how long it took to come back. While a probe is unanswered the gauge reports the time since it was sent, so a process that is stuck reads a number that grows by the sample interval each time | Read it together with the mailbox: a long wait with a short mailbox is a process busy inside one long operation (for `upstream`, a slow server call); a long wait with a long mailbox is a process that cannot keep up. Every agent request that goes through that process waits this long |
+| `yuzu_gw_listener_connections{listener}` | gauge | Connections a gRPC listener holds (Ranch's active connections), by listener role: `agent`, `management`, `other` (a listener that serves neither service). Listeners of the same role are added together | On the agent listener, compare with `yuzu_gw_agents_current`: many more connections than agents means clients holding connections open without registering. On the management listener, the server normally holds one or a few |
+| `yuzu_gw_listener_max_connections{listener}` | gauge | The role's `limits.max_connections`. No series when the listener has no ceiling, which is the default | `YuzuGatewayListenerNearConnectionCeiling` fires above 90% for 10 minutes. At the ceiling new connections wait in the kernel backlog and then fail. Raise `limits.max_connections` and the open-files limit together, or add a gateway |
+| `yuzu_gw_mgmt_streams_inflight` | gauge | Calls the management listener is running a handler for (a `SendCommand` waiting for its agents, a `WatchEvents`, a unary call) | Near the listener's `max_concurrent_streams` (4096 by default) new commands queue at the server. Compare with `yuzu_gw_router_fanouts_inflight`: the two move together during a fan-out |
+| `yuzu_gw_router_fanouts_inflight` | gauge | Command fan-outs the router is tracking: each one waits for its agents' terminal responses or for its timeout (300 s by default). Set by the router whenever the number changes; 0 after a router restart | A number that only grows means fan-outs whose agents never answer, each held until its timeout; check whether the targeted agents are connected |
+| `yuzu_gw_beam_ports` | gauge | Ports open in the gateway VM. Each TCP connection (agent, management, upstream) is one, so this tracks the file descriptors the connections use | `YuzuGatewayFileDescriptorsNearLimit` fires above 90% of either limit below for 10 minutes. At the limit, accepting fails and the upstream channel cannot reconnect |
+| `yuzu_gw_beam_port_limit` | gauge | The most ports the VM can open (`+Q` in `vm.args`) | Raise `+Q` if it is the lower of the two limits |
+| `yuzu_gw_beam_fd_limit` | gauge | The open-files limit the VM found when it started (the process's `nofile` limit; no series where the VM does not report one) | Raise `LimitNOFILE` (systemd) or the container's `nofile` ulimit, with headroom over the agent listener's `max_connections`; it applies at the next start |
+| `yuzu_gw_beam_run_queue` | gauge | Processes ready to run and waiting for a scheduler (`erlang:statistics(total_run_queue_lengths)`) | Held above the number of schedulers together with `yuzu_gw_beam_scheduler_util` near 1: the gateway is CPU bound. Give it more cores or spread agents over more gateways |
+| `yuzu_gw_grpc_connections_closed_total{listener,reason}` | counter | Connections the gateway's HTTP/2 server (Cowboy) closed itself, by listener role and `reason`: `idle_timeout` (nothing received for the listener's `idle_timeout`: 180 s on the agent listener of `sys.config.prod`, 600 s by default), `enhance_your_calm` (a flood limit, such as more stream cancels than `max_cancel_stream_rate`), `protocol_error` (any other HTTP/2 connection error). Counted once per connection, for a connection that had a call open when it closed (an agent's `Subscribe` is always open). A peer that closes is not counted; a connection killed for its memory ceiling is counted in `yuzu_gw_grpc_connection_killed_total` | `idle_timeout` on the agent listener is agents that went silent without closing (a network path that drops without a reset). `enhance_your_calm` on the management listener closed the server's connection and every command on it: check that the server's per-call deadline is longer than the gateway's (see the gateway manual's deadline section). Any `protocol_error` is a client sending malformed HTTP/2 |
+
+`yuzu_gw_beam_scheduler_util` now counts the normal schedulers only. It used to
+average the dirty schedulers in as well, which are mostly idle, so a gateway
+whose normal schedulers were all busy read about 0.3; it now reads about 1.
+
+**Per-process actions** (`YuzuGatewayProcessBacklogged`, or a high
+`yuzu_gw_process_queue_wait_seconds`):
+
+- `upstream`, `upstream_channel`, `heartbeat_buffer`: the server is slow or
+  unreachable. Check the server and its database, and `YuzuGatewayUpstreamSlow`
+  and the circuit breaker; restarting the gateway does not help and disconnects
+  its agents.
+- `registry`, `agent_sup`, `pg`: registrations and disconnects are arriving
+  faster than they are handled. Look for agents reconnecting in a loop
+  (`rate(yuzu_gw_agents_connected_total[5m])` far above the fleet's normal
+  churn) and for what makes them reconnect.
+- `router`: commands are fanned out faster than they complete. Slow the
+  dispatching side (scheduled instructions firing together).
+- `upstream_regulator`: callers waiting for upstream call permits; read
+  `yuzu_gw_upstream_permits_waiting` and the server's health.
+- `logger`: the gateway is writing too many log lines. Raise its log level;
+  OTP's handler drops lines rather than grow without bound, so this alone does
+  not stop the gateway.
+
+## Gateway metric index
+
+Every other metric the gateway exports, so this page names each one. The
+gateway manual's [Prometheus Metrics](gateway.md#prometheus-metrics) section has
+the full description of each; the sections above cover the certificate, permit,
+held-notification and runtime families. `node` is the gateway's Erlang node
+name. A family marked "first event" has no series until its first event,
+because its label values are not known at start (a plugin name, a TLS alert, a
+peer node) or because it is a histogram; every other family exists from start.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `yuzu_gw_agents_current` | gauge | `node` | Agents connected to this gateway now |
+| `yuzu_gw_agents_connected_total` | counter | `node` | Agent connections accepted |
+| `yuzu_gw_agents_disconnected_total` | counter | `node` | Agent disconnections |
+| `yuzu_gw_agent_session_duration_ms` | histogram | `node` | How long agent sessions lasted, in ms (first event) |
+| `yuzu_gw_commands_dispatched_total` | counter | `plugin` | Commands dispatched to agents (first event) |
+| `yuzu_gw_commands_timed_out_total` | counter | | Commands that timed out before a response |
+| `yuzu_gw_commands_dropped_backpressure_total` | counter | | Commands dropped because an agent's send buffer was full |
+| `yuzu_gw_command_duration_ms` | histogram | `plugin`, `status` | Command duration in ms (first event) |
+| `yuzu_gw_stream_write_errors_total` | counter | | Agent stream write errors |
+| `yuzu_gw_stream_queue_len_distribution` | histogram | | Agent stream mailbox lengths at backpressure events |
+| `yuzu_gw_fanout_target_count` | histogram | | Agents targeted per fan-out |
+| `yuzu_gw_fanout_dispatched_count` | histogram | | Agents dispatched to per fan-out |
+| `yuzu_gw_fanout_skipped_count` | histogram | | Agents skipped (not connected) per fan-out |
+| `yuzu_gw_fanout_remote_dispatched_count` | histogram | | Agents dispatched to another gateway node per fan-out |
+| `yuzu_gw_upstream_rpc_duration_ms` | histogram | `rpc_name` | Gateway-to-server call latency in ms (first event) |
+| `yuzu_gw_upstream_rpc_errors_total` | counter | `rpc_name`, `code` | Gateway-to-server call errors |
+| `yuzu_gw_upstream_tls_handshake_failures_total` | counter | `rpc_name`, `kind` | TLS handshake failures to the server, `kind` the TLS alert (first event) |
+| `yuzu_gw_upstream_circuit_transitions_total` | counter | `state` | Circuit breaker transitions (`closed`, `open`, `half_open`) |
+| `yuzu_gw_upstream_backpressure_seconds_total` | counter | | Seconds the path to the server was backed up |
+| `yuzu_gw_upstream_lane_saturated_seconds_total` | counter | `lane` | The same, per lane (`permits`, `notify`, `guardian`) |
+| `yuzu_gw_upstream_backpressure_duty_cycle` | gauge | | Share of the last 60 s the path to the server was backed up |
+| `yuzu_gw_upstream_slow` | gauge | | 1 when that share is 0.5 or more |
+| `yuzu_gw_upstream_notify_pending` | gauge | `node` | Stream-status notifications held now |
+| `yuzu_gw_upstream_notify_inflight` | gauge | `node` | Stream-status notification sends in flight (at most 10) |
+| `yuzu_gw_upstream_notify_coalesced_total` | counter | | Held notifications replaced by a newer one for the same session |
+| `yuzu_gw_upstream_notify_dropped_total` | counter | `reason` | Notifications refused at a full store |
+| `yuzu_gw_register_refused_total` | counter | `reason` | Registers the edge refused before any upstream call |
+| `yuzu_gw_registration_replay_total` | counter | | Registration replay attempts |
+| `yuzu_gw_registration_replay_queue_depth` | gauge | `node` | Agents queued for registration replay |
+| `yuzu_gw_registration_replay_triggered_total` | counter | `trigger` | Registration replays started (`breaker`, `heartbeat`, `notify_loss`) |
+| `yuzu_gw_guardian_forward_accepted_total` | counter | | Guardian drift events accepted for forwarding |
+| `yuzu_gw_guardian_forward_dropped_total` | counter | `reason` | Guardian drift events dropped (`circuit_open`, `at_capacity`) |
+| `yuzu_gw_heartbeat_rejected_total` | counter | `reason` | Heartbeats refused for want of a usable session binding |
+| `yuzu_gw_heartbeat_session_mismatch_total` | counter | `event` | Heartbeats refused because they came on another connection (`event="security"`) |
+| `yuzu_gw_heartbeat_unknown_truncated_total` | counter | | Heartbeat verdicts whose unknown-session list the server truncated |
+| `yuzu_gw_heartbeat_verdict_dropped_total` | counter | `reason` | Session ids from a verdict not queued for replay |
+| `yuzu_gw_heartbeat_buffer_dropped_total` | counter | `reason` | Heartbeat data the buffer gave up to stay bounded |
+| `yuzu_gw_heartbeat_coalesced_total` | counter | | Heartbeats merged into the buffered one of the same session |
+| `yuzu_gw_session_limit_rejected_total` | counter | | Registrations refused by the per-connection session cap |
+| `yuzu_gw_mgmt_auth_rejected_total` | counter | `reason` | Management-listener streams refused by the peer pin |
+| `yuzu_gw_mgmt_auth_pin_unresolved_total` | counter | | Management auth attempts with a configured pin that did not resolve |
+| `yuzu_gw_grpc_origin_ignored_total` | counter | `mode`, `reason` | Calls behind a proxy whose claimed client address was not used |
+| `yuzu_gw_grpc_dropped_data_bytes_total` | counter | `reason` | Request bytes discarded because the call could not use them |
+| `yuzu_gw_grpc_recv_timeout_total` | counter | | One-request calls aborted because the request did not arrive in time |
+| `yuzu_gw_grpc_connection_killed_total` | counter | `reason` | Connections killed for passing their memory ceiling (`max_heap_size`) |
+| `yuzu_gw_memory_shedding_active` | gauge | | 1 while the agent listener is suspended to shed load |
+| `yuzu_gw_memory_shedding_suspensions_total` | counter | | Times the gateway began shedding load |
+| `yuzu_gw_cluster_events_total` | counter | `event`, `node` | Peer nodes joining and leaving (first event) |
+| `yuzu_gw_cluster_rebalanced_agents_total` | counter | | Agents moved during rebalancing |
+| `yuzu_gw_cluster_peers_resolved` | gauge | `node` | Peer addresses the cluster discovery found |
+| `yuzu_gw_cluster_peers_connected` | gauge | `node` | Peer nodes connected |
+| `yuzu_gw_cluster_connect_failures_total` | counter | | Failed connections to peer nodes |
+| `yuzu_gw_cluster_address_cap_exceeded_total` | counter | | New peer addresses refused by the lifetime address cap |
+| `yuzu_gw_beam_process_count` | gauge | `node` | Erlang processes in the gateway VM |
+| `yuzu_gw_beam_memory_bytes` | gauge | `node`, `type` | VM memory by `type` (`total`, `processes`, `ets`, `binary`) |
+| `yuzu_gw_beam_scheduler_util` | gauge | `node` | Share of the last sample the normal schedulers were busy, 0 to 1 |
+
+A test (`yuzu_gw_metrics_scrape_tests`) starts the gateway from its shipped
+configuration, fetches `/metrics` over HTTP and fails if any metric the gateway
+declares is missing from the scrape or from this page, if this page names a
+`yuzu_gw_` metric the gateway does not declare, or if an alert rule reads one.
+
 ## Executions event-outbox metrics (HA WS-2a)
 
 The durable `event_outbox` (ADR-2002 §5) shadows the execution-history SSE events and,
