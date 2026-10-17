@@ -1,0 +1,153 @@
+/**
+ * msi_packages_inventory.hpp -- pure row builder for msi_packages.list_inventory.
+ *
+ * No Windows headers: the OS boundary (MsiEnumProductsExW / MsiGetProductInfoExW)
+ * is injected as two callables, so the builder is unit-tested on every OS from a
+ * committed real capture.
+ *
+ * Wire grammar (consumed by parse_msi_packages_list_inventory_output in
+ * agents/core/src/sync_source_installed_software.cpp):
+ *
+ *   status|list_inventory|<supported|constrained|unsupported>|<tokens or ->
+ *   inv|<product_code>|<name>|<version>|<publisher>      (one per product)
+ *
+ * The status row always leads. There is no sentinel row: zero products is
+ * `status|list_inventory|supported|-` and nothing else. A property that cannot
+ * be read is an EMPTY token, never `-` and never a status token.
+ */
+#pragma once
+
+#include <yuzu/string_utils.hpp>
+
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace yuzu::msi_packages::inventory {
+
+/// MSIINSTALLCONTEXT_MACHINE. The Windows shell static_asserts equality with the
+/// SDK constant; it is repeated here so this header needs no Windows headers.
+inline constexpr unsigned kMachineContext = 4;
+
+inline constexpr std::string_view kAction = "list_inventory";
+inline constexpr std::string_view kPropName = "InstalledProductName";
+inline constexpr std::string_view kPropVersion = "VersionString";
+inline constexpr std::string_view kPropPublisher = "Publisher";
+
+enum class StatusLevel { supported, constrained, unsupported };
+
+struct Product {
+    std::string code;
+    std::string name;
+    std::string version;
+    std::string publisher;
+};
+
+struct Inventory {
+    std::vector<Product> products;
+    /// Set when the enumeration did not end cleanly: a failure token. The rows
+    /// read before the failure are kept.
+    std::optional<std::string> constraint;
+};
+
+/// Walks the machine-context products. `enumerate(ctx, on_code)` calls
+/// on_code(std::string) once per product code and returns nullopt when the walk
+/// ended cleanly, else a failure token. `property(code, ctx, name)` returns the
+/// property value or nullopt when it cannot be read (empty field).
+///
+/// An advertised-but-not-installed product is enumerated by the OS, but
+/// InstalledProductName, VersionString and Publisher are installed-only
+/// properties (MsiGetProductInfoEx contract), so it renders `inv|{code}|||` and
+/// the collector drops the empty name. That is deliberate, not an oversight.
+template <class Enumerate, class Property>
+Inventory collect(Enumerate&& enumerate, Property&& property) {
+    Inventory inv;
+    auto on_code = [&](std::string code) {
+        Product p;
+        p.name = property(code, kMachineContext, kPropName).value_or(std::string{});
+        p.version = property(code, kMachineContext, kPropVersion).value_or(std::string{});
+        p.publisher = property(code, kMachineContext, kPropPublisher).value_or(std::string{});
+        p.code = std::move(code);
+        inv.products.push_back(std::move(p));
+    };
+    inv.constraint = enumerate(kMachineContext, on_code);
+    return inv;
+}
+
+/// Deletes the characters that would break the row framing: '|', tab, CR, LF.
+/// Backslash and everything else is kept. The collector's split_tokens
+/// (sync_source_installed_software.cpp) splits on every raw '|' and never
+/// unescapes, so yuzu::util::safe_output_field's `\|` would shift the fields and
+/// the row would be dropped; this is the installed_apps `inv|` pipe_safe rule
+/// (installed_apps_inventory.hpp). Do NOT use safe_output_field for inv fields.
+inline std::string strip_row_breakers(std::string_view v) {
+    std::string out;
+    out.reserve(v.size());
+    for (char c : v) {
+        if (c == '|' || c == '\t' || c == '\r' || c == '\n')
+            continue;
+        out.push_back(c);
+    }
+    return out;
+}
+
+[[nodiscard]] inline const char* level_token(StatusLevel level) noexcept {
+    switch (level) {
+    case StatusLevel::supported:
+        return "supported";
+    case StatusLevel::constrained:
+        return "constrained";
+    case StatusLevel::unsupported:
+        return "unsupported";
+    }
+    return "constrained";
+}
+
+/// status|<action>|<level>|<tokens or ->. Action and tokens are fixed
+/// vocabulary, so they go through safe_output_field as pkg_inventory does.
+[[nodiscard]] inline std::string format_status_row(std::string_view action, StatusLevel level,
+                                                   std::string_view tokens) {
+    std::string out = "status|";
+    out += yuzu::util::safe_output_field(action);
+    out += '|';
+    out += level_token(level);
+    out += '|';
+    out += tokens.empty() ? std::string{"-"} : yuzu::util::safe_output_field(tokens);
+    return out;
+}
+
+/// inv|<code>|<name>|<version>|<publisher>; empty stays empty.
+[[nodiscard]] inline std::string format_inventory_row(const Product& p) {
+    std::string out = "inv|";
+    out += strip_row_breakers(p.code);
+    out += '|';
+    out += strip_row_breakers(p.name);
+    out += '|';
+    out += strip_row_breakers(p.version);
+    out += '|';
+    out += strip_row_breakers(p.publisher);
+    return out;
+}
+
+[[nodiscard]] inline std::string unsupported_status_row(std::string_view token) {
+    return format_status_row(kAction, StatusLevel::unsupported, token);
+}
+
+/// Status row first (constrained iff a constraint is set), then one row per
+/// product. No cap: the enumeration is OS-bounded and the collector reads one
+/// past its own row cap.
+[[nodiscard]] inline std::vector<std::string> render(const Inventory& inv) {
+    std::vector<std::string> rows;
+    rows.reserve(inv.products.size() + 1);
+    if (inv.constraint)
+        rows.push_back(format_status_row(kAction, StatusLevel::constrained, *inv.constraint));
+    else
+        rows.push_back(format_status_row(kAction, StatusLevel::supported, {}));
+    for (const auto& p : inv.products)
+        rows.push_back(format_inventory_row(p));
+    return rows;
+}
+
+} // namespace yuzu::msi_packages::inventory

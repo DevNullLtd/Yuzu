@@ -141,7 +141,7 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 
 // matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list and
 // pkg_inventory.store_packages added 2026-10-17), 231 rows.
-inline constexpr std::array<UnitOsRow, 231> kUnitOs{{
+inline constexpr std::array<UnitOsRow, 232> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -243,6 +243,7 @@ inline constexpr std::array<UnitOsRow, 231> kUnitOs{{
     {"mgmt_posture", "posture", kWin | kLin | kMac},
     {"msi_packages", "list", kWin | kMac},
     {"msi_packages", "product_codes", kWin | kMac},
+    {"msi_packages", "list_inventory", kWin},
     {"netprobe", "icmp", kWin | kLin | kMac},
     {"netprobe", "tcp", kWin | kLin | kMac},
     {"netprobe", "dns", kWin | kLin | kMac},

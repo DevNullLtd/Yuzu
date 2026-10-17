@@ -7,6 +7,7 @@
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
 #include "sync_scheduler.hpp"
+#include "msi_packages_inventory.hpp"
 #include "pkg_inventory_parsers.hpp"
 #include "sync_source_installed_software.hpp"
 #include "windows_optional_features_parsers.hpp"
@@ -32,6 +33,7 @@
 using yuzu::agent::AdaptedRows;
 using yuzu::agent::installed_software_canonical_blob;
 using yuzu::agent::make_installed_software_source;
+using yuzu::agent::parse_msi_packages_list_inventory_output;
 using yuzu::agent::parse_pkg_inventory_managers_output;
 using yuzu::agent::parse_pkg_inventory_packages_output;
 using yuzu::agent::parse_pkg_inventory_store_packages_output;
@@ -1170,9 +1172,14 @@ TEST_CASE("SyncScheduler: a forced source's own RPC failure retries next tick, "
 // Extended tail pins, action adapters and the multi-action collector
 // ============================================================================
 
+#ifndef YUZU_TEST_FIXTURE_DIR
+#define YUZU_TEST_FIXTURE_DIR "tests/unit/fixtures"
+#endif
+
 namespace {
 namespace fs = std::filesystem;
 namespace pkg = yuzu::pkg_inventory;
+namespace msi = yuzu::msi_packages::inventory;
 using Status = AdaptedRows::Status;
 
 // Server-side fixtures, copied verbatim from
@@ -1261,7 +1268,7 @@ struct FakeOut {
     std::map<std::string, std::tuple<YuzuResultStatus, YuzuResultCompleteness, std::string>>
         result_status;
 };
-FakeOut g_fake[3]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features
+FakeOut g_fake[4]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features, 3 msi_packages
 
 template <int I>
 int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /*params*/,
@@ -1283,6 +1290,7 @@ int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /
 const char* const kFakeIaActions[] = {"list_inventory", nullptr};
 const char* const kFakePkgActions[] = {"managers", "packages", "store_packages", nullptr};
 const char* const kFakeWofActions[] = {"list", nullptr};
+const char* const kFakeMsiActions[] = {"list_inventory", nullptr};
 
 #define YUZU_FAKE_DESC(var, plugin_name, actions, idx)                                            \
     const YuzuPluginDescriptor var = {YUZU_PLUGIN_ABI_VERSION, plugin_name, "1.0.0", "test fake", \
@@ -1291,12 +1299,14 @@ const char* const kFakeWofActions[] = {"list", nullptr};
 YUZU_FAKE_DESC(kFakeIa, "installed_apps", kFakeIaActions, 0);
 YUZU_FAKE_DESC(kFakePkg, "pkg_inventory", kFakePkgActions, 1);
 YUZU_FAKE_DESC(kFakeWof, "windows_optional_features", kFakeWofActions, 2);
+YUZU_FAKE_DESC(kFakeMsi, "msi_packages", kFakeMsiActions, 3);
 #undef YUZU_FAKE_DESC
 
 SyncPluginMap all_plugins() {
     return {{"installed_apps", &kFakeIa},
             {"pkg_inventory", &kFakePkg},
-            {"windows_optional_features", &kFakeWof}};
+            {"windows_optional_features", &kFakeWof},
+            {"msi_packages", &kFakeMsi}};
 }
 
 void reset_fakes() {
@@ -1317,6 +1327,7 @@ void fake_mac() {
     g_fake[1].out["store_packages"] =
         capture_section("pkg_inventory", "macos.txt", "store_packages");
     g_fake[2].out["list"] = yuzu::wof::format_unsupported_row("list", "macos:dism:unsupported") + "\n";
+    g_fake[3].out["list_inventory"] = msi::unsupported_status_row("macos:owned_by_installed_apps") + "\n";
 }
 
 void fake_windows() {
@@ -1330,6 +1341,15 @@ void fake_windows() {
     g_fake[1].out["store_packages"] =
         pkg::unsupported_status_row("store_packages", "windows:planned") + "\n";
     g_fake[2].out["list"] = capture_section("windows_optional_features", "windows.txt", "list");
+    g_fake[3].out["list_inventory"] = capture_section("msi_packages", "windows.txt", "list_inventory");
+}
+
+// Number of MSI products in the committed Windows sample that the collector maps (a non-empty
+// name), counted from the sample itself so a recapture does not break the pinned totals.
+std::size_t msi_sample_mapped_rows() {
+    return parse_msi_packages_list_inventory_output(
+               capture_section("msi_packages", "windows.txt", "list_inventory"))
+        .entries.size();
 }
 
 std::optional<std::pair<std::string, std::string>> collect_with(SyncPluginMap plugins) {
@@ -1836,6 +1856,239 @@ TEST_CASE("new adapters clamp every field like parse_installed_apps_output",
     }
 }
 
+// --- msi_packages.list_inventory ---
+
+namespace {
+// The machine-context (ctx 4) rows of the committed Kingsley capture, rendered by the REAL
+// builder (msi::render), so the adapter is fed exactly what the plugin emits.
+// products-system.txt columns: code|ctx|sid|name|version|publisher|location.
+std::string msi_rendered_fixture(std::size_t* machine_rows = nullptr) {
+    const fs::path p = fs::path(YUZU_TEST_FIXTURE_DIR) / "software-estate" / "msi_packages" /
+                       "windows" / "products-system.txt";
+    std::ifstream in(p);
+    REQUIRE(in.is_open());
+    msi::Inventory inv;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line.front() == '#')
+            continue;
+        std::vector<std::string> f;
+        std::size_t pos = 0;
+        for (;;) {
+            const auto bar = line.find('|', pos);
+            if (bar == std::string::npos) {
+                f.push_back(line.substr(pos));
+                break;
+            }
+            f.push_back(line.substr(pos, bar - pos));
+            pos = bar + 1;
+        }
+        REQUIRE(f.size() == 7);
+        if (f[1] != "4")
+            continue; // the per-user row (ctx 2) is never listed
+        inv.products.push_back({f[0], f[3], f[4], f[5]});
+    }
+    if (machine_rows)
+        *machine_rows = inv.products.size();
+    std::string out;
+    for (const auto& row : msi::render(inv))
+        out += row + '\n';
+    return out;
+}
+} // namespace
+
+TEST_CASE("msi_packages adapter: maps the builder-rendered Kingsley capture",
+          "[sync][parse][adapter][msi_packages]") {
+    std::size_t n = 0;
+    const auto r = parse_msi_packages_list_inventory_output(msi_rendered_fixture(&n));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(n == 118);
+    REQUIRE(r.entries.size() == 118);
+    CHECK(r.reason.empty());
+
+    const auto& e = r.entries[0];
+    CHECK(e.name == "Python Launcher");
+    CHECK(e.version == "3.14.6150.0");
+    CHECK(e.publisher == "Python Software Foundation");
+    CHECK(e.kind == "pkg");
+    CHECK(e.ecosystem == "msi");
+    CHECK(e.package_id == "{0B1B5000-3C0E-41C0-83C4-4C914420AE93}");
+    CHECK(e.install_date.empty());
+    CHECK(e.epoch.empty());
+    CHECK(e.release.empty());
+    CHECK(e.arch.empty());
+    CHECK(e.signature_status.empty());
+    CHECK(e.distro_id.empty());
+    CHECK(e.distro_version.empty());
+    CHECK(e.source.empty()); // the collector stamps source
+    for (const auto& x : r.entries)
+        CHECK(x.package_id != "{665A0435-D5D5-4A49-9DE0-FBC23C5425ED}");
+    check_blob_size(installed_software_canonical_blob(r.entries), 118);
+}
+
+TEST_CASE("msi_packages adapter: a pipe-bearing product survives the producer/collector round trip",
+          "[sync][parse][adapter][msi_packages]") {
+    // SYNTHETIC product (no captured name contains a pipe). MUTATION: a producer that escapes the
+    // fields with safe_output_field emits `\|`, which the raw-pipe splitter sees as a 7-token row;
+    // the adapter drops it and entries.size() == 1 fails.
+    msi::Inventory inv;
+    inv.products.push_back({"{11111111-2222-3333-4444-555555555555}", "Foo | Bar Agent", "1.0",
+                            "Foo | Bar Ltd"});
+    std::string out;
+    for (const auto& row : msi::render(inv))
+        out += row + '\n';
+    const auto r = parse_msi_packages_list_inventory_output(out);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 1);
+    CHECK(r.entries[0].name == "Foo  Bar Agent");
+    CHECK(r.entries[0].publisher == "Foo  Bar Ltd");
+    CHECK(r.entries[0].package_id == "{11111111-2222-3333-4444-555555555555}");
+}
+
+TEST_CASE("msi_packages adapter: the real Windows sample", "[sync][parse][adapter][msi_packages]") {
+    const auto r = parse_msi_packages_list_inventory_output(
+        capture_section("msi_packages", "windows.txt", "list_inventory"));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE_FALSE(r.entries.empty());
+    for (const auto& e : r.entries) {
+        CHECK(e.kind == "pkg");
+        CHECK(e.ecosystem == "msi");
+        REQUIRE(e.package_id.size() == 38);
+        CHECK(e.package_id.front() == '{');
+        CHECK(e.package_id.back() == '}');
+        CHECK_FALSE(e.name.empty());
+    }
+}
+
+TEST_CASE("msi_packages adapter: status grammar", "[sync][parse][adapter][msi_packages]") {
+    const std::string row = "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub";
+    const auto status = [](std::string_view level, std::string_view tokens) {
+        return "status|list_inventory|" + std::string{level} + "|" + std::string{tokens};
+    };
+    SECTION("constrained fails (a partial roster would delete stored msi rows)") {
+        const auto r = parse_msi_packages_list_inventory_output(
+            nl({status("constrained", "windows:msi_enum:1610"), row}));
+        CHECK(r.status == Status::failed);
+        CHECK(r.reason == "windows:msi_enum:1610");
+    }
+    SECTION("unsupported on macOS and Linux") {
+        for (const char* token : {"macos:owned_by_installed_apps", "linux:no_msi"}) {
+            const auto r = parse_msi_packages_list_inventory_output(
+                nl({status("unsupported", token)}));
+            CHECK(r.status == Status::unsupported);
+            CHECK(r.entries.empty());
+        }
+    }
+    SECTION("no status row, another action's status row, empty input") {
+        CHECK(parse_msi_packages_list_inventory_output(nl({row})).status == Status::failed);
+        CHECK(parse_msi_packages_list_inventory_output(nl({"status|packages|supported|-", row}))
+                  .status == Status::failed);
+        CHECK(parse_msi_packages_list_inventory_output("").status == Status::failed);
+    }
+    SECTION("supported with zero rows is a legitimate answer") {
+        const auto r = parse_msi_packages_list_inventory_output(nl({status("supported", "-")}));
+        CHECK(r.status == Status::ok);
+        CHECK(r.entries.empty());
+    }
+    SECTION("two status rows fail") {
+        CHECK(parse_msi_packages_list_inventory_output(
+                  nl({status("supported", "-"), status("supported", "-")}))
+                  .status == Status::failed);
+    }
+}
+
+TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_packages]") {
+    const std::string ok_status = "status|list_inventory|supported|-";
+    const std::string good = "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub";
+    SECTION("a 4-token and a 6-token inv row are dropped, never truncated or padded") {
+        // MUTATION: split_tokens truncation to 5 would map the 6-token row.
+        const auto r = parse_msi_packages_list_inventory_output(
+            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0",
+                good + "|extra", good + "|extra|more"}));
+        CHECK(r.status == Status::ok);
+        CHECK(r.entries.empty());
+    }
+    SECTION("an empty code is mapped with an empty package_id (the adapter invents no key)") {
+        const auto r = parse_msi_packages_list_inventory_output(nl({ok_status, "inv||name|1|pub"}));
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].package_id.empty());
+    }
+    SECTION("an empty name is seen but not mapped") {
+        const auto r = parse_msi_packages_list_inventory_output(
+            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}||1|pub"}));
+        CHECK(r.status == Status::ok);
+        CHECK(r.entries.empty());
+    }
+    SECTION("legacy list rows and product_codes rows are ignored") {
+        const auto r = parse_msi_packages_list_inventory_output(
+            nl({ok_status, "msi|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|-",
+                "product_code|{AAAAAAAA-0000-0000-0000-000000000001}|App", good}));
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].name == "App");
+    }
+}
+
+TEST_CASE("collector: msi_packages rows ride the extended tail and a constrained answer skips",
+          "[sync][collector][msi_packages]") {
+    SECTION("Windows-shaped run: msi records carry package_id and source, slots 13-14 stay empty") {
+        fake_windows();
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        std::size_t msi_records = 0;
+        for (const auto& rec : records_of(got->first)) {
+            const auto f = fields_of(rec);
+            REQUIRE(f.size() == 16);
+            if (f[15] != "msi_packages.list_inventory")
+                continue;
+            ++msi_records;
+            CHECK(f[4] == "pkg");
+            CHECK(f[5] == "msi");
+            CHECK(f[12].empty()); // install_location (reserved, #5186)
+            CHECK(f[13].empty()); // uninstall_string (reserved, #5186)
+            CHECK(f[14].size() == 38); // {GUID}
+        }
+        CHECK(msi_records == msi_sample_mapped_rows());
+        CHECK(msi_records > 0);
+    }
+    SECTION("a constrained enumeration skips the whole cycle with the named reason") {
+        fake_windows();
+        g_fake[3].out["list_inventory"] =
+            "status|list_inventory|constrained|windows:msi_enum:5\n"
+            "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub\n";
+        auto src = make_installed_software_source(all_plugins());
+        REQUIRE(src.skip_reason);
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "msi_packages.list_inventory:windows:msi_enum:5");
+    }
+    SECTION("macOS: the unsupported answer is skipped silently and the cycle collects") {
+        fake_mac();
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        for (const auto& rec : records_of(got->first))
+            CHECK(fields_of(rec)[15] != "msi_packages.list_inventory");
+    }
+}
+
+TEST_CASE("extended tail: an msi entry's package_id participates in the canonical blob",
+          "[sync][hash][extended_row][msi_packages]") {
+    SwEntry with_id;
+    with_id.name = "CMake";
+    with_id.version = "4.3.4";
+    with_id.publisher = "Kitware";
+    with_id.kind = "pkg";
+    with_id.ecosystem = "msi";
+    with_id.package_id = "{B7526150-1C45-45B5-932D-A4CF5A23403C}";
+    with_id.source = "msi_packages.list_inventory";
+    SwEntry without_id = with_id;
+    without_id.package_id.clear();
+    CHECK(sha256_hex(installed_software_canonical_blob({with_id})) !=
+          sha256_hex(installed_software_canonical_blob({without_id})));
+    // Two products with the same name/version/publisher but different codes stay two rows.
+    SwEntry other = with_id;
+    other.package_id = "{B7526150-1C45-45B5-932D-A4CF5A23403D}";
+    CHECK(records_of(installed_software_canonical_blob({with_id, other})).size() == 2);
+}
+
 TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence row",
           "[sync][collector]") {
     fake_mac();
@@ -1954,7 +2207,7 @@ TEST_CASE("collector: successful-empty answers are not failures", "[sync][collec
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         const auto recs = records_of(got->first);
-        CHECK(recs.size() == 241 + 137);
+        CHECK(recs.size() == 241 + 137 + msi_sample_mapped_rows());
         std::size_t disabled = 0;
         std::size_t enabled = 0;
         for (const auto& rec : recs) {
@@ -1993,7 +2246,7 @@ TEST_CASE("collector: Windows-shaped run with the real captures", "[sync][collec
     }();
     const auto got = collect_with(all_plugins());
     REQUIRE(got.has_value());
-    CHECK(records_of(got->first).size() == 241 + 17);
+    CHECK(records_of(got->first).size() == 241 + 17 + msi_sample_mapped_rows());
 }
 
 TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector skips above it",

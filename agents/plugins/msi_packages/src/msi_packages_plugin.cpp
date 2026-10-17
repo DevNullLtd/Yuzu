@@ -2,11 +2,21 @@
  * msi_packages_plugin.cpp — MSI / pkgutil package inventory plugin for Yuzu
  *
  * Actions:
- *   "list"          — Lists all installed packages.
- *   "product_codes" — Returns compact list of package identifiers.
+ *   "list"           — Lists all installed packages.
+ *   "product_codes"  — Returns compact list of package identifiers.
+ *   "list_inventory" — Machine-context MSI products for the daily
+ *                      installed-software inventory (see below).
  *
- * Windows: enumerates MSI products via MsiEnumProductsA; the code slot is a
- *   real {GUID} product code.
+ * Windows: `list` and `product_codes` enumerate MSI products via
+ *   MsiEnumProductsA; the code slot is a real {GUID} product code. They stay on
+ *   the ANSI MsiEnumProductsA/MsiGetProductInfoA deliberately (behaviour freeze:
+ *   every visible install context, `-` placeholders, a sentinel row).
+ *   `list_inventory` is the wide-API leg (docs/cpp-conventions.md: the A variants
+ *   return the system code page and corrupt non-ASCII names): it walks
+ *   MsiEnumProductsExW(szUserSid=NULL, MSIINSTALLCONTEXT_MACHINE) and reads
+ *   InstalledProductName / VersionString / Publisher with MsiGetProductInfoExW.
+ *   Per-user products are never listed by it. The wire grammar and the pure row
+ *   builder live in msi_packages_inventory.hpp.
  * macOS: enumerates `pkgutil --pkgs` receipts; the code slot is the honest
  *   reverse-domain package identifier (e.g. "com.apple.pkg.Core") — never a
  *   fabricated GUID.
@@ -20,8 +30,11 @@
 #include <yuzu/plugin.hpp>
 
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
+
+#include "msi_packages_inventory.hpp"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -33,6 +46,8 @@
 #include <windows.h>
 #include <msi.h>
 #pragma comment(lib, "msi.lib")
+
+#include <win_str.hpp> // yuzu::win::to_wide / from_wide (list_inventory W/Ex leg)
 
 // String property names for MsiGetProductInfoA
 static constexpr const char* kInstalledProductName = "InstalledProductName";
@@ -107,6 +122,61 @@ std::string get_product_info(const char* product_code, const char* property) {
         return std::string(buf, size);
     }
     return {};
+}
+
+static_assert(yuzu::msi_packages::inventory::kMachineContext ==
+              static_cast<unsigned>(MSIINSTALLCONTEXT_MACHINE));
+
+// Walks the machine-context products, calling on_code(std::string) per product
+// code. Returns nullopt when the walk ended with ERROR_NO_MORE_ITEMS, else a
+// failure token.
+//
+// szUserSid MUST be NULL for MSIINSTALLCONTEXT_MACHINE (MS contract;
+// ERROR_INVALID_PARAMETER with a SID, measured on Kingsley 2026-10-17). szSid and
+// pcchSid are NULL because the machine context has no SID. dwIndex may only be
+// incremented after ERROR_SUCCESS (MS contract), so any other code ends the walk:
+// there is no skip-the-bad-index-and-continue path.
+template <class OnCode>
+std::optional<std::string> enumerate_machine_products(unsigned ctx, OnCode&& on_code) {
+    wchar_t code[39]{}; // {GUID} = 38 chars + NUL
+    MSIINSTALLCONTEXT got{};
+    for (DWORD i = 0;; ++i) {
+        const UINT rc = MsiEnumProductsExW(nullptr, /*szUserSid=*/nullptr,
+                                           static_cast<DWORD>(ctx), i, code, &got, nullptr,
+                                           nullptr);
+        if (rc == ERROR_NO_MORE_ITEMS)
+            return std::nullopt;
+        if (rc != ERROR_SUCCESS)
+            return "windows:msi_enum:" + std::to_string(rc);
+        on_code(yuzu::win::from_wide(code));
+    }
+}
+
+// Reads one product property in the given install context. MsiGetProductInfoExW
+// (not MsiGetProductInfoW) because the Ex form takes the context explicitly, so a
+// per-user product with the same code can never shadow the machine row.
+// nullopt = the property cannot be read (not set, or an advertised-only product).
+std::optional<std::string> read_product_property(const std::string& code, unsigned ctx,
+                                                 std::string_view prop) {
+    const std::wstring wcode = yuzu::win::to_wide(code);
+    const std::wstring wprop = yuzu::win::to_wide(prop);
+    DWORD cch = 256;
+    std::wstring buf(cch, L'\0');
+    UINT rc = MsiGetProductInfoExW(wcode.c_str(), nullptr, static_cast<MSIINSTALLCONTEXT>(ctx),
+                                   wprop.c_str(), buf.data(), &cch);
+    if (rc == ERROR_MORE_DATA) {
+        // pcchValue excludes the NUL on both ERROR_MORE_DATA and success (MS
+        // contract), so the retry capacity is cch + 1. No artificial cap: the
+        // length comes from the OS for a registry-stored value and the collector's
+        // clamp_field bounds what is stored.
+        buf.assign(static_cast<std::size_t>(cch) + 1, L'\0');
+        cch += 1;
+        rc = MsiGetProductInfoExW(wcode.c_str(), nullptr, static_cast<MSIINSTALLCONTEXT>(ctx),
+                                  wprop.c_str(), buf.data(), &cch);
+    }
+    if (rc != ERROR_SUCCESS)
+        return std::nullopt;
+    return yuzu::win::from_wide(buf.c_str(), static_cast<int>(cch));
 }
 #elif defined(__APPLE__)
 // Direct-argv, shell-free replacement for the old `/bin/sh -c` hop (Wave 4
@@ -318,9 +388,41 @@ int do_product_codes(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// list_inventory: the machine-context roster for the daily installed-software
+// sync. Buffer-then-emit: write_output only appends, and the status row must
+// lead, so the whole roster is built (pure, msi_packages_inventory.hpp) first.
+// A status answer is not a failed command, so every leg returns 0.
+int do_list_inventory(yuzu::CommandContext& ctx) {
+    namespace inv = yuzu::msi_packages::inventory;
+#ifdef _WIN32
+    const auto roster = inv::collect(
+        [](unsigned c, auto&& on_code) { return enumerate_machine_products(c, on_code); },
+        read_product_property);
+    for (auto& row : inv::render(roster))
+        ctx.write_output(std::move(row));
+    if (roster.constraint)
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              *roster.constraint);
+    else
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+#else
+#if defined(__APPLE__)
+    constexpr std::string_view token = "macos:owned_by_installed_apps";
+#else
+    constexpr std::string_view token = "linux:no_msi";
+#endif
+    ctx.write_output(inv::unsupported_status_row(token));
+    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                          token);
+#endif
+    return 0;
+}
+
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
-// windows: MsiEnumProductsA/MsiGetProductInfoA -- native MSI API, rung 1.
+// windows: MsiEnumProductsA/MsiGetProductInfoA (list, product_codes) and
+// MsiEnumProductsExW/MsiGetProductInfoExW (list_inventory) -- native MSI API,
+// rung 1.
 // macos: pkgutil --pkgs / --pkg-info via the bounded argv runner (Wave 4
 // PR4.3a, ADR-3002 rung 2) -- direct argv, no shell hop; ships via
 // msi_packages_macos.hpp's pure parsers, unchanged.
@@ -335,9 +437,20 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
      /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "pkgutil via bounded argv runner", nullptr},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "msi_api", nullptr}},
+    {"list_inventory",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "no Windows Installer on Linux"},
+     /* macos   = */
+     {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
+      "installed_apps.list_inventory owns the pkgutil receipt roster (ecosystem macos_pkgutil)"},
+     /* windows = */
+     {YUZU_SUPPORT_SUPPORTED, 1, "msi_api (MsiEnumProductsExW machine context)",
+      "machine context only: per-user MSI products are never listed; measured as SYSTEM and "
+      "as an admin user, non-elevated unmeasured"}},
 };
 
 } // namespace
+
+namespace inventory = yuzu::msi_packages::inventory;
 
 class MsiPackagesPlugin final : public yuzu::Plugin {
 public:
@@ -348,7 +461,7 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"list", "product_codes", nullptr};
+        static const char* acts[] = {"list", "product_codes", "list_inventory", nullptr};
         return acts;
     }
 
@@ -365,13 +478,29 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        if (action == "list")
-            return do_list(ctx);
-        if (action == "product_codes")
-            return do_product_codes(ctx);
+        // One firewall around the whole body: nothing may throw across the frozen
+        // plugin ABI. The catch reports a fixed token (never the exception text) and
+        // must not throw itself (pkg_inventory report_execute_exception shape).
+        try {
+            if (action == "list")
+                return do_list(ctx);
+            if (action == "product_codes")
+                return do_product_codes(ctx);
+            if (action == "list_inventory")
+                return do_list_inventory(ctx);
 
-        ctx.write_output(std::format("unknown action: {}", action));
-        return 1;
+            ctx.write_output(std::format("unknown action: {}", action));
+            return 1;
+        } catch (...) {
+            try {
+                ctx.write_output(inventory::format_status_row(
+                    action, inventory::StatusLevel::constrained, "msi_packages:exception"));
+                ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL, "msi_packages:exception");
+            } catch (...) {
+            }
+            return 1;
+        }
     }
 };
 

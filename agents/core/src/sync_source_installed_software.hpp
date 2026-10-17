@@ -11,6 +11,7 @@
 ///   pkg_inventory.managers                  one `homebrew` presence row
 ///   pkg_inventory.store_packages            active snaps/flatpaks (ecosystems `snap`, `flatpak`)
 ///   windows_optional_features.list          every DISM feature, state in `version`
+///   msi_packages.list_inventory             machine-context MSI products (ecosystem `msi`)
 /// Every row carries `source` = "<plugin>.<action>". NO per-user data (machine
 /// scope only — no PII).
 
@@ -37,7 +38,7 @@ struct SwEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -102,6 +103,14 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& o
 /// `flatpak`, version EMPTY (the branch is a ref, not a version), release =
 /// commit, arch. kind `app` iff the row's kind is `app`, else `pkg`.
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out);
+
+/// Adapt `msi_packages` `list_inventory` output (`status|list_inventory|<level>|...` plus
+/// five-token `inv|<product_code>|<name>|<version>|<publisher>`). Each row becomes
+/// {kind=pkg, ecosystem=msi} with package_id = the product code exactly as registered
+/// (no case normalisation). An empty name is seen-not-mapped. The producer strips `|`,
+/// tab, CR and LF from the fields, so no unescape is needed. `constrained` fails the
+/// action (a partial roster would delete stored msi rows); `unsupported` is skipped.
+YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out);
 
 /// Adapt `windows_optional_features` `list` output (`feature|<name>|<state>|<0/1>`):
 /// EVERY feature becomes {kind=feat, ecosystem=optional_feature} with the DISM

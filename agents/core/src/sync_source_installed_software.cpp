@@ -140,7 +140,8 @@ AdaptedRows failed(std::string reason) {
     return r;
 }
 
-// `pkg_inventory` grammar (pkg_inventory_parsers.hpp format_status_row /
+// `pkg_inventory` grammar -- shared by msi_packages.list_inventory
+// (msi_packages_inventory.hpp format_status_row) -- (pkg_inventory_parsers.hpp format_status_row /
 // format_manager_row / format_package_row / format_store_row): exactly one
 // `status|<action>|<supported|constrained|unsupported>|<tokens or ->` row, plus
 // data rows. Status decides success; malformed DATA rows are dropped. A status
@@ -220,6 +221,7 @@ const InventoryAction kInventoryActions[] = {
     {"pkg_inventory", "packages", parse_pkg_inventory_packages_output},
     {"pkg_inventory", "store_packages", parse_pkg_inventory_store_packages_output},
     {"windows_optional_features", "list", parse_windows_optional_features_output},
+    {"msi_packages", "list_inventory", parse_msi_packages_list_inventory_output},
 };
 
 } // namespace
@@ -353,6 +355,31 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
     }, /*constrained_fails=*/false);
 }
 
+AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out) {
+    // inv|<product_code>|<name>|<version>|<publisher>, machine-context MSI products.
+    // The producer deletes '|', tab, CR and LF from the fields (msi_packages_inventory.hpp
+    // strip_row_breakers), so no unescape is needed here and an over-wide row can only be
+    // malformed. A constrained enumeration fails the cycle: a partial roster would delete
+    // the stored msi rows beyond the failure point.
+    return adapt_pkg_inventory(out, "list_inventory",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "inv" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        e.name = clamp_field(tok[2], kMaxFieldLen);
+        if (e.name.empty())
+            return true; // seen, not mapped: the server drops empty names (also the advertised-only shape)
+        e.version = clamp_field(tok[3], kMaxFieldLen);
+        e.publisher = clamp_field(tok[4], kMaxFieldLen);
+        e.kind = "pkg";
+        e.ecosystem = "msi";
+        e.package_id = clamp_field(tok[1], kMaxFieldLen);
+        entries.push_back(std::move(e));
+        return true;
+    }, /*constrained_fails=*/true);
+}
+
 AdaptedRows parse_windows_optional_features_output(const std::string& out) {
     // windows_optional_features_parsers.hpp: `feature|<name>|<state>|<0/1>` per
     // feature (no status row in this grammar); sentinels are 3-token
@@ -448,7 +475,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
-    // A retry re-runs at most the five table actions in-process (no fan-out); the backoff
+    // A retry re-runs at most the six table actions in-process (no fan-out); the backoff
     // caps that at four extra runs per outage.
     src.skip_backoff = true;
     auto last_reason = std::make_shared<std::string>();

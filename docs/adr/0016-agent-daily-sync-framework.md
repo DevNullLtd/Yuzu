@@ -431,6 +431,15 @@ VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 > version empty, a branch being a ref; release = the commit), active rows only;
 > snap/flatpak rows carry no distro fields.
 
+> **Update (2026-10-17):** `msi_packages.list_inventory` is collected as
+> ecosystem `msi`, kind `pkg`, with `package_id` set to the MSI product code
+> exactly as registered (Windows machine install context only; per-user products
+> are never listed by this source). Name, version and publisher come from
+> `InstalledProductName`/`VersionString`/`Publisher`; slots 13-14 stay reserved
+> and empty (#5186). A `constrained` enumeration fails the action and skips the
+> whole cycle, like `pkg_inventory.packages`. The same product also appears as an
+> `installed_apps` `app`/`windows` row; the two are not de-duplicated.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no
