@@ -73,6 +73,7 @@ cd gateway
 Test suites:
 - `yuzu_gw_integration_SUITE` — Component integration with mocked upstream
 - `yuzu_gw_e2e_SUITE` — End-to-end flows with simulated gRPC
+- `yuzu_gw_scale_SUITE` — 500 simulated agents (by default) against the real gateway listeners and a fake server: registration ramp and storm, server crash, gateway crash, planned stop, management fan-out. See [gateway-scale-tests.md](gateway-scale-tests.md)
 
 ### 4. C++ Unit Tests
 
@@ -148,7 +149,15 @@ meson test -C build-linux --print-errorlogs
 
 ## Scale Testing
 
-The Erlang gateway includes scale tests that can exercise high agent counts:
+The multi-node scale suite, `yuzu_gw_scale_SUITE`, drives N simulated agents
+over real HTTP/2 against the gateway, with the server replaced by a fake on a
+real listener, and reports registration latency, replay time, notices lost,
+memory per connection and mailbox peaks. How to run it at 5,000 and 25,000
+agents, what it checks, and the numbers before the PR #5695 fixes are in
+[gateway-scale-tests.md](gateway-scale-tests.md).
+
+The EUnit module below exercises the registry and router data structures alone,
+in one VM, with no listener and no upstream:
 
 ```bash
 # Default: 50,000 agents
