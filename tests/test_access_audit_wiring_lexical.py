@@ -58,6 +58,10 @@ def audit_problems(src):
         out.append("audit .perm_fn is no longer the server's loud perm_fn")
     if ".quiet_perm_fn = draw_perm_fn," not in b:
         out.append("audit .quiet_perm_fn is no longer the server's quiet probe (draw_perm_fn)")
+    # draw_perm_fn is shared with other registrations: pin that it is the quiet probe.
+    dp = re.search(r"auto draw_perm_fn = \[this\]\([^)]*\) -> bool \{(.*?)\};", normalise(src))
+    if not dp or "return auth_routes_->probe_permission(req, res, type, op);" not in dp.group(1):
+        out.append("draw_perm_fn is no longer auth_routes_->probe_permission (the quiet probe)")
     if ".audit_fn = audit_fn," not in b:
         out.append("audit .audit_fn is no longer the server's audit_fn")
     qf = re.search(r"\.query_fn = (.*?), \.retention_days_fn", b)
@@ -91,6 +95,8 @@ MUTATIONS = [
     (r"\.quiet_perm_fn = draw_perm_fn,",
      r".quiet_perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&, const std::string&) { return true; },",
      "quiet_perm_fn"),
+    (r"return auth_routes_->probe_permission\(req, res, type, op\);",
+     "return auth_routes_->require_permission(req, res, type, op);", "draw_perm_fn"),
     (r"if \(!audit_store_ \|\| !audit_store_->is_open\(\)\)\n\s*return std::nullopt;\n(\s*return audit_store_->query\(q, pool_size\);)",
      r"\1", "nullopt"),
     (r"return audit_store_->query\(q, pool_size\);", "return std::vector<AuditEvent>{};", "query"),

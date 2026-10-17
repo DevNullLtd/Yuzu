@@ -15832,8 +15832,9 @@ private:
         // Audit and reviews page (Phase 2 UI), audit half: /access/audit, its log, sample and
         // retention fragments and the page's static glue. Each fragment is gated on the same
         // securable as its REST twin: the auto-loading log by the quiet probe (no denial row
-        // per page view), the on-request sample and retention by the loud `perm_fn`; the audit read returns nullopt when
-        // the store is closed or did not answer, never an empty vector for that.
+        // per page view), the on-request sample and retention by the loud `perm_fn`. The audit
+        // read returns nullopt when the store is closed or did not answer, never an empty
+        // vector for that.
         yuzu::server::access_audit::register_access_audit_routes(
             inline_sink,
             yuzu::server::access_audit::Deps{

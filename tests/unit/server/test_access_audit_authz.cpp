@@ -220,3 +220,67 @@ TEST_CASE("audit page authz: RBAC on, a Reviewer holds AccessReview only and is 
     CHECK(r.reads == 0);
     CHECK(r.denied_rows() == 1);  // the sample only; the auto-loading log is probed quietly
 }
+
+TEST_CASE("audit page authz: a token caller refused the log keeps its denial row",
+          "[pg][access-audit][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, audit_page_tpl);
+    Rig r{db_.dsn()};
+    const auto expiry = now_epoch() + 3600;
+    auto raw = r.api_tokens.get()->create_token("audit-page-token", "alice", expiry);
+    REQUIRE(raw.has_value());
+
+    // The quiet probe withholds the row for an interactive cookie only; a token is on the record.
+    const auto res = r.sink.dispatch("GET", kLog, {}, "application/json",
+                                     {{"Authorization", "Bearer " + *raw}});
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(r.reads == 0);
+    CHECK(r.denied_rows() == 1);
+}
+
+TEST_CASE("audit page authz: RBAC on, an Administrator reads all three panels",
+          "[pg][access-audit][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, audit_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    r.assign("root", "Administrator");
+    const auto cookie = r.session("root", auth::Role::admin);
+    for (const char* p : {kLog, kSample, kRetention}) {
+        INFO(p);
+        const auto res = r.get(p, cookie);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    CHECK(r.reads == 2);
+    CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("audit page authz: RBAC on, a user with no role is refused every panel",
+          "[pg][access-audit][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, audit_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    const auto cookie = r.session("alice", auth::Role::user);
+    for (const char* p : {kLog, kSample, kRetention}) {
+        INFO(p);
+        const auto res = r.get(p, cookie);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    CHECK(r.reads == 0);
+    CHECK(r.denied_rows() == 2);  // sample and retention; the auto-loading log is probed quietly
+}
+
+TEST_CASE("audit page authz: an unauthenticated caller is refused every panel and reads nothing",
+          "[pg][access-audit][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, audit_page_tpl);
+    Rig r{db_.dsn()};
+    for (const char* p : {kLog, kSample, kRetention}) {
+        INFO(p);
+        const auto res = r.sink.dispatch("GET", p);
+        REQUIRE(res);
+        CHECK(res->status == 401);
+    }
+    CHECK(r.reads == 0);
+    CHECK(r.denied_rows() == 0);
+}

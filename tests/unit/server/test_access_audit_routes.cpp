@@ -66,7 +66,9 @@ std::vector<AuditEvent> rows(int n) {
 struct Harness {
     bool session_present{true};
     bool allow{true};
-    std::vector<std::pair<std::string, std::string>> gate_calls;
+    std::vector<std::pair<std::string, std::string>> gate_calls;        // the loud gate
+    std::vector<std::pair<std::string, std::string>> quiet_gate_calls;  // the quiet probe
+    bool query_throws{false};
     int query_calls{0};
     AuditQuery last_query;
     std::size_t* last_pool_ptr{nullptr};
@@ -100,7 +102,15 @@ struct Harness {
             res.set_content(kDenyBody, "application/json");
             return false;
         };
-        d.quiet_perm_fn = d.perm_fn;
+        d.quiet_perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                                 const std::string& t, const std::string& o) {
+            quiet_gate_calls.emplace_back(t, o);
+            if (allow)
+                return true;
+            res.status = 403;
+            res.set_content(kDenyBody, "application/json");
+            return false;
+        };
         d.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
                             const std::string& tt, const std::string& ti, const std::string& dt) {
             if (audit_throws)
@@ -111,6 +121,8 @@ struct Harness {
         d.query_fn = [this](const AuditQuery& q, std::size_t* pool_ptr)
             -> std::optional<std::vector<AuditEvent>> {
             ++query_calls;
+            if (query_throws)
+                throw std::runtime_error("audit store exploded");
             last_query = q;
             last_pool_ptr = pool_ptr;
             if (pool_ptr)
@@ -195,8 +207,44 @@ TEST_CASE("audit routes: each fragment is gated on exactly its twin's securable"
     (void)h.get("/fragments/access/audit/sample");
     (void)h.get("/fragments/access/audit/retention");
     using P = std::pair<std::string, std::string>;
-    CHECK(h.gate_calls == std::vector<P>{{"AuditLog", "Read"}, {"AuditLog", "Read"},
-                                         {"ServerConfig", "Read"}});
+    // The auto-loading log asks the quiet probe; the on-request panels ask the loud gate.
+    CHECK(h.quiet_gate_calls == std::vector<P>{{"AuditLog", "Read"}});
+    CHECK(h.gate_calls == std::vector<P>{{"AuditLog", "Read"}, {"ServerConfig", "Read"}});
+}
+
+TEST_CASE("audit routes: the gate runs before any parameter is parsed or read",
+          "[access-audit][routes]") {
+    Harness h;
+    h.wire();
+    h.allow = false;
+    for (const char* path :
+         {"/fragments/access/audit/log?range=bogus&offset=-1&principal=x",
+          "/fragments/access/audit/sample?limit=zzz"}) {
+        INFO(path);
+        const auto res = h.get(path);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body == kDenyBody);  // the gate's response, never a bad-parameter note
+    }
+    CHECK(h.query_calls == 0);
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("audit routes: a store that throws is the red box, not a bare 500",
+          "[access-audit][routes]") {
+    Harness h;
+    h.wire();
+    h.query_throws = true;
+    auto res = h.get("/fragments/access/audit/log");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("The audit log could not be read."));
+    CHECK_THAT(res->body, !ContainsSubstring("<table"));
+    res = h.get("/fragments/access/audit/sample");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("The sample could not be drawn."));
+    CHECK(h.audits.empty());  // nothing was drawn, so nothing is recorded as exported
 }
 
 TEST_CASE("audit log: default request reads the last 24 hours, 51 rows, nothing else widened",

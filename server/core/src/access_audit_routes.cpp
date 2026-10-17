@@ -11,6 +11,9 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <exception>
+#include <optional>
+#include <vector>
 #include <stdexcept>
 
 namespace yuzu::server {
@@ -27,6 +30,18 @@ constexpr const char* kHtml = "text/html; charset=utf-8";
 void respond_fragment(httplib::Response& res, const std::string& body) {
     res.set_header("Cache-Control", "no-store");
     res.set_content(body, kHtml);
+}
+
+// One audit read. A store that throws is the same "did not answer" as one that returns nullopt,
+// so the panel shows its red box rather than a bare 500 that htmx would drop.
+std::optional<std::vector<AuditEvent>> read_audit(const Deps& deps, const AuditQuery& q,
+                                                  std::size_t* pool) {
+    try {
+        return deps.query_fn(q, pool);
+    } catch (const std::exception& e) {
+        spdlog::warn("access audit page: audit read threw: {}", e.what());
+        return std::nullopt;
+    }
 }
 
 bool has_nul(const std::string& s) {
@@ -93,7 +108,7 @@ void register_access_audit_routes(HttpRouteSink& sink, Deps deps) {
                  q.since = std::max<std::int64_t>(1, deps.now_fn() - range_seconds(v.range));
                  q.limit = kPageSize + 1; // limit is NEVER read from the client
                  q.offset = v.offset;
-                 auto rows = deps.query_fn(q, nullptr);
+                 auto rows = read_audit(deps, q, nullptr);
                  if (!rows) {
                      spdlog::warn("/fragments/access/audit/log: audit store did not answer");
                      respond_fragment(res, render_audit_log(access::Unavailable{}));
@@ -125,7 +140,7 @@ void register_access_audit_routes(HttpRouteSink& sink, Deps deps) {
                  q.random_sample = true;
                  q.limit = limit;
                  std::size_t pool = 0;
-                 auto rows = deps.query_fn(q, &pool);
+                 auto rows = read_audit(deps, q, &pool);
                  if (!rows) {
                      spdlog::warn("/fragments/access/audit/sample: audit store did not answer");
                      respond_fragment(res, render_auth_sample(access::Unavailable{}));
@@ -136,7 +151,10 @@ void register_access_audit_routes(HttpRouteSink& sink, Deps deps) {
                  v.candidates = pool;
                  v.recency_capped = pool >= kAuditSampleScanCap;
                  // Evidence access is itself on the audit chain, after the read (as the twin
-                 // does). A dropped row sets Sec-Audit-Failed and the panel says so.
+                 // does). A dropped row sets Sec-Audit-Failed and the panel says so. The
+                 // "from=0 to=0" detail is byte-for-byte what GET /api/v1/audit/auth-sample
+                 // writes for an open window (rest_api_v1.cpp builds it from since/until
+                 // value_or(0)), so evidence queries match across both surfaces.
                  v.audit_failed = !detail::emit_behavioral_audit(
                      deps.audit_fn, req, res, "audit.auth_sample.exported", "success", "AuditLog",
                      "auth-sample",

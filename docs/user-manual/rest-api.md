@@ -9990,7 +9990,7 @@ These endpoints back the read-only **Access → Audit and reviews** page (`/acce
 
 **`GET /fragments/access/audit/log`**
 
-The audit-log panel. Same store, gate and filters as `GET /api/v1/audit` (MCP `query_audit_log`), rendering only that route's fields.
+The audit-log panel. Same store and gate as `GET /api/v1/audit` (MCP `query_audit_log`), offering a subset of its filters (time range, exact principal, exact action; no `until`, target or `limit`) and rendering only that route's fields.
 
 - **Permission:** `AuditLog:Read` (admin-only while RBAC is disabled, #5771).
 - **Query:** `range` — `1h`, `24h` (default) or `7d`; `principal`, `action` — exact matches; `offset` — `0` to `10000`. `limit` is not read: the page is always 50 rows.
