@@ -10,8 +10,8 @@
  * any process-local push. The provider owns the failure direction:
  *   - a good read (including "nothing stored", which is the shipped defaults)
  *     is cached for kDexPolicyRefreshMs, counted from the moment the read
- *     COMPLETED (both windows are stamped from the clock sampled after the read,
- *     so a slow read never lengthens either);
+ *     COMPLETED (the clock is sampled after the read: a slow good read is
+ *     stamped when it finishes, and a slow failed read counts against the cap);
  *   - a stored document that fails to parse or validate is still a GOOD read:
  *     the policy in force is the shipped defaults with `fault` set;
  *   - a failed read serves the last good policy while it is no older than
