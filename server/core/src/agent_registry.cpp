@@ -1064,11 +1064,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // pkg_inventory
         {"pkg_inventory.managers",
          "List package managers present on the host with manager-level config facts "
-         "(macOS Homebrew prefixes with tap/formula/cask counts; read-only, no subprocess; "
-         "macOS only today, Linux and Windows report unsupported)"},
+         "(macOS Homebrew prefixes; Linux dpkg/apt/rpm/dnf/pacman/apk/snap/flatpak presence "
+         "with apt/snap/flatpak counts; read-only, no subprocess; Windows planned)"},
         {"pkg_inventory.packages",
-         "List macOS Homebrew formulae and casks by name, version and kind (macOS only "
-         "today; the Linux package roster is owned by installed_apps)"},
+         "List macOS Homebrew formulae and casks by name, version and kind (macOS only; "
+         "Linux unsupported by design; installed_apps owns the roster)"},
+        {"pkg_inventory.store_packages",
+         "List installed snaps and flatpak apps/runtimes from the system store (Linux; "
+         "read-only, no subprocess; macOS unsupported by design, Windows planned)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture
