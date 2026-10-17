@@ -768,6 +768,51 @@ TEST_CASE("/fragments/results: a filter that sanitizes past the bound shows the 
     CHECK_FALSE(contains(h.get(base + "&f_key=" + repeat("%FF", 682))->body, kTooLongMarker));
 }
 
+// The per-line filter compares a typed value against response text that was scrubbed at ingest,
+// so it must compare in the stored form the facet lookups bind. Before the fix the lookups matched
+// the response but the line filter compared the raw bytes: the page counted the agent and showed
+// no rows. These two filters carry a real NUL and a real 0xFF (percent-decoded by the request
+// parser, as in the case above) and each must show exactly the one row ingest stored for them.
+TEST_CASE("/fragments/results: a filter with a NUL or invalid UTF-8 byte shows the stored row",
+          "[pg][server][dashboard][fragment][facets]") {
+    using namespace std::string_literals;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-stored-form-line-filter-1";
+    store_registry_output(rs, command_id, "a\0b|v1x\nbad\xFFx|v2x\nplain|v3x"s, "status");
+
+    FragmentResultsHarness h(&rs);
+    wire_unfiltered_gate(h);
+    const std::string base = "/fragments/results?command_id=" + command_id + "&plugin=status";
+
+    SECTION("a NUL in the filter shows the row stored with a U+FFFD in its place") {
+        auto res = h.get(base + "&f_key=a%00b");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "v1x"));
+        CHECK_FALSE(contains(res->body, "v2x"));
+        CHECK_FALSE(contains(res->body, "v3x"));
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+    }
+    SECTION("an invalid UTF-8 byte in the filter shows the row stored with a U+FFFD") {
+        auto res = h.get(base + "&f_key=bad%FFx");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "v2x"));
+        CHECK_FALSE(contains(res->body, "v1x"));
+        CHECK_FALSE(contains(res->body, "v3x"));
+    }
+    SECTION("a plain filter is unchanged") {
+        auto res = h.get(base + "&f_key=plain");
+        REQUIRE(res);
+        CHECK(contains(res->body, "v3x"));
+        CHECK_FALSE(contains(res->body, "v1x"));
+        CHECK_FALSE(contains(res->body, "v2x"));
+    }
+}
+
 TEST_CASE("/fragments/results: saved View defaults and the over-bound hint",
           "[pg][server][dashboard][fragment][facets]") {
     YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_frag_instr_tpl);

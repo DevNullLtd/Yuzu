@@ -2451,6 +2451,13 @@ std::string DashboardRoutes::render_results(
     std::vector<ResultLine> all_lines;
     all_lines.reserve(responses.size() * 4);
 
+    // The response text was scrubbed at ingest, so a typed filter is compared in the same stored
+    // form the facet lookups bind (a raw NUL or invalid UTF-8 byte would never equal a cell).
+    std::vector<std::string> filter_stored_values;
+    filter_stored_values.reserve(filters.size());
+    for (const auto& f : filters)
+        filter_stored_values.push_back(facet_filter_stored_form(f.value));
+
     for (const auto& resp : responses) {
         auto agent_name = registry_ ? registry_->display_name(resp.agent_id)
                                      : resp.agent_id;
@@ -2460,9 +2467,10 @@ std::string DashboardRoutes::render_results(
 
             // Apply per-field filters
             bool match = true;
-            for (const auto& f : filters) {
+            for (std::size_t fi = 0; fi < filters.size(); ++fi) {
+                const auto& f = filters[fi];
                 if (f.col_idx >= 0 && f.col_idx < static_cast<int>(fields.size())) {
-                    if (fields[f.col_idx] != f.value) { match = false; break; }
+                    if (fields[f.col_idx] != filter_stored_values[fi]) { match = false; break; }
                 }
             }
             if (!match) continue;
