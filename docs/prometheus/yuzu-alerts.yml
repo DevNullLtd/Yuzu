@@ -1068,8 +1068,8 @@ groups:
             {{ $labels.instance }} with acknowledged=false: it did not record
             them, so the gateway keeps sending them again (at most a minute
             apart) and those agents stay connected to the gateway but unknown or
-            not dispatchable at the server. Restarting the gateway does not help
-            (the agents register again and are refused again). FIRST: on the
+            not dispatchable at the server. Do not restart the gateway for this:
+            the agents register again and are refused again. FIRST: on the
             server, read the NotifyStreamStatus WARN lines ("the directory read
             degraded and this replica holds no matching local session",
             "unknown session ... for agent", "but the directory names a
