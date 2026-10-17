@@ -2140,8 +2140,9 @@ TEST_CASE("OIDC discovery: a trickling JWKS is cut at the total bound",
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == OidcProvider::kJwksUnavailable);
-    // Two cut GETs (the empty-cache fetch, then the unknown-kid refetch): nominal 1000 ms. The
-    // floor is far below that (see the discovery case); the ceiling leaves 3x headroom.
+    // One cut GET (the fetch for this verification; there is no cache and no refetch). The floor
+    // is far below the nominal cut time (see the discovery case); the ceiling leaves headroom.
+    // The chunk bound below is kept loose on purpose.
     CHECK(elapsed >= std::chrono::milliseconds(100));
     CHECK(elapsed < std::chrono::milliseconds(3000));
     CHECK(idp.trickle_chunks_sent.load() < 2 * 250); // neither GET ran to the end
@@ -3805,6 +3806,7 @@ TEST_CASE("OIDC discovery: endpoints must be absolute and carry the issuer's own
 TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test - "
           "add_test_pending_flow - set_http_timeouts_for_test - "
           "set_discovery_negative_cache_for_test - set_resolver_for_test - "
+          "add_test_jwks_key - "
           "clear_nat64_discovery_cache_for_test - expire_nat64_discovery_cache_for_test - "
           "vet_egress_target_for_test or pending_flow_count_for_test "
           "(source pin)",
@@ -3818,6 +3820,7 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
                                              "set_http_timeouts_for_test",
                                              "set_discovery_negative_cache_for_test",
                                              "set_resolver_for_test",
+                                             "add_test_jwks_key",
                                              "clear_nat64_discovery_cache_for_test",
                                              "expire_nat64_discovery_cache_for_test",
                                              "vet_egress_target_for_test",
@@ -4150,6 +4153,11 @@ TEST_CASE("OIDC JWKS: a later key set is used as served - an empty one refuses, 
     });
     REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-2")).has_value());
     CHECK(idp.jwks_calls.load() == 3);
+    // The new set is NON-empty and holds only the new key: the old key is gone from it, so a
+    // token under the old kid is refused (nothing from an earlier answer is merged in).
+    auto old_key = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+    REQUIRE_FALSE(old_key.has_value());
+    CHECK(old_key.error().find("no matching JWKS key found") != std::string::npos);
 }
 
 // (Still inside the !YUZU_OIDC_MOCK_IDP_TSAN region opened above: this case uses the MockIdp
@@ -4187,8 +4195,8 @@ TEST_CASE("OIDC JWKS: a key with a member of the wrong type is skipped - its sib
         CHECK((*keys)[0].kid == "good-kid");
         CHECK((*keys)[0].pkey != nullptr);
     }
-    // Every key malformed: the document parses, with nothing usable (the pre-existing behavior;
-    // fetch_jwks then refuses to replace a cached set with it).
+    // Every key malformed: the document parses, with nothing usable (verification then refuses
+    // with `no matching JWKS key found`).
     const auto none =
         OidcProvider::parse_jwks(R"({"keys":[{"kty":"RSA","kid":null,"n":"AQAB","e":"AQAB"},5]})");
     REQUIRE(none.has_value());

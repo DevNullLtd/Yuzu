@@ -137,7 +137,8 @@ struct IdTokenClaims {
 /// harness. Governance UP-1 (#1832 hardening round).
 [[nodiscard]] bool groups_claim_reconcilable(const IdTokenClaims& claims);
 
-/// Cached JWK public key for JWT signature verification.
+/// A JWK public key parsed from a fetched key set (held only for the one verification that
+/// fetched it; nothing keeps these across calls).
 struct CachedJwk {
     std::string kid;
     std::string alg;
@@ -380,7 +381,10 @@ public:
     std::expected<void, std::string> validate_claims(const IdTokenClaims& claims,
                                                      const std::string& expected_nonce) const;
 
-    /// Verify JWT signature against cached JWKS keys. Returns error string on failure.
+    /// Verify the JWT signature against a key set fetched for THIS call (no key cache; see
+    /// `fetch_jwks_snapshot`). Returns an error string on failure: `kJwksUnavailable` when the
+    /// fetch failed, `no matching JWKS key found ...` when the fetched set holds no usable key for
+    /// the token's `kid`.
     std::expected<void, std::string> verify_jwt_signature(const std::string& jwt);
 
     /// The three endpoints of a validated discovery document.
