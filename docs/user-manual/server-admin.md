@@ -5181,8 +5181,8 @@ An agent id seen for the first time must also use only letters, digits, `.`, `_`
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/fragments/settings/api-tokens` | Render the API tokens management fragment (HTMX). |
-| `POST` | `/api/settings/api-tokens` | Create a new API bearer token. Body: `{ "name", "role", "scopes" }`. |
-| `DELETE` | `/api/settings/api-tokens/{id}` | Revoke an API token by ID. |
+| `POST` | `/api/settings/api-tokens` | Create a new API bearer token. Body: `{ "name", "role", "scopes" }`. MFA step-up gated, as `POST /api/v1/tokens` is. |
+| `DELETE` | `/api/settings/api-tokens/{id}` | Revoke an API token by ID. MFA step-up gated, as `DELETE /api/v1/tokens/{id}` is. |
 
 ### Tokens and principals page
 

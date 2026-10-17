@@ -1671,3 +1671,79 @@ TEST_CASE("SettingsRoutes DELETE api-tokens: a refused MFA step-up revokes nothi
     REQUIRE(gone.has_value());
     CHECK((gone->empty() || (*gone)[0].revoked));
 }
+
+// The gate runs before anything else in the handler. The dashboard answers a validation failure
+// with HTTP 200 and a feedback span, so a refused request that still comes back 403 with the
+// label recorded proves the step-up check ran before the form was read; for DELETE the same
+// holds for an id that does not exist.
+TEST_CASE("SettingsRoutes api-tokens: the step-up gate runs before form validation and lookup",
+          "[pg][settings][api_tokens][step_up]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    SettingsAdr2001Harness h;
+    h.step_up_refuse = true;
+
+    for (const char* body : {"name=", "name=t1&ttl_hours=0x5", "name=t1&mcp_tier=bogus"}) {
+        INFO(body);
+        h.step_up_labels.clear();
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.step_up_labels == std::vector<std::string>{"POST /api/settings/api-tokens"});
+    }
+    {
+        h.step_up_labels.clear();
+        auto res = h.sink.Post("/api/settings/api-tokens",
+                               "name=" + std::string(300, 'x'), kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.step_up_labels.size() == 1);
+    }
+    {
+        h.step_up_labels.clear();
+        auto res = h.sink.Delete("/api/settings/api-tokens/does-not-exist");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.step_up_labels ==
+              std::vector<std::string>{"DELETE /api/settings/api-tokens/{id}"});
+    }
+    const auto listed = h.token_store->list_tokens();
+    REQUIRE(listed.has_value());
+    CHECK(listed->empty());
+}
+
+// An MCP-tier token needs an expiry of at most 90 days. The form must refuse the request itself,
+// as POST /api/v1/tokens does, instead of letting the store reject it and reporting the result as
+// a CSPRNG failure (503, the entropy-failure counter and a csprng_unavailable audit row).
+TEST_CASE("SettingsRoutes POST api-tokens: an MCP tier without a usable TTL is an input error, "
+          "not a CSPRNG failure",
+          "[pg][settings][api_tokens][numeric_params]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    auto csprng_failures = [](SettingsAdr2001Harness& h) {
+        return h.metrics
+            .counter("yuzu_secure_random_failure_total",
+                     {{"reason", "prng_failure"}, {"site", "api_token_htmx"}})
+            .value();
+    };
+    for (const char* body : {"name=t1&mcp_tier=operator", "name=t1&mcp_tier=operator&ttl_hours=0",
+                             "name=t1&mcp_tier=operator&ttl_hours=2161"}) {
+        SettingsAdr2001Harness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("feedback-error") != std::string::npos);
+        CHECK(res->body.find("CSPRNG") == std::string::npos);
+        CHECK(csprng_failures(h) == 0.0);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        CHECK(listed->empty());
+    }
+    SettingsAdr2001Harness h;
+    auto ok = h.sink.Post("/api/settings/api-tokens", "name=t1&mcp_tier=operator&ttl_hours=2160",
+                          kFormCt);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto listed = h.token_store->list_tokens();
+    REQUIRE(listed.has_value());
+    CHECK(listed->size() == 1);
+}
