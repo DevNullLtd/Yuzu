@@ -560,6 +560,7 @@ struct KeysParse {
     bool truncated = false;       ///< the row budget refused a row
     bool unknown_type = false;    ///< a key of an unknown type was emitted
     bool field_oversized = false;
+    bool nul_truncated = false;   ///< a line held a NUL byte and was read only up to it, as sshd reads it
 };
 
 [[nodiscard]] inline std::string key_row(std::string_view account, std::string_view kind,
@@ -582,15 +583,20 @@ struct KeysParse {
 /// line, in file order, duplicates kept). Blank and `#` lines are ignored and uncounted. A
 /// line over kMaxKeyLine is counted oversized and not parsed; a line sshd would not accept is
 /// counted malformed and not emitted. Charges `budget` BEFORE materialising each row and
-/// stops at the first refusal (`out.truncated`).
+/// stops at the first refusal (`out.truncated`). A line is cut at its first NUL byte before it
+/// is parsed (`out.nul_truncated`): sshd reads each line with getline() and treats it as a C
+/// string, so a key before the NUL is a key it trusts and the file is still accepted.
 inline void parse_authorized_keys(std::string_view text, std::string_view account, std::string_view kind,
                                   yuzu::shared::RowByteBudget& budget, KeysParse& out) {
     std::size_t at = 0;
     while (at < text.size()) {
         const auto nl = text.find('\n', at);
-        const std::string_view line =
-            nl == std::string_view::npos ? text.substr(at) : text.substr(at, nl - at);
+        std::string_view line = nl == std::string_view::npos ? text.substr(at) : text.substr(at, nl - at);
         at = nl == std::string_view::npos ? text.size() : nl + 1;
+        if (const auto nul = line.find('\0'); nul != std::string_view::npos) {
+            line = line.substr(0, nul);
+            out.nul_truncated = true;
+        }
 
         std::size_t pos = 0;
         while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'))

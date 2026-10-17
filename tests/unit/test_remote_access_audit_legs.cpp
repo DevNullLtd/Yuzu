@@ -66,12 +66,14 @@ struct Fake {
     std::map<std::string, FileReadLike> abs_files;
     std::optional<std::vector<std::string>> prefixes{std::vector<std::string>{}};
     std::function<yuzu::agent::SubprocessResult(const std::vector<std::string>&)> runner;
+    std::function<bool(const HomeEntry&)> account_probe; // set => PosixFs::is_account_home
 
     mutable std::vector<std::string> touched;
     mutable std::string current_dir;
     mutable std::string current_home;
     mutable int open_home_calls = 0;
     mutable int key_reads = 0;
+    mutable int probe_calls = 0;
 
     PosixFs build() const {
         PosixFs fs;
@@ -112,6 +114,13 @@ struct Fake {
             too_many = homes_too_many;
             return homes_err;
         };
+        if (account_probe) {
+            fs.is_account_home = [this](const HomeEntry& h) {
+                ++probe_calls;
+                touched.push_back(h.path);
+                return account_probe(h);
+            };
+        }
         fs.open_home = [this](const HomeEntry& h) {
             ++open_home_calls;
             touched.push_back(h.path);
@@ -353,6 +362,67 @@ TEST_CASE("remote_access_audit legs: an inaccessible home does not hide a readab
     CHECK(f.open_home_calls == 0);
     CHECK(kind_rows(l, "key").size() == 2); // the same absolute file, once per account
     CHECK(l.status == StatusState::supported);
+}
+
+TEST_CASE("remote_access_audit legs: a non-account home is skipped by the eligibility probe, an unopenable account is refused",
+          "[remote_access_audit][legs]") {
+    auto f = healthy();
+    f.homes = {home("alice"), home("remote"), home("shared"), home("locked")};
+    f.prefixes = std::vector<std::string>{"/home/remote"};
+    f.account_probe = [](const HomeEntry& h) { return h.name != "shared"; }; // shared: positively not an account
+    f.open_err["/home/locked"] = EACCES;                                      // an account the agent cannot open
+    f.key_files["/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
+    const auto l = list_posix(f.build());
+
+    // shared: probed once and nothing else (no open, no read), no file rows, not counted as an account
+    CHECK(std::ranges::count(f.touched, "/home/shared") == 1);
+    CHECK_FALSE(f.touched_under("/home/shared/"));
+    CHECK(row_with(l.rows, "file|shared|") == "");
+    CHECK(l.rows[1] == "source|homes|read|3"); // alice, remote, locked
+
+    // a network-mounted home is never probed (the probe would stat it), opened or read
+    CHECK(f.probe_calls == 3); // alice, shared, locked
+    CHECK_FALSE(f.touched_under("/home/remote"));
+    CHECK(row_with(l.rows, "file|remote|authorized_keys|") == "file|remote|authorized_keys|failed|-|-|-");
+    CHECK(has_token(l, "linux:remote_access_audit:keys:network_mount_skipped"));
+
+    // an eligible account the agent cannot open is a refused row plus a token, never a silent drop
+    CHECK(row_with(l.rows, "file|locked|authorized_keys|") == "file|locked|authorized_keys|refused|-|-|-");
+    CHECK(row_with(l.rows, "file|locked|authorized_keys2|") == "file|locked|authorized_keys2|refused|-|-|-");
+    CHECK(has_token(l, "linux:remote_access_audit:homes:permission_denied"));
+    CHECK(row_with(l.rows, "key|alice|") != "");
+    CHECK(l.status == StatusState::constrained);
+
+    // a non-account is skipped before the %u-style token check too: it adds no token of its own
+    f = healthy();
+    f.config_files["/etc/ssh/sshd_config"] = ok("AuthorizedKeysFile /srv/%u/keys\n");
+    f.homes = {home("shared")};
+    f.account_probe = [](const HomeEntry&) { return false; };
+    const auto none = list_posix(f.build());
+    CHECK_FALSE(has_token(none, "path_token_unsupported"));
+    CHECK(none.rows[1] == "source|homes|read|0");
+    CHECK(none.status == StatusState::supported);
+
+    // no probe wired (Linux): every listed home is an account
+    f = healthy();
+    f.homes = {home("shared")};
+    CHECK(list_posix(f.build()).rows[1] == "source|homes|read|1");
+}
+
+TEST_CASE("remote_access_audit legs: a NUL in a key file cuts only its own line and the file is still read",
+          "[remote_access_audit][legs]") {
+    auto f = healthy();
+    f.homes = {home("alice")};
+    std::string text = kAliceKey;               // "<key> alice@laptop\n"
+    text.insert(text.size() - 1, 1, '\0');      // ... alice@laptop<NUL>\n
+    f.key_files["/home/alice/.ssh/authorized_keys"] = ok(text);
+    const auto l = list_posix(f.build());
+    CHECK(row_with(l.rows, "file|alice|authorized_keys|") == "file|alice|authorized_keys|read|1|0|0"); // read, not failed
+    CHECK(row_with(l.rows, "key|alice|") ==
+          std::string("key|alice|authorized_keys|ssh-ed25519|") + kAliceFp + "|256|-|-");
+    CHECK(has_token(l, "linux:remote_access_audit:keys:invalid_bytes"));
+    CHECK(l.status == StatusState::constrained);
+    // sshd_config keeps the whole-file rule (a NUL there is not per-line): pinned above in the config test
 }
 
 TEST_CASE("remote_access_audit legs: AuthorizedKeysFile none, unsupported tokens and Match scope",

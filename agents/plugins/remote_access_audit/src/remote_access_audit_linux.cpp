@@ -1,9 +1,9 @@
 /**
  * remote_access_audit_linux.cpp -- Linux leg: sshd_config (Include followed), per-account
  * authorized_keys fingerprints and sshd's enablement via `systemctl is-enabled` (rung 2, a
- * bounded argv runner; no library API reports unit enablement).
+ * bounded argv runner; chosen over the sd-bus GetUnitFileState API to avoid a system dependency).
  *
- * Only the path binding and the runner lives here: the reads are
+ * Only the path binding and the runner live here: the reads are
  * remote_access_audit_posix_fs.hpp and every decision (refused != absent, Include order,
  * network-mount skips, budgets) is `list_posix` in remote_access_audit_legs.hpp.
  */
@@ -32,7 +32,7 @@ int run_linux(yuzu::CommandContext& ctx) {
             argv.push_back(tool);
             argv.insert(argv.end(), args.begin(), args.end());
         }
-        // sink: remote_access_audit/run_linux#1 -- systemctl is-enabled <unit> (rung 2 argv; no library API reports unit enablement)
+        // sink: remote_access_audit/run_linux#1 -- systemctl is-enabled <unit> (rung 2 argv; chosen over the sd-bus GetUnitFileState API to avoid a system dependency)
         return yuzu::agent::run_bounded_subprocess(argv, opts);
     };
     report_list(ctx, list_posix(make_posix_fs(p)));

@@ -196,11 +196,14 @@ inline std::string src_token(std::string_view os, std::string_view src, std::str
 }
 
 /// Absent is a state, never a failure; a refusal is its own state; everything else that
-/// kept the file from being read, and a NUL byte in what was read, is a failure.
-inline SrcOutcome classify_read(const FileReadLike& r, std::string_view os, std::string_view src) {
+/// kept the file from being read, and (config side) a NUL byte in what was read, is a failure.
+/// `nul_is_failure` is false for key files: sshd reads those line by line and a NUL only cuts
+/// its own line short, so the key parser handles it per line (KeysParse::nul_truncated).
+inline SrcOutcome classify_read(const FileReadLike& r, std::string_view os, std::string_view src,
+                                bool nul_is_failure = true) {
     switch (r.error) {
     case ReadErr::none:
-        if (r.data.find('\0') != std::string::npos)
+        if (nul_is_failure && r.data.find('\0') != std::string::npos)
             return {SourceState::failed, src_token(os, src, "invalid_bytes")};
         return {SourceState::read, {}};
     case ReadErr::symlink_refused:
@@ -339,6 +342,11 @@ struct PosixFs {
     /// every root is absent.
     std::function<int(const std::vector<std::string>& roots, std::vector<HomeEntry>& homes, bool& too_many)>
         list_homes;
+    /// Optional account-eligibility predicate, asked AFTER the network-mount check and BEFORE the
+    /// home is opened. false only when the entry is positively not an account home (macOS: owned
+    /// by a uid under 500); any doubt answers true so open_home surfaces the errno. Unset = every
+    /// listed home is an account.
+    std::function<bool(const HomeEntry& home)> is_account_home;
     /// Opens `home` no-follow and keeps it for read_key_file. 0 or errno.
     std::function<int(const HomeEntry& home)> open_home;
     /// Reads a file by single path components under the opened home, hop by hop.
@@ -481,14 +489,15 @@ inline yuzu::agent::SubprocessOptions service_options(std::size_t max_lines, std
 }
 
 /// A runner failure (or truncation) -> the token to record; nullopt = the output is usable.
-/// `unavailable` is set for a tool that could not be started at all.
+/// `unavailable` is set for a tool that could not be started at all, whose token names the
+/// caller's own tool (`unavailable_cause`: systemctl_unavailable / launchctl_unavailable).
 inline std::optional<std::string> service_failure(const yuzu::agent::SubprocessResult& r, std::string_view os,
-                                                  bool& unavailable) {
+                                                  std::string_view unavailable_cause, bool& unavailable) {
     unavailable = false;
     if (const auto f = yuzu::agent::classify_runner_failure(r)) {
         if (f->status == YUZU_RESULT_STATUS_UNAVAILABLE) {
             unavailable = true;
-            return src_token(os, "service", "systemctl_unavailable");
+            return src_token(os, "service", unavailable_cause);
         }
         return std::string{f->provenance};
     }
@@ -509,7 +518,7 @@ inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
         ++out.units;
         const auto r = fs.run({"is-enabled", std::string{unit}}, detail::service_options(4, 4096));
         bool unavailable = false;
-        if (const auto bad = detail::service_failure(r, fs.os, unavailable)) {
+        if (const auto bad = detail::service_failure(r, fs.os, "systemctl_unavailable", unavailable)) {
             t.acc.add_failure(*bad);
             if (unavailable) {
                 out.rows.clear();
@@ -539,8 +548,8 @@ inline ServiceOutcome audit_service_macos(const PosixFs& fs, Tally& t) {
     out.units = 1;
     const auto r = fs.run({"print-disabled", "system"}, detail::service_options(4096, 256 * 1024));
     bool unavailable = false;
-    if (const auto bad = detail::service_failure(r, fs.os, unavailable)) {
-        t.acc.add_failure(unavailable ? src_token(fs.os, "service", "launchctl_unavailable") : *bad);
+    if (const auto bad = detail::service_failure(r, fs.os, "launchctl_unavailable", unavailable)) {
+        t.acc.add_failure(*bad);
         out.state = SourceState::failed;
         return out;
     }
@@ -669,6 +678,13 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
     for (const auto& home : homes) {
         if (t.truncated || attempts_exhausted)
             break;
+        // Order: network prefix -> eligibility -> lazy open_home. A home on a network mount is
+        // never stat'ed or opened (it is reported failed below); on any other home the
+        // eligibility probe runs before anything opens it, and a home that is positively not an
+        // account is neither counted nor reported.
+        const bool on_network = detail::under_prefix(home.path, prefixes);
+        if (!on_network && fs.is_account_home && !fs.is_account_home(home))
+            continue;
         ++out.accounts;
 
         std::vector<KeyFileSpec> specs;
@@ -681,7 +697,7 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
 
         // Records one file's outcome: its file row and, when read, its key rows.
         const auto record = [&](const KeyFileSpec& s, const FileReadLike& r) {
-            const SrcOutcome o = classify_read(r, os, "keys");
+            const SrcOutcome o = classify_read(r, os, "keys", false);
             t.note(o);
             std::optional<std::size_t> nk, nm, no;
             std::vector<std::string> krows;
@@ -696,6 +712,8 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
                     t.acc.add_failure(token("oversized_line"));
                 if (kp.unknown_type)
                     t.acc.add_failure(token("unknown_key_type"));
+                if (kp.nul_truncated)
+                    t.acc.add_failure(token("invalid_bytes"));
                 t.field_oversized = t.field_oversized || kp.field_oversized;
                 nk = kp.keys;
                 nm = kp.malformed;
@@ -717,7 +735,7 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
         };
 
         // A home on a network mount is not touched at all.
-        if (detail::under_prefix(home.path, prefixes)) {
+        if (on_network) {
             for (const auto& s : specs)
                 record_failed(s, SourceState::failed, token("network_mount_skipped"));
             continue;

@@ -8,9 +8,12 @@
  * follows a symlink leaf: /etc/ssh is writable by root only, a link there is root's own
  * configuration exactly as a directive is, sshd follows it, and stock macOS (crypto.conf) and
  * NixOS ship such links. The reader still refuses a non-regular target by fstat on the
- * descriptor it reads and caps the size. KEY side (account homes, .ssh, authorized_keys*,
- * absolute AuthorizedKeysFile entries) never follows: the subject can write there, and a link
- * would make a root agent read what the subject cannot.
+ * descriptor it reads and caps the size. A home PARENT (/home, /Users) is the same kind of
+ * root-only-writable path, so the lister follows it (Fedora Atomic ships /home -> var/home);
+ * only the entries beneath it are subject-writable. KEY side (each account home, .ssh,
+ * authorized_keys*, absolute AuthorizedKeysFile entries) never follows: the subject can write
+ * there, and a link would make a root agent read what the subject cannot. A single home
+ * (/root, /var/root) is a home, not a parent: it stays no-follow.
  *
  * Reads are bounded. An Include directory and each account home are opened ONCE and every read
  * under them goes through THAT descriptor, one path component per openat() (dir-fd
@@ -51,7 +54,7 @@ struct Paths {
     std::string config;   ///< /etc/ssh/sshd_config
     std::vector<std::string> home_parents; ///< directories whose subdirectories are homes (/home, /Users)
     std::vector<std::string> single_homes; ///< homes that are themselves a directory (/root, /var/root)
-    unsigned min_uid = 0; ///< a home-parent entry owned by a lower uid is not an account (macOS: 500); 0 = no filter
+    unsigned min_uid = 0; ///< a home-parent entry owned by a lower uid is not an account (macOS: 500); 0 = no filter (see PosixFs::is_account_home)
     std::size_t max_dir_entries = kMaxDirEntries; ///< injectable so a test need not make 4097 files
     std::function<std::optional<std::vector<std::string>>()> mounts; ///< network mount points
     RunFn run;
@@ -136,7 +139,9 @@ inline PosixFs make_posix_fs(const Paths& p) {
         return to_read_like(yuzu::shared::read_file_at(inc_dir->dir.fd(), name.c_str(), kConfigFileCap, yuzu::shared::Leaf::follow));
     };
 
-    fs.list_homes = [singles = p.single_homes, min_uid = p.min_uid, cap = p.max_dir_entries](
+    // Lists NAMES only: no entry is opened here, so an unopenable home is listed and surfaces as
+    // a refused file row when the leg opens it. Account eligibility is is_account_home (below).
+    fs.list_homes = [singles = p.single_homes, cap = p.max_dir_entries](
                         const std::vector<std::string>& roots, std::vector<HomeEntry>& homes,
                         bool& too_many) {
         int first_err = 0;
@@ -147,7 +152,8 @@ inline PosixFs make_posix_fs(const Paths& p) {
                 any_listed = true;
                 continue;
             }
-            auto d = yuzu::shared::open_dir_no_follow(root);
+            // The parent is root-owned like /etc/ssh, so a link here (/home -> var/home) is followed.
+            auto d = yuzu::shared::open_dir(root, yuzu::shared::Leaf::follow);
             if (!d.opened()) {
                 if (d.err != ENOENT && first_err == 0)
                     first_err = d.err != 0 ? d.err : EIO;
@@ -158,12 +164,6 @@ inline PosixFs make_posix_fs(const Paths& p) {
                 // Only directories (and links, so a refused symlinked home is visible) can be homes.
                 if (e->d_type != DT_DIR && e->d_type != DT_UNKNOWN && e->d_type != DT_LNK)
                     return true;
-                if (min_uid > 0) {
-                    auto h = yuzu::shared::open_dir_no_follow_at(d.dir.fd(), e->d_name);
-                    struct stat st{};
-                    if (!h.opened() || ::fstat(h.dir.fd(), &st) != 0 || st.st_uid < min_uid)
-                        return true; // not a real account home (macOS: uid < 500, or unopenable)
-                }
                 if (homes.size() >= kMaxHomes) {
                     too_many = true;
                     return false;
@@ -181,6 +181,20 @@ inline PosixFs make_posix_fs(const Paths& p) {
             return first_err;
         return any_listed ? 0 : ENOENT;
     };
+    if (p.min_uid > 0) {
+        // A path lstat: nothing is opened and nothing is followed. false ONLY on a confirmed
+        // owner below the floor; a failed stat answers true so open_home reports the errno
+        // (refused / failed) rather than the home vanishing. A single home (/root, /var/root)
+        // is never filtered: root's own home is owned by uid 0 by definition.
+        fs.is_account_home = [singles = p.single_homes, min_uid = p.min_uid](const HomeEntry& h) {
+            if (std::ranges::find(singles, h.path) != singles.end())
+                return true;
+            struct stat st{};
+            if (::lstat(h.path.c_str(), &st) != 0)
+                return true;
+            return st.st_uid >= min_uid;
+        };
+    }
     fs.open_home = [home_dir](const HomeEntry& h) {
         *home_dir = yuzu::shared::open_dir_no_follow(h.path);
         if (home_dir->opened())

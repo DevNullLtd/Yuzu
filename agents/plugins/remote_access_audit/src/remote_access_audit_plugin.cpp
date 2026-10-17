@@ -99,8 +99,9 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        // Every failure-token literal matches ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$;
-        // the body is execute_list.
+        // This plugin's own failure tokens match ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$;
+        // a runner failure's own `subprocess_runner:*` provenance token passes through unchanged.
+        // The body is execute_list.
         return yuzu::remote_access_audit::execute_list(ctx, action, kLeg, kLegExceptionToken);
     }
 };

@@ -345,6 +345,7 @@ TEST_CASE("remote_access_audit keys: comments, blank lines, CRLF, tabs, duplicat
     // a comment holding a pipe and a NUL never reaches a row: the comment is skipped, not read
     const auto hostile = parse(key + " ops|root\0evil\n"s);
     expect_one_key(hostile, "ssh-ed25519", "SHA256:BPH4QduMtDlX59CWZCda5Zf0U0jseMmFVimvek7EMhA", "256");
+    CHECK(hostile.kp.nul_truncated);
     // blank and # lines are ignored and not counted
     const auto quiet = parse("\n   \n# a comment\n\t# indented\n" + key + "\r\n" + key + "\n");
     CHECK(quiet.kp.keys == 2); // duplicates are emitted per line; CRLF is tolerated
@@ -363,6 +364,48 @@ TEST_CASE("remote_access_audit keys: comments, blank lines, CRLF, tabs, duplicat
     CHECK(big.kp.oversized == 1);
     CHECK(big.kp.malformed == 0);
     CHECK(big.kp.keys == 1);
+}
+
+TEST_CASE("remote_access_audit keys: a NUL cuts its own line short, as sshd's getline + C-string read does",
+          "[remote_access_audit][keys]") {
+    // sshd (auth2-pubkeyfile.c) reads each line with getline() and hands it on as a C string, so
+    // a NUL truncates THAT line and the file is still accepted: the key before it is trusted.
+    const std::string key = kAliceEd25519Type + " " + kAliceEd25519B64;
+    const std::string fp = "SHA256:BPH4QduMtDlX59CWZCda5Zf0U0jseMmFVimvek7EMhA";
+
+    // NUL mid-comment: the key row is still emitted, the flag is set, nothing is malformed
+    const auto in_comment = parse(key + " a\0x\n"s);
+    expect_one_key(in_comment, "ssh-ed25519", fp, "256");
+    CHECK(in_comment.kp.nul_truncated);
+    CHECK(in_comment.kp.keys == 1);
+
+    // no NUL, no flag
+    CHECK_FALSE(parse(key + " a\n").kp.nul_truncated);
+
+    // NUL on a later line only cuts that line: the first key and the third both survive
+    const auto many = parse(key + "\n" + key + "\0junk\n"s + key + "\n");
+    CHECK(many.kp.keys == 3);
+    CHECK(many.kp.malformed == 0);
+    CHECK(many.kp.nul_truncated);
+
+    // NUL inside the base64 blob: the line is cut there, the blob is incomplete, the line is malformed
+    const std::string cut = kAliceEd25519Type + " " + kAliceEd25519B64.substr(0, 20) + "\0"s +
+                            kAliceEd25519B64.substr(20) + " c\n";
+    const auto in_blob = parse(cut);
+    CHECK(in_blob.kp.keys == 0);
+    CHECK(in_blob.kp.malformed == 1);
+    CHECK(in_blob.kp.nul_truncated);
+
+    // a line that is only a NUL (or whitespace then NUL) is blank, not malformed
+    const auto blank = parse("\0junk\n"s + "  \0\n"s);
+    CHECK(blank.kp.keys == 0);
+    CHECK(blank.kp.malformed == 0);
+    CHECK(blank.kp.nul_truncated);
+
+    // the oversize cap measures what is parsed: a long line cut short by a NUL early is not oversized
+    const auto long_tail = parse(key + "\0"s + std::string(kMaxKeyLine, 'x') + "\n");
+    CHECK(long_tail.kp.keys == 1);
+    CHECK(long_tail.kp.oversized == 0);
 }
 
 TEST_CASE("remote_access_audit keys: the row budget is charged before a row exists and stops the parse",

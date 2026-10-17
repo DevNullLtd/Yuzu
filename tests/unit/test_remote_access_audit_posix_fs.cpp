@@ -173,7 +173,7 @@ TEST_CASE("remote_access_audit posix fs: the Include listing is sorted, matched 
     CHECK(b.list_include_dir(t.at("nodir").string(), "*", names, too_many) == ENOENT);
 }
 
-TEST_CASE("remote_access_audit posix fs: the home lister filters on uid, includes single homes, sorts",
+TEST_CASE("remote_access_audit posix fs: the home lister lists names only, includes single homes, sorts, caps",
           "[remote_access_audit][posix_fs]") {
     Tree t;
     fs::create_directories(t.at("home/bob"));
@@ -190,23 +190,15 @@ TEST_CASE("remote_access_audit posix fs: the home lister filters on uid, include
         names.push_back(h.name);
     CHECK(names == std::vector<std::string>{"alice", "bob", "linked", "rootsingle"}); // links stay visible: they are refused later
     CHECK(homes.back().path == t.at("rootsingle").string());
+    CHECK_FALSE(b.is_account_home); // no uid floor on this binding
 
-    // a uid floor above the owner filters every parent entry; the single home is still listed
+    // a uid floor changes eligibility (is_account_home), never what is listed
     auto p = t.paths();
     p.min_uid = static_cast<unsigned>(::geteuid()) + 1;
     auto high = make_posix_fs(p);
     homes.clear();
     REQUIRE(high.list_homes(high.home_roots, homes, too_many) == 0);
-    REQUIRE(homes.size() == 1);
-    CHECK(homes[0].name == "rootsingle");
-    // a floor at the owner's uid keeps them (>=)
-    if (::geteuid() != 0) {
-        p.min_uid = static_cast<unsigned>(::geteuid());
-        auto eq = make_posix_fs(p);
-        homes.clear();
-        REQUIRE(eq.list_homes(eq.home_roots, homes, too_many) == 0);
-        CHECK(homes.size() == 3); // alice, bob and the single home; the symlinked entry cannot be opened to be checked
-    }
+    CHECK(homes.size() == 4);
 
     // errno surfaces: a root that is a regular file, and a root that does not exist
     auto q = t.paths();
@@ -229,6 +221,113 @@ TEST_CASE("remote_access_audit posix fs: the home lister filters on uid, include
     REQUIRE(capped.list_homes(capped.home_roots, homes, too_many) == 0);
     CHECK(too_many);
     CHECK(homes.size() == 2);
+}
+
+TEST_CASE("remote_access_audit posix fs: account eligibility is a path lstat, false only on a confirmed lower owner",
+          "[remote_access_audit][posix_fs]") {
+    Tree t;
+    fs::create_directories(t.at("home/alice"));
+    fs::create_directories(t.at("rootsingle"));
+    fs::create_directory_symlink(t.at("home/alice"), t.at("home/linked"));
+
+    auto p = t.paths();
+    p.min_uid = static_cast<unsigned>(::geteuid()) + 1; // every file here is owned by euid: below the floor
+    const auto high = make_posix_fs(p);
+    REQUIRE(high.is_account_home);
+    const HomeEntry alice{"alice", t.at("home/alice").string()};
+    CHECK_FALSE(high.is_account_home(alice));
+    // a single home (/root, /var/root) is never filtered: it is root's own home by definition
+    CHECK(high.is_account_home({"rootsingle", t.at("rootsingle").string()}));
+    // a failed stat is not a confirmed owner: eligible, so open_home reports the errno
+    CHECK(high.is_account_home({"ghost", t.at("home/ghost").string()}));
+
+    if (::geteuid() != 0) { // with euid 0 the floor would be 0 = no filter, no predicate bound
+        p.min_uid = static_cast<unsigned>(::geteuid());
+        const auto eq = make_posix_fs(p);
+        REQUIRE(eq.is_account_home);
+        CHECK(eq.is_account_home(alice)); // a floor at the owner's uid keeps it (>=)
+        // lstat, not stat: a link is judged by its own owner, never opened and never followed
+        CHECK(eq.is_account_home({"linked", t.at("home/linked").string()}));
+    }
+}
+
+TEST_CASE("remote_access_audit posix fs: an unopenable home is listed and refused at open, not dropped",
+          "[remote_access_audit][posix_fs]") {
+    if (::geteuid() == 0)
+        SKIP("root opens a mode-000 directory");
+    Tree t;
+    fs::create_directories(t.at("home/alice"));
+    fs::create_directories(t.at("home/locked"));
+    fs::create_directory_symlink(t.at("home/alice"), t.at("home/linked"));
+    struct Restore { // let the TempDir clean up even when a REQUIRE below aborts the case
+        fs::path dir;
+        ~Restore() { ::chmod(dir.c_str(), 0700); }
+    } restore{t.at("home/locked")};
+    REQUIRE(::chmod(t.at("home/locked").c_str(), 0) == 0);
+    auto p = t.paths();
+    p.min_uid = static_cast<unsigned>(::geteuid()); // the macOS shape: a floor the owner meets
+    const auto b = make_posix_fs(p);
+
+    std::vector<HomeEntry> homes;
+    bool too_many = false;
+    REQUIRE(b.list_homes(b.home_roots, homes, too_many) == 0);
+    std::vector<std::string> names;
+    for (const auto& h : homes)
+        names.push_back(h.name);
+    CHECK(names == std::vector<std::string>{"alice", "linked", "locked", "rootsingle"}); // locked is NOT dropped
+
+    const auto find = [&](const std::string& n) { return *std::ranges::find(homes, n, &HomeEntry::name); };
+    REQUIRE(b.is_account_home(find("locked")));      // owned by us: eligible even though unopenable
+    CHECK(b.open_home(find("locked")) == EACCES);    // ... and the open reports the refusal
+    CHECK(b.open_home(find("alice")) == 0);
+    CHECK(b.open_home(find("linked")) != 0);         // a symlinked home is refused at the open (ELOOP or ENOTDIR by OS)
+
+    // and the whole listing says so: a refused file row plus the homes token, never a vanished account
+    p.run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+        yuzu::agent::SubprocessResult r;
+        r.tool_ran = true;
+        r.termination_reason = yuzu::agent::TerminationReason::exited;
+        r.output = "enabled\n";
+        return r;
+    };
+    const auto l = list_posix(make_posix_fs(p));
+    CHECK(std::ranges::find(l.rows, "file|locked|authorized_keys|refused|-|-|-") != l.rows.end());
+    CHECK(l.reason.find("linux:remote_access_audit:homes:permission_denied") != std::string::npos);
+}
+
+TEST_CASE("remote_access_audit posix fs: a symlinked home parent is followed, a symlinked entry or single home is not",
+          "[remote_access_audit][posix_fs]") {
+    Tree t;
+    // the Fedora Atomic shape: /home -> var/home. The parent is root-owned like /etc/ssh.
+    fs::create_directories(t.at("real_homes/alice/.ssh"));
+    fs::create_directories(t.at("real_homes/bob"));
+    t.write(t.at("real_homes/alice/.ssh/authorized_keys"), "k\n");
+    t.write(t.at("elsewhere/secret"), "outside");
+    fs::create_directory_symlink(t.at("elsewhere"), t.at("real_homes/evil"));
+    fs::create_directory_symlink(t.at("real_homes"), t.at("homes"));
+    fs::create_directories(t.at("realroot"));
+    fs::create_directory_symlink(t.at("realroot"), t.at("rootlink"));
+
+    auto p = t.paths();
+    p.home_parents = {t.at("homes").string()};
+    p.single_homes = {t.at("rootlink").string()};
+    const auto b = make_posix_fs(p);
+
+    std::vector<HomeEntry> homes;
+    bool too_many = false;
+    REQUIRE(b.list_homes(b.home_roots, homes, too_many) == 0);
+    std::vector<std::string> names;
+    for (const auto& h : homes)
+        names.push_back(h.name);
+    CHECK(names == std::vector<std::string>{"alice", "bob", "evil", "rootlink"});
+
+    const auto find = [&](const std::string& n) { return *std::ranges::find(homes, n, &HomeEntry::name); };
+    REQUIRE(b.open_home(find("alice")) == 0); // reached THROUGH the linked parent
+    const auto k = b.read_key_file({".ssh", "authorized_keys"});
+    CHECK(k.error == ReadErr::none);
+    CHECK(k.data == "k\n");
+    CHECK(b.open_home(find("evil")) != 0);     // a symlinked ENTRY is still refused
+    CHECK(b.open_home(find("rootlink")) != 0); // a single home is a home, not a parent: no-follow
 }
 
 TEST_CASE("remote_access_audit posix fs: an absolute key path outside any home is read by path",
