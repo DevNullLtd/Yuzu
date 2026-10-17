@@ -43,6 +43,17 @@ notify_result_test_() ->
       t("a result that no tracked worker sent is ignored",
         fun a_result_from_a_stranger_is_ignored/0)]}.
 
+%% Gate 8 #4: a notify worker's result counts toward the breaker only under the
+%% breaker generation it was started in. A short reset timeout, so an opened
+%% breaker goes half_open (and its probe closes it) within the test.
+notify_generation_test_() ->
+    {foreach,
+     fun setup_fast_reset/0,
+     fun cleanup/1,
+     [t("a notify started before the breaker cycled does not count against the new circuit; "
+        "one started in the current generation does",
+        fun a_result_from_an_older_generation_does_not_count/0)]}.
+
 t(Name, Fun) -> {timeout, 30, {Name, Fun}}.
 
 %%--------------------------------------------------------------------
@@ -154,11 +165,117 @@ a_result_from_a_stranger_is_ignored() ->
     %% A call is answered after the messages sent before it were handled.
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
 
+%% A slow notification is sent while the breaker is closed (generation N); the
+%% breaker then opens, goes half_open and closes again (generation N+1); the
+%% slow one then fails. Its notice is still given back and sent again, but the
+%% failure says nothing about the circuit that exists now, so the new circuit's
+%% failure count does not move. A failure of a notification started in the
+%% current generation still counts.
+a_result_from_an_older_generation_does_not_count() ->
+    Test = self(),
+    Failing = atomics:new(1, []),
+    atomics:put(Failing, 1, 1),
+    meck:expect(yuzu_grpc_client, unary,
+                fun(_Meta, Path, Req, _Def, _Opts) ->
+                        Method = lists:last(binary:split(Path, <<"/">>, [global])),
+                        Id = maps:get(agent_id, Req, <<>>),
+                        Answer =
+                            case {Method, Id} of
+                                {<<"NotifyStreamStatus">>, <<"notify-agent-slow", _/binary>>} ->
+                                    Test ! {blocked, self(), Id},
+                                    receive {release, R} -> R after 20000 -> ok end;
+                                {<<"NotifyStreamStatus">>, _} ->
+                                    case atomics:get(Failing, 1) of
+                                        1 -> {error, noproc};
+                                        0 -> ok
+                                    end;
+                                _ ->
+                                    ok
+                            end,
+                        case Answer of
+                            ok -> {ok, #{accepted => true}, #{}};
+                            {error, Reason} -> {error, Reason}
+                        end
+                end),
+    Gen0 = up_field(cb_gen),
+    ok = notify_id(connected, <<"slow1">>),
+    W1 = blocked(<<"notify-agent-slow1">>),
+    %% Open the breaker with failures of other notifications, then let the
+    %% half_open probe succeed: the breaker closes under a new generation.
+    [ok = notify(connected, I) || I <- lists:seq(1, ?THRESHOLD)],
+    ?assertEqual(ok, wait_until(fun() -> yuzu_gw_upstream:circuit_state() =:= open end)),
+    atomics:put(Failing, 1, 0),
+    ?assertEqual(ok, wait_until(fun() -> yuzu_gw_upstream:circuit_state() =:= closed
+                                             andalso up_field(cb_gen) > Gen0 end)),
+    ?assertEqual(ok, wait_until(fun() -> only_slow_in_flight(1) end)),
+    ?assertEqual(0, up_field(cb_failures)),
+    %% The old worker fails: the notice is sent again (it blocks once more),
+    %% and the new circuit's failure count is unchanged.
+    W1 ! {release, {error, noproc}},
+    W1b = blocked(<<"notify-agent-slow1">>),
+    ?assertEqual(0, up_field(cb_failures)),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    %% The same failure from a worker of the current generation counts.
+    ok = notify_id(connected, <<"slow2">>),
+    W2 = blocked(<<"notify-agent-slow2">>),
+    W2 ! {release, {error, noproc}},
+    W2b = blocked(<<"notify-agent-slow2">>),
+    ?assertEqual(1, up_field(cb_failures)),
+    [W ! {release, ok} || W <- [W1b, W2b]],
+    ?assertEqual(ok, wait_until(fun notifications_settled/0)).
+
+blocked(Id) ->
+    receive {blocked, W, Id} -> W
+    after ?WAIT_MS -> error({never_sent, Id})
+    end.
+
+notify_id(Event, Suffix) ->
+    yuzu_gw_upstream:notify_stream_status(
+      <<"notify-agent-", Suffix/binary>>, <<"notify-session">>, Event,
+      <<"203.0.113.9">>, <<"home">>).
+
+%% Nothing held and exactly N sends in flight (the slow ones, blocked).
+only_slow_in_flight(N) ->
+    case yuzu_gw_upstream:lane_snapshot() of
+        #{notify_inflight := N} ->
+            yuzu_gw_notify_queue:size(up_field(notify_pending)) =:= 0;
+        _ ->
+            false
+    end.
+
+%% A field of the upstream process's #state{}, by name.
+up_field(Name) ->
+    element(field_index(Name), sys:get_state(yuzu_gw_upstream)).
+
+field_index(Name) ->
+    Src = filename:join([code:lib_dir(yuzu_gw), "src", "yuzu_gw_upstream.erl"]),
+    {ok, Forms} = epp:parse_file(Src, []),
+    [Fs] = [Fs0 || {attribute, _, record, {state, Fs0}} <- Forms],
+    Names = [case F of
+                 {typed_record_field, {record_field, _, {atom, _, N}}, _} -> N;
+                 {typed_record_field, {record_field, _, {atom, _, N}, _}, _} -> N;
+                 {record_field, _, {atom, _, N}} -> N;
+                 {record_field, _, {atom, _, N}, _} -> N
+             end || F <- Fs],
+    [I] = [I || {I, N} <- lists:zip(lists:seq(2, length(Names) + 1), Names), N =:= Name],
+    I.
+
 %%--------------------------------------------------------------------
 %% Fixture
 %%--------------------------------------------------------------------
 
+%% setup/0 with a 100 ms reset timeout, read when the upstream starts.
+setup_fast_reset() ->
+    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 100),
+    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 100),
+    setup(fast).
+
 setup() ->
+    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 60000),
+    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 60000),
+    setup(slow).
+
+setup(_Reset) ->
     yuzu_gw_test_registry:ensure(),
     catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
@@ -178,9 +295,8 @@ setup() ->
     meck:expect(yuzu_gw_agent, reannounce, fun(_, _) -> ok end),
     meck:expect(yuzu_gw_agent, disconnect, fun(_) -> ok end),
     application:set_env(yuzu_gw, circuit_breaker_failure_threshold, ?THRESHOLD),
-    %% Long, so an opened breaker stays open for the length of a test.
-    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 60000),
-    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 60000),
+    %% The reset timeout was set by the caller: long (setup/0), so an opened
+    %% breaker stays open for the length of a test, or short (setup_fast_reset/0).
     application:set_env(yuzu_gw, registration_replay_start_jitter_ms, 0),
     {ok, UpPid} = yuzu_gw_upstream:start_link(),
     UpPid.

@@ -462,10 +462,13 @@
 
 -record(state, {
     %% Notify workers in flight: pid => the key, class and event it is sending
-    %% (so a failure can give the event back), or `resolved' once its result
+    %% (so a failure can give the event back) and the breaker generation it was
+    %% started under (so its result counts toward the breaker only if the
+    %% breaker has not moved since, Gate 8 #4), or `resolved' once its result
     %% is in (its slot is freed by its 'DOWN').
     notify_pids     :: #{pid() => {yuzu_gw_notify_queue:key(), connected | disconnected,
-                                   yuzu_gw_notify_queue:event()} | resolved},
+                                   yuzu_gw_notify_queue:event(), non_neg_integer()}
+                                  | resolved},
     %% Stream-status notifications held until a worker slot is free and the
     %% breaker is closed. Volatile: it does not outlive this process.
     notify_pending  :: yuzu_gw_notify_queue:t(),
@@ -1372,20 +1375,25 @@ handle_info({notify_probe_timeout, _Pid, _Gen}, State) ->
 %% is freed by the worker's 'DOWN'.
 %%
 %% The breaker: it counts like a call made from this process, but only while
-%% closed: the workers in flight when it opened or half-opened answer into a
-%% circuit they no longer belong to, and the half_open probe
-%% (notify_probe_result, resolved by generation), not a late answer, decides
-%% when it closes. record_result/2 has no clause for an open breaker.
+%% closed AND under the generation the worker was started in (as a proxied
+%% call is fenced by the generation its caller read, rpc_result): the workers
+%% in flight when it opened or half-opened answer into a circuit they no longer
+%% belong to, even once it has closed again (Gate 8 #4: a slow notice from
+%% before an open/half_open/closed cycle must not count against the recovered
+%% circuit), and the half_open probe (notify_probe_result, resolved by
+%% generation), not a late answer, decides when it closes. record_result/2 has
+%% no clause for an open breaker. The notice itself is settled the same way
+%% whatever its generation.
 handle_info({notify_result, Pid, Result}, #state{notify_pids = Pids} = State) ->
     Before = notify_counts(State),
     case maps:find(Pid, Pids) of
-        {ok, {Key, Class, Event}} ->
+        {ok, {Key, Class, Event, Gen}} ->
             State1 = settle_notify(Key, Class, Event, Result,
                                    State#state{notify_pids = Pids#{Pid := resolved}}),
-            State2 = case {State1#state.mode, State1#state.cb_state} of
-                         {flushing, _} -> count_flushed(Result, State1);
-                         {_, closed}   -> record_result(Result, State1);
-                         _             -> State1
+            State2 = case {State1#state.mode, State1#state.cb_state, State1#state.cb_gen} of
+                         {flushing, _, _}   -> count_flushed(Result, State1);
+                         {_, closed, Gen}   -> record_result(Result, State1);
+                         _                  -> State1
                      end,
             {noreply, report_notify_counts(Before, settle(State2))};
         _ ->
@@ -1415,7 +1423,7 @@ handle_info({'DOWN', _MonRef, process, Pid, _Reason},
     %% headroom may continue.
     Before = notify_counts(State),
     case maps:find(Pid, Pids) of
-        {ok, {_Key, Class, _Event}} -> emit_notify_lost(Class, crashed, 1);
+        {ok, {_Key, Class, _Event, _Gen}} -> emit_notify_lost(Class, crashed, 1);
         _ -> ok
     end,
     State1 = State#state{notify_pids = maps:remove(Pid, Pids),
@@ -1588,7 +1596,7 @@ terminate(_Reason, #state{notify_pending = Pending, notify_pids = Pids}) ->
     %% one loses it: counted, and named in one line, never sent from here (the
     %% supervisor gives this callback 5 s, no place for RPCs).
     Held = held_by_class(Pending),
-    InFlight = [C || {_K, C, _E} <- maps:values(Pids)],
+    InFlight = [C || {_K, C, _E, _G} <- maps:values(Pids)],
     [emit_notify_lost(C, shutdown, N) || {C, N} <- Held],
     [emit_notify_lost(C, shutdown, 1) || C <- InFlight],
     case lists:sum([N || {_, N} <- Held]) + length(InFlight) of
@@ -1915,7 +1923,8 @@ drain(#state{mode = flushing, cb_state = CbState} = State) when CbState =/= clos
     %% The breaker is not consulted or moved (count_flushed/2).
     Drained = drain(State#state{cb_state = closed}),
     Drained#state{cb_state = CbState};
-drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending} = State) ->
+drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
+             cb_gen = Gen} = State) ->
     case map_size(Pids) < notify_limit_now(State) of
         false ->
             State;
@@ -1949,7 +1958,7 @@ drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending} = 
                                 Server ! {notify_result, self(), Result}
                             end),
                             drain(State#state{notify_pending = Pending1,
-                                              notify_pids = Pids#{Pid => {Key, class_of(Notification), Ev}}})
+                                              notify_pids = Pids#{Pid => {Key, class_of(Notification), Ev, Gen}}})
                     end
             end
     end;
@@ -1984,7 +1993,7 @@ drain(#state{cb_state = half_open, notify_probe = undefined, notify_pids = Pids,
             %% cancelled with the probe, see handle_info({notify_probe_timeout, ...}).
             Timer = erlang:send_after(ProbeTimeout, Server, {notify_probe_timeout, Pid, Gen}),
             State#state{notify_pending = Pending1,
-                        notify_pids = Pids#{Pid => {Key, class_of(Notification), Event}},
+                        notify_pids = Pids#{Pid => {Key, class_of(Notification), Event, Gen}},
                         notify_probe = #{pid => Pid, mref => MonRef, timer => Timer,
                                          gen => Gen, key => Key, event => Event}}
     end;
@@ -2102,12 +2111,12 @@ settle_notify(Key, Class, Event, {error, _}, #state{notify_pending = Pending} = 
 %% The slots held back for Key's admission: one per send in flight whose event
 %% may come back (not yet resolved), except one for Key itself.
 reserved_slots(Key, #state{notify_pids = Pids}) ->
-    maps:fold(fun(_Pid, {K, _, _}, N) when K =/= Key -> N + 1;
+    maps:fold(fun(_Pid, {K, _, _, _}, N) when K =/= Key -> N + 1;
                  (_Pid, _Other, N) -> N
               end, 0, Pids).
 
 key_in_flight(Key, Pids) ->
-    lists:any(fun({K, _, _}) -> K =:= Key; (_) -> false end, maps:values(Pids)).
+    lists:any(fun({K, _, _, _}) -> K =:= Key; (_) -> false end, maps:values(Pids)).
 
 class_of(#{event := 'CONNECTED'}) -> connected;
 class_of(_Notification)           -> disconnected.
@@ -2142,7 +2151,7 @@ end_flush(#state{flush_from = From, flush_timer = Timer, flush_sent = Sent,
                  notify_pending = Pending, notify_pids = Pids} = State) ->
     _ = erlang:cancel_timer(Timer),
     Held = held_by_class(Pending),
-    InFlight = [C || {_K, C, _E} <- maps:values(Pids)],
+    InFlight = [C || {_K, C, _E, _G} <- maps:values(Pids)],
     Left = lists:sum([N || {_, N} <- Held]) + length(InFlight),
     [emit_notify_lost(C, shutdown, N) || {C, N} <- Held],
     [emit_notify_lost(C, shutdown, 1) || C <- InFlight],
