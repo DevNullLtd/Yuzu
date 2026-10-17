@@ -322,6 +322,42 @@ TEST_CASE("posix_secure_read: unreadable file reports EACCES", "[shared][posix_s
     CHECK(r.err == EACCES);
 }
 
+TEST_CASE("posix_secure_read: Leaf::follow follows a link, still refuses non-regular targets and maps a loop to io",
+          "[shared][posix_secure_read]") {
+    yuzu::test::TempDir tmp{"yuzu_test_psr_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    write_file(tmp.path / "real", "body");
+    fs::create_symlink("real", tmp.path / "link");
+    fs::create_symlink("loop", tmp.path / "loop");
+    fs::create_symlink("nowhere", tmp.path / "dangling");
+    REQUIRE(fs::create_directory(tmp.path / "d"));
+    write_file(tmp.path / "d" / "f", "in-d");
+    fs::create_directory_symlink("d", tmp.path / "dlink");
+    REQUIRE(::mkfifo((tmp.path / "fifo").c_str(), 0600) == 0);
+    fs::create_symlink("fifo", tmp.path / "fifolink");
+
+    const auto link = (tmp.path / "link").string();
+    CHECK(read_file(link, 64, Leaf::follow).data == "body");
+    CHECK(read_file_no_follow(link, 64).error == ReadError::symlink_refused); // the wrapper is unchanged
+    CHECK(read_file(link, 64, Leaf::no_follow).error == ReadError::symlink_refused);
+
+    const auto loop = read_file((tmp.path / "loop").string(), 64, Leaf::follow);
+    CHECK(loop.error == ReadError::io);
+    CHECK(loop.err == ELOOP);
+    const auto dangling = read_file((tmp.path / "dangling").string(), 64, Leaf::follow);
+    CHECK(dangling.error == ReadError::io);
+    CHECK(dangling.err == ENOENT);
+    CHECK(read_file((tmp.path / "fifolink").string(), 64, Leaf::follow).error == ReadError::not_regular);
+    CHECK(read_file(link, 3, Leaf::follow).error == ReadError::oversized);
+    CHECK(read_file(link + "/", 64, Leaf::follow).err == EINVAL); // plain-leaf guard holds in both modes
+
+    auto d = open_dir((tmp.path / "dlink").string(), Leaf::follow);
+    REQUIRE(d.opened());
+    CHECK(read_file_at(d.dir.fd(), "f", 64, Leaf::follow).data == "in-d");
+    CHECK(open_dir_no_follow((tmp.path / "dlink").string()).err == ENOTDIR);
+    CHECK(read_file_at(d.dir.fd(), "a/b", 64, Leaf::follow).err == EINVAL); // single-component guard holds
+}
+
 TEST_CASE("posix_secure_read: fdopendir failure closes its descriptor",
           "[shared][posix_secure_read]") {
     yuzu::test::TempDir tmp{"yuzu_test_psr_"};

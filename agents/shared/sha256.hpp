@@ -11,6 +11,7 @@
  */
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -98,7 +99,9 @@ struct Sha256 {
         }
     }
 
-    std::string hex_digest() {
+    /// The 32 raw digest bytes (big-endian words). Finalises the hash: call at most once, and
+    /// not after hex_digest() on the same object.
+    std::array<unsigned char, 32> raw_digest() {
         const std::uint64_t bit_len = total * 8;
         unsigned char pad = 0x80;
         update(&pad, 1);
@@ -111,12 +114,23 @@ struct Sha256 {
         // update() counts these framing bytes into `total`, but bit_len was
         // latched before padding began, so the encoded length is correct.
         update(len_be, 8);
+        std::array<unsigned char, 32> out{};
+        for (std::size_t i = 0; i < 8; ++i) {
+            out[i * 4] = static_cast<unsigned char>(h[i] >> 24);
+            out[i * 4 + 1] = static_cast<unsigned char>(h[i] >> 16);
+            out[i * 4 + 2] = static_cast<unsigned char>(h[i] >> 8);
+            out[i * 4 + 3] = static_cast<unsigned char>(h[i]);
+        }
+        return out;
+    }
+
+    std::string hex_digest() {
         static constexpr char hexc[] = "0123456789abcdef";
         std::string out;
         out.reserve(64);
-        for (std::uint32_t v : h) {
-            for (int shift = 28; shift >= 0; shift -= 4)
-                out += hexc[(v >> shift) & 0xF];
+        for (const unsigned char b : raw_digest()) {
+            out += hexc[b >> 4];
+            out += hexc[b & 0xF];
         }
         return out;
     }

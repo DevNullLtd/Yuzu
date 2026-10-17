@@ -14,7 +14,9 @@
  *   2. Symlink-leaf errno: under O_DIRECTORY|O_NOFOLLOW a symlink answers
  *      ENOTDIR, not ELOOP. ELOOP on a directory open means a link loop. File
  *      reads carry no O_DIRECTORY, so there a symlink leaf is ELOOP and maps
- *      to ReadError::symlink_refused.
+ *      to ReadError::symlink_refused. Under Leaf::follow there is no
+ *      O_NOFOLLOW, so ELOOP is a real link loop and maps to ReadError::io
+ *      (err = ELOOP), never symlink_refused.
  *   3. Size handling: reads go to EOF in fixed chunks and stop with
  *      `oversized` the moment the cap is exceeded. They never trust st_size
  *      (browser_inventory reads to st_size, which a growing or sparse file
@@ -39,6 +41,16 @@
  * '/' or '/.' (the kernel follows a symlink leaf named that way, defeating
  * O_NOFOLLOW); the single path "/" is allowed. A caller that holds a root
  * with a trailing separator must strip it first.
+ *
+ * LEAF POLICY: the *_no_follow functions are the default and the only safe
+ * choice wherever the audited subject can write the path (a link there would
+ * make a privileged reader open what the subject cannot). Leaf::follow
+ * (open_dir / read_file / read_file_at) exists for trees writable by root
+ * only, e.g. /etc/ssh, where a link is root's own configuration (NixOS and
+ * stock macOS ship such links) and the daemon being modelled follows it too.
+ * Follow mode still refuses a non-regular target by fstat on the descriptor it
+ * reads (no TOCTOU), caps the size, and keeps the single-component and
+ * plain-leaf-path guards.
  *
  * Blocking: open and read carry no deadline of their own, so a path on a dead
  * hard network mount can pin the calling worker (#4875 tracks the host-level
@@ -107,6 +119,9 @@ struct DirOpen {
 };
 
 enum class ReadError : int { none = 0, symlink_refused, not_regular, oversized, io };
+
+/// Whether the final path component may be a symlink (see LEAF POLICY above).
+enum class Leaf { no_follow, follow };
 
 /// Result of a bounded file read. `err` carries the errno when error == io.
 struct FileRead {
@@ -195,11 +210,11 @@ inline FileRead read_open_fd(int fd, std::size_t cap) {
     return out;
 }
 
-inline FileRead finish_file_open(int fd, std::size_t cap) {
+inline FileRead finish_file_open(int fd, std::size_t cap, Leaf leaf) {
     if (fd < 0) {
         FileRead out;
         const int e = errno;
-        if (e == ELOOP) {
+        if (e == ELOOP && leaf == Leaf::no_follow) {
             out.error = ReadError::symlink_refused;
         } else {
             out.error = ReadError::io;
@@ -213,16 +228,29 @@ inline FileRead finish_file_open(int fd, std::size_t cap) {
 inline constexpr int kDirFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 inline constexpr int kFileFlags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC;
 
+inline constexpr int dir_flags(Leaf l) noexcept {
+    return l == Leaf::follow ? (kDirFlags & ~O_NOFOLLOW) : kDirFlags;
+}
+inline constexpr int file_flags(Leaf l) noexcept {
+    return l == Leaf::follow ? (kFileFlags & ~O_NOFOLLOW) : kFileFlags;
+}
+
 } // namespace detail
 
-/// Open `path` as a directory; the leaf is not followed (intermediates are).
-inline DirOpen open_dir_no_follow(const std::string& path) {
+/// Open `path` as a directory; `leaf` selects whether a symlink leaf is followed
+/// (intermediates always are).
+inline DirOpen open_dir(const std::string& path, Leaf leaf) {
     if (!detail::is_plain_leaf_path(path)) {
         DirOpen out;
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_dir_open(::open(path.c_str(), detail::kDirFlags));
+    return detail::finish_dir_open(::open(path.c_str(), detail::dir_flags(leaf)));
+}
+
+/// Open the directory at `path`; the leaf is not followed (intermediates are).
+inline DirOpen open_dir_no_follow(const std::string& path) {
+    return open_dir(path, Leaf::no_follow);
 }
 
 /// Open the single component `name` under `parent_fd` as a directory.
@@ -235,26 +263,36 @@ inline DirOpen open_dir_no_follow_at(int parent_fd, const char* name) {
     return detail::finish_dir_open(::openat(parent_fd, name, detail::kDirFlags));
 }
 
-/// Read the regular file at `path` (leaf not followed) up to `cap` bytes.
-inline FileRead read_file_no_follow(const std::string& path, std::size_t cap) {
+/// Read the regular file at `path` up to `cap` bytes; `leaf` selects whether a symlink leaf is followed.
+inline FileRead read_file(const std::string& path, std::size_t cap, Leaf leaf) {
     if (!detail::is_plain_leaf_path(path)) {
         FileRead out;
         out.error = ReadError::io;
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_file_open(::open(path.c_str(), detail::kFileFlags), cap);
+    return detail::finish_file_open(::open(path.c_str(), detail::file_flags(leaf)), cap, leaf);
 }
 
-/// Read the regular file `name` under `dir_fd` up to `cap` bytes.
-inline FileRead read_file_no_follow_at(int dir_fd, const char* name, std::size_t cap) {
+/// Read the regular file `name` under `dir_fd` up to `cap` bytes; `leaf` selects whether a symlink is followed.
+inline FileRead read_file_at(int dir_fd, const char* name, std::size_t cap, Leaf leaf) {
     if (!detail::is_single_component(name)) {
         FileRead out;
         out.error = ReadError::io;
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_file_open(::openat(dir_fd, name, detail::kFileFlags), cap);
+    return detail::finish_file_open(::openat(dir_fd, name, detail::file_flags(leaf)), cap, leaf);
+}
+
+/// Read the regular file at `path` (leaf not followed) up to `cap` bytes.
+inline FileRead read_file_no_follow(const std::string& path, std::size_t cap) {
+    return read_file(path, cap, Leaf::no_follow);
+}
+
+/// Read the regular file `name` under `dir_fd` (leaf not followed) up to `cap` bytes.
+inline FileRead read_file_no_follow_at(int dir_fd, const char* name, std::size_t cap) {
+    return read_file_at(dir_fd, name, cap, Leaf::no_follow);
 }
 
 } // namespace yuzu::shared

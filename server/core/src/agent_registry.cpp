@@ -875,6 +875,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
          "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
          "/etc/exports.d and /etc/samba/smb.conf, macOS and Windows are planned; read-only"},
+        {"remote_access_audit.list",
+         "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
+         "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
+         "sshd is enabled; never a key comment, option value or key-file path; Linux and macOS, "
+         "Windows is planned; read-only, default-off, Forensics:Read single-target"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},

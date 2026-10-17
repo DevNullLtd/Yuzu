@@ -18,6 +18,15 @@ TEST_CASE("sha256: FIPS 180-4 vectors", "[shared][sha256]") {
     CHECK(sha256_hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     CHECK(sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ==
           "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+
+    // raw_digest() is the same 32 bytes hex_digest() encodes (ssh fingerprints need the raw form).
+    Sha256 s;
+    s.update("abc", 3);
+    const auto raw = s.raw_digest();
+    CHECK(raw[0] == 0xba);
+    CHECK(raw[1] == 0x78);
+    CHECK(raw[2] == 0x16);
+    CHECK(raw[31] == 0xad);
 }
 
 TEST_CASE("sha256: block boundary inputs", "[shared][sha256]") {

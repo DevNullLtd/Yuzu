@@ -210,6 +210,7 @@
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -5251,6 +5252,23 @@ public:
                     "/api/v1/plugin-config/privacy_permissions/kill-switch")) {
                 spdlog::error(
                     "[PG] Refusing to start: privacy_permissions default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
+        // Wave 11: remote_access_audit (per-account SSH authorized_keys
+        // fingerprints plus sshd_config and service state) ships default-off,
+        // same Forensics-class posture as privacy_permissions. An operator
+        // must explicitly enable it via PUT
+        // /api/v1/plugin-config/remote_access_audit/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "remote_access_audit",
+                    "default-off: forensics class (Wave 11); enable per PUT "
+                    "/api/v1/plugin-config/remote_access_audit/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: remote_access_audit default-off kill-switch "
                     "seed failed");
                 startup_failed_ = true;
             }
@@ -21826,6 +21844,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
         yuzu::server::capdecls::plugin_action_catalogue_mgmt_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_shares(),
+        yuzu::server::capdecls::plugin_action_catalogue_remote_access_audit(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail

@@ -101,6 +101,7 @@
     "crossplatform.browser_inventory.browsers":  "forensic",
     "crossplatform.browser_inventory.profiles":  "forensic",
     "crossplatform.privacy_permissions.permissions":"forensic",
+    "crossplatform.security.remote_access_audit": "forensic",
     "windows.execution_artifacts.shimcache":     "forensic",
     "windows.execution_artifacts.amcache":       "forensic",
     "windows.execution_artifacts.prefetch":      "forensic",
