@@ -176,6 +176,18 @@ whose normal schedulers were all busy read about 0.3; it now reads about 1.
   OTP's handler drops lines rather than grow without bound, so this alone does
   not stop the gateway.
 
+## Gateway agent owner restarts (#5695)
+
+Scraped from the GATEWAY (job `yuzu-gateway`). Each agent session is held by
+one owner process on the gateway; one that dies abnormally is restarted, sends
+its session's `DISCONNECTED` and recovers the session on the agent's open
+stream (gateway manual, "When an agent's owner process crashes"). The series
+exist at 0 from start.
+
+| Metric | Type | Meaning | When it is high |
+|---|---|---|---|
+| `yuzu_gw_agent_owner_restarts_total{outcome}` | counter | Owner processes restarted after an abnormal exit, by what the restarted owner did: `recovered` (the session was re-established on the agent's open stream; the agent kept it), `disconnected_only` (the `DISCONNECTED` was sent and the session ended: the stream was gone, a newer session held the agent, or the server could not take the session back; the agent reconnects), `gave_up` (the owner was restarted more than 3 times in 60 s: the session ended). `unknown` is never expected | Any increase is a gateway defect (owners do not crash in normal operation) worth a bug with the crash reports, but `recovered` and `disconnected_only` need nobody at once. `YuzuGatewayAgentOwnerCrashLoop` fires for 30 minutes after a `gave_up` |
+
 ## Gateway metric index
 
 Every other metric the gateway exports, so this page names each one. The

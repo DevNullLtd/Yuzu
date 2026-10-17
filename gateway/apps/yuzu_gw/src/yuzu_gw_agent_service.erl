@@ -33,6 +33,11 @@
 %% The reservation guard's process body (proc_lib entry point, see guard/1).
 -export([reservation_guard/2]).
 
+%% The Subscribe relay loop, run by subscribe/2 once the owner is started.
+%% Exported for tests (yuzu_gw_owner_restart_tests runs it as a stand-in
+%% stream).
+-export([stream_loop/3]).
+
 %% The bound on a Register's agent id, the same condition the server applies in
 %% GatewayUpstreamServiceImpl::ProxyRegister (and in the direct Register) before
 %% anything else: `info.agent_id().empty() || info.agent_id().size() >
@@ -305,14 +310,32 @@ subscribe(Ref, State) ->
             end
     end.
 
-%% Subscribe stream loop: relay messages between the stream and the agent process.
+%% Subscribe stream loop: relay messages between the stream and the agent
+%% process (its owner).
 %%
 %% Backpressure: before writing a command to the HTTP/2 stream, we check
 %% our own message queue length. If it exceeds the threshold (configurable
 %% via backpressure_threshold, default 1000), we emit a telemetry event
 %% and skip the send to prevent unbounded mailbox growth under load.
+%%
+%% The owner (OWNER-RESTART, #5695). This process MONITORS its owner; it is
+%% not linked to it, so the stream outlives an owner that crashes. The agent
+%% supervisor restarts a crashed owner, and the new owner re-attaches: it sends
+%% {yuzu_gw_owner_reattach, Dead, New, Alias} naming the owner this loop last
+%% delivered to; the loop then delivers to New and answers {Alias, reattached}
+%% (a re-attach naming any other process is answered {Alias, refused}). After
+%% an abnormal owner exit the loop waits ?REATTACH_WAIT_MS for one, dropping
+%% the agent's frames meanwhile (replies to commands the dead owner sent, which
+%% nobody waits for any more), and then ends the stream so the agent
+%% reconnects. An owner that ends `normal' or `shutdown' ends the stream at
+%% once: it is not restarted. Without the monitor a stream whose owner died
+%% relayed into the void until the agent's next heartbeat was refused.
+-define(REATTACH_WAIT_MS, 5000).
 
 stream_loop(Ref, State, AgentPid) ->
+    relay(Ref, State, AgentPid, erlang:monitor(process, AgentPid)).
+
+relay(Ref, State, AgentPid, Mon) ->
     receive
         {Ref, eos} ->
             %% Agent disconnected (gRPC stream closed by client).
@@ -322,7 +345,7 @@ stream_loop(Ref, State, AgentPid) ->
         {Ref, DataFromAgent} ->
             %% Data from the agent (CommandResponse frame).
             AgentPid ! {stream_data, DataFromAgent},
-            stream_loop(Ref, State, AgentPid);
+            relay(Ref, State, AgentPid, Mon);
 
         {send_command, Cmd} ->
             %% Command from the agent gen_statem to send to the agent.
@@ -330,7 +353,7 @@ stream_loop(Ref, State, AgentPid) ->
             case check_backpressure() of
                 ok ->
                     yuzu_grpc_stream:send(State, Cmd),
-                    stream_loop(Ref, State, AgentPid);
+                    relay(Ref, State, AgentPid, Mon);
                 {backpressure, QueueLen} ->
                     %% H13: Log and count dropped commands instead of dropping silently.
                     CmdId = maps:get(<<"command_id">>, Cmd,
@@ -341,13 +364,64 @@ stream_loop(Ref, State, AgentPid) ->
                                       #{count => 1},
                                       #{stream_pid => self(), queue_len => QueueLen,
                                         command_id => CmdId}),
-                    stream_loop(Ref, State, AgentPid)
+                    relay(Ref, State, AgentPid, Mon)
             end;
 
         close_stream ->
             %% Agent process requested graceful disconnect.
-            ok
+            ok;
+
+        {yuzu_gw_owner_reattach, AgentPid, New, Alias} ->
+            %% A restarted owner, before this loop saw its predecessor's 'DOWN'
+            %% (the two come from different processes, so in either order).
+            reattach(Ref, State, Mon, New, Alias);
+
+        {yuzu_gw_owner_reattach, _Other, _New, Alias} ->
+            Alias ! {Alias, refused},
+            relay(Ref, State, AgentPid, Mon);
+
+        {'DOWN', Mon, process, AgentPid, Reason} ->
+            case restarted(Reason) of
+                true ->
+                    await_owner(Ref, State, AgentPid,
+                                erlang:monotonic_time(millisecond) + ?REATTACH_WAIT_MS);
+                false ->
+                    ok
+            end
     end.
+
+%% The owner is gone and its supervisor restarts it: wait for the new one.
+await_owner(Ref, State, Dead, Deadline) ->
+    receive
+        {yuzu_gw_owner_reattach, Dead, New, Alias} ->
+            reattach(Ref, State, undefined, New, Alias);
+        {yuzu_gw_owner_reattach, _Other, _New, Alias} ->
+            Alias ! {Alias, refused},
+            await_owner(Ref, State, Dead, Deadline);
+        {Ref, eos} ->
+            ok;
+        {Ref, _Orphaned} ->
+            await_owner(Ref, State, Dead, Deadline);
+        close_stream ->
+            ok
+    after max(0, Deadline - erlang:monotonic_time(millisecond)) ->
+        ok
+    end.
+
+reattach(Ref, State, OldMon, New, Alias) ->
+    case OldMon of
+        undefined -> ok;
+        _         -> erlang:demonitor(OldMon, [flush])
+    end,
+    Mon = erlang:monitor(process, New),
+    Alias ! {Alias, reattached},
+    relay(Ref, State, New, Mon).
+
+%% The exits the agent supervisor restarts (its children are transient).
+restarted(normal)          -> false;
+restarted(shutdown)        -> false;
+restarted({shutdown, _})   -> false;
+restarted(_Abnormal)       -> true.
 
 %% @doc Check if our message queue is too deep; emit telemetry if so.
 check_backpressure() ->

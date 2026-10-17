@@ -1,0 +1,429 @@
+%%%-------------------------------------------------------------------
+%%% @doc What happens when an agent's owner process (yuzu_gw_agent) dies
+%%% abnormally (#5695, OWNER-RESTART).
+%%%
+%%% The agent supervisor restarts the owner (`transient'); the restarted owner
+%%% sends the DISCONNECTED notice for the session its predecessor held (with the
+%%% predecessor's stream_home_id), then tries to recover the agent: it re-attaches
+%%% to the agent's Subscribe stream if that is still open, registers the session
+%%% again (routing table and server, presenting the same session id) and
+%%% re-announces CONNECTED, so commands flow again without the agent
+%%% reconnecting. If the stream is gone it stops after the DISCONNECTED. An owner
+%%% that keeps crashing gives up after its budget; a crash of most of the fleet's
+%%% owners escalates to the gateway supervisor, which restarts the agent
+%%% supervisor.
+%%%
+%%% The whole application runs (no listeners, no upstream channel); the upstream
+%%% RPCs are a mocked yuzu_grpc_client:unary/5 that records every
+%%% NotifyStreamStatus and ProxyRegister. The Subscribe stream is the REAL relay
+%%% loop (yuzu_gw_agent_service:stream_loop/3) in a test process, writing to a
+%%% stand-in HTTP/2 connection process that acknowledges and records each frame.
+%%% @end
+%%%-------------------------------------------------------------------
+-module(yuzu_gw_owner_restart_tests).
+-include_lib("eunit/include/eunit.hrl").
+-include("yuzu_grpc.hrl").
+
+-define(TAB, yuzu_gw_owner_restart_tests_tab).
+-define(ENV_KEYS, [allow_no_upstream, allow_no_listeners, prometheus_port, health_port,
+                   grpc_listeners, shutdown_flush_budget_ms, upstream_client,
+                   agent_restart_intensity, agent_restart_period_s]).
+%% How long a notice may take to reach the mocked server ("promptly").
+-define(PROMPT_MS, 3000).
+
+owner_restart_test_() ->
+    {foreach,
+     fun setup/0,
+     fun cleanup/1,
+     [{timeout, 60, {"a killed owner: the DISCONNECTED for its session reaches the server",
+                     fun killed_owner_sends_disconnected/0}},
+      {timeout, 60, {"an owner that raised: the DISCONNECTED for its session reaches the server",
+                     fun crashed_owner_sends_disconnected/0}},
+      {timeout, 60, {"stream still open: the session is re-established and a command reaches "
+                     "the agent, with no reconnect", fun open_stream_is_recovered/0}},
+      {timeout, 60, {"stream gone: DISCONNECTED only, no resurrection, no child left",
+                     fun gone_stream_is_not_resurrected/0}},
+      {timeout, 60, {"an owner that crashes on every start gives up after its budget with one "
+                     "DISCONNECTED, and the supervisor stays", fun crash_loop_gives_up/0}},
+      {timeout, 60, {"a mass crash past the restart intensity restarts the agent supervisor; "
+                     "every session ends consistent", fun mass_crash_escalates/0}},
+      {timeout, 60, {"a superseded owner's crash sends nothing for the newer session",
+                     fun superseded_owner_crash/0}},
+      {timeout, 120, {"a kill during a planned stop: no resurrection, no double DISCONNECTED",
+                      fun kill_during_planned_stop/0}}]}.
+
+setup() ->
+    _ = application:stop(yuzu_gw),
+    {ok, _} = application:ensure_all_started(telemetry),
+    _ = application:load(yuzu_gw),
+    Prev = yuzu_gw_test_upstream:save_env(?ENV_KEYS),
+    yuzu_gw_test_upstream:stop_upstream(),
+    [stop_named(N) || N <- [yuzu_gw_registry, yuzu_gw_agent_sup, yuzu_gw_heartbeat_buffer,
+                            yuzu_gw_router, yuzu_gw_upstream_regulator,
+                            yuzu_gw_upstream_pressure, yuzu_gw_gauge, yuzu_gw_health,
+                            yuzu_gw_cluster_discovery, yuzu_gw_memory_shedder,
+                            yuzu_gw_mgmt_pins, yuzu_gw_sup]],
+    application:set_env(yuzu_gw, allow_no_upstream, true),
+    application:set_env(yuzu_gw, allow_no_listeners, true),
+    application:set_env(yuzu_gw, prometheus_port, 0),
+    application:set_env(yuzu_gw, health_port, 0),
+    application:set_env(yuzu_gw, grpc_listeners, []),
+    application:unset_env(yuzu_gw, upstream_client),
+    application:unset_env(yuzu_gw, agent_restart_intensity),
+    application:unset_env(yuzu_gw, agent_restart_period_s),
+    catch meck:unload(yuzu_grpc_client),
+    ok = meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    catch ets:delete(?TAB),
+    ?TAB = ets:new(?TAB, [named_table, public, duplicate_bag]),
+    set_register_delay(0),
+    mock(),
+    Httpd = httpd_services(),
+    Cookie = os:getenv("YUZU_GW_ALLOW_DEFAULT_COOKIE"),
+    os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", "1"),
+    %% Recorded in the table: the handler runs in the owner process, and the
+    %% test body may not run in this process.
+    HandlerId = {?MODULE, make_ref()},
+    ok = telemetry:attach(HandlerId, [yuzu, gw, agent, owner_restart],
+                          fun(_E, _M, #{outcome := O}, _) ->
+                                  catch ets:insert(?TAB, {outcome, O})
+                          end, none),
+    {Prev, Httpd, Cookie, HandlerId}.
+
+cleanup({Prev, Httpd0, Cookie, HandlerId}) ->
+    telemetry:detach(HandlerId),
+    case Cookie of
+        false -> os:unsetenv("YUZU_GW_ALLOW_DEFAULT_COOKIE");
+        _     -> os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", Cookie)
+    end,
+    _ = application:stop(yuzu_gw),
+    [catch inets:stop(httpd, P) || P <- httpd_services() -- Httpd0],
+    catch telemetry:detach(yuzu_gw_prometheus),
+    catch meck:unload(yuzu_grpc_client),
+    [catch exit(P, kill) || {proc, P} <- catch ets:tab2list(?TAB)],
+    catch ets:delete(?TAB),
+    flush(),
+    yuzu_gw_test_upstream:restore_env(Prev),
+    ok.
+
+%%--------------------------------------------------------------------
+%% Cases
+%%--------------------------------------------------------------------
+
+killed_owner_sends_disconnected() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    #{owner := Owner, session := S, home := Home} = start_relayed(<<"or-kill">>),
+    exit(Owner, kill),
+    ?assertEqual(ok, wait_until(fun() -> notices(S, 'DISCONNECTED') =/= [] end, ?PROMPT_MS)),
+    ?assertEqual([Home], [H || {H, _T} <- notices(S, 'DISCONNECTED')]).
+
+crashed_owner_sends_disconnected() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    #{owner := Owner, session := S, home := Home} = start_relayed(<<"or-raise">>),
+    %% A cast no state handles: the owner raises function_clause.
+    gen_statem:cast(Owner, owner_restart_test_unexpected),
+    ?assertEqual(ok, wait_until(fun() -> notices(S, 'DISCONNECTED') =/= [] end, ?PROMPT_MS)),
+    ?assertEqual([Home], [H || {H, _T} <- notices(S, 'DISCONNECTED')]).
+
+open_stream_is_recovered() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Id = <<"or-recover">>,
+    #{owner := Owner, session := S, home := Home, relay := Relay, conn := Conn} =
+        start_relayed(Id),
+    TKill = erlang:monotonic_time(microsecond),
+    exit(Owner, kill),
+    %% DISCONNECTED, then the session presented again, then CONNECTED again,
+    %% with the same session id and the same stream home.
+    ?assertEqual(ok, wait_until(fun() -> length(notices(S, 'CONNECTED')) >= 2 end, ?PROMPT_MS)),
+    [{_, TDisc}] = notices(S, 'DISCONNECTED'),
+    [{Home, _}, {Home2, TConn2}] = lists:keysort(2, notices(S, 'CONNECTED')),
+    ?assertEqual(Home, Home2),
+    ?assert(TConn2 > TDisc),
+    ?debugFmt("kill to DISCONNECTED ~b us, DISCONNECTED to CONNECTED again ~b us",
+              [TDisc - TKill, TConn2 - TDisc]),
+    ?assertMatch([_ | _], presented(Id, S)),
+    %% Routable again, through a new owner, on the same stream (no reconnect).
+    {ok, New} = yuzu_gw_registry:lookup(Id),
+    ?assertNotEqual(Owner, New),
+    ?assert(is_process_alive(Relay)),
+    {ok, _Ref} = yuzu_gw_router:send_command([Id], #{command_id => <<"or-cmd-1">>,
+                                                    plugin => <<"p">>, action => <<"a">>},
+                                             #{}),
+    ?assertEqual(ok, wait_until(fun() -> frames_with(Conn, <<"or-cmd-1">>) > 0 end, ?PROMPT_MS)),
+    ?assertEqual([recovered], outcomes()).
+
+gone_stream_is_not_resurrected() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Id = <<"or-gone">>,
+    %% A stand-in stream that ends when its owner dies (no re-attach).
+    #{owner := Owner, session := S} = start_with_stream(Id, fun mortal_stream/1),
+    exit(Owner, kill),
+    ?assertEqual(ok, wait_until(fun() -> notices(S, 'DISCONNECTED') =/= [] end, ?PROMPT_MS)),
+    ?assertEqual(ok, wait_until(fun() -> children() =:= [] end, ?PROMPT_MS)),
+    timer:sleep(300),
+    ?assertEqual(1, length(notices(S, 'DISCONNECTED'))),
+    ?assertEqual(1, length(notices(S, 'CONNECTED'))),
+    ?assertEqual([], presented(Id, S)),
+    ?assertEqual(error, yuzu_gw_registry:lookup(Id)),
+    ?assertEqual([disconnected_only], outcomes()).
+
+crash_loop_gives_up() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Sup = whereis(yuzu_gw_agent_sup),
+    Id = <<"or-loop">>,
+    #{owner := Owner, session := S, relay := Relay} = start_relayed(Id),
+    %% Every restarted owner is killed while it waits for the server.
+    set_register_delay(2000),
+    Kills = kill_restarts([Owner], 10),
+    ?debugFmt("owners killed before the restarted one gave up: ~b", [length(Kills)]),
+    ?assertEqual(4, length(Kills)),
+    ?assertEqual(ok, wait_until(fun() -> children() =:= [] end, ?PROMPT_MS)),
+    ?assertEqual(ok, wait_until(fun() -> not is_process_alive(Relay) end, ?PROMPT_MS)),
+    ?assertEqual(1, length(notices(S, 'DISCONNECTED'))),
+    ?assertEqual(Sup, whereis(yuzu_gw_agent_sup)),
+    ?assertEqual([gave_up], [O || O <- outcomes(), O =:= gave_up]).
+
+mass_crash_escalates() ->
+    application:set_env(yuzu_gw, agent_restart_intensity, 3),
+    application:set_env(yuzu_gw, agent_restart_period_s, 10),
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Top = whereis(yuzu_gw_sup),
+    Sup = whereis(yuzu_gw_agent_sup),
+    Agents = [start_relayed(<<"or-mass-", (integer_to_binary(I))/binary>>)
+              || I <- lists:seq(1, 8)],
+    [exit(O, kill) || #{owner := O} <- Agents],
+    ?assertEqual(ok, wait_until(fun() -> is_pid(whereis(yuzu_gw_agent_sup)) andalso
+                                         whereis(yuzu_gw_agent_sup) =/= Sup end, ?PROMPT_MS)),
+    ?assertEqual(Top, whereis(yuzu_gw_sup)),
+    %% Every killed session's DISCONNECTED reached the server ...
+    ?assertEqual(ok, wait_until(fun() ->
+                                        lists:all(fun(#{session := S}) ->
+                                                          notices(S, 'DISCONNECTED') =/= []
+                                                  end, Agents)
+                                end, 10000)),
+    %% ... and each agent ends consistent: routable with CONNECTED as the last
+    %% notice, or unroutable with DISCONNECTED as the last notice and its stream
+    %% ended.
+    ?assertEqual(ok, wait_until(fun() -> lists:all(fun consistent/1, Agents) end, 15000)).
+
+superseded_owner_crash() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Id = <<"or-super">>,
+    #{owner := Old, session := S1} = start_relayed(Id, <<"or-super-s1">>),
+    #{owner := New, session := S2} = start_relayed(Id, <<"or-super-s2">>),
+    exit(Old, kill),
+    ?assertEqual(ok, wait_until(fun() -> notices(S1, 'DISCONNECTED') =/= [] end, ?PROMPT_MS)),
+    timer:sleep(500),
+    ?assertEqual([], notices(S2, 'DISCONNECTED')),
+    ?assertEqual([], presented(Id, S1)),
+    ?assertEqual({ok, New}, yuzu_gw_registry:lookup(Id)),
+    ?assertEqual(1, length(notices(S1, 'DISCONNECTED'))).
+
+kill_during_planned_stop() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Agents = [start_relayed(<<"or-stop-", (integer_to_binary(I))/binary>>)
+              || I <- lists:seq(1, 5)],
+    [#{owner := Victim} | _] = Agents,
+    exit(Victim, kill),
+    ok = application:stop(yuzu_gw),
+    timer:sleep(200),
+    lists:foreach(
+      fun(#{session := S}) ->
+              Events = [E || {E, _H, _T} <- lists:keysort(3, all_notices(S))],
+              %% Ends with DISCONNECTED, and never two in a row.
+              ?assertEqual('DISCONNECTED', lists:last(Events)),
+              ?assertEqual([], [x || {'DISCONNECTED', 'DISCONNECTED'} <- pairs(Events)])
+      end, Agents).
+
+%%--------------------------------------------------------------------
+%% Plumbing
+%%--------------------------------------------------------------------
+
+%% Every NotifyStreamStatus is recorded {notice, Event, AgentId, SessionId,
+%% Home, T}; every ProxyRegister that presents a session {presented, AgentId,
+%% Session} and is adopted after register_delay_ms.
+mock() ->
+    ok = meck:expect(yuzu_grpc_client, unary,
+                     fun(Meta, Path, Req, _Def, _Opts) ->
+                         case lists:last(binary:split(Path, <<"/">>, [global])) of
+                             <<"NotifyStreamStatus">> ->
+                                 ets:insert(?TAB, {notice, maps:get(event, Req),
+                                                   maps:get(agent_id, Req),
+                                                   maps:get(session_id, Req),
+                                                   maps:get(stream_home_id, Req),
+                                                   erlang:monotonic_time(microsecond)}),
+                                 {ok, #{acknowledged => true}, #{}};
+                             <<"ProxyRegister">> ->
+                                 [{cfg, register_delay_ms, Delay} | _] =
+                                     [C || {cfg, register_delay_ms, _} = C
+                                               <- ets:lookup(?TAB, cfg)],
+                                 timer:sleep(Delay),
+                                 Info = maps:get(info, Req, #{}),
+                                 Agent = maps:get(agent_id, Info, <<>>),
+                                 case maps:get(<<"x-yuzu-session-id">>, Meta, undefined) of
+                                     undefined ->
+                                         {ok, #{session_id => <<"fresh">>, accepted => true}, #{}};
+                                     S ->
+                                         ets:insert(?TAB, {presented, Agent, S}),
+                                         {ok, #{session_id => S, accepted => true}, #{}}
+                                 end;
+                             _ ->
+                                 {ok, #{}, #{}}
+                         end
+                     end).
+
+notices(Session, Event) ->
+    [{H, T} || {notice, E, _A, S, H, T} <- ets:lookup(?TAB, notice), S =:= Session, E =:= Event].
+
+all_notices(Session) ->
+    [{E, H, T} || {notice, E, _A, S, H, T} <- ets:lookup(?TAB, notice), S =:= Session].
+
+presented(Agent, Session) ->
+    [x || {presented, A, S} <- ets:lookup(?TAB, presented), A =:= Agent, S =:= Session].
+
+pairs([A, B | T]) -> [{A, B} | pairs([B | T])];
+pairs(_) -> [].
+
+children() ->
+    [P || {_, P, _, _} <- supervisor:which_children(yuzu_gw_agent_sup), is_pid(P)].
+
+outcomes() ->
+    timer:sleep(200),
+    [O || {outcome, O} <- ets:lookup(?TAB, outcome)].
+
+set_register_delay(Ms) ->
+    ets:match_delete(?TAB, {cfg, register_delay_ms, '_'}),
+    ets:insert(?TAB, {cfg, register_delay_ms, Ms}).
+
+consistent(#{agent := Id, session := S, relay := Relay}) ->
+    Events = [E || {E, _H, _T} <- lists:keysort(3, all_notices(S))],
+    case {yuzu_gw_registry:lookup(Id), Events} of
+        {{ok, _}, [_ | _]} -> lists:last(Events) =:= 'CONNECTED';
+        {error, [_ | _]}   -> lists:last(Events) =:= 'DISCONNECTED'
+                                  andalso not is_process_alive(Relay);
+        _                  -> false
+    end.
+
+%% Kill each owner the supervisor restarts for the killed one (found by the
+%% agent id in the routing table or a fresh child), 150 ms after it appears,
+%% until no new owner appears within 2 s. Returns the owners killed.
+kill_restarts([Last | _] = Killed, 0) ->
+    _ = Last,
+    lists:reverse(Killed);
+kill_restarts([Last | _] = Killed, Left) ->
+    exit(Last, kill),
+    case wait_new_child(Killed, 2000) of
+        {ok, Next} ->
+            timer:sleep(150),
+            case is_process_alive(Next) of
+                true  -> kill_restarts([Next | Killed], Left - 1);
+                false -> lists:reverse(Killed)
+            end;
+        timeout ->
+            lists:reverse(Killed)
+    end.
+
+wait_new_child(Seen, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    wait_new_child_(Seen, Deadline).
+
+wait_new_child_(Seen, Deadline) ->
+    case [P || P <- children(), not lists:member(P, Seen)] of
+        [P | _] -> {ok, P};
+        [] ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true -> timeout;
+                false -> timer:sleep(5), wait_new_child_(Seen, Deadline)
+            end
+    end.
+
+start_relayed(Id) ->
+    start_relayed(Id, <<Id/binary, "-session">>).
+
+start_relayed(Id, Session) ->
+    start_with_stream(Id, Session, fun relay_stream/1).
+
+start_with_stream(Id, Fun) ->
+    start_with_stream(Id, <<Id/binary, "-session">>, Fun).
+
+%% A stream process (Fun(Conn) is its body once its owner is known) whose owner
+%% is started through the agent supervisor, as the Subscribe handler does.
+start_with_stream(Id, Session, Fun) ->
+    Parent = self(),
+    Conn = spawn(fun conn_loop/0),
+    Stream = spawn(fun() ->
+                           Args = #{agent_id => Id, agent_info => #{agent_id => Id},
+                                    stream_pid => self(), peer_addr => <<"127.0.0.1">>,
+                                    session_id => Session,
+                                    register_req => #{info => #{agent_id => Id}}},
+                           {ok, Owner} = yuzu_gw_agent_sup:start_agent(Args),
+                           Parent ! {started, self(), Owner},
+                           Fun({Conn, Owner})
+                   end),
+    ets:insert(?TAB, [{proc, Conn}, {proc, Stream}]),
+    Owner = receive {started, Stream, O} -> O after 10000 -> error(start_timeout) end,
+    ok = wait_until(fun() -> notices(Session, 'CONNECTED') =/= [] end, ?PROMPT_MS),
+    [{Home, _}] = notices(Session, 'CONNECTED'),
+    #{agent => Id, owner => Owner, session => Session, home => Home, relay => Stream,
+      conn => Conn}.
+
+%% The real Subscribe relay loop, writing to the stand-in connection.
+relay_stream({Conn, Owner}) ->
+    Stream = #yuzu_grpc_stream{conn = Conn, stream_id = 1, ctx = undefined,
+                               method = <<"/yuzu.agent.v1.AgentService/Subscribe">>,
+                               pb = agent_pb, output = 'yuzu.agent.v1.CommandRequest'},
+    yuzu_gw_agent_service:stream_loop(make_ref(), Stream, Owner).
+
+%% A stream that ends when its owner dies, and never re-attaches.
+mortal_stream({_Conn, Owner}) ->
+    Mon = monitor(process, Owner),
+    receive {'DOWN', Mon, process, Owner, _} -> ok after 60000 -> ok end.
+
+%% A stand-in HTTP/2 connection: acknowledges and records every frame.
+conn_loop() ->
+    receive
+        {{_Conn, _Sid}, {grpc_frame, From, Ack, Frame}} ->
+            ets:insert(?TAB, {frame, self(), iolist_to_binary(Frame)}),
+            From ! {grpc_ack, Ack},
+            conn_loop();
+        stop ->
+            ok
+    after 120000 ->
+        ok
+    end.
+
+frames_with(Conn, Bytes) ->
+    length([1 || {frame, C, F} <- ets:lookup(?TAB, frame), C =:= Conn,
+                 binary:match(F, Bytes) =/= nomatch]).
+
+httpd_services() ->
+    case catch inets:services() of
+        L when is_list(L) -> [P || {httpd, P} <- L, is_pid(P)];
+        _ -> []
+    end.
+
+flush() ->
+    receive _ -> flush() after 0 -> ok end.
+
+stop_named(Name) ->
+    case whereis(Name) of
+        undefined -> ok;
+        Pid ->
+            catch unlink(Pid),
+            Mon = monitor(process, Pid),
+            exit(Pid, shutdown),
+            receive {'DOWN', Mon, process, Pid, _} -> ok after 5000 -> ok end
+    end.
+
+wait_until(Pred, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    wait_until_(Pred, Deadline).
+
+wait_until_(Pred, Deadline) ->
+    case catch Pred() of
+        true -> ok;
+        _ ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true -> timeout;
+                false -> timer:sleep(10), wait_until_(Pred, Deadline)
+            end
+    end.

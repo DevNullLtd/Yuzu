@@ -64,6 +64,10 @@ init([]) ->
     %% See yuzu_gw_cluster_discovery.erl's `?DEFAULT_MAX_LIFETIME_ADDRS`
     %% comment for the full rationale.
     ok = yuzu_gw_cluster_discovery:ensure_seen_addrs_table(),
+    %% OWNER-RESTART (#5695): the agent owner table is owned here too, so it
+    %% outlives a restart of yuzu_gw_agent_sup (whose fresh instance restarts
+    %% the owners the old one left behind; see yuzu_gw_agent_sup's module doc).
+    ok = yuzu_gw_agent_sup:ensure_owner_table(),
 
     SupFlags = #{
         strategy  => one_for_one,

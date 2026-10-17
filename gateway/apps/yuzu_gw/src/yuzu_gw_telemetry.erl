@@ -158,7 +158,11 @@
 
     %% G8-CODE workstream (#5695): the concurrent-stream limit the server
     %% declared on the upstream connections (yuzu_gw_upstream_regulator).
-    [yuzu, gw, upstream, server_max_streams]
+    [yuzu, gw, upstream, server_max_streams],
+
+    %% OWNER-RESTART workstream (#5695): a restarted agent owner's outcome
+    %% (yuzu_gw_agent's recovering state).
+    [yuzu, gw, agent, owner_restart]
 ]).
 
 %%--------------------------------------------------------------------
@@ -619,6 +623,12 @@ handle_event([yuzu, gw, memory_shedding, transition_failed], #{count := N}, Meta
 handle_event([yuzu, gw, upstream, server_max_streams], #{streams := N}, _Meta, _Config) ->
     prometheus_gauge:set(yuzu_gw_upstream_server_max_streams, [], N);
 
+%% OWNER-RESTART workstream (#5695). `outcome' is a closed set; anything else
+%% folds to `unknown'.
+handle_event([yuzu, gw, agent, owner_restart], #{count := N}, Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_agent_owner_restarts_total,
+                           [closed(maps:get(outcome, Meta, unknown), owner_restart_outcomes())], N);
+
 handle_event(_Event, _Measurements, _Meta, _Config) ->
     ok.
 
@@ -637,6 +647,9 @@ close_reasons()   -> [idle_timeout, enhance_your_calm, protocol_error].
 
 %% SHEDDER workstream (#5695): the closed label set of its families.
 shedding_actions() -> [suspend, resume].
+
+%% OWNER-RESTART workstream (#5695): what a restarted agent owner did.
+owner_restart_outcomes() -> [recovered, disconnected_only, gave_up].
 
 closed(Value, Set) when is_atom(Value) ->
     case lists:member(Value, Set) of
@@ -1319,7 +1332,17 @@ metric_specs() ->
                    "connections together, as declared in its HTTP/2 SETTINGS "
                    "(SETTINGS_MAX_CONCURRENT_STREAMS, summed over the connections); 0 "
                    "when nothing is known (no connection up) or the server declared no "
-                   "limit. The upstream permits are sized from it"}]}
+                   "limit. The upstream permits are sized from it"}]},
+
+        %% OWNER-RESTART workstream (#5695).
+        {counter, [
+            {name, yuzu_gw_agent_owner_restarts_total},
+            {labels, [outcome]},
+            {help, "Agent owner processes restarted after an abnormal exit, by what the "
+                   "restarted owner did: recovered (the session was re-established on the "
+                   "agent's open stream), disconnected_only (its DISCONNECTED was sent and "
+                   "the session ended; the agent reconnects), gave_up (more than 3 restarts "
+                   "in 60 s: the session ended)"}]}
     ].
 
 %% @doc The names of every metric metric_specs/0 declares.
@@ -1475,6 +1498,10 @@ seed_metrics() ->
 
     %% G8-CODE workstream (#5695).
     prometheus_gauge:set(yuzu_gw_upstream_server_max_streams, [], 0),
+
+    %% OWNER-RESTART workstream (#5695).
+    [prometheus_counter:inc(yuzu_gw_agent_owner_restarts_total, [O], 0)
+     || O <- [atom_to_binary(O0, utf8) || O0 <- owner_restart_outcomes()] ++ [<<"unknown">>]],
 
     ok.
 
