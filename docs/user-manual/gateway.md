@@ -90,7 +90,9 @@ all writes to that agent go through its mailbox with no mutex contention.
 
 | State | Description |
 |---|---|
-| `connecting` | Agent called Register; forwarded to upstream server; awaiting session_id |
+| `registering` | The first event after the process starts: it enters the routing table (the session was already registered with the server by `Register`) |
+| `recovering` | The first event of an agent process restarted after a crash: see [When an agent's owner process crashes](#when-an-agents-owner-process-crashes) |
+| `connecting` | Registered, waiting for the Subscribe stream (only for a process started without one) |
 | `streaming` | Bidi stream active; agent process owns the stream writer |
 | `disconnected` | Stream broken or heartbeat timeout; cleanup and termination |
 
@@ -1345,6 +1347,8 @@ client at start, except `upstream_call_timeout_ms` and `upstream_rpc_timeout_ms`
 | `notify_probe_timeout_ms` | 15000 | 100 to 300000 | The gateway's own deadline for the half-open notification probe. A probe worker that has not reported after this many ms is killed, and the probe fails like any failed probe: its notification goes back to the head of the held queue, the breaker opens again with the doubled backoff, and the next half-open cycle sends a new probe. One WARN `Notify probe worker for <agent> did not answer within <ms>ms and was killed; the notification is held again` is logged per timeout. It bounds the notification probe only, not the call-path RPCs (`ProxyRegister`, `ProxyInventory`, replay), and it does not depend on the upstream client's connect and call bounds. Tuning: 15000 sits above the upstream client's default bounds (a 5000 ms connect and a 5000 ms call), so a healthy upstream answers in milliseconds and a silent one is cut off after one deadline. A `did not answer` WARN that repeats while the server is healthy points at RAISING the value, not lowering it. A value below about 5000 kills probes that would have answered. A killed probe is requeued, so delivery stays at least once. Read once at start (a change needs a gateway restart). Not present in any shipped `sys.config`. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
 | `upstream_call_timeout_ms` | 30000 | 100 to 300000 | The budget of a proxied `Register` or inventory report whose agent sent no `grpc-timeout`, from the call's arrival: the wait for a permit and the call itself must fit in it. Read on every call. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
 | `shutdown_flush_budget_ms` | 20000 | 0 to 600000 | How long a planned stop may spend ending the agent sessions and sending their `DISCONNECTED` notices before the processes stop. See "Planned stop". The container's or unit's stop timeout must be larger (40 s is shipped) |
+| `agent_restart_intensity` | 2000 | 1 to 1000000 | How many agent owner processes may be restarted within `agent_restart_period_s` before the agent supervisor itself stops and is restarted (shared by all owners). See "When an agent's owner process crashes". Read when the agent supervisor starts |
+| `agent_restart_period_s` | 10 | 1 to 3600 | The window of `agent_restart_intensity`, in seconds |
 
 An invalid value for any of these keys falls back to the default and logs a
 warning that names the key. See
@@ -4090,8 +4094,12 @@ stop`, `systemctl stop`) tells the server about every session the gateway gives 
    (or 30% of the budget) to finish.
 3. Every session is ended through its own agent process, which closes its stream
    and sends the `DISCONNECTED` notice with the session's stream home id (the
-   server matches a `DISCONNECTED` to the placement by it; it lives only in the
-   agent process). Up to 5 s (or 40% of the budget) for them to finish.
+   server matches a `DISCONNECTED` to the placement by it; it is kept by the
+   agent process and its row in the owner table, not by the routing table). Up
+   to 5 s (or 40% of the budget) for them to finish. An agent process that is
+   restarted after a crash during the stop sends its session's `DISCONNECTED`
+   and stops: its re-registration is refused (`stopping`), so no session comes
+   back, and no session gets a second `DISCONNECTED`.
 4. The heartbeat buffer is flushed.
 5. Every held notification is sent, whatever the breaker state, 64 at a time,
    until none is left or the budget ends. What is left is counted in
@@ -4125,6 +4133,82 @@ per call needs about 16 s, close to the default budget (arithmetic, not measured
 that scale). A server batch call ("this
 gateway is going away; these sessions are gone") would make it one call; it is not
 implemented.
+
+### When an agent's owner process crashes
+
+Each agent session is held by one Erlang process on the gateway, its owner
+(`yuzu_gw_agent`). Owners do not crash in normal operation; when one does (a
+gateway defect, or an operator killing it), the gateway does what the agent's
+own reconnect would do, faster, and without dropping the agent where it can
+avoid it (#5695):
+
+1. **The supervisor restarts the owner.** `yuzu_gw_agent_sup` restarts an owner
+   that ended abnormally (its children are `transient`); an owner that ends
+   normally (the agent disconnected, a refused registration) or is shut down (a
+   planned stop) is not restarted.
+2. **The restarted owner sends the `DISCONNECTED`** for the session its
+   predecessor held, with the predecessor's stream home id, so the server stops
+   showing the agent as connected through a process that no longer exists.
+   Before #5695 nothing told the server: it kept the agent listed as connected
+   until the agent itself reconnected, which took about 54 s in an independent
+   tester's runs (the agent's next heartbeat was refused, then it registered
+   again). The session's details survive the crash in the owner table (an ETS
+   table owned by `yuzu_gw_sup`, one row per owner, written when the session is
+   set up and removed when the owner ends for good). Exactly one process sends
+   a session's `DISCONNECTED`: the owner itself when it ends the session, or
+   its successor after a crash.
+3. **It tries to recover the agent.** The agent's Subscribe stream is a separate
+   process that watches its owner; after an abnormal owner exit it waits up to
+   5 s for the restarted owner to re-attach, and ends the stream otherwise. If
+   the stream is still open, the restarted owner re-attaches, waits until the
+   `DISCONNECTED` has reached the server (or been counted lost), registers the
+   session again in the routing table, presents the same session to the server
+   again (a `ProxyRegister` carrying the session id, as a registration replay
+   does), and announces `CONNECTED` for it with the same stream home id. The
+   agent keeps its connection and its session; commands reach it again at once.
+   If the stream is gone, or any of these steps fails (the agent registered a
+   newer session meanwhile, the server is unreachable, the server answers that
+   another session holds the agent), the owner closes the stream and ends after
+   the `DISCONNECTED`: the agent reconnects by itself.
+4. **A crash loop gives up.** One owner may be restarted at most 3 times within
+   60 s. The next restart sends the `DISCONNECTED` if it was not already sent,
+   closes the stream and ends, logging one WARN (`owner process restarted more
+   than 3 times in 60 s; giving up`) with the agent id.
+5. **A crash of most of the fleet's owners escalates.** The supervisor's restart
+   intensity is shared by every owner: `agent_restart_intensity` restarts
+   (default 2000) within `agent_restart_period_s` (default 10). An induced loss
+   of 10% of a 5,000-agent gateway's owners stays below it; a fault that crashes
+   more than 2000 owners within 10 s is a fault of the gateway, and the agent
+   supervisor stops. Every owner still running sends its session's
+   `DISCONNECTED` on the way down and its stream closes, so those agents
+   reconnect. The gateway supervisor starts a new agent supervisor, which
+   restarts an owner for every session left without one (it sends that
+   `DISCONNECTED` and recovers the session if its stream is still open). If the
+   fault persists, the gateway supervisor's own limit (10 restarts in 60 s)
+   stops the application and the container or systemd unit restarts the
+   gateway. Raise `agent_restart_intensity` for a gateway that holds far more
+   than 5,000 agents (about 40% of its agents keeps the same margins).
+
+What is lost: commands that were in flight at the crash. After an exception
+the dying owner answers their callers `agent_disconnected`; after a kill
+nothing can, and the router ends them at their timeout (300 s by default). The
+agent's replies to them arrive at the restarted owner and are dropped.
+
+Each restart writes the usual crash or supervisor report (one per crash,
+redacted) and one line naming the outcome. The outcomes are counted in
+`yuzu_gw_agent_owner_restarts_total{outcome}`: `recovered`,
+`disconnected_only`, `gave_up`. `YuzuGatewayAgentOwnerCrashLoop` fires for 30
+minutes after a give-up; a recovered restart raises no alert.
+
+Measured (EUnit, mocked server): a killed owner's `DISCONNECTED` reached the
+server 0.1 ms after the kill and the session was `CONNECTED` again 0.06 ms
+later, with a command reaching the agent on the same stream. Scale suite
+(`owner_kill`, 500 agents, 50 owners killed at once): 50 `DISCONNECTED`
+received, all 50 sessions recovered within 22 ms, no agent reconnected, every
+command to them answered, no supervisor restart; at 5,000 agents with 500
+owners killed at once, all 500 recovered within 147 ms, the same way. On the
+code before #5695 the 500-agent run received 0 `DISCONNECTED` and every one of
+the 50 agents had to reconnect.
 
 ## Building and Testing
 
