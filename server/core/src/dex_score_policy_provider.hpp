@@ -48,11 +48,8 @@ public:
     /// Monotonic milliseconds.
     using ClockFn = std::function<std::int64_t()>;
 
-    DexScorePolicyProvider(ReadFn read, ClockFn clock,
-                           std::int64_t refresh_ms = kDexPolicyRefreshMs,
-                           std::int64_t stale_cap_ms = kDexPolicyStaleCapMs)
-        : read_(std::move(read)), clock_(std::move(clock)), refresh_ms_(refresh_ms),
-          stale_cap_ms_(stale_cap_ms) {}
+    DexScorePolicyProvider(ReadFn read, ClockFn clock)
+        : read_(std::move(read)), clock_(std::move(clock)) {}
 
     DexScorePolicyProvider(const DexScorePolicyProvider&) = delete;
     DexScorePolicyProvider& operator=(const DexScorePolicyProvider&) = delete;
@@ -65,7 +62,7 @@ public:
         // refresh if the Apps read ever queues on it.
         std::lock_guard lk(mu_);
         const std::int64_t now = clock_();
-        if (have_ && now - last_ok_ms_ < refresh_ms_)
+        if (have_ && now - last_ok_ms_ < kDexPolicyRefreshMs)
             return cached_;
         return read_locked(now);
     }
@@ -84,7 +81,7 @@ private:
             outage_logged_ = false;
             return cached_;
         }
-        if (have_ && now - last_ok_ms_ <= stale_cap_ms_) {
+        if (have_ && now - last_ok_ms_ <= kDexPolicyStaleCapMs) {
             if (!outage_logged_)
                 spdlog::warn("DEX score policy store unreadable, serving the last good policy: {}",
                              r.error());
@@ -96,8 +93,6 @@ private:
 
     ReadFn read_;
     ClockFn clock_;
-    std::int64_t refresh_ms_;
-    std::int64_t stale_cap_ms_;
 
     std::mutex mu_;
     bool have_{false};

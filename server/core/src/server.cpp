@@ -18177,14 +18177,7 @@ private:
             yuzu::server::DexScorePolicyFn dex_policy_fn;
             if (runtime_config_store_ && runtime_config_store_->is_open()) {
                 dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
-                    [this]() -> std::expected<std::optional<std::string>, std::string> {
-                        auto r = runtime_config_store_->get(std::string(kDexScorePolicyKey));
-                        if (!r)
-                            return std::unexpected(r.error());
-                        if (!*r)
-                            return std::nullopt;
-                        return (*r)->value;
-                    },
+                    dex_score_policy_store_reader(*runtime_config_store_),
                     []() -> std::int64_t {
                         return std::chrono::duration_cast<std::chrono::milliseconds>(
                                    std::chrono::steady_clock::now().time_since_epoch())
@@ -22320,7 +22313,7 @@ private:
     std::unique_ptr<pg::SecretCodec> runtime_config_secret_codec_;
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
     /// Score policy read-through (dex_score_policy_provider.hpp). Its read function
-    /// borrows runtime_config_store_ through `this`: the web thread (the only
+    /// borrows runtime_config_store_ by reference: the web thread (the only
     /// caller, via the DexApi) is joined by web_server_->stop() before the store is
     /// reset, so the borrow never outlives the store. Declared after the store.
     std::shared_ptr<DexScorePolicyProvider> dex_score_policy_provider_;

@@ -4,6 +4,7 @@
 #include "dex_read_model.hpp"    // the pure model structs
 #include "dex_window.hpp"     // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (PURE)
 #include "guaranteed_state_store.hpp" // the builder-less signal reads
+#include "runtime_config_store.hpp"    // dex_score_policy_store_reader
 
 #include <spdlog/spdlog.h>
 
@@ -162,6 +163,17 @@ private:
 std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store, FleetFn fleet_fn,
                                            DexScorePolicyFn policy_fn) {
     return std::make_shared<LocalDexApi>(store, std::move(fleet_fn), std::move(policy_fn));
+}
+
+DexScorePolicyProvider::ReadFn dex_score_policy_store_reader(RuntimeConfigStore& store) {
+    return [&store]() -> std::expected<std::optional<std::string>, std::string> {
+        auto r = store.get(std::string(kDexScorePolicyKey));
+        if (!r)
+            return std::unexpected(r.error());
+        if (!*r)
+            return std::nullopt;
+        return (*r)->value;
+    };
 }
 
 } // namespace yuzu::server

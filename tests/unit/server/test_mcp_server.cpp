@@ -106,6 +106,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -1252,6 +1253,11 @@ struct McpTestServer {
     /// field (read LIVE at request time via the wiring lambda below).
     DexFleet dex_fleet_for_test;
 
+    /// The score policy for list_dex_apps, read LIVE at request time like
+    /// dex_fleet_for_test. Empty = the shipped defaults, as the factory's empty
+    /// function; a test sets it to return an error to drive the policy-unreadable path.
+    yuzu::server::DexScorePolicyFn dex_policy_fn_for_test;
+
     /// ADR-0031 WS-A4: the DeviceApi double backing list_agents/get_agent_details,
     /// hoisted to a member (was a start()-local) so a test can read its #3564
     /// short-circuit witness `lookup_calls` — asserting an out-of-scope
@@ -1584,7 +1590,12 @@ private:
         // store-unavailable error.
         if (guaranteed_state_store_for_test)
             mcp.set_dex_api(yuzu::server::make_local_dex_api(
-                guaranteed_state_store_for_test, [this]() { return dex_fleet_for_test; }));
+                guaranteed_state_store_for_test, [this]() { return dex_fleet_for_test; },
+                [this]() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+                    if (dex_policy_fn_for_test)
+                        return dex_policy_fn_for_test();
+                    return yuzu::server::DexPolicyInForce{};
+                }));
 
         // ADR-0031 WS-A4 (sixth family): wrap this file's plain dex_perf_fn_for_test
         // (heartbeat-now) + app_perf_providers_for_test (over-time) fn-shaped test
@@ -8482,6 +8493,31 @@ TEST_CASE("MCP DEX: list_dex_apps reports a degraded read as an error, never an 
         CHECK(a != "mcp.list_dex_apps|success");
 }
 
+TEST_CASE("MCP DEX: list_dex_apps names an unreadable score policy in its error",
+          "[pg][mcp][integration][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        return std::unexpected(std::string("store down"));
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":981,"params":{"name":"list_dex_apps","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("(score_policy_unavailable)") !=
+          std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
+    CHECK(ts.audit_log.back() == "mcp.list_dex_apps|failure");
+    CHECK(ts.audit_details.back().find("(score_policy_unavailable)") != std::string::npos);
+}
+
 TEST_CASE("MCP DEX: get_dex_catalogue_group returns the family drill, unknown family -> "
           "invalid params",
           "[pg][mcp][integration][dex]") {
@@ -8611,6 +8647,11 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         if (t["name"] != "list_dex_apps")
             continue;
         found = true;
+        // The description names the policy, the profile marker, the refused-policy
+        // fault and the staleness bound (concept words, so copy edits do not false-fail).
+        const auto desc = t["description"].get<std::string>();
+        for (const char* concept_word : {"policy", "profile", "fault", "staleness bound"})
+            CHECK(desc.find(concept_word) != std::string::npos);
         REQUIRE(t.contains("outputSchema"));
         const auto& out = t["outputSchema"];
         CHECK(out["required"] ==
