@@ -52,7 +52,8 @@
 %% @doc One unary call. `Metadata' is sent as request headers (lowercase
 %% names; see metadata_headers/1 for what is refused). Options: `channel'
 %% (default `default_channel'), `timeout' in ms for the whole call, connection
-%% wait included (default 5000).
+%% wait included (default 5000); what is left of it when the request goes out
+%% is sent as the `grpc-timeout' header.
 -spec unary(map(), binary(), term(), def(), map()) -> result().
 unary(Metadata, Path, Request, #{marshal := Marshal, unmarshal := Unmarshal}, Options)
   when is_map(Metadata), is_binary(Path), is_map(Options) ->
@@ -110,9 +111,12 @@ reserved(Key) -> lists:member(Key, [<<"content-type">>, <<"te">>, <<"user-agent"
 %%--------------------------------------------------------------------
 
 call(Conn, Path, Extra, Body, Unmarshal, Max, Deadline) ->
+    %% What is left of the call's timeout goes to the server as grpc-timeout, so
+    %% it can stop working on a call this client no longer waits for.
     Headers = [{<<"content-type">>, <<"application/grpc">>},
                {<<"te">>, <<"trailers">>},
-               {<<"user-agent">>, ?USER_AGENT}
+               {<<"user-agent">>, ?USER_AGENT},
+               {<<"grpc-timeout">>, timeout_header(remaining(Deadline))}
                | Extra],
     Ref = gun:post(Conn, Path, Headers, Body, #{reply_to => self()}),
     case response(Conn, Ref, Deadline) of
@@ -204,6 +208,11 @@ message(Data, Meta, Unmarshal) ->
 
 remaining(Deadline) ->
     max(0, Deadline - erlang:monotonic_time(millisecond)).
+
+%% A grpc-timeout value: at most eight digits, so milliseconds up to 99999999
+%% (about 27 hours) and seconds beyond. At least 1 ms.
+timeout_header(Ms) when Ms =< 99999999 -> <<(integer_to_binary(max(1, Ms)))/binary, "m">>;
+timeout_header(Ms) -> <<(integer_to_binary(min(99999999, Ms div 1000)))/binary, "S">>.
 
 to_map(Headers) ->
     maps:from_list([{K, V} || {K, V} <- Headers, is_binary(K), is_binary(V),

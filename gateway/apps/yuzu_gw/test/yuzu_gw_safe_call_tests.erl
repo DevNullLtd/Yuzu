@@ -46,13 +46,13 @@ safe_call_test_() ->
        fun register_noproc/0},
       {"runner: a crashing handler logs the method, the class and the top frame, nothing else",
        fun runner_crash_logs_no_request_no_reason/0},
-      {"register: an upstream that never answers times out without leaking",
+      {"register: a permit regulator that never answers runs out the deadline without leaking",
        fun register_timeout/0},
-      {"register: an upstream that dies serving the call does not leak",
+      {"register: a permit regulator that dies while the caller waits does not leak",
        fun register_died_serving/0},
       {"inventory: upstream not running answers upstream_unavailable, nothing leaks",
        fun inventory_noproc/0},
-      {"inventory: an upstream that never answers times out without leaking",
+      {"inventory: a registered upstream stand-in with no regulator answers without leaking",
        fun inventory_timeout/0},
       {"registry: register_agent with the registry not running answers an error, nothing leaks",
        fun registry_noproc/0},
@@ -160,19 +160,49 @@ runner_crash_logs_no_request_no_reason() ->
           ?assert(contains(hd(Warns), Needle), What)
       end, Cases).
 
+%% A proxied call never sends its request to another process: the RPC runs in
+%% the caller, and all it asks the regulator for is a permit (class, deadline,
+%% tag). So a regulator that stalls or dies cannot put the request in an exit
+%% reason; the caller runs out its own deadline, or sees the regulator go.
 register_timeout() ->
-    start_fake(yuzu_gw_upstream, hang),
+    application:set_env(yuzu_gw, ?TIMEOUT_KEY, 1000),
+    start_real_upstream(),
+    ok = sys:suspend(yuzu_gw_upstream_regulator),
     {Result, Events} = run_caller(fun() -> yuzu_gw_upstream:proxy_register(req()) end),
-    ?assertEqual({returned, {error, upstream_unavailable}}, Result),
-    assert_no_markers(Events),
-    ?assert(has_warning(Events, <<"timeout">>)).
+    ok = sys:resume(yuzu_gw_upstream_regulator),
+    ?assertEqual({returned, {error, deadline}}, Result),
+    assert_no_markers(Events).
 
 register_died_serving() ->
-    start_fake(yuzu_gw_upstream, die),
-    {Result, Events} = run_caller(fun() -> yuzu_gw_upstream:proxy_register(req()) end),
-    ?assertEqual({returned, {error, upstream_unavailable}}, Result),
-    assert_no_markers(Events),
-    ?assert(has_warning(Events, <<"other">>)).
+    application:set_env(yuzu_gw, ?TIMEOUT_KEY, 5000),
+    start_real_upstream(),
+    Reg = whereis(yuzu_gw_upstream_regulator),
+    ok = sys:suspend(Reg),
+    Test = self(),
+    Caller = spawn(fun() -> Test ! {result, self(), yuzu_gw_upstream:proxy_register(req())} end),
+    ok = wait_until(fun() -> element(2, process_info(Reg, message_queue_len)) >= 1 end),
+    exit(Reg, kill),
+    Result = receive {result, Caller, R} -> R after ?WAIT_MS -> error(no_result) end,
+    ?assertEqual({error, upstream_unavailable}, Result),
+    assert_no_markers(drain_events()).
+
+start_real_upstream() ->
+    {ok, Pid} = yuzu_gw_upstream:start_link(),
+    unlink(Pid),
+    Pid.
+
+wait_until(Pred) ->
+    wait_until(Pred, erlang:monotonic_time(millisecond) + ?WAIT_MS).
+
+wait_until(Pred, Deadline) ->
+    case Pred() of
+        true -> ok;
+        false ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true -> timeout;
+                false -> timer:sleep(5), wait_until(Pred, Deadline)
+            end
+    end.
 
 inventory_noproc() ->
     {Result, Events} = run_caller(fun() ->
@@ -272,9 +302,9 @@ warn_limited_kinds_are_independent() ->
 warn_names_class_only_and_is_limited() ->
     %% Not running: noproc. One WARN, however many callers fail in a burst.
     {_, E1} = run_caller(fun() ->
-        _ = yuzu_gw_upstream:proxy_register(req()),
-        _ = yuzu_gw_upstream:proxy_register(req()),
-        yuzu_gw_upstream:proxy_inventory(#{})
+        _ = yuzu_gw_safe_call:call(yuzu_gw_upstream, {proxy_register, req()}, 20, x),
+        _ = yuzu_gw_safe_call:call(yuzu_gw_upstream, {proxy_register, req()}, 20, x),
+        yuzu_gw_safe_call:call(yuzu_gw_upstream, {proxy_inventory, #{}}, 20, x)
     end),
     Warns = [W || W <- warnings(E1), contains(W, <<"yuzu_gw_upstream">>)],
     ?assertMatch([_], Warns),
@@ -388,7 +418,7 @@ register_handler_registry_down() ->
     ok = meck:new(yuzu_gw_upstream, [passthrough, no_link]),
     try
         ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                         fun(_) -> {ok, #{session_id => <<"s-1">>}} end),
+                         fun(_, _Opts) -> {ok, #{session_id => <<"s-1">>}} end),
         {Result, Events} = run_caller(fun() ->
             via_runner(unary, yuzu_gw_agent_service, register,
                        #{request => maps:merge(req(), #{info => #{agent_id => <<"a-1">>}})})

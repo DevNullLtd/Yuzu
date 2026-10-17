@@ -40,6 +40,8 @@ plaintext_test_() ->
          {"an unexported method is UNIMPLEMENTED (12)", fun() -> unimplemented(State) end},
          {"a handler crash is INTERNAL (13) and carries no request", fun() -> handler_crash(State) end},
          {"metadata reaches the handler", fun() -> metadata_reaches_handler(State) end},
+         {"the call's timeout is sent upstream as grpc-timeout",
+          fun() -> timeout_is_sent_as_grpc_timeout(State) end},
          {"a refused metadata key is {error, invalid_metadata} and sends nothing", fun() -> refused_metadata(State) end},
          {"a request larger than the HTTP/2 window arrives whole", {timeout, 30, fun() -> large_request(State) end}},
          {"concurrent calls all complete on a channel's connections", {timeout, 30, fun() -> concurrent(State) end}},
@@ -137,6 +139,17 @@ metadata_reaches_handler(#{chan := Chan}) ->
         yuzu_grpc_client:unary(#{<<"x-test">> => <<"hello">>}, ?HEARTBEAT,
                                #{session_id => <<"ctx">>}, def(), #{channel => Chan}),
     ?assertEqual(<<"hello">>, Seen).
+
+%% The server can stop working on a call nobody waits for only if it knows the
+%% deadline: the header carries what is left of the call's timeout, never more.
+timeout_is_sent_as_grpc_timeout(#{chan := Chan}) ->
+    {ok, #{pending_commands := [#{plugin := Header}]}, _} =
+        yuzu_grpc_client:unary(#{}, ?HEARTBEAT, #{session_id => <<"deadline">>}, def(),
+                               #{channel => Chan, timeout => 2500}),
+    ?assertMatch({ok, _}, yuzu_grpc_frame:parse_timeout(Header)),
+    {ok, Ms} = yuzu_grpc_frame:parse_timeout(Header),
+    ?assert(Ms =< 2500),
+    ?assert(Ms > 1500).
 
 refused_metadata(#{chan := Chan}) ->
     yuzu_grpc_stub_svc:reset(),

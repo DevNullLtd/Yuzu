@@ -7,15 +7,14 @@
 %%% The gateway reaches the server through lanes of bounded capacity. A lane is
 %%% SATURATED at an instant when work is waiting on it or would be refused:
 %%%
-%%%   serial    yuzu_gw_upstream is inside an RPC of its own (a proxied Register
-%%%             or Inventory, a registration-replay step) AND at least one
-%%%             message waits in its mailbox. The process runs one RPC at a time,
-%%%             so everything that arrives during one waits behind it.
+%%%   permits   a live ProxyRegister or ProxyInventory is waiting for a permit:
+%%%             every permit of its pool is held (yuzu_gw_upstream_regulator;
+%%%             48 for Register, 8 for inventory by default). A registration
+%%%             replay waiting for one does not count: it waits behind live
+%%%             registrations by design.
 %%%   notify    all of the stream-status notification slots the upstream may
-%%%             fill now are held: 10, or 9 while a registration replay is
-%%%             queued (one is kept back for the replay drip). The next
-%%%             notification is held until a slot frees (and is dropped only
-%%%             when the held store itself is full).
+%%%             fill now are held (10). The next notification is held until a
+%%%             slot frees (and is dropped only when the held store is full).
 %%%   guardian  all of the Guardian forward slots are held (50): the next one
 %%%             would be dropped.
 %%%
@@ -32,8 +31,8 @@
 %%% start, never over-read.
 %%%
 %%% What this does not tell apart: a server that answers slowly, and a burst of
-%%% work (every agent of a restarted fleet registering at once) larger than one
-%%% serial lane drains at a healthy server's pace. Both are the server's
+%%% work (every agent of a restarted fleet registering at once) larger than the
+%%% permits drain at a healthy server's pace. Both are the server's
 %%% service rate being below the rate work arrives, which is the thing measured.
 %%% yuzu_gw_upstream_rpc_duration_ms says which it was.
 %%%
@@ -86,9 +85,9 @@
 -define(MAX_STEP_MS, 1000).
 -define(BUCKET_MS, 1000).
 
--type lane() :: serial | notify | guardian.
--type sample() :: #{serial := boolean(), notify := boolean(), guardian := boolean()}.
--type delta() :: #{any_ms := non_neg_integer(), serial_ms := non_neg_integer(),
+-type lane() :: permits | notify | guardian.
+-type sample() :: #{permits := boolean(), notify := boolean(), guardian := boolean()}.
+-type delta() :: #{any_ms := non_neg_integer(), permits_ms := non_neg_integer(),
                    notify_ms := non_neg_integer(), guardian_ms := non_neg_integer()}.
 -opaque acc() :: #{last_ms := integer(), last := sample(), buckets := #{integer() => non_neg_integer()}}.
 
@@ -112,7 +111,7 @@ window_s() -> ?WINDOW_S.
 slow_threshold() -> ?SLOW_THRESHOLD.
 
 -spec lanes() -> [lane(), ...].
-lanes() -> [serial, notify, guardian].
+lanes() -> [permits, notify, guardian].
 
 %% @doc Which lanes a snapshot of yuzu_gw_upstream:lane_snapshot/0 has saturated.
 %% `undefined' (the process is not running) saturates nothing: there is no
@@ -120,14 +119,14 @@ lanes() -> [serial, notify, guardian].
 -spec saturated(undefined | map()) -> sample().
 saturated(undefined) ->
     idle();
-saturated(#{in_rpc := InRpc, mailbox_len := Mailbox,
+saturated(#{permit_waiting := Waiting,
             notify_inflight := N, notify_limit := NLimit,
             guardian_inflight := G, guardian_limit := GLimit}) ->
-    #{serial   => InRpc =:= true andalso Mailbox > 0,
+    #{permits  => Waiting > 0,
       notify   => N >= NLimit,
       guardian => G >= GLimit}.
 
-idle() -> #{serial => false, notify => false, guardian => false}.
+idle() -> #{permits => false, notify => false, guardian => false}.
 
 %% @doc A fresh accumulator whose first sample is taken to be at `NowMs'
 %% (monotonic milliseconds). Nothing is credited before the first step.
@@ -146,7 +145,7 @@ observe(#{last_ms := LastMs, last := Last, buckets := Buckets} = Acc, NowMs, Sam
                                  true -> Step;
                                  false -> 0
                              end,
-              serial_ms   => Lane(serial),
+              permits_ms   => Lane(permits),
               notify_ms   => Lane(notify),
               guardian_ms => Lane(guardian)},
     Second = NowMs div 1000,
@@ -217,7 +216,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 now_ms() -> erlang:monotonic_time(millisecond).
 
-zero() -> #{any_ms => 0, serial_ms => 0, notify_ms => 0, guardian_ms => 0}.
+zero() -> #{any_ms => 0, permits_ms => 0, notify_ms => 0, guardian_ms => 0}.
 
 add(A, B) -> maps:map(fun(K, V) -> V + maps:get(K, B) end, A).
 

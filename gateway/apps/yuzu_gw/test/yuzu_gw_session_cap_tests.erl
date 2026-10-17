@@ -538,7 +538,7 @@ concurrent_registers_proxy_at_most_cap() ->
     mock_handler_deps(),
     Parent = self(),
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          Parent ! {in_proxy, self()},
                          receive {release, Parent} -> ok after 20000 -> error(not_released) end,
                          {ok, #{session_id => <<"reg-session-", Id/binary>>}}
@@ -579,7 +579,7 @@ concurrent_same_id_registers_proxy_at_most_cap() ->
     Parent = self(),
     N = 20,
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          Parent ! {in_proxy, self()},
                          receive {release, Parent} -> ok after 20000 -> error(not_released) end,
                          {ok, #{session_id => <<"reg-session-", Id/binary,
@@ -690,7 +690,7 @@ failed_proxy_releases_reservation() ->
     %% More failures than the cap: each releases the slot it claimed.
     Failures = [{error, upstream_down}, {ok, not_a_map}],
     [begin
-         ok = meck:expect(yuzu_gw_upstream, proxy_register, fun(_) -> Failure end),
+         ok = meck:expect(yuzu_gw_upstream, proxy_register, fun(_, _Opts) -> Failure end),
          [?assertMatch({grpc_error, {?GRPC_STATUS_INTERNAL, _}}, Reg(conn_a, I))
           || I <- lists:seq(1, 2 * ?CAP)],
          ?assertEqual([], reserved_rows())
@@ -699,7 +699,7 @@ failed_proxy_releases_reservation() ->
     ?assertEqual([], pending_rows(conn_a)),
     %% Control: with a working upstream the connection admits exactly the cap.
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          {ok, #{session_id => <<"reg-session-", Id/binary>>}}
                      end),
     [?assertMatch({ok, _, _}, Reg(conn_a, I)) || I <- lists:seq(1, ?CAP)],
@@ -867,7 +867,7 @@ handler_superseded_register_is_retryable() ->
     %% While this Register is proxied upstream a newer one of the same agent
     %% commits (its row is stamped later than the row this Register stores).
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          Newer = <<"newer-session">>,
                          true = ets:insert(yuzu_gw_pending,
                                            {Newer, info(A, conn_a),
@@ -1231,6 +1231,6 @@ mock_handler_deps() ->
     ok = meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     ok = meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          {ok, #{session_id => <<"reg-session-", Id/binary>>}}
                      end).

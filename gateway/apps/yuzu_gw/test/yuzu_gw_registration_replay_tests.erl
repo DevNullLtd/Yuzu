@@ -125,12 +125,10 @@ verdict_replay_test_() ->
         fun missing_session_index_keeps_upstream_alive/0),
       t("E16b the registry stopped mid drip aborts the drip without a crash",
         fun registry_stopped_mid_drip_aborts_without_crash/0),
-      t("E17 a breaker replay during a targeted drip is dropped, the drip completes",
-        fun breaker_replay_during_targeted_drip_is_dropped/0),
+      t("E17 a breaker replay during a targeted replay walks the rest of the registry once",
+        fun breaker_replay_during_targeted_drip_walks_the_rest/0),
       t("E18 registration_replay_triggered fires once per appending cast",
         fun triggered_fires_once_per_appending_cast/0),
-      t("E19 notify pressure holds the head queued and unstamped until a slot frees",
-        fun notify_pressure_holds_the_head_unstamped/0),
       t("E20 accepted=false: disconnect, no reannounce, breaker success, stamped",
         fun rejected_replay_disconnects_without_reannounce/0),
       t("E20 a missing accepted key still means accepted",
@@ -188,6 +186,14 @@ verdict_breaker_test_() ->
         fun queue_depth_is_zero_after_circuit_abort/0)
      ]}.
 
+%% A held-notification cap of 4: a replay waits for notify headroom.
+verdict_notify_headroom_test_() ->
+    {foreach,
+     fun() -> setup([{notify_pending_max, 4}]) end,
+     fun cleanup/1,
+     [t("E19 a full held-notification store holds the replay, unstamped, until it drains",
+        fun notify_pressure_holds_the_head_unstamped/0)]}.
+
 %% Session guard 100 ms.
 verdict_guard_test_() ->
     {foreach,
@@ -241,10 +247,10 @@ verdict_env_test_() ->
         fun env_queue_max_invalid_falls_back/0),
       t("a queue cap inside 1..1000000 is kept",
         fun env_queue_max_valid_is_kept/0),
-      t("an out of range or non integer replay spacing falls back to the default with a warning",
-        fun env_spacing_invalid_falls_back/0),
-      t("a replay spacing inside 0..60000 is kept",
-        fun env_spacing_valid_is_kept/0)
+      t("an out of range or non integer replay start jitter falls back to the default with a warning",
+        fun env_jitter_invalid_falls_back/0),
+      t("a replay start jitter inside 0..60000 is kept",
+        fun env_jitter_valid_is_kept/0)
      ]}.
 
 setup() ->
@@ -311,7 +317,13 @@ setup(Env) ->
     application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 5),
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 150),
     application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 1000),
-    application:set_env(yuzu_gw, registration_replay_spacing_ms, 3),
+    %% One replay worker at a time: these tests pin the order-dependent rules
+    %% of the targeted path (dedup, the guard, skips at pop, aborts, depth),
+    %% which a single worker makes deterministic. Parallel replay is covered by
+    %% yuzu_gw_replay_concurrency_tests. No start jitter, so a full replay
+    %% starts at once.
+    application:set_env(yuzu_gw, upstream_replay_concurrency, 1),
+    application:set_env(yuzu_gw, registration_replay_start_jitter_ms, 0),
     lists:foreach(fun({K, V}) -> application:set_env(yuzu_gw, K, V) end, Env),
 
     {ok, UpPid} = yuzu_gw_upstream:start_link(),
@@ -335,6 +347,9 @@ cleanup(UpPid) ->
     %% them.
     application:unset_env(yuzu_gw, registration_replay_session_guard_ms),
     application:unset_env(yuzu_gw, registration_replay_queue_max),
+    application:unset_env(yuzu_gw, upstream_replay_concurrency),
+    application:unset_env(yuzu_gw, registration_replay_start_jitter_ms),
+    application:unset_env(yuzu_gw, notify_pending_max),
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 150),
     application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 1000),
     ok.
@@ -1113,22 +1128,24 @@ registry_stopped_mid_drip_aborts_without_crash() ->
         flush_exits()
     end.
 
-%% E17: a breaker-triggered full replay cast arrives while a targeted drip has
-%% entries queued. The existing in-flight rule drops it; the drip completes
-%% and the unnamed third agent is never replayed (a full replay would send it).
-breaker_replay_during_targeted_drip_is_dropped() ->
+%% E17: a breaker-triggered full replay arrives while a targeted replay is
+%% running. The full walk is not dropped (a recovery must reach every agent,
+%% not only the ones a verdict happened to name), and the sessions the targeted
+%% replay already sent are inside the guard window, so the walk skips them: each
+%% agent is replayed once, the unnamed third one by the walk.
+breaker_replay_during_targeted_drip_walks_the_rest() ->
     watch(),
-    [A1, A2, _A3] = [bind_agent(S) || S <- [<<"e17a">>, <<"e17b">>, <<"e17c">>]],
+    [A1, A2, A3] = [bind_agent(S) || S <- [<<"e17a">>, <<"e17b">>, <<"e17c">>]],
     mock_gated([sid(A1)]),
     ok = yuzu_gw_upstream:replay_sessions([sid(A1), sid(A2)]),
     await_msg({rpc_entered, sid(A1)}),
     ok = gen_server:cast(yuzu_gw_upstream, replay_registrations),
     release(sid(A1)),
-    await(fun() -> length(replay_hdrs()) >= 2 end),
+    await(fun() -> length(replay_hdrs()) >= 3 end),
     await_idle(),
-    ?assertEqual([sid(A1), sid(A2)], replay_hdrs()),
-    ?assertEqual(2, proxy_count()),
-    ?assertEqual([], triggers(breaker)).
+    ?assertEqual([sid(A1), sid(A2), sid(A3)], replay_hdrs()),
+    ?assertEqual(3, proxy_count()),
+    ?assertEqual([#{count => 1}], triggers(breaker)).
 
 %% E18: the event counts appending casts, not sessions. A cast that appends
 %% nothing (inside the guard, or not local) emits none.
@@ -1146,11 +1163,11 @@ triggered_fires_once_per_appending_cast() ->
     ?assertEqual([#{count => 1}], triggers(heartbeat)),
     ?assertEqual(2, length(replay_hdrs())).
 
-%% E19: ten notify workers are held in their rpc, so the notify budget is
-%% full. The head of the queue is retried, not popped, and is not stamped;
-%% once one worker finishes the head replays. The two barrier calls guarantee
-%% that at least one retry has run before the assertions: the first reply
-%% follows the cast, the second follows the replay_next the cast scheduled.
+%% E19: ten notify workers are held in their rpc and two more notifications are
+%% held, so the store (cap 4) is at half its cap: every adopted replay makes its
+%% agent re-send CONNECTED, so the replay waits for headroom. The queued entry
+%% is not popped and not stamped. Once a worker finishes, a held notification is
+%% sent, the store drops below half and the replay runs.
 notify_pressure_holds_the_head_unstamped() ->
     watch(),
     A = bind_agent(<<"e19">>),
@@ -1160,17 +1177,20 @@ notify_pressure_holds_the_head_unstamped() ->
                        {ok, #{}, #{}};
                   (M, R, H) -> default_rpc(M, R, H)
                end),
+    Notify = fun(I) ->
+                 ok = yuzu_gw_upstream:notify_stream_status(
+                        <<"notify-agent-", (integer_to_binary(I))/binary>>,
+                        <<"notify-session">>, connected, <<"peer">>, <<"home">>)
+             end,
     Workers = [begin
-                   ok = yuzu_gw_upstream:notify_stream_status(
-                          <<"notify-agent-", (integer_to_binary(I))/binary>>,
-                          <<"notify-session">>, connected, <<"peer">>, <<"home">>),
+                   Notify(I),
                    receive {notify_entered, W} -> W
                    after 3000 -> erlang:error({notify_worker_not_started, I})
                    end
                end || I <- lists:seq(1, 10)],
+    [Notify(I) || I <- [11, 12]],
     try
         ok = yuzu_gw_upstream:replay_sessions([sid(A)]),
-        sync(),
         sync(),
         ?assertMatch([{_, _, _}], up_get(replay_queue)),
         ?assertEqual(0, proxy_count()),
@@ -1180,7 +1200,8 @@ notify_pressure_holds_the_head_unstamped() ->
         await_idle(),
         ?assertEqual([sid(A)], replay_hdrs())
     after
-        [W ! release || W <- Workers]
+        [W ! release || W <- Workers],
+        [receive {notify_entered, W} -> W ! release after 0 -> ok end || _ <- [1, 2]]
     end.
 
 %% E20: the server answers OK but with accepted=false. The agent is
@@ -1855,13 +1876,13 @@ env_queue_max_valid_is_kept() ->
      || V <- [1, 7, 1000000]],
     ok.
 
-env_spacing_invalid_falls_back() ->
-    [env_case(registration_replay_spacing_ms, Bad, replay_spacing, 20, invalid)
+env_jitter_invalid_falls_back() ->
+    [env_case(registration_replay_start_jitter_ms, Bad, replay_jitter_ms, 1000, invalid)
      || Bad <- [-5, 60001, 1.5, foo, <<"20">>, "20"]],
     ok.
 
-env_spacing_valid_is_kept() ->
-    [env_case(registration_replay_spacing_ms, V, replay_spacing, V, valid)
+env_jitter_valid_is_kept() ->
+    [env_case(registration_replay_start_jitter_ms, V, replay_jitter_ms, V, valid)
      || V <- [0, 1, 60000]],
     ok.
 
@@ -2021,8 +2042,8 @@ default_rpc(<<"ProxyRegister">>, _Req, Hdr) when is_binary(Hdr) ->
 default_rpc(_Method, _Req, _Hdr) ->
     {ok, #{}, #{}}.
 
-%% ProxyRegister for a gated session blocks, inside the upstream process,
-%% until the test calls release/1; every other rpc succeeds.
+%% ProxyRegister for a gated session blocks, inside its replay worker, until
+%% the test calls release/1; every other rpc succeeds.
 mock_gated(GatedHdrs) ->
     mock_gated(GatedHdrs, fun default_rpc/3).
 
@@ -2034,14 +2055,18 @@ mock_gated(GatedHdrs, After) ->
         end
     end).
 
+%% The gated process (the replay worker the RPC runs in) is recorded before the
+%% test is told, so release/1 always finds it.
 gate(Hdr) ->
+    ets:insert(persistent_term:get(?DUMMYK), {gate, Hdr, self()}),
     notify({rpc_entered, Hdr}),
     receive {release, Hdr} -> ok
     after 10000 -> ok
     end.
 
 release(Hdr) ->
-    whereis(yuzu_gw_upstream) ! {release, Hdr},
+    [Pid ! {release, Hdr} || {gate, H, Pid} <- ets:lookup(persistent_term:get(?DUMMYK), gate),
+                             H =:= Hdr],
     ok.
 
 %% Make the calling process the one the mocks notify.
@@ -2149,15 +2174,15 @@ sync() ->
     _ = yuzu_gw_upstream:circuit_state(),
     ok.
 
-%% The drip is finished: queue empty twice with a call in between. The call
-%% matters: a cast sent from inside the last step (a replay trigger) is in the
-%% mailbox before that step's state is readable, so a second read after a
-%% round trip would show the queue it seeded.
+%% The replay is finished: nothing queued, no walk, no worker in flight (so
+%% every worker's result has been handled), twice with a call in between. The
+%% call matters: a cast sent while the last result was handled (a replay
+%% trigger) is in the mailbox before that state is readable, so a second read
+%% after a round trip would show the replay it started.
 await_idle() ->
-    await(fun() ->
-        up_get(replay_queue) =:= []
-            andalso begin sync(), up_get(replay_queue) =:= [] end
-    end).
+    Idle = fun() -> up_get(replay_queue) =:= [] andalso up_get(replay_walk) =:= idle
+                        andalso up_get(replay_pids) =:= #{} end,
+    await(fun() -> Idle() andalso begin sync(), Idle() end end).
 
 %% Sleep until the monotonic clock is past T0 + Ms. Waiting out a time window
 %% is the point of the caller; it is not a guess at how long something takes.

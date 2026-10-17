@@ -99,6 +99,11 @@ heartbeat(<<"ctx">>, Ctx, _Request) ->
                                                 undefined -> <<"no-cert">>;
                                                 _ -> <<"cert">>
                                             end}]}};
+%% The grpc-timeout header the call arrived with, in `plugin' (<<>> if none).
+heartbeat(<<"deadline">>, Ctx, _Request) ->
+    {ok, #{acknowledged => true,
+           pending_commands => [#{plugin => maps:get(<<"grpc-timeout">>, yuzu_grpc:headers(Ctx),
+                                                     <<>>)}]}};
 %% Where the call is attributed and what it reached the handler over: the
 %% origin address and how it was learned, the TCP peer, and whether a client
 %% certificate arrived (in `parameters').

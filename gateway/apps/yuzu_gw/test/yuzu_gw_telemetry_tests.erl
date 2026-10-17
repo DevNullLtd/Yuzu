@@ -567,7 +567,7 @@ backpressure_metrics_test_() ->
       {"every series exists straight after setup, at zero",
        fun() ->
            ?assertEqual(0, prometheus_counter:value(Seconds, [])),
-           ?assertEqual([guardian, notify, serial], lists:sort(yuzu_gw_upstream_pressure:lanes())),
+           ?assertEqual([guardian, notify, permits], lists:sort(yuzu_gw_upstream_pressure:lanes())),
            [?assertEqual(0, LaneValue(atom_to_binary(L, utf8))) || L <- yuzu_gw_upstream_pressure:lanes()],
            ?assertEqual(0.0, prometheus_gauge:value(yuzu_gw_upstream_backpressure_duty_cycle, [])),
            ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_slow, []))
@@ -581,16 +581,16 @@ backpressure_metrics_test_() ->
                           {<<"yuzu_gw_upstream_backpressure_duty_cycle">>, <<"gauge">>},
                           {<<"yuzu_gw_upstream_slow">>, <<"gauge">>}]],
            ?assertNotEqual(nomatch,
-                           binary:match(Out, <<"yuzu_gw_upstream_lane_saturated_seconds_total{lane=\"serial\"} ">>))
+                           binary:match(Out, <<"yuzu_gw_upstream_lane_saturated_seconds_total{lane=\"permits\"} ">>))
        end},
       {"the counter event adds its milliseconds as seconds, per lane and for the whole",
        fun() ->
            S0 = prometheus_counter:value(Seconds, []),
-           {Se0, N0, G0} = {LaneValue(<<"serial">>), LaneValue(<<"notify">>), LaneValue(<<"guardian">>)},
+           {Se0, N0, G0} = {LaneValue(<<"permits">>), LaneValue(<<"notify">>), LaneValue(<<"guardian">>)},
            telemetry:execute([yuzu, gw, upstream, backpressure],
-                             #{any_ms => 1500, serial_ms => 1000, notify_ms => 1500, guardian_ms => 0}, #{}),
+                             #{any_ms => 1500, permits_ms => 1000, notify_ms => 1500, guardian_ms => 0}, #{}),
            ?assert(abs(prometheus_counter:value(Seconds, []) - (S0 + 1.5)) < 1.0e-9),
-           ?assert(abs(LaneValue(<<"serial">>) - (Se0 + 1.0)) < 1.0e-9),
+           ?assert(abs(LaneValue(<<"permits">>) - (Se0 + 1.0)) < 1.0e-9),
            ?assert(abs(LaneValue(<<"notify">>) - (N0 + 1.5)) < 1.0e-9),
            ?assert(G0 == LaneValue(<<"guardian">>))
        end},

@@ -55,6 +55,7 @@
                    notify_probe_timeout_ms,
                    cluster_id,
                    registration_replay_spacing_ms,
+                   registration_replay_start_jitter_ms,
                    circuit_breaker_failure_threshold,
                    circuit_breaker_reset_timeout_ms,
                    circuit_breaker_max_reset_timeout_ms]).
@@ -163,28 +164,26 @@ env_test_() ->
         fun max_out_of_range_names_the_default_not_the_rejected_value/0)
      ]}.
 
-%% A registration replay that is active while the pending store is refilled.
-%% Replay spacing 1 ms so the drip retries quickly.
+%% A registration replay while every notify slot is held and a backlog is held.
 replay_test_() ->
     {foreach,
-     fun() -> setup([{registration_replay_spacing_ms, 1}]) end,
+     fun() -> setup([]) end,
      fun cleanup/1,
      [
-      t("a refilled backlog does not starve an active replay: the replay head advances",
-        fun replay_advances_while_the_backlog_is_refilled/0),
+      t("a replay does not wait for notify slots: with every slot held it runs at once",
+        fun replay_runs_while_every_notify_slot_is_held/0),
       t("a replayed registration that cannot be encoded does not touch the breaker",
         fun replay_local_encode_exception_leaves_the_breaker_alone/0)
      ]}.
 
-%% The reserved replay slot has a size, and a long replay spacing keeps the
-%% drip parked (queue non-empty, nothing advancing) so the size can be observed.
+%% No notify slot is held back for a replay (it no longer waits on them).
 replay_reserve_test_() ->
     {foreach,
-     fun() -> setup([{registration_replay_spacing_ms, 60000}]) end,
+     fun() -> setup([]) end,
      fun cleanup/1,
      [
-      t("while a replay is active the reserve is exactly one slot: refills stop at nine",
-        fun replay_reserve_is_exactly_one_slot/0)
+      t("no notify slot is held back during a replay: refills go to ten",
+        fun replay_holds_no_notify_slot_back/0)
      ]}.
 
 %% The half_open probe (#4632). The breaker's reset timer is a long way off (the
@@ -369,6 +368,8 @@ setup(Env) ->
     application:unset_env(yuzu_gw, notify_pending_max),
     application:unset_env(yuzu_gw, notify_probe_timeout_ms),
     application:unset_env(yuzu_gw, registration_replay_spacing_ms),
+    %% A full replay starts at once (no start jitter).
+    application:set_env(yuzu_gw, registration_replay_start_jitter_ms, 0),
     yuzu_gw_test_upstream:set_breaker_env(3),
     lists:foreach(fun({K, V}) -> application:set_env(yuzu_gw, K, V) end, Env),
     %% Public tables and counters shared with the mock, which runs in the
@@ -828,56 +829,43 @@ half_open_circuit_sends_one_probe_and_holds_the_rest() ->
     await_until(fun() -> last_gauge() =:= {0, 0} end).
 
 %% Ten workers are parked and 30 distinct keys are held, then a replay of three
-%% agents is armed. Releasing one worker at a time frees one slot, and without a
-%% reserved slot the freed slot is refilled from the backlog at once, so the
-%% replay drip never sees fewer than ten workers until the backlog is empty.
-%% The replay head must reach the mock while keys are still held.
-replay_advances_while_the_backlog_is_refilled() ->
+%% agents is armed. A replay waits only for held-notification headroom (the
+%% store under half its cap), never for a notify slot: all three ProxyRegister
+%% calls go out while every slot is still held and the backlog is untouched.
+replay_runs_while_every_notify_slot_is_held() ->
     watch(),
     Live0 = fill_slots(),
     Backlog = 30,
     [cast_connected(agent(I)) || I <- lists:seq(1, Backlog)],
     Sids = [bind_replay_agent(I) || I <- lists:seq(1, 3)],
     ok = yuzu_gw_upstream:replay_sessions(Sids),
-    sync(),
-    ?assertEqual({Backlog, ?INFLIGHT_MAX}, last_gauge()),
-    ?assertMatch([_, _, _], up_get(replay_queue)),
-    Refills = release_until_proxied(Live0, 0),
-    ?assertMatch(N when N < Backlog, Refills),
-    ?assert(pending_len() > 0),
-    %% The other two agents follow, and once the replay is over the reserved
-    %% slot is spent on the backlog again.
     [receive {proxied, _} -> ok
-     after ?AWAIT_MS -> erlang:error(replay_did_not_continue)
-     end || _ <- [2, 3]],
-    await_until(fun() -> last_gauge() =:= {Backlog - Refills - 1, ?INFLIGHT_MAX} end),
-    ?assertEqual([], up_get(replay_queue)).
+     after ?AWAIT_MS -> erlang:error(replay_waited_for_a_notify_slot)
+     end || _ <- [1, 2, 3]],
+    sync(),
+    ?assertEqual(?INFLIGHT_MAX, map_size(up_get(notify_pids))),
+    ?assertEqual(Backlog, pending_len()),
+    [W ! release || W <- Live0],
+    ok.
 
-%% Ten workers are parked, 30 keys are held and a replay of three agents is armed;
-%% the 60 s spacing leaves the drip waiting, so the replay queue stays non-empty.
-%% Three workers finish. The first leaves nine in flight, which is the budget while
-%% the replay is active, so nothing is refilled; each of the next two leaves eight
-%% and is refilled to nine from the backlog. A reserve of more than one slot would
-%% stop at fewer than nine, and no reserve would refill to ten.
-replay_reserve_is_exactly_one_slot() ->
+%% Ten workers are parked, 30 keys are held and a replay of three agents is
+%% armed. Three workers finish: each freed slot is refilled from the backlog at
+%% once, back to ten (no slot is reserved for the replay).
+replay_holds_no_notify_slot_back() ->
     watch(),
     Live0 = fill_slots(),
     Backlog = 30,
     [cast_connected(agent(I)) || I <- lists:seq(1, Backlog)],
     Sids = [bind_replay_agent(I) || I <- lists:seq(1, 3)],
     ok = yuzu_gw_upstream:replay_sessions(Sids),
-    sync(),
-    ?assertEqual({Backlog, ?INFLIGHT_MAX}, last_gauge()),
-    ?assertMatch([_, _, _], up_get(replay_queue)),
     [W1, W2, W3 | _] = Live0,
     W1 ! release,
     W2 ! release,
     W3 ! release,
-    await_until(fun() -> last_gauge() =:= {Backlog - 2, ?INFLIGHT_MAX - 1} end),
+    await_until(fun() -> last_gauge() =:= {Backlog - 3, ?INFLIGHT_MAX} end),
     sync(),
-    ?assertEqual(?INFLIGHT_MAX - 1, map_size(up_get(notify_pids))),
-    ?assertEqual(Backlog - 2, pending_len()),
-    ?assertMatch([_, _, _], up_get(replay_queue)).
+    ?assertEqual(?INFLIGHT_MAX, map_size(up_get(notify_pids))),
+    ?assertEqual(Backlog - 3, pending_len()).
 
 gauges_follow_a_burst() ->
     watch(),
@@ -1212,20 +1200,17 @@ probe_success_closes_drains_and_replays() ->
     Probe ! release,
     First = await_entered(?INFLIGHT_MAX),
     await_until(fun() -> last_gauge() =:= {1, ?INFLIGHT_MAX} end),
-    %% The gauge is reported after the replay cast was enqueued, and a call is
-    %% answered after it: the replay queue holds the one agent.
     sync(),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
-    ?assertMatch([_], up_get(replay_queue)),
     ?assertEqual(lists:sort(lists:sublist(Keys, 2, ?INFLIGHT_MAX)),
                  lists:sort([maps:get(agent_id, Req) || {_, Req} <- First])),
-    %% Ten workers are in flight, so the replay waits; one slot opens and the
-    %% replay head goes out, then the last held key.
-    {W, _} = hd(First),
-    W ! release,
+    %% The close started a full replay; it does not wait for the ten notify
+    %% workers in flight. One slot opens and the last held key goes out.
     receive {proxied, _} -> ok
     after ?AWAIT_MS -> erlang:error(replay_did_not_run)
     end,
+    {W, _} = hd(First),
+    W ! release,
     {_, Last} = await_entered(),
     ?assertEqual(agent(12), maps:get(agent_id, Last)),
     open_and_release_all(),
@@ -1880,9 +1865,9 @@ replay_local_encode_exception_leaves_the_breaker_alone() ->
     Fresh = breaker(),
     ?assertMatch({closed, 0, 0, _}, Fresh),
     ok = yuzu_gw_upstream:replay_sessions([Sid]),
-    %% replay_next is queued behind the first call by the cast handler, and the
-    %% second call is behind replay_next.
-    sync(),
+    %% The replay runs in a worker: wait until its result has been handled.
+    await_until(fun() -> meck:num_calls(yuzu_grpc_client, unary, '_') >= 1
+                             andalso up_get(replay_pids) =:= #{} end),
     sync(),
     ?assertEqual([], up_get(replay_queue)),
     ?assertEqual(1, meck:num_calls(yuzu_grpc_client, unary, '_')),
@@ -2319,18 +2304,6 @@ bind_replay_agent(I, RegisterReq) ->
     ok = yuzu_gw_registry:register_agent(Id, Pid, Sid, [<<"svc">>], <<"host">>,
                                          RegisterReq, conn_test),
     Sid.
-
-%% Release the oldest parked worker and wait for what follows: a new notify
-%% worker entering the mock (the freed slot was refilled from the backlog, one
-%% refill counted) or a ProxyRegister (the replay head advanced). Returns the
-%% number of refills seen before the first ProxyRegister.
-release_until_proxied([W | Rest], Refills) ->
-    W ! release,
-    receive
-        {proxied, _}       -> Refills;
-        {entered, W2, _Req} -> release_until_proxied(Rest ++ [W2], Refills + 1)
-    after ?AWAIT_MS -> erlang:error({replay_never_advanced, Refills})
-    end.
 
 %% half_open by hand (the reset timer is far away). The call is answered after
 %% the message was handled and the probe, if any, was started.

@@ -118,7 +118,7 @@ setup() ->
     ok = meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     ok = meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          {ok, #{session_id => <<"reg-session-", Id/binary>>}}
                      end),
     %% Events are recorded in a public table: eunit runs the fixture setup
@@ -615,7 +615,7 @@ register_non_map_upstream_response() ->
     A = uid(<<"regnm">>),
     Req = #{info => #{agent_id => A, hostname => <<"h">>}},
     [begin
-         ok = meck:expect(yuzu_gw_upstream, proxy_register, fun(_) -> {ok, Bad} end),
+         ok = meck:expect(yuzu_gw_upstream, proxy_register, fun(_, _Opts) -> {ok, Bad} end),
          Result = yuzu_gw_agent_service:register(ctx_with(conn_a), Req),
          %% The warning is limited to one per interval: start the capture with a
          %% fresh limit.

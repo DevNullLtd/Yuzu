@@ -201,7 +201,7 @@ in_conn(Cap, Fun) ->
     ok = meck:new(yuzu_gw_upstream, [passthrough, no_link]),
     Test = self(),
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(_Request) ->
+                     fun(_Request, _Opts) ->
                          Test ! {upstream_entered, self()},
                          receive {upstream_reply, Reply} -> Reply end
                      end),

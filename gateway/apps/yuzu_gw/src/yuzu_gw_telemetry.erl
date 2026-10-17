@@ -121,7 +121,20 @@
     %% BEAM VM
     [yuzu, gw, vm, process_count],
     [yuzu, gw, vm, memory],
-    [yuzu, gw, vm, scheduler_util]
+    [yuzu, gw, vm, scheduler_util],
+
+    %% UPSTREAM workstream (#5695): the permit regulator for proxied calls
+    %% (yuzu_gw_upstream_regulator), registration replay outcomes and duration,
+    %% and the held stream-status notifications' losses and high-water mark.
+    [yuzu, gw, upstream, permits],
+    [yuzu, gw, upstream, permit_limit],
+    [yuzu, gw, upstream, permit_refused],
+    [yuzu, gw, upstream, permit_wait],
+    [yuzu, gw, upstream, registration_replay_outcome],
+    [yuzu, gw, upstream, registration_replay_done],
+    [yuzu, gw, upstream, notify_lost],
+    [yuzu, gw, upstream, notify_requeued],
+    [yuzu, gw, upstream, notify_held]
 ]).
 
 %%--------------------------------------------------------------------
@@ -379,12 +392,12 @@ handle_event([yuzu, gw, upstream, call_dropped], #{count := N}, Meta, _Config) -
 %% is the share of time, so its unit is the base unit and the figure needs no
 %% scaling. The lanes overlap and are never summed; `any' is the union.
 handle_event([yuzu, gw, upstream, backpressure],
-             #{any_ms := Any, serial_ms := Serial, notify_ms := Notify,
+             #{any_ms := Any, permits_ms := Permits, notify_ms := Notify,
                guardian_ms := Guardian}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_upstream_backpressure_seconds_total, [], Any / 1000),
     [prometheus_counter:inc(yuzu_gw_upstream_lane_saturated_seconds_total,
                             [atom_to_binary(Lane, utf8)], Ms / 1000)
-     || {Lane, Ms} <- [{serial, Serial}, {notify, Notify}, {guardian, Guardian}]],
+     || {Lane, Ms} <- [{permits, Permits}, {notify, Notify}, {guardian, Guardian}]],
     ok;
 
 handle_event([yuzu, gw, upstream, backpressure_state],
@@ -496,8 +509,61 @@ handle_event([yuzu, gw, vm, memory], Measurements, _Meta, _Config) ->
 handle_event([yuzu, gw, vm, scheduler_util], #{weighted_avg := Avg}, _Meta, _Config) ->
     prometheus_gauge:set(yuzu_gw_beam_scheduler_util, [node()], Avg);
 
+%% UPSTREAM workstream (#5695). Every label is a closed set; a value outside it
+%% folds to `unknown' (pre-seeded where the metric is a counter), so a bug can
+%% neither widen the label set nor crash this handler.
+handle_event([yuzu, gw, upstream, permits], #{held := H, waiting := W}, Meta, _Config) ->
+    Class = closed(maps:get(class, Meta, unknown), permit_classes()),
+    prometheus_gauge:set(yuzu_gw_upstream_permits_held, [Class], H),
+    prometheus_gauge:set(yuzu_gw_upstream_permits_waiting, [Class], W);
+handle_event([yuzu, gw, upstream, permit_limit], #{limit := L}, Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_upstream_permit_limit,
+                         [closed(maps:get(class, Meta, unknown), permit_classes())], L);
+handle_event([yuzu, gw, upstream, permit_refused], #{count := N}, Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_upstream_permit_refused_total,
+                           [closed(maps:get(class, Meta, unknown), permit_classes()),
+                            closed(maps:get(reason, Meta, unknown), permit_refusals())], N);
+handle_event([yuzu, gw, upstream, permit_wait], #{seconds := S}, Meta, _Config) ->
+    prometheus_histogram:observe(yuzu_gw_upstream_permit_wait_seconds,
+                                 [closed(maps:get(class, Meta, unknown), permit_classes())], S);
+handle_event([yuzu, gw, upstream, registration_replay_outcome], #{count := N}, Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_registration_replay_outcomes_total,
+                           [closed(maps:get(outcome, Meta, unknown), replay_outcomes())], N);
+handle_event([yuzu, gw, upstream, registration_replay_done], #{seconds := S}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_registration_replay_last_duration_seconds, [], S);
+handle_event([yuzu, gw, upstream, notify_lost], #{count := N}, Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_upstream_notify_lost_total,
+                           [closed(maps:get(event, Meta, unknown), notify_events()),
+                            closed(maps:get(reason, Meta, unknown), notify_lost_reasons())], N);
+handle_event([yuzu, gw, upstream, notify_requeued], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_upstream_notify_requeued_total, [], N);
+handle_event([yuzu, gw, upstream, notify_held], #{hwm := Hwm, max := Max}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_upstream_notify_pending_hwm, [], Hwm),
+    prometheus_gauge:set(yuzu_gw_upstream_notify_pending_max, [], Max);
+
 handle_event(_Event, _Measurements, _Meta, _Config) ->
     ok.
+
+%% UPSTREAM workstream (#5695): the closed label sets, and the fold of anything
+%% else (atom or binary) to <<"unknown">>.
+permit_classes()      -> [register, replay, inventory].
+permit_refusals()     -> [queue_full, deadline, stopping].
+replay_outcomes()     -> [adopted, superseded, rejected, failed, skipped, aborted].
+notify_events()       -> [connected, disconnected].
+notify_lost_reasons() -> [at_capacity, evicted, rejected, shutdown].
+
+closed(Value, Set) when is_atom(Value) ->
+    case lists:member(Value, Set) of
+        true  -> atom_to_binary(Value, utf8);
+        false -> <<"unknown">>
+    end;
+closed(Value, Set) when is_binary(Value) ->
+    case [A || A <- Set, atom_to_binary(A, utf8) =:= Value] of
+        [_] -> Value;
+        []  -> <<"unknown">>
+    end;
+closed(_Value, _Set) ->
+    <<"unknown">>.
 
 %%%===================================================================
 %%% Internal
@@ -806,10 +872,9 @@ declare_metrics() ->
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_calls_dropped_total},
         {labels, [rpc_name]},
-        {help, "Queued upstream proxy calls skipped because the requesting gRPC "
-               "call had already ended (the client reset the stream or its "
-               "deadline passed while the call waited behind the serial "
-               "upstream process), by rpc_name (register, inventory)"}]),
+        {help, "Proxied upstream calls not sent because the caller's deadline "
+               "passed while it waited for a permit, or left too little time "
+               "to make the call, by rpc_name (register, inventory)"}]),
     [prometheus_counter:inc(yuzu_gw_upstream_calls_dropped_total,
                             [atom_to_binary(R, utf8)], 0)
      || R <- upstream_dropped_rpcs()],
@@ -817,16 +882,15 @@ declare_metrics() ->
         {name, yuzu_gw_upstream_backpressure_seconds_total},
         {labels, []},
         {help, "Seconds during which the path to the server was backed up: at "
-               "least one lane saturated (the serial upstream process inside an "
-               "RPC with a message waiting, every usable stream-status "
-               "notification slot held (10, or 9 during a registration "
-               "replay), or all 50 Guardian forward slots held). rate() of "
+               "least one lane saturated (a live Register or inventory report "
+               "waiting for a permit, all 10 stream-status notification slots "
+               "held, or all 50 Guardian forward slots held). rate() of "
                "this is the backpressure duty cycle, 0 to 1. Sampled every "
                "100 ms"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_lane_saturated_seconds_total},
         {labels, [lane]},
-        {help, "Seconds each lane (serial, notify, guardian) was saturated. The "
+        {help, "Seconds each lane (permits, notify, guardian) was saturated. The "
                "lanes overlap: do not add them, use "
                "yuzu_gw_upstream_backpressure_seconds_total for the whole"}]),
     [prometheus_counter:inc(yuzu_gw_upstream_lane_saturated_seconds_total,
@@ -1044,6 +1108,93 @@ declare_metrics() ->
                "(#4555) - compare against peers_resolved to distinguish a "
                "wrong seed name (resolved=0) from a partial mesh (resolved "
                "> connected > 0, most often a cookie mismatch)"}]),
+
+    %% ── UPSTREAM workstream (#5695) ────────────────────────────────────────
+    %% Proxied-call permits (yuzu_gw_upstream_regulator), registration replay,
+    %% held stream-status notifications. Every series is created at 0 here.
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_permits_held},
+        {labels, [class]},
+        {help, "Upstream call permits held now, by class: register (a live "
+               "ProxyRegister), replay (a registration replay), inventory (a "
+               "ProxyInventory). register and replay share one pool"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_permits_waiting},
+        {labels, [class]},
+        {help, "Callers waiting for an upstream call permit now, by class. Non-zero "
+               "for register or inventory means every permit of the pool is held"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_permit_limit},
+        {labels, [class]},
+        {help, "Configured upstream call permits, by class (replay is the most of "
+               "the register pool a replay may hold)"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_upstream_permit_refused_total},
+        {labels, [class, reason]},
+        {help, "Upstream call permits refused, by class and reason: queue_full (the "
+               "wait queue was full), deadline (the caller's deadline passed first), "
+               "stopping (planned stop). The agent is told UNAVAILABLE and retries"}]),
+    prometheus_histogram:declare([
+        {name, yuzu_gw_upstream_permit_wait_seconds},
+        {labels, [class]},
+        {duration_unit, false},
+        {buckets, [0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]},
+        {help, "Seconds a granted upstream call permit was waited for, by class"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_registration_replay_outcomes_total},
+        {labels, [outcome]},
+        {help, "Registration replay entries by outcome: adopted, superseded, "
+               "rejected (accepted=false), failed, skipped (gone, re-registered, "
+               "no stored request, or replayed within the guard window), aborted "
+               "(dropped when the breaker opened or the registry went away)"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_registration_replay_last_duration_seconds},
+        {labels, []},
+        {duration_unit, false},
+        {help, "Seconds the last finished registration replay took, from its first "
+               "entry to its last result (0 until one finished)"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_upstream_notify_lost_total},
+        {labels, [event, reason]},
+        {help, "Stream-status notifications lost, by event (connected, "
+               "disconnected) and reason: at_capacity (not admitted, the held store "
+               "was full), evicted (a held connected notification evicted to admit "
+               "a disconnected one; a full registration replay re-sends it), "
+               "rejected (the server answered that the notification itself was "
+               "wrong, or it could not be encoded), shutdown (still held or in "
+               "flight when a planned stop's flush ended)"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_upstream_notify_requeued_total},
+        {labels, []},
+        {help, "Stream-status notifications whose send failed and that were held "
+               "again to be retried"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_notify_pending_hwm},
+        {labels, []},
+        {help, "Most stream-status notifications held at once over the last one to "
+               "two minutes (kept by the upstream process, so a spike between "
+               "scrapes is seen)"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_notify_pending_max},
+        {labels, []},
+        {help, "The held stream-status notification cap in force "
+               "(notify_pending_max)"}]),
+    [begin
+         prometheus_gauge:set(yuzu_gw_upstream_permits_held, [C], 0),
+         prometheus_gauge:set(yuzu_gw_upstream_permits_waiting, [C], 0),
+         prometheus_gauge:set(yuzu_gw_upstream_permit_limit, [C], 0),
+         [prometheus_counter:inc(yuzu_gw_upstream_permit_refused_total, [C, R], 0)
+          || R <- [atom_to_binary(R0, utf8) || R0 <- permit_refusals()]]
+     end || C <- [atom_to_binary(C0, utf8) || C0 <- permit_classes()]],
+    [prometheus_counter:inc(yuzu_gw_registration_replay_outcomes_total, [O], 0)
+     || O <- [atom_to_binary(O0, utf8) || O0 <- replay_outcomes()] ++ [<<"unknown">>]],
+    prometheus_gauge:set(yuzu_gw_registration_replay_last_duration_seconds, [], 0),
+    [prometheus_counter:inc(yuzu_gw_upstream_notify_lost_total, [E, R], 0)
+     || E <- [atom_to_binary(E0, utf8) || E0 <- notify_events()],
+        R <- [atom_to_binary(R0, utf8) || R0 <- notify_lost_reasons()]],
+    prometheus_counter:inc(yuzu_gw_upstream_notify_requeued_total, [], 0),
+    prometheus_gauge:set(yuzu_gw_upstream_notify_pending_hwm, [], 0),
+    prometheus_gauge:set(yuzu_gw_upstream_notify_pending_max, [], 0),
 
     ok.
 

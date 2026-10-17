@@ -145,8 +145,8 @@ cleanup(#{listeners := Listeners, relays := Relays} = State) ->
 %% test says so (pending_session/2).
 mock_boundaries() ->
     meck:expect(yuzu_gw_upstream, proxy_register,
-                fun(#{info := #{agent_id := <<"upstream-fails">>}}) -> {error, unavailable};
-                   (#{info := #{agent_id := Id}}) ->
+                fun(#{info := #{agent_id := <<"upstream-fails">>}}, _Opts) -> {error, unavailable};
+                   (#{info := #{agent_id := Id}}, _Opts) ->
                        {ok, #{session_id => <<"sess-", Id/binary>>, accepted => true}}
                 end),
     meck:expect(yuzu_gw_registry, reserve_session,
