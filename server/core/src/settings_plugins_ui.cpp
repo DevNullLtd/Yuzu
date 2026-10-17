@@ -118,7 +118,9 @@ constexpr char kPart2[] = R"HTM(<body>
           <p>Recorded here and served with the trust bundle. Each agent enforces its own
             <code>--plugin-require-signature</code>. Agents do not check revocation when loading
             plugins, so the trust anchors cannot be revoked from here. To issue a code-signing
-            certificate, use <a href="/settings/pki">Certificates and secrets</a>.</p>
+            certificate, use <code>POST /api/v1/ca/issue-code-signing</code> (or the MCP tool
+            <code>issue_code_signing_cert</code>); issued certificates are listed, and can be
+            revoked, under <a href="/settings/pki">Certificates and secrets</a>.</p>
           <div id="plugin-signing-section"
                hx-get="/fragments/settings/plugin-signing"
                hx-trigger="load, refreshPluginSigning from:body"

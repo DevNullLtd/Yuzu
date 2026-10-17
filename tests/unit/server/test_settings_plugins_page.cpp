@@ -133,6 +133,10 @@ TEST_CASE("plugins page: wording does not repeat the artboard's false claims",
     CHECK_THAT(squash(html),
                ContainsSubstring("Agents do not check revocation when loading plugins"));
     CHECK_THAT(html, ContainsSubstring("href=\"/settings/pki\""));
+    // The PKI page has no issue control: the sentence must name the API route, not send the
+    // operator there to issue.
+    CHECK_THAT(squash(html), ContainsSubstring("POST /api/v1/ca/issue-code-signing"));
+    CHECK_THAT(squash(html), ContainsSubstring("issue_code_signing_cert"));
     CHECK_THAT(squash(html), ContainsSubstring("not how many have updated"));
 }
 
