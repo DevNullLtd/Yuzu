@@ -43,7 +43,7 @@ struct EcosystemFamily {
     std::string_view family; ///< windows | macos | linux; any other ecosystem is "other"
 };
 
-inline constexpr std::array<EcosystemFamily, 9> kEcosystemFamilies{{
+inline constexpr std::array<EcosystemFamily, 11> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
     {"macos", "macos"},
@@ -53,6 +53,8 @@ inline constexpr std::array<EcosystemFamily, 9> kEcosystemFamilies{{
     {"deb", "linux"},
     {"apk", "linux"},
     {"pacman", "linux"},
+    {"snap", "linux"},
+    {"flatpak", "linux"},
 }};
 
 /// SQL `CASE` over the `ecosystem` column generated from kEcosystemFamilies, so the SQL has
