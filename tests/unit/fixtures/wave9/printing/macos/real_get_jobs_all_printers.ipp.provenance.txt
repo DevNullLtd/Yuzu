@@ -2,7 +2,7 @@ status: REAL CAPTURE
 
 host: this Mac (macOS, arm64), live cupsd at /private/var/run/cupsd
 date: 2026-09-21 (UTC)
-identity: id -u = 501 (alex, non-root). Scratch queues created with `lpadmin`
+identity: id -u = 501 (jsmith, non-root). Scratch queues created with `lpadmin`
 and removed afterwards; same setup as real_get_jobs_binding_check.ipp (jobs 16
 and 17 on yuzu4616a, job 18 on yuzu4616b).
 
@@ -28,3 +28,5 @@ binding check list every queue's jobs, so any job id passed, and Cancel-Job
 (which ignores the printer) then cancelled a job on another queue; observed
 end to end on this cupsd. The test that loads this file proves the second guard:
 a job is accepted only when its own job-printer-uri names the named printer.
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

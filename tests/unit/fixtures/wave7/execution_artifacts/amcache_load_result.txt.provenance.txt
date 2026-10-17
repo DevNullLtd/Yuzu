@@ -1,5 +1,7 @@
-host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\jsmith)
 command: reg load HKLM\YuzuAmcacheProbe <amcache copy>, then reg unload HKLM\YuzuAmcacheProbe
 date: 2026-09-06
 status: REAL CAPTURE
 note: first unload attempt (same PowerShell process that ran the load) returned "Access is denied" because the process's own registry-provider handle was still open; a fresh SSH/PowerShell process's reg unload succeeded immediately. Verified clean afterward: reg query HKLM\YuzuAmcacheProbe returns "unable to find the specified registry key" (rig left clean).
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.
