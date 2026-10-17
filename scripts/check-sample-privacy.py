@@ -41,6 +41,8 @@ _SAFE_PROFILE_NAMES = {"jsmith", "public", "default", "default user", "all users
 _PROFILE_PATH = re.compile(r"(?:\b[A-Za-z]:[\\/]+Users[\\/]+|/Users/|/home/)([^/\\|\s:;,'\"]+)")
 
 _ACCOUNT_SID = re.compile(r"\bS-1-5-21-\d+-\d+-\d+(?:-\d+)?\b")
+# The documented placeholder a redaction uses (see #6010); it identifies nothing.
+_PLACEHOLDER_SID_DOMAIN = "S-1-5-21-1111111111-2222222222-3333333333"
 
 # Certificate rows: subject|issuer|thumbprint|... (the certificates plugin's row layout).
 _CERT_SUBJECT, _CERT_ISSUER = 0, 1
@@ -59,7 +61,7 @@ def problems(text: str) -> list[str]:
             if m.group(1).lower() not in _SAFE_PROFILE_NAMES:
                 found.append(f"line {n}: user-profile path names '{m.group(1)}' "
                              f"(use the placeholder 'jsmith' or '{REDACTED}')")
-        if _ACCOUNT_SID.search(line):
+        if any(not m.group(0).startswith(_PLACEHOLDER_SID_DOMAIN) for m in _ACCOUNT_SID.finditer(line)):
             found.append(f"line {n}: Windows account SID")
     return found
 

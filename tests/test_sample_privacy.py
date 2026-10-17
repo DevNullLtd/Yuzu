@@ -84,6 +84,7 @@ class CheckerCatches(unittest.TestCase):
     def test_account_sid(self):
         self.assertEqual(len(checker.problems("owner|S-1-5-21-1-2-3-1001")), 1)
         self.assertEqual(checker.problems("owner|S-1-5-18"), [])
+        self.assertEqual(checker.problems("HKU\\S-1-5-21-1111111111-2222222222-3333333333-1001\\Run"), [])
 
 
 if __name__ == "__main__":
