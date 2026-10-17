@@ -1764,4 +1764,11 @@ void ResponseStore::reap_expired() {
     }
 }
 
+bool facet_filter_value_over_bound(std::string_view raw_value) {
+    // The scrub grows a byte to at most 3, so a value this short cannot reach the bound.
+    if (raw_value.size() * 3 <= kMaxFacetValueBytes)
+        return false;
+    return facet_value_over_bound(sanitize_pg_text(raw_value));
+}
+
 } // namespace yuzu::server

@@ -270,7 +270,7 @@ than 2048 bytes:
   the results, counts, Create Group button and the `422` are unchanged.
 - **REST agent-count preview and MCP preview tool.** `GET /api/v1/management-groups/agent-count-preview`
   and `preview_management_group_agent_count` add `unindexed_filter_keys` to the result: the filter keys
-  (for example `output`, never the values) whose value is longer than 2048 bytes. It is always present
+  (for example `output`, never the values) whose value is longer than 2048 bytes, measured as ingest stores it (a NUL or invalid UTF-8 byte counts as 3). It is always present
   and is empty when no filter is over the bound. When it is not empty, `agent_count` can be 0 or an
   undercount. `agent_count`, the status codes and the `503` degrade are unchanged, so a client that
   ignores the new field behaves as before.

@@ -999,7 +999,7 @@ to report, and no store read is made.
 ```
 
 `unindexed_filter_keys` is always present (additive, #5623): the mangled keys, in a stable order (sorted by key) and
-without duplicates, of any filter whose value is longer than 2048 bytes, and an empty array when
+without duplicates, of any filter whose value is longer than 2048 bytes (measured as ingest stores it, so a NUL or invalid UTF-8 byte counts as 3), and an empty array when
 none is. Such a value is not indexed in newly stored responses, so when the array is not empty
 `agent_count` can be 0 or an undercount. The array names keys only, never the values. `agent_count`
 and every status code are unchanged, including the `503` when the response store is degraded.

@@ -117,6 +117,24 @@ TEST_CASE("unindexed_filter_keys: an unknown plugin or an out-of-range column is
     CHECK(unindexed_filter_keys("no_such_plugin", {{1, over}}).empty());
 }
 
+TEST_CASE("unindexed_filter_keys: the bound is measured on the stored (sanitized) form",
+          "[server][devices][facets]") {
+    // Ingest rewrites each NUL and each invalid UTF-8 byte to the 3-byte U+FFFD before it
+    // measures, so 683 of them are 2049 stored bytes (excluded) and 682 are 2046 (indexed).
+    CHECK(unindexed_filter_keys("procfetch", {{0, std::string(683, '\0')}}) ==
+          std::vector<std::string>{"pid"});
+    CHECK(unindexed_filter_keys("procfetch", {{0, std::string(683, '\xFF')}}) ==
+          std::vector<std::string>{"pid"});
+    CHECK(unindexed_filter_keys("procfetch", {{0, std::string(682, '\0')}}).empty());
+    CHECK(unindexed_filter_keys("procfetch", {{0, std::string(682, '\xFF')}}).empty());
+    // The raw-size shortcut: nothing at or under a third of the bound can reach it.
+    CHECK_FALSE(facet_filter_value_over_bound(std::string(kMaxFacetValueBytes / 3, '\0')));
+    CHECK(facet_filter_value_over_bound(std::string(kMaxFacetValueBytes / 3 + 1, '\0')));
+    // A value over the bound raw stays over it (the scrub never shrinks plain ASCII).
+    CHECK(facet_filter_value_over_bound(std::string(kMaxFacetValueBytes + 1, 'a')));
+    CHECK_FALSE(facet_filter_value_over_bound(std::string(kMaxFacetValueBytes, 'a')));
+}
+
 TEST_CASE("unindexed_filter_keys: the bound is bytes, not characters", "[server][devices][facets]") {
     std::string over; // U+00E9 is two bytes: 1025 of them are 2050 bytes
     std::string at_bound;

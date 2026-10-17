@@ -738,6 +738,33 @@ TEST_CASE("/fragments/results: with several filters, ONE over the bound shows th
     }
 }
 
+// The bound is measured in the stored (sanitized) form: each NUL or invalid UTF-8 byte of a
+// filter value becomes 3 bytes at ingest, so a short-looking filter can be over the bound.
+TEST_CASE("/fragments/results: a filter that sanitizes past the bound shows the hint",
+          "[pg][server][dashboard][fragment][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-sanitized-bound-1";
+    store_registry_output(rs, command_id, "alpha|beta", "status");
+
+    FragmentResultsHarness h(&rs);
+    wire_unfiltered_gate(h);
+    const std::string base = "/fragments/results?command_id=" + command_id + "&plugin=status";
+    const auto repeat = [](const std::string& unit, std::size_t n) {
+        std::string out;
+        for (std::size_t i = 0; i < n; ++i)
+            out += unit;
+        return out;
+    };
+    // 683 x 3 = 2049 bytes once scrubbed; 682 x 3 = 2046.
+    CHECK(contains(h.get(base + "&f_key=" + repeat("%00", 683))->body, kTooLongMarker));
+    CHECK(contains(h.get(base + "&f_key=" + repeat("%FF", 683))->body, kTooLongMarker));
+    CHECK_FALSE(contains(h.get(base + "&f_key=" + repeat("%00", 682))->body, kTooLongMarker));
+    CHECK_FALSE(contains(h.get(base + "&f_key=" + repeat("%FF", 682))->body, kTooLongMarker));
+}
+
 TEST_CASE("/fragments/results: saved View defaults and the over-bound hint",
           "[pg][server][dashboard][fragment][facets]") {
     YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_frag_instr_tpl);

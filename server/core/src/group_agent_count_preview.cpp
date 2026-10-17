@@ -43,7 +43,7 @@ std::vector<std::string> unindexed_filter_keys(const std::string& plugin,
     std::vector<std::string> keys;
     const auto& cols = columns_for_plugin(plugin);
     for (const auto& f : filters) {
-        if (!facet_value_over_bound(f.value))
+        if (!facet_filter_value_over_bound(f.value))
             continue;
         // cols[0] is "Agent"; a FacetFilter's col_idx is 0-based after it.
         if (f.col_idx < 0 || static_cast<std::size_t>(f.col_idx) + 1 >= cols.size())

@@ -1,4 +1,4 @@
-# Resource Ledger: facet value bound, deterministic facet cap, dropped-facets counter (#5623, ingest only)
+# Resource Ledger: facet value bound, deterministic facet cap, dropped-facets counter (#5623)
 
 Covers `origin/dev..HEAD` on `fix/5623-facet-ingest-bound`.
 

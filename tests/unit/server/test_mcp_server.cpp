@@ -23577,7 +23577,7 @@ TEST_CASE("MCP preview_management_group_agent_count: a filter value over kMaxFac
 }
 
 TEST_CASE("MCP preview_management_group_agent_count: tools/list documents unindexed_filter_keys "
-          "in the description and the typed output schema (not required)",
+          "in the description and the typed output schema (required), and bounds its inputs",
           "[mcp][devices][facets]") {
     McpTestServer ts;
     ts.start();
@@ -23604,8 +23604,14 @@ TEST_CASE("MCP preview_management_group_agent_count: tools/list documents uninde
               bound_text) != std::string::npos);
     CHECK(out["properties"]["unindexed_filter_keys"]["type"] == "array");
     CHECK(out["properties"]["unindexed_filter_keys"]["items"]["type"] == "string");
-    for (const auto& req_key : out["required"])
-        CHECK(req_key != "unindexed_filter_keys");
+    // Always emitted, so the schema promises it.
+    CHECK(std::find(out["required"].begin(), out["required"].end(), "unindexed_filter_keys") !=
+          out["required"].end());
+    // A5 item 3: every free-text input string is bounded.
+    const auto& in = (*tool)["inputSchema"]["properties"];
+    CHECK(in["command_id"]["maxLength"] == 256);
+    CHECK(in["plugin"]["maxLength"] == 256);
+    CHECK(in["filters"]["additionalProperties"]["maxLength"] == 65536);
 }
 
 TEST_CASE("preview agent count: REST and MCP report the same count and keys for the same input",

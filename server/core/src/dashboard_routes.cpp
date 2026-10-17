@@ -112,7 +112,7 @@ static int col_index_for_name(const std::vector<std::string>& cols, const std::s
 // rather than let an empty table read as "no agent has this value".
 static bool any_filter_value_too_long(const std::vector<FacetFilter>& filters) {
     return std::any_of(filters.begin(), filters.end(),
-                       [](const FacetFilter& f) { return facet_value_over_bound(f.value); });
+                       [](const FacetFilter& f) { return facet_filter_value_over_bound(f.value); });
 }
 
 /// Parse CLI-style "plugin action key=val key2=\"quoted val\"" into command + params.

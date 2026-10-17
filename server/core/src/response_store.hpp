@@ -82,10 +82,17 @@ namespace yuzu::server {
 /// facet batch, which is counted as `batch_failed`.
 inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 
-/// The one over-bound rule: ingest, the dashboard and the preview helper all call this.
+/// The one over-bound rule, on a value already in its stored (sanitized) form. Ingest calls
+/// this directly on the sanitized value.
 inline bool facet_value_over_bound(std::string_view value) noexcept {
     return value.size() > kMaxFacetValueBytes;
 }
+
+/// The same rule for a filter value a caller typed: it is measured in the form ingest would
+/// store it, so a raw value that the text scrub (each NUL or invalid UTF-8 byte becomes a
+/// 3-byte U+FFFD) grows past the bound is over-bound too. The preview helper and the
+/// dashboard call this one, never `facet_value_over_bound` on a raw filter value.
+bool facet_filter_value_over_bound(std::string_view raw_value);
 
 /// `yuzu_server_response_facets_dropped_total{reason}`: facet rows (distinct
 /// (column, value) pairs) of a response that did not persist, by reason. Counted only

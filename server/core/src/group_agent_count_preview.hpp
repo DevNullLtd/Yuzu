@@ -16,7 +16,8 @@
 /// NOTE: the dashboard fragment (`DashboardRoutes::parse_filters`,
 /// dashboard_routes.cpp) is NOT refactored onto `resolve_group_preview_filters`
 /// by this PR — it stays on its own `httplib::Request`-coupled `f_<column>`
-/// param extraction (out of scope; the fragment's behaviour is unchanged).
+/// param extraction (out of scope: the filter-to-column resolution stays separate; the
+/// fragment's over-bound hint uses the same `facet_filter_value_over_bound` rule).
 /// `resolve_group_preview_filters` exists so the NEW REST/MCP surfaces share
 /// ONE column-name -> FacetFilter{col_idx,value} resolver with each other,
 /// using the SAME mangled-key convention (`mangle_column_key`) the fragment's
