@@ -2,15 +2,15 @@ status: REAL CAPTURE
 
 host: this Mac (macOS, arm64)
 date: 2026-09-08 (UTC, see `date -u` at capture time)
-identity: id -u = 501 (alex, non-root — no sudo used or required)
+identity: id -u = 501 (jsmith, non-root — no sudo used or required)
 
 request: Cancel-Job (0x0008), printer `no_such_queue`, job-id 424242,
-requesting-user-name=alex, request-id 1, built by `build_request.py
-cancel-job no_such_queue 424242 alex`. NO `Authorization` header.
+requesting-user-name=jsmith, request-id 1, built by `build_request.py
+cancel-job no_such_queue 424242 jsmith`. NO `Authorization` header.
 
 exact command:
   cd tests/unit/fixtures/wave9/printing/macos
-  python3 build_request.py cancel-job no_such_queue 424242 alex \
+  python3 build_request.py cancel-job no_such_queue 424242 jsmith \
       > /tmp/req_cancel.ipp
   curl --unix-socket /private/var/run/cupsd -s -X POST \
       -H 'Content-Type: application/ipp' \
@@ -29,3 +29,5 @@ cupsd` socket — no sudo, no privileged queue/job creation. Captured by
 `real_cancel_job_not_found_peercred.ipp.provenance.txt` for the full
 framing-vs-authorisation distinction; this file's role is the WITHOUT-
 header half of that pair.
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.

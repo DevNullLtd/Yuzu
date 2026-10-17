@@ -7,7 +7,7 @@ What this file is: a byte-accurate Get-Jobs response (status
 successful-ok 0x0000, request-id 18) hand-assembled against
 printing_ipp.hpp's wire grammar — one job-attributes group: job-id=2,
 job-printer-uri=ipp://localhost/printers/yuzu_test,
-job-originating-user-name=alex, job-name=hosts, job-state=5 (processing),
+job-originating-user-name=jsmith, job-name=hosts, job-state=5 (processing),
 date-time-at-creation=2026-09-08T12:00:00Z (RFC 2911 dateTime, 11 raw
 octets — updated from time-at-creation after a real cupsd capture proved
 that attribute is printer-uptime-relative, not Unix epoch; see
@@ -28,4 +28,6 @@ with a genuine capture, at which point this provenance file is rewritten
 to `status: REAL CAPTURE`. Until Phase B runs, this fixture stays
 SYNTHETIC.
 
-identity (of this synthetic construction): id -u = 501 (alex)
+identity (of this synthetic construction): id -u = 501 (jsmith)
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.

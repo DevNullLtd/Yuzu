@@ -1,8 +1,8 @@
 REAL CAPTURE
 
 File: usage_live_macos.txt
-Host: alex's Mac (Darwin 25.6.0), 2026-09-14
-DB path: /private/tmp/yuzu-uat/agent-data/tar.db (mode 644, owner alex, WAL)
+Host: the capturing developer's Mac (Darwin 25.6.0), 2026-09-14
+DB path: /private/tmp/yuzu-uat/agent-data/tar.db (mode 644, owner jsmith, WAL)
 Writing agent: pid 50138, `yuzu-agent --data-dir /tmp/yuzu-uat/agent-data`, built from
   branch feat/wave7-pr72a-forensics-tar-usage (the usage fold dev carries as #4269,
   merge 4ab9b9c83); live tar_config schema_version = 7 at capture time.
@@ -23,3 +23,5 @@ N, REQUIREs it parses and N >= 1, then inserts N placeholder rows via
 insert_usage_live(db, i, "(placeholder)", "", 0) for i in 1..N — the row
 bodies are placeholders because no app_usage query reads them; only the
 count matters, and that count is the real captured value.
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.

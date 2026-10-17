@@ -2,8 +2,8 @@ status: REAL CAPTURE
 
 host: this Mac (macOS, arm64), live cupsd at /private/var/run/cupsd
 date: 2026-09-21 (UTC)
-identity: id -u = 501 (alex, non-root). The scratch queues were created with
-`lpadmin` (alex is in _lpadmin) and removed afterwards.
+identity: id -u = 501 (jsmith, non-root). The scratch queues were created with
+`lpadmin` (jsmith is in _lpadmin) and removed afterwards.
 
 setup: two scratch queues `yuzu4616a` and `yuzu4616b` on a dead socket device
 (socket://127.0.0.1:9), both disabled so nothing can print; held jobs (lp -H
@@ -30,3 +30,5 @@ before Cancel-Job because cupsd's Cancel-Job looks a job up by id alone and
 ignores the printer named. This is the real response the membership check
 consumes. The real not-found answer for a nonexistent printer (0x0406, "The
 printer or class does not exist.") is real_get_jobs_no_printer.ipp.
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.

@@ -2,7 +2,7 @@ status: REAL CAPTURE
 
 host: this Mac (macOS, arm64)
 date: 2026-09-08 (UTC, see `date -u` at capture time)
-identity: id -u = 501 (alex, non-root — no sudo used or required)
+identity: id -u = 501 (jsmith, non-root — no sudo used or required)
 
 request: Get-Jobs (0x000A), printer `no_such_queue`, which-jobs=
 not-completed, request-id 1, built by `build_request.py get-jobs
@@ -24,3 +24,5 @@ fails deterministically without a queue.
 This is a REAL, unprivileged capture against the live `/private/var/run/
 cupsd` socket — no sudo, no queue creation. Captured by `capture.sh`
 Phase A.
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.

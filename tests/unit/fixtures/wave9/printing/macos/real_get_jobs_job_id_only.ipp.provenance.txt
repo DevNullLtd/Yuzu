@@ -2,7 +2,7 @@ status: REAL CAPTURE
 
 host: this Mac (macOS, arm64), live cupsd at /private/var/run/cupsd
 date: 2026-09-21 (UTC)
-identity: id -u = 501 (alex, non-root). Scratch queue `yuzu4616a` created with
+identity: id -u = 501 (jsmith, non-root). Scratch queue `yuzu4616a` created with
 `lpadmin` on a dead socket device and removed afterwards; two held jobs (lp -H
 hold) with ids 6 and 7.
 
@@ -27,3 +27,5 @@ on a stock server this shape only arises from a request that did not ask for it;
 that omits the attribute. A job listed this way cannot be confirmed to
 be on the named printer, so `run_clear_queue` reports it as an error and sends
 no Cancel-Job.
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.
