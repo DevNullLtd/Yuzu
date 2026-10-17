@@ -4216,14 +4216,17 @@ void SettingsRoutes::register_routes(
         // one, and it covers every other caller (PUT /api/config included).
         if (is_exactly_redaction_placeholder(client_secret))
             client_secret.clear();
-        // Read the stored secret under the shared lock: a concurrent save writes it under the
-        // unique lock below, and an unlocked std::string read racing that write is undefined.
-        std::string effective_secret = client_secret;
-        if (effective_secret.empty()) {
-            std::shared_lock lock(*oidc_mu_);
-            effective_secret = cfg_->oidc_client_secret;
-        }
         bool skip_tls = (skip_tls_verify == "true");
+
+        // One unique lock covers the read of the stored secret, the provider build and the swap.
+        // A blank secret means "keep the stored one"; reading it under a separate shared lock
+        // and swapping later let a concurrent save that set a new secret be overwritten in the
+        // running config and provider. The OidcProvider constructor does no network work here
+        // (the authorization endpoint is always pre-set below), so building under the lock is
+        // cheap. The lock is released before any response that re-renders the fragment.
+        std::unique_lock lock(*oidc_mu_);
+        const std::string effective_secret =
+            client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
 
         std::unique_ptr<oidc::OidcProvider> new_provider;
         try {
@@ -4263,6 +4266,7 @@ void SettingsRoutes::register_routes(
 
             new_provider = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         } catch (const std::exception& e) {
+            lock.unlock(); // render_directory_fragment takes the shared lock
             spdlog::error("OIDC provider reinit failed: {}", e.what());
             res.status = 500;
             res.set_content(
@@ -4271,16 +4275,14 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        {
-            std::unique_lock lock(*oidc_mu_);
-            cfg_->oidc_issuer = issuer;
-            cfg_->oidc_client_id = client_id;
-            cfg_->oidc_client_secret = effective_secret;
-            cfg_->oidc_redirect_uri = redirect_uri;
-            cfg_->oidc_admin_group = admin_group;
-            cfg_->oidc_skip_tls_verify = skip_tls;
-            *oidc_provider_ = std::move(new_provider);
-        }
+        cfg_->oidc_issuer = issuer;
+        cfg_->oidc_client_id = client_id;
+        cfg_->oidc_client_secret = effective_secret;
+        cfg_->oidc_redirect_uri = redirect_uri;
+        cfg_->oidc_admin_group = admin_group;
+        cfg_->oidc_skip_tls_verify = skip_tls;
+        *oidc_provider_ = std::move(new_provider);
+        lock.unlock();
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
 
         std::vector<std::string> persist_errors;
