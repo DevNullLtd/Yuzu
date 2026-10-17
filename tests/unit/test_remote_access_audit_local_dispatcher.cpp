@@ -259,6 +259,11 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     CHECK(rows[3].starts_with("source|service|"));
     for (std::size_t i = 1; i <= 3; ++i)
         CHECK(in(fields(rows[i])[2], {"read", "absent", "refused", "failed"}));
+#if defined(__APPLE__)
+    // MUTATION: binding the macOS root home as /var/root (a link to private/var/root on stock macOS)
+    // makes the home open ELOOP and puts `homes:eloop` in this row.
+    CHECK(rows[0].find("homes:eloop") == std::string::npos);
+#endif
 
     static constexpr const char* kConfigKeys[] = {
         "permitrootlogin", "passwordauthentication", "pubkeyauthentication", "kbdinteractiveauthentication",

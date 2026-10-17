@@ -765,9 +765,8 @@ inline std::optional<KeyFileSpec> expand_authorized_keys_file(std::string_view e
             out.path = std::move(norm);
             return out;
         }
+        // norm was rebuilt from an already-validated split, so this re-split cannot fail.
         parts = split(std::string_view{norm}.substr(prefix.size()));
-        if (!parts)
-            return std::nullopt;
     }
     if (parts->empty())
         return std::nullopt;

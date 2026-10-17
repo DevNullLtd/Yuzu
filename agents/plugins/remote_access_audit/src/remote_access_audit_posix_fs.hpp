@@ -65,7 +65,8 @@ struct Paths {
     bool launchd = false;
     std::string config;   ///< /etc/ssh/sshd_config
     std::vector<std::string> home_parents; ///< directories whose subdirectories are homes (/home, /Users)
-    std::vector<std::string> single_homes; ///< homes that are themselves a directory, in canonical spelling (/root, /private/var/root)
+    /// homes that are themselves a directory, in canonical spelling (/root, /private/var/root)
+    std::vector<std::string> single_homes;
     unsigned min_uid = 0; ///< a home-parent entry owned by a lower uid is not an account (macOS: 500); 0 = no filter (see PosixFs::is_account_home)
     std::size_t max_dir_entries = kMaxDirEntries; ///< injectable so a test need not make 4097 files
     std::function<std::optional<std::vector<std::string>>()> mounts; ///< network mount points
@@ -293,7 +294,7 @@ inline PosixFs make_posix_fs(const Paths& p) {
         // and outlives the read.
         const std::filesystem::path p{path};
         const std::string leaf = p.filename().string();
-        if (!p.is_absolute() || leaf.empty())
+        if (leaf.empty())
             return hop_failure(EINVAL);
         auto d = open_dir_hops(p.parent_path().string());
         if (!d.opened())

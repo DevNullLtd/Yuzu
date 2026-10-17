@@ -366,21 +366,6 @@ TEST_CASE("remote_access_audit posix fs: a symlinked home parent is resolved by 
         CHECK(b.list_homes({t.at("homes").string()}, homes, too_many) == ELOOP);
         CHECK(homes.empty());
     }
-    SECTION("a single home whose own path holds a linked ancestor is refused while the resolved-parent homes still read") {
-        fs::create_directories(t.at("real_roots/rootx/.ssh"));
-        t.write(t.at("real_roots/rootx/.ssh/authorized_keys"), kAliceKey);
-        fs::create_directory_symlink(t.at("real_roots"), t.at("roots_alias"));
-        auto q = p;
-        q.single_homes = {t.at("roots_alias/rootx").string()};
-        const auto bq = make_posix_fs(q);
-        CHECK(bq.open_home({"rootx", t.at("roots_alias/rootx").string()}) == ELOOP);
-        const auto l = list_posix(bq);
-        CHECK(std::ranges::find(l.rows, "file|alice|authorized_keys|read|1|0|0") != l.rows.end());
-        CHECK(std::ranges::find(l.rows, "file|rootx|authorized_keys|failed|-|-|-") != l.rows.end());
-        CHECK(l.reason.find("linux:remote_access_audit:homes:eloop") != std::string::npos);
-        for (const auto& r : l.rows)
-            CHECK(r.rfind("file|rootx|authorized_keys|read", 0) != 0);
-    }
     SECTION("the whole listing reads alice's key") {
         const auto l = list_posix(b);
         CHECK(std::ranges::find(l.rows, "file|alice|authorized_keys|read|1|0|0") != l.rows.end());

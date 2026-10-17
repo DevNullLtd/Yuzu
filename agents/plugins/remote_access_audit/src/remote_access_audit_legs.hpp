@@ -357,7 +357,7 @@ struct PosixFs {
     std::function<int(const HomeEntry& home)> open_home;
     /// Reads a file by single path components under the opened home, hop by hop.
     std::function<FileReadLike(const std::vector<std::string>& components)> read_key_file;
-    /// Reads an absolute path outside any home (leaf not followed).
+    /// Reads an absolute path outside any home, opened from "/" hop by hop; no component is followed.
     ReadFn read_key_file_abs;
 };
 

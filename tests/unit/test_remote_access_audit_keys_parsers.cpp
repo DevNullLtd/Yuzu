@@ -245,8 +245,6 @@ TEST_CASE("remote_access_audit keys: an option clause is never accepted as an un
         CHECK(p.kp.rows.empty());
         CHECK(p.kp.malformed == 1);
         CHECK(p.kp.keys == 0);
-        for (const auto& row : p.kp.rows)
-            CHECK(row.find(secret) == std::string::npos);
     }
     // outside the type-name grammar: a `/`, a space-free over-length token (65 bytes), a quote
     CHECK(parse(line("ssh/foo", b64(str("ssh/foo")))).kp.malformed == 1);
