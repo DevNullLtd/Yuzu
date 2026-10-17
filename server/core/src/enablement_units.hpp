@@ -25,10 +25,10 @@
  * PROTECTIVE SEAM (one line): the caller injects the predicate, and it is the
  * canonical protective set, `kProtectivePredicate`, which is
  * `&yuzu::protective::is_protective_action` (common/include/yuzu/protective_actions.hpp):
- * the quarantine control actions plus `__guard__.push_rules`. One predicate, never a second list, so a future
- * widening of that set removes the new action from the switchable units with no
- * edit here. `__guard__.push_rules` is also caught by the reserved-name rule
- * (the control channel), which is checked first. There is no default, so a
+ * the quarantine control actions plus `__guard__.push_rules`. One predicate, never a
+ * second list, so a future widening of that set removes the new action from the
+ * switchable units with no edit here. `__guard__.push_rules` is also caught by the
+ * reserved-name rule (the control channel), which is checked first. There is no default, so a
  * caller can never forget to choose.
  *
  * Unit names are `<plugin>` or `<plugin>.<action>` only: a catalogue row whose
@@ -131,7 +131,8 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
     {"app_usage.last_used", "tar"},
 }};
 
-// matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list added 2026-10-17), 230 rows.
+// matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list added
+// 2026-10-17), 230 rows.
 inline constexpr std::array<UnitOsRow, 230> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},

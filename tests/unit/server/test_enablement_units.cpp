@@ -35,7 +35,6 @@
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
-#include "dispatch_confined_arms.hpp"
 #include "enablement_resolver.hpp"
 #include "enablement_units.hpp"
 
@@ -136,7 +135,8 @@ TEST_CASE("enablement units: the injected predicate is the canonical protective 
           "[enablement][catalogue]") {
     // The real catalogue cannot tell the canonical set from the narrow quarantine one
     // (its only addition, __guard__.push_rules, is already a reserved name), so the
-    // choice is pinned by identity. A swap back to the quarantine predicate fails here.
+    // constant is pinned by identity and by behaviour. This guards the constant itself;
+    // a caller must still pass it, which the caller's own test pins.
     CHECK(kProtectivePredicate == &yuzu::protective::is_protective_action);
     CHECK(kProtectivePredicate("__guard__", "push_rules"));
     CHECK(kProtectivePredicate("quarantine", "whitelist"));

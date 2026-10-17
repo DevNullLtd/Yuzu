@@ -218,8 +218,8 @@ validate_selector_attributes(const scope::Expression& expr,
 
 /// The attribute kinds a durable rule may use: the scope kind catalog minus
 /// from_result_set:<id>. The views alias `catalog`: it must outlive the returned
-/// vector, and both must outlive the make_rule call that consumes them (the Rule
-/// owns its own parsed strings).
+/// vector, and both must outlive the make_rule or make_persisted_rule call that consumes
+/// them (the Rule owns its own parsed strings).
 template <typename Catalog>
 [[nodiscard]] std::vector<std::string_view> durable_attribute_kinds(const Catalog& catalog) {
     std::vector<std::string_view> out;
@@ -270,17 +270,42 @@ make_rule(std::string id, std::vector<std::string> units, std::string_view selec
     return Rule{std::move(id), std::move(units), std::move(*selector), provenance};
 }
 
+/// The shape build_unit_overlay freezes for a unit name: `<plugin>` or
+/// `<plugin>.<action>`, each part a legal identifier (a plugin may also be a
+/// reserved control-channel name). Shape only, so a name a later release removed
+/// still passes; it exists to keep corrupt bytes out of `unresolved_units`, which
+/// reaches audit and export strings.
+[[nodiscard]] inline bool is_unit_name_shape(std::string_view name) {
+    const auto dot = name.find('.');
+    const auto plugin = name.substr(0, dot);
+    if (!plugin_config::is_valid_identifier(plugin) &&
+        !plugin_config::is_reserved_plugin_name(plugin))
+        return false;
+    return dot == std::string_view::npos ||
+           plugin_config::is_valid_identifier(name.substr(dot + 1));
+}
+
 /// Loading: the same selector and attribute validation as make_rule, but unit
-/// names are NOT checked against the overlay. A rule persisted when a unit
-/// existed must still load after a release removes or renames that unit;
-/// resolve() then switches nothing off for the stale name and reports it in
-/// `unresolved_units`. A rule that names no units is corrupt and is refused.
+/// names are checked for SHAPE only (is_unit_name_shape), not against the
+/// overlay. A rule persisted when a unit existed must still load after a
+/// release removes or renames that unit; resolve() then switches nothing off
+/// for the stale name and reports it in `unresolved_units`. A rule that names
+/// no units, or a name of no legal shape, is corrupt and is refused (the error
+/// does not echo the name).
+///
+/// Two duties fall on the loader, because a silent skip turns units back on:
+/// a rule refused here must be surfaced (a load fault or counter), never
+/// omitted; and `unresolved_units` must be surfaced, or the unit held off,
+/// rather than ignored.
 [[nodiscard]] inline std::expected<Rule, std::string>
 make_persisted_rule(std::string id, std::vector<std::string> units,
                     std::string_view selector_text, Provenance provenance,
                     std::span<const std::string_view> kinds) {
     if (units.empty())
         return std::unexpected<std::string>("rule names no units");
+    for (const auto& name : units)
+        if (!is_unit_name_shape(name))
+            return std::unexpected<std::string>("rule names a unit of no legal shape");
     auto selector = parse_rule_selector(selector_text, kinds);
     if (!selector)
         return std::unexpected<std::string>(selector.error());

@@ -8,13 +8,11 @@
  */
 
 #include "agent_registry.hpp" // detail::scope_kind_catalog (authoring refusals)
-#include "dispatch_confined_arms.hpp"
 #include "enablement_resolver.hpp"
 #include "custom_properties_store.hpp"
 #include "enablement_units.hpp"
 #include "tag_store.hpp"
 
-#include <yuzu/protective_actions.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -708,6 +706,20 @@ TEST_CASE("enablement resolver: a loaded rule keeps stale units but is validated
         CHECK_FALSE(make_persisted_rule("b", one, bad, Provenance::Operator, kinds()));
     }
     CHECK_FALSE(make_persisted_rule("b", {}, "__all__", Provenance::Operator, kinds()));
+
+    // A unit name is held to the shape build_unit_overlay freezes: a corrupt row must not
+    // reach unresolved_units (audit and export strings). Legal-but-stale shapes still load.
+    for (const char* ok : {"gone", "gone.x", "tar.fleet_snapshot", "__guard__.push_rules"})
+        CHECK(make_persisted_rule("g", {ok}, "__all__", Provenance::Operator, kinds()));
+    for (const std::string bad :
+         {std::string{}, std::string{"a\nb"}, std::string{"a\x01"}, std::string{"../../x"},
+          std::string{"A.b"}, std::string{"a.b.c"}, std::string{"a."}, std::string{".a"},
+          std::string{"a b"}, std::string(100000, 'x')}) {
+        INFO("bad unit name of " << bad.size() << " bytes");
+        auto r = make_persisted_rule("b", {bad}, "__all__", Provenance::Operator, kinds());
+        REQUIRE_FALSE(r);
+        CHECK(r.error() == "rule names a unit of no legal shape"); // never echoes the name
+    }
     CHECK_FALSE(make_rule("b", {}, "__all__", Provenance::Operator, overlay(), kinds()));
 }
 
