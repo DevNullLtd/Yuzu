@@ -21,6 +21,13 @@
 %% Crash and supervisor reports logged in this node (planned_stop counts them).
 -export([count_crash_reports/0, crash_reports/0]).
 -export([log/2]).  %% logger handler callback
+%% The upstream as the gateway's own telemetry sees it (upstream_trace/0).
+-export([upstream_trace/0, upstream_trace_reset/0, handle_event/4]).
+
+-define(TRACE, yuzu_gw_scale_probe_trace).
+-define(TRACE_EVENTS, [[yuzu, gw, upstream, rpc_latency], [yuzu, gw, upstream, rpc_error],
+                       [yuzu, gw, upstream, circuit_state],
+                       [yuzu, gw, upstream, registration_replay_triggered]]).
 -export([init/1]).
 
 -define(NAME, yuzu_gw_scale_probe).
@@ -56,6 +63,58 @@ log(#{msg := {report, #{label := {supervisor, _}}}}, #{config := #{counter := C}
     counters:add(C, 1, 1);
 log(_Event, _Config) ->
     ok.
+
+%% @doc What the gateway's own telemetry saw of the upstream since start/1 (or
+%% upstream_trace_reset/0): every breaker transition with its time (ms since the
+%% trace started), the BatchHeartbeat flushes' RPC time (stats, and how many
+%% took over 1 s and over 4 s), upstream RPC errors by RPC and code, and the
+%% replays started by trigger.
+-spec upstream_trace() -> map().
+upstream_trace() ->
+    [{t0, T0}] = ets:lookup(?TRACE, t0),
+    Rows = ets:tab2list(?TRACE),
+    Hb = [D || {{hb, _}, D} <- Rows],
+    Count = fun(Prefix) ->
+                    maps:from_list([{K, N} || {{P, K}, N} <- Rows, P =:= Prefix])
+            end,
+    #{breaker => lists:sort([[T - T0, S] || {{cb, T, _}, S} <- Rows]),
+      breaker_counts => Count(cb_count),
+      batch_heartbeat_ms => stats(Hb),
+      batch_heartbeat_over_1s => length([1 || D <- Hb, D > 1000]),
+      batch_heartbeat_over_4s => length([1 || D <- Hb, D > 4000]),
+      rpc_errors => Count(err),
+      replay_triggers => Count(trigger)}.
+
+-spec upstream_trace_reset() -> ok.
+upstream_trace_reset() ->
+    ets:delete_all_objects(?TRACE),
+    ets:insert(?TRACE, {t0, erlang:system_time(millisecond)}),
+    ok.
+
+handle_event([yuzu, gw, upstream, rpc_latency], #{duration_ms := D},
+             #{rpc_name := <<"batch_heartbeat">>}, _) ->
+    ets:insert(?TRACE, {{hb, erlang:unique_integer([monotonic])}, D});
+handle_event([yuzu, gw, upstream, rpc_error], #{count := N}, Meta, _) ->
+    K = iolist_to_binary(io_lib:format("~s/~0p", [maps:get(rpc_name, Meta, <<"?">>),
+                                                    maps:get(code, Meta, '?')])),
+    ets:update_counter(?TRACE, {err, K}, N, {{err, K}, 0});
+handle_event([yuzu, gw, upstream, circuit_state], _, #{state := S}, _) ->
+    T = erlang:system_time(millisecond),
+    ets:insert(?TRACE, {{cb, T, erlang:unique_integer([monotonic])}, S}),
+    ets:update_counter(?TRACE, {cb_count, S}, 1, {{cb_count, S}, 0});
+handle_event([yuzu, gw, upstream, registration_replay_triggered], #{count := N}, Meta, _) ->
+    K = maps:get(trigger, Meta, unknown),
+    ets:update_counter(?TRACE, {trigger, K}, N, {{trigger, K}, 0});
+handle_event(_, _, _, _) ->
+    ok.
+
+stats([]) -> #{n => 0};
+stats(L) ->
+    S = lists:sort(L),
+    N = length(S),
+    P = fun(Q) -> lists:nth(max(1, min(N, round(Q / 100 * N))), S) end,
+    #{n => N, p50 => P(50), p95 => P(95), p99 => P(99), max => lists:last(S),
+      mean => lists:sum(S) / N}.
 
 -spec start(pos_integer()) -> ok.
 start(IntervalMs) ->
@@ -152,6 +211,12 @@ call(Msg) ->
 
 init({Parent, IntervalMs}) ->
     register(?NAME, self()),
+    %% The trace table lives with this process, which outlives the application.
+    _ = (catch ets:delete(?TRACE)),
+    ets:new(?TRACE, [named_table, public, set, {write_concurrency, true}]),
+    ets:insert(?TRACE, {t0, erlang:system_time(millisecond)}),
+    _ = telemetry:detach({?MODULE, trace}),
+    ok = telemetry:attach_many({?MODULE, trace}, ?TRACE_EVENTS, fun ?MODULE:handle_event/4, #{}),
     Parent ! {self(), ready},
     loop(#{interval => IntervalMs, hwm => #{}, samples => 0,
            mem_hwm => 0, proc_hwm => 0, sched => undefined}, IntervalMs).

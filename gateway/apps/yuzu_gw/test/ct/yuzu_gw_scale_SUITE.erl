@@ -628,6 +628,7 @@ crash_progress(Config, KeptSessions, FlapOld, N) ->
 
 gateway_report(Config) ->
     #{probe => probe_report(Config),
+      upstream_trace => gw_call(Config, ?PROBE, upstream_trace, []),
       scheduler => probe_call(Config, sched_report, []),
       memory => gw_call(Config, ?PROBE, memory, []),
       memory_baseline => maps:get(mem_baseline, ?config(gw, Config)),
@@ -687,17 +688,27 @@ setup_registered(Config) ->
     probe_call(Config, reset_hwm, []),
     probe_call(Config, sched_mark, []),
     Up = up_call(Config, stats, []),
+    Trace = gw_call(Config, ?PROBE, upstream_trace, []),
+    ok = gw_call(Config, ?PROBE, upstream_trace_reset, []),
     Reg#{memory_per_connection_bytes => mem_per_conn(Config),
+         upstream_trace => Trace,
          connected_notices => maps:get(connected_notices, Up),
          upstream => Up#{stream_ends => up_call(Config, stream_ends, [])}}.
 
-%% Wait until N agents are live (or the cap passes). Returns how long it took.
+%% Wait until N agents are live (or the cap passes). Returns how long it took,
+%% and the live count every 5 s of the wait ([ms since T0, live]).
 await_registered(Config, N, T0) ->
+    Curve = ets:new(live_curve, [public, ordered_set]),
     {Reached, Live} = wait_until(fun() ->
                                          #{live := L} = load_call(Config, status, []),
+                                         Now = erlang:system_time(millisecond),
+                                         Slot = (Now - T0) div 5000,
+                                         ets:insert_new(Curve, {Slot, [Now - T0, L]}),
                                          {L >= N, L}
                                  end, budget(N) * 3, 250),
-    #{all_registered => Reached, live => Live,
+    Points = [P || {_, P} <- ets:tab2list(Curve)],
+    ets:delete(Curve),
+    #{all_registered => Reached, live => Live, live_curve => Points,
       time_to_all_registered_ms => case Reached of
                                        true -> erlang:system_time(millisecond) - T0;
                                        false -> null
