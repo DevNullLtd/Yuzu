@@ -374,8 +374,13 @@
 -define(NOTIFY_HWM_TICK_MS, 60000).
 %% Notify sends in flight during a planned stop's last gasp. Proxied calls are
 %% refused by then, so the 56 permit streams are free: 64 notify + 50 Guardian
-%% + 1 heartbeat flush = 115 stay under the server's 128 streams per connection
-%% (see yuzu_gw_upstream_regulator).
+%% + 1 heartbeat flush = 115 stay under 128 streams per connection, the C++
+%% server's DEFAULT (its --grpc-max-concurrent-streams; see
+%% yuzu_gw_upstream_regulator). A server run with a lower limit declares it in
+%% its HTTP/2 SETTINGS, and gun then refuses the last-gasp sends past it
+%% locally (too_many_streams): the last gasp does not retry, so each such
+%% notification is counted lost (notify_lost{reason="shutdown"}), like any
+%% other failed last-gasp send.
 -define(STOP_NOTIFY_INFLIGHT, 64).
 -define(MAX_NOTIFY_PENDING_MAX, 1000000).
 %% The deadline the gateway itself puts on a half_open notify probe (#4632): after
