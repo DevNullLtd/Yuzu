@@ -4,7 +4,7 @@
 | | |
 |---|---|
 | **What it does** | Certificate inventory and management for system stores |
-| **Version** | 1.0.0 |
+| **Version** | 1.1.0 |
 | **Kind** | Action · mutating · gathered (security.certificates.list, security.certificates.details, security.certificates.delete) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `delete` (definition `security.certificates.delete`) · `details` (definition `security.certificates.details`) · `list` (definition `security.certificates.list`) |
@@ -52,7 +52,7 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | `list`/`details`: none — `CertEnumCertificatesInStore` needs no elevation. `delete`: `SeBackupPrivilege` + `SeRestorePrivilege` to write the certificate store; already granted to the service account under LocalSystem today, no new grant. | 2026-09-07, bare-metal Windows 10.0.26200.0 x64, as SYSTEM | `enumerate_store()` returns a typed result that records whether the store actually opened under LocalMachine or fell back to CurrentUser, never a silent empty vector (`certificates_plugin.cpp:397-472`); `list` reports `not_available\|<store> store could not be opened` (provenance `cryptoapi:store-open`, `certificates_plugin.cpp:484-492`) or `not_available\|<store> store enumeration incomplete` when `CertEnumCertificatesInStore` ends abnormally part-way through a store (provenance `cryptoapi:store-enum`, `certificates_plugin.cpp:494-499`), then keeps scanning the remaining stores; when LocalMachine could not be opened but CurrentUser could, `list` emits a `not_available\|<store> store (LocalMachine) could not be opened; rows read from CurrentUser` row before that store's rows (provenance `cryptoapi:store-fallback`, `certificates_plugin.cpp:501-513`); `details` marks the result partial per store internally and, unlike `list`, does not emit a row for a plain open/enumeration failure at the point it happens — it keeps scanning, and only if a match is never found does it report one combined `not_available\|<store(s)> could not be opened/enumeration incomplete/read from CurrentUser; scan incomplete` row naming every affected store, instead of a false `status\|not_found`; a CurrentUser fallback, an unopened store, or an incompletely-enumerated store are the exceptions to "no row until the end" — `details_cert_win` discloses each such earlier store immediately alongside a later match, right before the matched certificate's own row, rather than waiting for the combined end-of-scan summary — see the Result-status table's `cryptoapi:store-fallback`/`cryptoapi:store-open`/`cryptoapi:store-enum` entries below for the exact shape (`details_cert_win`); `delete` opens the named store under LocalMachine only, with no CurrentUser retry (#4377) — a store that cannot be opened there reports `error\|<store> store could not be opened; nothing removed` (`certificates_plugin.cpp:679`), and a store whose enumeration ends abnormally reports `error\|<store> store enumeration ended abnormally; nothing removed` (`certificates_plugin.cpp:715`), both with a non-zero exit instead of `status\|not_found` |
+| Windows | agent service account (LocalSystem today, #1442) | `list`/`details`: none — `CertEnumCertificatesInStore` needs no elevation. `delete`: `SeBackupPrivilege` + `SeRestorePrivilege` to write the certificate store; already granted to the service account under LocalSystem today, no new grant. | 2026-10-17, bare-metal Windows 10.0.26200 x86_64, as an interactive non-elevated user (not the LocalSystem service account), with the `MY`-store device-enrolment subjects, thumbprints and serials redacted | `enumerate_store()` returns a typed result that records whether the store actually opened under LocalMachine or fell back to CurrentUser, never a silent empty vector (`certificates_plugin.cpp:397-472`); `list` reports `not_available\|<store> store could not be opened` (provenance `cryptoapi:store-open`, `certificates_plugin.cpp:484-492`) or `not_available\|<store> store enumeration incomplete` when `CertEnumCertificatesInStore` ends abnormally part-way through a store (provenance `cryptoapi:store-enum`, `certificates_plugin.cpp:494-499`), then keeps scanning the remaining stores; when LocalMachine could not be opened but CurrentUser could, `list` emits a `not_available\|<store> store (LocalMachine) could not be opened; rows read from CurrentUser` row before that store's rows (provenance `cryptoapi:store-fallback`, `certificates_plugin.cpp:501-513`); `details` marks the result partial per store internally and, unlike `list`, does not emit a row for a plain open/enumeration failure at the point it happens — it keeps scanning, and only if a match is never found does it report one combined `not_available\|<store(s)> could not be opened/enumeration incomplete/read from CurrentUser; scan incomplete` row naming every affected store, instead of a false `status\|not_found`; a CurrentUser fallback, an unopened store, or an incompletely-enumerated store are the exceptions to "no row until the end" — `details_cert_win` discloses each such earlier store immediately alongside a later match, right before the matched certificate's own row, rather than waiting for the combined end-of-scan summary — see the Result-status table's `cryptoapi:store-fallback`/`cryptoapi:store-open`/`cryptoapi:store-enum` entries below for the exact shape (`details_cert_win`); `delete` opens the named store under LocalMachine only, with no CurrentUser retry (#4377) — a store that cannot be opened there reports `error\|<store> store could not be opened; nothing removed` (`certificates_plugin.cpp:679`), and a store whose enumeration ends abnormally reports `error\|<store> store enumeration ended abnormally; nothing removed` (`certificates_plugin.cpp:715`), both with a non-zero exit instead of `status\|not_found` |
 | macOS | agent daemon; the shipped LaunchDaemon has no `UserName` key, so it runs as root — but this sample was captured unprivileged (see Measured) | System/root keychain reads: none (in-process `SecItemCopyMatching`, no subprocess). Login keychain read: root, via `launchctl asuser` + `sudo -u` — live today only because the daemon runs as root; needs a dormant sudoers grant once #1455 narrows the agent off root. `delete` (System/MY only): a sudoers grant for `/usr/bin/security delete-certificate -t /Library/Keychains/System.keychain *` under the future non-root account; moot today. | 2026-10-17, bare-metal macOS 27.0 arm64, euid 501 — unprivileged, captured with `plugin-capture` (`PluginHandle::load` + `init()` with a `StandalonePluginContext` + `LocalDispatcher::run`), not the production root LaunchDaemon | System/root keychain read failure emits `not_available\|<keychain> not readable (no read permission)`, `not_available\|<keychain> read timed out` (15 s per-keychain bound exceeded), `not_available\|<keychain> read refused (bounded-call ceiling)`, `not_available\|<keychain> read failed`, or `not_available\|<keychain> scan incomplete` (the read was capped before it finished) — each + `CONSTRAINED`/`PARTIAL` (`certificates_macos_parsers.hpp:516-538`); an in-process `/dev/console` owner recheck immediately before the login-keychain spawn emits `not_available\|console user changed` (`certificates_plugin.cpp:1714`) or `not_available\|console user recheck failed` (`certificates_plugin.cpp:1718`); a failed login-keychain spawn emits `not_available\|login keychain read failed (<detail>)` naming the termination reason, on both `list` (`certificates_plugin.cpp:1775`) and `details` (`certificates_plugin.cpp:2023`) — the macOS sample shows a login-keychain degradation (`macos.txt:164-165`) |
 | Linux | dedicated unprivileged `yuzu` account in production; this sample was captured as euid 0 in a container, not representative of that account | `list`/`details`: none — native filesystem read + in-process libcrypto parse, no subprocess. `delete`: write access to `/etc/ssl/certs` to remove the matching file via `unlinkat` on the held `/etc/ssl/certs` dirfd (`certificates_linux_store.hpp:418`). | 2026-10-17, Debian GNU/Linux 13 (trixie) aarch64 container, euid 0 | An unreadable/unparseable PEM file reports `(unreadable)`/`(skipped)` and `CONSTRAINED`/`PARTIAL` rather than being silently dropped, provenance `libcrypto:unreadable-file` (`certificates_plugin.cpp:755-760`); `details` reports `not_available\|... scan incomplete` rather than a false `status\|not_found` when a candidate file couldn't be inspected (`certificates_plugin.cpp:869-875`); `/etc/ssl/certs` could not be opened (including a non-directory or symlink at that path) reports `not_available\|/etc/ssl/certs could not be opened` and CONSTRAINED/PARTIAL, provenance `posix:cert-dir` (`certificates_plugin.cpp:919-921`); a readdir(3)/fdopendir enumeration of `/etc/ssl/certs` that fails part-way through reports `not_available\|/etc/ssl/certs enumeration incomplete` (`list`) or folds into `delete`'s `error\|/etc/ssl/certs enumeration incomplete; nothing removed`, provenance `posix:cert-enum` (`certificates_plugin.cpp:791-793,958-961`); a `delete` whose target's identity (link inode, target text, and target inode) changed between match and unlink reports `error\|certificate file changed during delete; nothing removed`, provenance `posix:delete-recheck` (`certificates_linux_store.hpp:389-431`; `certificates_plugin.cpp:947,954`), instead of unlinking a different file than the one matched |
 
@@ -84,7 +84,7 @@ Binaries/subprocesses/network: Windows — none, in-process CryptoAPI/`crypt32` 
 |---|---|---|---|---|---|
 | `status` | string | - | Windows, Linux, macOS | `error\|thumbprint parameter required` | A successful macOS delete emits status\|deleted; a delete targeting a certificate already provably absent from the keychain emits status\|not_found (rc 0), matching the Windows/Linux contract for an absent cert. store=root is rejected with error\|MESSAGE (SystemRootCertificates.keychain is sealed by System Integrity Protection). Every other macOS rejection or failure -- an unsupported store, a failed delete command, or a post-delete verification that still finds the certificate or could not re-read the keychain -- also emits error\|MESSAGE. Windows and Linux emit status\|deleted, status\|delete_failed, or status\|not_found on a store that opened successfully; either OS instead emits error\|<store> store could not be opened; nothing removed if every open attempt for the target store fails. Values: status\|deleted, status\|not_found, status\|delete_failed (Windows/Linux only), error\|<message> (any OS: bad thumbprint, unsupported/rejected store, an unopenable Windows/Linux store, or a macOS delete that could not be verified), not_available\|<reason> (macOS only, pre-validation). |
 
-**`security.certificates.details` — `subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage`**
+**`security.certificates.details` — `subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|key_algorithm|key_bits|signature_algorithm`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
@@ -96,8 +96,11 @@ Binaries/subprocesses/network: Windows — none, in-process CryptoAPI/`crypt32` 
 | `serial` | string | - | Windows, Linux, macOS | `076C11D1` | Certificate serial number as hex text, via the OS's own serial renderer (Windows: little-endian byte reversal; Linux/macOS: `i2a_ASN1_INTEGER` or the openssl `-serial` line). Values: free text (hex). |
 | `store` | string | - | Windows, Linux, macOS | `System.keychain` | Which store/keychain/directory the matching row was found in. Values: Windows: MY, ROOT, CA, Trust. macOS: System.keychain, SystemRootCertificates.keychain, login.keychain-db. Linux: the literal path "/etc/ssl/certs".. |
 | `key_usage` | string | - | Windows, Linux, macOS | `Digital Signature, Key Encipherment, Data Encipherment` | Comma-separated X.509 Key Usage extension names, or "(none)" when the extension is absent, empty, or could not be read. Values: comma-separated usage names, or "(none)". |
+| `key_algorithm` | string | - | Windows, Linux, macOS | `RSA` | The certificate's public-key algorithm, named from its SubjectPublicKeyInfo algorithm OID through one table shared by every OS leg, so the same certificate reports the same value on Windows, Linux and macOS. EC keys carry their named curve (e.g. "EC P-256"); post-quantum keys are named by parameter set (e.g. "ML-DSA-65"). An OID the table does not name is reported in dotted form rather than as "(unknown)". Values: RSA, RSASSA-PSS, DSA, EC <curve>, EC (no named curve), Ed25519, Ed448, X25519, X448, ML-DSA-44/65/87, ML-KEM-512/768/1024, a dotted OID, or "(unknown)" when the field could not be read. |
+| `key_bits` | string | - | Windows, Linux, macOS | `2048` | Public-key size in bits. RSA, RSASSA-PSS and DSA report the OS crypto library's own key length; EC reports the named curve's size from the shared table (never the library's), so it cannot differ between OSes. "(implied)" for algorithms whose size is fixed by the name in key_algorithm (Ed25519, X25519, ML-DSA-65, ...). Values: decimal bits, "(implied)", or "(unknown)" when the key could not be sized or the EC curve is not named. |
+| `signature_algorithm` | string | - | Windows, Linux, macOS | `sha256WithRSAEncryption` | The algorithm the issuer signed this certificate with, named from its signature OID through the same shared table (standard ASN.1 identifier names). Weak algorithms are reported as-is (e.g. "sha1WithRSAEncryption", "md5WithRSAEncryption") -- this column states what is present, it does not judge it. Values: e.g. sha256WithRSAEncryption, ecdsa-with-SHA384, RSASSA-PSS, Ed25519, ML-DSA-65, a dotted OID for an unnamed algorithm, or "(unknown)" when it could not be read. |
 
-**`security.certificates.list` — `subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage`**
+**`security.certificates.list` — `subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|key_algorithm|key_bits|signature_algorithm`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
@@ -109,6 +112,9 @@ Binaries/subprocesses/network: Windows — none, in-process CryptoAPI/`crypt32` 
 | `serial` | string | - | Windows, Linux, macOS | `09CFB6DE3AB5124757FFEFDF3759BBF2` | Certificate serial number as hex text, via the OS's own serial renderer (Windows: little-endian byte reversal; Linux/macOS: `i2a_ASN1_INTEGER` or the openssl `-serial` line). Values: free text (hex). |
 | `store` | string | - | Windows, Linux, macOS | `ROOT` | Which store/keychain/directory the row was read from. Values: Windows: MY, ROOT, CA, Trust. macOS: System.keychain, SystemRootCertificates.keychain, login.keychain-db. Linux: the literal path "/etc/ssl/certs" for every row.. |
 | `key_usage` | string | - | Windows, Linux, macOS | `Digital Signature` | Comma-separated X.509 Key Usage extension names, or "(none)" when the extension is absent, empty, or could not be read. Values: comma-separated usage names, or "(none)". |
+| `key_algorithm` | string | - | Windows, Linux, macOS | `RSA` | The certificate's public-key algorithm, named from its SubjectPublicKeyInfo algorithm OID through one table shared by every OS leg, so the same certificate reports the same value on Windows, Linux and macOS. EC keys carry their named curve (e.g. "EC P-256"); post-quantum keys are named by parameter set (e.g. "ML-DSA-65"). An OID the table does not name is reported in dotted form rather than as "(unknown)". Values: RSA, RSASSA-PSS, DSA, EC <curve>, EC (no named curve), Ed25519, Ed448, X25519, X448, ML-DSA-44/65/87, ML-KEM-512/768/1024, a dotted OID, or "(unknown)" when the field could not be read. |
+| `key_bits` | string | - | Windows, Linux, macOS | `2048` | Public-key size in bits. RSA, RSASSA-PSS and DSA report the OS crypto library's own key length; EC reports the named curve's size from the shared table (never the library's), so it cannot differ between OSes. "(implied)" for algorithms whose size is fixed by the name in key_algorithm (Ed25519, X25519, ML-DSA-65, ...). Values: decimal bits, "(implied)", or "(unknown)" when the key could not be sized or the EC curve is not named. |
+| `signature_algorithm` | string | - | Windows, Linux, macOS | `sha256WithRSAEncryption` | The algorithm the issuer signed this certificate with, named from its signature OID through the same shared table (standard ASN.1 identifier names). Weak algorithms are reported as-is (e.g. "sha1WithRSAEncryption", "md5WithRSAEncryption") -- this column states what is present, it does not judge it. Values: e.g. sha256WithRSAEncryption, ecdsa-with-SHA384, RSASSA-PSS, Ed25519, ML-DSA-65, a dotted OID for an unnamed algorithm, or "(unknown)" when it could not be read. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -126,7 +132,7 @@ Binaries/subprocesses/network: Windows — none, in-process CryptoAPI/`crypt32` 
 | `CONSTRAINED` | `PARTIAL` | `secitem:System.keychain` | macOS: System.keychain was not readable (no read permission), timed out, was refused at the bounded-call ceiling, failed to open, or its scan was capped (`certificates_macos_parsers.hpp:516-538`) |
 | `CONSTRAINED` | `PARTIAL` | `secitem:SystemRootCertificates.keychain` | macOS: SystemRootCertificates.keychain was not readable (no read permission), timed out, was refused at the bounded-call ceiling, failed to open, or its scan was capped (`certificates_macos_parsers.hpp:516-538`) |
 
-A clean run on any OS — one that hits none of the degradations above — leaves the agent's default `UNDECLARED`/`UNKNOWN` status; the table rows above are the only places the plugin calls `set_result_status` — the sample captures show this (`windows.txt:84,89,93`; `linux.txt:156,161,165`; `macos.txt:170,174`).
+A clean run on any OS — one that hits none of the degradations above — leaves the agent's default `UNDECLARED`/`UNKNOWN` status; the table rows above are the only places the plugin calls `set_result_status` — the sample captures show this (`windows.txt:71,76,80`; `linux.txt:156,161,165`; `macos.txt:170,174`).
 
 ### Where the data goes
 
@@ -139,28 +145,28 @@ A clean run on any OS — one that hits none of the degradations above — leave
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 12fa059e66fa
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-17 · interactive user (not elevated; MY-store device-enrolment subject, thumbprint and serial redacted) · leg-hash 34d934eec320
 
 ```
 == action=list
-subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage
-Logitech Inc|DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1|FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057|2025-01-09|2026-01-09|09CFB6DE3AB5124757FFEFDF3759BBF2|ROOT|Digital Signature
-Microsoft Identity Verification Root Certificate Authority 2020|Microsoft Identity Verification Root Certificate Authority 2020|F40042E2E5F7E8EF8189FED15519AECE42C3BFA2|2020-04-16|2045-04-16|5498D2D1D45B1995481379C811C08799|ROOT|Digital Signature, Certificate Signing, CRL Signing
-Logitech Inc|DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1|D8D11D216CC42B72EA838CAD51F4F4932A1940A0|2026-01-08|2027-01-13|0CADE25B085DD33813FD746151BF6B5E|ROOT|Digital Signature
-Baltimore CyberTrust Root|Baltimore CyberTrust Root|D4DE20D05E66FC53FE1A50882C78DB2852CAE474|2000-05-12|2025-05-12|020000B9|ROOT|Certificate Signing, CRL Signing
-AAA Certificate Services|AAA Certificate Services|D1EB23A46D17D68FD92564C2F1F1601764D8E349|2004-01-01|2028-12-31|01|ROOT|Certificate Signing, CRL Signing
-Microsoft Root Certificate Authority|Microsoft Root Certificate Authority|CDD4EEAE6000AC7F40C3802C171E30148030C072|2001-05-09|2021-05-09|79AD16A14AA0A5AD4C7358F407132E65|ROOT|Digital Signature, Certificate Signing, CRL Signing, Non-Repudiation
-Logitech Inc|DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1|C27999A8CEE208F833289CB1A129666E952C7EC2|2022-04-11|2025-04-10|08FABFA8F305A513536B9F231CD3249C|ROOT|Digital Signature
-Thawte Timestamping CA|Thawte Timestamping CA|BE36A4562FB2EE05DBB3D32323ADF445084ED656|1997-01-01|2020-12-31|00|ROOT|(none)
-Starfield Root Certificate Authority - G2|Starfield Root Certificate Authority - G2|B51C067CEE2B0C3DF855AB2D92F4FE39D4E70F0E|2009-09-01|2037-12-31|00|ROOT|Certificate Signing, CRL Signing
-Microsoft Root Authority|Microsoft Root Authority|A43489159A520F0D93D032CCAF37E7FE20A8B419|1997-01-10|2020-12-31|00C1008B3C3C8811D13EF663ECDF40|ROOT|(none)
-Symantec Enterprise Mobile Root for Microsoft|Symantec Enterprise Mobile Root for Microsoft|92B46C76E13054E104F230517E6E504D43AB10B5|2012-03-15|2032-03-14|0F6B552F9EBF907B0F6629A9BDF4D8CE|ROOT|Certificate Signing, CRL Signing
-… 12 of 81 rows shown
+subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|key_algorithm|key_bits|signature_algorithm
+(redacted)|Microsoft Intune Device Management Device CA|(redacted)|2026-09-16|2027-09-14|(redacted)|MY|Digital Signature, Key Encipherment|RSA|2048|sha256WithRSAEncryption
+(redacted)|MS-Organization-Access|(redacted)|2025-02-20|2035-02-20|(redacted)|MY|(none)|RSA|2048|sha256WithRSAEncryption
+(redacted)|MS-Organization-P2P-Access [2025]|(redacted)|2026-10-17|2026-10-18|(redacted)|MY|Digital Signature, Key Encipherment|RSA|2048|sha256WithRSAEncryption
+(redacted)|Microsoft Intune MDM Device CA|(redacted)|2026-07-26|2027-07-24|(redacted)|MY|Digital Signature, Key Encipherment|RSA|2048|sha256WithRSAEncryption
+Microsoft Root Certificate Authority|Microsoft Root Certificate Authority|CDD4EEAE6000AC7F40C3802C171E30148030C072|2001-05-09|2021-05-09|79AD16A14AA0A5AD4C7358F407132E65|ROOT|Digital Signature, Certificate Signing, CRL Signing, Non-Repudiation|RSA|4096|sha1WithRSAEncryption
+Thawte Timestamping CA|Thawte Timestamping CA|BE36A4562FB2EE05DBB3D32323ADF445084ED656|1997-01-01|2020-12-31|00|ROOT|(none)|RSA|1024|md5WithRSAEncryption
+Microsoft Root Authority|Microsoft Root Authority|A43489159A520F0D93D032CCAF37E7FE20A8B419|1997-01-10|2020-12-31|00C1008B3C3C8811D13EF663ECDF40|ROOT|(none)|RSA|2048|md5WithRSAEncryption
+Microsoft Intune Root Certification Authority|Microsoft Intune Root Certification Authority|A197D6717352023B615F6ED444A6981ABC80F6C9|2025-09-15|2030-09-15|58395D0E26E4AFA945333EABA9454344|ROOT|Digital Signature, Certificate Signing, CRL Signing|RSA|4096|sha256WithRSAEncryption
+Microsoft Intune Root Certification Authority|Microsoft Intune Root Certification Authority|9EA77BA6D30BB2AB2DECE2DFDC2470429DCC3677|2021-08-12|2026-08-12|5A1BDAA99141F4A54DA6655173BD465A|ROOT|Digital Signature, Certificate Signing, CRL Signing|RSA|4096|sha256WithRSAEncryption
+Symantec Enterprise Mobile Root for Microsoft|Symantec Enterprise Mobile Root for Microsoft|92B46C76E13054E104F230517E6E504D43AB10B5|2012-03-15|2032-03-14|0F6B552F9EBF907B0F6629A9BDF4D8CE|ROOT|Certificate Signing, CRL Signing|RSA|2048|sha256WithRSAEncryption
+Microsoft Device Management Root Certification Authority|Microsoft Device Management Root Certification Authority|90D29D7E8DF86BF6C1A1860ECBDA430DAD3D9F5C|2024-08-15|2029-08-15|3CEF8F5AC9457C9E4D87A010DA232B8B|ROOT|Digital Signature, Certificate Signing, CRL Signing|RSA|4096|sha256WithRSAEncryption
+… 12 of 68 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
-== action=details thumbprint=FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057
-subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage
-Logitech Inc|DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1|FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057|2025-01-09|2026-01-09|09CFB6DE3AB5124757FFEFDF3759BBF2|ROOT|Digital Signature
+== action=details thumbprint=(redacted)
+subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|key_algorithm|key_bits|signature_algorithm
+(redacted)|Microsoft Intune Device Management Device CA|(redacted)|2026-09-16|2027-09-14|(redacted)|MY|Digital Signature, Key Encipherment|RSA|2048|sha256WithRSAEncryption
 [result_status] UNDECLARED / UNKNOWN
 
 == action=delete
@@ -169,28 +175,28 @@ error|thumbprint parameter required
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 12fa059e66fa
+**macOS** — captured: macos macOS 27.0 arm64 · bare-metal · 2026-10-17 · euid 501 · leg-hash 34d934eec320
 
 ```
 == action=list
-subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage
-CN=com.apple.systemdefault, O=System Identity|CN=com.apple.systemdefault, O=System Identity|0C24DA5DE02640D8924F5C7BCB7D5F734815228D|2026-07-18|2046-07-13|076C11D1|System.keychain|Digital Signature, Key Encipherment, Data Encipherment
-CN=com.apple.kerberos.kdc, O=System Identity|CN=com.apple.kerberos.kdc, O=System Identity|3CB6CE678431CB8DD8FDCF6601AA6A4F8CAD329A|2026-07-18|2046-07-13|38F8E0C5|System.keychain|Digital Signature, Key Encipherment
-C=US, O=DigiCert, Inc., CN=DigiCert TLS ECC P384 Root G5|C=US, O=DigiCert, Inc., CN=DigiCert TLS ECC P384 Root G5|17F3DE5E9F0F19E98EF61F32266E20C407AE30EE|2021-01-15|2046-01-14|09E09365ACF7D9C8B93E1C0B042A2EF3|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign
-C=US, OU=www.xrampsecurity.com, O=XRamp Security Services Inc, CN=XRamp Global Certification Authority|C=US, OU=www.xrampsecurity.com, O=XRamp Security Services Inc, CN=XRamp Global Certification Authority|B80186D1EB9C86A54104CF3054F34C52B7E558C6|2004-11-01|2035-01-01|50946CEC18EAD59C4DD597EF758FA0AD|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign
-C=CH, O=WISeKey, OU=OISTE Foundation Endorsed, CN=OISTE WISeKey Global Root GB CA|C=CH, O=WISeKey, OU=OISTE Foundation Endorsed, CN=OISTE WISeKey Global Root GB CA|0FF9407618D3D76A4B98F0A8359E0CFD27ACCCED|2014-12-01|2039-12-01|76B1205274F0858746B3F8231AF6C2C0|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign
-C=US, O=Amazon, CN=Amazon Root CA 2|C=US, O=Amazon, CN=Amazon Root CA 2|5A8CEF45D7A69859767A8C8B4496B578CF474B1A|2015-05-26|2040-05-26|066C9FD29635869F0A0FE58678F85B26BB8A37|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign
-C=IT, L=Milan, O=Actalis S.p.A./03358520967, CN=Actalis Authentication Root CA|C=IT, L=Milan, O=Actalis S.p.A./03358520967, CN=Actalis Authentication Root CA|F373B387065A28848AF2F34ACE192BDDC78E9CAC|2011-09-22|2030-09-22|570A119742C4E3CC|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=US, O=Internet Security Research Group, CN=ISRG Root X1|C=US, O=Internet Security Research Group, CN=ISRG Root X1|CABD2A79A1076A31F21D253635CB039D4329A5E8|2015-06-04|2035-06-04|8210CFB0D240E3594463E0BB63828B00|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=US, O=Apple Inc., CN=Apple Platform Code Signing ECC Root CA - G1|C=US, O=Apple Inc., CN=Apple Platform Code Signing ECC Root CA - G1|E8DA8B1EFCFE2EB2FCEB9D41981E1869A71A9C13|2024-12-13|2049-12-08|521223A7BFF487D04BD387D29127D824|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-CN=ACCVRAIZ1, OU=PKIACCV, O=ACCV, C=ES|CN=ACCVRAIZ1, OU=PKIACCV, O=ACCV, C=ES|93057A8815C64FCE882FFA9116522878BC536417|2011-05-05|2030-12-31|5EC3B7A6437FA4E0|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=US, O=Certainly, CN=Certainly Root R1|C=US, O=Certainly, CN=Certainly Root R1|A050EE0F2871F427B2126D6F509625BACC8642AF|2021-04-01|2046-04-01|8E0FF94B907168653354F4D44439B7E0|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
+subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|key_algorithm|key_bits|signature_algorithm
+CN=com.apple.systemdefault, O=System Identity|CN=com.apple.systemdefault, O=System Identity|3C0BBAF4AD7A6AA5D781F94C19A0AC75F896D0C5|2026-09-24|2046-09-19|1012BFE1|System.keychain|Digital Signature, Key Encipherment, Data Encipherment|RSA|2048|sha256WithRSAEncryption
+CN=com.apple.kerberos.kdc, O=System Identity|CN=com.apple.kerberos.kdc, O=System Identity|2576266CE0F4B2C8605A8FF2DFC24668E112938C|2026-09-24|2046-09-19|1E0F38F1|System.keychain|Digital Signature, Key Encipherment|RSA|2048|sha256WithRSAEncryption
+C=US, O=DigiCert, Inc., CN=DigiCert TLS ECC P384 Root G5|C=US, O=DigiCert, Inc., CN=DigiCert TLS ECC P384 Root G5|17F3DE5E9F0F19E98EF61F32266E20C407AE30EE|2021-01-15|2046-01-14|09E09365ACF7D9C8B93E1C0B042A2EF3|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign|EC P-384|384|ecdsa-with-SHA384
+C=US, OU=www.xrampsecurity.com, O=XRamp Security Services Inc, CN=XRamp Global Certification Authority|C=US, OU=www.xrampsecurity.com, O=XRamp Security Services Inc, CN=XRamp Global Certification Authority|B80186D1EB9C86A54104CF3054F34C52B7E558C6|2004-11-01|2035-01-01|50946CEC18EAD59C4DD597EF758FA0AD|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign|RSA|2048|sha1WithRSAEncryption
+C=CH, O=WISeKey, OU=OISTE Foundation Endorsed, CN=OISTE WISeKey Global Root GB CA|C=CH, O=WISeKey, OU=OISTE Foundation Endorsed, CN=OISTE WISeKey Global Root GB CA|0FF9407618D3D76A4B98F0A8359E0CFD27ACCCED|2014-12-01|2039-12-01|76B1205274F0858746B3F8231AF6C2C0|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign|RSA|2048|sha256WithRSAEncryption
+C=US, O=Amazon, CN=Amazon Root CA 2|C=US, O=Amazon, CN=Amazon Root CA 2|5A8CEF45D7A69859767A8C8B4496B578CF474B1A|2015-05-26|2040-05-26|066C9FD29635869F0A0FE58678F85B26BB8A37|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign|RSA|4096|sha384WithRSAEncryption
+C=IT, L=Milan, O=Actalis S.p.A./03358520967, CN=Actalis Authentication Root CA|C=IT, L=Milan, O=Actalis S.p.A./03358520967, CN=Actalis Authentication Root CA|F373B387065A28848AF2F34ACE192BDDC78E9CAC|2011-09-22|2030-09-22|570A119742C4E3CC|SystemRootCertificates.keychain|Certificate Sign, CRL Sign|RSA|4096|sha256WithRSAEncryption
+C=US, O=Internet Security Research Group, CN=ISRG Root X1|C=US, O=Internet Security Research Group, CN=ISRG Root X1|CABD2A79A1076A31F21D253635CB039D4329A5E8|2015-06-04|2035-06-04|8210CFB0D240E3594463E0BB63828B00|SystemRootCertificates.keychain|Certificate Sign, CRL Sign|RSA|4096|sha256WithRSAEncryption
+C=US, O=Apple Inc., CN=Apple Platform Code Signing ECC Root CA - G1|C=US, O=Apple Inc., CN=Apple Platform Code Signing ECC Root CA - G1|E8DA8B1EFCFE2EB2FCEB9D41981E1869A71A9C13|2024-12-13|2049-12-08|521223A7BFF487D04BD387D29127D824|SystemRootCertificates.keychain|Certificate Sign, CRL Sign|EC P-384|384|ecdsa-with-SHA384
+CN=ACCVRAIZ1, OU=PKIACCV, O=ACCV, C=ES|CN=ACCVRAIZ1, OU=PKIACCV, O=ACCV, C=ES|93057A8815C64FCE882FFA9116522878BC536417|2011-05-05|2030-12-31|5EC3B7A6437FA4E0|SystemRootCertificates.keychain|Certificate Sign, CRL Sign|RSA|4096|sha1WithRSAEncryption
+C=US, O=Certainly, CN=Certainly Root R1|C=US, O=Certainly, CN=Certainly Root R1|A050EE0F2871F427B2126D6F509625BACC8642AF|2021-04-01|2046-04-01|8E0FF94B907168653354F4D44439B7E0|SystemRootCertificates.keychain|Certificate Sign, CRL Sign|RSA|4096|sha256WithRSAEncryption
 … 12 of 162 rows shown
 [result_status] CONSTRAINED / PARTIAL / login-keychain
 
-== action=details thumbprint=0C24DA5DE02640D8924F5C7BCB7D5F734815228D
-subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage
-CN=com.apple.systemdefault, O=System Identity|CN=com.apple.systemdefault, O=System Identity|0C24DA5DE02640D8924F5C7BCB7D5F734815228D|2026-07-18|2046-07-13|076C11D1|System.keychain|Digital Signature, Key Encipherment, Data Encipherment
+== action=details thumbprint=3C0BBAF4AD7A6AA5D781F94C19A0AC75F896D0C5
+subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|key_algorithm|key_bits|signature_algorithm
+CN=com.apple.systemdefault, O=System Identity|CN=com.apple.systemdefault, O=System Identity|3C0BBAF4AD7A6AA5D781F94C19A0AC75F896D0C5|2026-09-24|2046-09-19|1012BFE1|System.keychain|Digital Signature, Key Encipherment, Data Encipherment|RSA|2048|sha256WithRSAEncryption
 [result_status] UNDECLARED / UNKNOWN
 
 == action=delete
@@ -199,28 +205,28 @@ error|thumbprint parameter required
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 12fa059e66fa
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-17 · euid 0 · leg-hash 34d934eec320
 
 ```
 == action=list
-subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage
-C=US, O=Google Trust Services LLC, CN=GTS Root R4|C=US, O=Google Trust Services LLC, CN=GTS Root R4|77D30367B5E00C15F60C3861DF7CE13B92464D47|2016-06-22|2036-06-22|0203E5C068EF631A9C72905052|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
-C=ES, O=IZENPE S.A., CN=Izenpe.com|C=ES, O=IZENPE S.A., CN=Izenpe.com|2F783D255218A74A653971B52CA29C45156FE919|2007-12-13|2037-12-13|B0B75A16485FBFE1CBF58BD719E67D|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=BM, O=QuoVadis Limited, CN=QuoVadis Root CA 2 G3|C=BM, O=QuoVadis Limited, CN=QuoVadis Root CA 2 G3|093C61F38B8BDC7D55DF7538020500E125F5C836|2012-01-12|2042-01-12|445734245B81899B35F2CEB82B3B5BA726F07528|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=US, OU=emSign PKI, O=eMudhra Inc, CN=emSign Root CA - C1|C=US, OU=emSign PKI, O=eMudhra Inc, CN=emSign Root CA - C1|E72EF1DFFCB20928CF5DD4D56737B151CB864F01|2018-02-18|2043-02-18|AECF00BAC4CF32F843B2|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=DE, O=D-Trust GmbH, CN=D-TRUST BR Root CA 1 2020|C=DE, O=D-Trust GmbH, CN=D-TRUST BR Root CA 1 2020|1F5B98F0E3B5F7743CEDE6B0367D32CDF4094167|2020-02-11|2035-02-11|7CC98F2B84D7DFEA0FC9659AD34B4D96|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=US, O=The Go Daddy Group, Inc., OU=Go Daddy Class 2 Certification Authority|C=US, O=The Go Daddy Group, Inc., OU=Go Daddy Class 2 Certification Authority|2796BAE63F1801E277261BA0D77770028F20EEE4|2004-06-29|2034-06-29|00|/etc/ssl/certs|(none)
-C=FR, O=Dhimyotis, CN=Certigna|C=FR, O=Dhimyotis, CN=Certigna|B12E13634586A46F1AB2606837582DC4ACFD9497|2007-06-29|2027-06-29|FEDCE3010FC948FF|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=US, O=Microsoft Corporation, CN=Microsoft ECC Root Certificate Authority 2017|C=US, O=Microsoft Corporation, CN=Microsoft ECC Root Certificate Authority 2017|999A64C37FF47D9FAB95F14769891460EEC4C3C5|2019-12-18|2042-07-18|66F23DAF87DE8BB14AEA0C573101C2EC|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
-C=CN, O=TrustAsia Technologies, Inc., CN=TrustAsia Global Root CA G3|C=CN, O=TrustAsia Technologies, Inc., CN=TrustAsia Global Root CA G3|63CFB6C1272B56E4888E1C239AB62E814724C3C7|2021-05-20|2046-05-19|64F60E6577616AAB3BB4EA8584BBB189B871930F|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=US, O=Amazon, CN=Amazon Root CA 2|C=US, O=Amazon, CN=Amazon Root CA 2|5A8CEF45D7A69859767A8C8B4496B578CF474B1A|2015-05-26|2040-05-26|066C9FD29635869F0A0FE58678F85B26BB8A37|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
-C=BE, O=GlobalSign nv-sa, CN=GlobalSign Root R46|C=BE, O=GlobalSign nv-sa, CN=GlobalSign Root R46|53A2B04BCA6BD645E6398A8EC40DD2BF77C3A290|2019-03-20|2046-03-20|11D2BBB9D723189E405F0A9D2DD0DF2567D1|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
-… 12 of 152 rows shown
+subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|key_algorithm|key_bits|signature_algorithm
+CN=ACCVRAIZ1, OU=PKIACCV, O=ACCV, C=ES|CN=ACCVRAIZ1, OU=PKIACCV, O=ACCV, C=ES|93057A8815C64FCE882FFA9116522878BC536417|2011-05-05|2030-12-31|5EC3B7A6437FA4E0|/etc/ssl/certs|Certificate Sign, CRL Sign|RSA|4096|sha1WithRSAEncryption
+C=ES, O=FNMT-RCM, OU=AC RAIZ FNMT-RCM|C=ES, O=FNMT-RCM, OU=AC RAIZ FNMT-RCM|EC503507B215C4956219E2A89A5B42992C4C2C20|2008-10-29|2030-01-01|5D938D306736C8061D1AC754846907|/etc/ssl/certs|Certificate Sign, CRL Sign|RSA|4096|sha256WithRSAEncryption
+C=ES, O=FNMT-RCM, OU=Ceres, organizationIdentifier=VATES-Q2826004J, CN=AC RAIZ FNMT-RCM SERVIDORES SEGUROS|C=ES, O=FNMT-RCM, OU=Ceres, organizationIdentifier=VATES-Q2826004J, CN=AC RAIZ FNMT-RCM SERVIDORES SEGUROS|62FFD99EC0650D03CE7593D2ED3F2D32C9E3E54A|2018-12-20|2043-12-20|62F6326CE5C4E3685C1B62DD9C2E9D95|/etc/ssl/certs|Certificate Sign, CRL Sign|EC P-384|384|ecdsa-with-SHA384
+serialNumber=G63287510, C=ES, O=ANF Autoridad de Certificacion, OU=ANF CA Raiz, CN=ANF Secure Server Root CA|serialNumber=G63287510, C=ES, O=ANF Autoridad de Certificacion, OU=ANF CA Raiz, CN=ANF Secure Server Root CA|5B6E68D0CC15B6A05F1EC15FAE02FC6B2F5D6F74|2019-09-04|2039-08-30|0DD3E3BC6CF96BB1|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign|RSA|4096|sha256WithRSAEncryption
+C=IT, L=Milan, O=Actalis S.p.A./03358520967, CN=Actalis Authentication Root CA|C=IT, L=Milan, O=Actalis S.p.A./03358520967, CN=Actalis Authentication Root CA|F373B387065A28848AF2F34ACE192BDDC78E9CAC|2011-09-22|2030-09-22|570A119742C4E3CC|/etc/ssl/certs|Certificate Sign, CRL Sign|RSA|4096|sha256WithRSAEncryption
+C=US, O=AffirmTrust, CN=AffirmTrust Commercial|C=US, O=AffirmTrust, CN=AffirmTrust Commercial|F9B5B632455F9CBEEC575F80DCE96E2CC7B278B7|2010-01-29|2030-12-31|7777062726A9B17C|/etc/ssl/certs|Certificate Sign, CRL Sign|RSA|2048|sha256WithRSAEncryption
+C=US, O=AffirmTrust, CN=AffirmTrust Networking|C=US, O=AffirmTrust, CN=AffirmTrust Networking|293621028B20ED02F566C532D1D6ED909F45002F|2010-01-29|2030-12-31|7C4F04391CD4992D|/etc/ssl/certs|Certificate Sign, CRL Sign|RSA|2048|sha1WithRSAEncryption
+C=US, O=AffirmTrust, CN=AffirmTrust Premium|C=US, O=AffirmTrust, CN=AffirmTrust Premium|D8A6332CE0036FB185F6634F7D6A066526322827|2010-01-29|2040-12-31|6D8C1446B1A60AEE|/etc/ssl/certs|Certificate Sign, CRL Sign|RSA|4096|sha384WithRSAEncryption
+C=US, O=AffirmTrust, CN=AffirmTrust Premium ECC|C=US, O=AffirmTrust, CN=AffirmTrust Premium ECC|B8236B002F1D16865301556C11A437CAEBFFC3BB|2010-01-29|2040-12-31|7497258AC73F7A54|/etc/ssl/certs|Certificate Sign, CRL Sign|EC P-384|384|ecdsa-with-SHA384
+C=US, O=Amazon, CN=Amazon Root CA 1|C=US, O=Amazon, CN=Amazon Root CA 1|8DA7F965EC5EFC37910F1C6E59FDC1CC6A6EDE16|2015-05-26|2038-01-17|066C9FCF99BF8C0A39E2F0788A43E696365BCA|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign|RSA|2048|sha256WithRSAEncryption
+C=US, O=Amazon, CN=Amazon Root CA 2|C=US, O=Amazon, CN=Amazon Root CA 2|5A8CEF45D7A69859767A8C8B4496B578CF474B1A|2015-05-26|2040-05-26|066C9FD29635869F0A0FE58678F85B26BB8A37|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign|RSA|4096|sha384WithRSAEncryption
+… 12 of 153 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=details thumbprint=77D30367B5E00C15F60C3861DF7CE13B92464D47
-subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage
-C=US, O=Google Trust Services LLC, CN=GTS Root R4|C=US, O=Google Trust Services LLC, CN=GTS Root R4|77D30367B5E00C15F60C3861DF7CE13B92464D47|2016-06-22|2036-06-22|0203E5C068EF631A9C72905052|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
+subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage|key_algorithm|key_bits|signature_algorithm
+C=US, O=Google Trust Services LLC, CN=GTS Root R4|C=US, O=Google Trust Services LLC, CN=GTS Root R4|77D30367B5E00C15F60C3861DF7CE13B92464D47|2016-06-22|2036-06-22|0203E5C068EF631A9C72905052|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign|EC P-384|384|ecdsa-with-SHA384
 [result_status] UNDECLARED / UNKNOWN
 
 == action=delete
@@ -241,9 +247,10 @@ error|thumbprint parameter required
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/certificates/src/certificates_linux_store.hpp` · `agents/plugins/certificates/src/certificates_macos_parsers.hpp` · `agents/plugins/certificates/src/certificates_plugin.cpp` · `agents/plugins/certificates/src/certificates_x509.hpp`
+- Plugin: `agents/plugins/certificates/src/certificates_crypto_profile.hpp` · `agents/plugins/certificates/src/certificates_linux_store.hpp` · `agents/plugins/certificates/src/certificates_macos_parsers.hpp` · `agents/plugins/certificates/src/certificates_plugin.cpp` · `agents/plugins/certificates/src/certificates_x509.hpp`
 - Definitions: `content/definitions/certificates.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
-- Tests: `tests/unit/test_certificates_linux_store.cpp` · `tests/unit/test_certificates_macos.cpp` · `tests/unit/test_certificates_macos_actions.cpp` · `tests/unit/test_certificates_store_honesty.cpp` · `tests/unit/test_certificates_x509.cpp`
+- Tests: `tests/test_certificates_definition.py` · `tests/unit/test_certificates_crypto_profile.cpp` · `tests/unit/test_certificates_linux_store.cpp` · `tests/unit/test_certificates_macos.cpp` · `tests/unit/test_certificates_macos_actions.cpp` · `tests/unit/test_certificates_store_honesty.cpp` · `tests/unit/test_certificates_x509.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/20261016-certificates-crypto-profile.added.md`
 <!-- END GENERATED -->
