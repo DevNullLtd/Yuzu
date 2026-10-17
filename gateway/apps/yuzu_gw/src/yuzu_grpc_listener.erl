@@ -127,7 +127,7 @@
 
 %% Options the layer owns; an entry may not override them.
 -define(RESERVED_HTTP2, [stream_handlers, env, protocols, alpn_default_protocol,
-                         connection_type, middlewares, proxy_header]).
+                         connection_type, middlewares, proxy_header, logger]).
 %% The suites when `tls.ciphers' is unset, by the key type of the certificate:
 %% AEAD suites with ephemeral ECDH only. For an EC certificate (the generated
 %% gateway leaf is EC P-256) the list the gateway's upstream client uses
@@ -403,6 +403,9 @@ protocol_opts(Entry, Routes) ->
     Origin = maps:get(origin, Entry, #{mode => transport}),
     maps:merge(http2_opts(Entry),
                #{stream_handlers => [yuzu_grpc_stream_h],
+                 %% Cowboy's per-stream warnings (a message or an exit for a
+                 %% stream that has ended), rate-limited and without the term.
+                 logger => yuzu_grpc_cowboy_log,
                  env => #{grpc => Routes,
                           auth_fun => maps:get(auth_fun, Entry, undefined),
                           origin => Origin,

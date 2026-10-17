@@ -201,6 +201,73 @@ deadline_margin_test_() ->
      ?_assertEqual(0, yuzu_grpc_stream_h:deadline_ms(0))].
 
 %%%-------------------------------------------------------------------
+%%% 3. Messages for streams that have ended
+%%%-------------------------------------------------------------------
+
+%% A message for a stream that has already ended (a handler's frame, a status or
+%% a deadline timer that lost the race with a client reset) makes Cowboy write
+%% one warning per stream, with the whole message in it: a mass cancel wrote one
+%% per stream, and a frame there is a response body. The listener's connections
+%% write at most one such line per second, with the message's tag only.
+late_stream_messages_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     {timeout, 30, fun late_stream_messages/0}}.
+
+late_stream_messages() ->
+    {Port, L} = yuzu_gw_test_listener:start(prod_mgmt_entry(#{name => edge_late})),
+    {C, Mon} = open(Port),
+    try
+        S = list_agents(C),
+        {_, alive} = collect(C, Mon, [S], 5000),
+        [Conn] = ranch:procs({yuzu_grpc, edge_late}, connections),
+        Lines = yuzu_gw_test_logs:capture(
+                  warning,
+                  fun() ->
+                          [Conn ! {{Conn, 100001 + 2 * I},
+                                   {grpc_frame, self(), make_ref(), <<"secret-output">>}}
+                           || I <- lists:seq(1, 200)],
+                          %% a call the connection answers after the 200 messages
+                          _ = sys:get_state(Conn)
+                  end),
+        Late = [Line || Line <- Lines, binary:match(Line, <<"stream">>) =/= nomatch],
+        ?assertMatch([_], Late),
+        ?assertNotEqual(nomatch, binary:match(hd(Late), <<"grpc_frame">>)),
+        ?assertEqual([], [Line || Line <- Lines,
+                                  binary:match(Line, <<"secret-output">>) =/= nomatch])
+    after
+        gun:close(C),
+        yuzu_gw_test_listener:stop(L)
+    end.
+
+%% The exit of a handler whose stream had gone: one line per second, the
+%% reason's tag only. Every other Cowboy line is written as Cowboy writes it.
+cowboy_log_lines_test() ->
+    Lines = yuzu_gw_test_logs:capture(
+              warning,
+              fun() ->
+                      in_fresh_process(
+                        fun() ->
+                                [yuzu_grpc_cowboy_log:warning(
+                                   "Received EXIT signal ~p for unknown process ~p.~n",
+                                   [{shutdown, {secret_request, I}}, self()])
+                                 || I <- lists:seq(1, 50)],
+                                yuzu_grpc_cowboy_log:error("plain ~p line", [error_kept]),
+                                yuzu_grpc_cowboy_log:warning("Received stray message ~p.",
+                                                             [stray_kept])
+                        end)
+              end),
+    ?assertEqual([], [L || L <- Lines, binary:match(L, <<"secret_request">>) =/= nomatch]),
+    %% (error_logger lines are captured as their format and args)
+    ?assertMatch([_], [L || L <- Lines, binary:match(L, <<"stream had already ended">>) =/= nomatch,
+                            binary:match(L, <<"shutdown">>) =/= nomatch]),
+    ?assertMatch([_], [L || L <- Lines, binary:match(L, <<"error_kept">>) =/= nomatch]),
+    ?assertMatch([_], [L || L <- Lines, binary:match(L, <<"stray_kept">>) =/= nomatch]).
+
+in_fresh_process(Fun) ->
+    {Pid, Mon} = spawn_monitor(Fun),
+    receive {'DOWN', Mon, process, Pid, normal} -> ok end.
+
+%%%-------------------------------------------------------------------
 %%% Helpers
 %%%-------------------------------------------------------------------
 
