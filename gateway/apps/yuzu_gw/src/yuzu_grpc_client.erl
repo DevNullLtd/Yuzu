@@ -18,7 +18,11 @@
 %%%       was sent on closed, went away or is going away: the call ended because
 %%%       of the CONNECTION, so every call on that connection ends the same way;
 %%%       see `report_conn' below), `stream_error' (the server reset this one
-%%%       stream), `response_too_large' (over the channel's limit),
+%%%       stream), `too_many_streams' (gun refused to open the stream because
+%%%       the connection already has as many as the server's
+%%%       SETTINGS_MAX_CONCURRENT_STREAMS allows, RFC 9113 5.1.2: nothing was
+%%%       sent, and the caller decides whether to wait and try again),
+%%%       `response_too_large' (over the channel's limit),
 %%%       `invalid_metadata' (a refused request header; nothing was sent) or
 %%%       `protocol' (gun sent something this client does not read)
 %%%   {error, {connection_lost, Conn}}
@@ -321,8 +325,11 @@ end_stream(_Conn, Ref, _Reason) ->
 %%               not process (`{goaway, _, _}'), or refused the call because the
 %%               connection is closing (`closing').
 %% A stream reset by the server (`{stream_error, Code, _}') is `stream_error':
-%% it says nothing about the other calls on the connection.
+%% it says nothing about the other calls on the connection. A stream gun never
+%% opened because the connection is at the server's concurrent-stream limit is
+%% `too_many_streams' (gun answers it locally, before anything is sent).
 transport(timeout) -> timeout;
+transport({stream_error, {stream_error, too_many_streams, _}}) -> too_many_streams;
 transport({stream_error, closed}) -> {connection_lost, gone};
 transport({stream_error, {closed, _}}) -> {connection_lost, gone};
 transport({stream_error, {goaway, _, _}}) -> {connection_lost, going_away};

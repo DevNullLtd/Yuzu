@@ -18,6 +18,22 @@
 %%%   {config_error, Problems} present while the most recent attempt failed because
 %%%                            the TLS options are unusable (config_error/1); the
 %%%                            row is deleted when a connection comes up
+%%%   {server_max_streams, Cap} the concurrent streams the server allows on the
+%%%                            channel's connections together (server_capacity/1)
+%%%
+%%% The server's stream limit. RFC 9113 6.5.2: a server declares
+%%% SETTINGS_MAX_CONCURRENT_STREAMS in the SETTINGS frame that starts the
+%%% connection and may change it at any time (6.5); 5.1.2: the client must not
+%%% open more streams than that, and gun refuses a request past it locally
+%%% (`too_many_streams'). Every connection is opened with gun's
+%%% notify_settings_changed, so gun tells this process the server's settings on
+%%% the first SETTINGS frame and on every later one. The channel keeps each
+%%% current connection's limit and publishes the sum (`Cap', the row above):
+%%% `none' while no current connection has declared one (none is up yet), or
+%%% while any of them declares none (RFC 9113: no limit); otherwise the sum of
+%%% the declared values. A connection that goes down or is retired leaves the
+%%% sum. Each change is passed to yuzu_gw_upstream_regulator, which sizes the
+%%% gateway's upstream permits from it.
 %%%
 %%% A call finding no connection up waits on one that is connecting (at most its
 %%% own timeout); if none is, it fails at once with the last connection error,
@@ -38,7 +54,8 @@
 -module(yuzu_grpc_client_channel).
 -behaviour(gen_server).
 
--export([child_spec/1, start_link/1, pick/2, retire/2, max_receive/1, config_error/1]).
+-export([child_spec/1, start_link/1, pick/2, retire/2, max_receive/1, config_error/1,
+         server_capacity/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
 -export([compact/1, word/1, backoff_ms/1]).
 
@@ -71,7 +88,10 @@
              waiters = [] :: [{gen_server:from(), integer()}],
              %% monotonic ms of the last unusable-TLS-options error log line. Last in
              %% the record: the backoff tests read the fields above by position.
-             config_logged_at :: integer() | undefined}).
+             config_logged_at :: integer() | undefined,
+             %% the SETTINGS_MAX_CONCURRENT_STREAMS each current slot connection
+             %% declared (gun's settings_changed notification), by connection
+             streams = #{} :: #{pid() => non_neg_integer() | infinity}}).
 
 %%--------------------------------------------------------------------
 %% API
@@ -124,6 +144,15 @@ retire(Name, Conn) when is_pid(Conn) ->
 -spec config_error(atom()) -> none | [yuzu_gw_tls_files:problem()].
 config_error(Name) ->
     try ets:lookup_element(Name, config_error, 2)
+    catch error:badarg -> none
+    end.
+
+%% @doc The concurrent streams the server allows on the channel's current
+%% connections together, as they declared it (see the module doc), or `none'
+%% when nothing is known or the server declared no limit. A table read.
+-spec server_capacity(atom()) -> non_neg_integer() | none.
+server_capacity(Name) ->
+    try ets:lookup_element(Name, server_max_streams, 2)
     catch error:badarg -> none
     end.
 
@@ -188,7 +217,8 @@ do_init(#{name := Name, endpoints := Endpoints, pool_size := Size,
     process_flag(trap_exit, true),
     Name = ets:new(Name, [named_table, protected, set, {read_concurrency, true}]),
     true = ets:insert(Name, [{rr, counters:new(1, [write_concurrency])},
-                             {max_receive, Max}, {last_error, no_connection_yet}]),
+                             {max_receive, Max}, {last_error, no_connection_yet},
+                             {server_max_streams, none}]),
     Ids = lists:seq(1, length(Endpoints) * Size),
     Slots = maps:from_list(
               [{Id, #slot{id = Id, endpoint = lists:nth((Id - 1) rem length(Endpoints) + 1,
@@ -232,8 +262,8 @@ do_cast({retire, Pid}, #st{slots = Slots, by_pid = ByPid} = State) ->
             %% with backoff if its connections keep going away before they were
             %% stable.
             Slot = maps:get(Id, Slots),
-            State1 = State#st{slots = Slots#{Id := Slot#slot{pid = undefined}},
-                              by_pid = ByPid#{Pid := {retired, Id}}},
+            State1 = forget_streams(Pid, State#st{slots = Slots#{Id := Slot#slot{pid = undefined}},
+                                                  by_pid = ByPid#{Pid := {retired, Id}}}),
             {noreply, failed(Id, goaway, State1)};
         _ ->
             {noreply, State}
@@ -264,6 +294,20 @@ do_info({stable, Id, Pid}, #st{slots = Slots} = State) ->
         {ok, #slot{pid = Pid}} -> {noreply, reset_fails(Id, State)};
         _                      -> {noreply, State}
     end;
+do_info({gun_notify, Pid, settings_changed, Settings}, #st{by_pid = ByPid} = State)
+  when is_map(Settings) ->
+    %% The server's SETTINGS, the first and every later one. Only a slot's
+    %% current connection counts: a retired one takes no new calls.
+    case maps:find(Pid, ByPid) of
+        {ok, Id} when is_integer(Id) ->
+            Max = case maps:get(max_concurrent_streams, Settings, infinity) of
+                      N when is_integer(N), N >= 0 -> N;
+                      _ -> infinity
+                  end,
+            {noreply, publish_capacity(State#st{streams = (State#st.streams)#{Pid => Max}})};
+        _ ->
+            {noreply, State}
+    end;
 do_info({gun_down, Pid, _Protocol, Reason, _Killed}, State) ->
     {noreply, lost(Pid, Reason, State)};
 do_info({gun_error, Pid, _Ref, Reason}, State) when is_pid(Pid) ->
@@ -283,10 +327,12 @@ do_info({reconnect, Id}, #st{slots = Slots} = State) ->
 do_info(_Other, State) ->
     {noreply, State}.
 
-terminate(_Reason, #st{slots = Slots, by_pid = ByPid}) ->
+terminate(_Reason, #st{name = Name, slots = Slots, by_pid = ByPid}) ->
     %% The slots' connections and the retired ones still being waited out.
     _ = [close_conn(P) || #slot{pid = P} <- maps:values(Slots), is_pid(P)],
     _ = [close_conn(P) || {P, {retired, _}} <- maps:to_list(ByPid)],
+    %% Their stream limits go with them (the table goes with this process).
+    yuzu_gw_upstream_regulator:server_capacity(Name, none),
     ok.
 
 %% What a crash report or sys:get_status shows of this process: the shape, not
@@ -332,8 +378,11 @@ gun_opts(#{transport := Transport, tcp_opts := Tcp} = Endpoint, #{connect_timeou
              %% finish, and fails new requests on it meanwhile: 3 s, not the 15 s
              %% default (a call takes at most 5 s), then gun_down and the slot is
              %% redialled.
+             %% notify_settings_changed: gun sends this process the server's
+             %% SETTINGS (the first frame and every change), so the channel knows
+             %% the server's concurrent-stream limit (see the module doc).
              http2_opts => #{keepalive => 45000, keepalive_tolerance => 1,
-                             closing_timeout => 3000},
+                             closing_timeout => 3000, notify_settings_changed => true},
              retry => 0,
              %% gun's default puts the connection under its own supervisor, which
              %% leaves a failed connect unreported: no gun_down (it was never up),
@@ -364,8 +413,8 @@ lost(Pid, Reason, #st{slots = Slots, by_pid = ByPid} = State) ->
         {ok, Id} ->
             close_conn(Pid),
             Slot = maps:get(Id, Slots),
-            State1 = State#st{slots = Slots#{Id := Slot#slot{pid = undefined}},
-                              by_pid = maps:remove(Pid, ByPid)},
+            State1 = forget_streams(Pid, State#st{slots = Slots#{Id := Slot#slot{pid = undefined}},
+                                                  by_pid = maps:remove(Pid, ByPid)}),
             failed(Id, Reason, State1);
         error ->
             State
@@ -434,6 +483,34 @@ problem_text([]) ->
     "the other ssl options";
 problem_text(Problems) ->
     lists:join("; ", [yuzu_gw_tls_files:describe(P) || P <- Problems]).
+
+%% A connection no longer counts toward the server's capacity.
+forget_streams(Pid, #st{streams = Streams} = State) ->
+    case maps:is_key(Pid, Streams) of
+        true  -> publish_capacity(State#st{streams = maps:remove(Pid, Streams)});
+        false -> State
+    end.
+
+%% Publish the channel's capacity when it changed (table row, and the
+%% regulator).
+publish_capacity(#st{name = Name, streams = Streams} = State) ->
+    Cap = capacity(maps:values(Streams)),
+    case server_capacity(Name) of
+        Cap ->
+            State;
+        _ ->
+            true = ets:insert(Name, {server_max_streams, Cap}),
+            yuzu_gw_upstream_regulator:server_capacity(Name, Cap),
+            State
+    end.
+
+%% `none' for no connection or any connection without a limit, else the sum.
+capacity([]) -> none;
+capacity(Limits) ->
+    case lists:member(infinity, Limits) of
+        true  -> none;
+        false -> lists:sum(Limits)
+    end.
 
 reply_waiters(Reply, #st{waiters = Waiters} = State) ->
     Now = erlang:monotonic_time(millisecond),

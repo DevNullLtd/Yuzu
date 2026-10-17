@@ -23,27 +23,64 @@
 %%% When a permit frees, a waiting live Register is served before a waiting
 %%% replay. Within a class the order is first come, first served.
 %%%
-%%% == Why these numbers ==
+%%% == The server's stream limit ==
 %%%
-%%% The ceiling. The server registers the gateway-upstream service on the same
-%%% gRPC builder as its agent service (server.cpp), so the HTTP/2
-%%% MAX_CONCURRENT_STREAMS of each gateway connection is the server's
-%%% --grpc-max-concurrent-streams (default 128). gun refuses a request past that
-%%% number locally (too_many_streams), and the gateway counts that refusal as a
-%%% failed upstream call, which feeds the circuit breaker. Everything the
-%%% gateway sends upstream at once must therefore stay under 128 x the
-%%% channel's pool_size (default 1): stream-status notifications (10), Guardian
-%%% forwards (50), the heartbeat flush (1, serial) and these two pools. 61 +
-%%% 48 + 8 = 117 leaves 11 streams of margin at pool_size 1.
-%%% yuzu_gw_upstream logs a warning at start when the configured total does not
-%%% fit (upstream_max_concurrent_streams states the server's value; default 128).
+%%% Every upstream call is one HTTP/2 stream on a connection of the
+%%% `default_channel'. The server declares how many it accepts at once on a
+%%% connection, SETTINGS_MAX_CONCURRENT_STREAMS, in the SETTINGS frame that
+%%% starts the connection, and may change it at any time (RFC 9113 6.5.2, 6.5).
+%%% The client must not exceed it (5.1.2): gun refuses a request past it locally
+%%% (too_many_streams). The C++ server registers the gateway-upstream service on
+%%% the same gRPC builder as its agent service (server.cpp), so the value is its
+%%% --grpc-max-concurrent-streams (default 128).
+%%%
+%%% The gateway does not assume that value: the channel learns it from the
+%%% server (yuzu_grpc_client_channel, gun's settings_changed notification) and
+%%% passes every change here (server_capacity/2). The capacity is the sum of the
+%%% limits of the channel's current connections, or `none' when nothing is
+%%% known (no connection up) or the server declared no limit; it is published as
+%%% yuzu_gw_upstream_server_max_streams (0 for `none').
+%%%
+%%% The effective ceilings (effective_limits/3, yuzu_gw_upstream_permit_limit):
+%%%   - The other upstream lanes are not regulated here and are subtracted
+%%%     first: stream-status notifications (10 in flight), Guardian forwards
+%%%     (50) and the heartbeat flush (1, serial): 61 streams,
+%%%     yuzu_gw_upstream:reserved_streams/0.
+%%%   - What is left, Capacity - 61, caps the register and inventory pools
+%%%     together. When it is at least the two configured sizes together, they
+%%%     apply unchanged (at the C++ default of 128 and pool_size 1: 67 left for
+%%%     48 + 8). Otherwise it is split in proportion to the configured sizes:
+%%%     register gets Left x R / (R + I) rounded down, inventory the rest, and
+%%%     neither gets less than 1 or more than its configured size. A pool is
+%%%     never closed outright: one permit each, even when the server allows
+%%%     fewer streams than the other lanes reserve (a warning says so; then the
+%%%     other lanes can themselves meet the limit, see yuzu_gw_upstream).
+%%%   - The replay cap scales with register: configured replay x effective
+%%%     register / configured register, rounded down, at least 1, at most the
+%%%     effective register.
+%%%   - With no capacity known, the configured sizes apply.
+%%% Every change is applied at once. A ceiling that drops below the permits
+%%% already held revokes nothing: those calls finish, and no permit of the pool
+%%% is granted until the held count is below the new ceiling. A ceiling that
+%%% rises serves the waiters at once.
+%%%
+%%% A grant can still race a decrease (the server lowered its limit while the
+%%% caller was being granted). yuzu_gw_upstream treats the resulting
+%%% too_many_streams as local backpressure: the caller hands its permit back,
+%%% asks again (and waits in the queue below, within its deadline), and the
+%%% circuit breaker is not touched.
+%%%
+%%% == Why these numbers ==
 %%%
 %%% The register pool, by Little's law (L = lambda x W). A restarted gateway can
 %%% see its whole fleet register at once. 5,000 agents served inside 25 s (the
 %%% agent's 30 s Register deadline less margin) is lambda = 200 per second; at
 %%% W = 50 to 200 ms per server call that is L = 10 to 40 calls in flight, so 48
 %%% serves the storm with margin even at 200 ms (240 per second: 5,000 in 21 s).
-%%% Replay takes at most half, so live registrations always have 24 permits.
+%%% Replay takes at most half, so live registrations always have 24 permits
+%%% (half of a lowered register ceiling likewise; at a ceiling of one permit a
+%%% replay can hold it, and a waiting live Register is still served first when
+%%% it frees).
 %%%
 %%% The inventory pool is small: an inventory report is not on the path that
 %%% gets an agent connected, and its payload is large (up to 4 MiB).
@@ -89,11 +126,14 @@
 -behaviour(gen_server).
 
 -export([start_link/0, ask/2, done/1, refuse_all/0, snapshot/0, limits/0]).
+-export([server_capacity/2, effective_limits/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -export_type([class/0, permit/0]).
 
 -define(SERVER, ?MODULE).
 -define(CELL, {?MODULE, cell}).
+%% The channel every upstream call is made on (yuzu_gw_upstream:do_rpc/5).
+-define(CHANNEL, default_channel).
 
 -define(DEFAULT_REGISTER, 48).
 -define(DEFAULT_INVENTORY, 8).
@@ -128,7 +168,12 @@
 }).
 
 -record(st, {
+    %% the effective ceilings (effective_limits/3), what free/2 checks
     limit    :: #{class() => pos_integer()},
+    %% the configured sizes (limits/0)
+    configured :: #{class() => pos_integer()},
+    %% what the channel learned of the server's stream limit
+    capacity = none :: non_neg_integer() | none,
     qmax     :: #{class() => non_neg_integer() | infinity},
     held     = #{register => 0, replay => 0, inventory => 0} :: #{class() => non_neg_integer()},
     waiting  = #{register => 0, replay => 0, inventory => 0} :: #{class() => non_neg_integer()},
@@ -186,6 +231,38 @@ ask(Class, Deadline) when Class =:= register; Class =:= replay; Class =:= invent
 done({Pid, Tag}) ->
     gen_server:cast(Pid, {cancel, Tag}).
 
+%% @doc The channel `Channel' learned that the server allows `Capacity'
+%% concurrent streams on its connections together (`none': not known, or no
+%% limit). Only `default_channel' counts. A cast; a no-op when this process is
+%% not running (init/1 reads the channel's current value).
+-spec server_capacity(atom(), non_neg_integer() | none) -> ok.
+server_capacity(?CHANNEL, Capacity) ->
+    case whereis(?SERVER) of
+        undefined -> ok;
+        Pid       -> gen_server:cast(Pid, {server_capacity, Capacity})
+    end;
+server_capacity(_Channel, _Capacity) ->
+    ok.
+
+%% @doc The effective permit ceilings for the configured sizes, the server's
+%% capacity and the streams the other lanes reserve (see the module doc).
+-spec effective_limits(#{register := pos_integer(), replay := pos_integer(),
+                         inventory := pos_integer(), atom() => term()},
+                       non_neg_integer() | none, non_neg_integer()) ->
+          #{register := pos_integer(), replay := pos_integer(), inventory := pos_integer()}.
+effective_limits(#{register := R, replay := P, inventory := I}, none, _Reserved) ->
+    #{register => R, replay => P, inventory => I};
+effective_limits(#{register := R, replay := P, inventory := I}, Capacity, Reserved) ->
+    case max(0, Capacity - Reserved) of
+        Left when Left >= R + I ->
+            #{register => R, replay => P, inventory => I};
+        Left ->
+            Reg = min(R, max(1, Left * R div (R + I))),
+            Inv = min(I, max(1, Left - Reg)),
+            Rep = min(Reg, min(P, max(1, P * Reg div R))),
+            #{register => Reg, replay => Rep, inventory => Inv}
+    end.
+
 %% @doc Refuse every waiter now and every later request (planned stop).
 -spec refuse_all() -> ok.
 refuse_all() ->
@@ -212,7 +289,8 @@ read(Cell, H, W, L) ->
     #{held => atomics:get(Cell, H), waiting => atomics:get(Cell, W), limit => atomics:get(Cell, L)}.
 
 %% @doc The configured permit counts, as init/1 reads them (also used by
-%% yuzu_gw_upstream for the stream-budget check and the replay cap).
+%% yuzu_gw_upstream for its replay worker cap). The ceilings in force can be
+%% lower: see effective_limits/3 and snapshot/0.
 -spec limits() -> #{register := pos_integer(), replay := pos_integer(),
                     inventory := pos_integer(),
                     register_queue := non_neg_integer(),
@@ -240,18 +318,16 @@ init([]) ->
       register_queue := RQ, inventory_queue := IQ} = limits(),
     Cell = cell(),
     [atomics:put(Cell, S, 0) || S <- lists:seq(1, ?SLOT_INVENTORY_WAIT)],
-    atomics:put(Cell, ?SLOT_REGISTER_LIMIT, R),
-    atomics:put(Cell, ?SLOT_REPLAY_LIMIT, P),
-    atomics:put(Cell, ?SLOT_INVENTORY_LIMIT, I),
-    St = #st{limit  = #{register => R, replay => P, inventory => I},
-             qmax   = #{register => RQ, replay => infinity, inventory => IQ},
-             queues = maps:from_keys([register, replay, inventory], queue:new())},
-    [begin
-         telemetry:execute([yuzu, gw, upstream, permit_limit], #{limit => L}, #{class => C}),
-         emit(C, St)
-     end || {C, L} <- [{register, R}, {replay, P}, {inventory, I}]],
-    logger:info("Upstream permits: register=~b (replay at most ~b), inventory=~b; "
+    Configured = #{register => R, replay => P, inventory => I},
+    St0 = #st{limit  = Configured,
+              configured = Configured,
+              qmax   = #{register => RQ, replay => infinity, inventory => IQ},
+              queues = maps:from_keys([register, replay, inventory], queue:new())},
+    [emit(C, St0) || C <- [register, replay, inventory]],
+    logger:info("Upstream permits configured: register=~b (replay at most ~b), inventory=~b; "
                 "wait queues register=~b, inventory=~b", [R, P, I, RQ, IQ]),
+    %% What the channel has learned so far; later changes arrive as casts.
+    St = apply_capacity(yuzu_grpc_client_channel:server_capacity(?CHANNEL), St0, true),
     {ok, St}.
 
 handle_call({ask, Tag, Class, Deadline}, {Pid, _} = From, St) ->
@@ -285,6 +361,8 @@ handle_call(_Req, _From, St) ->
 
 handle_cast({cancel, Tag}, St) ->
     {noreply, grant_next(release(Tag, St))};
+handle_cast({server_capacity, Capacity}, St) ->
+    {noreply, grant_next(apply_capacity(Capacity, St, false))};
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
@@ -305,6 +383,61 @@ code_change(_OldVsn, St, _Extra) ->
 %%%===================================================================
 %%% Internal
 %%%===================================================================
+
+%% Take the server's capacity: recompute the ceilings, publish them (cell,
+%% gauges) and log a change. Held permits are untouched; the caller runs
+%% grant_next/1 for a ceiling that rose. Always publishes on the first call.
+apply_capacity(Capacity, #st{configured = Configured, limit = Old, capacity = OldCap} = St,
+               First) ->
+    Reserved = yuzu_gw_upstream:reserved_streams(),
+    New = effective_limits(Configured, Capacity, Reserved),
+    St1 = St#st{limit = New, capacity = Capacity},
+    case First orelse Capacity =/= OldCap of
+        true ->
+            telemetry:execute([yuzu, gw, upstream, server_max_streams],
+                              #{streams => case Capacity of none -> 0; N -> N end}, #{});
+        false ->
+            ok
+    end,
+    case First orelse New =/= Old of
+        true ->
+            Cell = cell(),
+            [begin
+                 atomics:put(Cell, Slot, maps:get(C, New)),
+                 telemetry:execute([yuzu, gw, upstream, permit_limit],
+                                   #{limit => maps:get(C, New)}, #{class => C})
+             end || {C, Slot} <- [{register, ?SLOT_REGISTER_LIMIT},
+                                  {replay, ?SLOT_REPLAY_LIMIT},
+                                  {inventory, ?SLOT_INVENTORY_LIMIT}]],
+            log_limits(Capacity, Reserved, New, Configured);
+        false ->
+            ok
+    end,
+    St1.
+
+log_limits(none, _Reserved, #{register := R, replay := P, inventory := I}, _Configured) ->
+    logger:info("Upstream permits in force: register=~b (replay at most ~b), inventory=~b "
+                "(the configured sizes; the server's stream limit is not known)", [R, P, I]);
+log_limits(Capacity, Reserved, #{register := R, replay := P, inventory := I}, Configured) ->
+    case Configured of
+        #{register := R, replay := P, inventory := I} ->
+            logger:info("Upstream permits in force: register=~b (replay at most ~b), "
+                        "inventory=~b (the configured sizes; the server allows ~b concurrent "
+                        "streams on the gateway's connections)", [R, P, I, Capacity]);
+        #{register := CR, inventory := CI} when Capacity - Reserved < 2 ->
+            logger:warning("The server allows ~b concurrent streams on the gateway's "
+                           "connections; its other upstream lanes reserve ~b, so ProxyRegister "
+                           "and ProxyInventory keep only one permit each (configured ~b and "
+                           "~b) and the other lanes can meet the server's limit too. Raise the "
+                           "server's --grpc-max-concurrent-streams or the channel's pool_size.",
+                           [Capacity, Reserved, CR, CI]);
+        #{register := CR, inventory := CI} ->
+            logger:notice("Upstream permits lowered to the server's stream limit: register=~b "
+                          "(replay at most ~b), inventory=~b, configured ~b and ~b (the server "
+                          "allows ~b concurrent streams on the gateway's connections, ~b of them "
+                          "kept for the other upstream lanes)",
+                          [R, P, I, CR, CI, Capacity, Reserved])
+    end.
 
 %% A permit of Class is free: its pool has room, and a replay is under its own cap.
 free(inventory, #st{held = H, limit = L}) ->

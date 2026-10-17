@@ -93,7 +93,8 @@ Notification" and "Planned stop".
 |---|---|---|
 | `yuzu_gw_upstream_permits_held{class}` | gauge | Upstream call permits held now: `register` (a live `ProxyRegister`), `replay` (a registration replay), `inventory` (a `ProxyInventory`). `register` and `replay` share one pool |
 | `yuzu_gw_upstream_permits_waiting{class}` | gauge | Callers waiting for a permit now. Non-zero for `register` or `inventory` means every permit of that pool is held |
-| `yuzu_gw_upstream_permit_limit{class}` | gauge | Configured permits (`replay`: the most of the register pool a replay may hold) |
+| `yuzu_gw_upstream_permit_limit{class}` | gauge | Permits in force (`replay`: the most of the register pool a replay may hold): the configured size, or less when the server's declared stream limit leaves less room |
+| `yuzu_gw_upstream_server_max_streams` | gauge | Concurrent streams the server allows on the gateway's upstream connections together, learned from its HTTP/2 SETTINGS (`SETTINGS_MAX_CONCURRENT_STREAMS`, summed over the connections). 0 when nothing is known (no connection up) or the server declared no limit. The gateway sets aside 61 streams for its other lanes and sizes the `register` and `inventory` permits from the rest; see the gateway manual, "How the gateway sizes its upstream calls" |
 | `yuzu_gw_upstream_permit_refused_total{class,reason}` | counter | Permits refused: `queue_full`, `deadline` (the caller's deadline passed while it waited), `stopping` (planned stop). The agent is told `UNAVAILABLE` and retries |
 | `yuzu_gw_upstream_permit_wait_seconds{class}` | histogram | Seconds a granted permit was waited for |
 | `yuzu_gw_upstream_calls_dropped_total{rpc_name}` | counter | Proxied calls not sent because the caller's deadline passed while it waited, or too little was left to make the call; nothing reaches the server for them |
@@ -111,7 +112,10 @@ Notification" and "Planned stop".
 longer replays every agent. `yuzu_gw_upstream_rpc_errors_total{code}` gained the
 value `connection_lost` (a call ended because its upstream connection closed or
 went away; the breaker counts one such connection once, however many calls it
-ended), which replaces `stream_error` and `connection_error` for those calls. The
+ended), which replaces `stream_error` and `connection_error` for those calls, and
+the value `too_many_streams` (the gateway did not open the stream because the
+connection was at the server's concurrent-stream limit; nothing was sent; a proxied
+call or replay waits for a permit again and does not count against the breaker). The
 pressure lane `serial` of `yuzu_gw_upstream_lane_saturated_seconds_total{lane}` is
 now `permits` (a live `Register` or inventory report waiting for a permit). No new
 alert ships for these; a sustained rise of

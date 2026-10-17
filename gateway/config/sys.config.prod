@@ -114,8 +114,8 @@
         %% Mgmt-plane peer pins (#1422): the identities the :50063 auth_fun
         %% (yuzu_gw_authz:check_mgmt_peer/1, wired in grpc_listeners below)
         %% accepts. {cert_file, Path} pins to the SPKI of the cert at Path; the
-        %% yuzu_gw_mgmt_pins watcher re-stats it every mgmt_pin_refresh_ms
-        %% (default 5000) and re-reads it when it changed, so a rotated server
+        %% yuzu_gw_mgmt_pins watcher re-reads it every mgmt_pin_refresh_ms
+        %% (default 5000) and re-pins when its contents changed, so a rotated server
         %% leaf is pinned within one interval (the auth_fun itself never
         %% touches the file). Commands the server forwards inside that interval
         %% are refused and NOT retried: they fail as gateway_unauthenticated.

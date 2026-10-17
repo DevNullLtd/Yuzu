@@ -154,7 +154,11 @@
     %% suspends and resumes of agent listeners that failed (retried each tick).
     [yuzu, gw, memory_shedding, marks],
     [yuzu, gw, memory_shedding, failing],
-    [yuzu, gw, memory_shedding, transition_failed]
+    [yuzu, gw, memory_shedding, transition_failed],
+
+    %% G8-CODE workstream (#5695): the concurrent-stream limit the server
+    %% declared on the upstream connections (yuzu_gw_upstream_regulator).
+    [yuzu, gw, upstream, server_max_streams]
 ]).
 
 %%--------------------------------------------------------------------
@@ -609,6 +613,11 @@ handle_event([yuzu, gw, memory_shedding, failing], #{count := N}, Meta, _Config)
 handle_event([yuzu, gw, memory_shedding, transition_failed], #{count := N}, Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_memory_shedding_transition_failures_total,
                            [closed(maps:get(action, Meta, unknown), shedding_actions())], N);
+
+%% G8-CODE workstream (#5695). Unlabelled: the gateway calls upstream on one
+%% channel (default_channel).
+handle_event([yuzu, gw, upstream, server_max_streams], #{streams := N}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_upstream_server_max_streams, [], N);
 
 handle_event(_Event, _Measurements, _Meta, _Config) ->
     ok.
@@ -1136,8 +1145,10 @@ metric_specs() ->
         {gauge, [
             {name, yuzu_gw_upstream_permit_limit},
             {labels, [class]},
-            {help, "Configured upstream call permits, by class (replay is the most of "
-                   "the register pool a replay may hold)"}]},
+            {help, "Upstream call permits in force, by class (replay is the most of "
+                   "the register pool a replay may hold): the configured size, or less "
+                   "when the server's declared concurrent-stream limit leaves less room "
+                   "(see yuzu_gw_upstream_server_max_streams)"}]},
         {counter, [
             {name, yuzu_gw_upstream_permit_refused_total},
             {labels, [class, reason]},
@@ -1296,7 +1307,19 @@ metric_specs() ->
             {help, "Failed attempts by the memory shedder to suspend or resume an "
                    "agent listener, by action (suspend, resume); one per listener "
                    "per attempt, and a failing listener is retried every "
-                   "interval_ms"}]}
+                   "interval_ms"}]},
+
+        %% -- G8-CODE workstream (#5695) ------------------------------------
+        %% The server's concurrent-stream limit, learned from its HTTP/2
+        %% SETTINGS (yuzu_grpc_client_channel -> yuzu_gw_upstream_regulator).
+        {gauge, [
+            {name, yuzu_gw_upstream_server_max_streams},
+            {labels, []},
+            {help, "Concurrent streams the server allows on the gateway's upstream "
+                   "connections together, as declared in its HTTP/2 SETTINGS "
+                   "(SETTINGS_MAX_CONCURRENT_STREAMS, summed over the connections); 0 "
+                   "when nothing is known (no connection up) or the server declared no "
+                   "limit. The upstream permits are sized from it"}]}
     ].
 
 %% @doc The names of every metric metric_specs/0 declares.
@@ -1449,6 +1472,9 @@ seed_metrics() ->
          prometheus_gauge:set(yuzu_gw_memory_shedding_transition_failing, [A], 0),
          prometheus_counter:inc(yuzu_gw_memory_shedding_transition_failures_total, [A], 0)
      end || A <- [atom_to_binary(A0, utf8) || A0 <- shedding_actions()]],
+
+    %% G8-CODE workstream (#5695).
+    prometheus_gauge:set(yuzu_gw_upstream_server_max_streams, [], 0),
 
     ok.
 

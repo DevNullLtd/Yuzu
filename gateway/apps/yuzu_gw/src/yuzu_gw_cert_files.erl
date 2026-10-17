@@ -2,16 +2,24 @@
 %%% @doc The certificate files the gateway is configured with: how they are
 %%% read, and the expiry gauges published for them.
 %%%
-%%% Reading a file (step/2). A file is stat'ed with `raw' file operations (no
-%%% file server) and re-read and parsed only when its {mtime, size} changed. A
-%%% file replaced while it was being read is not cached: the previous
-%%% observation stands and the file is tried again on the next call. What is
+%%% Reading a file (step/2). Every call reads the whole file with `raw' file
+%%% operations (no file server) and compares the SHA-256 of its bytes (the
+%%% token) with the previous observation's: the PEM is parsed again only when
+%%% the bytes changed. The file's {mtime, size} is NOT a change token: a
+%%% rotation to a new key of the same type gives a PEM of the same size, and a
+%%% copy that preserves the mtime (cp -p, rsync -a, tar -p) or a rewrite in the
+%%% same second keeps the mtime, so a stat alone would miss the new key (Gate 8
+%%% #2). Certificate files are a few kilobytes and the read runs on the pin
+%%% watcher's timer, off every request path. The file is stat'ed before and
+%%% after the read only to notice a writer caught half-way: when the stat
+%%% changed across the read, the bytes are not trusted, the previous
+%%% observation stands and the file is read again on the next call. What is
 %%% kept per path is an entry:
 %%%   obs    the latest observation: {Token, {ok, Info}} (the file parsed),
-%%%          {Token, error} (read at Token, not a PEM certificate, or one whose
-%%%          notAfter this reader cannot parse; not re-read until the token
-%%%          changes), or `unreadable' (the stat or the read failed; tried
-%%%          again next time)
+%%%          {Token, error} (read, not a PEM certificate, or one whose
+%%%          notAfter this reader cannot parse; not parsed again until the
+%%%          bytes change), or `unreadable' (the stat or the read failed;
+%%%          tried again next time)
 %%%   good   the Info of the last observation that parsed, or `none'. It is
 %%%          KEPT when a later observation fails: a cert volume that hiccups,
 %%%          or a writer caught half-way, does not erase what was last read.
@@ -63,7 +71,9 @@
 %% Seconds from 0000-01-01 (calendar's gregorian seconds) to 1970-01-01.
 -define(UNIX_EPOCH_GREGORIAN, 62167219200).
 
--type token() :: {integer(), non_neg_integer()}.
+%% The SHA-256 of the file's bytes.
+-type token() :: binary().
+-type stamp() :: {integer(), non_neg_integer()}.
 -type info() :: #{spki := binary(), not_after := integer()}.
 -type obs() :: {token(), {ok, info()} | error} | unreadable.
 -type entry() :: #{obs := obs(), good := info() | none}.
@@ -94,31 +104,35 @@ healthy(_) -> false.
 -spec observe(file:name_all(), obs() | none) -> obs().
 observe(Path, PrevObs) ->
     case stat(Path) of
-        error ->
-            unreadable;
-        Token ->
-            case PrevObs of
-                {Token, _} -> PrevObs;
-                _ -> read(Path, Token, PrevObs)
-            end
+        error -> unreadable;
+        Stamp -> read(Path, Stamp, PrevObs)
     end.
 
-%% The token is taken again after the read: a file replaced while it was being
-%% read is not cached, the previous observation stands (or `unreadable' when
-%% there is none) and the file is read again next time, as its token differs.
-read(Path, Token, PrevObs) ->
+%% Stamp is the {mtime, size} taken before the read; it is taken again after
+%% it. A file replaced while it was being read is not cached: the previous
+%% observation stands (or `unreadable' when there is none) and the file is
+%% read again next time. Unchanged bytes keep the previous observation as it
+%% is (the same term, so the pin watcher publishes nothing).
+read(Path, Stamp, PrevObs) ->
     case file:read_file(Path, [raw]) of
         {ok, Pem} ->
             case stat(Path) of
-                Token -> {Token, parse_pem(Pem)};
-                _ when PrevObs =:= none -> unreadable;
-                _ -> PrevObs
+                Stamp ->
+                    Token = crypto:hash(sha256, Pem),
+                    case PrevObs of
+                        {Token, _} -> PrevObs;
+                        _ -> {Token, parse_pem(Pem)}
+                    end;
+                _ when PrevObs =:= none ->
+                    unreadable;
+                _ ->
+                    PrevObs
             end;
         {error, _} ->
             unreadable
     end.
 
--spec stat(file:name_all()) -> token() | error.
+-spec stat(file:name_all()) -> stamp() | error.
 stat(Path) ->
     case file:read_file_info(Path, [raw, {time, posix}]) of
         {ok, #file_info{mtime = M, size = S}} -> {M, S};

@@ -38,7 +38,7 @@ pins_test_() ->
                  fun() -> stalled_stat_stalls_only_the_watcher(F) end}} end,
       fun(F) -> {timeout, 30, {"a rotated file is picked up within a refresh interval",
                  fun() -> rotation_picked_up_by_the_timer(F) end}} end,
-      fun(F) -> {"an unchanged file is not re-read and nothing is re-published",
+      fun(F) -> {"an unchanged file is read but not parsed or re-published",
                  fun() -> unchanged_file_not_reread(F) end} end,
       fun(F) -> {"a resolved pin survives a failed read; the source is flagged unhealthy",
                  fun() -> failed_read_keeps_last_good_pin(F) end} end,
@@ -54,7 +54,9 @@ pins_test_() ->
       fun(F) -> {"a literal spki_sha256 pin needs nothing published",
                  fun() -> literal_pin_unaffected(F) end} end,
       fun(F) -> {"a malformed pin list publishes nothing and does not crash the refresh",
-                 fun() -> malformed_config_publishes_nothing(F) end} end]}.
+                 fun() -> malformed_config_publishes_nothing(F) end} end,
+      fun(F) -> {"a different key of the same size, written with the same mtime, replaces the pin",
+                 fun() -> same_size_same_mtime_rotation_swaps_the_pin(F) end} end]}.
 
 %%%-------------------------------------------------------------------
 %%% Fixture
@@ -233,20 +235,30 @@ rotation_picked_up_by_the_timer(F) ->
         ?assertEqual(false, yuzu_gw_authz:check_mgmt_peer(srv(Certs)))
     end).
 
-%% A refresh over an unchanged file stats it and stops there: no read, and the
-%% published term is the same term (no persistent_term:put, which would make
-%% the VM scan every process).
+%% A refresh over an unchanged file reads it (the bytes, not {mtime, size},
+%% are the change token: Gate 8 #2), does not parse it again, and leaves the
+%% published term the same term (no persistent_term:put, which would make the
+%% VM scan every process). A touch that changes only the mtime is no change.
 unchanged_file_not_reread(F) ->
     with_certs(F, fun(#{srv_pem := SrvPem}) ->
         Pins = [{cert_file, SrvPem}],
         ok = yuzu_gw_mgmt_pins:refresh(Pins),
         Published = persistent_term:get(?KEY),
         mock_file(),
-        ok = yuzu_gw_mgmt_pins:refresh(Pins),
-        Calls = [Fn || {Fn, _} <- file_calls_from(self())],
-        ?assert(lists:member(read_file_info, Calls)),
-        ?assertNot(lists:member(read_file, Calls)),
-        ?assert(persistent_term:get(?KEY) =:= Published)
+        ok = meck:new(public_key, [passthrough, no_link]),
+        try
+            ok = yuzu_gw_mgmt_pins:refresh(Pins),
+            Calls = [Fn || {Fn, _} <- file_calls_from(self())],
+            ?assert(lists:member(read_file, Calls)),
+            ?assertEqual(0, meck:num_calls(public_key, pem_decode, '_')),
+            ?assert(persistent_term:get(?KEY) =:= Published),
+            ok = file:change_time(SrvPem, {{2020, 1, 1}, {0, 0, 0}}),
+            ok = yuzu_gw_mgmt_pins:refresh(Pins),
+            ?assertEqual(0, meck:num_calls(public_key, pem_decode, '_')),
+            ?assert(persistent_term:get(?KEY) =:= Published)
+        after
+            meck:unload(public_key)
+        end
     end).
 
 %% Once a pin has resolved, a failed stat, a failed read (any errno, enoent
@@ -409,6 +421,43 @@ malformed_config_publishes_nothing(F) ->
         ok = yuzu_gw_mgmt_pins:refresh([bogus, {cert_file, 42}]),
         ?assertEqual(error, yuzu_gw_mgmt_pins:lookup(SrvPem))
     end).
+
+%% Gate 8 #2. A same-key-type rotation gives a PEM of the same size (two
+%% RSA-2048 certificates here), and mtime-preserving copies (cp -p, rsync -a,
+%% tar -p) or a rewrite in the same second keep {mtime, size}. The watcher must
+%% still pick up the new key: publish it, stop admitting the old one, emit the
+%% rotation event, and report the new notAfter. Minted in-process (no openssl).
+same_size_same_mtime_rotation_swaps_the_pin(F) ->
+    #{certs := Certs} = F,
+    Dir = case Certs of
+              #{dir := D} -> D;
+              _ -> filename:basedir(user_cache, "yuzu_mgmt_pins_tests")
+          end,
+    ok = filelib:ensure_path(Dir),
+    listen(),
+    {PemA, PemB} = yuzu_gw_cert_files_tests:equal_size_rsa_pems({2030, 6, 1}, {2031, 6, 1}),
+    Path = filename:join(Dir, "same_size_" ++ integer_to_list(erlang:unique_integer([positive]))
+                              ++ ".pem"),
+    try
+        ok = file:write_file(Path, PemA),
+        Pins = [{cert_file, Path}],
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        {ok, SpkiA} = yuzu_gw_mgmt_pins:lookup(Path),
+        ?assertEqual([], rotations()),
+        ok = yuzu_gw_cert_files_tests:replace_keeping_mtime(Path, PemB),
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        [{'Certificate', DerB, _}] = public_key:pem_decode(PemB),
+        {ok, SpkiB} = yuzu_gw_authz:spki_sha256(DerB),
+        ?assertNotEqual(SpkiA, SpkiB),
+        ?assertEqual({ok, SpkiB}, yuzu_gw_mgmt_pins:lookup(Path)),
+        ?assert(yuzu_gw_mgmt_pins:healthy(Path)),
+        ?assertMatch([#{system_time := _}], rotations()),
+        NotAfterB = calendar:datetime_to_gregorian_seconds({{2031, 6, 1}, {13, 0, 0}})
+                    - 62167219200,
+        ?assertMatch(#{good := #{not_after := NotAfterB}}, yuzu_gw_mgmt_pins:source(Path))
+    after
+        file:delete(Path)
+    end.
 
 %%%-------------------------------------------------------------------
 %%% The refresh interval: boot validation

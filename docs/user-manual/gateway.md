@@ -1360,15 +1360,10 @@ process of the agent's own request, under a permit from
 | `replay` | at most 24 of the register pool | not counted | registration replays; live registrations always keep the other 24 |
 | `inventory` | 8 (`upstream_inventory_concurrency`) | 1000 | `ProxyInventory`; large payloads, not on the connect path |
 
-Why these numbers. The ceiling: the server registers the gateway-upstream service
-on the same gRPC builder as its agent service, so each gateway connection may carry
-at most the server's `--grpc-max-concurrent-streams` streams (128 by default). A
-request past that is refused by the gateway's own HTTP/2 client (`too_many_streams`)
-and counts as a failed upstream call, which feeds the circuit breaker. Everything a
-gateway sends at once must stay under 128 times the channel's `pool_size` (1 by
-default): notifications (10), Guardian forwards (50), the heartbeat flush (1) and
-these pools: 61 + 48 + 8 = 117. Raise the permits only with `pool_size` or the
-server's stream limit. The register pool, by Little's law: a restarted gateway can
+These are the configured sizes. The permits in force can be lower when the server
+allows fewer streams: see "How the gateway sizes its upstream calls" below.
+
+Why these numbers. The register pool, by Little's law: a restarted gateway can
 see its whole fleet register at once; 5,000 agents inside the agent's 30 s `Register`
 deadline (25 s with margin) is 200 per second, and at 50 to 200 ms per server call
 that is 10 to 40 calls in flight, so 48 serves the storm with margin even at 200 ms
@@ -1386,6 +1381,55 @@ is stopped (a reset stream, a closed connection) frees its permit or its place b
 its exit. The wait is in `yuzu_gw_upstream_permit_wait_seconds`; held and waiting
 permits are `yuzu_gw_upstream_permits_held` and `yuzu_gw_upstream_permits_waiting`
 by class.
+
+**How the gateway sizes its upstream calls.** Every upstream call is one HTTP/2
+stream on a connection of the upstream channel. The server says how many streams it
+accepts at once on a connection (`SETTINGS_MAX_CONCURRENT_STREAMS`, sent when the
+connection starts and possibly changed later, RFC 9113 sections 6.5 and 6.5.2), and
+the gateway must not open more (section 5.1.2): its HTTP/2 client refuses a call past
+the limit itself (`too_many_streams`). For the C++ server the value is its
+`--grpc-max-concurrent-streams` (128 by default), because the gateway-upstream
+service shares the gRPC builder of the agent service.
+
+The gateway reads the value from the server instead of assuming it. The channel
+records what each of its connections declared, adds them up (one connection by
+default, `pool_size`), and updates the total whenever the server sends new settings
+or a connection goes down. The total is `yuzu_gw_upstream_server_max_streams` (0 when
+nothing is known, or when the server declared no limit). From it the gateway works
+out the permits in force (`yuzu_gw_upstream_permit_limit`):
+
+- First it sets aside 61 streams for the lanes that take no permit: up to 10
+  stream-status notifications, up to 50 Guardian forwards, and one heartbeat flush.
+- If what is left covers the configured `register` and `inventory` pools together,
+  they apply unchanged. At the C++ default of 128 and `pool_size` 1, 67 streams are
+  left for 48 + 8, so nothing changes.
+- Otherwise what is left is split between the two pools in proportion to their
+  configured sizes: `register` gets (left x 48 / 56) rounded down and `inventory`
+  the rest. Neither gets less than one permit or more than its configured size.
+  The replay cap shrinks with `register` (half of it, by default). For example, a
+  server that allows 100 streams gives `register` 33, `replay` 16 and `inventory` 6.
+- A server that allows fewer streams than the 61 the other lanes need leaves one
+  permit each, and the gateway logs a WARN (`The server allows <N> concurrent
+  streams on the gateway's connections; ...`). The other lanes can then hit the
+  server's limit too, and a failed stream-status notification counts against the
+  circuit breaker as before. Raise the server's `--grpc-max-concurrent-streams`, or
+  the channel's `pool_size`.
+- Each change is logged (`Upstream permits in force: ...` or `Upstream permits
+  lowered to the server's stream limit: ...`).
+
+A lower limit takes nothing away: calls already holding a permit finish, and no new
+permit is granted until fewer are held than the new limit. If the server lowers its
+limit just as a call is granted, and the call is then refused with
+`too_many_streams`, the call is not counted against the circuit breaker: nothing was
+sent. The call hands its permit back, waits 10 ms (doubling up to 100 ms), and asks
+for a permit again, so it waits in the queue like any other call until its deadline
+(then the agent is told `UNAVAILABLE` and retries). Registration replays do the
+same. Each refusal is counted in `yuzu_gw_upstream_rpc_errors_total` under
+`code="too_many_streams"`.
+
+There is nothing to configure for this. To give the gateway more upstream capacity,
+raise the server's stream limit or the channel's `pool_size`; raising
+`upstream_register_concurrency` above what the server allows has no effect.
 
 **Upstream channel tuning** (read when the upstream channel configuration is parsed,
 at start-up; set it in the `yuzu_gw` section of `sys.config`. No `YUZU_GW_*`
@@ -1408,7 +1452,7 @@ through the environment; it takes a `sys.config` edit):
 
 | Key | Default | Valid values | Meaning |
 |---|---|---|---|
-| `mgmt_pin_refresh_ms` | 5000 | 100 to 3600000 | How often the `yuzu_gw_mgmt_pins` process re-stats every `{cert_file, Path}` entry of `mgmt_peer_pins`. It re-reads and parses the PEM only when the file's modification time or size changed, and publishes the pinned key for the management `auth_fun` to read. The `auth_fun` runs once per management stream and does no file I/O itself, so a stalled certificate volume stalls only the watcher, never a connection. The interval bounds how long a rotated server leaf is refused: until the next refresh the gateway still pins the old key, so a stream the server opens with its new leaf in that window gets `UNAUTHENTICATED` (`pin_mismatch`, fail closed). The server does not retry it: the commands it forwards in that window fail as `gateway_unauthenticated`, and commands after the refresh go through. The same tick refreshes the certificate expiry gauges (see [Certificate rotation and expiry](#certificate-rotation-and-expiry)). The pins are resolved once at start, before the listeners, so the first stream never waits for a refresh. A value outside the range, or one that is not an integer, **refuses boot** (`Refusing to start: invalid {yuzu_gw, mgmt_pin_refresh_ms}`). Not present in any shipped `sys.config`. |
+| `mgmt_pin_refresh_ms` | 5000 | 100 to 3600000 | How often the `yuzu_gw_mgmt_pins` process re-reads every `{cert_file, Path}` entry of `mgmt_peer_pins`. It parses the PEM again only when the file's bytes changed (it compares a SHA-256 of the contents, not the modification time or size, so a new key of the same size copied with `cp -p` is still picked up), and publishes the pinned key for the management `auth_fun` to read. The `auth_fun` runs once per management stream and does no file I/O itself, so a stalled certificate volume stalls only the watcher, never a connection. The interval bounds how long a rotated server leaf is refused: until the next refresh the gateway still pins the old key, so a stream the server opens with its new leaf in that window gets `UNAUTHENTICATED` (`pin_mismatch`, fail closed). The server does not retry it: the commands it forwards in that window fail as `gateway_unauthenticated`, and commands after the refresh go through. The same tick refreshes the certificate expiry gauges (see [Certificate rotation and expiry](#certificate-rotation-and-expiry)). The pins are resolved once at start, before the listeners, so the first stream never waits for a refresh. A value outside the range, or one that is not an integer, **refuses boot** (`Refusing to start: invalid {yuzu_gw, mgmt_pin_refresh_ms}`). Not present in any shipped `sys.config`. |
 
 **Heartbeat batching interval** (read by the heartbeat buffer at start; unlike
 the replay keys above, it also has an environment override):
@@ -1844,7 +1888,7 @@ What this warning does **not** cover:
 |---|---|---|
 | gateway → server upstream (`:50055`) | **mutual TLS in `sys.config.prod`; the gateway itself enforces only server verification** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. The gateway refuses to boot on `https` without `verify_peer` and a CA of its own, and on a channel mixing `http` and `https`; it does **not** require a client certificate, so mutual TLS holds only where the endpoint carries `certfile` and `keyfile` and the server demands them (SPKI pin, see [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)). Plaintext `http` boots as the lab/UAT posture. |
 | agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `tls => #{certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` in its `grpc_listeners` entry. Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or a UAT/demo `sys.config` (inline in `docker-compose.uat.yml`, mounted as a file by the others); the remaining composes do not run the gateway. Heartbeats are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. |
-| server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert` from the `tls` map) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one — within `mgmt_pin_refresh_ms` (default 5 s, see "Management-pin refresh"): the `yuzu_gw_mgmt_pins` watcher re-stats the file on its own timer and the per-stream check reads its published key, never the file, so a rotated server leaf can be refused for up to one interval (fail closed; the server's retry after it succeeds). |
+| server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert` from the `tls` map) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one — within `mgmt_pin_refresh_ms` (default 5 s, see "Management-pin refresh"): the `yuzu_gw_mgmt_pins` watcher re-reads the file on its own timer (comparing a SHA-256 of its contents, so a new key of the same size with a preserved mtime is still picked up) and the per-stream check reads its published key, never the file, so a rotated server leaf can be refused for up to one interval (fail closed; the server's retry after it succeeds). |
 
 TLS is configured in two places: the `tls` map of each `grpc_listeners` entry (the
 two listeners) and the `{yuzu_gw, [{upstream_client, ...}]}` entry (the upstream channel;
@@ -1937,9 +1981,14 @@ need none of this.
 
 **What the gateway watches.** The management-pin watcher (`yuzu_gw_mgmt_pins`)
 checks every certificate file the gateway is configured with every
-`mgmt_pin_refresh_ms` (default 5 s). It reads a file again only when its
-modification time or size changed, so a quiet volume costs one `stat` per file
-per interval and no management call ever touches the file system. The files,
+`mgmt_pin_refresh_ms` (default 5 s). It reads every file on every check and
+parses it again only when its bytes changed (a SHA-256 of the contents is
+compared). The modification time and size are not enough: a new certificate
+with a key of the same type usually has exactly the same size, and `cp -p`,
+`rsync -a` or `tar -p` keep the old modification time, so a check on those
+alone would keep the old key. Certificate files are a few kilobytes, so this
+costs one small read per file per interval, on the watcher's own timer; no
+management call ever touches the file system. The files,
 and the `role` and `name` labels they are reported under:
 
 | `role` | File | `name` |
@@ -4264,7 +4313,7 @@ that are actually emitted are listed.
 | `yuzu_gw_command_duration_ms` | histogram | Command dispatch duration in ms (labels `plugin`, `status`) |
 | `yuzu_gw_agent_session_duration_ms` | histogram | Agent session duration in ms (label `node`) |
 | `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms (label `rpc_name`) |
-| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`). `code` is the gRPC status number the server answered (`"16"` and so on) or, for a failure before any status, one of these words: `closed`, `econnrefused`, `timeout`, `connection_lost` (the call's connection closed or went away, since #5695), `stream_error` (the server reset that one call), `protocol`, `response_too_large`, `invalid_metadata`, `no_channel`, `exception`, `encode`, `other`, or `{tls_alert,<Alert>}` for a TLS alert (for example `{tls_alert,certificate_required}`). Alerts keyed on `code="16"` or on `yuzu_gw_upstream_tls_handshake_failures_total` are unchanged |
+| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`). `code` is the gRPC status number the server answered (`"16"` and so on) or, for a failure before any status, one of these words: `closed`, `econnrefused`, `timeout`, `connection_lost` (the call's connection closed or went away, since #5695), `stream_error` (the server reset that one call), `too_many_streams` (the gateway's own HTTP/2 client did not open the stream, because the connection was at the server's concurrent-stream limit; nothing was sent. Counted as `stream_error` before this was told apart), `protocol`, `response_too_large`, `invalid_metadata`, `no_channel`, `exception`, `encode`, `other`, or `{tls_alert,<Alert>}` for a TLS alert (for example `{tls_alert,certificate_required}`). Alerts keyed on `code="16"` or on `yuzu_gw_upstream_tls_handshake_failures_total` are unchanged |
 | `yuzu_gw_upstream_rpc_errors_total{code="exception"}` | counter series | An exception out of the client or transport. It counts against the circuit breaker on the `Register` and `ProxyInventory` call paths, a stream-status notification worker (while the breaker is closed), the half-open notification probe and a registration replay; a guardian forward and the heartbeat buffer's own flush do not feed the breaker. Pre-seeded to 0 for `register`, `inventory`, `notify_stream`, `guardian` and `batch_heartbeat`. |
 | `yuzu_gw_upstream_rpc_errors_total{code="encode"}` | counter series | A request that failed in the gateway's own encoder, including one over 4194304 bytes: local, never sent, no breaker effect. Pre-seeded to 0 for `register`, `inventory`, `notify_stream` and `guardian`; `batch_heartbeat` has no `encode` series, because a marshal failure on the heartbeat buffer's flush is counted as `code="exception"` and is not covered by the `YuzuGatewayUpstreamEncodeErrors` alert. That alert fires at about ten increases in 10 minutes (`increase()` is extrapolated). Other `code` values appear at their first occurrence. A `circuit_open` rejection never reaches the call and is not counted here. |
 | `yuzu_gw_register_refused_total` | counter | `Register` calls the gateway edge refused before any upstream call because the agent id was empty or longer than 256 bytes (label `reason`, closed set `agent_id_length` and `unknown`; both created at 0 at start). No label is derived from agent data. |
@@ -4290,7 +4339,8 @@ that are actually emitted are listed.
 | `yuzu_gw_upstream_calls_dropped_total` | counter | Proxied `Register` or inventory calls not sent because the caller's deadline passed while it waited for a permit, or left too little time (250 ms) to make the call (label `rpc_name`, closed set `register` and `inventory`, both created at 0 at start). Nothing is sent for them, so no server session is created. Before #5695 it counted queued calls of callers that had exited. |
 | `yuzu_gw_upstream_permits_held` | gauge | Upstream call permits held now, by `class` (`register`, `replay`, `inventory`; created at 0). `register` and `replay` share one pool (see "Upstream call permits") |
 | `yuzu_gw_upstream_permits_waiting` | gauge | Callers waiting for a permit now, by `class`. Non-zero for `register` or `inventory` means every permit of the pool is held |
-| `yuzu_gw_upstream_permit_limit` | gauge | Configured permits, by `class` (`replay` is the most of the register pool a replay may hold) |
+| `yuzu_gw_upstream_permit_limit` | gauge | Permits in force, by `class` (`replay` is the most of the register pool a replay may hold): the configured size, or less when the server's stream limit leaves less room (see "How the gateway sizes its upstream calls") |
+| `yuzu_gw_upstream_server_max_streams` | gauge | Concurrent streams the server allows on the gateway's upstream connections together, as it declared them (`SETTINGS_MAX_CONCURRENT_STREAMS`, summed over the connections). Created at 0; 0 also means nothing is known (no connection up) or the server declared no limit, and then the configured permit sizes apply. No label: the gateway makes its upstream calls on one channel |
 | `yuzu_gw_upstream_permit_refused_total` | counter | Permits refused, by `class` and `reason` (`queue_full`, `deadline`, `stopping`; every pair created at 0). The agent is told `UNAVAILABLE` and retries |
 | `yuzu_gw_upstream_permit_wait_seconds` | histogram | Seconds a granted permit was waited for, by `class` |
 | `yuzu_gw_registration_replay_outcomes_total` | counter | Registration replay entries by `outcome` (`adopted`, `superseded`, `rejected`, `failed`, `skipped`, `aborted`; created at 0) |

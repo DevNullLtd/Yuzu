@@ -18,6 +18,22 @@
 %%%   read: this process owns the breaker and moves it only for a result of the
 %%%   current generation, never while open. In half_open every proxied call may
 %%%   go (as before); the first result decides.
+%%%   A call gun refuses locally with too_many_streams (the connection is at
+%%%   the server's SETTINGS_MAX_CONCURRENT_STREAMS, RFC 9113 5.1.2; nothing was
+%%%   sent) is local backpressure, not a failure of the upstream: the result is
+%%%   not cast, the permit is handed back, and after a short pause (10 ms,
+%%%   doubling to 100 ms) the caller asks for a permit again, waiting in the
+%%%   regulator's queue, until its deadline (answered `deadline', so
+%%%   UNAVAILABLE). Registration replays do the same. The regulator sizes the
+%%%   permits from the limit the server declared (see
+%%%   yuzu_gw_upstream_regulator), so this happens only when a lowered limit
+%%%   races a grant, or when the other lanes need more than the server allows.
+%%%   The other lanes (stream-status notifications, Guardian forwards, the
+%%%   heartbeat flush) have no permit queue to wait in: for them it is a failed
+%%%   send like any other, and a notification's counts against the breaker
+%%%   (which is what stops its retries). Their 61 streams are kept out of the
+%%%   permits (reserved_streams/0), so they meet the limit only when the server
+%%%   allows fewer than that, which the regulator logs as a warning.
 %%%
 %%% Stream status notifications are held, not dropped (#4632):
 %%%   A notification is stored in a bounded pending store
@@ -271,6 +287,9 @@
 -export([circuit_state_now/0, lane_snapshot/0]).
 -export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
 -export([call_timeout/0]).        %% for testing (upstream_call_timeout_ms validation)
+%% The streams the lanes other than the permit pools can hold open on the
+%% upstream connections (read by yuzu_gw_upstream_regulator).
+-export([reserved_streams/0]).
 %% The reason/stacktrace redaction format_status/1 applies, shared with the
 %% crash-report filter (yuzu_gw_crash_redact), which applies it to the parts of
 %% a report OTP prints outside format_status.
@@ -288,6 +307,14 @@
 %% evidence; still bounded (NFR — no unbounded process spawn under a slow
 %% upstream). Overflow is dropped best-effort; durable buffering is Guardian A3.
 -define(MAX_GUARDIAN_INFLIGHT, 50).
+%% yuzu_gw_heartbeat_buffer sends its BatchHeartbeat chunks one after another.
+-define(HEARTBEAT_FLUSH_STREAMS, 1).
+%% A proxied call gun refused locally (too_many_streams: the connection is at
+%% the server's concurrent-stream limit) waits this long before it asks for a
+%% permit again, doubling to the maximum: long enough for the channel to tell
+%% the regulator of a lowered limit, short against a call's deadline.
+-define(STREAM_LIMIT_PAUSE_MS, 10).
+-define(STREAM_LIMIT_PAUSE_MAX_MS, 100).
 -define(DEFAULT_CALL_TIMEOUT_MS, 30000).
 -define(MIN_CALL_TIMEOUT_MS, 100).
 -define(MAX_CALL_TIMEOUT_MS, 300000).
@@ -462,10 +489,13 @@
 
 -record(state, {
     %% Notify workers in flight: pid => the key, class and event it is sending
-    %% (so a failure can give the event back), or `resolved' once its result
+    %% (so a failure can give the event back) and the breaker generation it was
+    %% started under (so its result counts toward the breaker only if the
+    %% breaker has not moved since, Gate 8 #4), or `resolved' once its result
     %% is in (its slot is freed by its 'DOWN').
     notify_pids     :: #{pid() => {yuzu_gw_notify_queue:key(), connected | disconnected,
-                                   yuzu_gw_notify_queue:event()} | resolved},
+                                   yuzu_gw_notify_queue:event(), non_neg_integer()}
+                                  | resolved},
     %% Stream-status notifications held until a worker slot is free and the
     %% breaker is closed. Volatile: it does not outlive this process.
     notify_pending  :: yuzu_gw_notify_queue:t(),
@@ -843,7 +873,9 @@ proxy_gate() ->
     end.
 
 proxied_call(Method, Class, Request, Opts) ->
-    Deadline = caller_deadline(Opts),
+    proxied_attempt(Method, Class, Request, caller_deadline(Opts), ?STREAM_LIMIT_PAUSE_MS).
+
+proxied_attempt(Method, Class, Request, Deadline, Pause) ->
     case proxy_gate() of
         undefined -> {error, upstream_unavailable};
         stopping  -> {error, stopping};
@@ -853,8 +885,18 @@ proxied_call(Method, Class, Request, Opts) ->
             %% call; a caller with less than that left is not worth a permit.
             case yuzu_gw_upstream_regulator:ask(Class, Deadline - ?MIN_USEFUL_MS) of
                 {ok, Permit} ->
-                    try permitted_call(Method, Class, Request, Deadline)
-                    after yuzu_gw_upstream_regulator:done(Permit)
+                    Result = try permitted_call(Method, Class, Request, Deadline)
+                             after yuzu_gw_upstream_regulator:done(Permit)
+                             end,
+                    case Result of
+                        stream_limit ->
+                            stream_limit_pause(Class, Deadline, Pause,
+                                               fun(Next) ->
+                                                       proxied_attempt(Method, Class, Request,
+                                                                       Deadline, Next)
+                                               end);
+                        _ ->
+                            Result
                     end;
                 {error, deadline} ->
                     drop_call(Class),
@@ -866,10 +908,28 @@ proxied_call(Method, Class, Request, Opts) ->
             end
     end.
 
+%% gun refused the call locally (too_many_streams): the connection is at the
+%% server's concurrent-stream limit, nothing was sent, and that is not a fact
+%% about the upstream's health. The permit has been handed back; after a short
+%% pause (so the regulator can take a lowered limit the channel just learned)
+%% the caller asks for one again and waits in the regulator's queue like any
+%% caller, until its deadline, which is answered `deadline' (UNAVAILABLE).
+stream_limit_pause(Class, Deadline, Pause, Retry) ->
+    case Deadline - ?MIN_USEFUL_MS - erlang:monotonic_time(millisecond) of
+        Left when Left > Pause ->
+            timer:sleep(Pause),
+            Retry(min(?STREAM_LIMIT_PAUSE_MAX_MS, 2 * Pause));
+        _ ->
+            drop_call(Class),
+            {error, deadline}
+    end.
+
 %% Holding a permit. The breaker is read again (it may have opened while the
 %% caller waited), and so is the clock: a caller that has run out of time makes
 %% no RPC. The result goes to this process by cast, with the breaker generation
 %% read before the call, and is returned to the caller without waiting for it.
+%% A call gun refused locally for the server's stream limit is `stream_limit':
+%% it is not cast (the breaker does not see it) and proxied_attempt/5 retries it.
 permitted_call(Method, Class, Request, Deadline) ->
     case proxy_gate() of
         undefined -> {error, upstream_unavailable};
@@ -882,9 +942,13 @@ permitted_call(Method, Class, Request, Deadline) ->
                     drop_call(Class),
                     {error, deadline};
                 true ->
-                    Result = do_rpc(Method, Request, Class, #{}, min(rpc_timeout(), Left)),
-                    gen_server:cast(?SERVER, {rpc_result, Gen, Result}),
-                    public_result(Result)
+                    case do_rpc(Method, Request, Class, #{}, min(rpc_timeout(), Left)) of
+                        {error, too_many_streams} ->
+                            stream_limit;
+                        Result ->
+                            gen_server:cast(?SERVER, {rpc_result, Gen, Result}),
+                            public_result(Result)
+                    end
             end
     end.
 
@@ -1372,20 +1436,25 @@ handle_info({notify_probe_timeout, _Pid, _Gen}, State) ->
 %% is freed by the worker's 'DOWN'.
 %%
 %% The breaker: it counts like a call made from this process, but only while
-%% closed: the workers in flight when it opened or half-opened answer into a
-%% circuit they no longer belong to, and the half_open probe
-%% (notify_probe_result, resolved by generation), not a late answer, decides
-%% when it closes. record_result/2 has no clause for an open breaker.
+%% closed AND under the generation the worker was started in (as a proxied
+%% call is fenced by the generation its caller read, rpc_result): the workers
+%% in flight when it opened or half-opened answer into a circuit they no longer
+%% belong to, even once it has closed again (Gate 8 #4: a slow notice from
+%% before an open/half_open/closed cycle must not count against the recovered
+%% circuit), and the half_open probe (notify_probe_result, resolved by
+%% generation), not a late answer, decides when it closes. record_result/2 has
+%% no clause for an open breaker. The notice itself is settled the same way
+%% whatever its generation.
 handle_info({notify_result, Pid, Result}, #state{notify_pids = Pids} = State) ->
     Before = notify_counts(State),
     case maps:find(Pid, Pids) of
-        {ok, {Key, Class, Event}} ->
+        {ok, {Key, Class, Event, Gen}} ->
             State1 = settle_notify(Key, Class, Event, Result,
                                    State#state{notify_pids = Pids#{Pid := resolved}}),
-            State2 = case {State1#state.mode, State1#state.cb_state} of
-                         {flushing, _} -> count_flushed(Result, State1);
-                         {_, closed}   -> record_result(Result, State1);
-                         _             -> State1
+            State2 = case {State1#state.mode, State1#state.cb_state, State1#state.cb_gen} of
+                         {flushing, _, _}   -> count_flushed(Result, State1);
+                         {_, closed, Gen}   -> record_result(Result, State1);
+                         _                  -> State1
                      end,
             {noreply, report_notify_counts(Before, settle(State2))};
         _ ->
@@ -1415,7 +1484,7 @@ handle_info({'DOWN', _MonRef, process, Pid, _Reason},
     %% headroom may continue.
     Before = notify_counts(State),
     case maps:find(Pid, Pids) of
-        {ok, {_Key, Class, _Event}} -> emit_notify_lost(Class, crashed, 1);
+        {ok, {_Key, Class, _Event, _Gen}} -> emit_notify_lost(Class, crashed, 1);
         _ -> ok
     end,
     State1 = State#state{notify_pids = maps:remove(Pid, Pids),
@@ -1447,10 +1516,29 @@ spawn_replay({AgentId, SessionId, Req0}, #state{cb_gen = Gen, replay_pids = RPid
 
 replay_one(AgentId, SessionId, Req0) ->
     Deadline = erlang:monotonic_time(millisecond) + ?REPLAY_PERMIT_WAIT_MS,
+    replay_attempt(AgentId, SessionId, Req0, Deadline, ?STREAM_LIMIT_PAUSE_MS).
+
+%% A replay gun refused locally for the server's stream limit (too_many_streams)
+%% asks for a permit again after a pause, as a proxied call does
+%% (stream_limit_pause/4); the breaker does not see it.
+replay_attempt(AgentId, SessionId, Req0, Deadline, Pause) ->
     case yuzu_gw_upstream_regulator:ask(replay, Deadline) of
         {ok, Permit} ->
-            try replay_permitted(AgentId, SessionId, Req0)
-            after yuzu_gw_upstream_regulator:done(Permit)
+            Outcome = try replay_permitted(AgentId, SessionId, Req0)
+                      after yuzu_gw_upstream_regulator:done(Permit)
+                      end,
+            case Outcome of
+                stream_limit ->
+                    case Deadline - erlang:monotonic_time(millisecond) > Pause of
+                        true ->
+                            timer:sleep(Pause),
+                            replay_attempt(AgentId, SessionId, Req0, Deadline,
+                                           min(?STREAM_LIMIT_PAUSE_MAX_MS, 2 * Pause));
+                        false ->
+                            skipped
+                    end;
+                _ ->
+                    Outcome
             end;
         {error, _} ->
             skipped
@@ -1505,6 +1593,10 @@ stored_request(_SessionId, _Req) ->
 replay_send(AgentId, Pid, SessionId, RegisterReq) ->
     Result = do_rpc_replay('ProxyRegister', RegisterReq, register, SessionId),
     case Result of
+        {error, too_many_streams} ->
+            %% Not sent: the connection is at the server's stream limit
+            %% (replay_attempt/5 waits and asks again).
+            stream_limit;
         {local_error, {Class, Why}} ->
             %% The stored request could not be encoded here, so nothing was
             %% sent: no verdict about the upstream (record_result/2
@@ -1588,7 +1680,7 @@ terminate(_Reason, #state{notify_pending = Pending, notify_pids = Pids}) ->
     %% one loses it: counted, and named in one line, never sent from here (the
     %% supervisor gives this callback 5 s, no place for RPCs).
     Held = held_by_class(Pending),
-    InFlight = [C || {_K, C, _E} <- maps:values(Pids)],
+    InFlight = [C || {_K, C, _E, _G} <- maps:values(Pids)],
     [emit_notify_lost(C, shutdown, N) || {C, N} <- Held],
     [emit_notify_lost(C, shutdown, 1) || C <- InFlight],
     case lists:sum([N || {_, N} <- Held]) + length(InFlight) of
@@ -1915,7 +2007,8 @@ drain(#state{mode = flushing, cb_state = CbState} = State) when CbState =/= clos
     %% The breaker is not consulted or moved (count_flushed/2).
     Drained = drain(State#state{cb_state = closed}),
     Drained#state{cb_state = CbState};
-drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending} = State) ->
+drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
+             cb_gen = Gen} = State) ->
     case map_size(Pids) < notify_limit_now(State) of
         false ->
             State;
@@ -1949,7 +2042,7 @@ drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending} = 
                                 Server ! {notify_result, self(), Result}
                             end),
                             drain(State#state{notify_pending = Pending1,
-                                              notify_pids = Pids#{Pid => {Key, class_of(Notification), Ev}}})
+                                              notify_pids = Pids#{Pid => {Key, class_of(Notification), Ev, Gen}}})
                     end
             end
     end;
@@ -1984,7 +2077,7 @@ drain(#state{cb_state = half_open, notify_probe = undefined, notify_pids = Pids,
             %% cancelled with the probe, see handle_info({notify_probe_timeout, ...}).
             Timer = erlang:send_after(ProbeTimeout, Server, {notify_probe_timeout, Pid, Gen}),
             State#state{notify_pending = Pending1,
-                        notify_pids = Pids#{Pid => {Key, class_of(Notification), Event}},
+                        notify_pids = Pids#{Pid => {Key, class_of(Notification), Event, Gen}},
                         notify_probe = #{pid => Pid, mref => MonRef, timer => Timer,
                                          gen => Gen, key => Key, event => Event}}
     end;
@@ -2102,12 +2195,12 @@ settle_notify(Key, Class, Event, {error, _}, #state{notify_pending = Pending} = 
 %% The slots held back for Key's admission: one per send in flight whose event
 %% may come back (not yet resolved), except one for Key itself.
 reserved_slots(Key, #state{notify_pids = Pids}) ->
-    maps:fold(fun(_Pid, {K, _, _}, N) when K =/= Key -> N + 1;
+    maps:fold(fun(_Pid, {K, _, _, _}, N) when K =/= Key -> N + 1;
                  (_Pid, _Other, N) -> N
               end, 0, Pids).
 
 key_in_flight(Key, Pids) ->
-    lists:any(fun({K, _, _}) -> K =:= Key; (_) -> false end, maps:values(Pids)).
+    lists:any(fun({K, _, _, _}) -> K =:= Key; (_) -> false end, maps:values(Pids)).
 
 class_of(#{event := 'CONNECTED'}) -> connected;
 class_of(_Notification)           -> disconnected.
@@ -2142,7 +2235,7 @@ end_flush(#state{flush_from = From, flush_timer = Timer, flush_sent = Sent,
                  notify_pending = Pending, notify_pids = Pids} = State) ->
     _ = erlang:cancel_timer(Timer),
     Held = held_by_class(Pending),
-    InFlight = [C || {_K, C, _E} <- maps:values(Pids)],
+    InFlight = [C || {_K, C, _E, _G} <- maps:values(Pids)],
     Left = lists:sum([N || {_, N} <- Held]) + length(InFlight),
     [emit_notify_lost(C, shutdown, N) || {C, N} <- Held],
     [emit_notify_lost(C, shutdown, 1) || C <- InFlight],
@@ -2749,6 +2842,17 @@ do_rpc(Method, Request, Tag, Metadata, Timeout) ->
                                 code => Status}),
             logger:warning("Upstream RPC ~s failed with HTTP-level error: ~p", [Method, Status]),
             {error, {internal, iolist_to_binary(io_lib:format("http_error ~p", [Status]))}};
+        {error, too_many_streams} ->
+            %% gun refused to open the stream: the connection is at the server's
+            %% SETTINGS_MAX_CONCURRENT_STREAMS (RFC 9113 5.1.2). Nothing was
+            %% sent. Counted under its own code; the proxied calls and replays
+            %% wait and try again without telling the breaker, and the other
+            %% lanes count it like any failed send (see the module doc).
+            telemetry:execute([yuzu, gw, upstream, rpc_error],
+                              #{count => 1},
+                              #{rpc_name => atom_to_binary(Tag, utf8),
+                                code => <<"too_many_streams">>}),
+            {error, too_many_streams};
         {error, {connection_lost, Conn}} when is_pid(Conn) ->
             %% The connection the call ran on closed or went away: the breaker
             %% counts this connection once (record_result/2), and the caller sees
@@ -2795,6 +2899,16 @@ encode_request(Msg, InputType) ->
     catch Class:Why ->
         erlang:error({?LOCAL_ENCODE_FAILED, Class, redact_why(Why)})
     end.
+
+%% @doc The streams the gateway's lanes other than the permit pools can hold
+%% open upstream at once: stream-status notifications, Guardian forwards and the
+%% heartbeat flush. yuzu_gw_upstream_regulator keeps them out of the server's
+%% capacity before it sizes the register and inventory pools. (A planned stop's
+%% last gasp sends up to STOP_NOTIFY_INFLIGHT notifications, but by then every
+%% permit is refused.)
+-spec reserved_streams() -> pos_integer().
+reserved_streams() ->
+    ?MAX_NOTIFY_INFLIGHT + ?MAX_GUARDIAN_INFLIGHT + ?HEARTBEAT_FLUSH_STREAMS.
 
 %% @doc The result as the callers of proxy_register/1 and proxy_inventory/1 and
 %% the log lines of the workers see it: a local encode exception reads as the
