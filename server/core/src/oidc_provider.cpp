@@ -2606,7 +2606,7 @@ void OidcProvider::retire(std::unique_ptr<OidcProvider> unpublished) {
     for (const auto n : overflow_counts)
         spdlog::warn("OidcProvider: {} replaced providers still have a request in flight; "
                      "waiting for the oldest to finish (the reply to this Settings save is held "
-                     "until then; the settings are already stored)",
+                     "until then)",
                      n);
     to_destroy.clear();
 }

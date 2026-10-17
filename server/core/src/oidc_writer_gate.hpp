@@ -19,11 +19,19 @@
 // ticket ends when the writer owns the lock (a reader that passed the gate in the instant before
 // the ticket was raised can still barge once; it finishes quickly and every later reader waits).
 //
-// The common case costs one relaxed-acquire atomic load. The gate is process-wide: it only delays
+// The common case costs one acquire atomic load. The gate is process-wide: it only delays
 // readers during the short window in which a save waits for the lock, and it holds no lock of its
 // own while a reader is inside `oidc_mu_`, so it cannot create a cycle with it. A reader MUST NOT
 // call `reader_pass()` while it already holds the shared lock (a nested acquisition would wait
 // behind a writer that is waiting for it); every call site takes the shared lock exactly once.
+// A Ticket is raised only by the Settings save handler, and only while it holds `oidc_save_mu_`,
+// so at most one is outstanding in a server; a shared-lock read made on the save handler's own
+// thread under that mutex (before its ticket exists) needs no `reader_pass()`. A new
+// `shared_lock(oidc_mu_)` site on any other thread MUST call `reader_pass()` first, or writer
+// starvation returns silently.
+//
+// `Ticket::release()` is noexcept and takes `mu_`; std::mutex::lock does not throw on the
+// supported platforms (the same assumption `OidcProvider::release_lease` makes).
 #pragma once
 
 #include <atomic>
@@ -70,8 +78,10 @@ public:
 
     /// The process-wide gate the routes use.
     static OidcWriterGate& instance() {
-        static OidcWriterGate g;
-        return g;
+        // Leaked on purpose (as `retired_providers()` is): a request thread still running during
+        // static destruction must not touch a destroyed mutex.
+        static auto* const g = new OidcWriterGate();
+        return *g;
     }
 
     /// Writers currently waiting (tests).

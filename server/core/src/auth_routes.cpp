@@ -3913,11 +3913,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             if (superseded_after_mint) {
                 const bool persisted = auth_mgr_.invalidate_session(session_token);
                 spdlog::warn("OIDC callback refused after the session was minted: a Settings "
-                             "save replaced the provider while this sign-in was in flight{}",
+                             "save replaced the provider while this sign-in was in flight for "
+                             "'{}'{}",
+                             ::yuzu::log_key_token(username),
                              persisted ? "" : " (the durable session delete failed)");
-                audit_log(req, "auth.oidc_login_failed", "failure", {}, {},
-                          std::string("reason=provider_replaced;post_mint=true") +
-                              (persisted ? "" : ";db_persisted=false"));
+                // A session row existed for this principal, so the row names it (as the
+                // session_create_failed refusal above does); `username` is the stable
+                // issuer-scoped id, never an IdP free-text field.
+                audit_log_for_principal(req, "auth.oidc_login_failed", "failure", username, "user",
+                                        "", "",
+                                        std::string("reason=provider_replaced;post_mint=true") +
+                                            (persisted ? "" : ";db_persisted=false"));
                 emit_event("auth.oidc_login_failed", req,
                            {{"source_ip", req.remote_addr}, {"error", "provider_replaced"}}, {},
                            Severity::kWarn);

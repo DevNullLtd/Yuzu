@@ -25,6 +25,7 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "oidc_provider.hpp"
+#include "oidc_writer_gate.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "session_store.hpp"
@@ -1102,6 +1103,48 @@ TEST_CASE("OIDC route: a Settings swap between the first provider check and the 
 }
 
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+TEST_CASE("OIDC route: the landing page and the sign-in start wait at the writer gate while a "
+          "Settings save is waiting for the OIDC lock",
+          "[pg][oidc][oidc_lease][oidc_gate][auth_routes]") {
+    // Pins the WIRING of the writer gate in auth_routes.cpp (#5692 UP-13): deleting a
+    // `reader_pass()` there brings writer starvation back with every other test still green.
+    OidcRoutesFixture fix;
+    fix.oidc_provider = std::make_unique<oidc::OidcProvider>(flow_cfg("http://127.0.0.1:1/token"));
+    fix.cfg.oidc_redirect_uri = "https://yuzu.example.test/auth/callback";
+    auto& gate = yuzu::server::oidc::OidcWriterGate::instance();
+    REQUIRE(gate.waiting_for_test() == 0);
+    for (const std::string path : {std::string("/home"), std::string("/auth/oidc/start")}) {
+        CAPTURE(path);
+        std::optional<yuzu::server::oidc::OidcWriterGate::Ticket> ticket;
+        ticket.emplace(gate); // a save waiting for the exclusive lock
+        std::atomic<bool> done{false};
+        std::unique_ptr<httplib::Response> res;
+        Browser b;
+        std::thread worker([&] {
+            res = fix.sink.dispatch("GET", path, {}, "application/json", b.headers());
+            done = true;
+        });
+        struct ReleaseAndJoin {
+            std::optional<yuzu::server::oidc::OidcWriterGate::Ticket>& tk;
+            std::thread& t;
+            ~ReleaseAndJoin() {
+                tk.reset();
+                if (t.joinable())
+                    t.join();
+            }
+        } release_and_join{ticket, worker};
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK_FALSE(done.load()); // held at the gate
+        ticket.reset();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!done.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        CHECK(done.load());
+        worker.join();
+        REQUIRE(res != nullptr);
+    }
+}
 
 TEST_CASE("OIDC binding route: a digest failure at login start answers 500 with no cookie and no redirect",
           "[pg][oidc][oidc_binding][oidc_hash_failure][auth_routes]") {

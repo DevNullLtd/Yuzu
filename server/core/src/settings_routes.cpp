@@ -4631,13 +4631,16 @@ void SettingsRoutes::register_routes(
                 // so swallowing here cannot lose or double-free it.
                 try {
                     oidc::OidcProvider::retire(std::move(unpublished));
-                } catch (...) {
+                } catch (const std::exception& e) {
                     // Nothing was lost, but the retirement bound did not run: say so.
                     try {
-                        spdlog::error("OIDC settings save: retiring the replaced provider "
-                                      "failed (the provider is destroyed or kept on the list, never lost)");
+                        spdlog::error("OIDC settings save: retiring the replaced provider failed "
+                                      "({}); the provider is destroyed or kept on the list, "
+                                      "never lost",
+                                      e.what());
                     } catch (...) {
                     }
+                } catch (...) {
                 }
             }
         } retire_on_exit;
@@ -4670,6 +4673,8 @@ void SettingsRoutes::register_routes(
             client_secret.clear();
         std::string stored_secret;
         {
+            // No writer-gate pass here: this thread holds `oidc_save_mu_`, and only the holder of
+            // that mutex ever raises a ticket, so none can be outstanding.
             std::shared_lock oidc_lock(*oidc_mu_);
             stored_secret = cfg_->oidc_client_secret;
         }

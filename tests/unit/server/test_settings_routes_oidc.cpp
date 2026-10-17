@@ -31,6 +31,7 @@
  */
 
 #include "settings_routes.hpp"
+#include "oidc_writer_gate.hpp"
 
 #include "key_provider.hpp"
 #include "pg/pg_pool.hpp"
@@ -778,6 +779,81 @@ TEST_CASE("Settings OIDC: a save returns promptly although a request holds a lea
     REQUIRE(second);
     CHECK(second->status == 200);
     oidc::OidcProvider::drain_retired();
+}
+
+// ── Writer-gate wiring ───────────────────────────────────────────────────────
+
+TEST_CASE("Settings OIDC: a save raises the writer ticket while it waits for the exclusive lock",
+          "[settings][oidc][oidc_gate]") {
+    // Pins the WIRING the gate unit tests cannot: deleting the Ticket in the save handler brings
+    // writer starvation back (#5692 UP-13) with every other test still green.
+    OidcHarness h{"", /*open_store=*/false};
+    oidc::OidcProvider::drain_retired();
+    auto& gate = yuzu::server::oidc::OidcWriterGate::instance();
+    REQUIRE(gate.waiting_for_test() == 0);
+    const std::string body =
+        "issuer=https://idp.example&client_id=cid&client_secret=s&redirect_uri="
+        "https://yuzu.example/auth/callback&admin_group=&skip_tls_verify=false";
+    std::shared_lock<std::shared_mutex> reader(h.oidc_mu); // a request inside the shared lock
+    std::unique_ptr<httplib::Response> res;
+    std::thread worker([&] {
+        res = h.sink.Post("/api/settings/oidc", body, "application/x-www-form-urlencoded");
+    });
+    // Declared after `worker`: lets the save finish, then joins, on any exit.
+    struct ReleaseAndJoin {
+        std::shared_lock<std::shared_mutex>& l;
+        std::thread& t;
+        ~ReleaseAndJoin() {
+            if (l.owns_lock())
+                l.unlock();
+            if (t.joinable())
+                t.join();
+        }
+    } release_and_join{reader, worker};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (gate.waiting_for_test() == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    CHECK(gate.waiting_for_test() == 1); // the save is waiting for the lock, ticket raised
+    reader.unlock();
+    worker.join();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(gate.waiting_for_test() == 0); // released once the save owned the lock
+    oidc::OidcProvider::drain_retired();
+}
+
+TEST_CASE("Settings OIDC: the directory page waits at the writer gate while a save is waiting",
+          "[settings][oidc][oidc_gate]") {
+    OidcHarness h{"", /*open_store=*/false};
+    auto& gate = yuzu::server::oidc::OidcWriterGate::instance();
+    REQUIRE(gate.waiting_for_test() == 0);
+    std::optional<yuzu::server::oidc::OidcWriterGate::Ticket> ticket;
+    ticket.emplace(gate); // a save waiting for the exclusive lock
+    std::atomic<bool> done{false};
+    std::unique_ptr<httplib::Response> res;
+    std::thread worker([&] {
+        res = h.sink.Get("/fragments/settings/directory");
+        done = true;
+    });
+    struct ReleaseAndJoin {
+        std::optional<yuzu::server::oidc::OidcWriterGate::Ticket>& tk;
+        std::thread& t;
+        ~ReleaseAndJoin() {
+            tk.reset();
+            if (t.joinable())
+                t.join();
+        }
+    } release_and_join{ticket, worker};
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK_FALSE(done.load()); // held at the gate
+    ticket.reset();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    CHECK(done.load());
+    worker.join();
+    REQUIRE(res);
+    CHECK(res->status == 200);
 }
 
 // ── Two saves racing ─────────────────────────────────────────────────────────

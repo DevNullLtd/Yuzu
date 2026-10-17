@@ -199,7 +199,7 @@ public:
     /// the exclusive `oidc_mu_` swap unpublished it, so no new lease can start on it afterwards.
     /// A publish always installs a NEW object while the old one is leased or retired, so a
     /// caller that holds a lease may compare `get()` with the published pointer to learn whether
-    /// a save has replaced it (the address cannot be reused while the lease is held); a second
+    /// a save has replaced it (the address cannot be reused while the lease is held). The callback holds its lease through the group sync and the session write, so a lease can outlive its provider's replacement by as long as the database takes; a second
     /// writer, or an in-place reconfigure, would need a generation number instead.
     [[nodiscard]] Lease acquire_lease() noexcept;
 
