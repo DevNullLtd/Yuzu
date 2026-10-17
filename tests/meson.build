@@ -3187,6 +3187,16 @@ test('instructions risk table',
   timeout: 30,
 )
 
+# The /test Instructions gate's parameter synthesis must satisfy every definition's
+# validation.pattern (the server answers 400 otherwise). Hermetic — imports the
+# runner and parses content/definitions/, starts no server.
+test('instructions runner parameter synthesis',
+  _python3_test,
+  args: [files('test_instructions_runner_params.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
 # scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
 # script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;
