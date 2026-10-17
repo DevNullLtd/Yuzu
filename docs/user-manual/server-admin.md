@@ -3652,7 +3652,7 @@ For environments that need something between manual approval and pre-shared toke
 
 1. Navigate to **Estate > Groups and enrolment** (panel **Auto-approve rules**) or **Settings > Auto-Approve Policies**.
 2. Create a rule with conditions (e.g., hostname matches `prod-web-*`, source IP in `10.0.0.0/8`). The Add rule confirmation asks before it saves; see [Auto-Approval Policies](device-management.md#auto-approval-policies) for what each rule type matches, what the server refuses and which rules the page flags.
-3. Agents matching any active policy are approved automatically at registration time.
+3. Agents matching any active policy are approved automatically at registration time. In "all" match mode every enabled rule must match, so an enabled `trusted_ca` rule (which never matches at this release) means no agent is auto-approved.
 
 ---
 
