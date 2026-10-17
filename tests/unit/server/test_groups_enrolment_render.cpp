@@ -129,6 +129,39 @@ TEST_CASE("enrolment: utc_stamp prints out of range instead of a bogus date",
     CHECK_THAT(html, ContainsSubstring("<span class=\"pill info\">Active</span>"));
 }
 
+// The element ids are baked into the Groups template and the Settings page, and an htmx swap
+// lands in whatever hx-target names. A renderer that targeted another panel's id would drop its
+// refreshed list into the wrong panel, so every target must be the section that owns the fragment.
+TEST_CASE("enrolment: every hx-target is the section that owns the fragment",
+          "[groups][enrolment][render]") {
+    using T = auth::AutoApproveRuleType;
+    const auto check = [](const std::string& html, const std::string& section,
+                          std::size_t at_least) {
+        const auto targets = hx_targets(html);
+        INFO("section=" << section);
+        CHECK(targets.size() >= at_least); // not vacuous: the buttons and forms are really there
+        for (const auto& t : targets)
+            CHECK(t == section);
+    };
+
+    const std::vector<auth::EnrollmentToken> toks = {token("aaaaaaaa", "live"),
+                                                     token("bbbbbbbb", "gone", 0, 0, true)};
+    // Done + Revoke + the generate form.
+    check(render_tokens(&toks, "secret", kNow), "#token-section", 3);
+    check(render_tokens(nullptr, "", kNow), "#token-section", 0);
+
+    const std::vector<auth::PendingAgent> agents = {agent("one", "h1"), agent("two", "h2"),
+                                                    agent("three", "h3", auth::PendingStatus::denied)};
+    // Approve + Deny + Forget for two rows, then Approve all and Deny all.
+    check(render_pending(&agents), "#pending-section", 8);
+
+    const std::vector<auth::AutoApproveRule> rules = {{T::hostname_glob, "a.corp", "", true},
+                                                      {T::ip_subnet, "10.0.0.0/8", "", false}};
+    // The other match mode, Toggle + Remove for two rules, and the Add form.
+    check(render_auto_approve(rules, false), "#auto-approve-section", 6);
+    check(render_auto_approve(rules, true), "#auto-approve-section", 6);
+}
+
 TEST_CASE("enrolment: match-everything detection", "[groups][enrolment][render]") {
     using T = auth::AutoApproveRuleType;
     // warns
