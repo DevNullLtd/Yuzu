@@ -4,4 +4,6 @@ date: 2026-09-06
 status: REAL CAPTURE
 note: probe output, not reconstructed -- NTSTATUS 0x00000000 (STATUS_SUCCESS) both for RtlGetCompressionWorkSpaceSize and RtlDecompressBufferEx; decompressed bytes 4-7 = SCCA. Full NTSTATUS/size values recorded verbatim in probes/the-rig-probe-findings.md.
 
-Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.
+Redacted 2026-10-17: the capturing account name is shown as `jsmith` in this note, and in this file five UTF-16
+paths \USERS\<account>\... (the account's profile and TEMP directories) are replaced with the same-length
+placeholder \USERS\USER\..., so every size and offset is unchanged. No other byte was changed.

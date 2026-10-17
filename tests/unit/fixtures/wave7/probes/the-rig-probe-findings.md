@@ -108,4 +108,4 @@ registered for this capture; no `WMI subscription` was created and none needed r
 - No HKLM/HKU keys were modified; no scheduled task or WMI subscription other than the two temporary
   probe launchers (both since removed) was created.
 
-Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

@@ -3,4 +3,4 @@ command: same capture as shimcache.bin; length and first 64 bytes hex-dumped inl
 date: 2026-09-06
 status: REAL CAPTURE
 
-Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

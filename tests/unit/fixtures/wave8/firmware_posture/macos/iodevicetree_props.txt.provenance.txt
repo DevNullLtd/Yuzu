@@ -3,4 +3,4 @@ status: REAL CAPTURE via a throwaway IOKit probe (not committed): IORegistryEntr
 format: "[node <path>] present|absent", then "<key><TAB>data|other|absent<TAB><hex>"
 notes: IODeviceTree:/rom is absent on Apple Silicon (`ioreg -p IODeviceTree -n rom` also has no match); the version is /chosen system-firmware-version = "mBoot-18000.161.10", and firmware-version is the same text in a 256-byte NUL-padded buffer. Intel /rom keys are not captured.
 
-Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

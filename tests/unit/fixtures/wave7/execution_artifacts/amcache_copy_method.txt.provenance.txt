@@ -4,4 +4,4 @@ date: 2026-09-06
 status: REAL CAPTURE
 note: plain Copy-Item SUCCEEDED (no sharing violation) -- the CreateFile+FILE_FLAG_BACKUP_SEMANTICS fallback path was not needed on this host. Amcache.hve.LOG1/.LOG2 did not exist alongside the live hive (SilentlyContinue, no error). The hive copy itself was used only as scratch input to reg load / RegLoadAppKeyW and is NOT committed to the repo (spec: "do NOT commit the hive").
 
-Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

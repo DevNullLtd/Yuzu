@@ -29,4 +29,4 @@ binding check list every queue's jobs, so any job id passed, and Cancel-Job
 end to end on this cupsd. The test that loads this file proves the second guard:
 a job is accepted only when its own job-printer-uri names the named printer.
 
-Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

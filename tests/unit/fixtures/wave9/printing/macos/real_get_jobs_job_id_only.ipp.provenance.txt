@@ -28,4 +28,4 @@ that omits the attribute. A job listed this way cannot be confirmed to
 be on the named printer, so `run_clear_queue` reports it as an error and sends
 no Cancel-Job.
 
-Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.
