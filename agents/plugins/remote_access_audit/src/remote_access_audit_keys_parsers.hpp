@@ -409,6 +409,19 @@ inline bool skip_dequoted(std::string_view s, std::size_t& at) {
     return true;
 }
 
+/// The grammar of a key-type name this table does not know: 1..64 bytes of [A-Za-z0-9._@+-]
+/// (every OpenSSH name fits: `webauthn-sk-ecdsa-sha2-nistp256@openssh.com`). The type token is
+/// the one subject-authored token that reaches a key row verbatim, so it can never carry the
+/// quote, `=`, `/`, space or free text of an option clause.
+inline bool is_key_type_name(std::string_view t) {
+    if (t.empty() || t.size() > 64)
+        return false;
+    return std::ranges::all_of(t, [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+               c == '_' || c == '@' || c == '+' || c == '-';
+    });
+}
+
 } // namespace detail
 
 /// auth-options.c sshauthopt_parse, syntactically. nullopt == sshd would reject the line:
@@ -496,7 +509,8 @@ inline std::optional<KeyOptions> parse_key_options(std::string_view s) {
 /// What reading one key off the front of `s[at..]` found. Mirrors sshkey_read: the type
 /// token runs to space/tab, the blob token to the next space/tab, and the decoded blob must
 /// be the same KEY TYPE as the token (rsa-sha2-256 and ssh-rsa are one type; an ECDSA token
-/// must name the blob's curve).
+/// must name the blob's curve). A type this table does not know is accepted only as 1..64 bytes
+/// of [A-Za-z0-9._@+-] (detail::is_key_type_name), so the token is never an option clause.
 struct ReadKey {
     KeyFacts facts;
     std::string type_token; ///< as written; a known name, or an unknown type (see unknown)
@@ -542,9 +556,12 @@ inline std::optional<ReadKey> try_read_key(std::string_view s, std::size_t at) {
     // A type this table does not know (ssh-dss, a newer algorithm): inventoried when the
     // blob leads with that same name, fingerprinted over the raw blob (which is what
     // ssh-keygen does for a plain key). A certificate of an unknown type cannot be unwrapped.
+    // The name must also fit detail::is_key_type_name (1..64 bytes of [A-Za-z0-9._@+-]): the
+    // token is written to the key row verbatim, so an option clause such as `command="..."`
+    // that a crafted blob repeats is refused here and left to the option parser.
     detail::Reader r{*blob};
     const auto lead = r.str();
-    if (!lead || *lead != type_token || type_token.empty() ||
+    if (!lead || *lead != type_token || !detail::is_key_type_name(type_token) ||
         type_token.find("-cert-v01@openssh.com") != std::string_view::npos)
         return std::nullopt;
     out.unknown = true;

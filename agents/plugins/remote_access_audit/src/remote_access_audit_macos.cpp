@@ -44,7 +44,8 @@ int run_macos(yuzu::CommandContext& ctx) {
     p.launchd = true;
     p.config = "/etc/ssh/sshd_config";
     p.home_parents = {"/Users"};
-    p.single_homes = {"/var/root"};
+    // canonical spelling: /var is a link to private/var and a home opens hop by hop with no link followed
+    p.single_homes = {"/private/var/root"};
     p.min_uid = 500; // an account home, not Shared or a stray entry (autoruns_macos.cpp's rule)
     p.mounts = &macos_network_prefixes;
     p.run = [](const std::vector<std::string>& args, const yuzu::agent::SubprocessOptions& opts) {

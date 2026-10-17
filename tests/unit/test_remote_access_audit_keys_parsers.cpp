@@ -232,6 +232,39 @@ TEST_CASE("remote_access_audit keys: sk keys and an unknown key type", "[remote_
     CHECK(parse(line("ssh-xyz-cert-v01@openssh.com", b64(str("ssh-xyz-cert-v01@openssh.com")))).kp.malformed == 1);
 }
 
+TEST_CASE("remote_access_audit keys: an option clause is never accepted as an unknown key type",
+          "[remote_access_audit][keys]") {
+    // RECONSTRUCTION of the hostile shape: the first token is an option clause and the blob
+    // that follows leads with that same token, so the unknown-type fallback would otherwise
+    // write the clause (and its value) into the key row's type column verbatim.
+    const std::string secret = "PRIVATE_OPTION_VALUE";
+    for (const std::string& clause : {"command=\"" + secret + "\"", "from=\"" + secret + "\"",
+                                     "principals=\"" + secret + "\"", "environment=\"" + secret + "=W\""}) {
+        CAPTURE(clause);
+        const auto p = parse(line(clause, b64(str(clause))));
+        CHECK(p.kp.rows.empty());
+        CHECK(p.kp.malformed == 1);
+        CHECK(p.kp.keys == 0);
+        for (const auto& row : p.kp.rows)
+            CHECK(row.find(secret) == std::string::npos);
+    }
+    // outside the type-name grammar: a `/`, a space-free over-length token (65 bytes), a quote
+    CHECK(parse(line("ssh/foo", b64(str("ssh/foo")))).kp.malformed == 1);
+    CHECK(parse(line(std::string(65, 'a'), b64(str(std::string(65, 'a'))))).kp.malformed == 1);
+    CHECK(parse(line("ssh\"x", b64(str("ssh\"x")))).kp.malformed == 1);
+    // positive controls: the longest legal name (64) and a real newer-algorithm name still
+    // inventory, flagged unknown_type, with the fingerprint taken over the raw blob
+    const std::string longest(64, 'a');
+    CHECK(parse(line(longest, b64(str(longest)))).kp.keys == 1);
+    const std::string sk_foo = "sk-foo@openssh.com";
+    const auto ok = parse(line(sk_foo, b64(str(sk_foo) + str("\7"))));
+    REQUIRE(ok.rows.size() == 1);
+    CHECK(ok.kp.malformed == 0);
+    CHECK(ok.kp.unknown_type);
+    CHECK(ok.rows[0][kType] == sk_foo);
+    CHECK(ok.rows[0][kFlags] == "unknown_type");
+}
+
 TEST_CASE("remote_access_audit keys: the blob is decoded completely and trailing bytes are refused",
           "[remote_access_audit][keys]") {
     const auto ed = [&](const std::string& pk) { return b64(str("ssh-ed25519") + str(pk)); };

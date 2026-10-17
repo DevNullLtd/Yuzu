@@ -257,7 +257,7 @@ TEST_CASE("remote_access_audit posix fs: account eligibility is a path lstat, fa
     // a link is never judged by its own owner: eligible even under a floor its owner misses
     // (a root-owned /Users/alice -> /Volumes/Data/Users/alice), and refused loudly at open
     CHECK(high.is_account_home(linked));
-    // a single home (/root, /var/root) is never filtered: it is root's own home by definition
+    // a single home (/root, /private/var/root) is never filtered: it is root's own home by definition
     CHECK(high.is_account_home({"rootsingle", t.at("rootsingle").string()}));
     // a failed stat is not a confirmed owner: eligible, so open_home reports the errno
     CHECK(high.is_account_home({"ghost", t.at("home/ghost").string()}));
@@ -366,6 +366,21 @@ TEST_CASE("remote_access_audit posix fs: a symlinked home parent is resolved by 
         CHECK(b.list_homes({t.at("homes").string()}, homes, too_many) == ELOOP);
         CHECK(homes.empty());
     }
+    SECTION("a single home whose own path holds a linked ancestor is refused while the resolved-parent homes still read") {
+        fs::create_directories(t.at("real_roots/rootx/.ssh"));
+        t.write(t.at("real_roots/rootx/.ssh/authorized_keys"), kAliceKey);
+        fs::create_directory_symlink(t.at("real_roots"), t.at("roots_alias"));
+        auto q = p;
+        q.single_homes = {t.at("roots_alias/rootx").string()};
+        const auto bq = make_posix_fs(q);
+        CHECK(bq.open_home({"rootx", t.at("roots_alias/rootx").string()}) == ELOOP);
+        const auto l = list_posix(bq);
+        CHECK(std::ranges::find(l.rows, "file|alice|authorized_keys|read|1|0|0") != l.rows.end());
+        CHECK(std::ranges::find(l.rows, "file|rootx|authorized_keys|failed|-|-|-") != l.rows.end());
+        CHECK(l.reason.find("linux:remote_access_audit:homes:eloop") != std::string::npos);
+        for (const auto& r : l.rows)
+            CHECK(r.rfind("file|rootx|authorized_keys|read", 0) != 0);
+    }
     SECTION("the whole listing reads alice's key") {
         const auto l = list_posix(b);
         CHECK(std::ranges::find(l.rows, "file|alice|authorized_keys|read|1|0|0") != l.rows.end());
@@ -433,6 +448,55 @@ TEST_CASE("remote_access_audit posix fs: a link chain or a linked component unde
         p.home_parents = {t.at("lnk/homes").string()};
         const auto b = make_posix_fs(p);
         refused_loudly(list_posix(b));
+    }
+}
+
+TEST_CASE("remote_access_audit posix fs: a single home reached through an aliased ancestor is refused, not matched or walked",
+          "[remote_access_audit][posix_fs]") {
+    // The macOS shape: /var is a link to private/var, getmntinfo names the CANONICAL spelling,
+    // and the configured home is spelled through the link. The configured spelling can never
+    // match the mount table, so the open itself must refuse the link. RECONSTRUCTION: the
+    // target is named by the run-start mount table and holds a valid key.
+    Tree t;
+    t.write(t.at("real/root/.ssh/authorized_keys"), kAliceKey);
+    fs::create_directory_symlink(t.at("real"), t.at("alias"));
+    const auto net = [&] {
+        return std::optional<std::vector<std::string>>{std::vector<std::string>{t.at("real/root").string()}};
+    };
+    auto p = t.paths();
+    p.home_parents = {};
+    p.run = service_enabled;
+    p.mounts = net;
+    const auto no_key_read = [&](const Listing& l) {
+        for (const auto& r : l.rows) {
+            CHECK(r.find(kAliceFp) == std::string::npos);
+            CHECK(r.rfind("key|", 0) != 0);
+            CHECK(r.find("|read|1|") == std::string::npos);
+        }
+        CHECK(l.status == StatusState::constrained);
+    };
+
+    SECTION("the aliased spelling opens hop by hop, answers ELOOP, and reads nothing") {
+        p.single_homes = {t.at("alias/root").string()};
+        const auto b = make_posix_fs(p);
+        CHECK(b.open_home({"root", t.at("alias/root").string()}) == ELOOP);
+        const auto l = list_posix(b);
+        no_key_read(l);
+        CHECK(std::ranges::find(l.rows, "file|root|authorized_keys|failed|-|-|-") != l.rows.end());
+        CHECK(l.reason.find("linux:remote_access_audit:homes:eloop") != std::string::npos);
+    }
+    SECTION("the canonical spelling is matched by the mount guard and never opened") {
+        p.single_homes = {t.at("real/root").string()};
+        const auto l = list_posix(make_posix_fs(p));
+        no_key_read(l);
+        CHECK(std::ranges::find(l.rows, "source|homes|absent|-") != l.rows.end()); // never listed, so never opened
+        CHECK(l.reason.find("linux:remote_access_audit:keys:network_mount_skipped") != std::string::npos);
+    }
+    SECTION("the canonical spelling off any mount is read") {
+        p.single_homes = {t.at("real/root").string()};
+        p.mounts = [] { return std::optional<std::vector<std::string>>{std::vector<std::string>{}}; };
+        const auto l = list_posix(make_posix_fs(p));
+        CHECK(std::ranges::find(l.rows, "file|root|authorized_keys|read|1|0|0") != l.rows.end());
     }
 }
 

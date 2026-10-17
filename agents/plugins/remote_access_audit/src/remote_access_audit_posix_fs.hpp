@@ -19,8 +19,10 @@
  * absolute entry is opened from "/" one O_NOFOLLOW component at a time, so a link in ANY
  * directory of its chain is refused, not only at the leaf (stock macOS /etc, /var, /tmp are
  * links: an absolute entry through one reports `failed` + symlink_refused, there is no
- * trusted-alias table). A single home (/root, /var/root) is a home, not a parent: it stays
- * no-follow.
+ * trusted-alias table). A single home (/root, /private/var/root) is a home, not a parent: it
+ * is configured under its canonical spelling and opened from "/" one component at a time like
+ * every home, so a link anywhere in its path (an aliased spelling such as /var/root, where /var
+ * is a link on macOS) answers ELOOP and is refused loudly, never walked past the mount guard.
  *
  * Reads are bounded. An Include directory and each account home are opened ONCE and every read
  * under them goes through THAT descriptor, one path component per openat() (dir-fd
@@ -63,7 +65,7 @@ struct Paths {
     bool launchd = false;
     std::string config;   ///< /etc/ssh/sshd_config
     std::vector<std::string> home_parents; ///< directories whose subdirectories are homes (/home, /Users)
-    std::vector<std::string> single_homes; ///< homes that are themselves a directory (/root, /var/root)
+    std::vector<std::string> single_homes; ///< homes that are themselves a directory, in canonical spelling (/root, /private/var/root)
     unsigned min_uid = 0; ///< a home-parent entry owned by a lower uid is not an account (macOS: 500); 0 = no filter (see PosixFs::is_account_home)
     std::size_t max_dir_entries = kMaxDirEntries; ///< injectable so a test need not make 4097 files
     std::function<std::optional<std::vector<std::string>>()> mounts; ///< network mount points
@@ -250,8 +252,8 @@ inline PosixFs make_posix_fs(const Paths& p) {
         // owner of the HOME below the floor; a failed stat answers true so open_home reports the
         // errno (refused / failed) rather than the home vanishing, and so does a link, whose
         // lstat owner (often root, for a relocated home) says nothing about the home it names:
-        // eligible at any floor, refused loudly at open. A single home (/root, /var/root) is
-        // never filtered: root's own home is owned by uid 0 by definition.
+        // eligible at any floor, refused loudly at open. A single home (/root, /private/var/root)
+        // is never filtered: root's own home is owned by uid 0 by definition.
         fs.is_account_home = [singles = p.single_homes, min_uid = p.min_uid](const HomeEntry& h) {
             if (std::ranges::find(singles, h.path) != singles.end())
                 return true;
@@ -262,7 +264,9 @@ inline PosixFs make_posix_fs(const Paths& p) {
         };
     }
     fs.open_home = [home_dir](const HomeEntry& h) {
-        *home_dir = yuzu::shared::open_dir_no_follow(h.path);
+        // Hop by hop from "/": the leaf-only path form would follow a link in any ancestor of a
+        // single home, and the mount guard compares the configured spelling.
+        *home_dir = open_dir_hops(h.path);
         if (home_dir->opened())
             return 0;
         return home_dir->err != 0 ? home_dir->err : EIO;
