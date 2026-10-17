@@ -119,14 +119,17 @@ API-token Create and Revoke buttons) now apply the same step-up check as the RES
   `/api/v1/tokens`. A deployment whose only interactive sign-in is SAML (`--auth-mode=sso-only`)
   therefore has no Settings-page route to create or revoke tokens. Create or revoke them from an
   API-token or MCP caller (the step-up check does not apply to those), or sign in with the armed
-  break-glass account. If a deployment has neither an existing token nor a break-glass account, it
-  has no route to mint one without a restart; `--mfa-step-up-window-secs 0` disables the check
-  (see Authentication) and is the documented escape hatch.
+  break-glass account and create or revoke within `--mfa-step-up-window-secs` of that sign-in (the
+  account is MFA-enrolled, so it is gated like any other local account, and it must hold an
+  administrator role). If a deployment has neither an existing token nor a usable break-glass
+  account, the only remaining route is to restart with `--mfa-step-up-window-secs 0` as a
+  temporary measure: it disables the step-up check on every gated endpoint, not only these two
+  (see [Authentication](authentication.md)), so restore the window afterwards.
 - **OIDC sessions** are gated only when the identity provider attests MFA (`amr`) or
   `--mfa-enforcement` protects the role.
 - **Local MFA-enrolled operators** whose proof is older than `--mfa-step-up-window-secs` must sign
   in again before creating or revoking a token. The Settings page cannot yet prompt for the code,
-  so the buttons do nothing until the operator re-authenticates.
+  so the button shows an error toast ("MFA step-up required") until the operator re-authenticates.
 - With no MFA enrolled and no SAML sign-in, nothing changes.
 
 ## Behaviour change: web UI wording and layout (Console, Home after sign-in, hidden quarantine controls)

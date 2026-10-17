@@ -298,6 +298,7 @@ struct SettingsAdr2001Harness {
     // The MFA step-up gate: records every action label it is asked about and, while
     // `step_up_refuse` is set, refuses like a session without fresh MFA proof.
     bool step_up_refuse{false};
+    bool step_up_plain_body{false}; // refuse with a non-envelope body
     std::vector<std::string> step_up_labels;
 
     ~SettingsAdr2001Harness() {
@@ -362,8 +363,12 @@ struct SettingsAdr2001Harness {
             step_up_labels.push_back(label);
             if (step_up_refuse) {
                 res.status = 403;
-                res.set_content(R"({"error":{"code":403,"message":"MFA step-up refused for test"}})",
-                                "application/json");
+                res.set_content(
+                    step_up_plain_body
+                        ? std::string("not json")
+                        : std::string(
+                              R"({"error":{"code":403,"message":"MFA step-up refused for test"}})"),
+                    "application/json");
                 return false;
             }
             return true;
@@ -1777,4 +1782,26 @@ TEST_CASE("SettingsRoutes api-tokens: both mutations answer 503 when the token s
     CHECK(revoked->get_header_value("HX-Trigger").find("Token store unavailable") !=
           std::string::npos);
     CHECK(nlohmann::json::parse(revoked->body).contains("error"));
+}
+
+// When the refusal body is not an A4 envelope the toast falls back to a fixed message instead of
+// showing nothing.
+TEST_CASE("SettingsRoutes api-tokens: a refused step-up without an envelope body still toasts",
+          "[pg][settings][api_tokens][step_up]") {
+    SettingsAdr2001Harness h;
+    h.step_up_refuse = true;
+    h.step_up_plain_body = true;
+
+    auto created = h.sink.Post("/api/settings/api-tokens", "name=t1",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(created);
+    CHECK(created->status == 403);
+    CHECK(created->get_header_value("HX-Trigger").find("MFA step-up required") !=
+          std::string::npos);
+
+    auto revoked = h.sink.Delete("/api/settings/api-tokens/some-token");
+    REQUIRE(revoked);
+    CHECK(revoked->status == 403);
+    CHECK(revoked->get_header_value("HX-Trigger").find("MFA step-up required") !=
+          std::string::npos);
 }
