@@ -93,8 +93,8 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         // Same-site gate for the cookie-authorised write the General page calls (API, MCP and
         // engine token callers are exempt). After the permission gate, so an unauthorised caller
         // still gets the 403 it always did, and before any refusal or the body is read, so a
-        // cross-site write is always audited as `csrf.denied`. auth_fn writes its own 401 when
-        // there is no session.
+        // cross-site write is audited as `csrf.denied` best effort (the row is attempted; the
+        // refusal does not wait on it). auth_fn writes its own 401 when there is no session.
         auto session = deps.auth_fn(req, res);
         if (!session)
             return;
@@ -109,8 +109,8 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // The score policy is one document with its own writer, which validates it
-        // whole; a generic single-value write could leave it half-edited. Refused
+        // The score policy is one document that will have its own writer (a later change),
+        // which validates it whole; a generic single-value write could leave it half-edited. Refused
         // before the store gate (the answer does not depend on the store) and with
         // no audit row, like the unknown-key refusal below.
         if (req.matches[1].str() == kDexScorePolicyKey) {

@@ -194,7 +194,7 @@ TEST_CASE("config_routes: PUT /api/config/dex_score_policy is refused with a typ
 }
 
 // The same-site gate runs before the governed-key refusal, so a cross-site browser write to
-// the key is audited as csrf.denied instead of getting a bare 400 (with a null store, and so
+// the key is audited as csrf.denied instead of getting the typed 400 (with a null store, and so
 // without reaching the store gate either).
 TEST_CASE("config_routes: a cross-site cookie PUT to dex_score_policy is a 403 with csrf.denied",
           "[server][routes][config_routes][security]") {
@@ -216,6 +216,34 @@ TEST_CASE("config_routes: a cross-site cookie PUT to dex_score_policy is a 403 w
                                 {{"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}});
     REQUIRE(same);
     CHECK(same->status == 400);
+    CHECK(h.audits.size() == 1);
+}
+
+// The same-site gate also sits before the store gate for an ordinary key: with a null store a
+// cross-site browser write is the 403 with its csrf.denied row, never the store 503, and a
+// same-site one still reaches the store 503. Fails if the gate moves below the store check.
+TEST_CASE("config_routes: a cross-site cookie PUT to an ordinary key with a null store is a 403 "
+          "with csrf.denied, a same-site one the store 503",
+          "[server][routes][config_routes][security]") {
+    MockHarness h;
+    h.auth_source = "local"; // a cookie session
+    h.wire();
+    const std::string path = "/api/config/log_level";
+    const std::string put_body = R"({"value":"debug"})";
+
+    auto cross = h.sink.dispatch("PUT", path, put_body, "application/json",
+                                 {{"Host", "yuzu.example"}, {"Origin", "https://evil.example"}});
+    REQUIRE(cross);
+    CHECK(cross->status == 403);
+    CHECK(body(cross->body)["error"]["message"] == "cross-site request refused");
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "csrf.denied");
+
+    auto same = h.sink.dispatch("PUT", path, put_body, "application/json",
+                                {{"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}});
+    REQUIRE(same);
+    CHECK(same->status == 503);
+    CHECK(body(same->body)["error"]["message"] == "runtime config store unavailable");
     CHECK(h.audits.size() == 1);
 }
 

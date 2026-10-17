@@ -3923,8 +3923,9 @@ groups:
             decrypted (KEK/DB pairing mismatch) — the next server restart will
             fail closed on this same secret; see "Key management (secrets
             KEK)" in the server admin guide before it does. DEX Apps lists
-            refuse with score_policy_unavailable while the dex_score_policy
-            key has been unreadable for over 60 s.
+            refuse with score_policy_unavailable once the dex_score_policy
+            key has been unreadable for over 60 s, or at once when no policy
+            is cached (a restart during the outage, or a concurrent first read).
           runbook_url: "https://docs.yuzu.io/runbooks/runtime-config-read-degraded"
       - alert: YuzuProductPackReadDegraded
         # A product_pack_store list()/get() read degraded and the caller failed
