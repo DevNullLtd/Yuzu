@@ -457,15 +457,80 @@ TEST_CASE("remote_access_audit posix fs: resolve_root normalises a relative targ
     CHECK(b.resolve_root(t.at("absent").string()) == t.at("absent").string());             // lstat fails
 }
 
-TEST_CASE("remote_access_audit posix fs: an absolute key path outside any home is read by path",
+TEST_CASE("remote_access_audit posix fs: an absolute key path outside any home is read by path, no link followed anywhere in it",
           "[remote_access_audit][posix_fs]") {
     Tree t;
     t.write(t.at("keys/shared"), "k");
+    t.write(t.at("protected/shared"), "secret");
     fs::create_symlink(t.at("keys/shared"), t.at("keys/link"));
+    fs::create_directory_symlink(t.at("protected"), t.at("keys/dirlink"));
     const auto b = make_posix_fs(t.paths());
     CHECK(b.read_key_file_abs(t.at("keys/shared").string()).data == "k");
-    CHECK(b.read_key_file_abs(t.at("keys/link").string()).error == ReadErr::symlink_refused);
+    CHECK(b.read_key_file_abs(t.at("keys/link").string()).error == ReadErr::symlink_refused); // a leaf link
     CHECK(b.read_key_file_abs(t.at("keys/none").string()).err == ENOENT);
+    // an INTERMEDIATE link is refused too (ELOOP on every OS), never walked to the target's file
+    const auto via_dir = b.read_key_file_abs(t.at("keys/dirlink/shared").string());
+    CHECK(via_dir.error == ReadErr::symlink_refused);
+    CHECK(via_dir.data.empty());
+    // a relative path and a path with no leaf name are refused as invalid, not resolved against the cwd
+    CHECK(b.read_key_file_abs("keys/shared").err == EINVAL);
+    CHECK(b.read_key_file_abs("/").err == EINVAL);
+}
+
+TEST_CASE("remote_access_audit posix fs: an absolute AuthorizedKeysFile through a subject-writable link is refused for the other account",
+          "[remote_access_audit][posix_fs]") {
+    // The two-account shape: alice's home holds `link -> protected`. sshd_config names
+    // <home>/alice/link/keys; for alice it is home-relative, for bob it is absolute. Neither may
+    // follow the link to the file the subject could not otherwise reach.
+    Tree t;
+    t.write(t.at("sshd_config"), "AuthorizedKeysFile " + t.at("home/alice/link/keys").string() + "\n");
+    t.write(t.at("protected/keys"), kAliceKey);
+    fs::create_directories(t.at("home/alice"));
+    fs::create_directories(t.at("home/bob"));
+    fs::create_directory_symlink(t.at("protected"), t.at("home/alice/link"));
+    auto p = t.paths();
+    p.single_homes = {};
+    p.run = service_enabled;
+    p.mounts = [net = t.at("protected").string()] {
+        return std::optional<std::vector<std::string>>{std::vector<std::string>{net}};
+    };
+    const auto l = list_posix(make_posix_fs(p));
+    for (const auto& r : l.rows)
+        CHECK(r.find(kAliceFp) == std::string::npos); // the protected file's fingerprint never appears
+    CHECK(std::ranges::find_if(l.rows, [](const std::string& r) { return r.rfind("key|", 0) == 0; }) == l.rows.end());
+    CHECK(std::ranges::find(l.rows, "file|alice|custom|failed|-|-|-") != l.rows.end());
+    CHECK(std::ranges::find(l.rows, "file|bob|custom|failed|-|-|-") != l.rows.end()); // absolute arm: failed, not read
+    CHECK(l.reason.find("linux:remote_access_audit:keys:symlink_refused") != std::string::npos);
+    CHECK(l.status == StatusState::constrained);
+}
+
+TEST_CASE("remote_access_audit posix fs: an unnormalised absolute AuthorizedKeysFile cannot slip past the network-mount guard",
+          "[remote_access_audit][posix_fs]") {
+    // The mount table names <root>/protected. `//`, `/./` and a trailing `/` are the same
+    // file to the kernel; they must be the same string to the guard, so none is opened.
+    Tree t;
+    const std::string root = t.root.string();
+    t.write(t.at("sshd_config"), "AuthorizedKeysFile " + root + "//protected/keys " + root + "/./protected/keys " +
+                                     root + "/protected/keys/\n");
+    t.write(t.at("protected/keys"), kAliceKey);
+    fs::create_directories(t.at("home/alice"));
+    fs::create_directories(t.at("home/bob"));
+    auto p = t.paths();
+    p.single_homes = {};
+    p.run = service_enabled;
+    p.mounts = [net = t.at("protected").string()] {
+        return std::optional<std::vector<std::string>>{std::vector<std::string>{net}};
+    };
+    const auto l = list_posix(make_posix_fs(p));
+    CHECK(std::ranges::find_if(l.rows, [](const std::string& r) { return r.rfind("key|", 0) == 0; }) == l.rows.end());
+    for (const auto& r : l.rows)
+        CHECK(r.find(kAliceFp) == std::string::npos);
+    for (const char* who : {"alice", "bob"}) {
+        const auto failed = std::string("file|") + who + "|custom|failed|-|-|-";
+        CHECK(std::ranges::count(l.rows, failed) == 3); // one per spelling, none read
+    }
+    CHECK(l.reason.find("linux:remote_access_audit:keys:network_mount_skipped") != std::string::npos);
+    CHECK(l.status == StatusState::constrained);
 }
 
 TEST_CASE("remote_access_audit posix fs: network mount points come from the mount table",

@@ -683,8 +683,11 @@ struct KeyFileSpec {
 /// form need the account's login name or uid, which a home found by directory walk does not
 /// authoritatively have: they are unsupported (nullopt), never guessed. A `..` component is
 /// unsupported too. A relative result is joined under the home, as sshd does; an absolute
-/// result inside the home is reduced to home-relative components so it is read through the
-/// home's directory descriptor.
+/// result is first normalised lexically (empty and `.` components and a trailing `/` dropped;
+/// an absolute path with no component left is unsupported), then, when inside the home,
+/// reduced to home-relative components so it is read through the home's directory descriptor.
+/// An absolute result outside the home is stored in that normalised form, the one spelling the
+/// network-mount prefix compare and the open both use.
 inline std::optional<KeyFileSpec> expand_authorized_keys_file(std::string_view entry, std::string_view home) {
     KeyFileSpec out;
     out.kind = entry == ".ssh/authorized_keys" ? "authorized_keys"
@@ -708,34 +711,50 @@ inline std::optional<KeyFileSpec> expand_authorized_keys_file(std::string_view e
         else
             return std::nullopt;
     }
-    std::string_view rel = path;
-    if (!path.empty() && path[0] == '/') {
-        const std::string prefix = std::string(home) + "/";
-        if (home.empty() || path.compare(0, prefix.size(), prefix) != 0) {
-            // Outside the home: read by path. A `..` would let the textual form name a
-            // different file than the one an auditor reads in the config.
-            if (path.find("/../") != std::string::npos || path.ends_with("/.."))
+    // The components of `p` with empty and `.` parts dropped; nullopt on `..`.
+    const auto split = [](std::string_view p) -> std::optional<std::vector<std::string>> {
+        std::vector<std::string> parts;
+        std::size_t i = 0;
+        while (i <= p.size()) {
+            const auto slash = p.find('/', i);
+            const auto part = p.substr(i, slash == std::string_view::npos ? std::string_view::npos : slash - i);
+            if (part == "..")
                 return std::nullopt;
+            if (!part.empty() && part != ".")
+                parts.emplace_back(part);
+            if (slash == std::string_view::npos)
+                break;
+            i = slash + 1;
+        }
+        return parts;
+    };
+    auto parts = split(path);
+    if (!parts)
+        return std::nullopt;
+    if (!path.empty() && path[0] == '/') {
+        if (parts->empty())
+            return std::nullopt;
+        // Lexically normalised BEFORE classification (never realpath: it would touch a dead
+        // mount), so the home-prefix test, the network-mount prefix compare and the open all see
+        // the one spelling: `//`, `/./` and a trailing `/` cannot slip past a byte compare.
+        std::string norm;
+        for (const auto& c : *parts) {
+            norm += '/';
+            norm += c;
+        }
+        const std::string prefix = std::string(home) + "/";
+        if (home.empty() || norm.compare(0, prefix.size(), prefix) != 0) {
             out.where = KeyFileSpec::Where::absolute;
-            out.path = path;
+            out.path = std::move(norm);
             return out;
         }
-        rel = std::string_view{path}.substr(prefix.size());
-    }
-    std::size_t i = 0;
-    while (i <= rel.size()) {
-        const auto slash = rel.find('/', i);
-        const auto part = rel.substr(i, slash == std::string_view::npos ? std::string_view::npos : slash - i);
-        if (part == "..")
+        parts = split(std::string_view{norm}.substr(prefix.size()));
+        if (!parts)
             return std::nullopt;
-        if (!part.empty() && part != ".")
-            out.components.emplace_back(part);
-        if (slash == std::string_view::npos)
-            break;
-        i = slash + 1;
     }
-    if (out.components.empty())
+    if (parts->empty())
         return std::nullopt;
+    out.components = std::move(*parts);
     return out;
 }
 

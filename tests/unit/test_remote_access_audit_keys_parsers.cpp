@@ -457,3 +457,32 @@ TEST_CASE("remote_access_audit keys: expand_authorized_keys_file", "[remote_acce
     CHECK_FALSE(expand_authorized_keys_file("/etc/ssh/../keys", home).has_value());
     CHECK_FALSE(expand_authorized_keys_file("", home).has_value());
 }
+
+TEST_CASE("remote_access_audit keys: an absolute AuthorizedKeysFile is lexically normalised before classification",
+          "[remote_access_audit][keys]") {
+    const auto home = std::string("/home/alice");
+    // `//`, `/./` and a trailing `/` collapse to the one spelling the mount compare and the open use
+    for (const char* spelling : {"/srv//keys/k", "/srv/./keys/k", "//srv/keys/k", "/srv/keys//./k", "/srv/keys/k/",
+                                 "/srv/keys/k/."}) {
+        INFO(spelling);
+        const auto s = expand_authorized_keys_file(spelling, home);
+        REQUIRE(s.has_value());
+        CHECK(s->where == KeyFileSpec::Where::absolute);
+        CHECK(s->path == "/srv/keys/k");
+    }
+    // the same normalisation decides home membership, so a doubled slash cannot dodge confinement
+    for (const char* spelling : {"/home//alice/.ssh/k", "/home/alice/./.ssh/k", "%h//.ssh/k", "/home/alice/.ssh//k/"}) {
+        INFO(spelling);
+        const auto s = expand_authorized_keys_file(spelling, home);
+        REQUIRE(s.has_value());
+        CHECK(s->where == KeyFileSpec::Where::home_relative);
+        CHECK(s->components == std::vector<std::string>{".ssh", "k"});
+    }
+    // an absolute path left with no component, or any `..` however spelled, is unsupported
+    CHECK_FALSE(expand_authorized_keys_file("/", home).has_value());
+    CHECK_FALSE(expand_authorized_keys_file("//", home).has_value());
+    CHECK_FALSE(expand_authorized_keys_file("/./.", home).has_value());
+    CHECK_FALSE(expand_authorized_keys_file("/srv//keys/../k", home).has_value());
+    CHECK_FALSE(expand_authorized_keys_file("/srv/keys/..", home).has_value());
+    CHECK_FALSE(expand_authorized_keys_file("/home//alice/../bob/k", home).has_value());
+}

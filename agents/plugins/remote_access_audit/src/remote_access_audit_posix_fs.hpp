@@ -15,8 +15,12 @@
  * further link followed, so a link chain or a linked component is refused (ELOOP), never
  * walked. Only the entries beneath the parent are subject-writable. KEY side (each account
  * home, .ssh, authorized_keys*, absolute AuthorizedKeysFile entries) never follows: the
- * subject can write there, and a link would make a root agent read what the subject cannot. A
- * single home (/root, /var/root) is a home, not a parent: it stays no-follow.
+ * subject can write there, and a link would make a root agent read what the subject cannot. An
+ * absolute entry is opened from "/" one O_NOFOLLOW component at a time, so a link in ANY
+ * directory of its chain is refused, not only at the leaf (stock macOS /etc, /var, /tmp are
+ * links: an absolute entry through one reports `failed` + symlink_refused, there is no
+ * trusted-alias table). A single home (/root, /var/root) is a home, not a parent: it stays
+ * no-follow.
  *
  * Reads are bounded. An Include directory and each account home are opened ONCE and every read
  * under them goes through THAT descriptor, one path component per openat() (dir-fd
@@ -278,8 +282,19 @@ inline PosixFs make_posix_fs(const Paths& p) {
         }
         return to_read_like(yuzu::shared::read_file_no_follow_at(fd, components.back().c_str(), kKeyFileCap));
     };
-    fs.read_key_file_abs = [](const std::string& path) {
-        return to_read_like(yuzu::shared::read_file_no_follow(path, kKeyFileCap));
+    fs.read_key_file_abs = [](const std::string& path) -> FileReadLike {
+        // The parent is opened from "/" one O_NOFOLLOW component at a time, exactly as the
+        // lister opens a home parent, so a link anywhere in the chain is refused (ELOOP), never
+        // walked; the leaf is then read no-follow through that descriptor. The handle is a local
+        // and outlives the read.
+        const std::filesystem::path p{path};
+        const std::string leaf = p.filename().string();
+        if (!p.is_absolute() || leaf.empty())
+            return hop_failure(EINVAL);
+        auto d = open_dir_hops(p.parent_path().string());
+        if (!d.opened())
+            return hop_failure(d.err != 0 ? d.err : EIO);
+        return to_read_like(yuzu::shared::read_file_no_follow_at(d.dir.fd(), leaf.c_str(), kKeyFileCap));
     };
     return fs;
 }
