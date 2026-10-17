@@ -260,7 +260,7 @@ yuzu_audit_js_embed = custom_target(
   input: 'static/yuzu-audit.js',
   output: 'yuzu_audit_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
