@@ -67,6 +67,7 @@ struct Fake {
     std::optional<std::vector<std::string>> prefixes{std::vector<std::string>{}};
     std::function<yuzu::agent::SubprocessResult(const std::vector<std::string>&)> runner;
     std::function<bool(const HomeEntry&)> account_probe; // set => PosixFs::is_account_home
+    std::function<std::string(const std::string&)> resolve; // set => PosixFs::resolve_root (a readlink hop)
 
     mutable std::vector<std::string> touched;
     mutable std::string current_dir;
@@ -74,6 +75,7 @@ struct Fake {
     mutable int open_home_calls = 0;
     mutable int key_reads = 0;
     mutable int probe_calls = 0;
+    mutable std::vector<std::string> resolved; // roots resolve_root was asked about (readlink only; not in `touched`)
 
     PosixFs build() const {
         PosixFs fs;
@@ -114,6 +116,12 @@ struct Fake {
             too_many = homes_too_many;
             return homes_err;
         };
+        if (resolve) {
+            fs.resolve_root = [this](const std::string& root) {
+                resolved.push_back(root);
+                return resolve(root);
+            };
+        }
         if (account_probe) {
             fs.is_account_home = [this](const HomeEntry& h) {
                 ++probe_calls;
@@ -473,6 +481,37 @@ TEST_CASE("remote_access_audit legs: a network mount is never touched", "[remote
     l = list_posix(f.build());
     CHECK_FALSE(f.touched_under("/home"));
     CHECK(has_token(l, "network_mount_skipped"));
+
+    // a home root that is itself a link into a network mount is skipped on its RESOLVED path:
+    // the alias passes the prefix check, the readlink hop reveals the target, and nothing under
+    // either path is listed, opened or read
+    f = healthy();
+    f.roots = {"/home"};
+    f.resolve = [](const std::string& r) { return r == "/home" ? std::string{"/net/home"} : r; };
+    f.prefixes = std::vector<std::string>{"/net"};
+    f.homes = {HomeEntry{"alice", "/net/home/alice"}};
+    f.key_files["/net/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
+    l = list_posix(f.build());
+    CHECK(f.resolved == std::vector<std::string>{"/home"});
+    CHECK(has_token(l, "linux:remote_access_audit:keys:network_mount_skipped"));
+    CHECK(row_with(l.rows, "key|alice|").empty());
+    CHECK(f.open_home_calls == 0);
+    CHECK(f.key_reads == 0);
+    CHECK_FALSE(f.touched_under("/home"));
+    CHECK_FALSE(f.touched_under("/net"));
+    CHECK(l.status == StatusState::constrained);
+
+    // a link whose target is local is listed at the TARGET path, mount-checked and then read
+    f = healthy();
+    f.roots = {"/home"};
+    f.resolve = [](const std::string& r) { return r == "/home" ? std::string{"/var/home"} : r; };
+    f.prefixes = std::vector<std::string>{"/net"};
+    f.homes = {HomeEntry{"alice", "/var/home/alice"}};
+    f.key_files["/var/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
+    l = list_posix(f.build());
+    CHECK(l.status == StatusState::supported);
+    CHECK(row_with(l.rows, "key|alice|") != "");
+    CHECK(f.touched_under("/var/home"));
 
     // an unreadable mount table is a token and the walk proceeds
     f = healthy();

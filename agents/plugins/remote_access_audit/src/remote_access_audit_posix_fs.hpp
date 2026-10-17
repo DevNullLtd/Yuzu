@@ -9,11 +9,14 @@
  * configuration exactly as a directive is, sshd follows it, and stock macOS (crypto.conf) and
  * NixOS ship such links. The reader still refuses a non-regular target by fstat on the
  * descriptor it reads and caps the size. A home PARENT (/home, /Users) is the same kind of
- * root-only-writable path, so the lister follows it (Fedora Atomic ships /home -> var/home);
- * only the entries beneath it are subject-writable. KEY side (each account home, .ssh,
- * authorized_keys*, absolute AuthorizedKeysFile entries) never follows: the subject can write
- * there, and a link would make a root agent read what the subject cannot. A single home
- * (/root, /var/root) is a home, not a parent: it stays no-follow.
+ * root-only-writable path, so ONE link hop is allowed (Fedora Atomic ships /home -> var/home):
+ * resolve_root readlinks it, the legs check the target against the mount table before anything
+ * is opened, and the lister then opens the target component by component from "/" with no
+ * further link followed, so a link chain or a linked component is refused (ELOOP), never
+ * walked. Only the entries beneath the parent are subject-writable. KEY side (each account
+ * home, .ssh, authorized_keys*, absolute AuthorizedKeysFile entries) never follows: the
+ * subject can write there, and a link would make a root agent read what the subject cannot. A
+ * single home (/root, /var/root) is a home, not a parent: it stays no-follow.
  *
  * Reads are bounded. An Include directory and each account home are opened ONCE and every read
  * under them goes through THAT descriptor, one path component per openat() (dir-fd
@@ -36,7 +39,9 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <dirent.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <fnmatch.h>
 #include <memory>
@@ -44,6 +49,7 @@
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 namespace yuzu::remote_access_audit {
@@ -95,6 +101,56 @@ inline std::optional<std::vector<std::string>> linux_mountinfo_prefixes(const st
     return yuzu::shared::network_mount_points(r.data);
 }
 
+/// One readlink hop of a configured home parent. A root that is not a link, a single home, and
+/// any lstat/readlink failure answer `root` unchanged (the no-follow open then reports it
+/// loudly). The link is read, never the target; a relative target is taken against the
+/// parent's directory; the result is lexically normalised with no trailing slash.
+inline std::string resolve_home_root(const std::string& root, const std::vector<std::string>& single_homes) {
+    if (std::ranges::find(single_homes, root) != single_homes.end())
+        return root;
+    struct stat st{};
+    if (::lstat(root.c_str(), &st) != 0 || !S_ISLNK(st.st_mode))
+        return root;
+    char buf[PATH_MAX];
+    const ssize_t n = ::readlink(root.c_str(), buf, sizeof buf);
+    if (n <= 0 || static_cast<std::size_t>(n) >= sizeof buf)
+        return root;
+    std::filesystem::path target{std::string(buf, static_cast<std::size_t>(n))};
+    if (target.is_relative())
+        target = std::filesystem::path(root).parent_path() / target;
+    auto out = target.lexically_normal().string();
+    if (out.size() > 1 && out.back() == '/')
+        out.pop_back();
+    return out;
+}
+
+/// Opens the absolute directory `path` one component at a time from "/", every hop O_NOFOLLOW:
+/// no link anywhere in it is followed. A hop that is a link answers ELOOP on every OS (Linux
+/// reports ENOTDIR for O_DIRECTORY|O_NOFOLLOW on a link; the lstat tells the two apart).
+inline yuzu::shared::DirOpen open_dir_hops(const std::string& path) {
+    if (path.empty() || path.front() != '/') {
+        yuzu::shared::DirOpen bad;
+        bad.err = EINVAL;
+        return bad;
+    }
+    auto cur = yuzu::shared::open_dir_no_follow("/");
+    for (const auto& part : std::filesystem::path(path).relative_path()) {
+        if (!cur.opened())
+            break;
+        const std::string name = part.string();
+        if (name.empty()) // a trailing slash
+            continue;
+        auto next = yuzu::shared::open_dir_no_follow_at(cur.dir.fd(), name.c_str());
+        if (!next.opened() && next.err == ENOTDIR) {
+            struct stat st{};
+            if (::fstatat(cur.dir.fd(), name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode))
+                next.err = ELOOP;
+        }
+        cur = std::move(next);
+    }
+    return cur;
+}
+
 inline PosixFs make_posix_fs(const Paths& p) {
     // The directory the last list_include_dir opened, kept alive across the per-file reads.
     auto inc_dir = std::make_shared<yuzu::shared::DirOpen>();
@@ -108,6 +164,9 @@ inline PosixFs make_posix_fs(const Paths& p) {
     fs.home_roots.insert(fs.home_roots.end(), p.single_homes.begin(), p.single_homes.end());
     fs.run = p.run;
     fs.network_mount_prefixes = p.mounts;
+    fs.resolve_root = [singles = p.single_homes](const std::string& root) {
+        return resolve_home_root(root, singles);
+    };
 
     fs.read_config = [](const std::string& path) {
         return to_read_like(yuzu::shared::read_file(path, kConfigFileCap, yuzu::shared::Leaf::follow));
@@ -152,8 +211,9 @@ inline PosixFs make_posix_fs(const Paths& p) {
                 any_listed = true;
                 continue;
             }
-            // The parent is root-owned like /etc/ssh, so a link here (/home -> var/home) is followed.
-            auto d = yuzu::shared::open_dir(root, yuzu::shared::Leaf::follow);
+            // `root` is already resolved (one link hop, mount-checked by the caller): nothing
+            // in it is followed here, so a chain or a linked component answers ELOOP.
+            auto d = open_dir_hops(root);
             if (!d.opened()) {
                 if (d.err != ENOENT && first_err == 0)
                     first_err = d.err != 0 ? d.err : EIO;
@@ -183,14 +243,16 @@ inline PosixFs make_posix_fs(const Paths& p) {
     };
     if (p.min_uid > 0) {
         // A path lstat: nothing is opened and nothing is followed. false ONLY on a confirmed
-        // owner below the floor; a failed stat answers true so open_home reports the errno
-        // (refused / failed) rather than the home vanishing. A single home (/root, /var/root)
-        // is never filtered: root's own home is owned by uid 0 by definition.
+        // owner of the HOME below the floor; a failed stat answers true so open_home reports the
+        // errno (refused / failed) rather than the home vanishing, and so does a link, whose
+        // lstat owner (often root, for a relocated home) says nothing about the home it names:
+        // eligible at any floor, refused loudly at open. A single home (/root, /var/root) is
+        // never filtered: root's own home is owned by uid 0 by definition.
         fs.is_account_home = [singles = p.single_homes, min_uid = p.min_uid](const HomeEntry& h) {
             if (std::ranges::find(singles, h.path) != singles.end())
                 return true;
             struct stat st{};
-            if (::lstat(h.path.c_str(), &st) != 0)
+            if (::lstat(h.path.c_str(), &st) != 0 || S_ISLNK(st.st_mode))
                 return true;
             return st.st_uid >= min_uid;
         };

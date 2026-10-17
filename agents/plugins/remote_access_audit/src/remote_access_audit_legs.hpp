@@ -338,8 +338,14 @@ struct PosixFs {
     // --- keys half ---
     /// Mount points of network filesystems; nullopt = the mount table could not be read.
     std::function<std::optional<std::vector<std::string>>()> network_mount_prefixes;
-    /// Lists the account homes under `roots`: errno of the first failed root, ENOENT when
-    /// every root is absent.
+    /// Optional. Resolves a configured home PARENT that is itself a symlink (Fedora Atomic's
+    /// /home -> var/home) by ONE readlink hop to the absolute, normalised path it names; any
+    /// other root, a single home, and any failure answer `root` unchanged. It reads the link
+    /// only, never the target, so the mount-table decision below runs on the real path before
+    /// anything is opened. Unset = every root is taken as written.
+    std::function<std::string(const std::string& root)> resolve_root;
+    /// Lists the account homes under `roots` (already resolved): errno of the first failed
+    /// root, ENOENT when every root is absent.
     std::function<int(const std::vector<std::string>& roots, std::vector<HomeEntry>& homes, bool& too_many)>
         list_homes;
     /// Optional account-eligibility predicate, asked AFTER the network-mount check and BEFORE the
@@ -639,13 +645,21 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
     else
         t.acc.add_failure(token("mounts_unreadable"));
 
-    // A home root on a network mount is never listed.
+    // A home root on a network mount is never listed. The configured path is checked first (no
+    // syscall); a root that is itself a link is then resolved by readlink alone and its target
+    // checked too, so a parent linked into a mount is skipped before anything is opened.
     std::vector<std::string> roots;
     for (const auto& r : fs.home_roots) {
-        if (detail::under_prefix(r, prefixes))
+        std::string resolved = r;
+        bool network = detail::under_prefix(r, prefixes);
+        if (!network && fs.resolve_root) {
+            resolved = fs.resolve_root(r);
+            network = detail::under_prefix(resolved, prefixes);
+        }
+        if (network)
             t.acc.add_failure(token("network_mount_skipped"));
         else
-            roots.push_back(r);
+            roots.push_back(std::move(resolved));
     }
     std::vector<HomeEntry> homes;
     bool too_many = false;
@@ -697,7 +711,7 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
 
         // Records one file's outcome: its file row and, when read, its key rows.
         const auto record = [&](const KeyFileSpec& s, const FileReadLike& r) {
-            const SrcOutcome o = classify_read(r, os, "keys", false);
+            const SrcOutcome o = classify_read(r, os, "keys", /*nul_is_failure=*/false);
             t.note(o);
             std::optional<std::size_t> nk, nm, no;
             std::vector<std::string> krows;
