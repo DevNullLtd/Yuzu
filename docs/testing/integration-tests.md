@@ -56,7 +56,9 @@ cd gateway
 ```
 
 Test modules:
-- `yuzu_gw_registry_tests` — ETS routing table and pg groups
+- `yuzu_gw_registry_tests` — ETS routing table (the registry makes no pg call)
+- `yuzu_gw_registry_cost_tests` — per-registration pg calls (none) and O(N) removal cost, by reduction count
+- `yuzu_gw_agent_registration_tests` — registration runs after `init/1`; `start_child` never waits for the registry; refusals never trip the agent supervisor
 - `yuzu_gw_agent_tests` — Agent gen_statem lifecycle
 - `yuzu_gw_upstream_tests` — Heartbeat batching and proxy
 - `yuzu_gw_router_tests` — Command fanout coordinator

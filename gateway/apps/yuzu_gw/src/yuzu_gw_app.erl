@@ -274,9 +274,11 @@ drain_pending(Deadline) ->
         true ->
             logger:warning("Drain deadline reached — proceeding with shutdown");
         false ->
-            %% Check if any agent processes still have pending commands.
-            %% pg:get_members may fail if pg is already shutting down.
-            Agents = try pg:get_members(yuzu_gw, all_agents) catch _:_ -> [] end,
+            %% Check if any agent processes still have pending commands. The
+            %% registry's routing table names them (the `all_agents' pg group
+            %% this used to read is gone); [] once the registry, and with it
+            %% the table, is down.
+            Agents = yuzu_gw_registry:local_agent_pids(),
             HasPending = lists:any(fun(Pid) ->
                 try gen_statem:call(Pid, pending_count, 1000) > 0
                 catch _:_ -> false

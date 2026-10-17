@@ -296,32 +296,32 @@ ets:insert(yuzu_gw_agents, {AgentId, self(), node(), SessionId, Plugins, os:time
 ets:delete(yuzu_gw_agents, AgentId).
 ```
 
-**pg (process groups)** — efficient broadcast/multicast:
+**pg (process groups)** — one group per agent, for cross-node lookup only:
 
 ```erlang
-%% Every agent process joins the 'all_agents' group
-pg:join(yuzu_gw, all_agents, self()).
+%% The agent process joins its own group once the registry has accepted it
+%% (yuzu_gw_registry:join_agent_group/1). The registry itself makes no pg call.
+pg:join(yuzu_gw, {agent, AgentId}, self()).
 
-%% Plugin-specific groups for targeted fanout
-pg:join(yuzu_gw, {plugin, <<"inventory">>}, self()).
-pg:join(yuzu_gw, {plugin, <<"patch">>}, self()).
-
-%% Broadcast to all agents (returns list of pids across the cluster)
-Pids = pg:get_members(yuzu_gw, all_agents).
-
-%% Plugin-targeted command
-Pids = pg:get_members(yuzu_gw, {plugin, Plugin}).
+%% lookup/1 reads it only when the local ETS table has no live row.
+Pids = pg:get_members(yuzu_gw, {agent, AgentId}).
 ```
+
+Earlier versions also kept an `all_agents` group and one `{plugin, Name}` group
+per plugin, joined by the registry on the agent's behalf. Nothing read them in
+production (broadcast reads ETS), and each `pg:join/3` is a synchronous call
+with an infinite timeout: about 71 of them per registration of an agent with a
+full plugin set, all inside the registry singleton. They were removed for the
+5,000-agent work (PR #5695). Measure the cost before adding a group back.
 
 **Why both?**
 
 | Operation | Mechanism | Time complexity |
 |-----------|-----------|-----------------|
 | Send to one agent by ID | ETS lookup | O(1) |
-| Broadcast to all agents | pg group | O(1) to get member list |
-| Send to agents with plugin X | pg group | O(1) to get member list |
+| Broadcast to all agents | ETS (`yuzu_gw_registry:all_agents/0`) | O(n) |
 | List all agents (dashboard) | ETS `select` | O(n) but paginated via cursor |
-| Cross-node fanout | pg (cluster-aware) | Automatic via Erlang distribution |
+| Find an agent held by another node | pg `{agent, Id}` (cluster-aware) | O(1) |
 
 ### Cross-Node Routing (Clustering)
 

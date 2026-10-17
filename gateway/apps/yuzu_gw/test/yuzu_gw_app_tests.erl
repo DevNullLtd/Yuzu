@@ -2183,17 +2183,11 @@ boot_setup(Extra) ->
     PrevPrometheus = application:get_env(prometheus, prometheus_http),
     AbsentKeys = [K || K <- [?SUMMARY_KEY, ?THROTTLE_KEY | ?SAFE_CALL_KEYS],
                        persistent_term:get(K, undefined) =:= undefined],
-    %% yuzu_gw_app:stop/1 drains every member of the `all_agents' pg group and
-    %% spends up to a second on each one that does not answer. A member left
-    %% there by another module is not this test's business and must not be able
-    %% to push stop/1 past the test's time bound, so park them for the
-    %% duration (cleanup joins the survivors back).
-    Parked = park_foreign_agents(),
     %% rebar3 runs eunit on a named node with a short cookie.
     os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", "1"),
     ok = yuzu_gw_crash_redact:remove(),
     Fixture = #{env => PrevEnv, cookie_flag => PrevCookieFlag, prometheus => PrevPrometheus,
-                absent_keys => AbsentKeys, parked => Parked, extra => Extra},
+                absent_keys => AbsentKeys, extra => Extra},
     try
         ok = meck:new(?BOOT_MODS, [non_strict, no_link]),
         [ok = meck:new(M, [passthrough, no_link]) || M <- Extra],
@@ -2208,7 +2202,7 @@ boot_setup(Extra) ->
     end.
 
 boot_cleanup(#{env := PrevEnv, cookie_flag := PrevCookieFlag, prometheus := PrevPrometheus,
-               absent_keys := AbsentKeys, parked := Parked, extra := Extra}) ->
+               absent_keys := AbsentKeys, extra := Extra}) ->
     catch meck:unload(?BOOT_MODS ++ Extra),
     ok = yuzu_gw_crash_redact:remove(),
     case PrevCookieFlag of
@@ -2221,17 +2215,4 @@ boot_cleanup(#{env := PrevEnv, cookie_flag := PrevCookieFlag, prometheus := Prev
     end,
     env_cleanup(PrevEnv),
     [persistent_term:erase(K) || K <- AbsentKeys],
-    persistent_term:erase(?SUMMARY_KEY),
-    unpark_foreign_agents(Parked).
-
-park_foreign_agents() ->
-    Members = try pg:get_members(yuzu_gw, all_agents) catch _:_ -> [] end,
-    _ = [pg:leave(yuzu_gw, all_agents, P) || P <- Members],
-    Members.
-
-unpark_foreign_agents(Parked) ->
-    Alive = [P || P <- Parked, is_process_alive(P)],
-    case Alive of
-        [] -> ok;
-        _  -> catch pg:join(yuzu_gw, all_agents, Alive), ok
-    end.
+    persistent_term:erase(?SUMMARY_KEY).

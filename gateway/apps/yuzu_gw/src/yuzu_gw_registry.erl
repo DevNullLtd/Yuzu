@@ -14,11 +14,24 @@
 %%%   but admits no heartbeat). The index is node-local by construction (it
 %%%   never consults `pg'); a row is removed with the agent process that owns
 %%%   it, and only ever by that process's own session id.
-%%% pg (`yuzu_gw` scope):   cluster-aware process groups for broadcast
-%%%   and plugin-targeted fanout.
+%%% pg (`yuzu_gw` scope): one group per agent, `{agent, AgentId}', read by the
+%%%   cross-node fallback of lookup/1. The agent process joins it itself
+%%%   (join_agent_group/1) once its registration is accepted, and leaves it
+%%%   when it disconnects or is told it no longer holds the agent id.
 %%%
-%%% This gen_server owns the ETS tables and coordinates pg group
-%%% membership on behalf of agent processes.
+%%% This gen_server owns the ETS tables. It makes no `pg' call at all: a
+%%% `pg:join/3' is a `gen_server:call' to the scope process with an infinite
+%%% timeout, one group per call, and the registry used to make one per plugin
+%%% plus two more for every registration (about 71 for a full agent build),
+%%% all inside this singleton. The per-plugin groups and `all_agents' had no
+%%% production reader (the router reads ETS) and are gone; do not add a group
+%%% back here without measuring what it costs a reconnect storm.
+%%%
+%%% Cost per agent. Registration, deregistration, supersede and process death
+%%% are each O(1) in the number of registered agents: the agent monitors are
+%%% indexed both by ref (to resolve a DOWN) and by agent id (to drop the one
+%%% monitor of an agent), so no operation walks every monitor. (They used to,
+%%% which made N disconnects O(N^2) work in this process.)
 %%%
 %%% Sessions per connection. One enrolled connection could otherwise hold any
 %%% number of sessions (a Register without a Subscribe stores a pending row, and
@@ -129,11 +142,12 @@
          lookup_pending_session/1,
          session_index_available/0,
          all_agents/0,
-         all_agent_pids/0,
+         local_agent_pids/0,
          all_register_reqs/0,
          entries_for_sessions/1,
-         agents_for_plugin/1,
          agent_count/0,
+         join_agent_group/1,
+         leave_agent_group/1,
          list_agents/2,
          store_pending/2,
          store_pending/3,
@@ -171,6 +185,7 @@
 -define(LIMIT_WARN_INTERVAL_MS, 1000).
 
 -record(state, {
+    %% The agent monitors, by ref (resolves a DOWN) ...
     monitor_refs :: #{reference() => binary()},
     %% One monitor per connection process that has a reservation or a pending row
     %% (the connection key, when it is a pid): its death removes those rows.
@@ -179,8 +194,18 @@
     %% One grace timer per dead connection that still has a row: the rows go when
     %% it fires (never one timer per row).
     dead_conns = #{} :: #{pid() => reference()},
-    dead_grace_ms = ?DEFAULT_DEAD_GRACE_MS :: non_neg_integer()
+    dead_grace_ms = ?DEFAULT_DEAD_GRACE_MS :: non_neg_integer(),
+    %% ... and by agent id (drops the one monitor of an agent without walking
+    %% the others). An agent id has at most one monitor: the two maps are
+    %% updated together and always hold the same pairs.
+    agent_mons = #{} :: #{binary() => reference()}
 }).
+
+%% Sent to an agent process that no longer holds its agent id in the routing
+%% table (a newer registration replaced it, or it was deregistered by id), so
+%% that it leaves `{agent, AgentId}'. A plain message: the process may be a
+%% stand-in that ignores it.
+-define(UNROUTED(AgentId), {?MODULE, unrouted, AgentId}).
 
 %%%===================================================================
 %%% API
@@ -266,8 +291,8 @@ deregister_agent(AgentId, Pid, SessionId) ->
 %% HA WS-4 4.3a (intra-cluster routing, ADR-2002 §7): node-local ETS is tried
 %% first (the common case — same node, zero cross-node cost) and remains the
 %% AUTHORITATIVE source for a pid on THIS node. On a local miss, falls back
-%% to the per-agent `pg' group (`{agent, AgentId}', joined/left alongside the
-%% existing `all_agents'/`{plugin, X}' groups below) — `pg' replicates group
+%% to the per-agent `pg' group (`{agent, AgentId}', which each agent process
+%% joins itself once registered, see join_agent_group/1) — `pg' replicates group
 %% membership across every CONNECTED distributed-Erlang node in this
 %% cluster, giving cross-node location transparency `pg' broadcast groups
 %% alone do not provide (see ADR-2002 §7's "per-agent `pg' group, a global
@@ -426,10 +451,44 @@ is_local_alive(Pid) ->
 all_agents() ->
     [AgentId || {AgentId, _, _, _, _, _, _, _} <- ets:tab2list(?TABLE)].
 
-%% @doc Return all agent pids (for broadcast via pg fallback).
--spec all_agent_pids() -> [pid()].
-all_agent_pids() ->
-    pg:get_members(?PG_SCOPE, all_agents).
+%% @doc The live agent processes (`yuzu_gw_agent') this node routes to, read
+%% from ETS. A row whose process is dead, remote, or not an agent process (a
+%% stand-in registered by a test) is left out. [] when the table does not
+%% exist. Used by the shutdown drain; it costs one `process_info' per row.
+-spec local_agent_pids() -> [pid()].
+local_agent_pids() ->
+    try ets:select(?TABLE, [{{'_', '$1', '_', '_', '_', '_', '_', '_'}, [], ['$1']}]) of
+        Pids -> [P || P <- Pids, is_agent_process(P)]
+    catch
+        error:badarg -> []
+    end.
+
+%% proc_lib:initial_call/1 answers {Module, Function, Args} with the arguments
+%% replaced by placeholder atoms (so only module and function are compared),
+%% and false for a dead process or one not started through proc_lib.
+is_agent_process(Pid) ->
+    node(Pid) =:= node() andalso
+        case proc_lib:initial_call(Pid) of
+            {yuzu_gw_agent, init, _} -> true;
+            _                        -> false
+        end.
+
+%% @doc Join the calling agent process to `{agent, AgentId}', the group
+%% lookup/1's cross-node fallback reads. Called by the agent process itself
+%% once its registration is accepted, never by the registry: `pg:join/3' is a
+%% synchronous call with an infinite timeout, and in the singleton it would
+%% serialise every registration behind the `pg' scope.
+-spec join_agent_group(binary()) -> ok.
+join_agent_group(AgentId) ->
+    pg:join(?PG_SCOPE, {agent, AgentId}, self()).
+
+%% @doc Leave `{agent, AgentId}' (the calling process). `pg' also removes a
+%% member when it exits; leaving first keeps a dying or superseded process out
+%% of the cross-node fallback. A process that is not a member gets
+%% `not_joined', which is fine.
+-spec leave_agent_group(binary()) -> ok | not_joined.
+leave_agent_group(AgentId) ->
+    pg:leave(?PG_SCOPE, {agent, AgentId}, self()).
 
 %% @doc The replay entries for the sessions this node holds (#1197).
 %%
@@ -496,11 +555,6 @@ all_register_reqs() ->
             [{AgentId, SessionId, RegisterReq}
              || {AgentId, _, _, SessionId, _, _, _, RegisterReq} <- ets:tab2list(?TABLE)]
     end.
-
-%% @doc Return pids of agents that have a specific plugin loaded.
--spec agents_for_plugin(binary()) -> [pid()].
-agents_for_plugin(PluginName) ->
-    pg:get_members(?PG_SCOPE, {plugin, PluginName}).
 
 %% @doc Total number of connected agents on this node.
 -spec agent_count() -> non_neg_integer().
@@ -930,9 +984,9 @@ handle_call({register, AgentId, _Pid, _SessionId, _Plugins, _Hostname, _Register
     end;
 
 handle_call({admitted_register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey},
-            _From, #state{monitor_refs = Mons} = State) ->
-    %% Remove any stale entry for this agent_id (returns cleaned Mons).
-    Mons1 = maybe_cleanup(AgentId, Mons),
+            _From, State) ->
+    %% Remove any stale entry for this agent_id, and its monitor.
+    State1 = maybe_cleanup(AgentId, Pid, State),
 
     %% Insert into ETS. The trailing field is the verbatim RegisterRequest,
     %% kept so yuzu_gw_upstream can re-proxy it on upstream reconnect.
@@ -944,20 +998,12 @@ handle_call({admitted_register, AgentId, Pid, SessionId, Plugins, Hostname, Regi
     %% `undefined' (the routing-focused test path) is not indexed.
     index_session(SessionId, AgentId, Pid, ConnKey),
 
-    %% Join pg groups. `{agent, AgentId}` (HA WS-4 4.3a) is the cross-node
-    %% location-transparency group `lookup/1`'s fallback reads — see that
-    %% function's doc comment.
-    pg:join(?PG_SCOPE, all_agents, Pid),
-    pg:join(?PG_SCOPE, {agent, AgentId}, Pid),
-    lists:foreach(fun(Plugin) ->
-        pg:join(?PG_SCOPE, {plugin, Plugin}, Pid)
-    end, Plugins),
+    %% No pg call here: the agent process joins `{agent, AgentId}' itself
+    %% (join_agent_group/1, see the module doc).
 
     %% Monitor the agent process for automatic cleanup.
     MonRef = monitor(process, Pid),
-    Mons2 = Mons1#{MonRef => AgentId},
-
-    {reply, ok, State#state{monitor_refs = Mons2}};
+    {reply, ok, add_agent_monitor(AgentId, MonRef, State1)};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
@@ -982,8 +1028,8 @@ handle_info({'DOWN', MonRef, process, Pid, _Reason},
                 _                                    -> ok
             end,
             ets:delete(?TABLE, AgentId),
-            %% pg auto-removes dead processes, but we clean ETS explicitly.
-            {noreply, State#state{monitor_refs = maps:remove(MonRef, Mons)}};
+            %% pg removes the dead process from `{agent, AgentId}' itself.
+            {noreply, remove_agent_monitor(AgentId, MonRef, State)};
         error ->
             %% A connection process: its reservations and pending rows go after
             %% the grace (a stored RegisterRequest is not kept for a connection
@@ -1043,6 +1089,12 @@ handle_info(_Info, State) ->
 terminate(_Reason, _State) ->
     ok.
 
+%% A state from before the by-agent monitor index (#state{} without
+%% agent_mons) gets the index built from the by-ref map.
+code_change(_OldVsn, {state, Mons, ConnMons, Sweep, Dead, Grace}, _Extra) ->
+    ByAgent = maps:fold(fun(Ref, AgentId, Acc) -> Acc#{AgentId => Ref} end, #{}, Mons),
+    {ok, #state{monitor_refs = Mons, conn_monitors = ConnMons, sweep_timer = Sweep,
+                dead_conns = Dead, dead_grace_ms = Grace, agent_mons = ByAgent}};
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
@@ -1189,43 +1241,60 @@ committed_rows_of(ConnKey, AgentId, SessionId) ->
     [{Key, T} || {Key, #{agent_id := A}, T} <- indexed_rows(ConnKey),
                  is_binary(Key), Key =/= SessionId, A =:= AgentId].
 
-do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
+do_deregister(AgentId, State) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, Pid, _, SessionId, Plugins, _, _, _}] ->
+        [{_, Pid, _, SessionId, _, _, _, _}] ->
             ets:delete(?TABLE, AgentId),
             unindex_session(SessionId, Pid),
-            leave_groups(AgentId, Pid, Plugins),
-            %% Find and remove the monitor ref.
-            Mons2 = maps:filter(fun(_Ref, Id) -> Id =/= AgentId end, Mons),
-            {noreply, State#state{monitor_refs = Mons2}};
+            %% The process may still be alive: it no longer holds the id.
+            Pid ! ?UNROUTED(AgentId),
+            {noreply, drop_agent_monitor(AgentId, State)};
         [] ->
             {noreply, State}
     end.
 
 %% Fenced removal for an agent process cleaning up after itself. Its own
 %% session index entry always goes (that entry can only be its own: it is
-%% matched on this pid). The routing-table row and the pg memberships go only
-%% while this pid is still the registered owner of AgentId; if a newer
-%% registration replaced it, that registration is left alone.
-do_deregister_fenced(AgentId, Pid, SessionId, #state{monitor_refs = Mons} = State) ->
+%% matched on this pid). The routing-table row and its monitor go only while
+%% this pid is still the registered owner of AgentId; if a newer registration
+%% replaced it, that registration is left alone. The caller leaves its own pg
+%% group (yuzu_gw_agent's cleanup).
+do_deregister_fenced(AgentId, Pid, SessionId, State) ->
     unindex_session(SessionId, Pid),
     case ets:lookup(?TABLE, AgentId) of
-        [{_, Pid, _, _, Plugins, _, _, _}] ->
+        [{_, Pid, _, _, _, _, _, _}] ->
             ets:delete(?TABLE, AgentId),
-            leave_groups(AgentId, Pid, Plugins),
-            Mons2 = maps:filter(fun(_Ref, Id) -> Id =/= AgentId end, Mons),
-            {noreply, State#state{monitor_refs = Mons2}};
+            {noreply, drop_agent_monitor(AgentId, State)};
         _ ->
             {noreply, State}
     end.
 
-%% pg auto-removes on process exit, but leave explicitly for clarity.
-leave_groups(AgentId, Pid, Plugins) ->
-    catch pg:leave(?PG_SCOPE, all_agents, Pid),
-    catch pg:leave(?PG_SCOPE, {agent, AgentId}, Pid),
-    lists:foreach(fun(Plugin) ->
-        catch pg:leave(?PG_SCOPE, {plugin, Plugin}, Pid)
-    end, Plugins).
+%% The agent monitor index (see #state{}): every change goes through these
+%% three, so the two maps never disagree, and each is O(1) in the number of
+%% registered agents.
+add_agent_monitor(AgentId, MonRef, #state{monitor_refs = Mons, agent_mons = ByAgent} = State) ->
+    State#state{monitor_refs = Mons#{MonRef => AgentId},
+                agent_mons = ByAgent#{AgentId => MonRef}}.
+
+%% A DOWN for MonRef: the monitor is spent. The by-agent entry goes only if it
+%% is this monitor (it always is: a replaced monitor is demonitored with its
+%% DOWN flushed).
+remove_agent_monitor(AgentId, MonRef, #state{monitor_refs = Mons, agent_mons = ByAgent} = State) ->
+    ByAgent2 = case ByAgent of
+        #{AgentId := MonRef} -> maps:remove(AgentId, ByAgent);
+        _                    -> ByAgent
+    end,
+    State#state{monitor_refs = maps:remove(MonRef, Mons), agent_mons = ByAgent2}.
+
+%% Drop the monitor of AgentId, if any, and any DOWN it already queued.
+drop_agent_monitor(AgentId, #state{monitor_refs = Mons, agent_mons = ByAgent} = State) ->
+    case maps:take(AgentId, ByAgent) of
+        {MonRef, ByAgent2} ->
+            demonitor(MonRef, [flush]),
+            State#state{monitor_refs = maps:remove(MonRef, Mons), agent_mons = ByAgent2};
+        error ->
+            State
+    end.
 
 %% The session index is a secondary table: it must never take down the
 %% routing table. If it does not exist (new code loaded into a node whose
@@ -1364,24 +1433,20 @@ warn_session_index_missing() ->
                            [?SESSIONS_TABLE])
     end.
 
-%% @doc Clean up a stale agent entry and return the updated monitor map.
-maybe_cleanup(AgentId, Mons) ->
+%% @doc Clean up the entry a registration of AgentId by NewPid replaces, and
+%% its monitor. A different process that held the id is told it no longer
+%% does, so it leaves `{agent, AgentId}' (the registry makes no pg call).
+maybe_cleanup(AgentId, NewPid, State) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, OldPid, _, OldSessionId, OldPlugins, _, _, _}] ->
-            leave_groups(AgentId, OldPid, OldPlugins),
+        [{_, OldPid, _, OldSessionId, _, _, _, _}] ->
             ets:delete(?TABLE, AgentId),
             %% The superseded session stops admitting heartbeats with its row.
             unindex_session(OldSessionId, OldPid),
-            %% Demonitor old refs and remove them from the map.
-            maps:fold(fun(Ref, Id, AccMons) ->
-                case Id of
-                    AgentId ->
-                        demonitor(Ref, [flush]),
-                        maps:remove(Ref, AccMons);
-                    _ ->
-                        AccMons
-                end
-            end, Mons, Mons);
+            case OldPid of
+                NewPid -> ok;
+                _      -> OldPid ! ?UNROUTED(AgentId)
+            end,
+            drop_agent_monitor(AgentId, State);
         [] ->
-            Mons
+            State
     end.

@@ -5,6 +5,16 @@
 %%% the agent's Subscribe bidi stream arrives. `temporary` restart
 %%% strategy: if an agent process crashes, the agent reconnects
 %%% naturally via Register → Subscribe.
+%%%
+%%% A temporary child is never restarted, so no child exit counts against
+%%% the restart intensity: neither a crash nor a refused registration (which
+%%% exits `normal') can take this supervisor down, however many arrive at once.
+%%%
+%%% The child's start function (yuzu_gw_agent:start_link_async/1) returns as
+%%% soon as the process exists; the agent registers as its first event. So
+%%% start_child never waits for the registry, and one slow registration does
+%%% not hold every other Subscribe (and this supervisor's handling of child
+%%% exits) behind it. start_agent/1 waits for the outcome in the caller.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_agent_sup).
@@ -22,7 +32,11 @@
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-%% @doc Start a new agent process for an incoming Subscribe stream.
+%% @doc Start a new agent process for an incoming Subscribe stream and
+%% return once its registration is decided: `{ok, Pid}' with the agent in the
+%% routing table, `{error, session_limit | registry_unavailable}' when it was
+%% refused (the process is then gone). The supervisor is free as soon as the
+%% process exists; the wait is in the caller (yuzu_gw_agent:await_registration/2).
 %%
 %% Args holds the RegisterRequest (enrollment_token, machine_certificate,
 %% csr_pem). A start_child that exits (this supervisor is not running) exits the
@@ -32,9 +46,19 @@ start_link() ->
 %% yuzu_gw_safe_call).
 -spec start_agent(map()) -> {ok, pid()} | {error, term()}.
 start_agent(Args) ->
-    yuzu_gw_safe_call:guard(?SERVER,
-                            fun() -> supervisor:start_child(?SERVER, [Args]) end,
-                            agent_sup_unavailable).
+    Alias = alias([reply]),
+    case yuzu_gw_safe_call:guard(?SERVER,
+                                 fun() ->
+                                     supervisor:start_child(?SERVER,
+                                                            [Args#{registered_ack => Alias}])
+                                 end,
+                                 agent_sup_unavailable) of
+        {ok, Pid} when is_pid(Pid) ->
+            yuzu_gw_agent:await_registration(Pid, Alias);
+        Other ->
+            unalias(Alias),
+            Other
+    end.
 
 %% @doc Return the number of active agent processes.
 -spec count() -> non_neg_integer().
@@ -54,7 +78,7 @@ init([]) ->
 
     ChildSpec = #{
         id       => agent,
-        start    => {yuzu_gw_agent, start_link, []},
+        start    => {yuzu_gw_agent, start_link_async, []},
         restart  => temporary,
         shutdown => 5000,
         type     => worker
