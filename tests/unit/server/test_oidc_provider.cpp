@@ -218,7 +218,7 @@ static_assert(!std::is_copy_constructible_v<OidcProvider> &&
                   !std::is_move_constructible_v<OidcProvider>,
               "a Lease holds the provider's address, so the provider must never move");
 
-TEST_CASE("OIDC lease: a move transfers the lease, a move-assign releases the old target, a "
+TEST_CASE("OIDC lease: a move transfers the lease; a move-assign releases the old target; a "
           "self-move keeps it",
           "[oidc][oidc_lease]") {
     auto a = lease_test_provider();

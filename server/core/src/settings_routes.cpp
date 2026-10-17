@@ -4630,6 +4630,12 @@ void SettingsRoutes::register_routes(
                 try {
                     oidc::OidcProvider::retire(std::move(unpublished));
                 } catch (...) {
+                    // Nothing was lost, but the retirement bound did not run: say so.
+                    try {
+                        spdlog::error("OIDC settings save: retiring the replaced provider "
+                                      "failed (the provider is destroyed or kept on the list, never lost)");
+                    } catch (...) {
+                    }
                 }
             }
         } retire_on_exit;

@@ -939,7 +939,7 @@ TEST_CASE("OIDC route: a provider swap does not wait for an in-flight sign-in st
     CHECK(oidc::OidcProvider::retired_count_for_test() == 0);
 }
 
-TEST_CASE("OIDC route: a Settings swap during an in-flight callback does not wait for it, and "
+TEST_CASE("OIDC route: a Settings swap during an in-flight callback does not wait for it and "
           "the callback is then refused - no session under the replaced configuration",
           "[pg][oidc][oidc_discovery][oidc_lease][auth_routes]") {
     // /auth/callback does the token POST and the JWKS fetch (the long network I/O). Two things
@@ -1012,12 +1012,93 @@ TEST_CASE("OIDC route: a Settings swap during an in-flight callback does not wai
     CHECK(events.front().action == "auth.oidc_login_failed");
     CHECK(events.front().result == "failure");
     CHECK(events.front().detail == "reason=provider_replaced");
+    CHECK(binding_cookie_cleared(*callback_res)); // the flow was matched and spent
+    // No login succeeded at any point: not merely "the newest row is a failure".
+    const auto all_events = rig.fix.audit_events(20);
+    CHECK(std::count_if(all_events.begin(), all_events.end(), [](const AuditEvent& e) {
+              return e.action == "auth.oidc_login" && e.result == "ok";
+          }) == 0);
     CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
           1.0);
-    CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "ok"}, {"role", "admin"}}) ==
-          0.0);
+    // The role label a wrongly minted login would carry is not known here, so none may exist.
+    for (const char* role : {"admin", "user"})
+        CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "ok"}, {"role", role}}) ==
+              0.0);
     oidc::OidcProvider::drain_retired();
     CHECK(oidc::OidcProvider::retired_count_for_test() == 0);
+}
+
+TEST_CASE("OIDC route: a Settings swap between the first provider check and the session mint "
+          "leaves no usable session - the minted one is invalidated and no cookie is set",
+          "[pg][oidc][oidc_lease][auth_routes]") {
+    // The second provider check (made right after create_oidc_session) exists for the span the
+    // first one cannot cover: the group sync, the SCIM read and the durable session write. The
+    // test seam runs the "save" (exclusive lock, swap, retire) in exactly that span.
+    DiscoveryRig rig;
+    oidc::OidcProvider::drain_retired();
+    yuzu::server::SessionStore store{*rig.fix.audit_pool};
+    REQUIRE(store.is_open());
+    rig.fix.auth_mgr.set_session_store(&store);
+    // Declared after `store`, so it is destroyed first: the manager never outlives its store.
+    struct Detach {
+        auth::AuthManager& mgr;
+        ~Detach() { mgr.set_session_store(nullptr); }
+    } detach{rig.fix.auth_mgr};
+
+    const auto durable_rows = [&] {
+        auto lease = rig.fix.audit_pool->acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(),
+                                               "SELECT count(*) FROM session_store.sessions",
+                                               std::vector<std::string>{});
+        return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+    };
+
+    // Control: with no save in the span the same flow signs in and leaves one durable row.
+    {
+        Browser c;
+        auto start = rig.get(c, "/auth/oidc/start");
+        REQUIRE(start->status == 302);
+        auto ok = rig.fix.sink.dispatch("GET", rig.callback_path(*start), {}, "application/json",
+                                        c.headers());
+        REQUIRE(ok != nullptr);
+        REQUIRE(ok->get_header_value("Location") == "/home");
+        REQUIRE(has_cookie_named(*ok, "yuzu_session="));
+        REQUIRE(durable_rows() == 1);
+    }
+
+    std::unique_ptr<oidc::OidcProvider> unpublished;
+    rig.fix.auth_routes->set_after_first_provider_check_for_test([&] {
+        std::unique_lock exclusive(rig.fix.oidc_mu); // the callback holds a lease, not this lock
+        unpublished = std::move(rig.fix.oidc_provider);
+        rig.fix.cfg.oidc_admin_group = "a-different-admin-group";
+        rig.fix.oidc_provider = std::make_unique<oidc::OidcProvider>(rig.cfg);
+    });
+    Browser b;
+    auto start = rig.get(b, "/auth/oidc/start");
+    REQUIRE(start->status == 302);
+    // The hook swaps AFTER handle_callback accepted the flow and the first check passed.
+    auto res = rig.fix.sink.dispatch("GET", rig.callback_path(*start), {}, "application/json",
+                                     b.headers());
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 302);
+    CHECK(res->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK_FALSE(has_cookie_named(*res, "yuzu_session="));
+    CHECK(binding_cookie_cleared(*res));
+    CHECK(durable_rows() == 1); // only the control login's row: the minted one was deleted
+
+    const auto events = rig.fix.audit_events(20);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "failure");
+    CHECK(events.front().detail == "reason=provider_replaced;post_mint=true");
+    CHECK(std::count_if(events.begin(), events.end(), [](const AuditEvent& e) {
+              return e.action == "auth.oidc_login" && e.result == "ok";
+          }) == 1); // the control login only
+    CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
+    oidc::OidcProvider::retire(std::move(unpublished));
+    oidc::OidcProvider::drain_retired();
 }
 
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN

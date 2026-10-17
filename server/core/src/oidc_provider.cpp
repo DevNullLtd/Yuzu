@@ -2579,6 +2579,7 @@ void OidcProvider::retire(std::unique_ptr<OidcProvider> unpublished) {
     if (!unpublished)
         return;
     std::vector<std::unique_ptr<OidcProvider>> to_destroy; // destroyed after the list mutex drops
+    std::vector<std::size_t> overflow_counts;              // logged after the list mutex drops
     {
         auto& r = retired_providers();
         std::lock_guard lock(r.mu);
@@ -2595,13 +2596,18 @@ void OidcProvider::retire(std::unique_ptr<OidcProvider> unpublished) {
         }
         // Bounded: beyond the cap, the oldest is destroyed below, which waits for its leases.
         while (r.list.size() > kMaxRetired) {
-            spdlog::warn("OidcProvider: {} replaced providers still have a request in flight; "
-                         "waiting for the oldest to finish (a Settings save is held until then)",
-                         r.list.size());
+            // Logged after the list mutex drops: a slow log sink must not hold up every other
+            // retire().
+            overflow_counts.push_back(r.list.size());
             to_destroy.push_back(std::move(r.list.front()));
             r.list.erase(r.list.begin());
         }
     }
+    for (const auto n : overflow_counts)
+        spdlog::warn("OidcProvider: {} replaced providers still have a request in flight; "
+                     "waiting for the oldest to finish (the reply to this Settings save is held "
+                     "until then; the settings are already stored)",
+                     n);
     to_destroy.clear();
 }
 

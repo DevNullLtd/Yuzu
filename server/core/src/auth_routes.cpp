@@ -3559,18 +3559,23 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // leased; if a save has since replaced it, minting a session now would map a role under
         // configuration the operator has already changed. Compare under the shared lock and
         // WHILE THE LEASE IS STILL HELD: the leased provider then cannot be destroyed, so a
-        // newer provider cannot reuse its address and make the pointers compare equal. The
-        // check is made before any group, role or session work, so a refusal has no side
-        // effects. A save that lands after this point is ordered after this sign-in; what
-        // remains is the few milliseconds of local database work below, which the docs state.
+        // newer provider cannot reuse its address and make the pointers compare equal. This
+        // first check is made before any group, role or session work, so a refusal has no side
+        // effects. The lease is KEPT until the second check, made right after the session is
+        // minted (below): the group sync, the SCIM read and the durable session write between the
+        // two take as long as the database takes (milliseconds when healthy, bounded by the
+        // statement and pool timeouts when it is not), and a save landing in that span would
+        // otherwise leave a session minted under the replaced configuration. A save that lands
+        // after the second check is ordered after this sign-in.
         bool superseded = false;
         if (result) {
             std::shared_lock oidc_lock(oidc_mu_);
             superseded = oidc_provider_.get() != provider.get();
         }
-        // The provider is not used again: drop the lease now so the session, group-sync and
-        // audit work below does not keep a swapped-out provider alive.
-        provider = oidc::OidcProvider::Lease{};
+        if (!result || superseded)
+            provider = oidc::OidcProvider::Lease{};
+        else if (after_first_provider_check_for_test_)
+            after_first_provider_check_for_test_();
         // The binding cookie is single-use and is cleared only when THIS visitor's cookie proved
         // a pending flow (a success, or a failure after the match); a success then appends the
         // session cookie after it. A callback that matches no pending flow leaves the cookie in place,
@@ -3883,6 +3888,40 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             res.set_redirect("/login?error=sso_failed");
             return;
+        }
+
+        // Second provider check, with the lease still held (see the first check above): a Settings
+        // save that replaced the provider while the group sync and the session write ran must not
+        // leave a usable session behind. The session just minted is invalidated by its own token
+        // (never `invalidate_user_sessions`, which would end the user's unrelated sessions) and no
+        // cookie is set. The group sync that already ran is not undone; it reconciles to the IdP's
+        // current claims and the next sign-in reconciles again. The audit row records whether the
+        // durable delete persisted, as the post-mint SCIM re-check below does.
+        {
+            bool superseded_after_mint = false;
+            {
+                std::shared_lock oidc_lock(oidc_mu_);
+                superseded_after_mint = oidc_provider_.get() != provider.get();
+            }
+            provider = oidc::OidcProvider::Lease{};
+            if (superseded_after_mint) {
+                const bool persisted = auth_mgr_.invalidate_session(session_token);
+                spdlog::warn("OIDC callback refused after the session was minted: a Settings "
+                             "save replaced the provider while this sign-in was in flight{}",
+                             persisted ? "" : " (the durable session delete failed)");
+                audit_log(req, "auth.oidc_login_failed", "failure", {}, {},
+                          std::string("reason=provider_replaced;post_mint=true") +
+                              (persisted ? "" : ";db_persisted=false"));
+                emit_event("auth.oidc_login_failed", req,
+                           {{"source_ip", req.remote_addr}, {"error", "provider_replaced"}}, {},
+                           Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}})
+                        .increment();
+                }
+                res.set_redirect("/login?error=sso_failed");
+                return;
+            }
         }
 
         // #1852 — auto-provision a durable auth.db row for this stable

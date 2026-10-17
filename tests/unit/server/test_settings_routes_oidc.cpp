@@ -734,7 +734,7 @@ TEST_CASE("Settings OIDC: a missing Issuer or Client ID is refused with a 400 an
 // ── The save's writer half: a live request does not delay it ─────────────────
 
 TEST_CASE("Settings OIDC: a save returns promptly although a request holds a lease on the live "
-          "provider, and the replaced provider is retired, not destroyed under the lock",
+          "provider and the replaced provider is retired, not destroyed under the lock",
           "[settings][oidc][oidc_lease]") {
     // The route test hand-copies what a save does; this drives the REAL handler. A bare
     // `*oidc_provider_ = std::move(new_provider)` would destroy the old provider inside the

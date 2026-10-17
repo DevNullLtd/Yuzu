@@ -1017,7 +1017,8 @@ TEST_CASE("OIDC egress: the host WinHTTP cracked must be the host the policy vet
     // guard refuses these (a plain character-by-character compare would call them equal), and the
     // narrow-only case (a high byte against an ASCII wide character of the same length).
     CHECK_FALSE(cracked_host_is_vetted(L"idp.exampl\u00C3.test", "idp.exampl\xC3.test"));
-    CHECK_FALSE(cracked_host_is_vetted(L"idp.example.test", "idp.exampl\xE9.test"));
+    // 0xE9 & 0x7f == 'i': a compare that truncates the high byte would call these equal.
+    CHECK_FALSE(cracked_host_is_vetted(L"idp.exampli.test", "idp.exampl\xE9.test"));
 }
 
 TEST_CASE("OIDC egress: the vetted port comes from the same origin the vet used",

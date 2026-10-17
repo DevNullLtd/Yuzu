@@ -197,6 +197,10 @@ public:
     /// Take a lease. MUST be called while the caller holds the route's shared `oidc_mu_` and
     /// has just observed this provider as the published one: a provider is retired only after
     /// the exclusive `oidc_mu_` swap unpublished it, so no new lease can start on it afterwards.
+    /// A publish always installs a NEW object while the old one is leased or retired, so a
+    /// caller that holds a lease may compare `get()` with the published pointer to learn whether
+    /// a save has replaced it (the address cannot be reused while the lease is held); a second
+    /// writer, or an in-place reconfigure, would need a generation number instead.
     [[nodiscard]] Lease acquire_lease() noexcept;
 
     /// Hand a provider that was just unpublished (swapped out under the exclusive lock, which
