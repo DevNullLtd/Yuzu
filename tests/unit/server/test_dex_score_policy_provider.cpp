@@ -2,16 +2,22 @@
  * test_dex_score_policy_provider.cpp -- the bounded-refresh score policy provider
  * over an injected store read and an injected clock: refresh interval,
  * cross-instance convergence, last-known-good through an outage, the staleness
- * cap and the invalid-document direction. No store, no sleeps, no I/O.
+ * cap, the invalid-document direction and the single-flight refresh (a caller
+ * arriving mid-refresh never waits on the store read). No store, no sleeps, no
+ * I/O.
  */
 #include "dex_score_policy_provider.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <thread>
 
 using namespace yuzu::server;
 
@@ -35,6 +41,31 @@ struct Fixture {
             if (down)
                 return std::unexpected(std::string("store down"));
             return doc;
+        };
+    }
+};
+
+// A store read that parks inside the read, once armed, until release() opens
+// the gate; every other read returns the document at once.
+struct ParkedRead {
+    Fixture& f;
+    std::atomic<bool> armed{false};
+    std::atomic<int> reads{0};
+    std::promise<void> entered_p;
+    std::promise<void> release_p;
+    std::future<void> entered = entered_p.get_future();
+    std::shared_future<void> gate = release_p.get_future().share();
+
+    explicit ParkedRead(Fixture& fx) : f(fx) {}
+    void release() { release_p.set_value(); }
+    DexScorePolicyProvider::ReadFn fn() {
+        return [this]() -> std::expected<std::optional<std::string>, std::string> {
+            ++reads;
+            if (armed.exchange(false)) {
+                entered_p.set_value();
+                gate.wait();
+            }
+            return f.doc;
         };
     }
 };
@@ -178,4 +209,127 @@ TEST_CASE("policy provider: a stored invalid document is the defaults with a fau
     const auto lkg = p.current();
     REQUIRE(lkg);
     CHECK(lkg->fault == v->fault);
+}
+
+TEST_CASE("policy provider: a caller arriving mid-refresh with no policy yet fails at once",
+          "[dex][policy_provider]") {
+    Fixture f;
+    ParkedRead pr(f);
+    pr.armed = true;
+    DexScorePolicyProvider p(pr.fn(), f.clock());
+    std::optional<std::expected<DexPolicyInForce, std::string>> first;
+    std::thread a([&] { first = p.current(); }); // parks inside the first store read
+    pr.entered.wait();
+
+    // The reader is still parked: this call must return without waiting on it.
+    const auto mid = p.current();
+    CHECK_FALSE(mid);
+    if (!mid)
+        CHECK(mid.error().find("refresh in progress") != std::string::npos);
+
+    pr.release();
+    a.join();
+    REQUIRE(first);
+    REQUIRE(*first);
+    CHECK((*first)->source == "default");
+    CHECK(pr.reads == 1); // the mid-refresh caller never touched the store
+}
+
+TEST_CASE("policy provider: a caller arriving mid-refresh is served the last good policy within the cap",
+          "[dex][policy_provider]") {
+    Fixture f;
+    f.doc = doc_with_excellent(95.0);
+    ParkedRead pr(f);
+    DexScorePolicyProvider p(pr.fn(), f.clock());
+    REQUIRE(p.current());
+
+    f.now += 6000; // past the refresh interval, inside the cap
+    pr.armed = true;
+    std::thread a([&] { (void)p.current(); }); // parks inside the refresh read
+    pr.entered.wait();
+
+    const auto lkg = p.current();
+    CHECK(lkg.has_value());
+    if (lkg) {
+        CHECK(lkg->source == "custom");
+        CHECK(lkg->policy.tiers.edges.excellent == 95.0);
+    }
+    f.now += 54000; // exactly 60 s since the last good read: still inside the cap
+    CHECK(p.current().has_value());
+    f.now += 1; // past the cap: the last good policy is no longer served
+    const auto gone = p.current();
+    CHECK_FALSE(gone);
+    if (!gone)
+        CHECK(gone.error().find("refresh in progress") != std::string::npos);
+
+    pr.release();
+    a.join();
+    CHECK(pr.reads == 2); // the initial read and the one parked refresh
+    // The refresh finished, so the next stale call starts a fresh one.
+    f.now += 5000;
+    REQUIRE(p.current());
+    CHECK(pr.reads == 3);
+}
+
+TEST_CASE("policy provider: a throwing read is a failed read and does not wedge the refresh",
+          "[dex][policy_provider]") {
+    Fixture f;
+    f.doc = doc_with_excellent(95.0);
+    int reads = 0;
+    bool boom = false;
+    DexScorePolicyProvider p(
+        [&]() -> std::expected<std::optional<std::string>, std::string> {
+            ++reads;
+            if (boom)
+                throw std::runtime_error("pool exploded");
+            return f.doc;
+        },
+        f.clock());
+    REQUIRE(p.current());
+
+    boom = true;
+    f.now += 6000;
+    const auto lkg = p.current(); // inside the cap: the throw is a failed read
+    REQUIRE(lkg);
+    CHECK(lkg->source == "custom");
+
+    f.now += 55000; // past the cap
+    const auto gone = p.current();
+    REQUIRE_FALSE(gone);
+    CHECK(gone.error().find("pool exploded") != std::string::npos);
+
+    boom = false; // the flag was cleared both times: the store is asked again
+    REQUIRE(p.current());
+    CHECK(reads == 4);
+}
+
+TEST_CASE("policy provider: the time a failed read takes counts against the staleness cap",
+          "[dex][policy_provider]") {
+    Fixture f;
+    f.doc = doc_with_excellent(95.0);
+    const std::int64_t t0 = f.now;
+    std::int64_t read_takes_ms = 0;
+    bool fail = false;
+    DexScorePolicyProvider p(
+        [&]() -> std::expected<std::optional<std::string>, std::string> {
+            f.now += read_takes_ms; // the read itself advances the clock
+            if (fail)
+                return std::unexpected(std::string("store slow"));
+            return f.doc;
+        },
+        f.clock());
+    REQUIRE(p.current()); // good read at t0
+    fail = true;
+
+    // A refresh starts at t0+59 s and the failure lands 1 s later, at the cap: served.
+    f.now = t0 + 59000;
+    read_takes_ms = 1000;
+    CHECK(p.current().has_value());
+
+    // The same refresh failing 10 s later, at t0+69 s: past the cap, refused.
+    f.now = t0 + 59000;
+    read_takes_ms = 10000;
+    const auto gone = p.current();
+    REQUIRE_FALSE(gone);
+    CHECK(gone.error().find("store slow") != std::string::npos);
 }

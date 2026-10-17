@@ -8661,6 +8661,16 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         CHECK(policy["required"] == nlohmann::json::array({"source", "revision", "fault", "tiers"}));
         CHECK(policy["properties"]["source"]["enum"] == nlohmann::json::array({"default", "custom"}));
         CHECK(policy["properties"]["fault"]["type"] == nlohmann::json::array({"string", "null"}));
+        // The tier block is typed, not a bare object: four tiers, each a numeric edge and a string name.
+        const auto& tiers = policy["properties"]["tiers"];
+        CHECK(tiers["required"] == nlohmann::json::array({"excellent", "good", "fair", "poor"}));
+        for (const char* tier : {"excellent", "good", "fair", "poor"}) {
+            const auto& t = tiers["properties"][tier];
+            CHECK(t["type"] == "object");
+            CHECK(t["required"] == nlohmann::json::array({"edge", "name"}));
+            CHECK(t["properties"]["edge"]["type"] == "number");
+            CHECK(t["properties"]["name"]["type"] == "string");
+        }
         CHECK(out["properties"]["population"]["type"] == nlohmann::json::array({"integer", "null"}));
         CHECK(out["properties"]["apps_total"]["type"] == "integer");
         CHECK(out["properties"]["apps_truncated"]["type"] == "boolean");

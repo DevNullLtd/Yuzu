@@ -15,7 +15,11 @@
  *   - a failed read serves the last good policy while it is no older than
  *     kDexPolicyStaleCapMs, and past that returns an error, so the caller
  *     degrades instead of scoring under a guess;
- *   - a failed read before any good read is an error at once.
+ *   - a failed read before any good read is an error at once;
+ *   - the store is read by one caller at a time, outside the lock: a caller
+ *     arriving mid-refresh is served the last good policy while it is within
+ *     the cap, or an error when there is none, and never waits on the read
+ *     (the Apps read answers its typed 503 with retry_after_ms 2000).
  *
  * No clock or store is touched except through the injected functions, so the
  * behaviour is testable without sleeping.
@@ -28,6 +32,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -57,19 +62,38 @@ public:
     /// The policy in force, from cache while fresh. See the file banner for the
     /// failure direction.
     [[nodiscard]] std::expected<DexPolicyInForce, std::string> current() {
-        // ponytail: one mutex across a single-row store read that is bounded
-        // by the store's own acquire timeout; a snapshot-outside-the-lock
-        // refresh if the Apps read ever queues on it.
-        std::lock_guard lk(mu_);
+        std::unique_lock lk(mu_);
         const std::int64_t now = clock_();
         if (have_ && now - last_ok_ms_ < kDexPolicyRefreshMs)
             return cached_;
-        return read_locked(now);
+        if (refreshing_) {
+            if (have_ && now - last_ok_ms_ <= kDexPolicyStaleCapMs)
+                return cached_;
+            return std::unexpected(std::string("score policy refresh in progress, no usable policy yet"));
+        }
+        refreshing_ = true;
+        lk.unlock(); // the store read runs unlocked: no caller queues behind it
+        auto r = read_guarded();
+        lk.lock();
+        refreshing_ = false;
+        return apply_locked(std::move(r), clock_());
     }
 
 private:
-    std::expected<DexPolicyInForce, std::string> read_locked(std::int64_t now) {
-        auto r = read_();
+    // A throw from the injected read is a failed read, so refreshing_ is always cleared.
+    std::expected<std::optional<std::string>, std::string> read_guarded() {
+        try {
+            return read_();
+        } catch (const std::exception& e) {
+            return std::unexpected(std::string("read threw: ") + e.what());
+        } catch (...) {
+            return std::unexpected(std::string("read threw"));
+        }
+    }
+
+    // `now` is sampled AFTER the read, so a slow failed read counts against the cap.
+    std::expected<DexPolicyInForce, std::string>
+    apply_locked(std::expected<std::optional<std::string>, std::string> r, std::int64_t now) {
         if (r) {
             cached_ = dex_policy_in_force_from_stored(*r);
             if (!cached_.fault.empty() && cached_.fault != logged_fault_)
@@ -94,7 +118,8 @@ private:
     ReadFn read_;
     ClockFn clock_;
 
-    std::mutex mu_;
+    std::mutex mu_; // guards the state below only; never held across the store read
+    bool refreshing_{false};
     bool have_{false};
     bool outage_logged_{false};
     std::int64_t last_ok_ms_{0};
