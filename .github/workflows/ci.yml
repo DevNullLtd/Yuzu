@@ -1194,7 +1194,7 @@ jobs:
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite agent --suite docs --suite proto --suite tar --suite gateway
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "server pg shard partition invariant" "dex link no presentation symbols"
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
 
       - name: Test (pg shards, full)
         if: matrix.pg_mode == 'full'
@@ -1534,7 +1534,7 @@ jobs:
       # Without this artifact we cannot identify which gateway test failed.
       - name: Upload meson-logs on test failure or cancel
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-logs-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.run_attempt }}
           path: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/
@@ -2065,7 +2065,7 @@ jobs:
       # cancels that fire before meson writes testlog.txt.
       - name: Upload meson-logs on test failure or cancel
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-logs-windows-${{ matrix.build_type }}-${{ github.run_attempt }}
           path: build-windows-${{ matrix.build_type }}/meson-logs/
@@ -2491,7 +2491,7 @@ jobs:
       # drops the test name (notably: gateway eunit summaries).
       - name: Upload meson-logs on test failure or cancel
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-logs-macos-${{ matrix.build_type }}-${{ github.run_attempt }}
           path: build-macos/meson-logs/

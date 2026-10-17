@@ -379,7 +379,7 @@
       "columns": [
         {
           "description": "The account (or nested group, on Windows) belonging to the queried group. Values: free text.",
-          "example": "Alex",
+          "example": "jsmith",
           "name": "member_name",
           "platforms": [
             "windows",
@@ -420,7 +420,7 @@
       "columns": [
         {
           "description": "The name of an account or group belonging to the local admin membership. Values: free text.",
-          "example": "Alex",
+          "example": "jsmith",
           "name": "member_name",
           "platforms": [
             "windows",
@@ -461,7 +461,7 @@
       "columns": [
         {
           "description": "The local account's username. Values: free text.",
-          "example": "Alex",
+          "example": "jsmith",
           "name": "username",
           "platforms": [
             "windows",
@@ -524,7 +524,7 @@
       "columns": [
         {
           "description": "The account name of a currently logged-on user. Values: free text.",
-          "example": "alex",
+          "example": "jsmith",
           "name": "username",
           "platforms": [
             "windows",
@@ -577,7 +577,7 @@
       "columns": [
         {
           "description": "The account with the most login events in the examined history, or \"unknown\" when none could be determined. Values: free text or \"unknown\".",
-          "example": "Alex",
+          "example": "jsmith",
           "name": "username",
           "platforms": [
             "windows",
@@ -618,7 +618,7 @@
       "columns": [
         {
           "description": "The account named in the record. Values: free text.",
-          "example": "Alex",
+          "example": "jsmith",
           "name": "username",
           "platforms": [
             "windows",
@@ -707,7 +707,7 @@
         },
         {
           "description": "The account that owns this session. Values: free text.",
-          "example": "alex",
+          "example": "jsmith",
           "name": "username",
           "platforms": [
             "windows",
@@ -1133,7 +1133,7 @@
           "row_count": 7,
           "rows": [
             "local_user|Administrator|false|2021-10-14 11:15:58|Built-in account for administering the computer/domain",
-            "local_user|Alex|true|2026-09-07 11:08:37|-",
+            "local_user|jsmith|true|2026-09-07 11:08:37|-",
             "local_user|CodexSandboxOffline|true|Never|-",
             "local_user|CodexSandboxOnline|true|Never|-",
             "local_user|DefaultAccount|false|Never|A user account managed by the system."
@@ -1153,7 +1153,7 @@
           "row_count": 2,
           "rows": [
             "admin|Administrator|user|DESKTOP-04DNSIG",
-            "admin|Alex|user|DESKTOP-04DNSIG"
+            "admin|jsmith|user|DESKTOP-04DNSIG"
           ],
           "truncated": false
         },
@@ -1170,7 +1170,7 @@
           "row_count": 2,
           "rows": [
             "group_member|Administrator|Administrators|user",
-            "group_member|Alex|Administrators|user"
+            "group_member|jsmith|Administrators|user"
           ],
           "truncated": false
         },
@@ -1186,7 +1186,7 @@
           },
           "row_count": 1,
           "rows": [
-            "primary_user|Alex|118|event_log_4624"
+            "primary_user|jsmith|118|event_log_4624"
           ],
           "truncated": false
         },
@@ -1202,11 +1202,11 @@
           },
           "row_count": 50,
           "rows": [
-            "session_history|Alex|logoff|network|-|2026-09-07T10:08:37.8345208Z|4634",
+            "session_history|jsmith|logoff|network|-|2026-09-07T10:08:37.8345208Z|4634",
             "session_history|sshd_6888|logoff|service|-|2026-09-07T10:08:37.8345130Z|4634",
-            "session_history|Alex|logon|network|-|2026-09-07T10:08:37.5888936Z|4624",
-            "session_history|Alex|logoff|network|-|2026-09-07T10:08:37.5439466Z|4634",
-            "session_history|Alex|logon|network|-|2026-09-07T10:08:37.5436517Z|4624"
+            "session_history|jsmith|logon|network|-|2026-09-07T10:08:37.5888936Z|4624",
+            "session_history|jsmith|logoff|network|-|2026-09-07T10:08:37.5439466Z|4634",
+            "session_history|jsmith|logon|network|-|2026-09-07T10:08:37.5436517Z|4624"
           ],
           "truncated": false
         }
@@ -1217,7 +1217,7 @@
         "leg_hash": "5734018da5be",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
-        "privilege": "SYSTEM"
+        "privilege": "SYSTEM (account name redacted to jsmith; account SID replaced with a placeholder)"
       }
     }
   },

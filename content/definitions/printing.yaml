@@ -159,7 +159,7 @@ spec:
       - name: owner
         type: string
         description: 'The submitting user, or "-" when unavailable.'
-        example: alex
+        example: jsmith
         platforms: [windows, linux, darwin]
       - name: document
         type: string

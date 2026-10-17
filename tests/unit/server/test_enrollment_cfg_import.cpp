@@ -35,6 +35,7 @@ using yuzu::server::auth::AuthManager;
 using yuzu::server::auth::EnrollmentTokenError;
 using yuzu::server::auth::PendingStatus;
 using yuzu::server::auth::RemovePendingOutcome;
+using yuzu::server::auth::PendingTransitionOutcome;
 using CEK = yuzu::server::auth::ConsumeEnrollResult::Kind;
 
 namespace {
@@ -404,7 +405,7 @@ TEST_CASE("import: restoring the SAME bytes after admin changes does NOT resurre
 
     // The operator acts: remove a pending agent, deny another, revoke the token.
     REQUIRE(f.mgr.remove_pending_agent("gone").value() == RemovePendingOutcome::removed);
-    REQUIRE(f.mgr.deny_pending_agent("flip", "admin").value());
+    REQUIRE(f.mgr.deny_pending_agent("flip", "admin").value() == PendingTransitionOutcome::changed);
     const auto token_id = f.mgr.list_enrollment_tokens().value()[0].token_id;
     REQUIRE(f.mgr.revoke_enrollment_token(token_id).value());
 
@@ -469,7 +470,7 @@ TEST_CASE("import: at first import PG state ALWAYS wins over a stale file",
             .c_str())};
     REQUIRE(ins.ok());
     REQUIRE(f.mgr.add_pending_agent("agent-x", "pg-host", "linux", "x86_64", "1").value());
-    REQUIRE(f.mgr.deny_pending_agent("agent-x", "admin").value());
+    REQUIRE(f.mgr.deny_pending_agent("agent-x", "admin").value() == PendingTransitionOutcome::changed);
 
     write_file(f.cfg_dir.path / "enrollment-tokens.cfg",
                kHeaderTokens + token_line(h, "stale-file-label", 5, 0, 1700000000, 0, false) + "\n");

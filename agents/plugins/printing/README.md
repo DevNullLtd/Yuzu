@@ -87,7 +87,7 @@ Every row is pipe-delimited, one row per printer/job. `printers`/`jobs` report `
 |---|---|---|---|---|---|
 | `printer` | string | - | Windows, Linux, macOS | `ipp://localhost/printers/Office-LaserJet` | The printer this job is queued on (URI on the IPP leg, printer name on Windows), or "-" when unavailable. |
 | `job_id` | int64 | - | Windows, Linux, macOS | `42` | Job identifier — the value clear_queue's job_id parameter targets. Values: 1 or greater. |
-| `owner` | string | - | Windows, Linux, macOS | `alex` | The submitting user, or "-" when unavailable. |
+| `owner` | string | - | Windows, Linux, macOS | `jsmith` | The submitting user, or "-" when unavailable. |
 | `document` | string | - | Windows, Linux, macOS | `hosts` | The job's document name/title, or "-" when unavailable. User content — see this definition's retention note above. |
 | `status` | string | - | Windows, Linux, macOS | `processing` | Job status. Values: pending, held, processing, stopped, canceled, aborted, completed, unknown. |
 | `submitted_at` | string | - | Windows, Linux, macOS | `2026-09-08T12:00:00Z` | ISO-8601 UTC submission timestamp, or "-" when unavailable. |

@@ -23,10 +23,10 @@ namespace yuzu::server {
 /// Typed failure of the enrollment-token / pending-agent store surface
 /// (WS-6 slice 6.2), shared by `AuthDB` (the store) and `auth::AuthManager`
 /// (which routes every enrollment call to it). Defined here, not in
-/// auth_db.hpp, so this header stays free of store headers. Deliberately
-/// three-valued and distinct from "not found"/"rejected"/"absent", which are
-/// SUCCESSFUL outcomes carried in the value channel: a caller can never read a
-/// store outage as an empty result.
+/// auth_db.hpp, so this header stays free of store headers. Deliberately a
+/// closed set of failures (two outages, two caller-input refusals), distinct from
+/// "not found"/"rejected"/"absent", which are SUCCESSFUL outcomes carried in the
+/// value channel: a caller can never read a store outage as an empty result.
 enum class StoreError : std::uint8_t {
     /// The store could not be reached: pool lease not acquired, OR no AuthDB is
     /// attached to the AuthManager (shutdown / never wired) — fail CLOSED.
@@ -36,11 +36,17 @@ enum class StoreError : std::uint8_t {
     /// A caller-supplied value violated a bound (empty/oversize/embedded NUL/
     /// out-of-range). Not a store outage — maps to INVALID_ARGUMENT / 400.
     InvalidInput,
+    /// Only from `AuthDB::add_pending` / `ensure_enrolled` called with
+    /// `enforce_new_id_charset`: the write WOULD HAVE CREATED a row for an id that
+    /// fails `auth::is_valid_new_agent_id`, so it was refused and nothing was
+    /// written. Caller input like `InvalidInput`, but kept distinct so a handler can
+    /// answer it exactly like the door's charset refusal.
+    CharsetRefused,
 };
 
 /// True iff `e` is a store outage (fail-closed UNAVAILABLE/503), not bad input.
 [[nodiscard]] inline bool is_store_unavailable(StoreError e) noexcept {
-    return e != StoreError::InvalidInput;
+    return e != StoreError::InvalidInput && e != StoreError::CharsetRefused;
 }
 
 class AuthDB;
@@ -359,6 +365,28 @@ inline Role effective_role(const Session& s) { return is_elevated(s) ? Role::adm
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
 
+/// Epoch milliseconds read from the store -> a clock value, SATURATING. A bare
+/// `time_point{milliseconds{ms}}` multiplies by the clock's ticks-per-millisecond and wraps for a
+/// large `ms`: on a nanosecond system_clock (libstdc++) anything past about year 2262, so a
+/// far-future expiry carried in by the legacy .cfg import (the epoch may be any year up to 9999)
+/// came back negative and rendered as Expired or as a garbage date, while the SQL consume path
+/// still accepted the token. A value above the clock's range is `time_point::max()`, which every
+/// enrolment-token reader treats as the "never expires" sentinel (the list shows "Never"), and a
+/// value below it is `time_point::min()`. In-range values convert exactly.
+[[nodiscard]] inline std::chrono::system_clock::time_point
+epoch_ms_to_time_point(std::int64_t ms) noexcept {
+    using Clock = std::chrono::system_clock;
+    using std::chrono::duration_cast;
+    using std::chrono::milliseconds;
+    constexpr std::int64_t kMaxMs = duration_cast<milliseconds>((Clock::duration::max)()).count();
+    constexpr std::int64_t kMinMs = duration_cast<milliseconds>((Clock::duration::min)()).count();
+    if (ms > kMaxMs)
+        return (Clock::time_point::max)();
+    if (ms < kMinMs)
+        return (Clock::time_point::min)();
+    return Clock::time_point{duration_cast<Clock::duration>(milliseconds{ms})};
+}
+
 struct EnrollmentToken {
     std::string token_id;   // Short display ID (first 8 hex chars)
     std::string token_hash; // SHA-256 hash of the actual token (stored, never raw)
@@ -438,10 +466,14 @@ struct CreatedEnrollmentToken {
 ///  - `admin_denied`   : the token was valid but an administrator has denied
 ///                       this agent_id. The whole txn rolled back — the token's
 ///                       use_count is unchanged (closes #1135).
+///  - `charset_refused`: only when the caller asked for `enforce_new_id_charset`
+///                       and the upsert would have CREATED a row for an id that
+///                       fails `is_valid_new_agent_id`. The whole txn rolled back:
+///                       the use_count is unchanged and no row exists.
 /// A store outage is NOT a value here — it is the `StoreError` on the outer
 /// `std::expected`.
 struct ConsumeEnrollResult {
-    enum class Kind : std::uint8_t { enrolled, token_rejected, admin_denied };
+    enum class Kind : std::uint8_t { enrolled, token_rejected, admin_denied, charset_refused };
     Kind kind{Kind::token_rejected};
     EnrollmentClaim claim{};                                        ///< enrolled only
     EnrollmentTokenError token_error{EnrollmentTokenError::not_found}; ///< token_rejected only
@@ -477,7 +509,11 @@ inline constexpr std::size_t kMaxAgentIdLength = 256;
 /// collapsed by browsers. Applied ONLY where the store holds no row for the id
 /// yet (`Register`/`ProxyRegister`): an id already enrolled, pending or denied
 /// keeps working unchanged, so no existing agent is locked out; renderers
-/// percent-encode and refuse dot-only ids for those (`url_path_segment`).
+/// percent-encode and refuse dot-only ids for those (`url_path_segment`). The
+/// handlers decide this from a single status read, so the row-creating writes
+/// (`consume_and_enroll`, `ensure_enrolled`, `add_pending`) re-apply it at the
+/// moment they would INSERT, when asked to (`enforce_new_id_charset`): a legacy row
+/// removed between the read and the write cannot be re-created under a refused id.
 [[nodiscard]] inline bool is_valid_new_agent_id(std::string_view id) noexcept {
     if (id.empty() || id.size() > kMaxAgentIdLength)
         return false;
@@ -529,6 +565,18 @@ enum class RemovePendingOutcome : std::uint8_t {
     removed,      ///< The row existed, was `pending`, and was deleted.
     not_found,    ///< No row exists for this agent_id.
     wrong_status, ///< A row exists but is `approved`/`denied` — refused, not deleted.
+};
+
+/// Outcome of `AuthDB::approve_pending`/`deny_pending` (and the `AuthManager` wrappers). Only a
+/// `pending` row is ever moved: the decision is a guarded transition
+/// (`UPDATE .. WHERE status = 'pending'`), like `bulk_transition` and `remove_pending`. An
+/// unguarded UPDATE let a stale Approve on a denied row silently reverse the denial and a stale
+/// Deny on an approved row flip an enrolled agent to denied, with nothing in the audit trail
+/// to say an earlier decision had been overturned.
+enum class PendingTransitionOutcome : std::uint8_t {
+    changed,      ///< The row existed, was `pending`, and moved to the requested status.
+    not_found,    ///< No row exists for this agent_id.
+    wrong_status, ///< A row exists but is already `approved`/`denied` — left untouched.
 };
 
 /// Why `AuthManager::verify_password` refused (#5342 Gate 7, sec-3). The two
@@ -1200,11 +1248,17 @@ public:
 
     /// THE atomic enrollment claim (one store transaction): count a token use,
     /// then approve the agent unless an admin denied it (a denial rolls the use
-    /// back). See `ConsumeEnrollResult`.
+    /// back). See `ConsumeEnrollResult`. `enforce_new_id_charset` makes the store
+    /// refuse (`Kind::charset_refused`, nothing consumed) a write that would CREATE
+    /// the row for an id failing `is_valid_new_agent_id`; an existing row is always
+    /// updated as before. A handler passes it because its own charset check reads
+    /// the status once, and the row can disappear before this write.
+    /// Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<ConsumeEnrollResult, StoreError>
     consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                        const std::string& hostname, const std::string& os,
-                       const std::string& arch, const std::string& agent_version);
+                       const std::string& arch, const std::string& agent_version,
+                       bool enforce_new_id_charset = false);
 
     /// All enrollment tokens, newest first (admin UI).
     [[nodiscard]] std::expected<std::vector<EnrollmentToken>, StoreError>
@@ -1217,19 +1271,28 @@ public:
 
     /// Queue an unenrolled agent as pending. `true` = NEWLY added (gates the
     /// analytics event + SSE publish); `false` = a row already existed.
+    /// `enforce_new_id_charset`: refuse with `StoreError::CharsetRefused` when this
+    /// would CREATE the row for an id failing `is_valid_new_agent_id` (an existing
+    /// row still yields `false`); see `consume_and_enroll`. Production registration
+    /// doors must pass true (pinned by test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<bool, StoreError>
     add_pending_agent(const std::string& agent_id, const std::string& hostname,
                       const std::string& os, const std::string& arch,
-                      const std::string& agent_version);
+                      const std::string& agent_version, bool enforce_new_id_charset = false);
 
     /// Mark an agent as enrolled (approved), creating the row if absent.
     /// `true` = enrolled; `false` = the agent was explicitly denied by an admin
     /// (tokens and auto-approve never override an admin denial). `by` is
-    /// recorded as the row's `status_changed_by`.
+    /// recorded as the row's `status_changed_by`. `enforce_new_id_charset`: refuse
+    /// with `StoreError::CharsetRefused` (rolled back, no row) when this would
+    /// CREATE the row for an id failing `is_valid_new_agent_id`; see
+    /// `consume_and_enroll`. Production registration doors must pass true (pinned by
+    /// test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<bool, StoreError>
     ensure_enrolled(const std::string& agent_id, const std::string& hostname,
                     const std::string& os, const std::string& arch,
-                    const std::string& agent_version, const std::string& by);
+                    const std::string& agent_version, const std::string& by,
+                    bool enforce_new_id_charset = false);
 
     /// Five-state lookup: a value = pending/approved/denied; `nullopt` = absent;
     /// `unexpected(StoreError)` = ERROR. A caller MUST NOT treat the error as
@@ -1240,10 +1303,11 @@ public:
     /// All pending-agent rows (any status), newest first (admin UI).
     [[nodiscard]] std::expected<std::vector<PendingAgent>, StoreError> list_pending_agents();
 
-    /// Approve / deny a pending agent. `true` = the row existed.
-    [[nodiscard]] std::expected<bool, StoreError>
+    /// Approve / deny a pending agent. Only a `pending` row moves; an already-decided row is
+    /// `wrong_status` and is left as it was — see `PendingTransitionOutcome`.
+    [[nodiscard]] std::expected<PendingTransitionOutcome, StoreError>
     approve_pending_agent(const std::string& agent_id, const std::string& principal);
-    [[nodiscard]] std::expected<bool, StoreError>
+    [[nodiscard]] std::expected<PendingTransitionOutcome, StoreError>
     deny_pending_agent(const std::string& agent_id, const std::string& principal);
 
     /// Bulk approve / deny: every row that is `pending` AT THE TIME OF THE

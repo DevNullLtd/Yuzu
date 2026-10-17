@@ -89,7 +89,7 @@
       "path": "/api/v1/tar/retention-paused/purge"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
   },
   {
     "method": "POST",

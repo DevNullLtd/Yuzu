@@ -20,10 +20,17 @@
 # future HELP table is a one-line change:
 #
 #   (a) DESCRIBE_GLOB -- every paren-balanced `describe(` call's double-quoted
-#       string-literal arguments, across server/core/src/*.cpp AND
-#       agents/core/src/*.cpp (the agent registers its own metrics at
+#       string-literal arguments, across every *.cpp under server/core/src AND
+#       agents/core/src (the agent registers its own metrics at
 #       agents/core/src/agent.cpp, e.g. around the AgentImpl constructor, and
-#       would otherwise be uncovered).
+#       would otherwise be uncovered), plus every *.hpp under those same
+#       directories. Both trees are walked recursively (a file in a
+#       subdirectory such as server/core/src/pg/ is scanned too), and headers
+#       are found by that walk rather than listed so a new header
+#       that carries an inline `describe(` call is covered with no edit here;
+#       a header with no `describe(` call contributes nothing, and a
+#       `describe(` mentioned in a comment or a string literal is masked out
+#       exactly as it is in the .cpp files.
 #
 #   (b) HELP_TABLE_FILES -- every double-quoted string literal in the two
 #       Guardian HELP-table headers (guardian_journal_fleet_tags.hpp,
@@ -76,7 +83,6 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 
 "$PYTHON_BIN" - "$REPO_ROOT" "$SELFTEST" <<'PYEOF'
-import glob
 import os
 import re
 import shutil
@@ -92,6 +98,7 @@ selftest_flag = sys.argv[2] == "1"
 # Kept in one constant so adding a future HELP table is a one-line change.
 SCAN_TARGETS = {
     "describe_dirs": ["server/core/src", "agents/core/src"],
+    # Every *.hpp in "describe_dirs" is scanned like the .cpp files (see scan_describe_surface).
     "help_tables": [
         "server/core/src/guardian_journal_fleet_tags.hpp",
         "server/core/src/guardian_health_fleet_tags.hpp",
@@ -196,20 +203,35 @@ def non_ascii_findings(rel, base_line, base_offset, segment):
 
 def scan_describe_surface(root):
     findings = []
+    paths = []
     for scan_dir in SCAN_TARGETS["describe_dirs"]:
         base = os.path.join(root, scan_dir)
         if not os.path.isdir(base):
+            if root == repo_root:
+                # A listed directory that vanished from the real tree is a config error, not a
+                # silent pass (selftest fixture trees hold only the directories they seed).
+                findings.append((scan_dir, 0, 0, "<missing scan target>"))
             continue
-        for full in sorted(glob.glob(os.path.join(base, "*.cpp"))):
-            rel = os.path.relpath(full, root).replace(os.sep, "/")
-            try:
-                with open(full, "r", encoding="utf-8") as f:
-                    text = f.read()
-            except OSError as e:
-                findings.append((rel, 0, 0, f"<unreadable: {type(e).__name__}>"))
-                continue
-            for line, byte_offset, call_text in find_describe_calls(text):
-                findings.extend(non_ascii_findings(rel, line, byte_offset, call_text))
+        # Recursive walk (no `**` glob, no bash-only construct): every .cpp and .hpp at any depth.
+        found = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if name.endswith((".cpp", ".hpp")):
+                    found.append(os.path.join(dirpath, name))
+        if not found and root == repo_root:
+            findings.append((scan_dir, 0, 0, "<missing scan target>"))
+        paths.extend(found)
+    for full in paths:
+        rel = os.path.relpath(full, root).replace(os.sep, "/")
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            findings.append((rel, 0, 0, f"<unreadable: {type(e).__name__}>"))
+            continue
+        for line, byte_offset, call_text in find_describe_calls(text):
+            findings.extend(non_ascii_findings(rel, line, byte_offset, call_text))
     return findings
 
 
@@ -348,6 +370,57 @@ def run_selftest():
         if not any(ch == "—" for _r, _l, _b, ch in table_findings):
             print(f"SELFTEST FAILED: HELP-table fixture was NOT flagged: {table_findings}")
             return 1
+
+        # Seeded fixture (a, header): a describe() call inline in ANY header under a scanned
+        # directory is scanned too. The file name is deliberately one no list could name.
+        hdr_dir = os.path.join(tmp, "header_seeded", "server", "core", "src")
+        os.makedirs(hdr_dir)
+        with open(os.path.join(hdr_dir, "some_new_metrics.hpp"), "w", encoding="utf-8") as f:
+            f.write(
+                'inline void seed(Metrics& m) {\n'
+                '    m.describe("yuzu_x_total", "Reintroduced em dash — in a header", "counter");\n'
+                '}\n'
+            )
+        hdr_findings = scan_describe_surface(os.path.join(tmp, "header_seeded"))
+        if not any(ch == "—" and r.endswith("some_new_metrics.hpp") for r, _l, _b, ch in hdr_findings):
+            print(f"SELFTEST FAILED: header describe() fixture was NOT flagged: {hdr_findings}")
+            return 1
+
+        # A header that only MENTIONS describe( in a comment, or holds non-ASCII prose outside
+        # any describe() call, must not be flagged (same masking as the .cpp files).
+        hdr_clean_dir = os.path.join(tmp, "header_clean", "server", "core", "src")
+        os.makedirs(hdr_clean_dir)
+        with open(os.path.join(hdr_clean_dir, "prose.hpp"), "w", encoding="utf-8") as f:
+            f.write(
+                '// See describe("x — y") in the registry; an em dash — here is prose.\n'
+                'inline int g() { return 1; } // section sign §\n'
+            )
+        hdr_clean_findings = scan_describe_surface(os.path.join(tmp, "header_clean"))
+        if hdr_clean_findings:
+            print(f"SELFTEST FAILED: header comment prose false-positived: {hdr_clean_findings}")
+            return 1
+
+        # Seeded fixture (a, subdirectory): a describe() call in a header AND in a .cpp placed in
+        # a subdirectory of a scanned directory (as under server/core/src/pg/) is scanned too.
+        sub_dir = os.path.join(tmp, "subdir_seeded", "server", "core", "src", "pg")
+        os.makedirs(sub_dir)
+        with open(os.path.join(sub_dir, "pool_metrics.hpp"), "w", encoding="utf-8") as f:
+            f.write(
+                'inline void seed(Metrics& m) {\n'
+                '    m.describe("yuzu_pg_x_total", "Reintroduced em dash \u2014 in a subdir header", "counter");\n'
+                '}\n'
+            )
+        with open(os.path.join(sub_dir, "pool_metrics.cpp"), "w", encoding="utf-8") as f:
+            f.write(
+                'void f(Metrics& m) {\n'
+                '    m.describe("yuzu_pg_y_total", "Reintroduced em dash \u2014 in a subdir source", "counter");\n'
+                '}\n'
+            )
+        sub_findings = scan_describe_surface(os.path.join(tmp, "subdir_seeded"))
+        for suffix in ("pg/pool_metrics.hpp", "pg/pool_metrics.cpp"):
+            if not any(ord(ch) == 0x2014 and r.endswith(suffix) for r, _l, _b, ch in sub_findings):
+                print(f"SELFTEST FAILED: subdirectory fixture {suffix} was NOT flagged: {sub_findings}")
+                return 1
 
         # Metric NAME / TYPE arguments are never edited by the fix this gate
         # guards, and this gate scans EVERY literal in the call -- a

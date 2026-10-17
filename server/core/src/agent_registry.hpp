@@ -1228,6 +1228,55 @@ public:
     evaluate_scope_local(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                         const CustomPropertiesStore* props_store = nullptr) const;
 
+    // Single-agent membership: is `agent_id` a member of `expr` under the
+    // evaluate_scope_local population (sessions on THIS replica only, no
+    // ResultSetStore, no principal, presence never consulted)? Built for a
+    // caller that already knows the one agent it is deciding for (the Guardian
+    // heartbeat reconcile) and must not build the whole fleet's matching-id
+    // vector or run the fleet-wide tag/props scans to find out. Cost: one
+    // brief mu_ lookup plus, only when the expression references tag:<key> /
+    // props.<key>, one PK read per store for that agent. mu_ is NEVER held
+    // across a store read.
+    //
+    // This is a SYSTEM targeting computation for the `__guard__` push path, NOT
+    // an operator dispatch decision: operator surfaces decide who is reached
+    // through dispatch_confined_arms.
+    //
+    // Resolution shares evaluate_scope_impl's per-attribute resolver
+    // (resolve_scope_attribute in the .cpp), so for every agent a successful
+    // result equals "id is in evaluate_scope_local(expr, tag_store,
+    // props_store)" (tests/unit/server/test_agent_registry_scope_for_agent.cpp
+    // asserts this for every scope_kind_catalog() kind and the combinators).
+    //
+    // Results:
+    //   - true / false -- member / not a member.
+    //   - false when `agent_id` is empty, longer than auth::kMaxAgentIdLength or contains a
+    //     NUL byte (checked after the Unresolvable checks below), decided BEFORE any session
+    //     lookup or store read (defence in
+    //     depth; the evaluator does not rely on the stores' own guards).
+    //   - false when `agent_id` has no session on this replica (LocalOnly
+    //     never includes presence-only ids), WITHOUT any store read. This
+    //     differs from evaluate_scope_local only in that a degraded store is
+    //     not surfaced for an agent that has no session to decide about.
+    //   - Kind::Unresolvable -- the expression has a from_result_set: atom
+    //     (no ResultSetStore can be wired here), or a props.<key> atom with
+    //     `props_store == nullptr`. Checked BEFORE the session lookup and
+    //     without I/O, so it is returned for any agent id, exactly as
+    //     evaluate_scope_local returns it for any fleet. A null `tag_store`
+    //     with a tag:<key> atom does NOT abort: the session's scopable_tags
+    //     are the fallback source (same as evaluate_scope_local).
+    //   - Kind::StoreDegraded -- the agent's TagStore::get_tag_map or
+    //     CustomPropertiesStore::get_property_map read failed. NEVER mapped to
+    //     false: under a NOT combinator a swallowed read failure inverts to
+    //     "member" (the ADR-0036 hazard). The caller must abort, not narrow.
+    //   - Never PresenceDegraded, OwnerCheckFailed or PrincipalUnresolved.
+    // Store-first tag precedence (#3295) is unchanged: a TagStore row for the
+    // key wins, scopable_tags is consulted only when the store has no row.
+    std::expected<bool, ScopeEvalError>
+    evaluate_scope_for_agent(const std::string& agent_id, const yuzu::scope::Expression& expr,
+                             const TagStore* tag_store,
+                             const CustomPropertiesStore* props_store = nullptr) const;
+
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;
@@ -1297,9 +1346,10 @@ private:
     enum class ScopePopulation { Fleet, LocalOnly };
 
     // Shared resolver body for evaluate_scope/evaluate_scope_local — see the
-    // DRIFT CONTRACT comment in agent_registry.cpp just above the local
-    // per-agent resolver lambda: this is the ONE implementation the two
-    // public entry points wrap, never a second copy. `touch_referenced_result_sets`
+    // DRIFT CONTRACT comment on resolve_scope_attribute in agent_registry.cpp
+    // (the ONE per-attribute resolver, shared with evaluate_scope_for_agent):
+    // this is the ONE implementation the two public entry points wrap, never
+    // a second copy. `touch_referenced_result_sets`
     // is an ORTHOGONAL axis to `population` (#4981 PR-3) — see evaluate_scope's
     // own doc comment above; evaluate_scope_local always passes `true` here,
     // which is a no-op in practice since it also always passes a null
@@ -1359,7 +1409,7 @@ private:
 // -- Scope kind discovery catalog ---------------------------------------------
 //
 // One row per scope-expression ATTRIBUTE kind the `evaluate_scope` resolver
-// (agent_registry.cpp, the `resolver` lambda inside the `agents_` loop) knows
+// (agent_registry.cpp, `resolve_scope_attribute`) knows
 // how to answer. Deliberately colocated with `evaluate_scope` rather than in
 // the discovery module (`discover_routes.cpp`) so a reviewer touching the
 // resolver sees this list in the same diff hunk / file.
@@ -1372,7 +1422,7 @@ private:
 // discovery route.
 //
 // DRIFT CONTRACT: any NEW `if (key == ...)` / `key.starts_with(...)` branch
-// added to the resolver lambda MUST get a matching entry here. The
+// added to `resolve_scope_attribute` MUST get a matching entry here. The
 // `test_discovery_routes.cpp` CROSS-CHECK test exercises `evaluate_scope` for
 // every entry below (proving the enumerator is a SUBSET of what the resolver
 // honors) and confirms a made-up kind resolves to no match (proving the

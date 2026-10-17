@@ -147,7 +147,8 @@ COPY --from=builder /src/builddir/server/core/yuzu-server /usr/local/bin/
 USER yuzu
 WORKDIR /var/lib/yuzu
 
-# 8443 = HTTPS dashboard (secure-by-default); 8080 = HTTP→HTTPS redirect.
+# 8443 = HTTPS dashboard (secure-by-default); 8080 = HTTP→HTTPS redirect (also answers GET /livez,
+# /readyz, /health, /api/health directly).
 EXPOSE 8443 8080 50051 50052 50055
 
 ENTRYPOINT ["yuzu-server"]

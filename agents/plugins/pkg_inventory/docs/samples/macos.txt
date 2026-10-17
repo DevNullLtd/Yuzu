@@ -1,8 +1,8 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-22 · euid 501 · leg-hash 57448de65bb7
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-14 · euid 501 · leg-hash 5e3ad4e08431
 == action=managers
 status|managers|supported|-
-manager|homebrew|present|-|/opt/homebrew|taps=0;formulae=66;casks=0|-
-[result_status] OK / FULL /
+manager|homebrew|present|-|/opt/homebrew|taps=0;formulae=69;casks=0|-
+[result_status] OK / FULL / 
 
 == action=packages
 status|packages|supported|-
@@ -17,6 +17,7 @@ package|homebrew|c-ares|1.34.8|formula
 package|homebrew|ca-certificates|2026-08-13|formula
 package|homebrew|ccache|4.13.6_1|formula
 package|homebrew|cmake|4.4.2|formula
+package|homebrew|dotnet|10.0.401|formula
 package|homebrew|erlang@28|28.5.0.5|formula
 package|homebrew|fmt|12.2.0|formula
 package|homebrew|gettext|1.0|formula
@@ -55,9 +56,11 @@ package|homebrew|ncurses|6.6|formula
 package|homebrew|ninja|1.13.2|formula
 package|homebrew|node|26.7.0|formula
 package|homebrew|openssl@3|3.6.3|formula
+package|homebrew|openssl@3|3.6.4|formula
 package|homebrew|pcre2|10.47_1|formula
 package|homebrew|pkgconf|3.0.5|formula
 package|homebrew|postgresql@18|18.6|formula
+package|homebrew|powershell|7.6.6_1|formula
 package|homebrew|python@3.14|3.14.7|formula
 package|homebrew|readline|8.3.3|formula
 package|homebrew|rebar3|3.27.0|formula
@@ -66,10 +69,16 @@ package|homebrew|simdjson|4.6.7|formula
 package|homebrew|simdutf|9.1.0|formula
 package|homebrew|sqlite|3.53.4|formula
 package|homebrew|unixodbc|2.3.14|formula
+package|homebrew|uv|0.12.17|formula
 package|homebrew|uvwasi|0.0.23|formula
 package|homebrew|webp|1.6.0|formula
 package|homebrew|wxwidgets@3.2|3.2.11|formula
 package|homebrew|xxhash|0.8.3|formula
 package|homebrew|xz|5.8.3|formula
 package|homebrew|zstd|1.5.7_1|formula
-[result_status] OK / FULL /
+[result_status] OK / FULL / 
+
+== action=store_packages
+status|store_packages|unsupported|macos:owned_by_installed_apps
+[result_status] UNAVAILABLE / PARTIAL / macos:owned_by_installed_apps
+

@@ -257,7 +257,7 @@ Example:
   --https-key /etc/yuzu/server.key
 ```
 
-When `--https` is enabled, plain HTTP requests are redirected to HTTPS by default. Pass `--no-https-redirect` to serve both protocols independently.
+When HTTPS is enabled (the default), plain HTTP requests are redirected to HTTPS by default, except `GET`/`HEAD` on the four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`), which are served directly. Pass `--no-https-redirect` to not start the HTTP listener at all (HTTPS only; see server-admin.md).
 
 ```bash
 # Verify HTTPS is working
@@ -1223,7 +1223,7 @@ The following audit actions are emitted for authentication and authorization eve
 
 | Action | Result | Description |
 |---|---|---|
-| `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin). Not written for an interactive cookie session refused on an auto-loading dashboard panel (Access Users); token and engine callers always are |
+| `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin). Not written for an interactive cookie session refused on an auto-loading dashboard panel (Access Users; the Enrollment Tokens, Pending Agent Approvals and Auto-Approve Policies fragments, whether shown on Settings or on Groups and enrolment). A refused token or engine caller, and every refused write, always writes a row |
 | `auth.permission_required` | `denied` | Token blocked from permission-gated operation. Not written for an interactive cookie session refused on an auto-loading dashboard panel (the probe-gated Dashboard and Access panels), though `yuzu_auth_topology_floor_denied_total` still counts a floored refusal; token and engine callers always are |
 | `auth.scoped_permission_required` | `denied` | Token blocked from agent-scoped operation |
 | `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from an approval-gated operation **on a non-MCP (REST) transport**. On the MCP `/mcp/v1/` transport there is no such denial — the operation runs through the ticket-then-recall approval flow (the first call mints JSON-RPC `-32006` `ApprovalRequired`; a recall with the approved `approval_id` executes). See `mcp.md`. |

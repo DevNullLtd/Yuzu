@@ -297,7 +297,7 @@ does not fit a signed 64-bit integer (the auto-approve rule index answers `200` 
 
 ## Pre-Auth Request Body Caps (#2407)
 
-Every request is checked against a per-route body-size cap **before authentication runs and before the body is read** — a single pre-routing chokepoint (`server.cpp`) resolves the caller's `(method, path)` against the policy table in `body_cap_policy.hpp` and rejects an oversized or unmeasurable body without buffering it. **The four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are NOT exempt from this gate** — the cap is a single lambda, `enforce_pre_auth_body_cap` in `server.cpp`'s pre-routing handler, invoked from exactly two sites: once INSIDE the probe branch, before its early return, and once after the on-behalf-of guard and the rate limiter for every other route. One definition, two call sites — so the probes cannot drift out of coverage without deleting a call. `tests/unit/server/test_body_cap_policy.cpp`'s "POST /health … is rejected (D3)" case exercises that DECISION on a real socket, but against a test server that reproduces the gate rather than invoking the production one, so it does not pin the wiring: deleting either call site in `server.cpp` would leave the suite green. Treat the wiring as verified by review, not by test, until that gap is closed. Before this fix the probes' early-return sat above the cap entirely, making them the server's last unauthenticated 100 MiB buffer — closing that was the point. The probes remain exempt from the on-behalf-of guard and the rate limiter that run further below (a header-stamping proxy or orchestrator must not be able to crash-loop the server by tripping either on its own liveness check) — that exemption is unchanged; only the body cap now also reaches them. Three status codes:
+Every request is checked against a per-route body-size cap **before authentication runs and before the body is read** — a single pre-routing chokepoint (`server.cpp`) resolves the caller's `(method, path)` against the policy table in `body_cap_policy.hpp` and rejects an oversized or unmeasurable body without buffering it. **The four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are NOT exempt from this gate** — the cap is a single lambda, `enforce_pre_auth_body_cap` in `server.cpp`'s pre-routing handler, invoked from exactly two sites: once INSIDE the probe branch, before its early return, and once after the on-behalf-of guard and the rate limiter for every other route. One definition, two call sites — so the probes cannot drift out of coverage without deleting a call. The plain-HTTP redirect listener (#5906) also serves these four paths, but it admits no body at all: a probe declaring `Content-Length` or `Transfer-Encoding` is redirected before any read (`is_plaintext_probe_request`, `health_routes.hpp`), so no second cap table exists. `tests/unit/server/test_body_cap_policy.cpp`'s "POST /health … is rejected (D3)" case exercises that DECISION on a real socket, but against a test server that reproduces the gate rather than invoking the production one, so it does not pin the wiring: deleting either call site in `server.cpp` would leave the suite green. Treat the wiring as verified by review, not by test, until that gap is closed. Before this fix the probes' early-return sat above the cap entirely, making them the server's last unauthenticated 100 MiB buffer — closing that was the point. The probes remain exempt from the on-behalf-of guard and the rate limiter that run further below (a header-stamping proxy or orchestrator must not be able to crash-loop the server by tripping either on its own liveness check) — that exemption is unchanged; only the body cap now also reaches them. Three status codes:
 
 | Status | Meaning |
 |---|---|
@@ -3769,7 +3769,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`, `failure`, `partial`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404), `owns_active_engine_principal` (409), `last_administrator_blocked` (409, nothing revoked: the early form). The LATE form is `result=partial` (credentials were revoked and the account stays active), detail `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary. `failure` detail `store_failure ...` (503), or `identity_link_resolution_failed` / `api_token_store_unavailable`; `partial` detail `account_deactivated session_wipe_failed=true ...` (503) or the revoke summary with `api_tokens_db_error=true` (500). |
 | `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`; the principal is the caller on every row, including those written after its own session was revoked. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service sessions_revoked=<N> provisional_mfa_cleared=<true\|false>`, written in the same transaction as the change (no separate `session.revoke_all` row). Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `wrong_current`, `account_locked`, `sso_only_local_disabled`, `verify_transient`, `not_found`, `conflict`, `store_unavailable`, `audit_unavailable`. A malformed body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. Never carries the password or its length. |
 | `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`, principal = the caller. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user> sessions_revoked=<N> provisional_mfa_cleared=<true\|false>` (no separate `session.revoke_all` row), plus — only when a lockout existed — an `auth.lockout.cleared` row (`result=ok`, `detail=password_reset`), both in the same transaction as the reset. Denied/error detail tokens: `token_session`, `csrf`, `durable_admin_required`, `admin_gate_unavailable`, `self_target`, `break_glass_target`, `not_found`, `not_local`, `store_unavailable`, `audit_unavailable`. A malformed username or body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. |
-| `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. **Exception:** an interactive cookie session (local, OIDC or SAML) refused on an auto-loading dashboard panel fragment (the Access Users panels) writes no row; token and engine callers always do. |
+| `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. **Exception:** an interactive cookie session (local, OIDC or SAML) refused on an auto-loading dashboard panel fragment (the Access Users panels, and the three enrolment fragments `GET /fragments/settings/tokens`, `/pending` and `/auto-approve` on Settings and on Groups and enrolment) writes no row; token and engine callers always do, and so does every refused write. |
 | `auth.lockout.applied` | Account locked after `--auth-lockout-threshold` consecutive failed local-password logins (SOC 2 CC6.3). Emitted **once** at the threshold crossing — not once per blocked attempt (those are tracked only by `yuzu_auth_lockout_blocked_total` to avoid audit flooding). `result=ok` (the lock was applied; the warning severity is carried by the metric + analytics event, not the audit result), `target_type=User`, `detail=threshold=<N> window_secs=<S>`. |
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, `reset_on_successful_login` when the user's next successful login clears a non-zero counter, `reset_on_password_change` when `POST /api/v1/users/me/password` verifies the current password, or `password_reset` when `POST /api/v1/users/{name}/password` clears an existing lockout (written in the same transaction as the reset; never written when there was nothing to clear). |
 | `execution.detail.fetch` | `GET /api/v1/executions/{id}` (REST v1 single-execution lookup). `result=denied` only (#1634) on the BARE route (no `include`) — emitted on the 404 branch, execution genuinely nonexistent OR out of the caller's management-group scope, non-distinguishing detail text; there is no `result=success` row on the bare route's 200 path. **As of #4030, this no longer holds for the whole URL pattern:** `?include=agents` on this same route, and the sibling `GET /api/v1/executions/{id}/responses`, both DO write `result=success` rows under this identical verb name on their 200 path (see `docs/user-manual/audit-log.md`'s `execution.detail.fetch` row for the full, current three-way split). |
@@ -5331,6 +5331,10 @@ envelope and has not been migrated onto it.
 }
 ```
 
+**Invalid agent id:** after the permission and store-availability checks, an agent id longer than
+256 bytes or containing a NUL byte answers `200` with an empty `properties` list (for a valid-UTF-8
+id; a non-UTF-8 byte in the id makes the response body fail to serialise).
+
 ---
 
 #### `PUT /api/agents/:id/properties/:key`
@@ -5392,6 +5396,10 @@ to be silently treated by the SQLite original as "no schema, accept any value" �
 was already closed by the original Postgres migration (it correctly rejects the write instead of
 accepting it unvalidated); this change only affects which status code that rejection now uses.
 
+**Invalid agent id:** after the permission and store-availability checks and once the request body
+is accepted, an agent id longer than 256 bytes or containing a NUL byte is refused with `400` and
+the body `{"error":"invalid agent id (1-256 bytes, no NUL)"}`.
+
 ---
 
 #### `DELETE /api/agents/:id/properties/:key`
@@ -5421,6 +5429,10 @@ predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a distingui
 this route's underlying `delete_property` was deliberately left unwidened — it's an
 admin/operator-driven delete, not a scope/dispatch-feeding read, matching `custom_properties_store.hpp`'s
 documented posture — so this stays a tracked gap rather than a fixed one.
+
+**Invalid agent id:** after the permission and store-availability checks, an agent id longer than
+256 bytes or containing a NUL byte answers `404` ("property not found"), and the audit record is
+`not_found`.
 
 ---
 
@@ -6615,7 +6627,7 @@ mapped to a `503` (a client typo must not read as store degradation).
 #### `GET /api/v1/responses/{id}/export`
 
 **Permission:** `Response:Read`, same resolve-then-scope confinement as the routes above. The v1
-twin of `GET /api/responses/{id}/export` above (no MCP twin — export is a REST-only shape). `format`
+twin of `GET /api/responses/{id}/export` above (no MCP twin yet). `format`
 is `json` (default) or `csv` — an unrecognised value falls through to `json`, matching the legacy
 route's own behavior exactly (neither route rejects an unknown `format` with `400`); `limit` is
 clamped to `[1,10000]` on both bounds (see the differences above). Does not accept `offset` (see
@@ -12479,9 +12491,11 @@ The header bell polls `GET /api/notifications?limit=10` with the session cookie 
 
 > **Note:** `/api/health` is an identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Both paths are unauthenticated, exempt from rate limiting, and return the same JSON body. The canonical path is `/health`; use `/api/health` only when your tooling enforces the `/api/` prefix unconditionally. (Restored in v0.12.0 — see issue #620.)
 >
+> **Note:** When HTTPS is on, `/health` and `/api/health` are also answered on the plain-HTTP redirect port, in cleartext, where they always return the unauthenticated shape (no session is ever resolved there). That port answers `503 {"status":"not ready","reason":"https_listener_not_serving"}` to all four probe paths while the HTTPS listener is not bound or has exited.
+>
 > **Note:** `/health` and `/api/health` are intentionally NOT draining-aware (they continue returning 200 during graceful shutdown). For load-balancer health checks that should drain in-flight traffic before stopping, use `/readyz` instead — it returns 503 once the server begins draining.
 >
-> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `version`. Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*` — those fields require SQLite scans and are gated behind a session so an unauthenticated probe flood cannot become a DoS amplification primitive.
+> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `version`, `tls.*` (default-certificates flag, install CA fingerprint and expiry). Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*` — those fields require SQLite scans and are gated behind a session so an unauthenticated probe flood cannot become a DoS amplification primitive.
 
 Structured JSON health check endpoint. This endpoint is **unauthenticated** and intended for load balancers, monitoring systems, and orchestration tools.
 

@@ -274,7 +274,7 @@
         },
         {
           "description": "The submitting user, or \"-\" when unavailable.",
-          "example": "alex",
+          "example": "jsmith",
           "name": "owner",
           "platforms": [
             "windows",
