@@ -5,7 +5,7 @@ The route tests stub every dependency, so a permissive gate or a swapped data so
 server.cpp would leave them all green. This gate pins the production wiring of
 access_audit::register_access_audit_routes( ... ):
 
-  1. `.perm_fn` is the server's loud `perm_fn` (never a lambda returning a constant) and
+  1. `.perm_fn` is the server's loud `perm_fn`, `.quiet_perm_fn` its `draw_perm_fn` probe (never a lambda returning a constant) and
      `.audit_fn` is the server's `audit_fn`.
   2. `.query_fn` returns std::nullopt for a missing or closed audit store and otherwise returns
      `audit_store_->query(q, pool_size)`; it never returns a literal empty vector.
@@ -55,6 +55,8 @@ def audit_problems(src):
     out = []
     if ".perm_fn = perm_fn," not in b:
         out.append("audit .perm_fn is no longer the server's loud perm_fn")
+    if ".quiet_perm_fn = draw_perm_fn," not in b:
+        out.append("audit .quiet_perm_fn is no longer the server's quiet probe (draw_perm_fn)")
     if ".audit_fn = audit_fn," not in b:
         out.append("audit .audit_fn is no longer the server's audit_fn")
     qf = re.search(r"\.query_fn = (.*?), \.retention_days_fn", b)
@@ -84,6 +86,9 @@ MUTATIONS = [
     (r"(register_access_audit_routes\(\s*inline_sink,\s*yuzu::server::access_audit::Deps\{\s*\.auth_fn = auth_fn,\s*)\.perm_fn = perm_fn,",
      r"\1.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&, const std::string&) { return true; },",
      "perm_fn"),
+    (r"\.quiet_perm_fn = draw_perm_fn,",
+     r".quiet_perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&, const std::string&) { return true; },",
+     "quiet_perm_fn"),
     (r"if \(!audit_store_ \|\| !audit_store_->is_open\(\)\)\n\s*return std::nullopt;\n(\s*return audit_store_->query\(q, pool_size\);)",
      r"\1", "nullopt"),
     (r"return audit_store_->query\(q, pool_size\);", "return std::vector<AuditEvent>{};", "query"),

@@ -60,7 +60,7 @@ const BadFilter* parse_log_request(const httplib::Request& req, LogView& v) {
 } // namespace
 
 void register_access_audit_routes(HttpRouteSink& sink, Deps deps) {
-    if (!deps.auth_fn || !deps.perm_fn || !deps.audit_fn || !deps.query_fn ||
+    if (!deps.auth_fn || !deps.perm_fn || !deps.quiet_perm_fn || !deps.audit_fn || !deps.query_fn ||
         !deps.retention_days_fn || !deps.now_fn)
         throw std::invalid_argument(
             "access_audit::register_access_audit_routes: every Deps member is required");
@@ -79,7 +79,7 @@ void register_access_audit_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/fragments/access/audit/log",
              [deps](const httplib::Request& req, httplib::Response& res) {
                  // Gate first: a denied caller costs no parse and no read.
-                 if (!deps.perm_fn(req, res, "AuditLog", "Read"))
+                 if (!deps.quiet_perm_fn(req, res, "AuditLog", "Read"))
                      return;
                  LogView v;
                  if (const auto* bad = parse_log_request(req, v)) {

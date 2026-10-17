@@ -53,6 +53,10 @@ struct Deps {
 
     AuthFn auth_fn;
     PermFn perm_fn;
+    /// `AuthRoutes::probe_permission`: the same decision as `perm_fn`, the denial row withheld
+    /// for a cookie session. Used only by the log panel, which loads on its own when the page
+    /// opens; the sample and retention panels run on request and keep the loud gate.
+    PermFn quiet_perm_fn;
     AuditFn audit_fn;
     QueryFn query_fn;
     /// `Config::audit_retention_days`, read per call so a runtime change shows.

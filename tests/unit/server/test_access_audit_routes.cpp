@@ -100,6 +100,7 @@ struct Harness {
             res.set_content(kDenyBody, "application/json");
             return false;
         };
+        d.quiet_perm_fn = d.perm_fn;
         d.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
                             const std::string& tt, const std::string& ti, const std::string& dt) {
             if (audit_throws)
@@ -132,6 +133,7 @@ TEST_CASE("audit routes: registration fails fast when any dependency is unbound"
     const std::vector<Member> unbind = {
         [](access_audit::Deps& d) { d.auth_fn = nullptr; },
         [](access_audit::Deps& d) { d.perm_fn = nullptr; },
+        [](access_audit::Deps& d) { d.quiet_perm_fn = nullptr; },
         [](access_audit::Deps& d) { d.audit_fn = nullptr; },
         [](access_audit::Deps& d) { d.query_fn = nullptr; },
         [](access_audit::Deps& d) { d.retention_days_fn = nullptr; },

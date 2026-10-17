@@ -9995,7 +9995,7 @@ The audit-log panel. Same store, gate and filters as `GET /api/v1/audit` (MCP `q
 - **Permission:** `AuditLog:Read` (admin-only while RBAC is disabled, #5771).
 - **Query:** `range` — `1h`, `24h` (default) or `7d`; `principal`, `action` — exact matches; `offset` — `0` to `10000`. `limit` is not read: the page is always 50 rows.
 - **Response (200):** HTML fragment: the table and pager, `No events match` when the store answered with zero rows, or a red "could not be read" box with no table when the store did not answer. A refused request (unknown `range`, `offset` outside `0..10000`, NUL byte in a filter) is also 200 with a fixed note and nothing read.
-- **Response (403):** The caller lacks `AuditLog:Read` (the gate's own response).
+- **Response (403):** The caller lacks `AuditLog:Read` (the gate's own response). The panel loads on its own, so a refused browser session writes no denial row; a refused token does.
 - **Audit:** none on a read, like the REST route.
 - **Headers:** `Cache-Control: no-store`.
 

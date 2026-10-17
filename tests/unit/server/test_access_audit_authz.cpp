@@ -94,6 +94,8 @@ struct Rig {
         };
         d.perm_fn = [this](const httplib::Request& q, httplib::Response& r, const std::string& t,
                            const std::string& o) { return ar->require_permission(q, r, t, o); };
+        d.quiet_perm_fn = [this](const httplib::Request& q, httplib::Response& r, const std::string& t,
+                                 const std::string& o) { return ar->probe_permission(q, r, t, o); };
         d.audit_fn = [this](const httplib::Request&, const std::string&, const std::string&,
                             const std::string&, const std::string&, const std::string&) {
             return true;
@@ -174,7 +176,9 @@ TEST_CASE("audit page authz: a plain user with RBAC off is refused the audit tra
         CHECK_THAT(res->body, !ContainsSubstring("<table"));
     }
     CHECK(r.reads == 0);
-    CHECK(r.denied_rows() == 3);
+    // The log auto-loads, so its refusal is a quiet probe (no row for a cookie session); the
+    // sample and retention panels run on request and keep the loud gate.
+    CHECK(r.denied_rows() == 2);
 }
 
 TEST_CASE("audit page authz: RBAC on, Operator and Viewer read the log but not retention",
@@ -214,5 +218,5 @@ TEST_CASE("audit page authz: RBAC on, a Reviewer holds AccessReview only and is 
         CHECK(res->status == 403);  // AccessReview:Read does not satisfy AuditLog:Read
     }
     CHECK(r.reads == 0);
-    CHECK(r.denied_rows() == 2);
+    CHECK(r.denied_rows() == 1);  // the sample only; the auto-loading log is probed quietly
 }
