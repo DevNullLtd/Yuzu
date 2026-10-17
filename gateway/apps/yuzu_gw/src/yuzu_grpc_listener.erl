@@ -120,6 +120,7 @@
 -export([start_link/1, start/1, stop/1, child_spec/1]).
 -export([port/1, validate/1, ssl_opts/1, http2_opts/1]).
 -export([serves_agent/1, routes_agent/1, serves_proto/2, proper_list/1]).
+-export([role/1, ref/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([entry/0]).
@@ -351,7 +352,7 @@ terminate(_Reason, _State) ->
 %%--------------------------------------------------------------------
 
 listen(#{name := Name} = Entry, Routes) ->
-    Ref = {yuzu_grpc, Name},
+    Ref = ref(Entry),
     Tls = maps:get(tls, Entry, undefined),
     Trans = transport_opts(Entry, Tls),
     Proto = protocol_opts(Entry, Routes),
@@ -425,6 +426,9 @@ protocol_opts(Entry, Routes) ->
                  %% stream that has ended), rate-limited and without the term.
                  logger => yuzu_grpc_cowboy_log,
                  env => #{grpc => Routes,
+                          %% the closed role the connection's metrics are
+                          %% labelled with (yuzu_grpc_stream_h)
+                          listener => role(Entry),
                           auth_fun => maps:get(auth_fun, Entry, undefined),
                           origin => Origin,
                           limits => Limits},
@@ -558,6 +562,26 @@ check_auth_fun(Entry) ->
 -spec serves_agent(term()) -> boolean().
 serves_agent(Entry) ->
     serves_proto(Entry, agent_pb) orelse routes_agent(Entry).
+
+%% @doc The Ranch reference of an entry's listener.
+-spec ref(entry()) -> {yuzu_grpc, term()}.
+ref(#{name := Name}) ->
+    {yuzu_grpc, Name}.
+
+%% @doc What a listener is for, as a metric label (a closed set, never the
+%% configured name): `agent' when it serves the agent service (a combined
+%% agent+management lab listener included), `management' when it routes the
+%% ManagementService and not the agent service, `other' otherwise.
+-spec role(term()) -> agent | management | other.
+role(Entry) ->
+    case serves_agent(Entry) of
+        true -> agent;
+        false ->
+            case routes_service(Entry, ?MGMT_SERVICE) of
+                true -> management;
+                false -> other
+            end
+    end.
 
 %% @doc Whether the entry routes the AgentService: it is a key of `services'.
 %% The strict test, which the boot guard and /readyz ask: an entry that lists

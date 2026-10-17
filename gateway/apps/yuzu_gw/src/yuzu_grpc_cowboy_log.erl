@@ -12,14 +12,20 @@
 %%%       the exit of a handler whose stream has already gone
 %%%
 %%% When a client resets many streams at once (a mass cancel) each of them can
-%%% produce one, so these are written at most once per ?INTERVAL_MS per
-%%% connection, the next line saying how many were not written; and the message
+%%% produce one, and so can many connections at once: every agent whose Register
+%%% timed out (a registration storm against a slow server) ends its own stream
+%%% on its own connection, and the handler's late status then arrives for a
+%%% stream that has gone, about 15,000 lines at 25,000 agents when the limit was
+%%% kept per connection. So each kind is written at most once per ?INTERVAL_MS
+%%% per NODE, the next line saying how many were not written; and the message
 %%% or exit reason is reduced to its tag, because Cowboy would print the whole
 %%% term: a handler's frame there is a response body (an agent's command
 %%% output), and an exit reason can embed a request.
 %%%
-%%% The limit's state lives in the connection process's dictionary: no table, no
-%%% global state, nothing to set up, and it goes when the connection does.
+%%% The limit's state is an atomics array per kind, found through
+%%% persistent_term and made on first use (no lock, no process: a line racing
+%%% another may make a second array, which is harmless, as in
+%%% yuzu_grpc_runner). Of callers racing at the same moment exactly one writes.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_cowboy_log).
@@ -30,8 +36,11 @@
 -export([emergency/2, alert/2, critical/2, error/2, warning/2, notice/2, info/2,
          debug/2]).
 -export([tag/1]).
+-export([reset/0]).  %% for testing
 
 -define(INTERVAL_MS, 1000).
+%% "No line written yet": far enough before any clock reading, whatever its origin.
+-define(NEVER, -(1 bsl 62)).
 -define(UNKNOWN_STREAM, "Received message ~p for unknown stream ~p.").
 -define(UNKNOWN_EXIT, "Received EXIT signal ~p for unknown process ~p.~n").
 
@@ -64,24 +73,47 @@ tag(Tuple) when is_tuple(Tuple), tuple_size(Tuple) > 0, is_atom(element(1, Tuple
     atom_to_list(element(1, Tuple));
 tag(_) -> "other".
 
-%% One line per interval per connection; the next written line counts the rest.
+%% One line per interval per node; the next written line counts the rest.
 limited(Kind, Format, Args) ->
+    Limit = limit(Kind),
     Now = erlang:monotonic_time(millisecond),
-    case get({?MODULE, Kind}) of
-        {Last, Suppressed} when Now - Last < ?INTERVAL_MS ->
-            put({?MODULE, Kind}, {Last, Suppressed + 1});
-        Previous ->
-            Suppressed = case Previous of
-                             {_, N} -> N;
-                             undefined -> 0
-                         end,
-            put({?MODULE, Kind}, {Now, 0}),
-            case Suppressed of
+    Last = atomics:get(Limit, 1),
+    case Now - Last >= ?INTERVAL_MS andalso
+         atomics:compare_exchange(Limit, 1, Last, Now) =:= ok of
+        true ->
+            case atomics:exchange(Limit, 2, 0) of
                 0 -> error_logger:warning_msg(Format ++ "~n", Args);
-                _ -> error_logger:warning_msg(Format ++ " (~b similar line(s) not logged "
-                                              "since the last)~n", Args ++ [Suppressed])
-            end
+                Suppressed ->
+                    error_logger:warning_msg(Format ++ " (~b similar line(s) not logged "
+                                             "since the last)~n", Args ++ [Suppressed])
+            end;
+        false ->
+            atomics:add(Limit, 2, 1)
     end,
+    ok.
+
+%% The limit of one kind: slot 1 the time of the last line, slot 2 the lines
+%% since it that were not written.
+limit(Kind) ->
+    case persistent_term:get({?MODULE, Kind}, undefined) of
+        undefined ->
+            Limit = atomics:new(2, [{signed, true}]),
+            atomics:put(Limit, 1, ?NEVER),
+            persistent_term:put({?MODULE, Kind}, Limit),
+            Limit;
+        Limit ->
+            Limit
+    end.
+
+%% @doc Forget the last line and the count of each kind, so the next line of
+%% each is written.
+-spec reset() -> ok.
+reset() ->
+    [begin
+         Limit = limit(Kind),
+         atomics:put(Limit, 1, ?NEVER),
+         atomics:put(Limit, 2, 0)
+     end || Kind <- [unknown_stream, unknown_exit]],
     ok.
 
 %% What cowboy:log/4 does when no logger module is set.

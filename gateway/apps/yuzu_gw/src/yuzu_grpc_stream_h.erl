@@ -72,6 +72,10 @@
 %% a tenth of the timeout, at most one second (deadline_ms/1).
 -define(DEADLINE_MARGIN_MAX_MS, 1000).
 -define(DEADLINE_MARGIN_DIVISOR, 10).
+%% Connection-process dictionary keys: the listener role, and the mark that a
+%% close of this connection was already counted.
+-define(LISTENER_KEY, '$yuzu_grpc_listener').
+-define(CLOSED_KEY, '$yuzu_grpc_close_counted').
 
 -record(st, {
     phase = awaiting_request :: awaiting_request | running | running_single | ended,
@@ -125,7 +129,8 @@ info(_StreamId, Msg, St) ->
 %% deadline, a closed connection): it does not trap exits, so it ends at once
 %% wherever it is blocked and runs no cleanup of its own (see yuzu_grpc_runner).
 -spec terminate(cowboy_stream:streamid(), cowboy_stream:reason(), #st{}) -> ok.
-terminate(_StreamId, _Reason, #st{handler = Handler, timer = Timer, recv_timer = RecvTimer}) ->
+terminate(_StreamId, Reason, #st{handler = Handler, timer = Timer, recv_timer = RecvTimer}) ->
+    count_close(Reason),
     cancel_timer(Timer),
     cancel_timer(RecvTimer),
     _ = case Handler of
@@ -151,12 +156,43 @@ start(StreamId, Req, Env) ->
     %% in the connection process). It is per connection, not per stream, so do
     %% it once; a later stream on the same connection finds it already set.
     cap_connection_memory(MaxMessage, Limits),
+    %% The listener role a close of this connection is counted under.
+    put(?LISTENER_KEY, maps:get(listener, Env, other)),
     St0 = #st{max_message = MaxMessage},
     case authenticate(maps:get(auth_fun, Env, undefined), maps:get(cert, Req, undefined)) of
         false ->
             reject(St0, ?GRPC_STATUS_UNAUTHENTICATED, <<"unauthenticated">>);
         true ->
             admitted(StreamId, Req, Env, St0)
+    end.
+
+%% A connection Cowboy closes itself, counted once per connection when the close
+%% reaches a stream: Cowboy ends every stream still open with the connection's
+%% reason, and this runs in the connection process, so the first stream to see
+%% it counts it and the rest find the mark. Only Cowboy's own reasons are
+%% counted, from a closed set: an idle_timeout (nothing received for the
+%% listener's idle_timeout), enhance_your_calm (a flood limit: resets, cancels,
+%% settings, pings, priorities or empty frames past its rate) and any other
+%% HTTP/2 connection error (protocol_error). A peer that closes, a socket error
+%% and a stop of the listener are not counted; a connection the VM kills for
+%% its memory ceiling never gets here (yuzu_gw_conn_watch counts that); a
+%% connection with no stream open when it closes is not seen.
+count_close({connection_error, enhance_your_calm, _}) -> connection_closed(enhance_your_calm);
+count_close({connection_error, _, _}) -> connection_closed(protocol_error);
+count_close({stop, timeout, _}) -> connection_closed(idle_timeout);
+count_close(_) -> ok.
+
+connection_closed(Reason) ->
+    case get(?CLOSED_KEY) of
+        true -> ok;
+        _ ->
+            put(?CLOSED_KEY, true),
+            Listener = case get(?LISTENER_KEY) of
+                           undefined -> other;
+                           L -> L
+                       end,
+            telemetry:execute([yuzu, gw, grpc, connection_closed], #{count => 1},
+                              #{listener => Listener, reason => Reason})
     end.
 
 %% The max_heap_size ceiling on the connection process. `include_shared_binaries'

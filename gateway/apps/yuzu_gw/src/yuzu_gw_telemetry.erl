@@ -11,7 +11,7 @@
 -module(yuzu_gw_telemetry).
 
 -export([setup/0, handle_event/4]).
--export([metric_specs/0, declared_metrics/0]).
+-export([metric_specs/0, declared_metrics/0, unseeded_metrics/0]).
 -export([mgmt_auth_reject_reasons/0, heartbeat_reject_reasons/0,
          origin_ignored_labels/0, dropped_data_reasons/0,
          upstream_dropped_rpcs/0]).
@@ -135,7 +135,20 @@
     [yuzu, gw, upstream, registration_replay_done],
     [yuzu, gw, upstream, notify_lost],
     [yuzu, gw, upstream, notify_requeued],
-    [yuzu, gw, upstream, notify_held]
+    [yuzu, gw, upstream, notify_held],
+
+    %% METRICS workstream (#5695): the runtime sampler (yuzu_gw_gauge) -- named
+    %% processes' mailboxes and queue wait, listener connections against their
+    %% ceiling, the management listener's handlers, ports and limits, the run
+    %% queue -- the router's fan-outs in flight, and connections Cowboy closed.
+    [yuzu, gw, process, mailbox],
+    [yuzu, gw, process, queue_wait],
+    [yuzu, gw, listener, connections],
+    [yuzu, gw, mgmt, streams],
+    [yuzu, gw, vm, ports],
+    [yuzu, gw, vm, run_queue],
+    [yuzu, gw, router, fanouts],
+    [yuzu, gw, grpc, connection_closed]
 ]).
 
 %%--------------------------------------------------------------------
@@ -542,6 +555,40 @@ handle_event([yuzu, gw, upstream, notify_held], #{hwm := Hwm, max := Max}, _Meta
     prometheus_gauge:set(yuzu_gw_upstream_notify_pending_hwm, [], Hwm),
     prometheus_gauge:set(yuzu_gw_upstream_notify_pending_max, [], Max);
 
+%% METRICS workstream (#5695). Labels are closed sets (the sampler's process
+%% list, the listener roles, Cowboy's close reasons); anything else folds to
+%% `unknown', so a bug can neither widen a label set nor crash this handler.
+handle_event([yuzu, gw, process, mailbox], #{len := N}, Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_process_mailbox_len,
+                         [closed(maps:get(process, Meta, unknown), process_labels())], N);
+handle_event([yuzu, gw, process, queue_wait], #{seconds := S}, Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_process_queue_wait_seconds,
+                         [closed(maps:get(process, Meta, unknown), process_labels())], S);
+handle_event([yuzu, gw, listener, connections], #{active := A, max := M}, Meta, _Config) ->
+    Role = closed(maps:get(listener, Meta, unknown), listener_roles()),
+    prometheus_gauge:set(yuzu_gw_listener_connections, [Role], A),
+    case M of
+        _ when is_integer(M) -> prometheus_gauge:set(yuzu_gw_listener_max_connections, [Role], M);
+        _ -> prometheus_gauge:remove(yuzu_gw_listener_max_connections, [Role])
+    end;
+handle_event([yuzu, gw, mgmt, streams], #{count := N}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_mgmt_streams_inflight, [], N);
+handle_event([yuzu, gw, vm, ports], #{count := N, limit := L} = M, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_beam_ports, [], N),
+    prometheus_gauge:set(yuzu_gw_beam_port_limit, [], L),
+    case maps:get(fd_limit, M, undefined) of
+        F when is_integer(F) -> prometheus_gauge:set(yuzu_gw_beam_fd_limit, [], F);
+        _ -> ok
+    end;
+handle_event([yuzu, gw, vm, run_queue], #{length := N}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_beam_run_queue, [], N);
+handle_event([yuzu, gw, router, fanouts], #{inflight := N}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_router_fanouts_inflight, [], N);
+handle_event([yuzu, gw, grpc, connection_closed], #{count := N}, Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_grpc_connections_closed_total,
+                           [closed(maps:get(listener, Meta, unknown), listener_roles()),
+                            closed(maps:get(reason, Meta, unknown), close_reasons())], N);
+
 handle_event(_Event, _Measurements, _Meta, _Config) ->
     ok.
 
@@ -552,6 +599,11 @@ permit_refusals()     -> [queue_full, deadline, stopping].
 replay_outcomes()     -> [adopted, superseded, rejected, failed, skipped, aborted].
 notify_events()       -> [connected, disconnected].
 notify_lost_reasons() -> [at_capacity, evicted, rejected, crashed, shutdown].
+
+%% METRICS workstream (#5695): the closed label sets of its families.
+process_labels() -> [L || {L, _} <- yuzu_gw_gauge:sampled_processes()].
+listener_roles()  -> [agent, management, other].
+close_reasons()   -> [idle_timeout, enhance_your_calm, protocol_error].
 
 closed(Value, Set) when is_atom(Value) ->
     case lists:member(Value, Set) of
@@ -961,7 +1013,8 @@ metric_specs() ->
         {gauge, [
             {name, yuzu_gw_beam_scheduler_util},
             {labels, [node]},
-            {help, "BEAM scheduler utilization (weighted average)"}]},
+            {help, "Share of the last sample interval the normal schedulers were busy, "
+                   "0 to 1 (dirty schedulers are not counted)"}]},
         {gauge, [
             {name, yuzu_gw_upstream_backpressure_duty_cycle},
             {labels, []},
@@ -1106,7 +1159,81 @@ metric_specs() ->
             {name, yuzu_gw_upstream_notify_pending_max},
             {labels, []},
             {help, "The held stream-status notification cap in force "
-                   "(notify_pending_max)"}]}
+                   "(notify_pending_max)"}]},
+
+        %% -- METRICS workstream (#5695) ------------------------------------
+        %% Sampled by yuzu_gw_gauge every telemetry_gauge_interval_ms (bounded
+        %% cost: a fixed process list, one ranch:info/1 per listener), except
+        %% the router's fan-outs (reported by the router on every change) and
+        %% the Cowboy closes (counted by yuzu_grpc_stream_h at the event).
+        {gauge, [
+            {name, yuzu_gw_process_mailbox_len},
+            {labels, [process]},
+            {help, "Messages waiting in the mailbox of a named gateway process, by "
+                   "process (closed set: upstream, upstream_regulator, registry, "
+                   "router, heartbeat_buffer, agent_sup, pg, upstream_channel, "
+                   "logger). Sampled every telemetry_gauge_interval_ms; 0 when the "
+                   "process is not running"}]},
+        {gauge, [
+            {name, yuzu_gw_process_queue_wait_seconds},
+            {labels, [process]},
+            {duration_unit, false},
+            {help, "Seconds a message sent to a named gateway process waited "
+                   "before the process reached it, by process: the round trip of "
+                   "a probe sent each sample. While a probe is unanswered, the time "
+                   "since it was sent (it grows each sample until the process "
+                   "reaches it)"}]},
+        {gauge, [
+            {name, yuzu_gw_listener_connections},
+            {labels, [listener]},
+            {help, "Connections a gRPC listener holds now (Ranch active "
+                   "connections), by listener role: agent, management, other"}]},
+        {gauge, [
+            {name, yuzu_gw_listener_max_connections},
+            {labels, [listener]},
+            {help, "The listener's limits.max_connections, by listener role. "
+                   "Absent when the listener has no ceiling (the default)"}]},
+        {gauge, [
+            {name, yuzu_gw_mgmt_streams_inflight},
+            {labels, []},
+            {help, "Calls the management listener is running a handler for now "
+                   "(SendCommand, WatchEvents and unary calls of the server's "
+                   "connections)"}]},
+        {gauge, [
+            {name, yuzu_gw_router_fanouts_inflight},
+            {labels, []},
+            {help, "Command fan-outs the router is tracking now (each waits for "
+                   "its agents' terminal responses or its timeout)"}]},
+        {gauge, [
+            {name, yuzu_gw_beam_ports},
+            {labels, []},
+            {help, "Ports open in the gateway VM (each TCP connection is one, so "
+                   "this tracks the file descriptors the connections use)"}]},
+        {gauge, [
+            {name, yuzu_gw_beam_port_limit},
+            {labels, []},
+            {help, "The most ports the gateway VM can open (+Q)"}]},
+        {gauge, [
+            {name, yuzu_gw_beam_fd_limit},
+            {labels, []},
+            {help, "The file descriptor limit the gateway VM found at start "
+                   "(the process's open-files limit)"}]},
+        {gauge, [
+            {name, yuzu_gw_beam_run_queue},
+            {labels, []},
+            {help, "Processes ready to run and waiting for a scheduler (normal and "
+                   "dirty CPU run queues)"}]},
+        {counter, [
+            {name, yuzu_gw_grpc_connections_closed_total},
+            {labels, [listener, reason]},
+            {help, "Connections the gateway's HTTP/2 server (Cowboy) closed itself, "
+                   "by listener role and reason: idle_timeout (nothing received for "
+                   "the listener's idle_timeout), enhance_your_calm (a flood limit, "
+                   "such as more stream cancels than max_cancel_stream_rate), "
+                   "protocol_error (any other HTTP/2 connection error). Counted for "
+                   "a connection that had a stream open when it closed. A "
+                   "connection killed for its memory ceiling is counted in "
+                   "yuzu_gw_grpc_connection_killed_total"}]}
     ].
 
 %% @doc The names of every metric metric_specs/0 declares.
@@ -1221,7 +1348,67 @@ seed_metrics() ->
     prometheus_gauge:set(yuzu_gw_upstream_notify_pending_hwm, [], 0),
     prometheus_gauge:set(yuzu_gw_upstream_notify_pending_max, [], 0),
 
+    %% Node-labelled families whose producer reports on its first tick or event:
+    %% present at 0 from the declaration so a dashboard or rate() sees the
+    %% series before then.
+    Node = node(),
+    [prometheus_counter:inc(C, [Node], 0)
+     || C <- [yuzu_gw_agents_connected_total, yuzu_gw_agents_disconnected_total]],
+    [prometheus_gauge:set(G, [Node], 0)
+     || G <- [yuzu_gw_agents_current, yuzu_gw_beam_process_count,
+              yuzu_gw_beam_scheduler_util, yuzu_gw_registration_replay_queue_depth,
+              yuzu_gw_cluster_peers_resolved, yuzu_gw_cluster_peers_connected]],
+    [prometheus_gauge:set(yuzu_gw_beam_memory_bytes, [Node, T], 0)
+     || T <- [total, processes, ets, binary]],
+    [prometheus_counter:inc(yuzu_gw_guardian_forward_dropped_total, [R], 0)
+     || R <- [<<"circuit_open">>, <<"at_capacity">>]],
+
+    %% METRICS workstream (#5695).
+    [begin
+         prometheus_gauge:set(yuzu_gw_process_mailbox_len, [P], 0),
+         prometheus_gauge:set(yuzu_gw_process_queue_wait_seconds, [P], 0)
+     end || P <- [atom_to_binary(P0, utf8) || P0 <- process_labels()]],
+    [begin
+         prometheus_gauge:set(yuzu_gw_listener_connections, [R], 0),
+         [prometheus_counter:inc(yuzu_gw_grpc_connections_closed_total, [R, C], 0)
+          || C <- [atom_to_binary(C0, utf8) || C0 <- close_reasons()]]
+     end || R <- [atom_to_binary(R0, utf8) || R0 <- listener_roles()]],
+    [prometheus_gauge:set(G, [], 0)
+     || G <- [yuzu_gw_mgmt_streams_inflight, yuzu_gw_router_fanouts_inflight,
+              yuzu_gw_beam_ports, yuzu_gw_beam_run_queue]],
+    prometheus_gauge:set(yuzu_gw_beam_port_limit, [], erlang:system_info(port_limit)),
+
     ok.
+
+%% @doc The declared metrics that have no series until their first event, and
+%% why. Every other declared metric has at least one series from the moment it
+%% is declared (yuzu_gw_metrics_scrape_tests scrapes a started gateway to hold
+%% that). A histogram gets a series only with an observation; the rest have
+%% labels whose values are not known at start.
+-spec unseeded_metrics() -> [{atom(), string()}].
+unseeded_metrics() ->
+    [{yuzu_gw_commands_dispatched_total,
+      "plugin is the command's plugin name, not a closed set"},
+     {yuzu_gw_command_duration_ms,
+      "a histogram (series appear with the first observation); plugin is not a closed set"},
+     {yuzu_gw_upstream_rpc_duration_ms,
+      "a histogram: series appear with the first upstream call of each rpc_name"},
+     {yuzu_gw_upstream_permit_wait_seconds,
+      "a histogram: series appear with the first permit granted per class"},
+     {yuzu_gw_agent_session_duration_ms,
+      "a histogram: series appear with the first agent disconnect"},
+     {yuzu_gw_upstream_tls_handshake_failures_total,
+      "kind is the TLS alert name of the failure, known only when one happens"},
+     {yuzu_gw_cluster_events_total,
+      "node is the peer node's name, known only when it joins or leaves"},
+     {yuzu_gw_cert_expiry_timestamp_seconds,
+      "one series per configured certificate file, set when the file is first read"},
+     {yuzu_gw_cert_file_readable,
+      "one series per configured certificate file, set when the file is first checked"},
+     {yuzu_gw_listener_max_connections,
+      "a series exists only for a listener role with a max_connections ceiling"},
+     {yuzu_gw_beam_fd_limit,
+      "set by the first sample, where the VM reports its file descriptor limit"}].
 
 node_labels(Meta) ->
     [maps:get(node, Meta, node())].

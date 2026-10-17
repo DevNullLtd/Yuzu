@@ -214,6 +214,8 @@ late_stream_messages_test_() ->
      {timeout, 30, fun late_stream_messages/0}}.
 
 late_stream_messages() ->
+    %% the limit is per node: a line another test wrote this second would hide ours
+    yuzu_grpc_cowboy_log:reset(),
     {Port, L} = yuzu_gw_test_listener:start(prod_mgmt_entry(#{name => edge_late})),
     {C, Mon} = open(Port),
     try
@@ -242,6 +244,7 @@ late_stream_messages() ->
 %% The exit of a handler whose stream had gone: one line per second, the
 %% reason's tag only. Every other Cowboy line is written as Cowboy writes it.
 cowboy_log_lines_test() ->
+    yuzu_grpc_cowboy_log:reset(),
     Lines = yuzu_gw_test_logs:capture(
               warning,
               fun() ->
