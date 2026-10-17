@@ -9593,28 +9593,28 @@ outcome's granularity.
 
 ### Settings — OIDC Configuration
 
-**`POST /api/settings/oidc`** — Save OIDC / Entra ID SSO configuration.
+**`POST /api/settings/oidc`** — Save OIDC SSO configuration.
 
 - **Permission:** Admin only, on the caller's own account (the local account role, or the administrator role mapped from the identity provider). A session that is administrator only through a temporary elevation gets `403`; audit `oidc.configure / denied / elevated_session_oidc_change_blocked`.
 - **Request body (form-encoded):**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `issuer` | string | Yes | OIDC issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`) |
+| `issuer` | string | Yes | OIDC issuer URL, exactly as the IdP's discovery document states it in `issuer` (e.g., Entra ID: `https://login.microsoftonline.com/<tenant-guid>/v2.0`, the tenant ID form; Keycloak: `https://<keycloak>/realms/<realm>`) |
 | `client_id` | string | Yes | Application (client) ID from Azure portal |
 | `client_secret` | string | No | Client secret value. If empty and a secret already exists, the existing secret is preserved. |
-| `redirect_uri` | string | No | Callback URL. If empty, auto-computed from web address/port. |
+| `redirect_uri` | string | Yes | Callback URL; register exactly this value at the IdP. A blank value is refused with `400` and a red message naming the field (a provider without one never fetches discovery and `GET /auth/oidc/start` would answer `500` "OIDC redirect_uri not configured"). It is NOT auto-computed on this route: only the startup flag path fills in a localhost default. |
 | `admin_group` | string | No | Entra group object ID for admin role mapping |
-| `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC endpoints (insecure, dev only) |
+| `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC discovery, JWKS and (Linux/macOS) token requests (insecure, dev only); the Windows token request ignores it. The save itself does not contact the IdP; use `/test` |
 
-- **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success.
+- **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success. `400` with a red message when `issuer` or `client_id` is missing, or `redirect_uri` is blank; nothing is saved in that case. Each `400`, and the `500` returned when the provider cannot be built, also carries an error toast (`HX-Trigger: {"showToast":{"message":"...","level":"error"}}`) because the dashboard does not swap a 4xx or 5xx body. Saves are serialized: two concurrent saves run one after the other, and a blank `client_secret` keeps the secret stored when that save runs.
 - **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts the provider to that value (the stored `oidc_admin_group` still applies after a restart; see [When a change takes effect](#when-a-change-takes-effect)). Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
-**`POST /api/settings/oidc/test`** — Test OIDC discovery connectivity.
+**`POST /api/settings/oidc/test`** — Test OIDC discovery and signing-key connectivity.
 
 - **Permission:** Admin only
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
-- **Response:** HTML feedback span — green on success, red on failure with specific error.
+- **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` (one request after the other, each with its own total time bound, so one call can take up to about 20 s in the worst case at the default timeouts: a slow discovery document followed by a stalled JWKS fetch; a dead IdP fails at the discovery step) and reports how many signing keys it found. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. The typed issuer and the `jwks_uri` are subject to the server's OIDC egress policy: an address the policy refuses (link-local and cloud-metadata always; loopback, RFC 1918, carrier-grade NAT and unique-local unless the server was started with `--oidc-allow-private-networks`) is not connected to, and the red feedback reads `Discovery failed: request failed: address not permitted by the OIDC egress policy` (never the resolved address). The switch is a server start-up option; no form field of this route or of `POST /api/settings/oidc` can change it. This is a connectivity check, not a guarantee of what a sign-in will hit: it uses the form's `issuer` (the saved issuer when blank), never reads or clears the running provider's discovery state (the 30 s no-retry window and the in-flight mark), and skips TLS verification when the form's `skip_tls_verify` is `"true"` OR the server's current value is true (an absent field cannot turn verification on while that value is true).
 
 #### `GET /api/v1/settings/oidc`
 
@@ -9634,7 +9634,7 @@ Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration c
 {
   "data": {
     "configured": true,
-    "issuer": "https://login.microsoftonline.com/{tenant}/v2.0",
+    "issuer": "https://login.microsoftonline.com/<tenant-guid>/v2.0",
     "client_id": "abcd-1234",
     "client_secret_configured": true,
     "redirect_uri": "https://yuzu.example.com/auth/callback",
