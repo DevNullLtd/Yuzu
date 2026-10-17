@@ -7,32 +7,6 @@
 
 namespace yuzu::server {
 
-namespace {
-
-// Machine (snake_case) values, byte-identical to auth::rule_type_to_string() (exported from
-// auto_approve.hpp; on-disk persistence and the dashboard's rule identity use it) and to the
-// strings auth::parse_auto_approve_rule_type() accepts from the POST body — NOT the page
-// wording: the sentences the Groups and Settings panels show ("Agent-reported hostname
-// matches ...") and the Add-rule <option> list live in enrolment_render.cpp (rule_phrase and
-// render_auto_approve). This switch is now a second copy of the exported function and could
-// call it instead — not done in this pass. A future new rule type must update
-// rule_type_to_string, this switch and the renderer's phrase and option list.
-const char* auto_approve_rule_type_str(auth::AutoApproveRuleType t) {
-    switch (t) {
-    case auth::AutoApproveRuleType::trusted_ca:
-        return "trusted_ca";
-    case auth::AutoApproveRuleType::hostname_glob:
-        return "hostname_glob";
-    case auth::AutoApproveRuleType::ip_subnet:
-        return "ip_subnet";
-    case auth::AutoApproveRuleType::cloud_provider:
-        return "cloud_provider";
-    }
-    return "unknown";
-}
-
-} // namespace
-
 nlohmann::json directory_user_row_json(const DirectoryUser& u) {
     nlohmann::json groups = nlohmann::json::array();
     for (const auto& g : u.groups)
@@ -68,7 +42,7 @@ nlohmann::json directory_status_json(const SyncStatus& status,
 
 nlohmann::json auto_approve_rule_row_json(const auth::AutoApproveRule& rule, std::size_t index) {
     return {{"index", static_cast<int64_t>(index)},
-           {"type", auto_approve_rule_type_str(rule.type)},
+           {"type", auth::rule_type_to_string(rule.type)},
            {"value", rule.value},
            {"label", rule.label},
            {"enabled", rule.enabled}};
