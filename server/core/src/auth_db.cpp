@@ -2163,8 +2163,10 @@ std::string sqlstate_of(const pg::PgResult& res) {
 
 int to_int(const char* s) { return static_cast<int>(to_i64(s)); }
 
+// Saturating (auth::epoch_ms_to_time_point): a far-future expiry becomes time_point::max(),
+// which renders as the "never" sentinel, instead of wrapping negative.
 std::chrono::system_clock::time_point ms_to_tp(int64_t ms) {
-    return std::chrono::system_clock::time_point{std::chrono::milliseconds{ms}};
+    return auth::epoch_ms_to_time_point(ms);
 }
 
 std::optional<auth::PendingStatus> parse_pending_status(std::string_view s) {
@@ -2632,44 +2634,65 @@ namespace {
 const char* to_status_sql(bool approve) { return approve ? "approved" : "denied"; }
 } // namespace
 
-std::expected<bool, StoreError> AuthDB::approve_pending(const std::string& agent_id,
-                                                        const std::string& principal) {
+namespace {
+/// The single-row decision, shared by approve and deny. The UPDATE is guarded on
+/// `status = 'pending'` so a stale click can never reverse an earlier decision; when it
+/// matches nothing, a follow-up SELECT in the same transaction tells "no such row" from "a
+/// row exists but is already decided" (the same shape as `remove_pending`).
+std::expected<auth::PendingTransitionOutcome, StoreError>
+transition_pending(pg::PgPool& pool, std::chrono::milliseconds timeout, bool approve,
+                   const std::string& agent_id, const std::string& principal) {
     if (!agent_id_ok(agent_id) || !principal_ok(principal))
         return std::unexpected(StoreError::InvalidInput);
-    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    auto lease = pool.try_acquire_for(timeout);
     if (!lease)
         return std::unexpected(StoreError::Unavailable);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE auth.pending_agents SET status = $2, status_changed_at = now(), "
-        "  status_changed_by = $3 WHERE agent_id = $1 RETURNING agent_id",
-        std::vector<std::string>{agent_id, to_status_sql(true), principal});
-    if (res.status() != PGRES_TUPLES_OK)
+
+    auth::PendingTransitionOutcome outcome = auth::PendingTransitionOutcome::not_found;
+    bool query_ok = true;
+    const bool committed = pool.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
+        pg::PgResult upd = pg::exec_params(
+            conn,
+            "UPDATE auth.pending_agents SET status = $2, status_changed_at = now(), "
+            "  status_changed_by = $3 WHERE agent_id = $1 AND status = 'pending' "
+            "RETURNING agent_id",
+            std::vector<std::string>{agent_id, to_status_sql(approve), principal});
+        if (upd.status() != PGRES_TUPLES_OK) {
+            query_ok = false;
+            return false;
+        }
+        if (PQntuples(upd.get()) > 0) {
+            outcome = auth::PendingTransitionOutcome::changed;
+            return true;
+        }
+        pg::PgResult remaining = pg::exec_params(
+            conn, "SELECT 1 FROM auth.pending_agents WHERE agent_id = $1",
+            std::vector<std::string>{agent_id});
+        if (remaining.status() != PGRES_TUPLES_OK) {
+            query_ok = false;
+            return false;
+        }
+        outcome = PQntuples(remaining.get()) > 0 ? auth::PendingTransitionOutcome::wrong_status
+                                                  : auth::PendingTransitionOutcome::not_found;
+        return true; // no row touched; still a clean, committable no-op txn
+    });
+    if (!committed || !query_ok)
         return std::unexpected(StoreError::QueryFailed);
-    const bool found = PQntuples(res.get()) > 0;
-    if (found)
-        spdlog::info("Agent {} approved for enrollment by {}", agent_id, principal);
-    return found;
+    if (outcome == auth::PendingTransitionOutcome::changed)
+        spdlog::info("Agent {} {} for enrollment by {}", agent_id,
+                     approve ? "approved" : "denied", principal);
+    return outcome;
+}
+} // namespace
+
+std::expected<auth::PendingTransitionOutcome, StoreError>
+AuthDB::approve_pending(const std::string& agent_id, const std::string& principal) {
+    return transition_pending(impl_->pool, kWriteTimeout, true, agent_id, principal);
 }
 
-std::expected<bool, StoreError> AuthDB::deny_pending(const std::string& agent_id,
-                                                     const std::string& principal) {
-    if (!agent_id_ok(agent_id) || !principal_ok(principal))
-        return std::unexpected(StoreError::InvalidInput);
-    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected(StoreError::Unavailable);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE auth.pending_agents SET status = $2, status_changed_at = now(), "
-        "  status_changed_by = $3 WHERE agent_id = $1 RETURNING agent_id",
-        std::vector<std::string>{agent_id, to_status_sql(false), principal});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(StoreError::QueryFailed);
-    const bool found = PQntuples(res.get()) > 0;
-    if (found)
-        spdlog::info("Agent {} denied enrollment by {}", agent_id, principal);
-    return found;
+std::expected<auth::PendingTransitionOutcome, StoreError>
+AuthDB::deny_pending(const std::string& agent_id, const std::string& principal) {
+    return transition_pending(impl_->pool, kWriteTimeout, false, agent_id, principal);
 }
 
 namespace {
