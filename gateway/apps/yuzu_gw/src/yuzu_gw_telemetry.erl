@@ -148,7 +148,13 @@
     [yuzu, gw, vm, ports],
     [yuzu, gw, vm, run_queue],
     [yuzu, gw, router, fanouts],
-    [yuzu, gw, grpc, connection_closed]
+    [yuzu, gw, grpc, connection_closed],
+
+    %% SHEDDER workstream (#5695): the memory shedder's marks in force, and the
+    %% suspends and resumes of agent listeners that failed (retried each tick).
+    [yuzu, gw, memory_shedding, marks],
+    [yuzu, gw, memory_shedding, failing],
+    [yuzu, gw, memory_shedding, transition_failed]
 ]).
 
 %%--------------------------------------------------------------------
@@ -591,6 +597,19 @@ handle_event([yuzu, gw, grpc, connection_closed], #{count := N}, Meta, _Config) 
                            [closed(maps:get(listener, Meta, unknown), listener_roles()),
                             closed(maps:get(reason, Meta, unknown), close_reasons())], N);
 
+%% SHEDDER workstream (#5695). `action' is a closed set (suspend, resume);
+%% anything else folds to `unknown', so a bug can neither widen the label set
+%% nor crash this handler.
+handle_event([yuzu, gw, memory_shedding, marks], #{high := H, low := L}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_memory_shedding_high_water_bytes, [], H),
+    prometheus_gauge:set(yuzu_gw_memory_shedding_low_water_bytes, [], L);
+handle_event([yuzu, gw, memory_shedding, failing], #{count := N}, Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_memory_shedding_transition_failing,
+                         [closed(maps:get(action, Meta, unknown), shedding_actions())], N);
+handle_event([yuzu, gw, memory_shedding, transition_failed], #{count := N}, Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_memory_shedding_transition_failures_total,
+                           [closed(maps:get(action, Meta, unknown), shedding_actions())], N);
+
 handle_event(_Event, _Measurements, _Meta, _Config) ->
     ok.
 
@@ -606,6 +625,9 @@ notify_lost_reasons() -> [at_capacity, evicted, rejected, crashed, shutdown].
 process_labels() -> [L || {L, _} <- yuzu_gw_gauge:sampled_processes()].
 listener_roles()  -> [agent, management, other].
 close_reasons()   -> [idle_timeout, enhance_your_calm, protocol_error].
+
+%% SHEDDER workstream (#5695): the closed label set of its families.
+shedding_actions() -> [suspend, resume].
 
 closed(Value, Set) when is_atom(Value) ->
     case lists:member(Value, Set) of
@@ -868,10 +890,13 @@ metric_specs() ->
         {gauge, [
             {name, yuzu_gw_memory_shedding_active},
             {labels, []},
-            {help, "1 while the gateway is shedding load (the agent listener(s) are "
-                   "suspended in Ranch because erlang:memory(total) passed the "
-                   "high-water mark); 0 otherwise. The management listener is never "
-                   "suspended"}]},
+            {help, "1 while the gateway is shedding load: erlang:memory(total) "
+                   "passed the high-water mark and has not yet fallen to the "
+                   "low-water mark, so the agent listener(s) are suspended in Ranch "
+                   "and new agent connections are refused; 0 otherwise. A listener "
+                   "that could not be suspended or resumed is shown by "
+                   "yuzu_gw_memory_shedding_transition_failing. The management "
+                   "listener is never suspended"}]},
         {counter, [
             {name, yuzu_gw_memory_shedding_suspensions_total},
             {labels, []},
@@ -1238,7 +1263,40 @@ metric_specs() ->
                    "protocol_error (any other HTTP/2 connection error). Counted for "
                    "a connection that had a stream open when it closed. A "
                    "connection killed for its memory ceiling is counted in "
-                   "yuzu_gw_grpc_connection_killed_total"}]}
+                   "yuzu_gw_grpc_connection_killed_total"}]},
+
+        %% -- SHEDDER workstream (#5695) ------------------------------------
+        %% The memory shedder (yuzu_gw_memory_shedder): the marks it resolved
+        %% at start, and agent listeners it could not suspend or resume (each
+        %% retried on its next tick).
+        {gauge, [
+            {name, yuzu_gw_memory_shedding_high_water_bytes},
+            {labels, []},
+            {help, "The memory shedder's high-water mark in bytes of "
+                   "erlang:memory(total), resolved at start (a fraction of the "
+                   "smaller of host memory and the cgroup memory limit, or the "
+                   "configured bytes); 0 when the shedder is disabled or inactive"}]},
+        {gauge, [
+            {name, yuzu_gw_memory_shedding_low_water_bytes},
+            {labels, []},
+            {help, "The memory shedder's low-water mark in bytes, below which it "
+                   "resumes the agent listener(s); 0 when the shedder is disabled "
+                   "or inactive"}]},
+        {gauge, [
+            {name, yuzu_gw_memory_shedding_transition_failing},
+            {labels, [action]},
+            {help, "Agent listeners the memory shedder's last attempt failed to "
+                   "move, by action: suspend (shedding, but the listener still "
+                   "accepts) or resume (no longer shedding, but the listener still "
+                   "refuses new agents and /readyz stays 503). Retried every "
+                   "interval_ms; 0 once it succeeds"}]},
+        {counter, [
+            {name, yuzu_gw_memory_shedding_transition_failures_total},
+            {labels, [action]},
+            {help, "Failed attempts by the memory shedder to suspend or resume an "
+                   "agent listener, by action (suspend, resume); one per listener "
+                   "per attempt, and a failing listener is retried every "
+                   "interval_ms"}]}
     ].
 
 %% @doc The names of every metric metric_specs/0 declares.
@@ -1383,6 +1441,14 @@ seed_metrics() ->
      || G <- [yuzu_gw_mgmt_streams_inflight, yuzu_gw_router_fanouts_inflight,
               yuzu_gw_beam_ports, yuzu_gw_beam_run_queue]],
     prometheus_gauge:set(yuzu_gw_beam_port_limit, [], erlang:system_info(port_limit)),
+
+    %% SHEDDER workstream (#5695).
+    prometheus_gauge:set(yuzu_gw_memory_shedding_high_water_bytes, [], 0),
+    prometheus_gauge:set(yuzu_gw_memory_shedding_low_water_bytes, [], 0),
+    [begin
+         prometheus_gauge:set(yuzu_gw_memory_shedding_transition_failing, [A], 0),
+         prometheus_counter:inc(yuzu_gw_memory_shedding_transition_failures_total, [A], 0)
+     end || A <- [atom_to_binary(A0, utf8) || A0 <- shedding_actions()]],
 
     ok.
 

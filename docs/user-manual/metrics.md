@@ -227,8 +227,12 @@ peer node) or because it is a histogram; every other family exists from start.
 | `yuzu_gw_grpc_dropped_data_bytes_total` | counter | `reason` | Request bytes discarded because the call could not use them |
 | `yuzu_gw_grpc_recv_timeout_total` | counter | | One-request calls aborted because the request did not arrive in time |
 | `yuzu_gw_grpc_connection_killed_total` | counter | `reason` | Connections killed for passing their memory ceiling (`max_heap_size`) |
-| `yuzu_gw_memory_shedding_active` | gauge | | 1 while the agent listener is suspended to shed load |
+| `yuzu_gw_memory_shedding_active` | gauge | | 1 while the gateway sheds load: memory passed the high-water mark and has not yet fallen to the low-water mark, so the agent listener is suspended and new agent connections are refused |
 | `yuzu_gw_memory_shedding_suspensions_total` | counter | | Times the gateway began shedding load |
+| `yuzu_gw_memory_shedding_high_water_bytes` | gauge | | The shedder's high-water mark in bytes, resolved at start from the smaller of host memory and the cgroup memory limit (or the configured bytes); 0 when the shedder is off or inactive |
+| `yuzu_gw_memory_shedding_low_water_bytes` | gauge | | The shedder's low-water mark in bytes; 0 when the shedder is off or inactive |
+| `yuzu_gw_memory_shedding_transition_failing` | gauge | `action` | Agent listeners the shedder's last attempt failed to `suspend` or `resume`; retried every `interval_ms`, 0 once it succeeds. `YuzuGatewayMemorySheddingTransitionFailing` fires after 5 minutes |
+| `yuzu_gw_memory_shedding_transition_failures_total` | counter | `action` | Failed attempts to suspend or resume an agent listener, one per listener per attempt |
 | `yuzu_gw_cluster_events_total` | counter | `event`, `node` | Peer nodes joining and leaving (first event) |
 | `yuzu_gw_cluster_rebalanced_agents_total` | counter | | Agents moved during rebalancing |
 | `yuzu_gw_cluster_peers_resolved` | gauge | `node` | Peer addresses the cluster discovery found |

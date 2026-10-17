@@ -4035,6 +4035,76 @@ tests:
         eval_time: 20m
         exp_samples: []
 
+  # YuzuGatewayMemorySheddingTransitionFailing -- the shedder could not suspend
+  # or resume an agent listener and is retrying every tick. A failure that
+  # clears inside 5 minutes must not page; one that lasts 5 minutes must, per
+  # action, and resolve once the gauge is back at 0.
+
+  # CASE: the seeded zero of both actions stays quiet.
+  - interval: 1m
+    name: gateway shedder transition failing - seeded zeros never fire
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="resume"}'
+        values: "0x30"
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="suspend"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE: a resume that fails from minute 6 to minute 10 and then succeeds
+  # never fires (kills a `for` of 4m or less, and a bare `> 0`).
+  - interval: 1m
+    name: gateway shedder transition failing - a failure shorter than 5m never fires
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="resume"}'
+        values: "0x5 1x4 0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # CASE: a resume that keeps failing is pending at 3m and firing at 6m (kills
+  # a `for` longer than 5m), carries its action label, and resolves.
+  - interval: 1m
+    name: gateway shedder transition failing - a lasting resume failure fires and resolves
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="resume"}'
+        values: "0x5 1x10 0x20"
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="suspend"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="pending"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="pending", action="resume", instance="g1", job="yuzu-gateway", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing", action="resume", instance="g1", job="yuzu-gateway", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE: a lasting suspend failure fires with action="suspend".
+  - interval: 1m
+    name: gateway shedder transition failing - a lasting suspend failure fires
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_transition_failing{job="yuzu-gateway",instance="g1",action="suspend"}'
+        values: "0x2 1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingTransitionFailing", alertstate="firing", action="suspend", instance="g1", job="yuzu-gateway", severity="critical"}'
+            value: 1
+
   # -- YuzuGatewayUpstreamCircuitOpened (S3, #5695) ---------------------------
   #
   # yuzu_gw_telemetry.erl pre-seeds yuzu_gw_upstream_circuit_transitions_total

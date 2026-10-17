@@ -33,6 +33,8 @@ health_test_() ->
        fun readyz_agent_service_under_management_protos/0},
       {"readyz 503 while a listener is suspended and 200 again once resumed",
        fun readyz_503_listener_suspended/0},
+      {"readyz 503 while the memory shedder cannot resume the agent listener, 200 once it can",
+       fun readyz_503_while_shedder_resume_fails/0},
       {"readyz 503 for a configured listener that was never started",
        fun readyz_503_never_started/0},
       {"readyz 503 for an entry that lists agent_pb but routes no AgentService",
@@ -415,6 +417,49 @@ readyz_503_listener_suspended() ->
             ?assertEqual({200, true}, ready(Port))
         end)
     after
+        yuzu_gw_test_listener:stop(A)
+    end.
+
+%% The memory shedder sheds by suspending the agent listener, which closes its
+%% listen socket; resuming opens it again and can fail. Here another socket
+%% takes the port while it is closed, so the real ranch:resume_listener/1
+%% fails with eaddrinuse. /readyz must stay 503 for as long as the listener is
+%% not accepting, and the shedder must retry on its next tick and bring
+%% readiness back once the port is free.
+readyz_503_while_shedder_resume_fails() ->
+    {ok, Port} = yuzu_gw_health:port(),
+    {AgentPort, A} = yuzu_gw_test_listener:start(agent_entry(shed_resume_agent)),
+    Ref = {yuzu_grpc, shed_resume_agent},
+    Mem = atomics:new(1, []),
+    {ok, Shedder} = yuzu_gw_memory_shedder:start_link(
+                      #{register => false,
+                        config => #{high_water_bytes => 100, low_water_bytes => 50,
+                                    interval_ms => 60000},
+                        listener_refs => [Ref],
+                        mem_fun => fun() -> atomics:get(Mem, 1) end}),
+    try
+        with_listeners([agent_entry(shed_resume_agent)], fun() ->
+            application:unset_env(yuzu_gw, allow_no_listeners),
+            ?assertEqual({200, true}, ready(Port)),
+            atomics:put(Mem, 1, 200),
+            ?assertEqual({ok, true}, yuzu_gw_memory_shedder:sample_now(Shedder)),
+            ?assertEqual({503, false}, ready(Port)),
+            {ok, Squat} = gen_tcp:listen(AgentPort, [{ip, {127, 0, 0, 1}}, {reuseaddr, true}]),
+            try
+                atomics:put(Mem, 1, 10),
+                ?assertEqual({ok, false}, yuzu_gw_memory_shedder:sample_now(Shedder)),
+                ?assertEqual(suspended, ranch:get_status(Ref)),
+                ?assertEqual({503, false}, ready(Port))
+            after
+                gen_tcp:close(Squat)
+            end,
+            ?assertEqual({ok, false}, yuzu_gw_memory_shedder:sample_now(Shedder)),
+            ?assertEqual(running, ranch:get_status(Ref)),
+            ?assertEqual({200, true}, ready(Port))
+        end)
+    after
+        unlink(Shedder),
+        catch gen_server:stop(Shedder, shutdown, 5000),
         yuzu_gw_test_listener:stop(A)
     end.
 

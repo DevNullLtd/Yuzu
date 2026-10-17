@@ -136,7 +136,10 @@ init([]) ->
 
         %% Node-wide memory load shedder (the third edge bound). Ahead of the
         %% listeners it may suspend; its first tick is one interval away, by
-        %% which time the listeners are up. A crash restarts a fresh sampler.
+        %% which time the listeners are up. A crash restarts a fresh sampler,
+        %% which takes any agent listener it finds suspended as its own (and
+        %% resumes it below the low-water mark), so a crash while shed does
+        %% not strand the listener.
         #{id       => yuzu_gw_memory_shedder,
           start    => {yuzu_gw_memory_shedder, start_link, []},
           restart  => permanent,

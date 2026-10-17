@@ -368,6 +368,42 @@ groups:
             yuzu_gw_agents_current (fleet growth). Add gateway capacity or, for a
             flood, rate-limit per source at the L4 balancer or firewall.
 
+      # The memory shedder could not move an agent listener the way it decided
+      # (yuzu_gw_memory_shedder; SHEDDER workstream, #5695 review). The gauge
+      # counts the agent listeners its last attempt failed to suspend or
+      # resume; it retries every interval_ms (1 s by default) and the gauge
+      # returns to 0 once an attempt succeeds, so a passing cause (a burst of
+      # file-descriptor exhaustion) clears on its own and does not page. Five
+      # minutes of failed retries is no longer passing: someone has to act.
+      # Critical because neither direction recovers on its own and both are
+      # serious: a failed RESUME leaves this gateway refusing every new agent
+      # connection (and /readyz 503) after memory has recovered, and a failed
+      # SUSPEND leaves the memory backstop doing nothing above the high-water
+      # mark. Seeded at 0 for both actions (yuzu_gw_telemetry).
+      - alert: YuzuGatewayMemorySheddingTransitionFailing
+        expr: |
+          yuzu_gw_memory_shedding_transition_failing > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway memory shedder cannot {{ $labels.action }} its agent listener on {{ $labels.instance }}"
+          description: >-
+            For 5 minutes the gateway's memory shedder has failed to
+            {{ $labels.action }} {{ $value }} agent listener(s), retrying every
+            interval_ms. resume: memory is back below the low-water mark, but the
+            agent listener could not reopen its socket, so this gateway refuses
+            every new agent connection and /readyz stays 503. suspend: memory is
+            above the high-water mark, but the listener still accepts, so the
+            memory backstop is not acting. The gateway log line "could not
+            resume (or suspend) agent listener(s)" names the reason. For
+            eaddrinuse another process took the agent port while it was closed:
+            find it with `ss -ltnp 'sport = :50051'` on the gateway host and
+            stop it. For emfile or enfile the gateway is out of file
+            descriptors: raise LimitNOFILE or lower the agent listener's
+            max_connections. Otherwise restart the gateway, which reconnects
+            its agents.
+
       # HA WS-4 4.2b — `#4246` item #1's alert-rule half. Emitted by the
       # SERVER (gateway_service_impl.cpp's record_route_store_failure), not
       # the Erlang gateway, despite living in this group — it is the same
