@@ -9984,6 +9984,35 @@ These endpoints back the read-only **Access → Tokens and principals** page (`/
 - **Revocation detail:** for a revoked principal the free-text detail of the `engine_principal.revoke` audit event is shown only to callers who hold `AuditLog:Read`; others see it marked withheld (also when the grant could not be confirmed). The newest 200 events are read; when more exist the panel says so.
 - **Audit:** success writes `engine_principal.list` or `engine_principal.get`, plus `engine_principal.role.listed` when the roles were read. A refused browser session writes no row; a refused token or engine caller does.
 
+### Access — Audit and reviews
+
+These endpoints back the read-only **Access → Audit and reviews** page (`/access/audit`). They return HTMX fragments, not the JSON envelope, and are the dashboard views of existing REST routes; they add no capability.
+
+**`GET /fragments/access/audit/log`**
+
+The audit-log panel. Same store and gate as `GET /api/v1/audit` (MCP `query_audit_log`), offering a subset of its filters (time range, exact principal, exact action; no `until`, target or `limit`) and rendering only that route's fields.
+
+- **Permission:** `AuditLog:Read` (admin-only while RBAC is disabled, #5771).
+- **Query:** `range` — `1h`, `24h` (default) or `7d`; `principal`, `action` — exact matches; `offset` — `0` to `10000`. `limit` is not read: the page is always 50 rows.
+- **Response (200):** HTML fragment: the table and pager, `No events match` when the store answered with zero rows, or a red "could not be read" box with no table when the store did not answer. A refused request (unknown `range`, `offset` outside `0..10000`, NUL byte in a filter) is also 200 with a fixed note and nothing read.
+- **Response (403):** The caller lacks `AuditLog:Read` (the gate's own response). The panel loads on its own, so a refused browser session writes no denial row; a refused token does.
+- **Audit:** none on a read, like the REST route.
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/audit/sample`**
+
+The dashboard view of `GET /api/v1/audit/auth-sample` with the window left open.
+
+- **Permission:** `AuditLog:Read`.
+- **Query:** `limit` — `1` to `1000` (default `100`); anything else is a 200 note, nothing read.
+- **Audit:** `audit.auth_sample.exported`, once per successful draw. A dropped row sets `Sec-Audit-Failed: true` and the panel says so.
+
+**`GET /fragments/access/audit/retention`**
+
+The dashboard view of `GET /api/v1/settings/data-retention` (audit retention only).
+
+- **Permission:** `ServerConfig:Read`.
+
 ### Commands
 
 #### `POST /api/command`

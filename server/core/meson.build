@@ -254,6 +254,20 @@ yuzu_tokens_js_embed = custom_target(
   ],
 )
 
+# Audit and reviews page (Phase 2): client glue. Symbol: kYuzuAuditJs (std::string).
+yuzu_audit_js_embed = custom_target(
+  'yuzu_audit_js_bundle',
+  input: 'static/yuzu-audit.js',
+  output: 'yuzu_audit_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuAuditJs',
+  ],
+)
+
 # Operate O1: the Executions / Approvals page controller (read-only). Symbol:
 # kYuzuOperateJs (std::string).
 yuzu_operate_js_embed = custom_target(
@@ -521,7 +535,7 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, yuzu_access_js_embed, yuzu_tokens_js_embed,
-   cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_audit_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
    yuzu_dialog_js_embed, yuzu_integrations_js_embed,
    yuzu_integrations_sync_js_embed, yuzu_operate_extras_js_embed,
    yuzu_estate_js_embed, yuzu_device_data_js_embed,
@@ -563,6 +577,9 @@ yuzu_server_core_lib = static_library(
     'src/access_tokens_render.cpp', # Tokens and principals page: pure renderers
     'src/access_tokens_ui.cpp', # Tokens and principals page: template
     'src/access_tokens_routes.cpp', # Tokens and principals page: /access/tokens + fragments + glue
+    'src/access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
+    'src/access_audit_ui.cpp', # Audit and reviews page: template
+    'src/access_audit_routes.cpp', # Audit and reviews page: /access/audit + fragments + glue
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
