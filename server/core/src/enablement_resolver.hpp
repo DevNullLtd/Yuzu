@@ -270,12 +270,11 @@ make_rule(std::string id, std::vector<std::string> units, std::string_view selec
     return Rule{std::move(id), std::move(units), std::move(*selector), provenance};
 }
 
-/// The shape build_unit_overlay freezes for a unit name (is_legal_unit_plugin is the shared
-/// plugin half): `<plugin>` or
-/// `<plugin>.<action>`, each part a legal identifier (a plugin may also be a
-/// reserved control-channel name). Shape only, so a name a later release removed
-/// still passes; it exists to keep corrupt bytes out of `unresolved_units`, which
-/// reaches audit and export strings.
+/// The shape build_unit_overlay freezes for a unit name: `<plugin>` or
+/// `<plugin>.<action>`, each part a legal identifier (is_legal_unit_plugin is the
+/// shared plugin half; a plugin may also be a reserved control-channel name). Shape
+/// only, so a name a later release removed still passes; it exists to keep corrupt
+/// bytes out of `unresolved_units`, which reaches audit and export strings.
 [[nodiscard]] inline bool is_unit_name_shape(std::string_view name) {
     const auto dot = name.find('.');
     const auto plugin = name.substr(0, dot);

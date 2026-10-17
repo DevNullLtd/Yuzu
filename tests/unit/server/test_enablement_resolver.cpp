@@ -710,7 +710,7 @@ TEST_CASE("enablement resolver: a loaded rule keeps stale units but is validated
     // reach unresolved_units (audit and export strings). Legal-but-stale shapes still load.
     for (const char* ok : {"gone", "gone.x", "tar.fleet_snapshot", "__guard__.push_rules"})
         CHECK(make_persisted_rule("g", {ok}, "__all__", Provenance::Operator, kinds()));
-    for (const std::string bad :
+    for (const std::string& bad :
          {std::string{}, std::string{"a\nb"}, std::string{"a\x01"}, std::string{"../../x"},
           std::string{"A.b"}, std::string{"a.b.c"}, std::string{"a."}, std::string{".a"},
           std::string{"a b"}, std::string(100000, 'x')}) {

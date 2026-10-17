@@ -127,7 +127,7 @@ using ProtectivePredicate = bool (*)(std::string_view plugin, std::string_view a
 }
 
 /// The predicate a caller injects: the canonical protective set. Named so the
-/// choice is one checkable line (test_enablement_units.cpp asserts its identity).
+/// choice is one checkable line (test_enablement_units.cpp pins its behaviour).
 inline constexpr ProtectivePredicate kProtectivePredicate = &yuzu::protective::is_protective_action;
 
 // Requirement edges, per action. app_usage.summary and app_usage.last_used

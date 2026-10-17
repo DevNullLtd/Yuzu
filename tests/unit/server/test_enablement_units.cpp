@@ -143,6 +143,21 @@ TEST_CASE("enablement units: the injected predicate is the canonical protective 
     CHECK_FALSE(kProtectivePredicate("tar", "fleet_snapshot"));
 }
 
+TEST_CASE("enablement units: every real unit and non-unit name is a legal loader name",
+          "[enablement][catalogue]") {
+    // The loader's shape check must accept everything the overlay can name, so it can never
+    // be tightened past the overlay and refuse a rule that names a real unit.
+    const auto ov = real_overlay();
+    for (const auto& u : ov.units) {
+        INFO(u.name);
+        CHECK(is_unit_name_shape(u.name));
+    }
+    for (const auto& n : ov.non_units) {
+        INFO(n.name);
+        CHECK(is_unit_name_shape(n.name));
+    }
+}
+
 TEST_CASE("enablement units: every catalogue pair follows the canonical protective predicate",
           "[enablement][catalogue]") {
     // Compared per pair against yuzu::protective::is_protective_action rather than a
