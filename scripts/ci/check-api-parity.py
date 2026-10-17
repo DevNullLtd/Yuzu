@@ -348,7 +348,7 @@ REVISIT_MIN = datetime.date(2026, 1, 1)
 REVISIT_MAX = datetime.date(2028, 12, 31)
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named
-# here have no committed date or owner yet (ADR-1005's 2026-10-15 entry is the one home that
+# here carry no machine-checked dated revisit (ADR-1005's 2026-10-15 entry is the one home that
 # names them and says why), so they are grandfathered by capability_id. The gate pins the set's size
 # (len == GRANDFATHERED_MAX) and requires every id to still be a free-form `exception:` row;
 # converting or removing a row means deleting its id AND lowering GRANDFATHERED_MAX in the same

@@ -613,6 +613,9 @@ see §5 for which chokepoints apply.
     `capability_id`: rename the id in the JSON (a grandfathered row that is renamed must be
     converted to the strict shape, unless the set is edited, which is review-only, since the set
     is keyed by id).
+    Flipping a converted #520 row to twinned also needs the MCP tier decision amended
+    (`mcp_policy.hpp` `tier_allows`, the ADR-1005 #4028 entry and the `docs/mcp-server.md` bullet
+    "Server administration surfaces stay REST-only (#520)"), which the gate does not check.
 
 ---
 

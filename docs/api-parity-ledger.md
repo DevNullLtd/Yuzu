@@ -44,11 +44,11 @@ churns the ledger. Each row records:
   `exception:#<issue> revisit:<YYYY-MM-DD> <reason>` (a deliberate, reviewed
   exception with a tracking issue and a revisit date - an ADR-1005 ledger
   entry, not a free pass; the `<issue>` may be the originating or decision
-  issue and need not be open, e.g. #520 and #2102 are closed; a few rows
-  that have no committed date or owner yet are grandfathered by
-  `capability_id` in a size-pinned set in the script, named in ADR-1005's
-  2026-10-15 entry - extending it, swapping an id or rebinding an id to
-  another row is caught only in review), or `retire` (the
+  issue and need not be open, e.g. #520 and #2102 are closed as of
+  2026-10-17; a few rows with no machine-checked dated revisit are
+  grandfathered by `capability_id` in a size-pinned set in the script, named
+  in ADR-1005's 2026-10-15 entry - extending it, swapping an id or rebinding
+  an id to another row is caught only in review), or `retire` (the
   fragment route no longer exists; kept for history until the ledger row
   itself is deleted).
 

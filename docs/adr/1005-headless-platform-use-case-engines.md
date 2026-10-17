@@ -179,9 +179,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        fleet-data destructor as an MCP tool hands an autonomous worker a
        one-call, unrecoverable data-loss primitive. The twin is withheld
        until an MCP destructive-operation gate exists (human confirmation /
-       tier ceiling) that makes a guarded twin safe. Tracked as **#2102**;
-       **revisit by 2027-01-13**. #2102 is the closed recording issue (closed
-       2026-07-14) and there is no open tracker. The fragment that probes the
+       tier ceiling) that makes a guarded twin safe. Recorded in **#2102** (closed
+       2026-07-14); no open issue tracks the work. **Revisit by 2027-01-13**
+       (not machine-checked). The fragment that probes the
        `Decommission:Delete` gate, `get.fragments-hardware-ci-stored-data`, is
        ledgered as `exception:#2102 revisit:2027-01-13`.
      - **Scoped to the destructive verb only — the capability's read half
@@ -347,10 +347,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        MCP-tier boundary, not a decision record: the decision of record is
        `mcp_policy.hpp`'s `tier_allows` and the `docs/mcp-server.md` bullet
        "Server administration surfaces stay REST-only (#520)". No open item
-       owns the 2027-04-30 re-confirmation of these eleven rows or the
-       2027-01-13 re-confirmation of the stored-data row; the dates were set
-       by the author and are not machine-checked. #5955 covers only its own
-       13 rows.
+       owns the 2027-04-30 re-confirmation of these eleven rows: 2027-04-30
+       was chosen when the dated-exceptions change was written (2026-10-16)
+       and accepted by the maintainer in that change's session; it is not a
+       recorded ruling and is not machine-checked. #4031 is open but carries
+       no re-confirmation date. The stored-data row
+       (`get.fragments-hardware-ci-stored-data`) is dated 2027-01-13 from the
+       2026-07-13 SLE-erasure entry, and the admin reset 2027-01-04 from the
+       2026-10-04 passwords entry (earlier ADR text); neither date is
+       machine-checked. #5955 covers only its own 13 rows.
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -651,15 +656,19 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      revisit date that has passed is not machine-checked (#5955 is the
      reminder). The #520 dating of the eleven #520 rows (three #4031, eight
      #4028; see the #4028 entry) is not part of the 2026-10-15 acceptance.
-     Seven free-form `exception:` rows remain, in a size-pinned set; each
-     has no committed date or owner yet: the two NVD rows, the self-service
-     password row, the two api-tokens rows (a known gate mismatch with their v1
-     twins, recorded in the api-tokens rows of
-     `scripts/ci/api-parity/rbac.json`, with no tracker or date as of
-     2026-10-17) and the two TAR process-tree rows. Plain growth of the set
-     is machine-caught, while growth paired with a raise of the pin, a swap
-     or a rebind to a row with the same slug is review-only. They are a
-     disclosed residual not covered by #5955. The eight `twinned-rest-only`
+     As of 2026-10-17 seven free-form rows remain in a
+     size-pinned set. None carries a machine-checked dated revisit, and none
+     has an open tracker that owns a date: the two NVD fragments
+     (grandfathered surface #2, 2027-Q1 target, #4099 open); the
+     self-service password change (a permanent exception, ADR 2026-10-04);
+     the two api-tokens routes (a known gate mismatch with their v1 twins,
+     recorded in the api-tokens rows of `scripts/ci/api-parity/rbac.json`;
+     no tracker or date); the two TAR process-tree fragments (waiting on a
+     /run twin; #4027 closed, #3994 open design issue). Plain growth of the
+     set is machine-caught,
+     while growth paired with a raise of the pin, a swap or a rebind to a
+     row with the same slug is review-only. These seven rows are a disclosed
+     residual not covered by #5955. The eight `twinned-rest-only`
      rows are open gaps counted by the ratchet and tracked by #5963 (the two
      hardware rows also by #4456).
 
