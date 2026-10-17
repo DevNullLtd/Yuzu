@@ -70,14 +70,6 @@ public:
         return read_locked(now);
     }
 
-    /// Reads the store now, ignoring the interval (a writer calls this after a
-    /// write so its own instance converges at once). Same failure direction as
-    /// current().
-    void refresh() {
-        std::lock_guard lk(mu_);
-        (void)read_locked(clock_());
-    }
-
 private:
     std::expected<DexPolicyInForce, std::string> read_locked(std::int64_t now) {
         auto r = read_();

@@ -161,24 +161,6 @@ TEST_CASE("policy provider: nothing stored is a good read that survives a later 
     CHECK(lkg->revision == "default");
 }
 
-TEST_CASE("policy provider: refresh() reads at once and the next current() is served from it",
-          "[dex][policy_provider]") {
-    Fixture f;
-    int reads = 0;
-    DexScorePolicyProvider p(f.reader(&reads), f.clock());
-    REQUIRE(p.current());
-    CHECK(reads == 1);
-    f.doc = doc_with_excellent(92.0);
-    f.now += 10; // well inside the interval
-    p.refresh();
-    CHECK(reads == 2);
-    const auto v = p.current();
-    REQUIRE(v);
-    CHECK(reads == 2); // served from the refresh, no third read
-    CHECK(v->source == "custom");
-    CHECK(v->policy.tiers.edges.excellent == 92.0);
-}
-
 TEST_CASE("policy provider: a stored invalid document is the defaults with a fault, never an error",
           "[dex][policy_provider]") {
     Fixture f;
