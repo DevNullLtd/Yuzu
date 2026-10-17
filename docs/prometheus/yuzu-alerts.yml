@@ -844,7 +844,8 @@ groups:
         # The window is [10m], not [5m]: once the gateway's upstream circuit
         # breaker opens, calls stop reaching the client and the failure is
         # counted only at the half-open probe, whose spacing doubles up to the
-        # 300 s cap (yuzu_gw_upstream.erl). A 5 m window can then hold no
+        # cap circuit_breaker_max_reset_timeout_ms (30 s by default since #5695;
+        # an operator can raise it to 300 s or more). A 5 m window can then hold no
         # increment at all between two probes, so the alert would resolve and
         # re-fire during one continuing fault. 10 m holds at least one probe
         # at the cap (a scrape and evaluation offset can still leave a window
@@ -871,47 +872,77 @@ groups:
             term, and "Gateway Disconnections" in
             docs/operations/troubleshooting.md. This alert stays active for about
             11 minutes after the last failure (a 10 minute window: the gateway's
-            circuit breaker can leave up to 300 seconds between two failures it
-            counts): check that the counter is flat rather than waiting for it to
-            clear.
+            circuit breaker can leave up to its maximum backoff, 30 seconds by
+            default, between two failures it counts): check that the counter is
+            flat rather than waiting for it to clear.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
 
       - alert: YuzuGatewayUpstreamCircuitOpened
         # yuzu_gw_upstream_circuit_transitions_total{state} counts the gateway's
         # upstream circuit breaker transitions (yuzu_gw_upstream.erl: state is
         # open, half_open or closed). `open` is the configured number (default
-        # 5) of consecutive failed upstream calls; each failed half-open probe
-        # reopens it with a doubled timeout, up to 300 s. While open, /readyz
-        # answers 503 and upstream calls are not made, so this is the
-        # gateway-wide "cannot reach a working server" signal whatever the cause. The TLS and peer-denied
-        # alerts above name two specific causes; this one also covers a server
-        # that is down, slow or refusing for another reason.
+        # 5) of consecutive failed upstream calls, or a failed half-open probe
+        # reopening it with a doubled timeout, up to
+        # circuit_breaker_max_reset_timeout_ms (30 s by default, #5695: it was
+        # 300 s, which left a recovered server unused for up to 5 minutes).
+        # While it is not closed /readyz answers 503 and upstream calls are
+        # refused, so this is the gateway-wide "cannot reach a working server"
+        # signal whatever the cause.
+        #
+        # It fires only when someone has to act (owner policy):
+        #   1. the breaker opened and has NOT closed since: an open in the last
+        #      5 minutes and no close in the last 5 minutes, held for 3 minutes.
+        #      A server that comes back within 3 minutes closes the breaker and
+        #      the alert never fires (a deploy, a restart, a blip). While the
+        #      server stays down the breaker reopens at least every 30 s plus
+        #      the probe's time (the default cap), so the 5-minute window keeps
+        #      seeing opens; an operator who raises the cap above about 4
+        #      minutes must widen both windows with it.
+        #   2. OR it is flapping: three or more closes in 15 minutes, i.e. the
+        #      breaker opened and recovered again and again. Clause 1 alone would
+        #      stay quiet for a server that is up just often enough to close the
+        #      breaker between failures; this clause catches it.
+        # A gateway that crash-loops opens once per life and never closes, which
+        # clause 1 sees.
         #
         # Pre-seeded: yuzu_gw_telemetry.erl creates the closed, open and
         # half_open series at 0 when the gateway starts, so the FIRST open of a
-        # gateway process is a 0 -> 1 step that increase() sees (a crash-looping
-        # gateway, which opens its breaker once per life, alerts too).
-        # INITIAL threshold, to be tuned on a real deployment.
+        # gateway process is a 0 -> 1 step that increase() sees.
+        # Known gap: a half_open breaker that nothing probes (an idle gateway: no
+        # registration, no held notification) makes no transition, so clause 1
+        # clears 5 minutes after the last open while the breaker is still not
+        # closed; /readyz still answers 503 there.
+        # INITIAL thresholds, to be tuned on a real deployment.
         expr: |
-          sum by (instance) (increase(yuzu_gw_upstream_circuit_transitions_total{state="open"}[15m])) > 0
-        for: 2m
+          (
+            sum by (instance) (increase(yuzu_gw_upstream_circuit_transitions_total{state="open"}[5m])) > 0
+            unless on (instance)
+            sum by (instance) (increase(yuzu_gw_upstream_circuit_transitions_total{state="closed"}[5m])) > 0
+          )
+          or on (instance)
+          (
+            sum by (instance) (increase(yuzu_gw_upstream_circuit_transitions_total{state="closed"}[15m])) >= 3
+          )
+        for: 3m
         labels:
           severity: warning
         annotations:
-          summary: "Gateway upstream circuit breaker opened on {{ $labels.instance }}"
+          summary: "Gateway {{ $labels.instance }} cannot reach a working server"
           description: >-
-            The upstream circuit breaker on {{ $labels.instance }} opened at least
-            once in the last 15 minutes: a run of consecutive calls from the
-            gateway to the server failed, or a half-open probe failed and reopened it with a
-            longer timeout (up to 300 seconds). While it is open the gateway
-            reports not ready and does not send registrations upstream. Read
-            yuzu_gw_upstream_rpc_errors_total by code,
-            yuzu_gw_upstream_tls_handshake_failures_total by kind and the
-            server-side yuzu_server_gateway_peer_denied_total by reason to tell a
-            server that is down or slow from a certificate or pin problem, and see
-            "Gateway Disconnections" in docs/operations/troubleshooting.md. This
-            alert stays active for about 16 minutes after the last open: check
-            the counter is flat rather than waiting for it to clear.
+            The upstream circuit breaker on {{ $labels.instance }} opened and has
+            not closed for 3 minutes, or it has opened and closed again at least
+            three times in 15 minutes. While it is open the gateway reports not
+            ready, refuses registrations (agents retry on another gateway) and
+            holds stream-status notices. FIRST: is the server up? If it is down,
+            its own alerts cover it. If it is up, read
+            yuzu_gw_upstream_rpc_errors_total by code (16 = the server refuses
+            this gateway's certificate, 14 = unavailable, 4 = deadline) and
+            yuzu_gw_upstream_tls_handshake_failures_total by kind, and on the
+            server yuzu_server_gateway_peer_denied_total by reason, to tell a
+            network or certificate problem from a server that is up but failing;
+            see "Gateway Disconnections" in docs/operations/troubleshooting.md.
+            The alert clears as soon as the breaker closes and stays quiet for 5
+            minutes (15 minutes for the flapping case).
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md"
 
       # yuzu_gw_upstream_slow is 1 while the gateway's backpressure duty cycle over

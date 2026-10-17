@@ -4035,19 +4035,101 @@ tests:
         eval_time: 20m
         exp_samples: []
 
-  # -- YuzuGatewayUpstreamCircuitOpened (S3) -----------------------------------
+  # -- YuzuGatewayUpstreamCircuitOpened (S3, #5695) ---------------------------
   #
   # yuzu_gw_telemetry.erl pre-seeds yuzu_gw_upstream_circuit_transitions_total
   # for closed, open and half_open at 0 when the gateway starts, so the first
-  # open of a fresh process is a 0 -> 1 step. Before the seed the `open` series
-  # was born at 1, which increase() cannot see, and a gateway that opened once
-  # per life (a crash loop) never alerted. The Erlang half is pinned by
-  # yuzu_gw_telemetry_tests:circuit_transitions_seeded_test_/0; these cases pin
-  # that the rule fires on the series shape the seed produces.
+  # open of a fresh process is a 0 -> 1 step. The rule fires when the breaker
+  # opened and has not closed for 3 minutes (clause 1), or when it keeps
+  # opening and closing (clause 2: three closes in 15 minutes). The old rule
+  # (any open in 15 minutes, for 2 minutes) fired on case A below for 17
+  # minutes; it goes red there.
 
-  # CASE A -- a fresh process (no series before it starts at t5; promtool's
-  # `_x5` is five missing samples, `0x1` two zeros) seeds `open` at 0 and opens once at t7:
-  # pending at 7m, firing at 9m (the `for: 2m`), and quiet before the open.
+  # CASE A -- a server that comes back inside 3 minutes: open at t6 (`0x5` is
+  # six zeros, t0..t5), closed at t8. Pending at t6, never firing (the close resets the `for: 3m`, and once the open is
+  # older than the close nothing is left to fire on).
+  - interval: 1m
+    name: gateway circuit opened - open then closed within 3m stays quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="open"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="closed"}'
+        values: "0x7 1x28"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="pending", instance="g1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE B -- a server that stays down: the breaker opens at t6 and reopens
+  # every minute (the half-open probe fails), and never closes. Pending from
+  # t6, firing at t9 (`for: 3m`), and still firing while it lasts.
+  - interval: 1m
+    name: gateway circuit opened - open with no close for 3m fires
+    input_series:
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="open"}'
+        values: "0x5 1+1x25"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="closed"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="pending"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="pending", instance="g1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
+            value: 1
+
+  # CASE C -- a flapping server, up just often enough to close the breaker
+  # between failures: it opens at every odd minute and closes at every even
+  # one from t2. Clause 1 never holds for 3 minutes (a close every 2), but the
+  # closes pile up: three in 15 minutes by t6, so it is firing by t10, and it
+  # keeps firing while the flapping lasts.
+  - interval: 1m
+    name: gateway circuit opened - a flapping breaker that mostly fails still fires
+    input_series:
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="open"}'
+        values: "0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="half_open"}'
+        values: "0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13"
+      - series: 'yuzu_gw_upstream_circuit_transitions_total{job="yuzu-gateway",instance="g1",state="closed"}'
+        values: "0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
+        eval_time: 24m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
+            value: 1
+
+  # CASE D -- the first open of a fresh process (no series before it starts at
+  # t5; `_x5` is five missing samples) that is never followed by a close:
+  # pending at 7m, firing at 10m.
   - interval: 1m
     name: gateway circuit opened - first open of a fresh process fires
     input_series:
@@ -4065,13 +4147,13 @@ tests:
           - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="pending", instance="g1", severity="warning"}'
             value: 1
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing"}'
-        eval_time: 9m
+        eval_time: 10m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
             value: 1
 
-  # CASE B -- a crash-looping gateway: each life seeds `open` at 0, opens once
-  # and dies before the next scrape (`_`). Every life is a 0 -> 1 step, so the
+  # CASE E -- a crash-looping gateway: each life seeds `open` at 0, opens once
+  # and dies before the next scrape (`_`). The breaker never closes, so the
   # alert fires and stays firing while the loop lasts.
   - interval: 1m
     name: gateway circuit opened - a gateway that opens once per life fires
@@ -4085,7 +4167,7 @@ tests:
           - labels: 'ALERTS{alertname="YuzuGatewayUpstreamCircuitOpened", alertstate="firing", instance="g1", severity="warning"}'
             value: 1
 
-  # CASE C -- a healthy gateway (every seeded series at 0, never moving) is quiet.
+  # CASE F -- a healthy gateway (every seeded series at 0, never moving) is quiet.
   - interval: 1m
     name: gateway circuit opened - seeded zero series stay quiet
     input_series:
