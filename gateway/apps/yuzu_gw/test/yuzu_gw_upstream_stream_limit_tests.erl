@@ -229,7 +229,10 @@ backpressure_test_() ->
                  {timeout, 30, fun refused_call_is_retried/0}} end,
       fun(_) -> {"a call refused until its deadline is answered deadline (UNAVAILABLE); "
                  "the breaker does not move",
-                 {timeout, 30, fun refused_until_deadline/0}} end]}.
+                 {timeout, 30, fun refused_until_deadline/0}} end,
+      fun(_) -> {"a registration replay refused too_many_streams once is retried and adopted; "
+                 "the breaker does not move",
+                 {timeout, 30, fun refused_replay_is_retried/0}} end]}.
 
 setup_upstream() ->
     yuzu_gw_test_registry:ensure(),
@@ -281,6 +284,49 @@ refused_until_deadline() ->
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
     ?assertEqual(0, up_field(cb_failures)),
     ok = wait(fun() -> held(register) =:= 0 end).
+
+%% A replay is a ProxyRegister too (replay_send/4 maps a local too_many_streams
+%% refusal to `stream_limit', and replay_attempt/5 pauses, asks for a replay
+%% permit again and retries within its permit deadline): the first attempt is
+%% refused locally, the second is adopted, the agent is told to re-announce its
+%% session, and the breaker sees one success and no failure.
+refused_replay_is_retried() ->
+    Agent = <<"stream-limit-replay-agent">>,
+    Session = <<"stream-limit-replay-session">>,
+    Self = self(),
+    %% Stands in for the agent process: forwards the re-announce cast.
+    Owner = spawn(fun() -> receive {'$gen_cast', Msg} -> Self ! {owner, Msg} end end),
+    ok = yuzu_gw_registry:register_agent(Agent, Owner, Session, [], <<"h">>, request(),
+                                         undefined),
+    Refusals = atomics:new(1, []),
+    atomics:put(Refusals, 1, 1),
+    meck:expect(yuzu_grpc_client, unary,
+                fun(Meta, _Path, _Req, _Def, _Opts) ->
+                        Self ! {presented, maps:get(<<"x-yuzu-session-id">>, Meta, undefined)},
+                        case atomics:sub_get(Refusals, 1, 1) >= 0 of
+                            true  -> {error, too_many_streams};
+                            false -> {ok, #{accepted => true, session_id => Session}, #{}}
+                        end
+                end),
+    try
+        ok = yuzu_gw_upstream:replay_sessions([Session]),
+        receive {owner, M} -> ?assertEqual({upstream_reannounced, Session}, M)
+        after ?WAIT_MS -> error(never_adopted)
+        end,
+        ?assertEqual([Session, Session], presented()),
+        ?assertEqual(2, meck:num_calls(yuzu_grpc_client, unary, '_')),
+        ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+        ?assertEqual(0, up_field(cb_failures)),
+        ok = wait(fun() -> held(replay) =:= 0 end)
+    after
+        exit(Owner, kill),
+        yuzu_gw_registry:deregister_agent(Agent)
+    end.
+
+presented() ->
+    receive {presented, S} -> [S | presented()]
+    after 0 -> []
+    end.
 
 %%%===================================================================
 %%% Helpers
