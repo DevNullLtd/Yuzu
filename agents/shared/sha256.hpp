@@ -124,6 +124,8 @@ struct Sha256 {
         return out;
     }
 
+    /// Lowercase hex of the digest. Finalises the hash exactly like raw_digest(): call at most
+    /// once, and not after raw_digest() on the same object (a second call is silently wrong).
     std::string hex_digest() {
         static constexpr char hexc[] = "0123456789abcdef";
         std::string out;

@@ -18,7 +18,7 @@
  *
  * Row contract (pipe rows, status row first):
  *   status|list|<supported|constrained|permission_denied|unsupported>|<tokens or ->
- *   source|<sshd_config|homes|service>|<read|absent|refused|failed>|<n or ->
+ *   source|<sshd_config|homes|service>|<read|absent|refused|failed>|<n or ->[|<skipped or ->]
  *   config|<key>|<value or ->|<origin or ->
  *   service|<unit>|<state>|<mechanism>
  *   file|<account>|<authorized_keys|authorized_keys2|custom>|<read|absent|refused|failed>|<keys>|<malformed>|<oversized>
@@ -26,7 +26,9 @@
  * All three `source` rows and every `config` row are emitted on EVERY real-leg arm, so zero
  * `key` rows is never an ambiguous empty success. `account` is the HOME DIRECTORY BASENAME,
  * not the login name. These are CONFIGURED facts (sshd_config as written, key files as
- * found), not sshd's effective policy.
+ * found), not sshd's effective policy. The `homes` source row alone carries a fifth field: the
+ * number of listed home-root entries the account-eligibility probe positively refused (macOS:
+ * owned by a uid under 500), `-` where no probe exists (Linux) or the roots were not listed.
  *
  * Each entry point is a READ and returns 0: a degraded read is not a failed command.
  */
@@ -457,6 +459,7 @@ struct IncludeCtx {
     SshdConfigState& st;
     const std::vector<std::string>& prefixes; ///< the run-start network mount snapshot
     std::size_t files_read = 0;
+    std::size_t directives = 0; ///< Include directives seen, followed or not
 };
 
 inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t depth);
@@ -470,6 +473,12 @@ inline void parse_with_includes(IncludeCtx& c, std::string_view text, std::strin
 /// One Include argument, processed AT the directive's position by the sink that called us.
 inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t depth) {
     const auto& os = c.fs.os;
+    // Every directive counts, not only the ones that read a file: a glob that matches nothing
+    // lists its directory again each time, and only a successful read raises files_read.
+    if (++c.directives > kMaxIncludeFiles) {
+        c.t.acc.add_failure(src_token(os, "include", "too_many"));
+        return;
+    }
     if (d.in_match) {
         c.t.acc.add_failure(src_token(os, "include", "in_match"));
         return;
@@ -565,6 +574,11 @@ inline ConfigOutcome audit_config(const PosixFs& fs, Tally& t, SshdConfigState& 
     out.files_read = c.files_read;
     if (st.invalid_quotes)
         t.acc.add_failure(src_token(fs.os, "sshd_config", "invalid_quotes"));
+    // A credential source this plugin does not read (CA trust, a key or principals command, a
+    // principals file, hostbased auth, AuthenticationMethods): the key listing below is not the
+    // whole answer to "who can log in", so the listing cannot be `supported`.
+    if (st.other_credential_sources)
+        t.acc.add_failure(src_token(fs.os, "sshd_config", "other_credential_sources"));
     return out;
 }
 
@@ -580,12 +594,13 @@ struct ServiceOutcome {
 
 namespace detail {
 
-inline yuzu::agent::SubprocessOptions service_options(std::size_t max_lines, std::size_t cap_bytes) {
+inline yuzu::agent::SubprocessOptions service_options(std::size_t max_lines, std::size_t cap_bytes,
+                                                      bool merge_stderr) {
     yuzu::agent::SubprocessOptions o;
     o.deadline = std::chrono::milliseconds{5000};
     o.max_lines = max_lines;
     o.output_cap_bytes = cap_bytes;
-    o.merge_stderr = false;
+    o.merge_stderr = merge_stderr;
     return o;
 }
 
@@ -610,14 +625,16 @@ inline std::optional<std::string> service_failure(const yuzu::agent::SubprocessR
 } // namespace detail
 
 /// `systemctl is-enabled` once per unit (compile-time literals). A tool that cannot be
-/// started is a FAILED service source and NO service row -- never `disabled`.
+/// started is a FAILED service source and NO service row -- never `disabled`. stderr is merged
+/// into the captured output: systemd 249/252 name a missing unit only there
+/// (parse_systemctl_is_enabled).
 inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
     static constexpr std::array<std::string_view, 3> kUnits = {"ssh.service", "sshd.service", "ssh.socket"};
     ServiceOutcome out;
     bool any_answered = false;
     for (const auto unit : kUnits) {
         ++out.units;
-        const auto r = fs.run({"is-enabled", std::string{unit}}, detail::service_options(4, 4096));
+        const auto r = fs.run({"is-enabled", std::string{unit}}, detail::service_options(4, 4096, /*merge_stderr=*/true));
         bool unavailable = false;
         if (const auto bad = detail::service_failure(r, fs.os, "systemctl_unavailable", unavailable)) {
             t.acc.add_failure(*bad);
@@ -629,7 +646,7 @@ inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
             t.emit(out.rows, service_row(unit, "unknown", "systemctl_is_enabled"));
             continue;
         }
-        const ServiceFact f = parse_systemctl_is_enabled(r.output);
+        const ServiceFact f = parse_systemctl_is_enabled(r.output, r.exit_code, unit);
         if (!f.cause.empty())
             t.acc.add_failure(src_token(fs.os, "service", f.cause));
         else
@@ -647,7 +664,7 @@ inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
 inline ServiceOutcome audit_service_macos(const PosixFs& fs, Tally& t) {
     ServiceOutcome out;
     out.units = 1;
-    const auto r = fs.run({"print-disabled", "system"}, detail::service_options(4096, 256 * 1024));
+    const auto r = fs.run({"print-disabled", "system"}, detail::service_options(4096, 256 * 1024, /*merge_stderr=*/false));
     bool unavailable = false;
     if (const auto bad = detail::service_failure(r, fs.os, "launchctl_unavailable", unavailable)) {
         t.acc.add_failure(*bad);
@@ -689,6 +706,9 @@ inline ServiceOutcome audit_service_macos(const PosixFs& fs, Tally& t) {
 struct KeysOutcome {
     SourceState homes_state = SourceState::absent;
     std::size_t accounts = 0;
+    /// Listed home-root entries the eligibility probe refused; nullopt when no probe is wired
+    /// (Linux) or the roots were not listed. Counts the homes examined before any early stop.
+    std::optional<std::size_t> skipped_homes;
     std::vector<std::string> rows;
 };
 
@@ -717,6 +737,8 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
 
     if (cfg.akf_in_match)
         t.acc.add_failure(token("match_scoped_authorizedkeysfile"));
+    if (cfg.akf_capped)
+        t.acc.add_failure(token("path_token_cap"));
 
     std::vector<std::string> entries;
     if (!cfg.akf_set)
@@ -756,6 +778,8 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
     if (lerr != 0)
         return out;
 
+    if (fs.is_account_home)
+        out.skipped_homes = 0;
     bool attempts_exhausted = false;
     const auto take_attempt = [&]() {
         if (t.file_attempts >= kMaxKeyFileAttempts) {
@@ -776,8 +800,10 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
         // eligibility probe runs before anything opens it, and a home that is positively not an
         // account is neither counted nor reported.
         const bool on_network = detail::under_prefix(home.path, prefixes);
-        if (!on_network && fs.is_account_home && !fs.is_account_home(home))
+        if (!on_network && fs.is_account_home && !fs.is_account_home(home)) {
+            ++*out.skipped_homes;
             continue;
+        }
         ++out.accounts;
 
         std::vector<KeyFileSpec> specs;
@@ -795,6 +821,19 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
             std::optional<std::size_t> nk, nm, no;
             std::vector<std::string> krows;
             if (o.state == SourceState::read) {
+                // The file row is charged BEFORE its key rows, at its worst-case size (every count
+                // is at most the file cap). The parse then charges the key rows against what is
+                // left and stops at the first refusal, so a file that saturates the budget keeps
+                // its first N keys and its file row; charging the row after the parse dropped the
+                // row and every key already admitted.
+                bool ignored = false;
+                const std::size_t file_row_cost =
+                    file_row(home.name, s.kind, o.state, kKeyFileCap, kKeyFileCap, kKeyFileCap, ignored).size() +
+                    kRowOverhead;
+                if (!t.budget.charge(file_row_cost)) {
+                    t.truncated = true;
+                    return;
+                }
                 KeysParse kp;
                 parse_authorized_keys(r.data, home.name, s.kind, t.budget, kp);
                 if (kp.truncated)
@@ -813,10 +852,13 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
                 no = kp.oversized;
                 krows = std::move(kp.rows);
             }
-            if (!t.emit(out.rows, file_row(home.name, s.kind, o.state, nk, nm, no, t.field_oversized)))
-                return;
-            for (auto& k : krows)
-                out.rows.push_back(std::move(k)); // already charged inside the parse
+            if (o.state == SourceState::read) {
+                out.rows.push_back(file_row(home.name, s.kind, o.state, nk, nm, no, t.field_oversized)); // charged above
+                for (auto& k : krows)
+                    out.rows.push_back(std::move(k)); // charged inside the parse
+            } else {
+                t.emit(out.rows, file_row(home.name, s.kind, o.state, nk, nm, no, t.field_oversized));
+            }
         };
         const auto record_failed = [&](const KeyFileSpec& s, SourceState st, std::string tok) {
             if (st == SourceState::refused)
@@ -912,8 +954,9 @@ inline Listing list_posix(const PosixFs& fs) {
     std::vector<std::string> rows;
     rows.push_back(source_row("sshd_config", co.state,
                               co.state == SourceState::read ? std::optional<std::size_t>{co.files_read} : std::nullopt));
-    rows.push_back(source_row("homes", ko.homes_state,
-                              ko.homes_state == SourceState::read ? std::optional<std::size_t>{ko.accounts} : std::nullopt));
+    rows.push_back(homes_source_row(ko.homes_state,
+                                    ko.homes_state == SourceState::read ? std::optional<std::size_t>{ko.accounts} : std::nullopt,
+                                    ko.homes_state == SourceState::read ? ko.skipped_homes : std::nullopt));
     rows.push_back(source_row("service", so.state,
                               so.state == SourceState::read ? std::optional<std::size_t>{so.units} : std::nullopt));
     for (auto& r : config_rows_out)

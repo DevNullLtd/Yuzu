@@ -5257,7 +5257,7 @@ public:
             }
         }
 
-        // Wave 11: remote_access_audit (per-account SSH authorized_keys
+        // remote_access_audit (per-account SSH authorized_keys
         // fingerprints plus sshd_config and service state) ships default-off,
         // same Forensics-class posture as privacy_permissions. An operator
         // must explicitly enable it via PUT
@@ -5265,7 +5265,7 @@ public:
         if (plugin_config_store_ && !startup_failed_) {
             if (!plugin_config_store_->seed_kill_switch_default_off(
                     "remote_access_audit",
-                    "default-off: forensics class (Wave 11); enable per PUT "
+                    "default-off: forensics class; enable per PUT "
                     "/api/v1/plugin-config/remote_access_audit/kill-switch")) {
                 spdlog::error(
                     "[PG] Refusing to start: remote_access_audit default-off kill-switch "

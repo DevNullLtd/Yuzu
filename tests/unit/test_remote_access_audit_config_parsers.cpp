@@ -11,7 +11,9 @@
  *                     `launchctl print-disabled system` output from the same Mac. Comment lines
  *                     (which the parser ignores) and third-party launchd labels are elided.
  *                     The `systemctl is-enabled` strings and exit codes were captured on Ubuntu
- *                     26.04.1, systemd 259.5 (kingsley WSL), 2026-10-17.
+ *                     26.04.1, systemd 259.5 (kingsley WSL), 2026-10-17; the missing-unit line on
+ *                     debian:12 (systemd 252.39) and ubuntu:22.04 (systemd 249.11) containers,
+ *                     2026-10-17, where it is printed on STDERR with stdout empty and exit 1.
  *   CONSTRUCTED    -- every other specimen, built from sshd_config(5) and the OpenSSH source
  *                     (servconf.c, misc.c); none is a capture.
  */
@@ -234,6 +236,69 @@ TEST_CASE("remote_access_audit config: the authorizedkeysfile row never carries 
           "config|authorizedkeysfile|custom:3|sshd_config");
 }
 
+TEST_CASE("remote_access_audit config: AuthorizedKeysFile tokens are capped, the count stays honest",
+          "[remote_access_audit][config]") {
+    std::string at_cap = "AuthorizedKeysFile";
+    for (std::size_t i = 0; i < kMaxAuthorizedKeysFileTokens; ++i)
+        at_cap += " .ssh/k" + std::to_string(i);
+    auto run = parse(at_cap + "\n");
+    CHECK(run.st.akf.size() == kMaxAuthorizedKeysFileTokens);
+    CHECK_FALSE(run.st.akf_capped);
+
+    // one over the cap: the first kMaxAuthorizedKeysFileTokens are kept, the rest dropped and flagged
+    run = parse(at_cap + " .ssh/extra\n");
+    CHECK(run.st.akf.size() == kMaxAuthorizedKeysFileTokens);
+    CHECK(run.st.akf.back() == ".ssh/k99");
+    CHECK(run.st.akf_capped);
+    CHECK(run.st.akf_count == kMaxAuthorizedKeysFileTokens + 1);
+    bool ov = false;
+    CHECK(row_for(config_rows(run.st, true, ov), "authorizedkeysfile") == "config|authorizedkeysfile|custom:101|sshd_config");
+
+    // a 100,000-token directive (the measured 5.0 s case) is bounded the same way
+    std::string huge = "AuthorizedKeysFile";
+    for (int i = 0; i < 100000; ++i)
+        huge += " a";
+    run = parse(huge + "\n");
+    CHECK(run.st.akf.size() == kMaxAuthorizedKeysFileTokens);
+    CHECK(run.st.akf_capped);
+}
+
+// MUTATION: dropping a keyword from kOtherCredentialKeys, or reading its value instead of its first
+// occurrence, leaves a host that trusts a CA / runs a key command reading as fully `supported`.
+TEST_CASE("remote_access_audit config: credential sources the plugin does not read are flagged by presence",
+          "[remote_access_audit][config]") {
+    // live: each keyword at global scope, with a real-looking value, sets the flag
+    for (const char* line : {"TrustedUserCAKeys /etc/ssh/ca.pub", "AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys",
+                             "AuthorizedPrincipalsFile .ssh/principals", "AuthorizedPrincipalsCommand /usr/bin/p %u",
+                             "AuthenticationMethods publickey,password", "HostbasedAuthentication yes",
+                             "trustedusercakeys=/etc/ssh/ca.pub", "  authorizedkeyscommand /x"}) {
+        INFO(line);
+        const auto run = parse(std::string(line) + "\n");
+        CHECK(run.st.other_credential_sources);
+    }
+    // inert: absent, the disabling/default value, a commented line
+    for (const char* text : {"", "PermitRootLogin no\n", "AuthorizedKeysCommand none\n", "AuthorizedKeysCommand NONE\n",
+                             "AuthorizedPrincipalsFile none\n", "AuthorizedPrincipalsCommand none\n",
+                             "AuthenticationMethods any\n", "HostbasedAuthentication no\n",
+                             "#TrustedUserCAKeys /etc/ssh/ca.pub\n", "TrustedUserCAKeys\n"}) {
+        INFO(text);
+        CHECK_FALSE(parse(text).st.other_credential_sources);
+    }
+    // first occurrence wins, as for every sshd keyword: `none` first leaves a later value ignored
+    CHECK_FALSE(parse("AuthorizedKeysCommand none\nAuthorizedKeysCommand /x\n").st.other_credential_sources);
+    CHECK(parse("AuthorizedKeysCommand /x\nAuthorizedKeysCommand none\n").st.other_credential_sources);
+    // a Match-scoped directive is not global: counted by match_blocks, not flagged
+    CHECK_FALSE(parse("Match User bob\n  TrustedUserCAKeys /etc/ssh/ca.pub\n").st.other_credential_sources);
+    // an Include'd file is part of the global config
+    const std::map<std::string, std::string> files{{"/etc/ssh/ca.conf", "TrustedUserCAKeys /etc/ssh/ca.pub\n"}};
+    CHECK(parse("Include /etc/ssh/ca.conf\n", files).st.other_credential_sources);
+    // the flag carries no value or path into any row
+    const auto run = parse("TrustedUserCAKeys /etc/ssh/zq-ca-9731.pub\n");
+    bool ov = false;
+    for (const auto& r : config_rows(run.st, true, ov))
+        CHECK(r.find("zq-ca-9731") == std::string::npos);
+}
+
 TEST_CASE("remote_access_audit config: a missing sshd_config reports every value as absent",
           "[remote_access_audit][config]") {
     const auto run = parse("PermitRootLogin yes\n");
@@ -263,30 +328,57 @@ TEST_CASE("remote_access_audit config: expand_include_pattern", "[remote_access_
 
 TEST_CASE("remote_access_audit config: systemctl is-enabled output", "[remote_access_audit][service]") {
     // REAL CAPTURE strings (Ubuntu 26.04.1, systemd 259.5): enabled / disabled / not-found / static /
-    // masked-runtime / indirect / alias / generated / transient. Exit codes are NOT consulted.
+    // masked-runtime / indirect / alias / generated / transient. A state word is read whatever the exit code.
     for (const char* s : {"enabled", "disabled", "not-found", "static", "masked-runtime", "indirect", "alias",
                           "generated", "transient"}) {
-        const auto f = parse_systemctl_is_enabled(std::string(s) + "\n");
+        const auto f = parse_systemctl_is_enabled(std::string(s) + "\n", 0, "ssh.service");
         CHECK(f.state == s);
         CHECK(f.cause.empty());
     }
     // CONSTRUCTED from systemctl(1): the states the capture host did not show
     for (const char* s : {"enabled-runtime", "linked", "linked-runtime", "masked", "bad"}) {
-        const auto f = parse_systemctl_is_enabled(std::string(s) + "\n");
+        const auto f = parse_systemctl_is_enabled(std::string(s) + "\n", 0, "ssh.service");
         CHECK(f.state == s);
         CHECK(f.cause.empty());
     }
     CHECK(kSystemctlStates.size() == 14);
-    CHECK(parse_systemctl_is_enabled("enabled\r\n").state == "enabled");
-    CHECK(parse_systemctl_is_enabled("  disabled \n").state == "disabled");
-    const auto empty = parse_systemctl_is_enabled("");
+    CHECK(parse_systemctl_is_enabled("enabled\r\n", 0, "ssh.service").state == "enabled");
+    CHECK(parse_systemctl_is_enabled("  disabled \n", 1, "ssh.service").state == "disabled");
+    const auto empty = parse_systemctl_is_enabled("", 1, "ssh.service");
     CHECK(empty.state == "unknown");
     CHECK(empty.cause == "no_output");
-    const auto junk = parse_systemctl_is_enabled("enabled-junk\n");
+    const auto junk = parse_systemctl_is_enabled("enabled-junk\n", 0, "ssh.service");
     CHECK(junk.state == "unknown");
     CHECK(junk.cause == "unrecognised_output");
-    CHECK(parse_systemctl_is_enabled("Enabled\n").cause == "unrecognised_output"); // case-sensitive
-    CHECK(parse_systemctl_is_enabled("\nenabled\n").cause == "no_output");          // first line only
+    CHECK(parse_systemctl_is_enabled("Enabled\n", 0, "ssh.service").cause == "unrecognised_output"); // case-sensitive
+    CHECK(parse_systemctl_is_enabled("\nenabled\n", 0, "ssh.service").cause == "no_output");          // first line only
+}
+
+// MUTATION: dropping the stderr branch (or reading stdout only) makes every unit of a host without
+// that sshd unit `no_output`, so a Debian/Ubuntu/RHEL host with sshd.service absent was permanently CONSTRAINED.
+TEST_CASE("remote_access_audit config: a missing unit is not-found only on systemd's exact stderr line",
+          "[remote_access_audit][service]") {
+    // REAL CAPTURE (debian:12 systemd 252.39 and ubuntu:22.04 systemd 249.11): stdout empty, exit 1,
+    // this single line on stderr (the runner merges it into the captured output).
+    constexpr const char* kMissing = "Failed to get unit file state for ssh.service: No such file or directory\n";
+    const auto f = parse_systemctl_is_enabled(kMissing, 1, "ssh.service");
+    CHECK(f.state == "not-found");
+    CHECK(f.cause.empty());
+    CHECK(parse_systemctl_is_enabled("Failed to get unit file state for ssh.socket: No such file or directory\n", 1,
+                                     "ssh.socket")
+              .state == "not-found");
+    // narrow: the unit must be the one asked about, the exit non-zero, and the line exactly that
+    CHECK(parse_systemctl_is_enabled(kMissing, 1, "sshd.service").cause == "unrecognised_output");
+    CHECK(parse_systemctl_is_enabled(kMissing, 0, "ssh.service").cause == "unrecognised_output");
+    CHECK(parse_systemctl_is_enabled(kMissing, 1, "").cause == "unrecognised_output");
+    CHECK(parse_systemctl_is_enabled("Failed to connect to bus: No such file or directory\n", 1, "ssh.service")
+              .cause == "unrecognised_output");
+    CHECK(parse_systemctl_is_enabled("Failed to get unit file state for ssh.service: Permission denied\n", 1,
+                                     "ssh.service")
+              .cause == "unrecognised_output");
+    CHECK(parse_systemctl_is_enabled("xFailed to get unit file state for ssh.service: No such file or directory\n", 1,
+                                     "ssh.service")
+              .cause == "unrecognised_output");
 }
 
 TEST_CASE("remote_access_audit config: launchctl print-disabled for one exact label",
@@ -317,4 +409,9 @@ TEST_CASE("remote_access_audit config: row formatters escape and cut", "[remote_
           "service|ssh.service|enabled|systemctl_is_enabled");
     CHECK(source_row("homes", SourceState::read, 3) == "source|homes|read|3");
     CHECK(source_row("homes", SourceState::refused, std::nullopt) == "source|homes|refused|-");
+    // the homes row alone carries the skipped-home count: `-` is "no eligibility probe" or "not listed"
+    CHECK(homes_source_row(SourceState::read, 3, 1) == "source|homes|read|3|1");
+    CHECK(homes_source_row(SourceState::read, 3, 0) == "source|homes|read|3|0");
+    CHECK(homes_source_row(SourceState::read, 3, std::nullopt) == "source|homes|read|3|-");
+    CHECK(homes_source_row(SourceState::refused, std::nullopt, std::nullopt) == "source|homes|refused|-|-");
 }

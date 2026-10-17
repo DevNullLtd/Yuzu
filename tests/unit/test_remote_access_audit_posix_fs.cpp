@@ -372,7 +372,7 @@ TEST_CASE("remote_access_audit posix fs: a symlinked home parent is resolved by 
         const auto key = std::ranges::find_if(l.rows, [](const std::string& r) { return r.rfind("key|alice|", 0) == 0; });
         REQUIRE(key != l.rows.end());
         CHECK(key->find(kAliceFp) != std::string::npos);
-        CHECK(std::ranges::find(l.rows, "source|homes|read|4") != l.rows.end()); // alice, bob, evil, rootlink
+        CHECK(std::ranges::find(l.rows, "source|homes|read|4|-") != l.rows.end()); // alice, bob, evil, rootlink
         CHECK(std::ranges::find(l.rows, "file|evil|authorized_keys|failed|-|-|-") != l.rows.end()); // refused, never followed
         // the linked entries are reported (ELOOP or ENOTDIR by OS); the linked PARENT raised no refusal
         CHECK(l.reason.find("linux:remote_access_audit:homes:") != std::string::npos);
@@ -398,7 +398,7 @@ TEST_CASE("remote_access_audit posix fs: a home parent linked into a network mou
     const auto l = list_posix(b);
     CHECK(l.reason.find("linux:remote_access_audit:keys:network_mount_skipped") != std::string::npos);
     CHECK(l.status == StatusState::constrained);
-    CHECK(std::ranges::find(l.rows, "source|homes|absent|-") != l.rows.end()); // never listed, so never read
+    CHECK(std::ranges::find(l.rows, "source|homes|absent|-|-") != l.rows.end()); // never listed, so never read
     for (const auto& r : l.rows)
         CHECK(r.find("alice") == std::string::npos); // nothing under the target was listed, opened or read
 }
@@ -411,7 +411,7 @@ TEST_CASE("remote_access_audit posix fs: a link chain or a linked component unde
     p.single_homes = {};
     p.run = service_enabled;
     const auto refused_loudly = [&](const Listing& l) {
-        CHECK(std::ranges::find(l.rows, "source|homes|failed|-") != l.rows.end());
+        CHECK(std::ranges::find(l.rows, "source|homes|failed|-|-") != l.rows.end());
         CHECK(l.reason.find("linux:remote_access_audit:homes:eloop") != std::string::npos);
         CHECK(l.status == StatusState::constrained);
         for (const auto& r : l.rows)
@@ -456,7 +456,8 @@ TEST_CASE("remote_access_audit posix fs: a single home reached through an aliase
         for (const auto& r : l.rows) {
             CHECK(r.find(kAliceFp) == std::string::npos);
             CHECK(r.rfind("key|", 0) != 0);
-            CHECK(r.find("|read|1|") == std::string::npos);
+            if (r.rfind("file|", 0) == 0) // a file row that read one key (the homes source row also says `read|1|`)
+                CHECK(r.find("|read|1|") == std::string::npos);
         }
         CHECK(l.status == StatusState::constrained);
     };
@@ -474,7 +475,7 @@ TEST_CASE("remote_access_audit posix fs: a single home reached through an aliase
         p.single_homes = {t.at("real/root").string()};
         const auto l = list_posix(make_posix_fs(p));
         no_key_read(l);
-        CHECK(std::ranges::find(l.rows, "source|homes|absent|-") != l.rows.end()); // never listed, so never opened
+        CHECK(std::ranges::find(l.rows, "source|homes|absent|-|-") != l.rows.end()); // never listed, so never opened
         CHECK(l.reason.find("linux:remote_access_audit:keys:network_mount_skipped") != std::string::npos);
     }
     SECTION("the canonical spelling off any mount is read") {
@@ -605,6 +606,21 @@ TEST_CASE("remote_access_audit posix fs: network mount points come from the moun
     REQUIRE(read.has_value());
     CHECK(read->size() == 3);
     CHECK_FALSE(linux_mountinfo_prefixes(t.at("absent").string()).has_value()); // unreadable != empty
+
+    // The bound: a table over the cap is unreadable (the guard then reports mounts_unreadable),
+    // never a silently truncated list. The cap is a parameter so the boundary needs no big file.
+    std::string dense;
+    while (dense.size() < 6000)
+        dense += "40 36 0:35 / /home/remote rw,relatime shared:5 - nfs4 srv:/export rw,vers=4.2\n";
+    t.write(t.at("dense"), dense);
+    CHECK_FALSE(linux_mountinfo_prefixes(t.at("dense").string(), 4096).has_value());
+    const auto fits = linux_mountinfo_prefixes(t.at("dense").string(), 8192);
+    REQUIRE(fits.has_value());
+    CHECK(fits->size() == dense.size() / std::string{"40 36 0:35 / /home/remote rw,relatime shared:5 - nfs4 srv:/export rw,vers=4.2\n"}.size());
+    // MUTATION: restoring the old 1 MiB default drops a container-dense node's guard entirely.
+    // The default holds fs.mount-max (100,000 mounts at ~160 bytes a line) in full.
+    static_assert(kMountinfoCap >= 100000 * 160);
+    static_assert(kMountinfoCap == 16 * 1024 * 1024);
 }
 
 TEST_CASE("remote_access_audit posix fs: config-side symlinks are followed as sshd follows them, key-side never",
@@ -688,7 +704,7 @@ TEST_CASE("remote_access_audit posix fs: end to end over a real tree", "[remote_
     const auto l = list_posix(make_posix_fs(p));
     CHECK(l.status == StatusState::supported);
     CHECK(l.rows[0] == "source|sshd_config|read|2");
-    CHECK(l.rows[1] == "source|homes|read|2");
+    CHECK(l.rows[1] == "source|homes|read|2|-");
     CHECK(std::ranges::find(l.rows, "config|permitrootlogin|no|include:10.conf") != l.rows.end());
     CHECK(std::ranges::find(l.rows, "file|alice|authorized_keys|read|1|0|0") != l.rows.end());
     CHECK(std::ranges::find(l.rows, "file|rootsingle|authorized_keys|read|0|0|0") != l.rows.end());

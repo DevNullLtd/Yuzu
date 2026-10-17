@@ -20,6 +20,8 @@
 
 #include "remote_access_audit_keys_parsers.hpp"
 
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -285,6 +287,131 @@ TEST_CASE("remote_access_audit keys: the blob is decoded completely and trailing
     CHECK(parse(line(kAliceEd25519CertType, b64(cert.substr(0, cert.size() - kAliceCertSigField)))).kp.malformed == 1);
     CHECK(parse(line(kAliceEd25519CertType, b64(cert + "\0\0\0\0"s))).kp.malformed == 1);
     CHECK(parse(line(kAliceEd25519CertType, b64(cert.substr(0, cert.size() - 1)))).kp.malformed == 1);
+}
+
+namespace {
+
+/// The fields of a certificate blob after its type string, in cert_parse order (sshkey.c:1854).
+struct CertParts {
+    std::string nonce, pk, key_id, principals, critical, extensions, reserved, sigkey, sig;
+    std::uint64_t serial = 0, valid_after = 0, valid_before = 0;
+    std::uint32_t type = 1;
+};
+
+std::string u32be(std::uint32_t v) {
+    std::string out;
+    for (int shift = 24; shift >= 0; shift -= 8)
+        out += static_cast<char>((v >> shift) & 0xFF);
+    return out;
+}
+std::string u64be(std::uint64_t v) { return u32be(static_cast<std::uint32_t>(v >> 32)) + u32be(static_cast<std::uint32_t>(v)); }
+
+/// Splits the REAL alice_ed25519-cert.pub blob, so a case mutates exactly one field of a genuine
+/// ssh-keygen-signed certificate and every other byte stays as captured.
+CertParts split_alice_cert() {
+    const std::string blob = unb64(kAliceEd25519CertB64);
+    detail::Reader r{blob};
+    REQUIRE(r.str().value() == kAliceEd25519CertType);
+    CertParts c;
+    c.nonce = std::string(r.str().value());
+    c.pk = std::string(r.str().value());
+    c.serial = r.u64().value();
+    c.type = r.u32().value();
+    c.key_id = std::string(r.str().value());
+    c.principals = std::string(r.str().value());
+    c.valid_after = r.u64().value();
+    c.valid_before = r.u64().value();
+    c.critical = std::string(r.str().value());
+    c.extensions = std::string(r.str().value());
+    c.reserved = std::string(r.str().value());
+    c.sigkey = std::string(r.str().value());
+    c.sig = std::string(r.str().value());
+    REQUIRE(r.left() == 0);
+    return c;
+}
+
+std::string build_cert(const CertParts& c) {
+    return str(kAliceEd25519CertType) + str(c.nonce) + str(c.pk) + u64be(c.serial) + u32be(c.type) + str(c.key_id) +
+           str(c.principals) + u64be(c.valid_after) + u64be(c.valid_before) + str(c.critical) + str(c.extensions) +
+           str(c.reserved) + str(c.sigkey) + str(c.sig);
+}
+
+std::string principals_of(std::size_t n) {
+    std::string out;
+    for (std::size_t i = 0; i < n; ++i)
+        out += str("p");
+    return out;
+}
+
+} // namespace
+
+// Each case changes ONE field of the real certificate. MUTATION: dropping the matching check in
+// skip_certificate_body (type 1/2, the 256-principal cap, cstr on key_id/principals, the (name,data)
+// pair read, decode of the CA key as a non-certificate, the signature's type string) flips its case.
+TEST_CASE("remote_access_audit keys: every certificate field is checked, one mutation per case",
+          "[remote_access_audit][keys]") {
+    struct Case {
+        const char* what;
+        std::function<void(CertParts&)> mutate;
+        bool accepted;
+    };
+    const std::string kCa = unb64(kCaEd25519B64);
+    const std::vector<Case> cases = {
+        {"unchanged (control)", [](CertParts&) {}, true},
+        {"host certificate type 2", [](CertParts& c) { c.type = 2; }, true},
+        {"certificate type 0", [](CertParts& c) { c.type = 0; }, false},
+        {"certificate type 3", [](CertParts& c) { c.type = 3; }, false},
+        {"256 principals (the cap)", [](CertParts& c) { c.principals = principals_of(256); }, true},
+        {"257 principals", [](CertParts& c) { c.principals = principals_of(257); }, false},
+        {"a principal with an embedded NUL", [](CertParts& c) { c.principals = str(std::string("a\0b", 3)); }, false},
+        {"a principal length that overruns the list", [](CertParts& c) { c.principals = std::string("\0\0\0\x09" "ab", 6); }, false},
+        {"key_id with an embedded NUL", [](CertParts& c) { c.key_id = std::string("id\0x", 4); }, false},
+        {"a critical option with its data", [](CertParts& c) { c.critical = str("force-command") + str(str("/bin/true")); }, true},
+        {"a critical option name with no data", [](CertParts& c) { c.critical = str("force-command"); }, false},
+        {"an extension name with no data", [](CertParts& c) { c.extensions = str("permit-pty"); }, false},
+        {"a critical option length that overruns the section", [](CertParts& c) { c.critical = std::string("\0\0\0\x20x", 5); }, false},
+        {"the CA key is itself a certificate", [](CertParts& c) { c.sigkey = unb64(kAliceEd25519CertB64); }, false},
+        {"the CA key is not a key blob", [](CertParts& c) { c.sigkey = "xx"; }, false},
+        {"the CA key has trailing bytes", [kCa](CertParts& c) { c.sigkey = kCa + "\0"s; }, false},
+        {"an empty signature (no type string)", [](CertParts& c) { c.sig.clear(); }, false},
+        {"a signature that leads with its type", [](CertParts& c) { c.sig = str("ssh-ed25519") + str(std::string(64, '\2')); }, true},
+    };
+    for (const auto& tc : cases) {
+        INFO(tc.what);
+        auto parts = split_alice_cert();
+        tc.mutate(parts);
+        const auto p = parse(line(kAliceEd25519CertType, b64(build_cert(parts))));
+        if (tc.accepted) {
+            expect_one_key(p, kAliceEd25519CertType, "SHA256:BPH4QduMtDlX59CWZCda5Zf0U0jseMmFVimvek7EMhA", "256",
+                           "certificate");
+        } else {
+            CHECK(p.kp.keys == 0);
+            CHECK(p.kp.malformed == 1);
+            CHECK(p.rows.empty());
+        }
+    }
+}
+
+// MUTATION: reading an sk application string with str() instead of cstr(), or lifting the 16384-bit
+// modulus bound, accepts the rows below.
+TEST_CASE("remote_access_audit keys: sk application strings and the RSA modulus bound",
+          "[remote_access_audit][keys]") {
+    // CONSTRUCTED (wire format, sshkey.c): an application string with an embedded NUL
+    const std::string sked = str("sk-ssh-ed25519@openssh.com") + str(std::string(32, '\1'));
+    CHECK(parse(line("sk-ssh-ed25519@openssh.com", b64(sked + str("ssh:")))).kp.keys == 1);
+    CHECK(parse(line("sk-ssh-ed25519@openssh.com", b64(sked + str(std::string("ss\0h", 4))))).kp.malformed == 1);
+    const std::string pt256 = "\x04" + std::string(64, '\1');
+    const std::string skec = str("sk-ecdsa-sha2-nistp256@openssh.com") + str("nistp256") + str(pt256);
+    CHECK(parse(line("sk-ecdsa-sha2-nistp256@openssh.com", b64(skec + str("ssh:")))).kp.keys == 1);
+    CHECK(parse(line("sk-ecdsa-sha2-nistp256@openssh.com", b64(skec + str(std::string("ss\0h", 4))))).kp.malformed == 1);
+
+    // 16384 bits is the largest modulus (sshbuf_get_bignum2's bound); one bit more is refused
+    const auto rsa = [&](std::string_view n) { return b64(str("ssh-rsa") + mp(std::string("\x01\x00\x01", 3)) + mp(n)); };
+    const auto at_cap = parse(line("ssh-rsa", rsa("\x80" + std::string(2047, '\x11'))));
+    REQUIRE(at_cap.rows.size() == 1);
+    CHECK(at_cap.rows[0][kBits] == "16384");
+    CHECK(parse(line("ssh-rsa", rsa("\x01" + std::string(2048, '\x11')))).kp.malformed == 1); // 16385 bits
+    CHECK(parse(line("ssh-rsa", rsa("\x80" + std::string(2048, '\x11')))).kp.malformed == 1); // 16392 bits
 }
 
 TEST_CASE("remote_access_audit keys: RSA bits from the modulus; <1024 refused; leading zeros trimmed",

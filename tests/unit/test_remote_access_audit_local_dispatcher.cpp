@@ -174,9 +174,9 @@ bool in(const std::string& v, std::initializer_list<const char*> set) {
 } // namespace
 
 // MUTATION: flip a leg's declared support without changing the code behind it (Windows to
-// SUPPORTED while the leg is still the placeholder, Linux or macOS to PLANNED) -> the exact-level
-// checks fail. The mechanism/notes prose is not pinned: the capability-matrix check gates it.
-TEST_CASE("remote_access_audit plugin: the descriptor declares Linux and macOS supported and Windows planned",
+// SUPPORTED while the leg is still the placeholder, Linux back to SUPPORTED although the unprivileged
+// agent usually cannot open other users' homes, macOS to PLANNED) -> the exact-level checks fail. The mechanism/notes prose is not pinned: the capability-matrix check gates it.
+TEST_CASE("remote_access_audit plugin: the descriptor declares Linux constrained, macOS supported and Windows planned",
           "[remote_access_audit][descriptors]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -189,7 +189,7 @@ TEST_CASE("remote_access_audit plugin: the descriptor declares Linux and macOS s
     REQUIRE(plugin->descriptor->action_descriptor_count == 1);
     const auto& d = plugin->descriptor->action_descriptors[0];
     CHECK(std::string_view{d.action} == "list");
-    CHECK(d.linux_leg.support == YUZU_SUPPORT_SUPPORTED);
+    CHECK(d.linux_leg.support == YUZU_SUPPORT_CONSTRAINED);
     CHECK(d.linux_leg.rung == 2);
     CHECK(d.macos_leg.support == YUZU_SUPPORT_SUPPORTED);
     CHECK(d.macos_leg.rung == 2);
@@ -259,6 +259,44 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     CHECK(rows[3].starts_with("source|service|"));
     for (std::size_t i = 1; i <= 3; ++i)
         CHECK(in(fields(rows[i])[2], {"read", "absent", "refused", "failed"}));
+    // The homes row alone carries a fifth field (entries the eligibility probe refused; `-` on Linux).
+    CHECK(fields(rows[2]).size() == 5);
+    CHECK(fields(rows[1]).size() == 4);
+    CHECK(fields(rows[3]).size() == 4);
+    // The production wiring, asserted only on what is environment-stable. sshd_config is world-readable
+    // on every Mac and is either there or not on a CI image; a path that was mis-bound would read `failed`.
+    CHECK(in(fields(rows[1])[2], {"read", "absent"}));
+#if defined(__APPLE__)
+    // launchctl print-disabled answers an unprivileged caller, so the service source IS read and the one
+    // row names the label and the mechanism. MUTATION: a wrong tool path or arguments drops this row.
+    CHECK(fields(rows[3])[2] == "read");
+    const auto svc = std::ranges::find_if(rows, [](const std::string& r) { return r.starts_with("service|"); });
+    REQUIRE(svc != rows.end());
+    const auto sf = fields(*svc);
+    CHECK(sf[1] == "com.openssh.sshd");
+    CHECK(in(sf[2], {"enabled", "disabled", "unknown"}));
+    CHECK(sf[3] == "launchctl_print_disabled");
+    // the macOS home roots are /Users and /var/root: the eligibility probe is wired, so the skipped count is a number
+    CHECK(fields(rows[2])[4] != "-");
+#else
+    // systemctl may not exist on a CI image (a failed service source, no service rows); when it ran, every
+    // row is for one of the three units and names the mechanism.
+    CHECK(fields(rows[2])[4] == "-"); // Linux has no eligibility probe, so nothing is detectably skipped
+    CHECK(in(fields(rows[3])[2], {"read", "failed"}));
+    const auto n_svc = std::ranges::count_if(rows, [](const std::string& r) { return r.starts_with("service|"); });
+    if (fields(rows[3])[2] == "read") {
+        CHECK(n_svc == 3);
+        for (const auto& r : rows) {
+            if (!r.starts_with("service|"))
+                continue;
+            const auto sf = fields(r);
+            CHECK(in(sf[1], {"ssh.service", "sshd.service", "ssh.socket"}));
+            CHECK(sf[3] == "systemctl_is_enabled");
+        }
+    } else {
+        CHECK(n_svc == 0);
+    }
+#endif
 #if defined(__APPLE__)
     // MUTATION: binding the macOS root home as /var/root (a link to private/var/root on stock macOS)
     // makes the home open ELOOP and puts `homes:eloop` in this row.

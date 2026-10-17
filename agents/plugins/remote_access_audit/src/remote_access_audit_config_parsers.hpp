@@ -31,12 +31,14 @@
 #include <wire_utf8.hpp>
 #include <yuzu/string_utils.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -57,6 +59,9 @@ inline constexpr std::size_t kRowOverhead = 64;
 inline constexpr std::size_t kMaxIncludeDepth = 4;
 inline constexpr std::size_t kMaxIncludeFiles = 32;
 inline constexpr std::size_t kMaxPorts = 256; ///< sshd's own MAX_PORTS
+/// AuthorizedKeysFile tokens kept; the rest are dropped with a token. The order of the
+/// MAX_AUTHKEYS_FILES (100) older OpenSSH enforced: each token is resolved once per account home.
+inline constexpr std::size_t kMaxAuthorizedKeysFileTokens = 100;
 
 inline std::string_view state_token(SourceState s) {
     switch (s) {
@@ -131,6 +136,14 @@ inline std::string wire_field(std::string_view v, bool& oversized) {
     r += '|';
     r += n ? std::to_string(*n) : std::string{"-"};
     return r;
+}
+
+/// The `homes` source row: `source|homes|<state>|<accounts or ->|<skipped or ->`. `skipped` counts the
+/// listed home-root entries the account-eligibility probe positively refused (macOS: owned by a uid
+/// under 500, such as /Users/Shared); `-` where no probe exists (Linux) or the roots were not listed.
+[[nodiscard]] inline std::string homes_source_row(SourceState state, std::optional<std::size_t> accounts,
+                                                  std::optional<std::size_t> skipped) {
+    return source_row("homes", state, accounts) + '|' + (skipped ? std::to_string(*skipped) : std::string{"-"});
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +286,24 @@ struct CountSlot {
     std::string origin; ///< file of the first occurrence
 };
 
+/// Keywords that name a login credential source, or an extra login requirement, this plugin does
+/// NOT read (the value allowlist above is closed). Only their PRESENCE at global scope is
+/// recorded -- never a value or a path -- so a host that uses one is not reported as fully
+/// `supported`. `inert` is the lowercase first argument that disables the keyword or is its
+/// default (sshd: `none`, `any`, `no`); the first occurrence decides, as for every sshd keyword.
+struct OtherCredentialKey {
+    std::string_view keyword;
+    std::string_view inert;
+};
+inline constexpr std::array<OtherCredentialKey, 6> kOtherCredentialKeys = {{
+    {"trustedusercakeys", "none"},
+    {"authorizedkeyscommand", "none"},
+    {"authorizedprincipalsfile", "none"},
+    {"authorizedprincipalscommand", "none"},
+    {"authenticationmethods", "any"},
+    {"hostbasedauthentication", "no"},
+}};
+
 struct SshdConfigState {
     std::array<ScalarSlot, kScalarKeys.size()> scalar{};
     std::vector<std::string> ports; ///< APPENDS across occurrences, like sshd
@@ -280,7 +311,11 @@ struct SshdConfigState {
     bool akf_set = false;
     std::vector<std::string> akf; ///< tokens, kept for path resolution only
     std::string akf_origin;
-    bool akf_in_match = false; ///< an AuthorizedKeysFile appeared inside a Match block
+    std::size_t akf_count = 0;  ///< tokens written, before the kMaxAuthorizedKeysFileTokens cut
+    bool akf_capped = false;    ///< the cut dropped tokens
+    bool akf_in_match = false;  ///< an AuthorizedKeysFile appeared inside a Match block
+    unsigned cred_seen = 0;     ///< bit per kOtherCredentialKeys entry whose first occurrence was read
+    bool other_credential_sources = false; ///< a kOtherCredentialKeys keyword is live at global scope
     std::array<CountSlot, 4> lists{}; ///< allowusers, allowgroups, denyusers, denygroups (args summed)
     std::size_t match_blocks = 0;
     bool invalid_quotes = false;
@@ -342,12 +377,25 @@ inline void parse_sshd_config(std::string_view text, std::string_view origin, Ss
             if (bad)
                 continue; // sshd rejects an empty argument or a "none" that is not alone
             st.akf_set = true;
-            st.akf = args;
+            st.akf_count = args.size();
+            st.akf_capped = args.size() > kMaxAuthorizedKeysFileTokens;
+            st.akf.assign(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(
+                                                           (std::min)(args.size(), kMaxAuthorizedKeysFileTokens)));
             st.akf_origin = std::string(origin);
             continue;
         }
         if (in_match)
             continue;
+
+        if (const auto cred = std::ranges::find(kOtherCredentialKeys, kw, &OtherCredentialKey::keyword);
+            cred != kOtherCredentialKeys.end()) {
+            const unsigned bit = 1u << static_cast<unsigned>(std::distance(kOtherCredentialKeys.begin(), cred));
+            if ((st.cred_seen & bit) == 0 && !args.empty() && !args[0].empty()) {
+                st.cred_seen |= bit;
+                st.other_credential_sources = st.other_credential_sources || detail::lower(args[0]) != cred->inert;
+            }
+            continue;
+        }
 
         if (kw == "port") {
             if (!args.empty() && st.ports.size() < kMaxPorts) {
@@ -449,7 +497,7 @@ inline IncludeSpec expand_include_pattern(std::string_view arg) {
         return "default";
     if (st.akf.size() == 1 && detail::lower(st.akf[0]) == "none")
         return "none";
-    return "custom:" + std::to_string(st.akf.size());
+    return "custom:" + std::to_string(st.akf_count);
 }
 
 /// The 13 config rows, ALWAYS all of them. `config_read == false` (sshd_config absent or
@@ -493,9 +541,14 @@ struct ServiceFact {
     std::string cause; ///< failure cause (`no_output`, `unrecognised_output`); empty when the output was understood
 };
 
-/// The first line of stdout, trimmed, must be exactly one state word. The EXIT CODE is not a
-/// failure signal: `disabled` and `masked-runtime` exit 1, `not-found` exits 4.
-inline ServiceFact parse_systemctl_is_enabled(std::string_view out) {
+/// The first line of the output, trimmed, must be exactly one state word. The EXIT CODE is not a
+/// failure signal for that: `disabled` and `masked-runtime` exit 1, `not-found` exits 4. `out` is
+/// stdout and stderr merged, because systemd 249/252 report a unit that does not exist ONLY on
+/// stderr (stdout empty, exit 1): `Failed to get unit file state for <unit>: No such file or
+/// directory`. That one exact line, with a non-zero exit, is `not-found`, the word systemd 259
+/// prints on stdout for the same unit; nothing else is ever read as an absent unit (a broader
+/// match would also take `Failed to connect to bus: No such file or directory`).
+inline ServiceFact parse_systemctl_is_enabled(std::string_view out, int exit_code, std::string_view unit) {
     const auto nl = out.find('\n');
     std::string_view first = nl == std::string_view::npos ? out : out.substr(0, nl);
     while (!first.empty() && (first.front() == ' ' || first.front() == '\t' || first.front() == '\r'))
@@ -507,6 +560,13 @@ inline ServiceFact parse_systemctl_is_enabled(std::string_view out) {
     for (const auto s : kSystemctlStates) {
         if (first == s)
             return {std::string(s), {}};
+    }
+    if (exit_code != 0 && !unit.empty()) {
+        std::string missing = "Failed to get unit file state for ";
+        missing += unit;
+        missing += ": No such file or directory";
+        if (first == missing)
+            return {"not-found", {}};
     }
     return {"unknown", "unrecognised_output"};
 }

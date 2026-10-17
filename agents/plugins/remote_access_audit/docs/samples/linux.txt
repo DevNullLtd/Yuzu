@@ -1,8 +1,8 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-17 · euid 0 · leg-hash af04792464e9
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-17 · euid 0 · leg-hash 58c6c41593ed
 == action=list
 status|list|constrained|linux:remote_access_audit:keys:malformed,linux:remote_access_audit:keys:oversized_line,linux:remote_access_audit:keys:symlink_refused
 source|sshd_config|read|3
-source|homes|read|4
+source|homes|read|4|-
 source|service|read|3
 config|permitrootlogin|prohibit-password|include:10-test.conf
 config|passwordauthentication|no|include:10-test.conf

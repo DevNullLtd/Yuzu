@@ -31,22 +31,26 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2,
+        {YUZU_SUPPORT_CONSTRAINED, 2,
          "bounded reads of /etc/ssh/sshd_config (Include followed, config symlinks followed as sshd "
          "does) and each account's authorized_keys (no-follow; pure parsers, SHA-256 "
          "fingerprints); one bounded systemctl is-enabled argv per sshd unit",
-         "configured access as written, not sshd's effective policy (Match is not evaluated); "
-         "key comments, option values and key-file paths are never emitted; a home the agent "
-         "cannot open is refused, not empty (constrained is the common unprivileged outcome); "
-         "a symlinked key file or .ssh is refused; network mounts are skipped"},
+         "constrained: the agent runs unprivileged, so other users' homes (usually 0700) are "
+         "refused, not empty, and the listing is constrained; configured access as written, not "
+         "sshd's effective policy (Match is not evaluated); CA trust, key and principals "
+         "commands and hostbased auth are not read; key comments, option values and key-file "
+         "paths are never emitted; only homes under /home and /root are walked; a symlinked key "
+         "file or .ssh is refused; network mounts are skipped"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,
          "bounded reads of /etc/ssh/sshd_config (Include followed, config symlinks followed as sshd "
          "does) and each account's authorized_keys (no-follow; pure parsers, SHA-256 "
          "fingerprints); one bounded launchctl print-disabled system argv",
          "configured access as written, not sshd's effective policy; the launchd override is "
-         "not 'running'; key comments, option values and key-file paths are never emitted; a "
-         "symlinked key file or .ssh is refused; network mounts are skipped"},
+         "not 'running'; CA trust, key and principals commands and hostbased auth are not read; "
+         "key comments, option values and key-file paths are never emitted; only homes under "
+         "/Users owned by uid 500 or above, and /var/root, are walked; a symlinked key file or "
+         ".ssh is refused; network mounts are skipped"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1,
          "per-profile .ssh\\authorized_keys, %ProgramData%\\ssh\\administrators_authorized_keys "

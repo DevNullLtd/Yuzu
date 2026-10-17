@@ -48,6 +48,12 @@ class RemoteAccessAuditDefinitionColumns(unittest.TestCase):
         self.assertIn("option values", text)
         self.assertIn("key-file paths", text)
         self.assertIn("off until enabled", text)
+        # what the audit does not cover is stated in the description, not only in the README
+        self.assertIn("does not read every way to log in", text)
+        self.assertIn("certificate authority", text)
+        self.assertIn("host-based authentication", text)
+        self.assertIn("access list", text)
+        self.assertIn("uid 500", text)
 
 
 class RemoteAccessAuditDefinitionContract(unittest.TestCase):

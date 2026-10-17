@@ -16,11 +16,22 @@
 ##
 ## Sources by platform:
 ##   Linux:   bounded reads of /etc/ssh/sshd_config (Include followed; config symlinks are
-##            followed as sshd does) and each account's authorized_keys (never through a
-##            symlink); `systemctl is-enabled` for ssh.service, sshd.service
-##            and ssh.socket. A home the agent cannot open is refused, not empty.
-##   macOS:   the same files; `launchctl print-disabled system` for com.openssh.sshd.
+##            followed as sshd does; 0644 on Debian-family packages, 0600 root on the RHEL
+##            family, where the unprivileged agent gets sshd_config:permission_denied) and the
+##            authorized_keys of each home directly under /home plus /root (never through a
+##            symlink); `systemctl is-enabled` for ssh.service, sshd.service and ssh.socket.
+##            A home the agent cannot open is refused, not empty.
+##   macOS:   the same files, for each home under /Users owned by uid 500 or above plus
+##            /var/root (the source row counts the entries skipped); `launchctl print-disabled
+##            system` for com.openssh.sshd.
 ##   Windows: PLANNED, not read yet; one `unsupported` status row, windows:planned.
+##
+## NOT read, and flagged rather than hidden: a certificate authority (TrustedUserCAKeys), keys
+## or principals supplied by a command (AuthorizedKeysCommand, AuthorizedPrincipalsCommand), a
+## principals file, host-based authentication, AuthenticationMethods, macOS Remote Login's
+## access list, and accounts whose home is outside the roots above. When sshd_config sets one
+## of the first group at global scope the status is constrained with
+## <os>:remote_access_audit:sshd_config:other_credential_sources (presence only).
 ##
 ## Fingerprints and option NAMES only: a key comment, an option value (command=, from=,
 ## principals=) and a key-file path are never emitted. The AuthorizedKeysFile config row says
@@ -33,19 +44,28 @@ metadata:
   displayName: Remote Access Audit
   version: 1.0.0
   description: >
-    Who can log in over SSH, as configured: the sshd_config values that govern inbound access
-    (read as written, Include followed, first occurrence wins; Match blocks are counted and not
-    evaluated, defaults are not applied, so this is configured access and not sshd's effective
-    policy), a SHA-256 fingerprint for every public key in each account's authorized_keys (a
+    The SSH public keys this host trusts through each account's authorized_keys, plus the
+    sshd_config values that govern inbound access, as configured (read as written, Include
+    followed, first occurrence wins; Match blocks are counted and not evaluated, defaults are
+    not applied, so this is configured access and not sshd's effective policy). It reports a
+    SHA-256 fingerprint for every public key in the authorized_keys of the homes it walks (a
     certificate reports the fingerprint of the key it carries) with the option names it uses,
-    and whether the sshd service is enabled. Key comments, option values, principals and
-    key-file paths are never emitted; the account is the home directory's name. A home or file
-    the agent cannot read is reported as refused with a reason token (on Linux an unprivileged
-    agent usually cannot open other users' homes, so constrained is the common outcome), never
-    as an empty result. A key row flagged unknown_type records a line present in the file, not
-    a key sshd is known to accept: OpenSSH 10 refuses an unknown type at parse time; whether
-    this host's sshd knows the type is not checked. Reads one machine per request and is off until enabled. The Windows leg
-    is planned and not yet read. A leading status row states whether the read was complete.
+    and whether the sshd service is enabled. It does not read every way to log in: a
+    certificate authority, keys or principals supplied by a command, a principals file,
+    host-based authentication and macOS Remote Login's access list are not read (when
+    sshd_config sets one of the first four the status is constrained, with a presence-only
+    token), and only homes under /home and /root (Linux) or under /Users owned by uid 500 or
+    above and /var/root (macOS) are walked, so an account with its home elsewhere is not
+    listed. Key comments, option values, principals and key-file paths are never emitted; the
+    account is the home directory's name. A home or file the agent cannot read is reported as
+    refused with a reason token (on Linux an unprivileged agent usually cannot open other
+    users' homes, so constrained is the common outcome), never as an empty result. A key row
+    flagged unknown_type records a line present in the file, not a key sshd is known to accept:
+    OpenSSH 10 refuses an unknown type at parse time; whether this host's sshd knows the type
+    is not checked. Reads one machine per request and is off until enabled. The Windows leg is
+    planned and not yet read. The first row is a status row stating whether the read was
+    complete; if a leg threw after its rows had started, a second unsupported status row
+    follows and is the one that counts.
   tags: [remote_access, ssh, security, posture, forensics]
 
 spec:
@@ -67,7 +87,7 @@ spec:
     # then a file row per authorized_keys file followed by one key row per accepted key line.
     #
     #   status|list|<supported|constrained|permission_denied|unsupported>|<reason tokens or ->
-    #   source|<sshd_config|homes|service>|<read|absent|refused|failed>|<count or ->
+    #   source|<sshd_config|homes|service>|<read|absent|refused|failed>|<count or ->[|<skipped homes or ->]
     #   config|<key>|<value or ->|<origin: sshd_config|include:<file name> or ->
     #   service|<unit>|<state>|<systemctl_is_enabled|launchctl_print_disabled>
     #   file|<account>|<authorized_keys|authorized_keys2|custom>|<read|absent|refused|failed>|<keys>|<malformed>|<oversized>
@@ -96,7 +116,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_4
         type: string
-        description: 'file: the number of key lines accepted, "-" unless read. key: the fingerprint, SHA256: plus unpadded base64, identical to ssh-keygen -lf (a certificate reports the key it carries).'
+        description: 'source (homes row only): the number of home-root entries not treated as accounts (macOS: owned by a uid under 500, such as /Users/Shared), "-" on Linux where nothing is detectably skipped, or when the roots were not listed. file: the number of key lines accepted, "-" unless read. key: the fingerprint, SHA256: plus unpadded base64, identical to ssh-keygen -lf (a certificate reports the key it carries).'
         example: '2'
         platforms: [linux, darwin]
       - name: field_5

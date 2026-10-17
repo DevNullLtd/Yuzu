@@ -103,9 +103,15 @@ inline FileReadLike hop_failure(int err) {
     return out;
 }
 
+/// Cap on the mount table read: fs.mount-max (100,000 mounts) at ~160 bytes a line, so a
+/// container-dense node still reads in full (a smaller cap read as "unreadable" and switched the
+/// whole network-mount guard off). procfs reports st_size 0; the reader streams to the cap.
+inline constexpr std::size_t kMountinfoCap = 16 * 1024 * 1024;
+
 /// The Linux mount table via the bounded no-follow reader; nullopt when it cannot be read in full.
-inline std::optional<std::vector<std::string>> linux_mountinfo_prefixes(const std::string& path) {
-    const auto r = yuzu::shared::read_file_no_follow(path, 1024 * 1024);
+inline std::optional<std::vector<std::string>> linux_mountinfo_prefixes(const std::string& path,
+                                                                        std::size_t cap = kMountinfoCap) {
+    const auto r = yuzu::shared::read_file_no_follow(path, cap);
     if (!r.ok())
         return std::nullopt;
     return yuzu::shared::network_mount_points(r.data);
