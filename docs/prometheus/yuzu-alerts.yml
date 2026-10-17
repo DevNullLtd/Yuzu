@@ -1056,6 +1056,82 @@ groups:
             scanner are expected; a steady rate is not.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md#client-addresses-behind-a-proxy"
 
+      # METRICS workstream (#5695): three capacity alerts, each one a
+      # condition someone has to act on before the gateway refuses work.
+      # The gauges are sampled every telemetry_gauge_interval_ms (10 s) by
+      # yuzu_gw_gauge; the families are created at start, and
+      # yuzu_gw_listener_max_connections exists only for a listener with a
+      # ceiling, so a listener without one never matches the first rule.
+      - alert: YuzuGatewayListenerNearConnectionCeiling
+        expr: |
+          yuzu_gw_listener_connections > 0.9 * yuzu_gw_listener_max_connections
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway {{ $labels.instance }}: the {{ $labels.listener }} listener holds over 90% of its max_connections"
+          description: >-
+            For 10 minutes the {{ $labels.listener }} listener of
+            {{ $labels.instance }} has held more than 90% of its
+            limits.max_connections. At the ceiling it stops accepting: new
+            connections wait in the kernel backlog (4096) and then fail, so
+            agents that reconnect cannot get back on. ACTION: raise that
+            listener's limits.max_connections in the gateway's sys.config,
+            together with the gateway's open-files limit (LimitNOFILE / ulimit
+            -n, with headroom for the other listeners and the upstream), or add
+            a gateway and move agents to it. If the count is far above the
+            number of agents you run, look for clients that hold connections
+            open without registering (yuzu_gw_agents_current against
+            yuzu_gw_listener_connections).
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md#gateway-runtime-metrics-5695"
+
+      - alert: YuzuGatewayFileDescriptorsNearLimit
+        expr: |
+          yuzu_gw_beam_ports > 0.9 * yuzu_gw_beam_fd_limit
+          or
+          yuzu_gw_beam_ports > 0.9 * yuzu_gw_beam_port_limit
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway {{ $labels.instance }}: open ports are over 90% of its file descriptor or port limit"
+          description: >-
+            For 10 minutes {{ $labels.instance }} has had more than 90% of the
+            ports it can open in use (each TCP connection is one port and one
+            file descriptor). At the limit accepting fails with emfile and the
+            upstream channel cannot reconnect. ACTION: raise the gateway's
+            open-files limit (LimitNOFILE in the systemd unit, the nofile ulimit
+            of the container) and, if yuzu_gw_beam_port_limit is the lower of
+            the two, the VM's port limit (+Q in vm.args), above the agents you
+            expect plus headroom; or set the agent listener's
+            limits.max_connections below the limit, so excess connections wait
+            in the backlog instead of failing.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md#gateway-runtime-metrics-5695"
+
+      - alert: YuzuGatewayProcessBacklogged
+        expr: |
+          yuzu_gw_process_mailbox_len > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway {{ $labels.instance }}: {{ $labels.process }} has had over 10,000 queued messages for 10 minutes"
+          description: >-
+            The {{ $labels.process }} process of {{ $labels.instance }} has held
+            more than 10,000 unhandled messages at every sample for 10 minutes:
+            it is not keeping up, and every agent whose traffic passes through
+            it waits (yuzu_gw_process_queue_wait_seconds says how long). A burst
+            that drains, such as a fleet reconnecting, does not last 10
+            minutes. ACTION, by process: upstream, upstream_channel or
+            heartbeat_buffer, the server is slow or unreachable (check the
+            server and YuzuGatewayUpstreamSlow); registry, agent_sup or pg,
+            registrations are arriving faster than they are handled (look for
+            agents reconnecting in a loop); router, commands are being fanned
+            out faster than they complete (slow the dispatching side); logger,
+            the gateway is logging too much (raise its log level). The runbook
+            lists the steps per process.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md#gateway-runtime-metrics-5695"
+
   - name: yuzu-security
     rules:
       - alert: YuzuOnBehalfAssertionRejected

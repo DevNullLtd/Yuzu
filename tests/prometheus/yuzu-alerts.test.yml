@@ -4498,3 +4498,112 @@ tests:
             value: 1
           - labels: 'ALERTS{alertname="YuzuCertificateExpiryCritical", alertstate="firing", instance="s1", job="yuzu-server", cert="default-ca", severity="critical"}'
             value: 1
+
+  # ── Gateway capacity alerts (#5695, METRICS workstream) ───────────────────
+  #
+  # Three gauges sampled by yuzu_gw_gauge, each alert held for 10 minutes so a
+  # reconnect herd that drains does not page.
+
+  # YuzuGatewayListenerNearConnectionCeiling. CASE A -- the agent listener at
+  # 95% of its ceiling from minute 0: quiet at 9m, firing at 11m, for that
+  # listener only (the management listener at 4% stays quiet). RED if `for:`
+  # were shortened or the 0.9 factor dropped (management would not fire either
+  # way; agent would fire at 9m).
+  - interval: 1m
+    name: gateway listener near its ceiling - sustained, that listener only
+    input_series:
+      - series: 'yuzu_gw_listener_connections{job="yuzu-gateway",instance="g1",listener="agent"}'
+        values: "950x20"
+      - series: 'yuzu_gw_listener_max_connections{job="yuzu-gateway",instance="g1",listener="agent"}'
+        values: "1000x20"
+      - series: 'yuzu_gw_listener_connections{job="yuzu-gateway",instance="g1",listener="management"}'
+        values: "10x20"
+      - series: 'yuzu_gw_listener_max_connections{job="yuzu-gateway",instance="g1",listener="management"}'
+        values: "256x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayListenerNearConnectionCeiling", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayListenerNearConnectionCeiling", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayListenerNearConnectionCeiling", alertstate="firing", instance="g1", job="yuzu-gateway", listener="agent", severity="warning"}'
+            value: 1
+
+  # CASE B -- a herd at 95% for 8 minutes that then drains never fires; and a
+  # listener with no ceiling (no max series: the default) never fires however
+  # many connections it holds.
+  - interval: 1m
+    name: gateway listener near its ceiling - a short herd, and no ceiling, stay quiet
+    input_series:
+      - series: 'yuzu_gw_listener_connections{job="yuzu-gateway",instance="g1",listener="agent"}'
+        values: "950x7 100x30"
+      - series: 'yuzu_gw_listener_max_connections{job="yuzu-gateway",instance="g1",listener="agent"}'
+        values: "1000x37"
+      - series: 'yuzu_gw_listener_connections{job="yuzu-gateway",instance="g2",listener="agent"}'
+        values: "100000x37"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayListenerNearConnectionCeiling"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # YuzuGatewayFileDescriptorsNearLimit. CASE A -- the file descriptor limit is
+  # the lower one: fires at 11m. CASE B (g2) -- the VM's port limit is the
+  # lower one and the fd limit is not reported (an absent series): fires too.
+  # g3 at half its limits stays quiet. RED if either side of the `or` went.
+  - interval: 1m
+    name: gateway ports near the fd or port limit - either limit fires, half does not
+    input_series:
+      - series: 'yuzu_gw_beam_ports{job="yuzu-gateway",instance="g1"}'
+        values: "950x20"
+      - series: 'yuzu_gw_beam_fd_limit{job="yuzu-gateway",instance="g1"}'
+        values: "1000x20"
+      - series: 'yuzu_gw_beam_port_limit{job="yuzu-gateway",instance="g1"}'
+        values: "65536x20"
+      - series: 'yuzu_gw_beam_ports{job="yuzu-gateway",instance="g2"}'
+        values: "950x20"
+      - series: 'yuzu_gw_beam_port_limit{job="yuzu-gateway",instance="g2"}'
+        values: "1000x20"
+      - series: 'yuzu_gw_beam_ports{job="yuzu-gateway",instance="g3"}'
+        values: "500x20"
+      - series: 'yuzu_gw_beam_fd_limit{job="yuzu-gateway",instance="g3"}'
+        values: "1000x20"
+      - series: 'yuzu_gw_beam_port_limit{job="yuzu-gateway",instance="g3"}'
+        values: "1000x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayFileDescriptorsNearLimit", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayFileDescriptorsNearLimit", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayFileDescriptorsNearLimit", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayFileDescriptorsNearLimit", alertstate="firing", instance="g2", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
+  # YuzuGatewayProcessBacklogged. CASE A -- the registry holds 20,000 messages
+  # from minute 0: firing at 11m with its process label; the router at 50 stays
+  # quiet. CASE B (g2) -- a reconnect herd: 50,000 for 5 minutes, then drained:
+  # never fires. RED if `for:` were under 5m or the threshold dropped.
+  - interval: 1m
+    name: gateway process backlogged - sustained fires for that process, a drained burst does not
+    input_series:
+      - series: 'yuzu_gw_process_mailbox_len{job="yuzu-gateway",instance="g1",process="registry"}'
+        values: "20000x20"
+      - series: 'yuzu_gw_process_mailbox_len{job="yuzu-gateway",instance="g1",process="router"}'
+        values: "50x20"
+      - series: 'yuzu_gw_process_mailbox_len{job="yuzu-gateway",instance="g2",process="registry"}'
+        values: "50000x4 0x16"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayProcessBacklogged", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayProcessBacklogged", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayProcessBacklogged", alertstate="firing", instance="g1", job="yuzu-gateway", process="registry", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayProcessBacklogged", instance="g2"}'
+        eval_time: 15m
+        exp_samples: []
