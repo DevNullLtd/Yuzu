@@ -1486,10 +1486,6 @@ TEST_CASE("settings auto-approve: match-everything rules and oversized text are 
     CHECK(h.attempt_calls.empty());
 }
 
-// A lapsed token cannot be minted without waiting out a TTL, so the store row's expiry is
-// pushed into the past the way test_auth.cpp does for the consume path. It must list Expired
-// (warn pill), not Active; an exhausted-and-lapsed token keeps Exhausted, and a token that
-// never expires stays Active.
 // The legacy .cfg import allows an expiry in any year up to 9999. Read back through the store's
 // epoch-millisecond conversion that must stay in the future (a wrapped value would list the token
 // Expired while the SQL consume path still accepts it). What the page prints for it depends on
@@ -1568,6 +1564,10 @@ TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as
             lease.get(),
             "UPDATE auth.enrollment_tokens SET expires_at = now() - interval '1 hour' "
             "WHERE token_id = $1",
+// A lapsed token cannot be minted without waiting out a TTL, so the store row's expiry is
+// pushed into the past the way test_auth.cpp does for the consume path. It must list Expired
+// (warn pill), not Active; an exhausted-and-lapsed token keeps Exhausted, and a token that
+// never expires stays Active.
             std::vector<std::string>{lapsed->token_id});
         REQUIRE(upd.status() == PGRES_COMMAND_OK);
     }
