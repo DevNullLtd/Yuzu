@@ -3007,6 +3007,16 @@ test('compose certs volume',
   timeout: 30,
 )
 
+# Gateway scrape (#5695): every Prometheus config under deploy/prometheus/ and
+# every compose stack that runs a Prometheus next to a gateway scrapes the
+# gateway's metrics port. Stdlib only, no Docker.
+test('gateway prometheus scrape',
+  _python3_test,
+  args: [files('test_gateway_prometheus_scrape.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Compose Wizard (#5420): every generated mode gives the server a writable,
 # persistent /etc/yuzu/certs (KEK + internal CA), and Operator mode mounts the
 # operator's PEMs read-only at /etc/yuzu/tls instead of over it. Runs the real
