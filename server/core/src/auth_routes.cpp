@@ -3554,6 +3554,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         bool binding_verified = false;
         auto result =
             provider->handle_callback(code, state, binding_secret, &binding_verified);
+        // Was the provider replaced by a Settings save while the exchange ran? The settings this
+        // handler copied (admin group, issuer through the provider) belong to the provider it
+        // leased; if a save has since replaced it, minting a session now would map a role under
+        // configuration the operator has already changed. Compare under the shared lock and
+        // WHILE THE LEASE IS STILL HELD: the leased provider then cannot be destroyed, so a
+        // newer provider cannot reuse its address and make the pointers compare equal. The
+        // check is made before any group, role or session work, so a refusal has no side
+        // effects. A save that lands after this point is ordered after this sign-in; what
+        // remains is the few milliseconds of local database work below, which the docs state.
+        bool superseded = false;
+        if (result) {
+            std::shared_lock oidc_lock(oidc_mu_);
+            superseded = oidc_provider_.get() != provider.get();
+        }
         // The provider is not used again: drop the lease now so the session, group-sync and
         // audit work below does not keep a swapped-out provider alive.
         provider = oidc::OidcProvider::Lease{};
@@ -3590,6 +3604,24 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                        Severity::kWarn);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+            }
+            res.set_redirect("/login?error=sso_failed");
+            return;
+        }
+
+        if (superseded) {
+            // Same generic user-facing shape as every other callback failure; the audit detail
+            // and the analytics event name it by a fixed token so an auditor can tell it from
+            // an IdP failure. No claims are logged: nothing has been decided about this login.
+            spdlog::warn("OIDC callback refused: a Settings save replaced the provider while "
+                         "this sign-in was in flight");
+            audit_log(req, "auth.oidc_login_failed", "failure", {}, {}, "reason=provider_replaced");
+            emit_event("auth.oidc_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "provider_replaced"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}})
+                    .increment();
             }
             res.set_redirect("/login?error=sso_failed");
             return;

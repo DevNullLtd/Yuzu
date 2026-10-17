@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -329,6 +330,10 @@ private:
     GatewaySessionCountFn gateway_session_count_fn_;
     AgentsJsonFn agents_json_fn_;
     std::shared_mutex* oidc_mu_{};
+    /// Serializes POST /api/settings/oidc end to end (stored-secret read, provider build, swap,
+    /// persist) so two saves cannot interleave. Never taken by a sign-in; lock order: this, then
+    /// `*oidc_mu_` (shared or exclusive), never the reverse.
+    std::mutex oidc_save_mu_;
     std::unique_ptr<oidc::OidcProvider>* oidc_provider_{};
     yuzu::MetricsRegistry* metrics_registry_{};
     StepUpFn step_up_fn_;

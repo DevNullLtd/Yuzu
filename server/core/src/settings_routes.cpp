@@ -2939,14 +2939,14 @@ std::string SettingsRoutes::render_directory_fragment() {
 
     // A Settings save assigns these under the exclusive OIDC lock; read them under the shared
     // one so a page render never overlaps a save's writes (the callers hold neither lock).
-    std::string snap_issuer, snap_client_id, snap_client_secret, snap_redirect_uri,
-        snap_admin_group;
+    std::string snap_issuer, snap_client_id, snap_redirect_uri, snap_admin_group;
+    bool snap_secret_set = false; // the secret itself is never copied into this render
     bool snap_skip_tls_verify = false;
     {
         std::shared_lock oidc_lock(*oidc_mu_);
         snap_issuer = cfg_->oidc_issuer;
         snap_client_id = cfg_->oidc_client_id;
-        snap_client_secret = cfg_->oidc_client_secret;
+        snap_secret_set = !cfg_->oidc_client_secret.empty();
         snap_redirect_uri = cfg_->oidc_redirect_uri;
         snap_admin_group = cfg_->oidc_admin_group;
         snap_skip_tls_verify = cfg_->oidc_skip_tls_verify;
@@ -2992,7 +2992,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <input type=\"password\" name=\"client_secret\" "
             "value=\"\" "
             "placeholder=\"" +
-            (snap_client_secret.empty() ? std::string("Client secret value")
+            (!snap_secret_set ? std::string("Client secret value")
                                               : std::string("********")) +
             "\" "
             "style=\"flex:1;min-width:0\">"
@@ -4615,6 +4615,31 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // Retirement of the provider this save replaces. Declared BEFORE the save lock below so
+        // that, destroyed in reverse order, it runs AFTER the lock is released: a retire() that
+        // has to wait (more than kMaxRetired providers each still in a request) then delays only
+        // this reply, never another save's read-modify-write.
+        struct RetireOnExit {
+            std::unique_ptr<oidc::OidcProvider> unpublished;
+            ~RetireOnExit() {
+                // retire() can throw (allocation, a mutex failure) and a destructor is
+                // implicitly noexcept, so an escaping exception would terminate the server. The
+                // provider is owned either by retire()'s by-value parameter (destroyed on
+                // unwind, which waits for its leases and never leaks) or by the retirement list,
+                // so swallowing here cannot lose or double-free it.
+                try {
+                    oidc::OidcProvider::retire(std::move(unpublished));
+                } catch (...) {
+                }
+            }
+        } retire_on_exit;
+
+        // One save at a time. Reading the stored secret ("leave it alone" when the field is
+        // blank), building the provider, swapping it in and persisting are one unit: two
+        // interleaved saves could otherwise leave the live provider on one secret and the store
+        // on another, both reporting success. Sign-ins never take this mutex.
+        std::lock_guard save_lock(oidc_save_mu_);
+
         // The redaction placeholder is not a credential. It reaches this handler when an
         // operator copies it out of the startup log or a config.update audit detail -- the
         // two surfaces that emit it. GET /api/config is NOT one of them: it omits a
@@ -4676,6 +4701,9 @@ void SettingsRoutes::register_routes(
         } catch (const std::exception& e) {
             spdlog::error("OIDC provider reinit failed: {}", e.what());
             res.status = 500;
+            // htmx swaps neither 4xx nor 5xx, so a toast is the only thing the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"OIDC provider could not be initialised; see the server log","level":"error"}})");
             auto html = render_directory_fragment() +
                         "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
                         "hx-swap-oob=\"true\">OIDC init failed: " +
@@ -4686,17 +4714,11 @@ void SettingsRoutes::register_routes(
 
         // The swap holds the exclusive lock only for these assignments: sign-ins keep the
         // provider they started with through a lease and run their network I/O without the
-        // lock, so this does not wait for them. The unpublished provider is retired AFTER the
-        // lock drops, and is destroyed by the first later retirement or drain once its last
-        // in-flight request has finished (releasing the last lease does not destroy it).
-        //
-        // The retirement runs when this handler exits, after the settings are persisted and the
-        // response is built, so the one case where it can wait (more than kMaxRetired providers
-        // each still in a request) never delays the save itself, only its reply.
-        struct RetireOnExit {
-            std::unique_ptr<oidc::OidcProvider> unpublished;
-            ~RetireOnExit() { oidc::OidcProvider::retire(std::move(unpublished)); }
-        } retire_on_exit;
+        // lock, so this does not wait for them. The unpublished provider goes to
+        // `retire_on_exit` (declared above, before the save lock), so it is retired when this
+        // handler exits, after the settings are persisted and the response is built and after
+        // the save lock is released; it is destroyed by the first later retirement or drain once
+        // its last in-flight request has finished (releasing the last lease does not destroy it).
         {
             std::unique_lock lock(*oidc_mu_);
             cfg_->oidc_issuer = issuer;

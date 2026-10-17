@@ -26,7 +26,6 @@
 #include <optional>
 #include <span>
 #include <sstream>
-#include <cstdlib>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -655,13 +654,10 @@ static std::string winhttp_post(const std::string& url, const std::string& vette
         spdlog::error("WinHTTP: failed to crack URL: {}", ::yuzu::log_key_token(url));
         return {};
     }
-    if (!cracked_host_is_vetted(std::wstring_view(host, uc.dwHostNameLength), vetted_host)) {
-        spdlog::error("WinHTTP: the URL's host is not the host the egress policy vetted: {}",
-                      ::yuzu::log_key_token(url));
-        return {};
-    }
-    if (static_cast<unsigned>(uc.nPort) != vetted_port) {
-        spdlog::error("WinHTTP: the URL's port is not the port the egress policy vetted: {}",
+    if (!cracked_endpoint_is_vetted(std::wstring_view(host, uc.dwHostNameLength),
+                                    static_cast<unsigned>(uc.nPort), vetted_host, vetted_port)) {
+        spdlog::error("WinHTTP: the URL's host or port is not the host and port the egress policy "
+                      "vetted: {}",
                       ::yuzu::log_key_token(url));
         return {};
     }
@@ -1427,18 +1423,10 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
         return std::unexpected(std::string("token endpoint request failed: ") + vet.error());
     }
     // Use WinHTTP on Windows — httplib's OpenSSL client fails from handler threads.
-    // The vetted port, from the same parse the vet used: an explicit ":port" after the host,
-    // else the scheme default. WinHTTP cracks the URL again, and the two must agree.
-    unsigned vetted_port = egress_target->cleartext ? 80u : 443u;
-    {
-        const auto& origin = egress_target->origin;
-        const auto authority = origin.substr(origin.find("://") + 3);
-        const auto colon = authority.rfind(':');
-        const auto bracket = authority.rfind(']');
-        if (colon != std::string::npos && (bracket == std::string::npos || colon > bracket))
-            vetted_port = static_cast<unsigned>(std::strtoul(authority.c_str() + colon + 1,
-                                                             nullptr, 10));
-    }
+    // The vetted port comes from the same parse the vet used; WinHTTP cracks the URL again and
+    // the two must agree (cracked_endpoint_is_vetted).
+    const unsigned vetted_port =
+        vetted_port_from_origin(egress_target->origin, egress_target->cleartext);
     response_body = winhttp_post(*token_endpoint, egress_target->host, vetted_port, form_body,
                                  auth_header);
     if (response_body.empty()) {
@@ -1639,6 +1627,11 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
         // not a string, or key material of the wrong type) is skipped and its siblings are kept;
         // only a structural error in the document fails the whole parse (the catch below).
         std::size_t index = 0;
+        // Every sign-in now parses a fresh JWKS, so a hostile or broken IdP serving thousands of
+        // malformed members would otherwise write that many warn lines PER SIGN-IN: log at most
+        // kMaxSkipWarnings per document and one summary line for the rest.
+        constexpr std::size_t kMaxSkipWarnings = 8;
+        std::size_t skipped = 0;
         for (const auto& key : j["keys"]) {
             const std::size_t at = index++;
             const auto string_member = [&key](const char* name, const char* fallback,
@@ -1658,9 +1651,10 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
             if (!key.is_object() || !string_member("use", "sig", use) ||
                 !string_member("kid", "", cached.kid) ||
                 !string_member("alg", "RS256", cached.alg)) {
-                spdlog::warn("OidcProvider: skipping JWK #{}: not an object or a use/kid/alg "
-                             "member that is not a string",
-                             at);
+                if (++skipped <= kMaxSkipWarnings)
+                    spdlog::warn("OidcProvider: skipping JWK #{}: not an object or a use/kid/alg "
+                                 "member that is not a string",
+                                 at);
                 continue;
             }
             if (use != "sig")
@@ -1669,16 +1663,23 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
             try {
                 cached.pkey = jwk_to_pkey(key);
             } catch (const std::exception&) { // kty/n/e of the wrong type
-                spdlog::warn("OidcProvider: skipping JWK #{}: key material of the wrong type", at);
+                if (++skipped <= kMaxSkipWarnings)
+                    spdlog::warn("OidcProvider: skipping JWK #{}: key material of the wrong type",
+                                 at);
                 continue;
             }
             if (!cached.pkey) {
-                spdlog::warn("OidcProvider: failed to parse JWK kid={}",
-                             ::yuzu::log_key_token(cached.kid));
+                if (++skipped <= kMaxSkipWarnings)
+                    spdlog::warn("OidcProvider: failed to parse JWK kid={}",
+                                 ::yuzu::log_key_token(cached.kid));
                 continue;
             }
             keys.push_back(std::move(cached));
         }
+        if (skipped > kMaxSkipWarnings)
+            spdlog::warn("OidcProvider: {} JWKs were skipped in total; only the first {} are "
+                         "logged individually",
+                         skipped, kMaxSkipWarnings);
         return keys;
     } catch (const std::exception& e) {
         return std::unexpected(std::string("JWKS parse error: ") + ::yuzu::log_key_token(e.what()));
@@ -1781,9 +1782,13 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
     if (!pkey && kid.empty() && !keys.empty())
         pkey = keys.front().pkey;
     if (!pkey) {
-        spdlog::warn("OidcProvider: the token names kid={}, which the fetched key set does not "
-                     "hold",
-                     ::yuzu::log_key_token(kid));
+        if (kid.empty())
+            spdlog::warn("OidcProvider: the token has no kid and the fetched key set has no usable "
+                         "key");
+        else
+            spdlog::warn("OidcProvider: the token names kid={}, which the fetched key set does not "
+                         "hold",
+                         ::yuzu::log_key_token(kid));
         return std::unexpected("no matching JWKS key found for kid=" + ::yuzu::log_key_token(kid));
     }
 
@@ -1851,6 +1856,27 @@ bool OidcProvider::add_test_jwks_key(const std::string& kid, const std::string& 
     test_jwks_keys_.push_back(std::move(cached));
     return true;
 }
+
+#ifdef _WIN32
+bool OidcProvider::winhttp_url_agrees_for_test(const std::string& url) {
+    const auto target = split_http_url(url);
+    if (!target)
+        return false; // refused before WinHTTP is ever reached
+    std::wstring wurl(url.begin(), url.end());
+    URL_COMPONENTS uc = {};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t host[256] = {}, path[2048] = {};
+    uc.lpszHostName = host;
+    uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;
+    uc.dwUrlPathLength = 2048;
+    if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc))
+        return false;
+    return cracked_endpoint_is_vetted(std::wstring_view(host, uc.dwHostNameLength),
+                                      static_cast<unsigned>(uc.nPort), target->host,
+                                      vetted_port_from_origin(target->origin, target->cleartext));
+}
+#endif
 
 // ── Discovery (#5692) ────────────────────────────────────────────────────────
 
@@ -2569,6 +2595,9 @@ void OidcProvider::retire(std::unique_ptr<OidcProvider> unpublished) {
         }
         // Bounded: beyond the cap, the oldest is destroyed below, which waits for its leases.
         while (r.list.size() > kMaxRetired) {
+            spdlog::warn("OidcProvider: {} replaced providers still have a request in flight; "
+                         "waiting for the oldest to finish (a Settings save is held until then)",
+                         r.list.size());
             to_destroy.push_back(std::move(r.list.front()));
             r.list.erase(r.list.begin());
         }

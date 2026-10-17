@@ -38,4 +38,41 @@ inline bool cracked_host_is_vetted(std::wstring_view cracked, std::string_view v
     return true;
 }
 
+/// The port a request to `origin` ("scheme://authority", as `split_http_url` builds it) connects
+/// to: an explicit ":port" after the host, else the scheme default (80 for http, 443 for https).
+/// Returns 0 when an explicit port is not 1 to 5 decimal digits in 1..65535 - a value no real
+/// port equals, so any comparison against it fails closed. A colon INSIDE the brackets of an IPv6
+/// literal is not a port separator.
+inline unsigned vetted_port_from_origin(std::string_view origin, bool cleartext) {
+    unsigned port = cleartext ? 80u : 443u;
+    const auto scheme_end = origin.find("://");
+    const auto authority =
+        scheme_end == std::string_view::npos ? origin : origin.substr(scheme_end + 3);
+    const auto colon = authority.rfind(':');
+    const auto bracket = authority.rfind(']');
+    if (colon != std::string_view::npos &&
+        (bracket == std::string_view::npos || colon > bracket)) {
+        unsigned long value = 0;
+        std::size_t digits = 0;
+        for (const char c : authority.substr(colon + 1)) {
+            if (c < '0' || c > '9' || ++digits > 5)
+                return 0;
+            value = value * 10 + static_cast<unsigned long>(c - '0');
+        }
+        if (digits == 0 || value == 0 || value > 65535)
+            return 0;
+        port = static_cast<unsigned>(value);
+    }
+    return port;
+}
+
+/// The whole Windows token-POST decision: the host AND port `WinHttpCrackUrl` produced must be
+/// the host and port the egress policy vetted. A zero vetted port (an unparseable explicit port)
+/// never matches.
+inline bool cracked_endpoint_is_vetted(std::wstring_view cracked_host, unsigned cracked_port,
+                                       std::string_view vetted_host, unsigned vetted_port) {
+    return vetted_port != 0 && cracked_port == vetted_port &&
+           cracked_host_is_vetted(cracked_host, vetted_host);
+}
+
 } // namespace yuzu::server::oidc

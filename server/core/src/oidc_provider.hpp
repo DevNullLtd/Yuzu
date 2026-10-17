@@ -202,7 +202,7 @@ public:
     /// Hand a provider that was just unpublished (swapped out under the exclusive lock, which
     /// the caller has since released) to the process-wide retirement list instead of
     /// destroying it under the lock. Idle retired providers are destroyed at once; one that
-    /// still has leases is kept until they drain, so a Settings save never waits for a
+    /// still has leases is kept until they drain, so a Settings save does not normally wait for a
     /// sign-in. The list holds at most `kMaxRetired`: beyond that the oldest is destroyed
     /// here, which waits for ITS leases (the one case a retirement can wait; the save calls this
     /// last, so only its reply is delayed). Releasing the last lease does not destroy a retired
@@ -369,6 +369,12 @@ public:
     /// and a refused callback leaves the count unchanged). Same source-scan pin.
     std::size_t pending_flow_count_for_test() const;
 
+#ifdef _WIN32
+    /// Test-only seam (Windows): does WinHttpCrackUrl agree with `split_http_url` about `url`'s
+    /// host and port, as the token POST requires? False when the URL is refused before WinHTTP
+    /// (not a well-formed http(s) URL) or when the two parsers disagree. Same source-scan pin.
+    [[nodiscard]] static bool winhttp_url_agrees_for_test(const std::string& url);
+#endif
     /// Test-only seam (#1856): inject an RSA verifying key that verify_jwt_signature uses
     /// INSTEAD of fetching, so it can be exercised end-to-end (jwk_to_pkey + EVP_DigestVerify)
     /// without a live IdP.
