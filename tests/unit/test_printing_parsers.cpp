@@ -115,7 +115,7 @@ TEST_CASE("encode_request/decode round-trip: Cancel-Job with printer-uri/job-id/
     const std::vector<ipp::OperationAttr> attrs{
         {ipp::kTagUri, "printer-uri", "ipp://localhost/printers/yuzu_test"},
         {ipp::kTagInteger, "job-id", ipp::encode_int32(42)},
-        {ipp::kTagNameWithoutLanguage, "requesting-user-name", "alex"},
+        {ipp::kTagNameWithoutLanguage, "requesting-user-name", "jsmith"},
     };
     const auto req = ipp::encode_request(ipp::kCancelJob, 99, attrs);
     const auto decoded =
@@ -131,7 +131,7 @@ TEST_CASE("encode_request/decode round-trip: Cancel-Job with printer-uri/job-id/
     CHECK(op_attrs[3].name == "job-id");
     CHECK(op_attrs[3].values == std::vector<std::string>{ipp::encode_int32(42)});
     CHECK(op_attrs[4].name == "requesting-user-name");
-    CHECK(op_attrs[4].values == std::vector<std::string>{"alex"});
+    CHECK(op_attrs[4].values == std::vector<std::string>{"jsmith"});
 }
 
 TEST_CASE("decode: additional-value continuation appends to the preceding attribute",
@@ -257,7 +257,7 @@ TEST_CASE("printers_from_ipp / jobs_from_ipp: SYNTHETIC fixture decode + row map
         const auto rows = jobs_from_ipp(*decoded);
         REQUIRE(rows.size() == 1);
         CHECK(rows[0].job_id == 2);
-        CHECK(rows[0].owner == "alex");
+        CHECK(rows[0].owner == "jsmith");
         CHECK(rows[0].document == "hosts");
         CHECK(rows[0].status == "processing");
         CHECK(rows[0].submitted_at == "2026-09-08T12:00:00Z");
@@ -508,12 +508,12 @@ TEST_CASE("format_printer_row / format_job_row / format_clear_queue_row shapes",
     JobRow j;
     j.printer = "Office-LaserJet";
     j.job_id = 5;
-    j.owner = "alex";
+    j.owner = "jsmith";
     j.document = "hosts";
     j.status = "pending";
     j.submitted_at = "-";
     j.size_bytes = 512;
-    CHECK(format_job_row(j) == "job|Office-LaserJet|5|alex|hosts|pending|-|512");
+    CHECK(format_job_row(j) == "job|Office-LaserJet|5|jsmith|hosts|pending|-|512");
 
     CHECK(format_clear_queue_row("Office-LaserJet", 5, "canceled", "-") ==
           "clear_queue|Office-LaserJet|5|canceled|-");
@@ -666,7 +666,7 @@ TEST_CASE("run_clear_queue: a job listed on the named printer is cancelled -- Ge
     // REAL: jobs 16 and 17 on yuzu4616a; REAL Linux cupsd successful-ok for the Cancel-Job.
     FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"),
                     result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
-    const auto d = run_clear_queue("yuzu4616a", 16, "alex", kTestTokens, t);
+    const auto d = run_clear_queue("yuzu4616a", 16, "jsmith", kTestTokens, t);
     CHECK(t.ops == kListThenCancel);
     check_disposition(d, 0, ClearQueueStatus::ok, true, "clear_queue|yuzu4616a|16|canceled|-");
     REQUIRE(t.sent.size() == 2);
@@ -680,13 +680,13 @@ TEST_CASE("run_clear_queue: a job listed on the named printer is cancelled -- Ge
     CHECK(cancel[1].value == ipp::encode_int32(16));
     CHECK(cancel[2].tag == ipp::kTagNameWithoutLanguage);
     CHECK(cancel[2].name == "requesting-user-name");
-    CHECK(cancel[2].value == "alex");
+    CHECK(cancel[2].value == "jsmith");
 }
 
 TEST_CASE("run_clear_queue: a job id that is not on the printer's active queue sends NO Cancel-Job",
           "[printing][binding]") {
     FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"), result_with_status(0x0000), {}, {}};
-    const auto d = run_clear_queue("yuzu4616a", 99, "alex", kTestTokens, t);
+    const auto d = run_clear_queue("yuzu4616a", 99, "jsmith", kTestTokens, t);
     CHECK(t.ops == kListOnly);
     check_disposition(d, 1, ClearQueueStatus::unavailable, true, "clear_queue|yuzu4616a|99|not_found|os:not_found");
 }
@@ -700,21 +700,21 @@ TEST_CASE("run_clear_queue: a job that belongs to ANOTHER queue is never cancell
     const auto all = result_from_fixture("real_get_jobs_all_printers.ipp");
     {
         FakeTransport t{all, result_with_status(0x0000), {}, {}};
-        const auto d = run_clear_queue("yuzu4616a", 18, "alex", kTestTokens, t); // 18 is on yuzu4616b
+        const auto d = run_clear_queue("yuzu4616a", 18, "jsmith", kTestTokens, t); // 18 is on yuzu4616b
         CHECK(t.ops == kListOnly);
         check_disposition(d, 1, ClearQueueStatus::unavailable, true,
                           "clear_queue|yuzu4616a|18|not_found|os:not_found");
     }
     {
         FakeTransport t{all, result_with_status(0x0000), {}, {}};
-        const auto d = run_clear_queue("yuzu4616b", 16, "alex", kTestTokens, t); // 16 is on yuzu4616a
+        const auto d = run_clear_queue("yuzu4616b", 16, "jsmith", kTestTokens, t); // 16 is on yuzu4616a
         CHECK(t.ops == kListOnly);
         check_disposition(d, 1, ClearQueueStatus::unavailable, true,
                           "clear_queue|yuzu4616b|16|not_found|os:not_found");
     }
     {
         FakeTransport t{all, result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
-        const auto d = run_clear_queue("yuzu4616b", 18, "alex", kTestTokens, t); // the right pair
+        const auto d = run_clear_queue("yuzu4616b", 18, "jsmith", kTestTokens, t); // the right pair
         CHECK(t.ops == kListThenCancel);
         check_disposition(d, 0, ClearQueueStatus::ok, true, "clear_queue|yuzu4616b|18|canceled|-");
     }
@@ -726,7 +726,7 @@ TEST_CASE("run_clear_queue: printer names match case-insensitively, as cupsd res
     // lower case: an exact comparison would report a live job as not found.
     FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"),
                     result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
-    const auto d = run_clear_queue("YUZU4616A", 16, "alex", kTestTokens, t);
+    const auto d = run_clear_queue("YUZU4616A", 16, "jsmith", kTestTokens, t);
     CHECK(t.ops == kListThenCancel);
     check_disposition(d, 0, ClearQueueStatus::ok, true, "clear_queue|YUZU4616A|16|canceled|-");
     REQUIRE(t.sent.size() == 2);
@@ -737,7 +737,7 @@ TEST_CASE("run_clear_queue: a job listed WITHOUT a job-printer-uri cannot be con
           "cancelled (REAL job-id-only listing)",
           "[printing][binding]") {
     FakeTransport t{result_from_fixture("real_get_jobs_job_id_only.ipp"), result_with_status(0x0000), {}, {}};
-    const auto d = run_clear_queue("yuzu4616a", 6, "alex", kTestTokens, t);
+    const auto d = run_clear_queue("yuzu4616a", 6, "jsmith", kTestTokens, t);
     CHECK(t.ops == kListOnly);
     check_disposition(d, 1, ClearQueueStatus::unavailable, false, "clear_queue|yuzu4616a|6|error|os:unexpected_status");
     CHECK(d.detail == "Get-Jobs: the job is listed but its printer could not be confirmed");
@@ -746,7 +746,7 @@ TEST_CASE("run_clear_queue: a job listed WITHOUT a job-printer-uri cannot be con
 TEST_CASE("run_clear_queue: a '%00' printer name is sent ENCODED and cancels nothing (the exploit)",
           "[printing][binding]") {
     FakeTransport t{result_from_fixture("real_get_jobs_all_printers.ipp"), result_with_status(0x0000), {}, {}};
-    const auto d = run_clear_queue("%00", 18, "alex", kTestTokens, t);
+    const auto d = run_clear_queue("%00", 18, "jsmith", kTestTokens, t);
     REQUIRE(t.sent.size() == 1);
     CHECK(t.sent[0][0].value == "ipp://localhost/printers/%2500"); // never a raw %00
     CHECK(t.ops == kListOnly);
@@ -756,7 +756,7 @@ TEST_CASE("run_clear_queue: a '%00' printer name is sent ENCODED and cancels not
 TEST_CASE("run_clear_queue: a nonexistent printer (REAL 0x0406 answer) is not_found and sends no Cancel-Job",
           "[printing][binding]") {
     FakeTransport t{result_from_fixture("real_get_jobs_no_printer.ipp"), result_with_status(0x0000), {}, {}};
-    const auto d = run_clear_queue("no_such_queue", 3, "alex", kTestTokens, t);
+    const auto d = run_clear_queue("no_such_queue", 3, "jsmith", kTestTokens, t);
     CHECK(t.ops == kListOnly);
     check_disposition(d, 1, ClearQueueStatus::unavailable, true, "clear_queue|no_such_queue|3|not_found|os:not_found");
     CHECK(d.detail == "Get-Jobs: printer not found");
@@ -768,7 +768,7 @@ TEST_CASE("run_clear_queue: every failure of the Get-Jobs step is reported and s
     const auto denied = ClearQueueStatus::permission_denied;
     const auto run = [](const IppResult& listing, std::vector<uint16_t>& ops) {
         FakeTransport t{listing, {}, {}, {}};
-        auto d = run_clear_queue("q", 1, "alex", kTestTokens, t);
+        auto d = run_clear_queue("q", 1, "jsmith", kTestTokens, t);
         ops = t.ops;
         return d;
     };
@@ -798,7 +798,7 @@ TEST_CASE("run_clear_queue: cupsd's own Cancel-Job answer after a passing listin
     const auto denied = ClearQueueStatus::permission_denied;
     const auto run = [&](const IppResult& cancel) {
         FakeTransport t{listing, cancel, {}, {}};
-        auto d = run_clear_queue("yuzu4616a", 16, "alex", kTestTokens, t);
+        auto d = run_clear_queue("yuzu4616a", 16, "jsmith", kTestTokens, t);
         CHECK(t.ops == kListThenCancel);
         return d;
     };
@@ -823,12 +823,12 @@ TEST_CASE("run_clear_queue: a printer name the agent will not build a request fo
                                    std::string("ipp://localhost:631/printers/%00"), // decodes to NUL
                                    std::string("ipp://localhost:631/printers/")}) { // empty name
         FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"), result_with_status(0x0000), {}, {}};
-        const auto d = run_clear_queue(bad, 16, "alex", kTestTokens, t);
+        const auto d = run_clear_queue(bad, 16, "jsmith", kTestTokens, t);
         CHECK(t.ops == kNoOps);
         check_disposition(d, 1, ClearQueueStatus::unavailable, false, "clear_queue|-|16|error|invalid_printer");
     }
     FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"), result_with_status(0x0000), {}, {}};
-    (void)run_clear_queue(std::string(127, 'x'), 16, "alex", kTestTokens, t); // exactly at the limit
+    (void)run_clear_queue(std::string(127, 'x'), 16, "jsmith", kTestTokens, t); // exactly at the limit
     CHECK(t.ops == kListOnly);
 }
 
@@ -837,7 +837,7 @@ TEST_CASE("run_clear_queue: the destination URI the `jobs` action prints is acce
           "[printing][binding]") {
     FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"),
                     result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
-    const auto d = run_clear_queue("ipp://localhost:631/printers/yuzu4616a", 17, "alex", kTestTokens, t);
+    const auto d = run_clear_queue("ipp://localhost:631/printers/yuzu4616a", 17, "jsmith", kTestTokens, t);
     REQUIRE(t.sent.size() == 2);
     CHECK(t.sent[0][0].value == "ipp://localhost/printers/yuzu4616a");
     CHECK(t.sent[1][0].tag == ipp::kTagUri);
@@ -847,7 +847,7 @@ TEST_CASE("run_clear_queue: the destination URI the `jobs` action prints is acce
     FakeTransport t2{result_from_fixture("real_get_jobs_binding_check.ipp"),
                      result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
     const auto long_host = "ipps://user:pw@" + std::string(5000, 'h') + ".example:9999/printers/yuzu4616a";
-    const auto d2 = run_clear_queue(long_host, 16, "alex", kTestTokens, t2);
+    const auto d2 = run_clear_queue(long_host, 16, "jsmith", kTestTokens, t2);
     CHECK(d2.row == "clear_queue|yuzu4616a|16|canceled|-"); // not a 5 KB row
 }
 
@@ -866,7 +866,7 @@ TEST_CASE("run_clear_queue: the destination URI of a queue named with '?' is acc
                     v.replace(at, real.size(), "we?rd");
                 }
     FakeTransport t{listing, result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
-    const auto d = run_clear_queue("ipp://localhost:631/printers/we?rd", 17, "alex", kTestTokens, t);
+    const auto d = run_clear_queue("ipp://localhost:631/printers/we?rd", 17, "jsmith", kTestTokens, t);
     CHECK(t.ops == kListThenCancel);
     REQUIRE(t.sent.size() == 2);
     CHECK(t.sent[0][0].value == "ipp://localhost/printers/we%3Frd"); // the '?' goes out encoded
@@ -874,7 +874,7 @@ TEST_CASE("run_clear_queue: the destination URI of a queue named with '?' is acc
     check_disposition(d, 0, ClearQueueStatus::ok, true, "clear_queue|we?rd|17|canceled|-");
 
     FakeTransport t2{listing, result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
-    check_disposition(run_clear_queue("we?rd", 16, "alex", kTestTokens, t2), 0, ClearQueueStatus::ok, true,
+    check_disposition(run_clear_queue("we?rd", 16, "jsmith", kTestTokens, t2), 0, ClearQueueStatus::ok, true,
                       "clear_queue|we?rd|16|canceled|-");
 }
 
@@ -1010,7 +1010,7 @@ TEST_CASE("is_valid_utf8 and the name validators: real UTF-8 names pass, malform
 TEST_CASE("run_clear_queue: a pasted URI whose name decodes to malformed UTF-8 sends nothing and shows '-'",
           "[printing][binding]") {
     FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"), result_with_status(0x0000), {}, {}};
-    const auto d = run_clear_queue("ipp://localhost:631/printers/%FF", 16, "alex", kTestTokens, t);
+    const auto d = run_clear_queue("ipp://localhost:631/printers/%FF", 16, "jsmith", kTestTokens, t);
     CHECK(t.ops == kNoOps);
     check_disposition(d, 1, ClearQueueStatus::unavailable, false, "clear_queue|-|16|error|invalid_printer");
 }

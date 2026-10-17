@@ -1,6 +1,14 @@
-host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\jsmith)
 command: Copy-Item C:\Windows\Prefetch\REG.EXE-6A8B6960.pf (real prefetch file, one of the 3 smallest non-zero-byte .pf files on the-rig)
 date: 2026-09-06
 status: REAL CAPTURE
 note: MAM-compressed (first 4 bytes 4D 41 4D 04). See REG.EXE-6A8B6960.pf.decompressed.provenance.txt for the decompression probe result.
 run_count_note: selected as the "run count > 1" candidate because reg.exe was invoked 8+ times by earlier capture steps in this same session (multiple reg export / reg load / reg unload / reg query calls before this file's LastWriteTime of 18:23:47); the probe's job per spec is decompression evidence only, not full v31 header field parsing, so the exact RunCount integer is left for P31's parser to verify against these real decompressed bytes.
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith` in this note. The file itself is NO LONGER
+Windows' original compressed bytes: the decompressed payload carried the account name in five UTF-16 paths
+(\USERS\<account>\...), replaced with the same-length placeholder \USERS\USER\..., and the payload was
+re-encoded as a valid literal-only XPRESS_HUFF stream behind the ORIGINAL 8-byte header (MAM\x04, uncompressed
+size 10944, unchanged). A decoder that reproduces the three original captures byte for byte decodes this file to
+exactly REG.EXE-6A8B6960.pf.decompressed. The compressed size (11256 bytes, was 2680) and the encoded bitstream
+are therefore not Windows' own; only the header and the decompressed content are evidence.

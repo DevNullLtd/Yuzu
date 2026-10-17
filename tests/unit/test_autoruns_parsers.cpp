@@ -259,7 +259,7 @@ TEST_CASE("autoruns: parse_reg_run_values decodes quoted HKU values "
         if (v.name == "Discord") discord = &v;
     REQUIRE(discord != nullptr);
     const auto split = split_command_line(discord->data);
-    CHECK(split.target == "C:\\Users\\Alex\\AppData\\Local\\Discord\\Update.exe");
+    CHECK(split.target == "C:\\Users\\jsmith\\AppData\\Local\\Discord\\Update.exe");
     CHECK(split.args == "--processStart Discord.exe");
 }
 
@@ -1484,7 +1484,7 @@ TEST_CASE("autoruns: launchd_row_from_fields uses Program and joins the remainin
     LaunchdFields fields;
     fields.label = "com.docker.socket";
     fields.program = "/Library/PrivilegedHelperTools/com.docker.socket";
-    fields.program_arguments = {"/Library/PrivilegedHelperTools/com.docker.socket", "alex"};
+    fields.program_arguments = {"/Library/PrivilegedHelperTools/com.docker.socket", "jsmith"};
     fields.disabled_present = false;
 
     const auto row = launchd_row_from_fields(SourceId::mac_launchdaemons, fields,
@@ -1492,7 +1492,7 @@ TEST_CASE("autoruns: launchd_row_from_fields uses Program and joins the remainin
                                              Scope::system, 1700000000);
     CHECK(row.entry == "com.docker.socket");
     CHECK(row.target == "/Library/PrivilegedHelperTools/com.docker.socket");
-    CHECK(row.args == "alex");
+    CHECK(row.args == "jsmith");
     CHECK(row.enabled == Enabled::enabled);
     CHECK(row.signed_state == Signed::not_checked); // /Library, not /System/Library
 }

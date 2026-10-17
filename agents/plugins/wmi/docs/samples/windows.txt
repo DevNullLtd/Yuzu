@@ -45,7 +45,7 @@ property|OperatingSystemSKU|48
 property|PortableOperatingSystem|false
 property|Primary|true
 property|ProductType|1
-property|RegisteredUser|Alex
+property|RegisteredUser|jsmith
 property|SerialNumber|00330-80000-00000-AA096
 property|ServicePackMajorVersion|0
 property|ServicePackMinorVersion|0
