@@ -14,6 +14,19 @@
  * the catalog kinds and the closed ostype domain only. An absent `tag:`/`props.` value is
  * the known value "" (known-none): `!=` and `NOT ==` both match it.
  *
+ * TWO-VALUED UNTIL THE FIRST ASYNCHRONOUS PROVIDER. ADR-3006 D5 makes a fact
+ * unknown until its provider has reported, treats an undetermined selector as
+ * matching (unit off, reason "undetermined") and rejects "unknown = does not
+ * match". This resolver does not implement that yet, deliberately: today every
+ * attribute is a synchronous fact, so "unknown" cannot arise and the string-only
+ * view cannot express it. Three-valued evaluation, the provider registry that
+ * says whether a fact is known and how fresh it is, and `Reason::Undetermined`
+ * ship together with the first asynchronous provider, tracked by
+ * #5973. That change replaces the `AttributeResolver` view with a
+ * fact type and edits this contract; until then a selector over an attribute no
+ * provider has reported evaluates as if it were known-none, and
+ * test_enablement_resolver.cpp pins exactly that two-valued behaviour.
+ *
  * Fleet-wide is the ONE spelling `kBroadcastScope` ("__all__",
  * dispatch_target_shape.hpp), authored by name exactly as dispatch passes it
  * and stored as a rule with no selector. An empty selector is refused at
@@ -37,7 +50,8 @@
  *    unit removed or renamed since the rule was authored) switches nothing off
  *    and is reported in `unresolved_units`, so "rule exists, nothing happens"
  *    is visible; it is collected from every rule whether or not its selector
- *    matches, so the answer is the same on every endpoint;
+ *    matches, so the answer is the same on every endpoint; a loader reaches
+ *    this state through make_persisted_rule, which keeps stale unit names;
  *  - consumers key on (plugin, action), never on the plugin entry alone: a
  *    plugin unit that contains protective (non-unit) actions is off while those
  *    actions stay on, so the plugin entry is not a blanket block;
@@ -84,11 +98,12 @@ enum class Reason : std::uint8_t {
     OffRequirement,
 };
 
-/// A Rule must be built via make_rule: resolve() trusts that the selector's
+/// A Rule must be built via make_rule (authoring) or make_persisted_rule (a
+/// loader re-reading a stored rule): resolve() trusts that the selector's
 /// attributes were validated, and the evaluator answers "" for an unknown
 /// attribute, so `!=`/NOT on an unvalidated (for example renamed) kind would
 /// match every endpoint. A loader re-validates every persisted rule through
-/// make_rule, with durable_attribute_kinds, on every load.
+/// make_persisted_rule, with durable_attribute_kinds, on every load.
 struct Rule {
     /// Not required to be unique here: matches are keyed on the full
     /// (rule_id, provenance) pair and the output is canonical either way.
@@ -217,6 +232,28 @@ template <typename Catalog>
 template <typename Catalog>
 void durable_attribute_kinds(const Catalog&&) = delete;
 
+/// The selector half shared by authoring and loading: `__all__` (exactly, as
+/// dispatch compares it) is fleet-wide and stored as no selector; anything else
+/// must parse and use only the given attribute kinds. Empty never means everyone.
+[[nodiscard]] inline std::expected<std::optional<scope::Expression>, std::string>
+parse_rule_selector(std::string_view selector_text, std::span<const std::string_view> kinds) {
+    using Err = std::unexpected<std::string>;
+    if (selector_text.find_first_not_of(" \t\r\n") == std::string_view::npos)
+        return Err("empty selector; use __all__ for every endpoint");
+
+    // Compared untrimmed, exactly as dispatch does (classify_dispatch_arm): a
+    // padded `__all__` is not fleet-wide here either; it fails to parse.
+    if (selector_text == kBroadcastScope)
+        return std::optional<scope::Expression>{};
+    auto parsed = scope::parse(selector_text);
+    if (!parsed)
+        return Err("selector: " + parsed.error());
+    if (auto ok = validate_selector_attributes(*parsed, kinds); !ok)
+        return Err(ok.error());
+    return std::optional<scope::Expression>{std::move(*parsed)};
+}
+
+/// Authoring: every named unit must exist in the overlay today.
 [[nodiscard]] inline std::expected<Rule, std::string>
 make_rule(std::string id, std::vector<std::string> units, std::string_view selector_text,
           Provenance provenance, const UnitOverlay& overlay,
@@ -227,22 +264,27 @@ make_rule(std::string id, std::vector<std::string> units, std::string_view selec
     for (const auto& name : units)
         if (!overlay.find(name) && !overlay.find_non_unit(name))
             return Err("unknown unit: " + name);
+    auto selector = parse_rule_selector(selector_text, kinds);
+    if (!selector)
+        return Err(selector.error());
+    return Rule{std::move(id), std::move(units), std::move(*selector), provenance};
+}
 
-    if (selector_text.find_first_not_of(" \t\r\n") == std::string_view::npos)
-        return Err("empty selector; use __all__ for every endpoint");
-
-    // Compared untrimmed, exactly as dispatch does (classify_dispatch_arm): a
-    // padded `__all__` is not fleet-wide here either; it fails to parse.
-    Rule rule{std::move(id), std::move(units), std::nullopt, provenance};
-    if (selector_text != kBroadcastScope) {
-        auto parsed = scope::parse(selector_text);
-        if (!parsed)
-            return Err("selector: " + parsed.error());
-        if (auto ok = validate_selector_attributes(*parsed, kinds); !ok)
-            return Err(ok.error());
-        rule.selector = std::move(*parsed);
-    }
-    return rule;
+/// Loading: the same selector and attribute validation as make_rule, but unit
+/// names are NOT checked against the overlay. A rule persisted when a unit
+/// existed must still load after a release removes or renames that unit;
+/// resolve() then switches nothing off for the stale name and reports it in
+/// `unresolved_units`. A rule that names no units is corrupt and is refused.
+[[nodiscard]] inline std::expected<Rule, std::string>
+make_persisted_rule(std::string id, std::vector<std::string> units,
+                    std::string_view selector_text, Provenance provenance,
+                    std::span<const std::string_view> kinds) {
+    if (units.empty())
+        return std::unexpected<std::string>("rule names no units");
+    auto selector = parse_rule_selector(selector_text, kinds);
+    if (!selector)
+        return std::unexpected<std::string>(selector.error());
+    return Rule{std::move(id), std::move(units), std::move(*selector), provenance};
 }
 
 // -- Resolution ---------------------------------------------------------------

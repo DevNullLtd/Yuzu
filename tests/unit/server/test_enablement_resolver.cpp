@@ -14,6 +14,8 @@
 #include "enablement_units.hpp"
 #include "tag_store.hpp"
 
+#include <yuzu/protective_actions.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -96,7 +98,7 @@ constexpr std::array<RequirementEdge, 9> kFixtureEdges{{
 const UnitOverlay& overlay() {
     static const UnitOverlay ov = [] {
         auto r = build_unit_overlay({std::span<const CommandCapability>{kFixtureRows}},
-                                    &is_quarantine_control_plugin, kFixtureOs, kFixtureEdges);
+                                    &yuzu::protective::is_protective_action, kFixtureOs, kFixtureEdges);
         REQUIRE(r.has_value());
         return std::move(*r);
     }();
@@ -272,6 +274,10 @@ TEST_CASE("enablement resolver: provenance keys the match and not the id alone",
     }
 }
 
+// Two-valued by design until the first asynchronous provider (#5973): an
+// attribute no provider has reported evaluates as known-none, which ADR-3006 D5
+// will replace with "undetermined". These cases pin today's behaviour so that
+// change is a visible edit to the contract, not a silent one.
 TEST_CASE("enablement resolver: != and NOT agree on an absent tag (known-none)",
           "[enablement][scope]") {
     const auto neq = run({{"n", {"p.x"}, R"(tag:lab != "yes")"}}, "linux");
@@ -605,7 +611,7 @@ TEST_CASE("enablement resolver: a requirement edge from a unit inapplicable on t
     // and absent (not even a required_off entry) on linux.
     const std::array<RequirementEdge, 1> edges{{{"s.m", "p"}}};
     auto ov = build_unit_overlay({std::span<const CommandCapability>{kFixtureRows}},
-                                 &is_quarantine_control_plugin, kFixtureOs, edges);
+                                 &yuzu::protective::is_protective_action, kFixtureOs, edges);
     REQUIRE(ov.has_value());
     auto rule = make_rule("r", {"p"}, "__all__", Op, *ov, kinds());
     REQUIRE(rule.has_value());
@@ -627,17 +633,22 @@ TEST_CASE("enablement resolver: a requirement edge from a unit inapplicable on t
     CHECK(sm->required_off == Names{"p"});
 }
 
+static Rule load(const std::string& id, std::vector<std::string> units, std::string_view selector,
+          Provenance prov = Provenance::Operator) {
+    auto r = make_persisted_rule(id, std::move(units), selector, prov, kinds());
+    INFO(id << ": " << (r ? "" : r.error()));
+    REQUIRE(r.has_value());
+    return std::move(*r);
+}
+
 TEST_CASE("enablement resolver: a rule naming a vanished unit is reported and switches nothing",
           "[enablement][scope]") {
-    // Built by aggregate init, as a stale persisted rule would be after a unit
-    // was removed: make_rule would refuse these names today.
+    // Built through the loader constructor, as a stale persisted rule is after a
+    // unit was removed: make_rule would refuse these names today.
     std::vector<Rule> rules;
-    rules.push_back(Rule{"g1", {"gone.x", "p.y"}, std::nullopt, Provenance::Operator});
-    auto windows_only = build({"g2", {"p.x"}, R"(ostype == "windows")"});
-    windows_only.units.push_back("gone.z");
-    windows_only.units.push_back("gone.x"); // duplicate across rules: listed once
-    rules.push_back(std::move(windows_only));
-    rules.push_back(Rule{"g3", {"quarantine"}, std::nullopt, Provenance::Operator});
+    rules.push_back(load("g1", {"gone.x", "p.y"}, "__all__"));
+    rules.push_back(load("g2", {"p.x", "gone.z", "gone.x"}, R"(ostype == "windows")"));
+    rules.push_back(load("g3", {"quarantine"}, "__all__"));
 
     // g2's selector does not match a linux endpoint, yet its stale name is
     // reported: the answer is the same on every endpoint.
@@ -648,6 +659,35 @@ TEST_CASE("enablement resolver: a rule naming a vanished unit is reported and sw
         CHECK(find_off(r, "p.y") != nullptr);
         CHECK(find_off(r, "gone.x") == nullptr);
     }
+}
+
+TEST_CASE("enablement resolver: a loaded rule keeps stale units but is validated like an authored one",
+          "[enablement][scope]") {
+    // Same result as make_rule on a valid, current rule.
+    const Spec s{"same", {"p.x"}, R"(ostype == "linux" AND tag:lab == "y")"};
+    auto authored = make_rule(s.id, s.units, s.selector, s.prov, overlay(), kinds());
+    auto loaded = make_persisted_rule(s.id, s.units, s.selector, s.prov, kinds());
+    REQUIRE(authored.has_value());
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->id == authored->id);
+    CHECK(loaded->units == authored->units);
+    CHECK(loaded->provenance == authored->provenance);
+    CHECK(loaded->selector.has_value());
+
+    // The unit-name check is the only thing the loader skips.
+    CHECK_FALSE(make_rule("g", {"gone.x"}, "__all__", Provenance::Operator, overlay(), kinds()));
+    CHECK(make_persisted_rule("g", {"gone.x"}, "__all__", Provenance::Operator, kinds()));
+
+    // Everything else still refuses: a corrupt or renamed-kind rule must not load.
+    const std::vector<std::string> one{"p.x"};
+    for (const char* bad : {"", "   ", R"(nosuchattr == "x")", R"(ostype == "plan9")",
+                            R"(from_result_set:rs_1 == "x")", R"(hostname MATCHES "(")",
+                            "ostype ==", " __all__"}) {
+        INFO(bad);
+        CHECK_FALSE(make_persisted_rule("b", one, bad, Provenance::Operator, kinds()));
+    }
+    CHECK_FALSE(make_persisted_rule("b", {}, "__all__", Provenance::Operator, kinds()));
+    CHECK_FALSE(make_rule("b", {}, "__all__", Provenance::Operator, overlay(), kinds()));
 }
 
 TEST_CASE("enablement resolver: the selector key alphabet AGREES with both stores",
