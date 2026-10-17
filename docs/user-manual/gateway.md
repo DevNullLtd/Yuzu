@@ -739,11 +739,14 @@ runs are marked below.)
   (`log_text`), whereas the value that is kept and sent is the sanitised one of up
   to 255 bytes.
 - **Volatile.** The pending store is memory only. It is lost when the upstream
-  client process restarts and when the gateway stops; nothing is flushed at
-  shutdown. A notification that an ordinary worker started and that then failed (a
-  returned RPC error or a killed worker) is not retried and not counted as
-  dropped, as before; only the probe is requeued on failure, and a probe that
-  cannot be encoded in the gateway is evicted (see Known limits). The gauges `yuzu_gw_upstream_notify_pending` and
+  client process restarts, and when the gateway stops except for what a planned
+  stop sends before it goes (see Planned stop); a crash or a kill sends nothing.
+  Failed sends are retried while the process runs, as described above: a
+  returned RPC error puts the notification back at the head of the store, a
+  notification the server rejects as a bad request or that cannot be encoded is
+  counted lost (`reason="rejected"`; a probe that cannot be encoded is evicted,
+  see Known limits), and one whose worker died without a result is counted lost
+  (`reason="crashed"`). The gauges `yuzu_gw_upstream_notify_pending` and
   `yuzu_gw_upstream_notify_inflight` report the held keys and the tracked workers
   of the current upstream client process only.
 
