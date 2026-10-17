@@ -1,7 +1,9 @@
 host: braga (braga.local)
 os: macOS 26.6.2 (Darwin 25.6.0), Xcode CLT clang
-identity: alex (unprivileged, uid 501)
+identity: jsmith (unprivileged, uid 501)
 command: ioreg -a -r -c IOThunderboltSwitch -d 1
 date: 2026-09-08
 status: REAL CAPTURE
 lines: 210 (budget 210)
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

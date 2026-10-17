@@ -48,7 +48,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, `docs/agent-privilege-model.md:70`, #1442) | None — `IcmpSendEcho`, `connect()`, and `getaddrinfo` need no elevation | 2026-09-07 as `SYSTEM` (`docs/samples/windows.txt:1`) | n/a — no netprobe action is privilege-gated on Windows |
-| macOS | agent daemon, intended unprivileged `_yuzu` account (`docs/agent-privilege-model.md:12`) | None — the ICMP ping socket, `connect()`, and `getaddrinfo` all work unprivileged | 2026-09-07 at euid 501, `alex` (`docs/samples/macos.txt:1`) | n/a — no netprobe action is privilege-gated on macOS |
+| macOS | agent daemon, intended unprivileged `_yuzu` account (`docs/agent-privilege-model.md:12`) | None — the ICMP ping socket, `connect()`, and `getaddrinfo` all work unprivileged | 2026-09-07 at euid 501, `jsmith` (`docs/samples/macos.txt:1`) | n/a — no netprobe action is privilege-gated on macOS |
 | Linux | agent daemon, intended unprivileged `yuzu` account (`docs/agent-privilege-model.md:12`) | `icmp` only: the kernel sysctl `net.ipv4.ping_group_range` must admit the agent's process group, or the ping-socket open fails (`matrix.md`, `netprobe_plugin.cpp:229-230`) | 2026-09-07 at euid 0, root, container (`docs/samples/linux.txt:1`) — privileged, so this gate was not exercised | `icmp` row reports `status: not-permitted`, `sent: 0`, `ok: 0`, `loss_pct: 100.0` — never a fabricated loss figure (`netprobe_plugin.cpp:9-11`, `:332-337`); `tcp`/`dns` are unaffected |
 
 No netprobe-specific row exists in `docs/agent-privilege-model.md` (per `privilege.md`); the identities above are the agent's general per-OS account model, cited at the lines shown.

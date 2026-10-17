@@ -112,7 +112,7 @@ tcp|127.0.0.1|5432|127.0.0.1|49749|ESTABLISHED|6436|postgres.exe|C:\Program File
 tcp|127.0.0.1|5432|127.0.0.1|49748|ESTABLISHED|6436|postgres.exe|C:\Program Files\PostgreSQL\18\bin\postgres.exe
 tcp|0.0.0.0|8080|0.0.0.0|0|LISTEN|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
 tcp|127.0.0.1|8080|127.0.0.1|49754|ESTABLISHED|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
-tcp|0.0.0.0|8099|0.0.0.0|0|LISTEN|13800|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+tcp|0.0.0.0|8099|0.0.0.0|0|LISTEN|13800|python.exe|C:\Users\jsmith\AppData\Local\Programs\Python\Python312\python.exe
 tcp|0.0.0.0|49664|0.0.0.0|0|LISTEN|1740|lsass.exe|C:\Windows\System32\lsass.exe
 tcp|0.0.0.0|49665|0.0.0.0|0|LISTEN|1596|wininit.exe|C:\Windows\System32\wininit.exe
 tcp|0.0.0.0|49666|0.0.0.0|0|LISTEN|2448|svchost.exe|C:\Windows\System32\svchost.exe
@@ -124,9 +124,9 @@ tcp|0.0.0.0|49706|0.0.0.0|0|LISTEN|1676|services.exe|C:\Windows\System32\service
 tcp|203.0.113.131|49708|199.165.136.100|443|ESTABLISHED|5808|tailscaled.exe|C:\Program Files\Tailscale\tailscaled.exe
 tcp|127.0.0.1|49748|127.0.0.1|5432|ESTABLISHED|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
 tcp|127.0.0.1|49749|127.0.0.1|5432|ESTABLISHED|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
-tcp|127.0.0.1|49750|127.0.0.1|49751|ESTABLISHED|13800|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
-tcp|127.0.0.1|49751|127.0.0.1|49750|ESTABLISHED|13800|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
-tcp|127.0.0.1|49754|127.0.0.1|8080|ESTABLISHED|13800|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+tcp|127.0.0.1|49750|127.0.0.1|49751|ESTABLISHED|13800|python.exe|C:\Users\jsmith\AppData\Local\Programs\Python\Python312\python.exe
+tcp|127.0.0.1|49751|127.0.0.1|49750|ESTABLISHED|13800|python.exe|C:\Users\jsmith\AppData\Local\Programs\Python\Python312\python.exe
+tcp|127.0.0.1|49754|127.0.0.1|8080|ESTABLISHED|13800|python.exe|C:\Users\jsmith\AppData\Local\Programs\Python\Python312\python.exe
 tcp|127.0.0.1|49759|127.0.0.1|50051|ESTABLISHED|13496|yuzu-agent.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-agent.exe
 tcp|203.0.113.131|49794|172.187.86.73|443|ESTABLISHED|5132|svchost.exe|C:\Windows\System32\svchost.exe
 tcp|127.0.0.1|50051|127.0.0.1|49759|ESTABLISHED|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
