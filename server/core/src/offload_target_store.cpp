@@ -1,5 +1,7 @@
 #include "offload_target_store.hpp"
 
+#include "outbound_url_policy.hpp"
+
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -348,7 +350,7 @@ void OffloadTargetStore::set_metrics(yuzu::MetricsRegistry* metrics) { metrics_ 
 void OffloadTargetStore::log_dropped_delivery(const std::string& target_url) {
     spdlog::warn("OffloadTargetStore: dropped delivery to {} - worker pool queue full or "
                  "server shutting down",
-                 target_url);
+                 url_log_host(target_url));
     if (metrics_)
         metrics_->counter("yuzu_server_offload_delivery_dropped_total").increment();
 }
@@ -370,11 +372,12 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
         return std::unexpected(OffloadWriteError::invalid_input);
     }
     if (!url.starts_with("http://") && !url.starts_with("https://")) {
-        spdlog::warn("OffloadTargetStore: rejected target with invalid URL scheme: {}", url);
+        spdlog::warn("OffloadTargetStore: rejected target with invalid URL scheme");
         return std::unexpected(OffloadWriteError::invalid_input);
     }
-    if (batch_size < 1) {
-        spdlog::warn("OffloadTargetStore: batch_size must be >= 1, got {}", batch_size);
+    if (batch_size < 1 || batch_size > kMaxOffloadBatchSize) {
+        spdlog::warn("OffloadTargetStore: batch_size must be 1..{}, got {}", kMaxOffloadBatchSize,
+                     batch_size);
         return std::unexpected(OffloadWriteError::invalid_input);
     }
     // Reject control characters in operator-supplied free-text fields.
@@ -383,20 +386,16 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
     //   would inject a second header and smuggle a request through any
     //   HTTP-aware proxy. Basic is base64'd, HMAC is hex; the guard
     //   fires for all auth_types as defence-in-depth.
-    // - name, url: both are emitted verbatim into the DELETE audit-row
-    //   `detail` field as `name=<n> url=<u>`. A control byte (CR/LF/NUL)
+    // - name, url: both reach the audit-row `detail` field (the name made
+    //   audit-safe, the URL as scheme+host and a fingerprint), and the log lines. A control byte (CR/LF/NUL)
     //   in either field would line-split the audit row and forge a
     //   downstream event in any SIEM that parses log lines individually.
     // - event_types: rides a libpq text-format parameter verbatim; a NUL
     //   byte would silently truncate at the C-string boundary rather than
     //   erroring, and CR/LF has the same log/audit-injection shape as name.
-    auto has_control_byte = [](const std::string& s) {
-        for (char c : s) {
-            if (static_cast<unsigned char>(c) < 0x20)
-                return true;
-        }
-        return false;
-    };
+    // One definition shared with the webhook store (outbound_url_policy.hpp):
+    // bytes below 0x20 and DEL.
+    auto has_control_byte = [](const std::string& s) { return url_has_control_bytes(s); };
     if (has_control_byte(auth_credential)) {
         spdlog::warn(
             "OffloadTargetStore: rejected target with control bytes in auth_credential: {}",
@@ -411,6 +410,11 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
         spdlog::warn(
             "OffloadTargetStore: rejected target with control bytes in url (target name: {})",
             name);
+        return std::unexpected(OffloadWriteError::invalid_input);
+    }
+    if (url_has_userinfo(url)) {
+        spdlog::warn("OffloadTargetStore: rejected target with userinfo in url (target name: {})",
+                     name);
         return std::unexpected(OffloadWriteError::invalid_input);
     }
     if (has_control_byte(event_types)) {
@@ -513,7 +517,7 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
             return std::unexpected(OffloadWriteError::invalid_input);
         }
         spdlog::error("OffloadTargetStore::create_target: insert failed: {}",
-                      PQresultErrorMessage(res.get()));
+                      first_line(PQresultErrorMessage(res.get())));
         return std::unexpected(OffloadWriteError::db_error);
     }
     return id;
@@ -637,12 +641,17 @@ std::expected<bool, OffloadWriteError> OffloadTargetStore::delete_target(int64_t
 
 std::vector<OffloadDelivery> OffloadTargetStore::get_deliveries(int64_t target_id,
                                                                 int limit) const {
+    return get_deliveries_checked(target_id, limit).value_or(std::vector<OffloadDelivery>{});
+}
+
+std::optional<std::vector<OffloadDelivery>>
+OffloadTargetStore::get_deliveries_checked(int64_t target_id, int limit) const {
     std::vector<OffloadDelivery> results;
     if (!open_)
-        return results;
+        return std::nullopt;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return results;
+        return std::nullopt;
 
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -653,7 +662,7 @@ std::vector<OffloadDelivery> OffloadTargetStore::get_deliveries(int64_t target_i
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("OffloadTargetStore::get_deliveries: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return results;
+        return std::nullopt;
     }
 
     const int rows = PQntuples(res.get());
@@ -757,7 +766,7 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
     // it in /deliveries.
     if (!tgt.url.starts_with("http://") && !tgt.url.starts_with("https://")) {
         record_delivery(tgt.id, event_type, event_count, payload_body, 0, "invalid_scheme");
-        spdlog::warn("OffloadTargetStore: refused dispatch with non-http(s) URL: {}", tgt.url);
+        spdlog::warn("OffloadTargetStore: refused dispatch of target {} with a non-http(s) URL", tgt.id);
         if (metrics_)
             metrics_->counter("yuzu_server_offload_delivery_failed_total").increment();
         return;
@@ -797,9 +806,9 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             // Fail closed — never fire unsigned/unauthenticated when a
             // credential was configured (ADR-0010 §1). No HTTP call is
             // made at all.
-            spdlog::warn("OffloadTargetStore: delivery to {} skipped - credential unavailable "
-                         "({})",
-                         tgt.url, pg::SecretCodec::to_external_error());
+            spdlog::warn("OffloadTargetStore: delivery to {} (target {}) skipped - credential "
+                         "unavailable ({})",
+                         url_log_host(tgt.url), tgt.id, pg::SecretCodec::to_external_error());
             if (metrics_)
                 metrics_->counter("yuzu_server_offload_delivery_credential_unavailable_total")
                     .increment();
@@ -814,25 +823,8 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
     std::string error;
 
     try {
-        std::string url = tgt.url;
-        std::string scheme = "http";
-        std::string host_port;
-        std::string path = "/";
-
-        if (url.starts_with("https://")) {
-            scheme = "https";
-            url = url.substr(8);
-        } else if (url.starts_with("http://")) {
-            url = url.substr(7);
-        }
-
-        auto path_pos = url.find('/');
-        if (path_pos != std::string::npos) {
-            host_port = url.substr(0, path_pos);
-            path = url.substr(path_pos);
-        } else {
-            host_port = url;
-        }
+        // One parser for validation and delivery (outbound_url_policy.hpp).
+        const auto [scheme, host_port, path] = url_delivery_parts(tgt.url);
 
         httplib::Client cli(scheme + "://" + host_port);
         cli.set_connection_timeout(5);
@@ -883,11 +875,13 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             status_code = result->status;
         } else {
             error = "connection_failed";
-            spdlog::warn("OffloadTargetStore: delivery to {} failed: connection error", tgt.url);
+            spdlog::warn("OffloadTargetStore: delivery to {} (target {}) failed: connection error",
+                         url_log_host(tgt.url), tgt.id);
         }
     } catch (const std::exception& ex) {
         error = ex.what();
-        spdlog::warn("OffloadTargetStore: delivery to {} failed: {}", tgt.url, error);
+        spdlog::warn("OffloadTargetStore: delivery to {} (target {}) failed: {}",
+                     url_log_host(tgt.url), tgt.id, error);
     }
 
     if (metrics_) {

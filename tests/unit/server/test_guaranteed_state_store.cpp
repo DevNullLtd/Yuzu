@@ -193,6 +193,14 @@ TEST_CASE("GuaranteedStateStore: opens in-memory and runs migrations",
     CHECK(store.event_count() == 0);
 }
 
+TEST_CASE("GuaranteedStateStore: retention_days() reports the constructor-time window",
+          "[pg][guaranteed_state_store][db][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, 31);
+    REQUIRE(store.is_open());
+    CHECK(store.retention_days() == 31);
+}
 // ── M6 / #1209: monotonic policy generation ─────────────────────────────────
 
 TEST_CASE("GuaranteedStateStore: policy_generation bumps monotonically on mutations",
@@ -266,6 +274,86 @@ TEST_CASE("GuaranteedStateStore: rule round-trip", "[pg][guaranteed_state_store]
     CHECK((*fetched)->scope_expr == "tag:workstations");
     CHECK((*fetched)->created_by == "alice");
     CHECK((*fetched)->updated_by == "alice");
+}
+
+TEST_CASE("GuaranteedStateStore: rule version is bounded to 1..kMaxRuleVersion on create and update",
+          "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    int n = 0;
+    for (const int64_t bad : {int64_t{0}, int64_t{-1}, kMaxRuleVersion + 1,
+                              std::numeric_limits<int64_t>::max()}) {
+        INFO("version=" << bad);
+        auto rule = make_rule("bad-" + std::to_string(++n), "bad-name-" + std::to_string(n));
+        rule.version = bad;
+        auto r = store.create_rule(rule);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("out of range") != std::string::npos);
+    }
+    CHECK(store.rule_count() == 0);
+
+    auto edge = make_rule("edge", "edge-name");
+    edge.version = kMaxRuleVersion;
+    REQUIRE(store.create_rule(edge));
+
+    auto low = make_rule("low", "low-name");
+    REQUIRE(store.create_rule(low));
+    low.version = std::numeric_limits<int64_t>::max();
+    auto u = store.update_rule(low);
+    REQUIRE_FALSE(u.has_value());
+    CHECK(u.error().find("out of range") != std::string::npos);
+}
+
+// A row stored before the bound existed (or written out of band) can carry an out-of-range
+// version. `apply_guard_change` rewrites the stored version UNCHANGED when an operator disables
+// the rule, so update_rule must let an unchanged version through and refuse only a CHANGE to an
+// out-of-range one; otherwise such a rule could not even be disabled.
+TEST_CASE("GuaranteedStateStore: update_rule lets a legacy out-of-range version stay unchanged",
+          "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    int n = 0;
+    for (const int64_t legacy : {int64_t{0}, int64_t{1} << 40}) {
+        INFO("stored version=" << legacy);
+        const std::string id = "legacy-" + std::to_string(++n);
+        REQUIRE(store.create_rule(make_rule(id, "legacy-name-" + std::to_string(n))));
+        exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guaranteed_state_rules SET version = " +
+                               std::to_string(legacy) + " WHERE rule_id = '" + id + "'");
+
+        // Disable it: the version round-trips UNCHANGED.
+        auto row = store.get_rule(id);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        auto disabled = **row;
+        REQUIRE(disabled.version == legacy);
+        disabled.enabled = false;
+        auto ok = store.update_rule(disabled);
+        REQUIRE(ok.has_value());
+        CHECK(query_scalar(db.dsn(), "SELECT enabled::text FROM guaranteed_state_store."
+                                     "guaranteed_state_rules WHERE rule_id = '" + id + "'") ==
+              "false");
+
+        // A CHANGE to another out-of-range value is still refused; a change into range works.
+        auto bad = disabled;
+        bad.version = legacy == 0 ? -1 : legacy + 1; // legacy 0 + 1 would be IN range
+        auto refused = store.update_rule(bad);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find("out of range") != std::string::npos);
+        auto fixed = disabled;
+        fixed.version = 5;
+        REQUIRE(store.update_rule(fixed).has_value());
+    }
+
+    // An out-of-range version for a rule that does not exist is "not found", not "out of range".
+    auto ghost = make_rule("ghost", "ghost-name");
+    ghost.version = 0;
+    auto g = store.update_rule(ghost);
+    REQUIRE_FALSE(g.has_value());
+    CHECK(g.error().find("not found") != std::string::npos);
 }
 
 TEST_CASE("GuaranteedStateStore: list returns all rules ordered by name",
@@ -2818,6 +2906,96 @@ TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
         CHECK(m.count({"a1", "r1"}) == 0); // gone with the rule
         CHECK(m.count({"a2", "r1"}) == 0);
         CHECK(m.count({"a1", "r2"}) == 1); // an unrelated rule's status is untouched
+    }
+}
+
+TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state (C-1)",
+          "[pg][guaranteed_state_store][census]") {
+    // guard.errored is the #2818 spark subscription-death detach lifecycle event. It
+    // must set the per-(agent, rule) census state to "errored" exactly as
+    // guard.unhealthy does. The upsert is ordered by updated_at with `>=` (equal
+    // timestamps overwrite), so D4 characterises that existing tie behaviour.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store{pool, /*retention_days=*/30};
+    REQUIRE(store.is_open());
+
+    auto ev = [&](std::string id, std::string rule, std::string agent, std::string type,
+                  std::string ts) {
+        auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
+        e.event_type = std::move(type);
+        return e;
+    };
+    auto census = [&] {
+        std::map<std::pair<std::string, std::string>, std::string> m;
+        auto rows = store.agent_rule_statuses();
+        REQUIRE(rows.has_value());
+        for (auto& s : *rows)
+            m[{s.agent_id, s.rule_id}] = s.state;
+        return m;
+    };
+
+    SECTION("D1: a later guard.errored replaces a compliant verdict") {
+        REQUIRE(store.insert_event(ev("d1a", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d1b", "r1", "a1", "guard.errored", "2026-06-04T10:01:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+    }
+    SECTION("D2: a later guard.compliant recovers an errored pair") {
+        REQUIRE(store.insert_event(ev("d2a", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+        REQUIRE(store.insert_event(ev("d2b", "r1", "a1", "guard.compliant", "2026-06-04T10:01:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+    }
+    SECTION("D3: an OLDER guard.errored does not regress a newer compliant verdict") {
+        REQUIRE(store.insert_event(ev("d3a", "r1", "a1", "guard.compliant", "2026-06-04T10:02:00Z")));
+        REQUIRE(store.insert_event(ev("d3b", "r1", "a1", "guard.errored", "2026-06-04T10:01:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+    }
+    SECTION("D4: equal timestamps, distinct event ids: the later arrival wins (existing >=)") {
+        REQUIRE(store.insert_event(ev("d4a", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d4b", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+
+        REQUIRE(store.insert_event(ev("d4c", "r2", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d4d", "r2", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r2"}] == "compliant");
+    }
+    SECTION("D5: an exact redelivery of the errored event never reaches the census write") {
+        // Equal timestamps (compliant arrives after errored, so it wins the >= tie): had the
+        // redelivery reached the upsert, the tie would flip the row to errored, so the final
+        // census assertion can observe a reached census write.
+        const auto errored = ev("d5x", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z");
+        CHECK(store.insert_event_classified(errored).outcome == EventInsertOutcome::Inserted);
+        REQUIRE(store.insert_event(ev("d5y", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+        CHECK(store.insert_event_classified(errored).outcome == EventInsertOutcome::Redelivered);
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+    }
+    SECTION("D6: the batch path applies the mapping inside its transaction") {
+        std::vector<GuaranteedStateEventRow> batch = {
+            ev("d6a", "r1", "a1", "guard.compliant", "2026-06-04T11:00:00Z"),
+            ev("d6b", "r1", "a1", "guard.errored", "2026-06-04T11:01:00Z"),
+        };
+        REQUIRE(store.insert_events(batch));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+    }
+    SECTION("D7: the reserved ruleless sentinel never gets a census row from guard.errored") {
+        REQUIRE(store.insert_event(
+            ev("d7a", "__observation__", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        std::vector<GuaranteedStateEventRow> batch = {
+            ev("d7b", "__observation__", "a2", "guard.errored", "2026-06-04T10:00:00Z"),
+        };
+        REQUIRE(store.insert_events(batch));
+        auto sentinel = store.agent_rule_statuses("__observation__");
+        REQUIRE(sentinel.has_value());
+        CHECK(sentinel->empty());
+        CHECK(census().empty());
+    }
+    SECTION("D8: guard.armed, guard.disarmed and guard.healthy remain no-census-change") {
+        REQUIRE(store.insert_event(ev("d8a", "r1", "a1", "guard.armed", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d8b", "r2", "a1", "guard.disarmed", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d8c", "r3", "a1", "guard.healthy", "2026-06-04T10:00:00Z")));
+        CHECK(census().empty());
     }
 }
 

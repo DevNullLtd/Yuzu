@@ -111,21 +111,19 @@ namespace gpb = ::yuzu::guardian::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
 // #2233 item 3 ("S+"): ShutdownDeadlineGuard's grace period for both AgentImpl::stop()
-// and run()'s teardown ScopeExit. NOT a measured value - the named sub-budgets listed here
-// are only PART of the blocking chain, and they sum to roughly 15-20s (GuardianEngine's two
-// persist_lifecycle_journal_locked calls, each documented as "worst case one KvStore 5s busy
-// timeout"; SparkEngine's kConsumerJoinBudgetMs = 2'000), and the loss-ledger write adds
-// another. #4045 adds the final baseline flush (up to one more busy timeout), and
-// GuardianEngine::stop()'s own comment lists the stop() timelines measured against a BUSY
-// store: 10s to 25s and more with a worker write in flight. dex_observer_'s
-// drain wait and stop_all_guards_locked()'s per-guard stops have NO named bound at all - so
-// this sits AT the named floor, not comfortably above it (corrected per external review, PR
-// #3737 - the earlier wording overstated the margin), without claiming to be a derived
-// guarantee (matching spark_file.cpp's arm_ancestor deadline comment: state plainly that it's
-// not a wall-clock bound where it isn't one). Also constrained from above: service_win.cpp
-// reports a 30s STOP_PENDING hint to the Windows SCM, so a SINGLE watchdog must stay under
-// that - 20s leaves only a 10s margin, not a comfortable one (matching service_win.cpp's own
-// wording on the same relationship, not "well under").
+// and run()'s teardown ScopeExit. NOT a measured value - the named sub-budgets are only PART
+// of the blocking chain: SparkEngine's kConsumerJoinBudgetMs = 2'000, and GuardianEngine::stop()'s
+// serial KvStore waits, which stop() bounds by lowering the store's busy budget to
+// kKvStoreStopBusyTimeout for the rest of the process (#5604). The comments in
+// GuardianEngine::stop() carry that budget, the timelines measured against a BUSY store and
+// what it does not bound (slow I/O, the DEX observer, plugin shutdown()); numbers are not
+// repeated here so they cannot drift from it. dex_observer_'s
+// drain wait and stop_all_guards_locked()'s per-guard stops have NO named bound at all, so this
+// is not a derived guarantee (matching spark_file.cpp's arm_ancestor deadline comment: state
+// plainly that it's not a wall-clock bound where it isn't one). Also constrained from above:
+// service_win.cpp reports a 30s STOP_PENDING hint to the Windows SCM, so a SINGLE watchdog must
+// stay under that - 20s leaves only a 10s margin, not a comfortable one (matching
+// service_win.cpp's own wording on the same relationship, not "well under").
 //
 // TWO watchdogs on the external-trigger path, and their budgets are independent, not
 // shared: run()'s ScopeExit re-calls guardian_->stop() on EVERY exit (comment below),
@@ -1098,11 +1096,13 @@ public:
             // completion barrier (lifecycle_mu_+teardown_complete_, early-out on repeat -
             // its own header comment names this exact stop()-vs-ScopeExit scenario as the
             // reason). GuardianEngine::stop() has no such early-out: it takes mtx_ and
-            // RE-EXECUTES its whole body on a second call, safe only because every
+            // RE-EXECUTES most of its body on a second call, safe only because every
             // downstream step in it (ConvergenceScheduler::stop(), OutboxDrainWorker::stop(),
             // stop_all_guards_locked(), GuardianSparkRuntime::begin_stop(),
             // lifecycle_journal_->request_stop()) is independently idempotent - verified, not
-            // a barrier. #2233 item 3's watchdog above
+            // a barrier. The Spark baseline Stop pass is the exception: a once-only latch
+            // makes a second call skip it (see GuardianEngine::stop()). #2233 item 3's
+            // watchdog above
             // covers the case where the call THIS thread is executing hangs; it is
             // deliberately NOT layered with an AgentImpl-level once-only guard on top of
             // these calls - an earlier revision of this PR added one (stop_guardian_once/
@@ -2024,10 +2024,9 @@ public:
                     current_executable_path());
                 set_updater(updater);
 
-                if (updater->rollback_if_needed()) {
+                if (updater->perform_startup_maintenance()) {
                     spdlog::warn("OTA rollback was triggered - running previous binary");
                 }
-                updater->cleanup_old_binary();
             }
 
             // 4. Open Subscribe bidi stream
@@ -3326,7 +3325,7 @@ public:
                     }
 
                     // Write health marker after first successful read (OTA rollback guard)
-                    if (!update_verified) {
+                    if (cfg_.auto_update && !update_verified) {
                         update_verified = true;
                         auto marker =
                             current_executable_path().parent_path() / ".yuzu-update-verified";

@@ -43,7 +43,7 @@
 /// `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
 /// DisabledUntilFixed passes (schedule/policy/quarantine dispatch, ca.publish_crl,
 /// nvd_sync, the concurrency reconciler), plus the load-bearing ReplicaSafe ones —
-/// the event-outbox poll, the three retention prunes, the app_perf rollup upsert,
+/// the event-outbox poll, the four retention prunes, the app_perf rollup upsert,
 /// and the MUST-run-per-replica / shared-PG-writing passes found by the sweep
 /// (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
 /// projector, MCP bridge sweep + session gc, store-worker delivery pools, the
@@ -71,7 +71,9 @@
 /// them): the detached per-dispatch gateway-forward thread, FleetTopologyStore's
 /// request-path refill, ExecutionEventBus inline gc, `shutdown_watcher.hpp`'s
 /// signal self-pipe watcher, per-request SSE `wait_for` loops, and boot-time
-/// one-shot poll loops (`default_certs.cpp`, `nvd_client.cpp`).
+/// one-shot poll loops (`default_certs.cpp`, `nvd_client.cpp`), and
+/// `healthcheck_probe.cpp`'s probe_bounded worker (`--healthcheck`: one-shot, pre-init, the
+/// process exits with it).
 
 #include <array>
 #include <cstddef>
@@ -92,11 +94,12 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (45 passes). Verified against the source sweep
+/// The exhaustive inventory (46 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
-/// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29); keep the count
+/// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29, and the #5678
+/// addition of `offline_endpoint_store.run_retention_prune`, 2026-10-12); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -171,6 +174,8 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "clock-guarded + advisory lock (WS-10 10.2)"},
     {"deployment_run_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (WS-10 10.2); piggybacks the preflight thread"},
+    {"offline_endpoint_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
+     "clock-guarded + advisory lock (#5678 / #1545 UP-4); piggybacks the preflight thread"},
 
     // ---- policy_eval_thread_ (10s tick) — tick() SPLITS into two passes (PR #4134) ----
     {"policy_evaluator.collect_ready", "policy_eval_thread_", BackgroundJobClass::ReplicaSafe,

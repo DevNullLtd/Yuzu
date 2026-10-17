@@ -18,7 +18,7 @@
 /// per-request logic, so a null registry now 503s even a request that would
 /// not have touched the registry (e.g. an empty `?q=`).
 ///
-/// Routes (25) — gate in parens, `-` = no gate:
+/// Routes — gate in parens, `-` = no gate:
 ///   GET /static/yuzu.css                    -
 ///   GET /static/icons.svg                   -
 ///   GET /static/htmx.js                     -
@@ -28,8 +28,17 @@
 ///   GET /static/three-orbit-controls.js     -
 ///   GET /static/yuzu-viz.js                 -
 ///   GET /static/yuzu-viz-host.js            -
+///   GET /static/yuzu-operate.js             -                      (Operate pages' controller)
+///   GET /static/yuzu-dialog.js              -                      (shared modal dialog + request helper)
+///   GET /static/yuzu-operate-extras.js      -                      (Operate extras page controllers)
+///   GET /static/yuzu-estate.js              -                      (device containment controls)
+///   GET /static/yuzu-device-data.js         -                      (Hardware record tag/property controls)
 ///   GET /static/cytoscape.min.js            -
-///   GET /static/fonts/InterVariable.woff2   -
+///   GET /static/fonts/ibm-plex-sans-latin-400-normal.woff2   -
+///   GET /static/fonts/ibm-plex-sans-latin-500-normal.woff2   -
+///   GET /static/fonts/ibm-plex-sans-latin-600-normal.woff2   -
+///   GET /static/fonts/ibm-plex-mono-latin-400-normal.woff2   -
+///   GET /static/fonts/ibm-plex-mono-latin-500-normal.woff2   -
 ///   GET /static/yuzu-charts.js              -
 ///   GET /                                   -                      (dashboard shell)
 ///   GET /chargen                            -                      (302 -> /)
@@ -44,6 +53,9 @@
 ///   GET /viz/fleet                          (auth_fn + viz kill switch)
 ///   GET /viz/host/:agent_id                 (auth_fn + viz kill switch)
 ///   GET /instructions                       (auth_fn)
+///   GET /approvals                          (auth_fn)
+///   GET /executions                         (auth_fn)
+///   GET /workflows                          (auth_fn)
 ///
 /// ORDERING: `/viz/fleet` is registered before `/viz/host/([^/]+)` — see the
 /// comment carried over onto that registration in page_routes.cpp. Today's
@@ -95,7 +107,7 @@ struct Deps {
     const yuzu::server::detail::AgentRegistry* registry{nullptr};
 };
 
-/// Register all 25 page-shell / static-asset routes against `sink`.
+/// Register all the page-shell / static-asset routes against `sink`.
 void register_page_routes(HttpRouteSink& sink, Deps deps);
 
 } // namespace page

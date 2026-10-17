@@ -6,8 +6,10 @@
 //
 // Design: docs/tar-dashboard.md.
 
+#include "app_shell.hpp"
+
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
+const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -16,422 +18,272 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
   <style>
-    body { display: flex; flex-direction: column; min-height: 100vh; }
+    body { display: flex; flex-direction: column; min-height: calc(100vh - var(--shell-top-h)); }
     .tar-content {
-      max-width: 1200px;
-      margin: 1rem auto;
-      padding: 0 1.5rem 2rem 1.5rem;
-      width: 100%;
-      box-sizing: border-box;
-      flex: 1;
+      width: 100%; flex: 1; padding: 22px 28px 36px;
+      display: flex; flex-direction: column; gap: 22px;
     }
-    .tar-content h1 {
-      font-size: 1.4rem;
-      margin: 0.25rem 0 0.5rem 0;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 0.5rem;
+    .tar-ph h1 {
+      font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2;
+      color: var(--ink);
     }
-    .tar-subtitle {
-      color: var(--mds-color-theme-text-tertiary);
-      font-size: 0.85rem;
-      margin: 0 0 1.5rem 0;
-    }
-    .tar-frame {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 0.5rem;
-      margin-bottom: 1.5rem;
-      overflow: hidden;
-    }
-    .tar-frame-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0.75rem 1rem;
-      border-bottom: 1px solid var(--border);
-      background: var(--mds-color-state-hover);
-    }
-    .tar-frame-title {
-      font-size: 0.95rem;
-      font-weight: 600;
-      margin: 0;
-    }
-    .tar-frame-actions { display: flex; gap: 0.5rem; }
-    .tar-frame-actions button {
-      padding: 0.35rem 0.85rem;
-      font-size: 0.8rem;
-      background: var(--accent);
-      color: var(--mds-color-text-on-accent);
-      border: none;
-      border-radius: 0.25rem;
-      cursor: pointer;
-    }
-    .tar-frame-actions button:hover { opacity: 0.85; }
-    .tar-frame-actions button.btn-secondary {
-      background: var(--surface);
-      color: var(--fg);
-      border: 1px solid var(--border);
-    }
-    .tar-frame-body { padding: 1rem; }
-    .tar-frame-body table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.85rem;
-    }
-    .tar-frame-body th {
-      text-align: left;
-      padding: 0.5rem 0.75rem;
-      border-bottom: 1px solid var(--border);
-      color: var(--mds-color-theme-text-tertiary);
-      font-weight: 600;
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    .tar-frame-body td {
-      padding: 0.5rem 0.75rem;
-      border-bottom: 1px solid var(--border);
-      vertical-align: top;
-    }
-    .tar-frame-body tr:last-child td { border-bottom: none; }
-    .tar-frame-body tr:hover { background: var(--mds-color-state-hover); }
-    .tar-frame-body .source-pill {
-      display: inline-block;
-      padding: 0.1rem 0.5rem;
-      font-size: 0.7rem;
-      font-weight: 600;
-      background: var(--mds-color-bg-warning-tinted);
-      color: var(--mds-color-indicator-warning-bright);
-      border-radius: 0.75rem;
-    }
-    .tar-frame-body .placeholder {
-      padding: 2rem 0;
-      text-align: center;
-      color: var(--mds-color-theme-text-tertiary);
-    }
-    .tar-frame-body .empty-state {
-      padding: 2.5rem 0;
-      text-align: center;
-      color: var(--mds-color-theme-text-tertiary);
-      font-size: 0.9rem;
-    }
-    .tar-frame-body .empty-state strong { color: var(--green); }
-    .tar-frame-coming-soon {
-      padding: 2rem;
-      text-align: center;
-      color: var(--mds-color-theme-text-tertiary);
-      font-size: 0.85rem;
-      background: var(--mds-color-state-hover);
-      border: 1px dashed var(--border);
-      border-radius: 0.25rem;
-      margin: 0.5rem;
-    }
-    .tar-frame-coming-soon code {
-      background: var(--mds-color-state-hover);
-      padding: 0.1rem 0.4rem;
-      border-radius: 0.25rem;
-      font-size: 0.8rem;
-    }
-    .tar-row-error { color: var(--mds-color-theme-indicator-error); }
-    .tar-row-error td { font-style: italic; }
+    .tar-subtitle { color: var(--mut); font-size: 14px; margin: 4px 0 0; max-width: 70ch; }
 
-    /* Scope chip (design §8.3) — reusable header for query frames. */
-    .scope-chip-row {
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-      margin-bottom: 0.75rem;
-      flex-wrap: wrap;
+    /* Frames are yuzu.css panels (.panel / .tw); the header row stays local because look's .hd also sets
+       font-size / weight on everything inside it. Tables in a frame take the shared .tw table skin. */
+    .tar-frame { overflow: hidden; }
+    .tar-frame-header {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+      padding: 12px 16px; border-bottom: 1px solid var(--line);
     }
-    .scope-chip-label {
-      font-size: 0.7rem;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      color: var(--mds-color-theme-text-tertiary);
-      font-weight: 600;
+    .tar-frame-title { font-size: 14px; font-weight: 600; margin: 0; }
+    .tar-frame-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-left: auto; }
+    .tar-pad { padding: 16px; }
+    #retention-paused-body > :not(table):not(.result-degrade-banner),
+    #capture-sources > .picker-row,
+    #cap-sources-body > :not(table):not(.apply-bar):not(.result-degrade-banner) { margin: 0; padding: 14px 16px; }
+    .tar-content code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
+    .tar-meta { font-size: 13px; color: var(--mut); }
+    .tar-meta strong, .tar-meta b { color: var(--ink); font-weight: 600; }
+    .tar-frame-body .placeholder, .tar-frame-body .empty-state {
+      text-align: center; color: var(--mut); font-size: 14px;
     }
-    .scope-chip-select {
-      background: var(--surface);
-      color: var(--fg);
-      border: 1px solid var(--border);
-      border-radius: 0.25rem;
-      padding: 0.3rem 0.5rem;
-      font-size: 0.8rem;
-      max-width: 24rem;
+    .tar-frame-body .placeholder { padding: 28px 16px; }
+    .tar-frame-body .empty-state strong { color: var(--ink); font-weight: 600; }
+    .tar-frame-body .result-degrade-banner {
+      margin: 12px 16px; padding: 12px 14px; text-align: left; font-size: 13.5px;
+      color: var(--ink2); background: var(--surface2); border-radius: var(--rad-panel);
+      border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line2));
     }
-    .scope-chip-meta {
-      font-size: 0.75rem;
-      color: var(--mds-color-theme-text-tertiary);
+    .result-degrade-banner b { color: var(--ink); }
+    .tar-row-error { color: var(--bad); }
+    .tar-row-error td { font-style: italic; }
+    .tar-row-note { color: var(--mut); font-size: 13px; }
+
+    /* Buttons: raised by default, primary for the one main action, text links in table rows */
+    .tar-content button {
+      display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px;
+      font: inherit; font-size: 13px; font-weight: 500; line-height: 1; white-space: nowrap;
+      color: var(--ink); background: var(--raise); border: 1px solid var(--line2);
+      border-radius: var(--rad-ctl); cursor: pointer;
+      transition: background-color .12s, border-color .12s;
     }
-    .tar-sql-textarea {
-      width: 100%;
-      box-sizing: border-box;
-      background: var(--mds-color-state-hover);
-      color: var(--fg);
-      border: 1px solid var(--border);
-      border-radius: 0.25rem;
-      padding: 0.6rem;
-      font-family: var(--mono, monospace);
-      font-size: 0.8rem;
-      resize: vertical;
+    .tar-content button:hover:not(:disabled) { background: var(--surface2); border-color: var(--mut); }
+    .tar-content button:disabled { opacity: .5; cursor: default; }
+    .tar-content button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+    .tar-content .apply-push {
+      color: var(--on-primary); background: var(--primary); border-color: var(--primary); font-weight: 600;
     }
-    .tar-sql-controls {
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-      margin-top: 0.6rem;
-      flex-wrap: wrap;
+    .tar-content .apply-push:hover:not(:disabled) {
+      background: var(--primary-h); border-color: var(--primary-h);
     }
-    .tar-sql-name {
-      flex: 1 1 16rem;
-      min-width: 12rem;
-      background: var(--surface);
-      color: var(--fg);
-      border: 1px solid var(--border);
-      border-radius: 0.25rem;
-      padding: 0.35rem 0.5rem;
-      font-size: 0.8rem;
+    .tar-content td .btn-secondary, .tar-content td .btn-danger {
+      padding: 0 6px; color: var(--primary); background: none; border-color: transparent;
     }
-    .tar-sql-empty {
-      font-size: 0.75rem;
-      color: var(--mds-color-theme-text-tertiary);
-      display: flex;
-      align-items: center;
-      gap: 0.3rem;
+    .tar-content td .btn-danger { color: var(--bad); }
+    .tar-content td .btn-secondary:hover:not(:disabled), .tar-content td .btn-danger:hover:not(:disabled) {
+      background: none; border-color: transparent; text-decoration: underline;
     }
-    .tar-sql-controls button {
-      padding: 0.4rem 0.9rem;
-      font-size: 0.8rem;
-      background: var(--accent);
-      color: var(--mds-color-text-on-accent);
-      border: none;
-      border-radius: 0.25rem;
-      cursor: pointer;
+
+    /* Form fields */
+    .picker-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .picker-row label, .filter-label, .tt-filter-label {
+      font-size: 13px; font-weight: 500; color: var(--ink2);
     }
-    .tar-sql-controls button:disabled { opacity: 0.5; cursor: default; }
-    .tar-sql-result {
-      margin-top: 0.75rem;
-      font-size: 0.82rem;
-      color: var(--mds-color-theme-text-tertiary);
+    .tar-tree-filter, .tar-tree-custom input[type="datetime-local"] {
+      color: var(--ink); background: var(--bg); border: 1px solid var(--line2);
+      border-radius: var(--rad-ctl);
+      height: var(--ctl); padding: 0 10px; min-width: 0; font: inherit; font-size: 14px;
     }
-    .tar-sql-result a { color: var(--accent); }
-    .tar-sql-result code {
-      background: var(--mds-color-state-hover);
-      padding: 0.1rem 0.35rem;
-      border-radius: 0.25rem;
-    }
-    .tar-sql-result.error { color: var(--mds-color-theme-indicator-error); }
+    .src-note { font-size: 12.5px; color: var(--mut); }
+    .tar-content input[type="checkbox"] { accent-color: var(--primary); }
+    .tar-tree-filter::placeholder { color: var(--faint); }
+    .tar-sql-moved a { color: var(--primary); }
 
     /* ── Process tree viewer (Phase 15.H) ───────────────────────────────── */
-    .tar-tree-toolbar {
-      display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
-    }
-    .tar-tree-presets { display: flex; gap: 0.35rem; flex-wrap: wrap; }
-    .tar-tree-custom { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
-    .tar-tree-custom label {
-      font-size: 0.7rem; color: var(--mds-color-theme-text-tertiary);
-      display: flex; align-items: center; gap: 0.3rem;
-    }
-    .tar-tree-custom input[type="datetime-local"] {
-      background: var(--surface); color: var(--fg);
-      border: 1px solid var(--border); border-radius: 0.25rem;
-      padding: 0.25rem 0.4rem; font-size: 0.75rem;
+    .tar-tree-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .tar-tree-custom { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .tar-tree-custom label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink2); }
+    /* Segmented control: preset ranges, state filter, capture category filter */
+    .tar-tree-presets, .tar-seg {
+      display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 2px;
+      background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
     }
     .tar-chip {
-      display: inline-block; cursor: pointer; user-select: none;
-      background: var(--mds-color-state-hover); color: var(--fg);
-      border: 1px solid var(--border); border-radius: 1rem;
-      padding: 0.25rem 0.7rem; font-size: 0.75rem;
+      display: inline-flex; align-items: center; gap: 6px; height: calc(var(--ctl) - 8px);
+      padding: 0 12px; border-radius: 2px; cursor: pointer; user-select: none;
+      font-size: 13px; font-weight: 500; color: var(--mut);
     }
-    .tar-chip:hover { border-color: var(--accent); }
-    .tar-chip.on { background: var(--accent); color: var(--mds-color-text-on-accent); border-color: var(--accent); }
+    .tar-chip:hover { color: var(--ink); }
+    .tar-chip.on {
+      color: var(--ink); background: var(--raise); font-weight: 600;
+      box-shadow: inset 0 0 0 1px var(--line2);
+    }
+    .tar-tree-custom .tar-chip {
+      height: var(--ctl); padding: 0 14px; color: var(--ink); background: var(--raise);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+    }
+    .tar-tree-custom .tar-chip:hover { background: var(--surface2); border-color: var(--mut); }
     /* Filter bar (state + anomalies + text) */
     .tar-tree-filterbar {
-      display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;
-      margin: 0.5rem 0 0.6rem; padding-top: 0.5rem; border-top: 1px solid var(--border);
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      margin: 12px 0; padding-top: 12px; border-top: 1px solid var(--line);
     }
-    .tt-filter-label {
-      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em;
-      color: var(--mds-color-theme-text-tertiary); font-weight: 600;
-    }
-    .tt-anom-toggle {
-      font-size: 0.72rem; color: var(--mds-color-theme-text-tertiary);
-      display: flex; align-items: center; gap: 0.3rem;
-    }
-    .tar-tree-filter {
-      flex: 1 1 12rem; min-width: 10rem;
-      background: var(--surface); color: var(--fg);
-      border: 1px solid var(--border); border-radius: 0.25rem;
-      padding: 0.3rem 0.5rem; font-size: 0.78rem;
-    }
+    .tt-anom-toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink2); }
+    .tar-tree-filter { flex: 1 1 12rem; min-width: 10rem; }
     .tar-tree-banner, .tar-tree-note, .tar-tree-warn, .tar-tree-empty, .tar-tree-loading,
-    .tar-tree-nomatch {
-      font-size: 0.78rem; color: var(--mds-color-theme-text-tertiary); margin: 0.3rem 0;
-    }
-    .tar-tree-note code, .tar-tree-banner b { color: var(--fg); }
-    .tar-tree-warn { color: var(--mds-color-theme-indicator-warning, #d6a500); }
-    .tar-tree-mute { color: var(--mds-color-theme-text-tertiary); }
+    .tar-tree-nomatch { font-size: 13px; color: var(--mut); margin: 6px 0; }
+    .tar-tree-note code { color: var(--ink2); }
+    .tar-tree-banner b { color: var(--ink); font-weight: 600; }
+    .tar-tree-warn { color: var(--warn); }
+    .tar-tree-mute, .tar-tree-pid { color: var(--mut); }
+    .tar-tree-pid { font-size: 12.5px; font-weight: 400; margin-left: 6px; }
 
     /* Tree */
-    .tar-tree { font-family: var(--mono, monospace); font-size: 0.8rem; margin-top: 0.4rem; line-height: 1.5; }
+    .tar-tree { font-family: var(--mds-font-family-mono); font-size: 12.5px; margin-top: 8px; line-height: 1.7; }
     .tar-tree-node { margin: 0; }
-    .tar-tree-node > summary {
-      display: flex; align-items: center; list-style: none; cursor: pointer; padding: 0.05rem 0;
-    }
+    .tar-tree-node > summary { display: flex; align-items: center; list-style: none; cursor: pointer; }
     .tar-tree-node > summary::-webkit-details-marker { display: none; }
     .tar-tree-node > summary::before {
-      content: "\25B8"; flex: 0 0 1rem; text-align: center;
-      color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem;
+      content: "\25B8"; flex: 0 0 1rem; text-align: center; font-size: 11px; color: var(--faint);
     }
     .tar-tree-node[open] > summary::before { content: "\25BE"; }
-    .tar-tree-children {
-      margin-left: 0.5rem; padding-left: 0.7rem; border-left: 1px solid var(--border);
-    }
-    .tar-tree-leaf { display: flex; align-items: center; padding: 0.05rem 0 0.05rem 1rem; }
+    .tar-tree-children { margin-left: 8px; padding-left: 12px; border-left: 1px solid var(--line2); }
+    .tar-tree-leaf { display: flex; align-items: center; padding-left: 1rem; }
     .tar-tree-row {
-      display: inline-flex; align-items: center; gap: 0.45rem; flex: 1 1 auto; min-width: 0;
-      color: var(--fg); text-decoration: none; cursor: pointer;
-      padding: 0.05rem 0.3rem; border-radius: 0.2rem;
+      display: inline-flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0;
+      color: var(--ink); text-decoration: none; cursor: pointer;
+      padding: 0 6px; border-radius: 2px;
     }
-    .tar-tree-row:hover { background: var(--mds-color-state-hover); }
-    .tar-tree-row[data-anom="1"] { box-shadow: inset 2px 0 0 var(--mds-color-theme-indicator-error); }
+    .tar-tree-row:hover { background: var(--surface2); }
+    .tar-tree-row[data-anom="1"] { box-shadow: inset 3px 0 0 var(--bad); }
     .tar-tree-row[data-state="exited"] { opacity: 0.78; }
-    .tt-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; flex: 0 0 auto; }
-    .tt-dot-run { background: var(--green); box-shadow: 0 0 4px rgba(60,200,120,0.5); }
-    .tt-dot-exit { background: var(--mds-color-theme-text-tertiary); }
-    .tt-pid {
-      color: var(--mds-color-theme-text-tertiary); flex: 0 0 auto; min-width: 3.4rem;
-      text-align: right; font-variant-numeric: tabular-nums;
-    }
-    .tt-name { color: var(--fg); font-weight: 600; white-space: nowrap; }
-    .tar-tree-row[data-state="exited"] .tt-name { font-weight: 500; color: var(--mds-color-theme-text-tertiary); }
-    .tt-user { color: var(--accent); font-size: 0.72rem; white-space: nowrap; }
-    .tt-meta { color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem; white-space: nowrap; }
-    .tt-anom { color: var(--mds-color-theme-indicator-error); }
+    .tt-dot { width: 8px; height: 8px; flex: 0 0 auto; }
+    .tt-dot-run { background: var(--ok); }
+    .tt-dot-exit { background: var(--faint); }
+    .tt-pid { flex: 0 0 auto; min-width: 3.4rem; text-align: right; color: var(--mut); }
+    .tt-name { color: var(--ink); font-weight: 600; white-space: nowrap; }
+    .tar-tree-row[data-state="exited"] .tt-name { font-weight: 500; color: var(--mut); }
+    .tt-user { color: var(--ink2); font-size: 12px; white-space: nowrap; }
+    .tt-meta { color: var(--mut); font-size: 12px; white-space: nowrap; }
+    .tt-anom { color: var(--bad); }
     /* Inline network summary */
     .tt-net {
-      display: inline-flex; align-items: center; gap: 0.25rem; font-size: 0.68rem;
-      color: var(--mds-color-theme-text-tertiary); min-width: 0; overflow: hidden;
+      display: inline-flex; align-items: center; gap: 4px; min-width: 0; overflow: hidden;
+      font-size: 11.5px; color: var(--mut);
     }
-    .tt-net-ico { color: var(--accent); }
-    .tt-net-pub .tt-net-ico { color: var(--mds-color-theme-indicator-warning, #d6a500); }
-    .tt-ep {
-      background: var(--mds-color-state-hover); border-radius: 0.6rem; padding: 0 0.35rem;
-      white-space: nowrap; font-variant-numeric: tabular-nums;
-    }
-    .tt-ep-pub { color: var(--mds-color-theme-indicator-warning, #d6a500); }
+    .tt-net-ico { color: var(--mut); }
+    .tt-net-pub .tt-net-ico, .tt-ep-pub { color: var(--warn); }
+    .tt-ep { background: var(--surface2); border-radius: 3px; padding: 0 6px; white-space: nowrap; }
     .tt-ep-more { opacity: 0.7; }
     /* Same-name sibling group ("svchost.exe ×42") */
-    .tt-group { color: var(--mds-color-theme-text-tertiary); }
-    .tt-group-ico { color: var(--accent); flex: 0 0 auto; font-size: 0.7rem; }
-    .tt-group .tt-name { color: var(--fg); }
+    .tt-group { color: var(--mut); }
+    .tt-group-ico { flex: 0 0 auto; font-size: 11px; color: var(--mut); }
     .tt-group-count {
-      color: var(--fg); font-weight: 600; background: var(--mds-color-state-hover);
-      border-radius: 0.6rem; padding: 0 0.4rem; font-size: 0.7rem;
+      color: var(--ink); font-weight: 600; background: var(--surface2);
+      border-radius: 3px; padding: 0 6px; font-size: 12px;
     }
 
-    /* Two-column layout: scrollable tree + sticky right-hand detail panel */
-    .tar-tree-layout { display: flex; gap: 1rem; align-items: flex-start; margin-top: 0.5rem; }
+    /* Two-column layout: scrollable tree + right-hand detail panel */
+    .tar-tree-layout { display: flex; gap: 16px; align-items: flex-start; margin-top: 12px; }
     .tar-tree-main { flex: 1 1 auto; min-width: 0; overflow-x: auto; }
     .tar-tree-side {
-      flex: 0 0 23rem; position: sticky; top: 0.5rem;
-      max-height: calc(100vh - 6rem); overflow: auto;
+      flex: 0 0 340px; max-height: calc(100vh - var(--shell-top-h) - 2rem); overflow: auto;
+      border: 1px solid var(--line); border-radius: var(--rad-panel);
     }
+    .tar-tree-side > div > .tar-tree-mute { padding: 14px 16px; font-size: 13px; }
     @media (max-width: 1000px) {
       .tar-tree-layout { flex-direction: column; }
       .tar-tree-side { position: static; flex-basis: auto; width: 100%; max-height: none; }
     }
 
     /* Detail panel */
-    .tar-detail {
-      margin-top: 0.75rem; padding: 0.75rem;
-      background: var(--mds-color-state-hover); border: 1px solid var(--border);
-      border-radius: 0.25rem; font-size: 0.8rem;
+    .tar-detail { font-size: 13.5px; }
+    .tar-detail-title { padding: 12px 16px; font-size: 14px; font-weight: 600; border-bottom: 1px solid var(--line); }
+    .tar-kv { display: flex; justify-content: space-between; gap: 16px; padding: 9px 16px; border-bottom: 1px solid var(--line); }
+    .tar-kv-k { flex: 0 0 auto; color: var(--mut); }
+    .tar-kv-v { min-width: 0; text-align: right; font-weight: 500; color: var(--ink); overflow-wrap: anywhere; }
+    code.tar-kv-v { font-weight: 400; }
+    .tar-kv-v.tar-tree-mute { font-weight: 400; color: var(--mut); }
+    .tar-detail-section { padding: 12px 16px 8px; font-size: 13px; font-weight: 600; }
+    .tar-detail-anom { padding: 10px 16px; color: var(--bad); border-bottom: 1px solid var(--line); }
+    .tar-detail > .tar-tree-mute { padding: 0 16px 14px; }
+    .tar-detail-conns { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    table.tar-detail-conns th, table.tar-detail-conns td {
+      text-align: left; padding: 6px 8px; white-space: nowrap; border-bottom: 1px solid var(--line);
     }
-    .tar-detail-title { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.5rem; }
-    .tar-kv { display: flex; gap: 0.6rem; padding: 0.15rem 0; }
-    .tar-kv-k { flex: 0 0 9rem; color: var(--mds-color-theme-text-tertiary); }
-    .tar-kv-v { color: var(--fg); word-break: break-all; }
-    .tar-detail-section { font-weight: 600; margin: 0.7rem 0 0.3rem; }
-    .tar-detail-anom { margin: 0.5rem 0; color: var(--mds-color-theme-indicator-error); }
-    .tar-detail-conns { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
-    .tar-detail-conns th, .tar-detail-conns td {
-      text-align: left; padding: 0.2rem 0.4rem; border-bottom: 1px solid var(--border);
-    }
-    .tar-detail-conns th { color: var(--mds-color-theme-text-tertiary); font-weight: 600; }
+    .tar-detail-conns th:first-child, .tar-detail-conns td:first-child { padding-left: 16px; }
+    table.tar-detail-conns th { font-weight: 500; color: var(--mut); background: var(--surface2); }
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate
 // (still one continuous <style> block in the rendered HTML).
 R"HTM(
     /* Device DNS/ARP panels (ADR-0015) — embedded below the process tree */
-    .devnet-row { display: flex; gap: 1rem; margin-top: 1rem; padding-top: 0.85rem;
-      border-top: 1px solid var(--border); flex-wrap: wrap; }
-    .devnet-panel { flex: 1 1 22rem; min-width: 18rem; border: 1px solid var(--border);
-      border-radius: 0.4rem; overflow: hidden; background: var(--mds-color-theme-background-canvas); }
+    .devnet-row { display: flex; gap: 16px; margin-top: 16px; padding-top: 16px;
+      border-top: 1px solid var(--line); flex-wrap: wrap; }
+    .devnet-panel { flex: 1 1 22rem; min-width: 18rem; overflow: hidden; background: var(--surface);
+      border: 1px solid var(--line); border-radius: var(--rad-panel); }
     .devnet-panel > summary { list-style: none; cursor: pointer; display: flex; align-items: center;
-      justify-content: space-between; gap: 0.5rem; padding: 0.55rem 0.8rem;
-      background: var(--mds-color-state-hover); font-size: 0.82rem; font-weight: 600; }
+      justify-content: space-between; gap: 8px; padding: 12px 16px; font-size: 14px; font-weight: 600; }
+    .devnet-panel[open] > summary { border-bottom: 1px solid var(--line); }
+    .devnet-panel > summary > span:first-of-type { flex: 1 1 auto; }
     .devnet-panel > summary::-webkit-details-marker { display: none; }
-    .devnet-panel > summary::before { content: "\25B8"; color: var(--mds-color-theme-text-tertiary);
-      font-size: 0.7rem; margin-right: 0.1rem; }
+    .devnet-panel > summary::before { content: "\25B8"; color: var(--faint); font-size: 11px; margin-right: 4px; }
     .devnet-panel[open] > summary::before { content: "\25BE"; }
-    .devnet-title-ico { color: var(--accent); margin-right: 0.35rem; }
-    .devnet-count { font-weight: 600; color: var(--fg); background: var(--mds-color-state-hover);
-      border-radius: 0.6rem; padding: 0 0.45rem; font-size: 0.7rem; }
+    .devnet-title-ico { color: var(--mut); margin-right: 6px; }
+    .devnet-count { font-weight: 500; color: var(--ink2); background: var(--surface2);
+      border-radius: 3px; padding: 0 8px; font-size: 12.5px; }
     .devnet-body { max-height: 18rem; overflow: auto; }
-    .devnet-table { width: 100%; border-collapse: collapse; font-family: var(--mono, monospace); font-size: 0.72rem; }
-    .devnet-table th { position: sticky; top: 0; background: var(--mds-color-theme-background-solid-secondary);
-      text-align: left; padding: 0.35rem 0.6rem; color: var(--mds-color-theme-text-tertiary); font-weight: 600;
-      font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 1px solid var(--border); }
-    .devnet-table td { padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
-    .devnet-table tr:last-child td { border-bottom: none; }
-    .devnet-table tr:hover { background: var(--mds-color-state-hover); }
-    .dn-type { color: var(--accent); }
-    .dn-data { color: var(--fg); }
-    .dn-ttl { color: var(--mds-color-theme-text-tertiary); text-align: right; font-variant-numeric: tabular-nums; }
-    .dn-src { color: var(--mds-color-theme-text-tertiary); }
-    .arp-mac { color: var(--fg); }
-    .arp-type-static { color: var(--mds-color-theme-text-tertiary); }
-    .arp-type-dynamic { color: var(--accent); }
-    .arp-type-other { color: var(--mds-color-theme-indicator-warning, #d6a500); } /* incomplete / unresolved */
-    .devnet-caveat { padding: 0.4rem 0.8rem; font-size: 0.68rem; color: var(--mds-color-theme-text-tertiary);
-      background: var(--surface); border-top: 1px solid var(--border); }
-    .devnet-empty { padding: 1.5rem; text-align: center; color: var(--mds-color-theme-text-tertiary); font-size: 0.78rem; }
+    .devnet-table { width: 100%; border-collapse: collapse;
+      font-family: var(--mds-font-family-mono); font-size: 12.5px; }
+    /* table.-prefixed: ties with look's (0,1,2) .tw table th/td and wins by source order */
+    table.devnet-table th { position: sticky; top: 0; background: var(--surface2); text-align: left;
+      padding: 6px 12px; color: var(--mut); font-weight: 500; border-bottom: 1px solid var(--line); }
+    table.devnet-table td { padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    /* Table-prefixed so the cell colours outrank look's .tw table td */
+    .devnet-table .dn-type { color: var(--ink); font-weight: 500; }
+    .devnet-table .dn-data, .devnet-table .arp-mac, .devnet-table .arp-type-dynamic { color: var(--ink2); }
+    .devnet-table .dn-ttl { color: var(--mut); text-align: right; }
+    .devnet-table .dn-src, .devnet-table .arp-type-static { color: var(--mut); }
+    .devnet-table .arp-type-other { color: var(--warn); } /* incomplete / unresolved */
+    .devnet-caveat { padding: 8px 16px; font-size: 12.5px; color: var(--mut); border-top: 1px solid var(--line); }
+    .devnet-empty { padding: 28px 16px; text-align: center; color: var(--mut); font-size: 14px; }
 
     /* Capture-sources frame (ADR-0015) — toggles, category filter, push guardrail */
-    .picker-row { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.9rem; flex-wrap: wrap; }
-    .picker-row label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--mds-color-theme-text-tertiary); font-weight: 600; }
-    .cat-filter { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
-    .filter-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--mds-color-theme-text-tertiary); font-weight: 600; margin-right: 0.2rem; }
-    #capTable .src-name { font-weight: 600; color: var(--fg); font-family: var(--mono, monospace); font-size: 0.82rem; }
-    #capTable .src-dollar { color: var(--mds-color-theme-text-tertiary); font-size: 0.72rem; font-family: var(--mono, monospace); }
-    #capTable .cat { font-size: 0.74rem; color: var(--fg); white-space: nowrap; }
-    .badge { display: inline-block; padding: 0.1rem 0.5rem; font-size: 0.68rem; font-weight: 600; border-radius: 0.75rem; }
-    .badge-new { background: var(--mds-color-bg-info-tinted); color: var(--accent); }
-    .badge-pii { background: var(--mds-color-bg-warning-tinted); color: var(--mds-color-indicator-warning-bright); }
-    .badge-rows { background: var(--mds-color-bg-neutral-tinted); color: var(--mds-color-theme-text-tertiary); font-family: var(--mono, monospace); }
-    .os-cell { font-size: 0.7rem; white-space: nowrap; }
-    .os-ok { color: var(--green); }
-    .os-con { color: var(--yellow); }
-    .os-planned { color: var(--mds-color-theme-text-tertiary); opacity: 0.7; }
-    .tgl { position: relative; display: inline-block; width: 38px; height: 20px; }
+    .cat-filter { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    #capTable .src-name { font-family: var(--mds-font-family-mono); font-size: 12.5px; font-weight: 500; color: var(--ink); }
+    #capTable .src-dollar { font-family: var(--mds-font-family-mono); font-size: 12px; color: var(--mut); }
+    #capTable .cat { color: var(--ink2); }
+    .badge-new { background: var(--mds-color-bg-info-tinted); color: var(--info); }
+    .badge-pii { background: var(--mds-color-bg-warning-tinted); color: var(--warn); }
+    .badge-rows { background: var(--surface2); color: var(--mut); font-family: var(--mds-font-family-mono); }
+    .os-cell { font-size: 12.5px; white-space: nowrap; }
+    #capTable .os-ok { color: var(--ok); }
+    #capTable .os-con { color: var(--warn); }
+    #capTable .os-planned { color: var(--mut); }
+    /* Switch (design .sw): 36x20 track, 16px square knob */
+    .tgl { position: relative; display: inline-block; flex: 0 0 36px; width: 36px; height: 20px; }
     .tgl input { opacity: 0; width: 0; height: 0; }
-    .tgl .sl { position: absolute; cursor: pointer; inset: 0; background: var(--mds-color-theme-outline-secondary); border-radius: 20px; transition: .15s; }
-    .tgl .sl:before { content: ""; position: absolute; height: 14px; width: 14px; left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: .15s; }
-    .tgl input:checked + .sl { background: var(--accent); }
-    .tgl input:checked + .sl:before { transform: translateX(18px); }
-    .tgl.locked .sl { background: var(--green); cursor: not-allowed; opacity: 0.55; }
-    .state-cell { display: flex; align-items: center; gap: 0.5rem; }
-    .state-txt { font-size: 0.72rem; color: var(--mds-color-theme-text-tertiary); }
-    .state-on { color: var(--green); font-weight: 600; }
-    .pending-txt { color: var(--mds-color-indicator-warning-bright) !important; font-weight: 600; }
-    #capTable tr.pending { box-shadow: inset 3px 0 0 var(--yellow); }
-    #capTable tr.pending td { background: var(--mds-color-bg-warning-tinted); }
-    .apply-bar { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.9rem; padding: 0.6rem 0.85rem; background: var(--mds-color-bg-warning-tinted); border: 1px solid var(--yellow); border-radius: 0.4rem; font-size: 0.82rem; }
-    .apply-icon { color: var(--mds-color-indicator-warning-bright); font-size: 1rem; }
+    .tgl .sl { position: absolute; cursor: pointer; inset: 0; background: var(--line2);
+      border-radius: 3px; transition: background-color .12s; }
+    .tgl .sl:before { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+      background: var(--raise); border-radius: 2px; transition: transform .12s; }
+    .tgl input:checked + .sl { background: var(--primary); }
+    .tgl input:checked + .sl:before { background: var(--on-primary); transform: translateX(16px); }
+    .tgl input:focus-visible + .sl { outline: 2px solid var(--focus); outline-offset: 2px; }
+    .tgl.locked .sl { cursor: not-allowed; opacity: 0.55; }
+    .state-cell { display: flex; align-items: center; gap: 10px; }
+    .state-txt { font-size: 12.5px; color: var(--mut); }
+    .state-on { color: var(--ok); font-weight: 500; }
+    .pending-txt { color: var(--warn); font-weight: 500; }
+    #capTable tr.pending td { background: color-mix(in srgb, var(--warn) 10%, transparent); }
+    #capTable tr.pending td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+    /* Notes and warning frame come from yuzu.css (.note.warn); only the flex row and margin are local */
+    .apply-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 16px; }
+    .apply-bar[hidden] { display: none; }
+    .apply-icon { color: var(--warn); }
     .apply-spacer { flex: 1; }
-    .apply-push { background: var(--accent); color: #fff; border: none; border-radius: 0.25rem; padding: 0.4rem 0.95rem; font-size: 0.8rem; cursor: pointer; font-weight: 600; }
-    .apply-push:hover { opacity: 0.9; }
+    @media (max-width: 640px) { .tar-content { padding: 16px; } }
   </style>
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals are
@@ -439,43 +291,19 @@ R"HTM(
 R"HTM(</head>
 <body>
 
-  <nav class="nav-bar">
-    <a href="/" class="nav-brand">
-      <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
-    </a>
-    <a href="/" class="nav-link">Dashboard</a>
-    <a href="/instructions" class="nav-link">Instructions</a>
-    <a href="/compliance" class="nav-link">Compliance</a>
-    <a href="/guardian" class="nav-link">Guardian</a>
-    <a href="/dex" class="nav-link">DEX</a>
-    <a href="/tar" class="nav-link active">TAR</a>
-    <a href="/hardware" class="nav-link">Hardware</a>
-    <a href="/software" class="nav-link">Software</a>
-    <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
-    <a href="/result-sets" class="nav-link">Result Sets</a>
-    <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
-    <span class="nav-spacer"></span>
-    <span class="nav-user" id="nav-user"></span>
-    <button class="nav-logout" hx-post="/logout">Logout</button>
-  </nav>
-  <div class="context-bar" id="context-bar">
-    <span class="context-role-badge" id="role-badge"></span>
-    <span class="context-user" id="context-user"></span>
-    <span class="context-spacer"></span>
-    <button class="context-bell" title="Notifications">
-      <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
-    </button>
-  </div>
+  <!--yuzu:shell--><!--/yuzu:shell-->
 
   <div class="tar-content">
-    <h1>TAR &mdash; Timeline Activity Record</h1>
-    <p class="tar-subtitle">
-      Forensic + inventory data warehouse on each agent. Disable a
-      collector to freeze its data for analysis; re-enable when finished.
-    </p>
+    <div class="tar-ph">
+      <h1>TAR</h1>
+      <p class="tar-subtitle">
+        Timeline Activity Record: what ran, what it connected to, and what
+        changed, recorded on each device.
+      </p>
+    </div>
 
     <!-- ── Retention-paused sources (Phase 15.A) ─────────────────────── -->
-    <div class="tar-frame" id="frame-retention-paused">
+    <div class="tar-frame panel" id="frame-retention-paused">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Retention-paused sources</h2>
         <div class="tar-frame-actions">
@@ -492,7 +320,7 @@ R"HTM(</head>
           </button>
         </div>
       </div>
-      <div class="tar-frame-body" id="retention-paused-body"
+      <div class="tar-frame-body tw" id="retention-paused-body"
            hx-get="/fragments/tar/retention-paused"
            hx-trigger="load"
            hx-swap="innerHTML">
@@ -503,11 +331,11 @@ R"HTM(</head>
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate.
 R"HTM(    <!-- ── Capture sources (ADR-0015) ───────────────────────────────── -->
-    <div class="tar-frame" id="frame-capture-sources">
+    <div class="tar-frame panel" id="frame-capture-sources">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Capture sources</h2>
       </div>
-      <div class="tar-frame-body" id="capture-sources"
+      <div class="tar-frame-body tw" id="capture-sources"
            hx-get="/fragments/tar/capture-sources" hx-trigger="load" hx-swap="innerHTML">
         <div class="placeholder">Loading capture sources&hellip;</div>
       </div>
@@ -539,46 +367,24 @@ R"HTM(    <!-- ── Capture sources (ADR-0015) ──────────�
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate.
 R"HTM(
-    <!-- ── Ad-hoc TAR SQL frame (Phase 15.D — scope walking) ────────── -->
-    <div class="tar-frame" id="frame-tar-sql">
+    <!-- Ad-hoc TAR SQL moved to Result sets > From TAR query (it carries the same parent
+         scope, SQL, name and include-empty fields, behind a confirm that shows the SQL). -->
+    <div class="tar-frame panel" id="frame-tar-sql">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Ad-hoc TAR SQL</h2>
-        <div class="tar-frame-actions">
-          <button class="btn-secondary" id="tar-sql-refresh-scopes"
-                  title="Reload your result sets">Refresh scopes</button>
-        </div>
       </div>
-      <div class="tar-frame-body">
-        <!-- Scope chip (design §8.3): pick the candidate scope this query
-             narrows. Submitting creates a NEW result set parented at the
-             selected set. Standard scopes (__all__) carry no parent. -->
-        <div class="scope-chip-row">
-          <label class="scope-chip-label" for="tar-sql-scope">Scope</label>
-          <select id="tar-sql-scope" class="scope-chip-select">
-            <option value="__all__">__all__ — entire fleet</option>
-          </select>
-          <span class="scope-chip-meta" id="tar-sql-scope-meta"></span>
-        </div>
-        <textarea id="tar-sql-text" class="tar-sql-textarea" rows="4" spellcheck="false"
-                  placeholder="SELECT DISTINCT pid FROM process_live WHERE name = 'chrome.exe'"></textarea>
-        <div class="tar-sql-controls">
-          <input type="text" id="tar-sql-name" class="tar-sql-name"
-                 placeholder="Name (optional) e.g. windows-chrome-suspects" maxlength="120">
-          <label class="tar-sql-empty">
-            <input type="checkbox" id="tar-sql-include-empty"> include responders with 0 rows
-          </label>
-          <button id="tar-sql-run">Run &amp; create result set</button>
-        </div>
-        <div class="tar-sql-result" id="tar-sql-result"></div>
+      <div class="tar-frame-body tar-pad tar-sql-moved">
+        Ad-hoc TAR queries now start from <a href="/result-sets">Result sets</a>: choose
+        <strong>From TAR query</strong> to run a SELECT on a scope and keep the devices that answer.
       </div>
     </div>
 
     <!-- ── Process tree viewer (Phase 15.H) ─────────────────────────── -->
-    <div class="tar-frame" id="frame-process-tree">
+    <div class="tar-frame panel" id="frame-process-tree">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Process tree viewer</h2>
       </div>
-      <div class="tar-frame-body">
+      <div class="tar-frame-body tw tar-pad">
         <!-- No hx-target here: the default target is this element itself. An
              explicit hx-target="this" would be INHERITED by descendants (the poll
              div), making their swaps clobber this whole frame body. -->
@@ -671,138 +477,12 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
     applyTarTreeFilters();
   }
 });
-fetch('/api/me').then(function(r){return r.json()}).then(function(d){
-  document.getElementById('nav-user').textContent = (d.display_name || d.username);
-  var role = d.rbac_role || d.role;
-  document.getElementById('role-badge').textContent = role;
-  document.getElementById('context-user').textContent = (d.display_name || d.username);
-  document.body.setAttribute('data-role', role);
-  if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
-    var sl = document.getElementById('nav-settings-link');
-    if(sl) sl.style.display = 'none';
-  }
-});
 
-// ── Scope-walking SQL frame (Phase 15.D) ─────────────────────────────────
-// Drives the scope chip + ad-hoc TAR SQL against the REST result-set API.
-// Selecting a scope picks the candidate set; running the query dispatches
-// tar.sql to that scope and creates a NEW result set parented at it, then
-// polls until the async maintenance thread materialises membership.
-(function() {
-  var scopeSel  = document.getElementById('tar-sql-scope');
-  var scopeMeta = document.getElementById('tar-sql-scope-meta');
-  var sqlText   = document.getElementById('tar-sql-text');
-  var nameInput = document.getElementById('tar-sql-name');
-  var emptyChk  = document.getElementById('tar-sql-include-empty');
-  var runBtn    = document.getElementById('tar-sql-run');
-  var resultBox = document.getElementById('tar-sql-result');
-  var refreshBtn= document.getElementById('tar-sql-refresh-scopes');
-  if (!scopeSel || !runBtn) return;
-
-  // id -> {name, device_count, status} for the meta line.
-  var scopeIndex = {};
-
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
-      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c];
-    });
-  }
-
-  function renderMeta() {
-    var v = scopeSel.value;
-    if (v === '__all__') { scopeMeta.textContent = 'entire fleet — no parent'; return; }
-    var s = scopeIndex[v];
-    if (!s) { scopeMeta.textContent = ''; return; }
-    var bits = [s.device_count + ' devices'];
-    if (s.status && s.status !== 'materialized') bits.push(s.status);
-    scopeMeta.textContent = bits.join(' · ');
-  }
-
-  function loadScopes() {
-    fetch('/api/v1/result-sets?limit=200').then(function(r){return r.json();}).then(function(j){
-      var sets = (j.data && j.data.result_sets) || [];
-      var keep = scopeSel.value;
-      scopeIndex = {};
-      while (scopeSel.options.length > 1) scopeSel.remove(1);
-      sets.forEach(function(s){
-        scopeIndex[s.id] = s;
-        var label = (s.name ? s.name : s.id) + ' — ' + s.device_count + ' devices'
-                  + (s.status && s.status !== 'materialized' ? ' (' + s.status + ')' : '');
-        var opt = document.createElement('option');
-        opt.value = s.id; opt.textContent = label;
-        scopeSel.appendChild(opt);
-      });
-      if (keep && (keep === '__all__' || scopeIndex[keep])) scopeSel.value = keep;
-      renderMeta();
-    }).catch(function(){ /* leave __all__ only */ });
-  }
-
-  // Poll a freshly-created pending set until membership materialises.
-  function pollSet(id, name, tries) {
-    fetch('/api/v1/result-sets/' + encodeURIComponent(id)).then(function(r){return r.json();})
-      .then(function(j){
-        var s = j.data || {};
-        if (s.status === 'pending' && tries > 0) {
-          setTimeout(function(){ pollSet(id, name, tries - 1); }, 2000);
-          return;
-        }
-        if (s.status === 'failed') {
-          resultBox.className = 'tar-sql-result error';
-          resultBox.innerHTML = 'Result set <code>' + esc(id) + '</code> failed to materialise.';
-        } else if (s.status === 'pending') {
-          resultBox.className = 'tar-sql-result';
-          resultBox.innerHTML = 'Result set <code>' + esc(id) + '</code> still pending — '
-            + '<a href="/result-sets">view in Result Sets</a>.';
-        } else {
-          resultBox.className = 'tar-sql-result';
-          resultBox.innerHTML = 'Created <code>' + esc(name || id) + '</code> — <strong>'
-            + esc(s.device_count) + '</strong> device(s). '
-            + 'Copy scope token <code>from_result_set:' + esc(id) + '</code> · '
-            + '<a href="/result-sets">open</a>';
-          loadScopes();
-        }
-        runBtn.disabled = false;
-      }).catch(function(){ runBtn.disabled = false; });
-  }
-
-  function run() {
-    var sql = sqlText.value.trim();
-    if (!sql) { showToast('Enter a SQL query', 'warning'); return; }
-    var body = { sql: sql, include_empty: !!emptyChk.checked };
-    var nm = nameInput.value.trim();
-    if (nm) body.name = nm;
-    if (scopeSel.value && scopeSel.value !== '__all__') body.parent_id = scopeSel.value;
-    runBtn.disabled = true;
-    resultBox.className = 'tar-sql-result';
-    resultBox.textContent = 'Dispatching to agents…';
-    fetch('/api/v1/result-sets/from-tar-query', {
-      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
-    }).then(function(r){ return r.json().then(function(j){ return {status:r.status, body:j}; }); })
-      .then(function(res){
-        if (res.status === 202 && res.body.data) {
-          var s = res.body.data;
-          resultBox.innerHTML = 'Dispatched (execution <code>' + esc(s.source_execution_id)
-            + '</code>) — awaiting responses…';
-          pollSet(s.id, s.name, 150);
-        } else {
-          var msg = (res.body.error && (res.body.error.message || res.body.error)) || 'request failed';
-          resultBox.className = 'tar-sql-result error';
-          resultBox.textContent = msg;
-          runBtn.disabled = false;
-        }
-      }).catch(function(){
-        resultBox.className = 'tar-sql-result error';
-        resultBox.textContent = 'network error';
-        runBtn.disabled = false;
-      });
-  }
-
-  scopeSel.addEventListener('change', renderMeta);
-  runBtn.addEventListener('click', run);
-  if (refreshBtn) refreshBtn.addEventListener('click', loadScopes);
-  loadScopes();
-})();
 </script>
 </body></html>
 )HTM";
+
+// The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
+extern const char* const kTarPageHtml =
+    yuzu::server::shell::bake(kTarPageTemplate, {.active_key = "tar"});
 // NOLINTEND(cert-err58-cpp)

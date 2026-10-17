@@ -303,6 +303,11 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
     // same way for pre-floor legacy rows.
     if (sched.frequency_type == "interval" && sched.interval_minutes < 1)
         return std::unexpected("interval_minutes must be >= 1");
+    // Ceiling guard: the route already caps this, so a larger value here is a non-route caller.
+    // advance_schedule is bigint-safe (below), but an interval past the cap is not a schedule.
+    if (sched.frequency_type == "interval" && sched.interval_minutes > kMaxScheduleIntervalMinutes)
+        return std::unexpected("interval_minutes must be <= " +
+                               std::to_string(kMaxScheduleIntervalMinutes));
     // Persistence-layer backstop (PR1.5a): schedule_routes.cpp already
     // validates+canonicalizes the caller-supplied `parameters` field before
     // it reaches here, but this call is what makes that guarantee hold for
@@ -321,13 +326,15 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
     // separate raw in-memory value to redact FROM: the persisted blob IS
     // what gets redispatched. Redacting it here would silently break
     // re-dispatch instead of merely protecting a history row, so a
-    // grant_secret-bearing schedule is refused outright — a single-
-    // redemption, ~15-minute-TTL credential cannot survive as a repeatable
-    // schedule regardless of this leak. See sensitive_instruction_params.hpp.
+    // schedule carrying a classified secret is refused outright — a single-
+    // redemption, ~15-minute-TTL grant cannot survive as a repeatable
+    // schedule, and a long-lived credential (client_secret) must not sit in
+    // the schedules table in the clear. See sensitive_instruction_params.hpp.
     if (schedule_params_contain_sensitive_key(*canon_params))
         return std::unexpected(
-            "parameters contain a one-time credential (grant_secret/grant_id) that cannot be "
-            "scheduled — mint a fresh grant and dispatch it directly instead");
+            "parameters contain a secret value (a grant secret or id, or a client secret) that "
+            "cannot be stored in a schedule — dispatch the instruction directly with a fresh "
+            "value instead");
 
     auto id = sched.id.empty() ? generate_id() : sched.id;
     auto now = now_epoch();
@@ -469,7 +476,12 @@ void ScheduleEngine::advance_schedule(const std::string& id) {
             "UPDATE schedule_engine.schedules SET "
             "  next_execution_at = CASE frequency_type "
             "    WHEN 'once' THEN 0 "
-            "    WHEN 'interval' THEN $1::bigint + GREATEST(interval_minutes, 1) * 60 "
+            // ::bigint BEFORE the multiply: interval_minutes is INTEGER, and int4 * int4 overflows
+            // (SQLSTATE 22003, the whole UPDATE fails and the row re-fires every tick) above
+            // 35791394. Rows stored before the create-time cap can hold up to INT32_MAX; as bigint
+            // seconds that is ~1.3e11, far inside next_execution_at's BIGINT, so no clamp is needed
+            // and a stored value keeps its meaning.
+            "    WHEN 'interval' THEN $1::bigint + GREATEST(interval_minutes, 1)::bigint * 60 "
             "    WHEN 'daily' THEN $1::bigint + 86400 "
             "    WHEN 'weekly' THEN $1::bigint + 604800 "
             "    WHEN 'monthly' THEN $1::bigint + 2592000 "

@@ -6,9 +6,13 @@
  */
 
 #include "execution_tracker.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <string>
@@ -307,6 +311,62 @@ TEST_CASE("ExecutionStatistics: agent stats with since filter",
     CHECK(stats[0].total_executions == 1); // only the recent one
 }
 
+TEST_CASE("ExecutionStatistics: since and until are presence-tracked and a literal 0 is not the "
+          "unbounded sentinel (#4644)",
+          "[pg][execution_statistics][since_until]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    const auto now = now_epoch();
+    const int64_t old_ts = now - 86400 * 30;
+    const int64_t recent_ts = now - 60;
+    auto e1 = make_exec("def-A", "succeeded", 1, 1, 0, old_ts, old_ts + 5);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+    insert_agent_status(tracker, *id1, "agent-1", "success", 0, old_ts, old_ts + 5);
+    auto e2 = make_exec("def-B", "succeeded", 1, 1, 0, recent_ts, recent_ts + 5);
+    auto id2 = tracker.create_execution(e2);
+    REQUIRE(id2.has_value());
+    insert_agent_status(tracker, *id2, "agent-1", "success", 0, recent_ts, recent_ts + 5);
+
+    const auto total_agent = [&](const ExecutionStatsQuery& q) {
+        const auto s = tracker.get_agent_statistics(q);
+        return s.empty() ? int64_t{0} : static_cast<int64_t>(s[0].total_executions);
+    };
+    const auto defs = [&](const ExecutionStatsQuery& q) {
+        return tracker.get_definition_statistics(q).size();
+    };
+
+    ExecutionStatsQuery none;
+    CHECK_FALSE(none.since.has_value());
+    CHECK_FALSE(none.until.has_value());
+    CHECK(total_agent(none) == 2);
+    CHECK(defs(none) == 2);
+
+    ExecutionStatsQuery since_zero;
+    since_zero.since = 0; // literal bound at the epoch: matches what unset matches
+    CHECK(total_agent(since_zero) == 2);
+    CHECK(defs(since_zero) == 2);
+
+    ExecutionStatsQuery until_old;
+    until_old.until = old_ts + 100; // inclusive upper bound keeps only the old one
+    CHECK(total_agent(until_old) == 1);
+    CHECK(defs(until_old) == 1);
+
+    // Presence, not a sentinel: a literal `until = 0` matches nothing. (No REST/MCP surface can
+    // send it; the type must still not read it back as unbounded.)
+    ExecutionStatsQuery until_zero;
+    until_zero.until = 0;
+    CHECK(total_agent(until_zero) == 0);
+    CHECK(defs(until_zero) == 0);
+
+    // The fleet summary takes the same presence-tracked bound.
+    const auto unbounded = tracker.get_fleet_summary();
+    CHECK(unbounded.total_executions == 2);
+    CHECK(tracker.get_fleet_summary(int64_t{0}).total_executions == unbounded.total_executions);
+    CHECK(tracker.get_fleet_summary(now - 3600).total_executions == 1);
+}
+
 TEST_CASE("ExecutionStatistics: agent stats limit",
           "[pg][execution_statistics][agent_stats]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
@@ -500,4 +560,84 @@ TEST_CASE("ExecutionStatistics: definition stats skips pending/running execution
     auto stats = tracker.get_definition_statistics();
     REQUIRE(stats.size() == 1);
     CHECK(stats[0].total_executions == 1); // only the succeeded one
+}
+
+// ============================================================================
+// #4644: a degraded read is distinguishable from "no executions"
+// ============================================================================
+
+TEST_CASE("ExecutionStatistics: try_get_* reports a degraded store as nullopt and not empty",
+          "[pg][execution_statistics][degrade]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    auto id = tracker.create_execution(make_exec("def-degrade", "succeeded", 1, 1, 0));
+    REQUIRE(id.has_value());
+    insert_agent_status(tracker, *id, "agent-1", "success");
+
+    // Healthy: a value, even when it is an honest empty one.
+    REQUIRE(tracker.try_get_agent_statistics().has_value());
+    CHECK(tracker.try_get_agent_statistics()->size() == 1);
+    ExecutionStatsQuery none;
+    none.visible_agents = std::vector<std::string>{}; // deny-all: honest empty, NOT a degrade
+    REQUIRE(tracker.try_get_agent_statistics(none).has_value());
+    CHECK(tracker.try_get_agent_statistics(none)->empty());
+    REQUIRE(tracker.try_get_fleet_summary().has_value());
+    CHECK(tracker.try_get_fleet_summary()->total_executions == 1);
+
+    // Degraded: every statistics query reads this table.
+    {
+        auto lease = tracker_bundle.pool().try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(), "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_4644",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    CHECK_FALSE(tracker.try_get_agent_statistics().has_value());
+    CHECK_FALSE(tracker.try_get_definition_statistics().has_value());
+    CHECK_FALSE(tracker.try_get_fleet_summary().has_value());
+    // The deny-all fast path answers before any query, so it stays an honest empty even while the
+    // store is degraded (a present-empty visible set reads nothing it could fail to read).
+    REQUIRE(tracker.try_get_agent_statistics(none).has_value());
+    CHECK(tracker.try_get_agent_statistics(none)->empty());
+    // The plain forms keep their documented collapse for callers that cannot report a degrade.
+    CHECK(tracker.get_agent_statistics().empty());
+    CHECK(tracker.get_fleet_summary().total_executions == 0);
+}
+
+// get_fleet_summary_checked: a store failure is not a genuine zero
+// ============================================================================
+
+static void drop_table(yuzu::test::ExecutionTrackerPg& rig, const char* sql) {
+    auto lease = rig.pool().acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+TEST_CASE("ExecutionStatistics: checked fleet summary reads an empty store as zeros",
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg rig;
+    auto s = rig->get_fleet_summary_checked();
+    REQUIRE(s.has_value());
+    CHECK(s->total_executions == 0);
+}
+
+TEST_CASE("ExecutionStatistics: checked fleet summary fails when the active-agent statement fails",
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg rig;
+    drop_table(rig, "DROP TABLE execution_tracker.agent_exec_status");
+    CHECK_FALSE(rig->get_fleet_summary_checked(0, true).has_value());
+    // The strip variant never touches that table.
+    CHECK(rig->get_fleet_summary_checked(0, false).has_value());
+    // The unchanged wrapper contract: failure reads as zeros.
+    CHECK(rig->get_fleet_summary().total_executions == 0);
+}
+
+TEST_CASE("ExecutionStatistics: checked fleet summary fails when the executions table is gone",
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg rig;
+    drop_table(rig, "DROP TABLE execution_tracker.executions CASCADE");
+    CHECK_FALSE(rig->get_fleet_summary_checked(0, false).has_value());
+    CHECK(rig->get_fleet_summary().total_executions == 0);
 }

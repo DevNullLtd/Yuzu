@@ -31,6 +31,7 @@
 #include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <libpq-fe.h>
 
@@ -381,10 +382,13 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
     h.store = &w.store;
     h.wire();
 
+    yuzu::test::LogCapture logs;
     auto put = h.sink.Put("/api/v1/plugin-config/firewall/kill-switch?action=block",
                           json{{"enabled", false}, {"reason", "incident 99"}}.dump());
+    logs.stop();
     REQUIRE(put);
     CHECK(put->status == 200);
+    CHECK(logs.text().find("covers a protective action") == std::string::npos); // ordinary pair: no warning
     auto data = body(put->body)["data"];
     CHECK(data["enabled"] == false);
     CHECK(data["action"] == "block");
@@ -395,6 +399,7 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
     CHECK(h.audits[0].action == "plugin_config.kill_switch.set");
     CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[0].target_id == "firewall.block");
+    CHECK(h.audits[0].detail == "enabled=false"); // ordinary pair: no protective label
     CHECK(h.audits[1].result == "success");
     CHECK(h.audits[1].target_id == "firewall.block");
 
@@ -407,10 +412,11 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
 // a dedicated reserved-namespace regression test during an earlier fix round
 // (test_mcp_server.cpp) — this REST route shares the identical
 // parse_kill_switch_scope pre-validation but had no equivalent case, the same
-// coverage gap in a different transport.
-TEST_CASE("plugin_config_routes: kill-switch PUT reaches the real dispatch chokepoint for "
-          "the reserved-namespace __guard__.push_rules capability, not just an ordinary "
-          "plugin.action",
+// coverage gap in a different transport. The row is stored and echoed but has
+// no dispatch effect for push_rules (a protective action).
+TEST_CASE("plugin_config_routes: kill-switch PUT writes and reads the reserved-namespace "
+          "__guard__.push_rules row through the real store (addressability only - not the "
+          "dispatch decision - see test_protective_action_dispatch_gate.cpp)",
           "[pg][server][routes][config][killswitch]") {
     YUZU_REQUIRE_PG_DB_TPL(db, route_tpl);
     PgWired w{db.dsn()};
@@ -421,13 +427,29 @@ TEST_CASE("plugin_config_routes: kill-switch PUT reaches the real dispatch choke
     // Baseline: no row yet — the #3265 regression shape exactly.
     CHECK(w.store.action_allowed("__guard__", "push_rules"));
 
+    yuzu::test::LogCapture logs;
     auto put = h.sink.Put("/api/v1/plugin-config/__guard__/kill-switch?action=push_rules",
                           json{{"enabled", false}, {"reason", "incident"}}.dump());
+    logs.stop();
     REQUIRE(put);
     CHECK(put->status == 200);
     CHECK(body(put->body)["data"]["enabled"] == false);
 
-    // Proven against the real chokepoint, not the echoed response.
+    // Exactly one warning, naming the scope key, emitted after the successful store.
+    const auto text = logs.text();
+    const auto first = text.find("covers a protective action");
+    CHECK(first != std::string::npos);
+    CHECK(text.find("covers a protective action", first + 1) == std::string::npos);
+    CHECK(text.find("__guard__.push_rules") != std::string::npos);
+
+    // The audit evidence says the row is inert for dispatch: a stored OFF row
+    // on a protective pair must never read as proof of a stop.
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].detail == "enabled=false, protective_exempt=true");
+    CHECK(h.audits[1].detail == "enabled=false, protective_exempt=true");
+
+    // Proven against the real store accessor, not the echoed response (the
+    // stored row, not the dispatch decision: a protective pair is exempt).
     CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
 
     auto put_on = h.sink.Put("/api/v1/plugin-config/__guard__/kill-switch?action=push_rules",
@@ -462,6 +484,16 @@ TEST_CASE("plugin_config_routes: a dropped audit row fails the write closed (503
     auto ks_entry = w.store.get_kill_switch("firewall", "");
     REQUIRE(ks_entry.has_value());
     CHECK(ks_entry->enabled); // still default-enabled — the flip never landed
+
+    // A protective pair refused at the audit gate must not log the "row stored"
+    // warning: the warn is emitted only once the row is stored.
+    yuzu::test::LogCapture logs;
+    auto guard_put = h.sink.Put("/api/v1/plugin-config/__guard__/kill-switch?action=push_rules",
+                                R"({"enabled":false,"reason":"x"})");
+    logs.stop();
+    REQUIRE(guard_put);
+    CHECK(guard_put->status == 503);
+    CHECK(logs.text().find("covers a protective action") == std::string::npos);
 
     auto secret_put = h.sink.Put("/api/v1/plugin-config/email/api_key/secret",
                                  R"({"value":"sk_never_committed"})");

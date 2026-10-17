@@ -976,6 +976,56 @@ TEST_CASE("query_software keyset paging walks to an empty page in (name, agent_i
     CHECK(bravo.size() == 3);
 }
 
+TEST_CASE("query_software skip passes over rows after the keyset position, in SQL",
+          "[pg][software_inventory][extended_row]") {
+    SWINV_SHARED(store, pool);
+    auto mk = [](const char* name) {
+        SoftwareEntry e;
+        e.name = name;
+        e.version = "1";
+        e.source = "installed_apps.list_inventory";
+        return e;
+    };
+    for (const char* agent : {"agent-a", "agent-b", "agent-c", "agent-d"})
+        REQUIRE(store.apply_installed_software(
+                    agent, "", std::vector<SoftwareEntry>{mk("alpha"), mk("bravo")}, 1000) ==
+                InventoryIngestOutcome::kStored);
+    // order: alpha a b c d, bravo a b c d (8 rows)
+    auto ids = [&](const SoftwareFleetQuery& q) {
+        auto page = store.query_software(q);
+        REQUIRE(page.has_value());
+        std::vector<std::string> out;
+        for (const auto& r : *page)
+            out.push_back(r.entry.name + "/" + r.agent_id);
+        return out;
+    };
+    SoftwareFleetQuery q;
+    q.limit = 2;
+    q.skip = 3; // from the start: pass alpha a, b, c
+    CHECK(ids(q) == std::vector<std::string>{"alpha/agent-d", "bravo/agent-a"});
+
+    auto first = store.query_software(SoftwareFleetQuery{.limit = 1});
+    REQUIRE(first.has_value());
+    REQUIRE(first->size() == 1);
+    const auto& a1 = first->front();
+    q.after = SoftwareCursor{a1.entry.name, a1.agent_id, a1.install_id}; // after alpha/agent-a
+    q.skip = 2;                                                           // pass b, c
+    CHECK(ids(q) == std::vector<std::string>{"alpha/agent-d", "bravo/agent-a"});
+
+    q.skip = 100; // past the end: an empty page, not an error
+    CHECK(ids(q).empty());
+
+    q.skip = 1; // composes with the scope push-down: skip counts rows of the filtered set
+    q.agent_ids = std::vector<std::string>{"agent-b", "agent-d"};
+    CHECK(ids(q) == std::vector<std::string>{"alpha/agent-d", "bravo/agent-b"});
+
+    q.agent_ids.reset(); // ...and with the bounded q arm
+    q.q = "bravo";
+    q.after.reset();
+    q.skip = 3;
+    CHECK(ids(q) == std::vector<std::string>{"bravo/agent-d"});
+}
+
 TEST_CASE("migration v7 backfills '' + install_id into pre-existing rows and re-runs "
           "idempotently",
           "[pg][software_inventory][extended_row]") {
@@ -2368,7 +2418,7 @@ TEST_CASE("Installs-by-OS is exact and the CASE SQL mirrors the C++ table",
     std::string values;
     for (const auto& e : sc::kEcosystemFamilies)
         values += "('" + std::string(e.ecosystem) + "'),";
-    values += "(''),('snap')";
+    values += "(''),('zypper')"; // snap is a published spelling; zypper is not
     auto r = run_sql(pool, "SELECT ecosystem, " + sc::os_family_case_sql() + " FROM (VALUES " +
                                values + ") v(ecosystem)");
     const int published = static_cast<int>(sc::kEcosystemFamilies.size());
@@ -2718,4 +2768,240 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
                                       "ORDER BY device_count DESC, name");
         CHECK(PQntuples(old_read.get()) == n_titles);
     }
+}
+
+// ── software_catalog_totals ────────────────────────────────────────
+
+TEST_CASE("catalogue totals: unfiltered totals equal the refreshed meta", "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    const auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    const auto t = store.software_catalog_totals({});
+    REQUIRE(t.has_value());
+    CHECK(t->titles == meta->total_titles);
+    CHECK(t->installs == meta->total_installs);
+    // d1 carries two titles, so installs (4) exceeds distinct devices (3): sums per title.
+    CHECK(t->titles == 2);
+    CHECK(t->installs == 4);
+}
+
+TEST_CASE("catalogue totals: filtered totals equal the page-walk over the same filters",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    for (const SoftwareCatalogQuery& base :
+         {SoftwareCatalogQuery{.q = "git"}, SoftwareCatalogQuery{.ecosystem = "brew"},
+          SoftwareCatalogQuery{.source = kSrcApps},
+          SoftwareCatalogQuery{.kind = "package", .versions_min = 2},
+          // host path: the same predicate, one device
+          SoftwareCatalogQuery{.agent_id = "d1"},
+          SoftwareCatalogQuery{.kind = "package", .agent_id = "d1"},
+          SoftwareCatalogQuery{.ecosystem = "brew", .agent_id = "d1"},
+          SoftwareCatalogQuery{.source = kSrcApps, .agent_id = "d1"},
+          SoftwareCatalogQuery{.q = "chrom", .agent_id = "d1"}, SoftwareCatalogQuery{}}) {
+        std::int64_t titles = 0, installs = 0;
+        std::optional<SoftwareCatalogCursor> after;
+        for (int page = 0; page < 10; ++page) {
+            auto q = base;
+            q.limit = 1;
+            q.after = after;
+            auto rows = store.software_catalog(q);
+            REQUIRE(rows.has_value());
+            if (rows->empty())
+                break;
+            titles += static_cast<std::int64_t>(rows->size());
+            for (const auto& r : *rows)
+                installs += r.device_count;
+            after = SoftwareCatalogCursor{rows->back().device_count, rows->back().name};
+        }
+        CAPTURE(base.q, base.ecosystem, base.kind, base.source, base.agent_id, base.versions_min);
+        REQUIRE(titles > 0); // a zero == zero comparison would pass for any totals bug
+        const auto t = store.software_catalog_totals(base);
+        REQUIRE(t.has_value());
+        CHECK(t->titles == titles);
+        CHECK(t->installs == installs);
+        // limit/after are ignored by totals
+        auto paged = base;
+        paged.limit = 1;
+        paged.after = SoftwareCatalogCursor{1, "zzz"};
+        CHECK(store.software_catalog_totals(paged)->titles == titles);
+    }
+    // The filter really narrows: ecosystem=brew drops the rpm-only/macos-only cases.
+    CHECK(store.software_catalog_totals({.ecosystem = "brew"})->installs == 2);
+    CHECK(store.software_catalog_totals({.q = "git"})->installs == 3);
+    // source=installed_apps.list_inventory: git's pkgutil copy (d1) + Chrome (d1).
+    CHECK(store.software_catalog_totals({.source = kSrcApps})->installs == 2);
+    CHECK(store.software_catalog_totals({.source = kSrcApps, .agent_id = "d1"})->titles == 2);
+    CHECK(store.software_catalog_totals({.source = kSrcPkg, .agent_id = "d1"})->titles == 1);
+}
+
+TEST_CASE("catalogue totals + host keyset walk (host `after` lives in HAVING)",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    SoftwareCatalogQuery q;
+    q.agent_id = "d1";
+    const auto t = store.software_catalog_totals(q);
+    REQUIRE(t.has_value());
+    CHECK(t->titles == 2);
+    CHECK(t->installs == 2); // one device: installs == titles by construction
+
+    std::vector<std::string> walked;
+    std::optional<SoftwareCatalogCursor> after;
+    for (int page = 0; page < 5; ++page) {
+        auto pq = q;
+        pq.limit = 1;
+        pq.after = after;
+        auto rows = store.software_catalog(pq);
+        REQUIRE(rows.has_value());
+        if (rows->empty())
+            break;
+        walked.push_back(rows->front().name);
+        after = SoftwareCatalogCursor{rows->front().device_count, rows->front().name};
+    }
+    CHECK(walked == std::vector<std::string>{"Chrome", "git"}); // no duplicate, no skip
+
+    q.versions_min = 2; // d1 carries one version of each title
+    CHECK(store.software_catalog_totals(q)->titles == 0);
+    q.versions_min = 0;
+    q.agent_id = "nobody";
+    CHECK(store.software_catalog_totals(q)->titles == 0);
+}
+
+TEST_CASE("catalogue totals degrade to nullopt and never a zero", "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    SECTION("schema dropped under an open store") {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        SoftwareInventoryStore store{pool};
+        REQUIRE(store.is_open());
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(store.software_catalog_totals({}).has_value());
+    }
+    SECTION("pool starved (the only lease is held)") {
+        PgPool one{{.conninfo = db.dsn(), .size = 1}};
+        REQUIRE(one.valid());
+        SoftwareInventoryStore store{one};
+        REQUIRE(store.is_open());
+        auto held = one.acquire();
+        CHECK_FALSE(store.software_catalog_totals({}).has_value());
+    }
+    SECTION("store not open") {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "DELETE FROM public.schema_meta WHERE store = "
+                                    "'software_inventory_store'",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        SoftwareInventoryStore store{pool}; // the v1 re-run over live tables fails the open
+        REQUIRE_FALSE(store.is_open());
+        CHECK_FALSE(store.software_catalog_totals({}).has_value());
+        CHECK_FALSE(store.software_catalog_totals({.agent_id = "d1"}).has_value());
+    }
+}
+
+TEST_CASE("source_last_seen_bulk returns the receipt time per agent and omits the unreported",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", ""}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software("agent-a", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("agent-b", h, rows, 2000) ==
+            InventoryIngestOutcome::kStored);
+    auto b_before = store.source_last_seen("agent-b", "installed_software");
+    REQUIRE(b_before.has_value());
+    // A hash-only touch never regresses last_seen.
+    REQUIRE(store.apply_installed_software("agent-b", h, std::nullopt, 3000) ==
+            InventoryIngestOutcome::kTouched);
+
+    auto got = store.source_last_seen_bulk("installed_software",
+                                           {"agent-a", "agent-b", "agent-never"});
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 2);
+    // last_seen is the SERVER receipt time (#1685), never the caller-supplied timestamp.
+    CHECK(got->at("agent-a") > 1'000'000'000); // a real wall-clock epoch, not the 1000/2000/3000 passed in
+    CHECK(got->at("agent-b") >= *b_before); // the touch never moves it backwards
+    CHECK_FALSE(got->contains("agent-never")); // absent, never a 0
+    // Same datum the Hardware record shows, read one device at a time.
+    for (const char* id : {"agent-a", "agent-b"}) {
+        auto one = store.source_last_seen(id, "installed_software");
+        REQUIRE(one.has_value());
+        CHECK(got->at(id) == *one);
+    }
+    // Another source is a different row set.
+    auto other = store.source_last_seen_bulk("device_ci", {"agent-a"});
+    REQUIRE(other.has_value());
+    CHECK(other->empty());
+}
+
+TEST_CASE("source_last_seen_bulk: empty inputs are a precondition miss, not a degrade",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    auto no_ids = store.source_last_seen_bulk("installed_software", {});
+    REQUIRE(no_ids.has_value());
+    CHECK(no_ids->empty());
+    auto no_source = store.source_last_seen_bulk("", {"agent-a"});
+    REQUIRE(no_source.has_value());
+    CHECK(no_source->empty());
+}
+
+TEST_CASE("source_last_seen_bulk degrades to nullopt, never an empty map", "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    SECTION("schema dropped under an open store") {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        SoftwareInventoryStore store{pool};
+        REQUIRE(store.is_open());
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(store.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+    }
+    SECTION("pool starved (the only lease is held)") {
+        PgPool one{{.conninfo = db.dsn(), .size = 1}};
+        REQUIRE(one.valid());
+        SoftwareInventoryStore store{one};
+        REQUIRE(store.is_open());
+        auto held = one.acquire();
+        CHECK_FALSE(store.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+    }
+}
+
+TEST_CASE("source_last_seen_bulk: a store that never opened is a degrade", "[pg][software_inventory]") {
+    // DDL, so a private template clone (the macro drops it): nothing to restore if a REQUIRE throws.
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    // Rename a column the open-time projection probes, so a store fails closed (the same
+    // technique the schema-guard test uses).
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE software_inventory_store.inventory_state RENAME COLUMN last_seen TO "
+            "last_seen_gone",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareInventoryStore broken{pool};
+    REQUIRE_FALSE(broken.is_open());
+    CHECK_FALSE(broken.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
 }

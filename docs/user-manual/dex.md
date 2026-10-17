@@ -8,7 +8,7 @@ picture of what the workforce actually experiences on their machines. It does
 **not** author or enforce anything (that is [Guardian](guaranteed-state.md)); it
 only reads and aggregates.
 
-It is reached from the **DEX** link in the dashboard nav, or directly at
+It is reached from the **DEX** entry in the sidebar, or directly at
 `/dex`. Access requires the **`GuaranteedState:Read`** permission.
 
 ## The eight views
@@ -16,7 +16,9 @@ It is reached from the **DEX** link in the dashboard nav, or directly at
 DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
 links* into seven deep pages. A shared sub-nav switches between **Overview ·
 Apps · Catalogue · Health score · Trends · Performance · App Performance ·
-Network**; the window selector (below) applies to the signal views (Performance
+Network · Alerts**; the Alerts tab is the configuration page for DEX alert
+routing and is for administrators only (anyone else sees a role note). The
+window selector (below) applies to the signal views (Performance
 and Network are now-views — see below). The Network view also has its own URL,
 `/network`, but it is a DEX sub-view, not a standalone top-level nav item.
 
@@ -60,9 +62,12 @@ tab's application trend), joined on the same process-image key an application's 
 and perf identity already share on Windows/Linux — an exact match, not a
 name-normalized guess. Attribution of repository/install/service signals to the
 originating app is a follow-on slice; the Apps tab today scopes to crash and
-hang signals only. Per-version crash/hang *counts* on the performance trend
-(as opposed to the per-app crash/hang totals already shown here) remain
-deferred — see "Fleet-wide application performance" under Drill-downs.
+hang signals only. The Apps API (`GET /api/v1/dex/apps`) now also carries per-version
+figures, the Windows devices online now as the population, exact intervals and the stability score with its
+decomposition (the share and rate count only affected devices that are online now, so one population on both sides, while the crash and device counts cover the whole window; the score is withheld as `offline_affected` when any affected device is offline, which on a fleet with laptops or off-hours devices will be the common case for applications with several affected devices; the figures vary with the time of day, so read the share and rate against `distinct_devices_online` / `distinct_devices`, see #5894 for an offline-aware score); the tab itself follows in a later change. Tab counts are all platforms; the API counts Windows devices only and keeps the 100 applications affecting the most devices (`apps_total` and `apps_truncated` report the cut), so the same application can show different crashes and devices on the two surfaces until the tab is rewired. Per-version crash/hang *counts* on the performance trend
+(as opposed to the per-app crash/hang totals already shown here) are not
+rendered on the Apps tab; `GET /api/v1/dex/perf/app` carries them per version
+— see "Fleet-wide application performance" under Drill-downs.
 
 ### Catalogue
 
@@ -140,9 +145,9 @@ server-side series store).
   key from the selector — e.g. an `image` key compares a vanilla VDI image
   against a layered one on identical hardware). Cohorts come from tags, not
   from a central inventory column: tag the fleet via the tag API (see the
-  asset-tagging guide) and the comparison appears. Honesty rules: cohorts
-  under **10 reporting devices** show "n too small" instead of noisy
-  percentiles, and devices without the chosen key always appear as an explicit
+  asset-tagging guide) and the comparison appears. Honesty rules: the one-device floor
+  means a cohort is published whenever at least one device reported (only an empty
+  cohort shows "n too small"; a cohort keyed by a per-device tag value with one device is that device's exact figures), and devices without the chosen key always appear as an explicit
   **(untagged)** residual row.
 - **Everything drills.** Each metric card opens the worst devices by that
   metric; the Reporting card opens the devices *not* reporting; each cohort
@@ -204,9 +209,9 @@ numbers match.
   gets its own row with avg/p95 CPU, a CPU sparkline, avg working set, and the
   reporting device count, over the retained fleet window (≤180 days) or, when a
   management group **or a device model** is selected, that cohort's on-the-fly
-  aggregate (≤31 days, sub-10-device points suppressed to a count only — the
-  same floor either way, since a named tag-value cohort is a set of specific
-  devices exactly like a management group). The two cohort selectors
+  aggregate (≤31 days; the cohort floor is one device, so only an empty point
+  is suppressed to a count — the same floor either way, since a named tag-value
+  cohort is a set of specific devices exactly like a management group). The two cohort selectors
   (**Scope**, by management group, and **Model**, by device-tag value) are
   **mutually exclusive**: picking one clears the other, and a management
   group takes precedence if a URL somehow names both. Choosing a model calls
@@ -228,9 +233,43 @@ numbers match.
   narrows the trend to one version at a time (the same `version` parameter the
   `GET /api/v1/dex/perf/app` / `/perf/group` / `/perf/tag` endpoints already
   accept); "all
-  versions" is the default. Per-version crash/hang counts are not shown here
-  yet (a separate central crash-store join, still deferred) — use the
-  per-application crash/hang drill above for those.
+  versions" is the default.
+  On the **whole-fleet** scope a second table, **Crashes and hangs by
+  version**, sits under the performance table; it renders the same
+  `versions[]` join that `GET /api/v1/dex/perf/app` and the `get_dex_app_perf`
+  MCP tool return. Its columns are **Crashes**, **Hangs** and **Affected
+  devices** (fleet-wide counts at any device count; `0` means no events were
+  reported), **Exposed devices**, **Failure rate** and **Rate vs previous
+  version**. Read it with these rules:
+  - **Every rate sits beside its population.** The failure rate is exposed
+    events per exposed device over the window, shown per 1,000 exposed devices
+    with its 95 percent interval and the exposed-device count it came from. A
+    `reliable` marker means 20 or more events; "under 20 events" flags a small
+    count and the interval stays on screen either way. It is not a rate per day
+    of use, so read it beside the "seen on N days" line under each version.
+  - **Exposed devices are sampled devices, not a census.** Only a device's top
+    resource-consuming applications each day are sampled, so a device running
+    the version can be missing from the count. An **unknown** exposure (no
+    sample rows for the version) is shown as "unknown", never as 0, and shows no
+    rate; a known `0` shows "no exposed devices". A row with affected devices
+    and an unknown exposure is failures recorded under a version that has no
+    samples.
+  - **The ratio against the previous version** needs a known, positive
+    exposure on both versions. When the previous version had no exposed events
+    the page says "no upper bound" and prints only the interval's lower end. A
+    missing ratio states why (no older version listed, exposure missing on one
+    side, or no exposed events on either).
+  - **The window and the cap are stated:** "last N days" (the failure window,
+    29 at the default 30-day observation retention) and, when more than 20
+    versions exist, "Showing the 20 newest versions". A version with no
+    performance rows is not listed, so a missing row is not the absence of
+    failures.
+  - **A non-zero `stat_failures`** is shown as a fault banner (an unexpected
+    condition), and a **degraded read** shows a failed-read note with a retry
+    link while the performance table above stays; it is never a table of zeros.
+  - Nothing is labelled good or bad: there are no status colours on the
+    figures. A management-group or device-model scope does not show this table,
+    because crashes and hangs are recorded fleet-wide.
   On the **fleet-wide** view (no management-group or device-model scope), each version row
   has a **&#9656; devices** affordance that expands in place to list the
   devices behind that number — `agent_id`, last-seen day, and that day's CPU /
@@ -294,8 +333,8 @@ numbers match.
   heartbeat values against the current fleet p50–p90 band (the marker turns
   red above the fleet p90) and show its percentile position in the fleet and
   in its cohort — rendered live from registry state, no query dispatched, and
-  the cohort comparison is withheld below the 10-device floor with an honest
-  caption.
+  the cohort comparison is withheld only when the cohort has no reporting
+  devices (the floor is one device), with an honest caption.
 
   A separate **Top applications** panel queries the device's opt-in per-app
   tier (`$ProcPerf_Hourly`, process **names only** — never command lines)
@@ -382,7 +421,10 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/perf/apps`** — the application-performance-over-time picker
   (apps with retained fleet data; `{app_name, versions, last_day}`).
 - **`GET /api/v1/dex/perf/app?app=&version=`** — the fleet trend for one app, one
-  point per `(version, day)` over the retained B2 window (≤180 days).
+  point per `(version, day)` over the retained B2 window (≤180 days), plus a
+  per-version `versions[]` join of crash and hang counts, exposure and the
+  exposed-device failure rate and rate ratio (no device floor on the join; the
+  point floor is one device — see the REST reference).
 - **`GET /api/v1/dex/perf/app/devices?app=&version=`** — the version-row "which
   devices" drill: devices reporting one EXACT `(app, version)` among their
   retained top-N daily summaries (B1, ≤31 days), one row per device (`agent_id`,
@@ -419,8 +461,10 @@ view; the rollup, scope, and true aggregate perf endpoints (`/perf/fleet`,
 `/perf/cohorts`, `/perf/cohort-diff`, `/perf/apps`, `/perf/app`, `/perf/group`,
 `/perf/tag`)
 are machine-health telemetry / fleet metadata and are not audited — and the
-app-perf aggregates suppress any sub-floor `(version, day)` point (fewer than
-10 devices) to a count only. **`/perf/devices` and `/perf/app/devices` are the
+app-perf aggregates publish every `(version, day)` point with at least one
+device (the cohort floor is one device — maintainer ruling, 2026-10-14; only an
+empty point is reduced to a count), and the per-version crash and hang join on
+`/perf/app` carries no device floor (see the REST reference). **`/perf/devices` and `/perf/app/devices` are the
 exceptions**: each row names an `agent_id` fleet-wide (or, for `/perf/app/
 devices`, the caller's visible subset), so unlike their aggregate siblings
 they ARE audited — `/perf/devices` as `dex.perf.device.view` (fail-closed,
@@ -513,7 +557,7 @@ A standing incident re-alerts at most once per cooldown period (per-pair), and
 a global per-minute fan-out cap keeps a correlated multi-subject incident (e.g.
 a bad update crashing many apps at once) from flooding your ITSM. The
 thresholds (default **5 devices / 15 min window / 1 h cooldown**) are
-**operator-tunable under Settings → DEX alerts** and apply immediately — no
+**operator-tunable on the DEX → Alerts tab** and apply immediately — no
 restart. The memory and fan-out bounds are not configurable (they are DoS
 posture, not policy). Detector activity is observable via the
 `yuzu_server_dex_blast_radius_*` Prometheus metrics. Subscribe to the event in
@@ -522,7 +566,7 @@ posture, not policy). Detector activity is observable via the
 ## Routing signals to alerts
 
 Beyond fleet incidents, you can route **individual signal types** to alerts
-under **Settings → DEX alerts**: tick the types you care about (grouped by the
+on the **DEX → Alerts** tab: tick the types you care about (grouped by the
 same families as the Catalogue) and each routed observation raises an operator
 notification and fires the **`dex.signal`** webhook/offload event
 (`obs_type`, `subject`, `agent_id`) — **once per device per hour** per type, so
@@ -561,7 +605,7 @@ rejected; percentages clamp at 100) so a single misbehaving agent cannot poison
 a fleet percentile. Agents with `--dex-disable` ship no perf tags at all.
 
 **Per-cohort export (opt-in).** Setting a **cohort export tag key** in
-Settings → DEX alerts additionally publishes the same stats per cohort of that
+The DEX → Alerts tab additionally publishes the same stats per cohort of that
 key:
 
 | Gauge | Meaning |
@@ -572,8 +616,8 @@ key:
 | `yuzu_fleet_perf_cohort_reporting{cohort}` | reporting devices per exported cohort |
 | `yuzu_fleet_perf_cohort_clipped` | exportable cohorts dropped by the cardinality cap (a measured 0 when nothing was cut; absent when the export is off) |
 
-Cardinality is bounded by design: only cohorts with **≥ 10 reporting devices**
-export, capped at the **top 50 by population**, and clipping is visible via
+Cardinality is bounded by design: only cohorts with **at least one reporting device**
+export (the one-device floor: an empty cohort is withheld), capped at the **top 50 by population**, and clipping is visible via
 the `_clipped` gauge rather than silent. Devices without the key export as
 `cohort="(untagged)"`. The export refreshes on the same sweep — and through
 the same validation — as the fleet gauges, so Grafana, the REST API and the

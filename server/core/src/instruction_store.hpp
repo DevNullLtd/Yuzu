@@ -78,6 +78,7 @@
 #include <expected>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server::pg {
@@ -143,6 +144,10 @@ struct InstructionQuery {
     bool enabled_only{false};
     int limit{100};
 };
+
+/// Upper bounds on a set's name and description, shared by the store and the page dialog.
+inline constexpr std::size_t kMaxInstructionSetNameLen = 128;
+inline constexpr std::size_t kMaxInstructionSetDescriptionLen = 512;
 
 struct InstructionSet {
     std::string id;
@@ -233,6 +238,11 @@ public:
     std::expected<std::vector<InstructionDefinition>, std::string>
     query_definitions(const InstructionQuery& q = {}) const;
 
+    /// Exact definition count per instruction set (only sets with at least one member), via
+    /// GROUP BY - unlike counting a truncated `query_definitions` page, never capped.
+    std::expected<std::unordered_map<std::string, std::size_t>, std::string>
+    count_definitions_per_set() const;
+
     /// `nullopt` = a successful read finding none; `unexpected(msg)` (prefixed
     /// `kInstructionStoreDbErrorPrefix`) = a genuine read failure — never treat the latter as
     /// "not found." Matches `ProductPackStore::get`'s exact shape.
@@ -246,7 +256,14 @@ public:
     /// loaded copy back: the PUT route and the response-template persist blank
     /// `parameter_schema` on the loaded definition before calling this, and the YAML editor builds
     /// its definition from the YAML, which carries none.
-    std::expected<void, std::string> update_definition(const InstructionDefinition& def);
+    /// `expected_updated_at` is an optimistic-concurrency check: when set, the UPDATE only
+    /// applies if the stored row still carries that `updated_at`, otherwise the error is
+    /// `kConflictPrefix`-tagged ("modified since it was loaded") and nothing is written.
+    /// ponytail: `updated_at` is epoch SECONDS, so two saves inside one second both pass;
+    /// a version column would close it but needs a migration.
+    std::expected<void, std::string>
+    update_definition(const InstructionDefinition& def,
+                      std::optional<std::int64_t> expected_updated_at = std::nullopt);
 
     /// `unexpected("not_found: ...")` when no definition with this id exists; any other
     /// `unexpected(msg)` (prefixed `kInstructionStoreDbErrorPrefix`) is a genuine failure.

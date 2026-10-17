@@ -91,7 +91,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 1. **The in-server dashboard's in-process store access** (`*_ui.cpp`, `/fragments/*`). Grandfathered until the strangler migration reaches each surface. No NEW private seam may be added; new capability on a grandfathered surface must be API-first (Decision 4).
 2. **Server-side NVD sync + CVE matching** (capability-map 9.4, shipped). In-server interpretation by Decision 2's test; grandfathered until re-homed into the first use-case module. The agent-side `vuln_scan` collection plugin is mechanism (Decision 2) and is NOT grandfathered — it stays core. Roadmap phases 18.1 (CVE lifecycle store), 18.2 (auditor-ready compliance bundles), and 18.5 (SBOM CVE linkage) are **boundary-affected**: on acceptance they must be re-evaluated against Decision 2 before implementation. **Extended 2026-07-07:** the ADR-0023 in-server correlation stack (the shipped `NvdDatabase::assess()` and `VulnFindingStore`, and the `VulnCorrelationEngine` + triggers + `Vulnerability:Scan` securable + findings routes that ADR planned — 18.1-flavoured work authored in parallel with this ADR) is **absorbed into this same grandfathered surface**: interim capability, re-homed and deleted by the same strangler sequence. The absorption is **bounded**: it covers ADR-0023's designed scope only (vuln-roadmap M1a/M1b) and it is **placement-only** — Decision 4 (API-first), full governance, ADR-0017 confinement, and ADR-0023's own securable/audit obligations apply to every further in-server vuln PR undiminished. Anything not in this enumeration is **outside the grandfather by default**, classified in governance review, not by the proposing document; for the absorbed M1a/M1b scope the 18.1 re-evaluation above is discharged by this reconciliation, while 18.1-and-beyond work outside that scope still re-evaluates against Decision 2. **Further extended 2026-07-08 — a prospective carve-out, not grandfathering of existing code:** the ADR-4001 vulnerability dashboard (the `/vuln` lens with its `/fragments/vuln/*` surface, the versioned `/api/v1/vuln/*` REST + `query_vulnerabilities` MCP read twins, the `Vulnerability` securable, and the in-server `attack_path_engine`) is absorbed on the same terms — placement-only, bounded to ADR-4001's designed scope, outside-by-default beyond it. Unlike the 0023 extension's shipped components, **every ADR-4001 item is planned/design-only** (ADR-4001 carries `status: accepted` as of 2026-07-09 per the ADR Acceptance Convention, but none of its surfaces exist in code): this section's "pre-existing surfaces" framing does not apply to them — the carve-out pre-authorizes their *future* in-server implementation, activates as each surface ships, and is void for anything ADR-4001's ratification does not carry. Two riders: (a) unlike the legacy un-versioned `/api/nvd/*` routes, 4001's read surfaces are on the **published versioned API contract from birth**, so their Phase-7 re-home requires the full Phase 0.3 deprecation cycle with module-provided equivalents; (b) ADR-4002's scoring substrate is **not** absorbed here — it faces its own Decision 2 boundary review at its own merge. Reconciliation record: execution plan § "Relationship to ADR-0023 and ADR-4001".
 3. Exceptions recorded here accrete into the "exception ledger" the standing review question refers to:
-   - **2026-07-07 (Phase 1 implementation, pre-acceptance — see Binding status above for the pre-acceptance meaning):** the four HTTP liveness/readiness probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are **exempt from the Interim-rules on-behalf-of rejection**. Rationale (governance Gate 5, CH-3/UP-5): a mesh/SSO proxy that stamps a reserved header on every request must not be able to 403 the probes and crash-loop the pod — a probe performs no identity-bearing action, nothing consumes the header on that path, and a bricked orchestrator would hide the very misconfiguration the guard exists to surface. Every other path rejects. The set is **closed and exact-match** (`req.path ==` equality — `/health/detailed` or a trailing-slash variant does NOT inherit the exemption); any additional exempt path requires its own ledger entry with its own no-identity-bearing-action justification. Implementation **ships with the Phase-1 implementation PR (#1972)** — the pre-routing chokepoint in `server/core/src/server.cpp` plus the "On-behalf-of assertions rejected" section of `docs/auth-architecture.md`; this entry is recorded ahead of that merge as the exception's review trail, and the cross-references resolve once #1972 lands.
+   - **2026-07-07 (Phase 1 implementation, pre-acceptance — see Binding status above for the pre-acceptance meaning):** the four HTTP liveness/readiness probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are **exempt from the Interim-rules on-behalf-of rejection**. Rationale (governance Gate 5, CH-3/UP-5): a mesh/SSO proxy that stamps a reserved header on every request must not be able to 403 the probes and crash-loop the pod — a probe performs no identity-bearing action, nothing consumes the header on that path, and a bricked orchestrator would hide the very misconfiguration the guard exists to surface. Every other path rejects. The set is **closed and exact-match** (`req.path ==` equality — `/health/detailed` or a trailing-slash variant does NOT inherit the exemption); any additional exempt path requires its own ledger entry with its own no-identity-bearing-action justification. Implementation **ships with the Phase-1 implementation PR (#1972)** — the pre-routing chokepoint in `server/core/src/server.cpp` plus the "On-behalf-of assertions rejected" section of `docs/auth-architecture.md`; this entry is recorded ahead of that merge as the exception's review trail, and the cross-references resolve once #1972 lands. **Amended 2026-10-15 (#5906):** the same closed set is additionally served, to GET and HEAD requests only, on the plaintext HTTP→HTTPS redirect listener (previously every request there answered a `301`), so a container healthcheck can probe without a TLS client. The justification is unchanged — a probe performs no identity-bearing action — and that listener binds session resolution to none, so `/health` and `/api/health` always return the unauthenticated shape there; every other request on it still `301`s to the guarded main listener. `yuzu-server --healthcheck` is a client of these already-exempt paths, not an ingress, and a plain-port `200` means the process is alive and the HTTPS listener is bound.
 
    - **2026-07-14 — class-level entry: Prometheus fleet-gauge families are
      observability, not capability (spark rung 1; retroactively covering
@@ -494,7 +494,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
    - **2026-09-16 — Hardware CI list/record (`GET /api/v1/hardware`,
      `GET /api/v1/hardware/{id}`, `POST /api/v1/hardware/{id}/sync`, PR
-     `feat/hardware-ci-view`).** REST-only, no MCP twin, and absent from
+     `feat/hardware-ci-view`; extended 2026-10-15 with the fleet/group/scope
+     fan-out `POST /api/v1/hardware/sync`, which has its MCP twin
+     `sync_hardware_software` as of the same change; the rest of this row is
+     unchanged).** The list/record/per-device routes are REST-only, no MCP twin, and absent from
      route discovery only in the sense that no `get_hardware_ci`/
      `list_hardware`/equivalent MCP tool exists yet — the REST routes
      themselves ARE in `openapi_spec()` and `GET /api/v1/routes` (A2/A3
@@ -512,9 +515,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        NOT part of this gap — they reuse the pre-existing generic
        live-info/bundle dispatch mechanism, which already has its own MCP
        reachability via `execute_instruction`, unaffected by this row.
-     - Scoping and building the list/detail/sync-dispatch MCP twin is out
-       of scope for this PR; tracked as **#4456**. Until it lands, this row
-       stands as the open exception.
+     - The fleet/group/scope fan-out route `POST /api/v1/hardware/sync` has its MCP twin
+       `sync_hardware_software` (owner ruling 2026-10-15: the twin is required, not an
+       exception), sharing the route's cooldown and single in-flight run. Scoping and building
+       the list/detail/per-device-sync MCP twins is out of scope for this PR; tracked as
+       **#4456**. Until it lands, this row stands as the open exception for those routes.
      - Full design record: the round-3 hardware-ci-view plan
        (`docs/user-manual/inventory.md`'s Dashboard section describes the
        shipped REST/HTMX surface); wire reference:
@@ -554,6 +559,41 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - Design record: `docs/auth-architecture.md` "Local password change and
        reset (#5342, #5274)"; wire reference: `docs/user-manual/rest-api.md`
        (`POST /api/v1/users/me/password`).
+
+   - **2026-10-07 — software title catalogue (`GET /api/v1/inventory/software/catalogue`,
+     `GET /api/v1/inventory/software/catalogue/versions`) and its MCP twins
+     (`query_software_catalogue`, `get_software_versions`).**
+     The REST routes merged first and REST-only, a "no" on Decision 1/4's
+     both-surfaces requirement that was recorded rather than fixed pre-merge;
+     the MCP twins then landed over the same pure model, so both surfaces exist
+     now. What stays an exception:
+     - **A build-order gap that has closed, not a boundary.** The catalogue read
+       surface (shared pure model, totals, cursors, CSV export) landed first so
+       the MCP tools are a thin transport over the same model
+       (`docs/api-twin-recipe.md` Rule 1) instead of a second shaper. The
+       `titles` CSV export is REST-only by design (a download, not a structured
+       tool result).
+     - **#3988's remaining disposition is a decision, not this change's merge.**
+       The open P1 issue #3988 ("Inventory catalogue-grain read ... has no
+       REST/MCP twin") is answered on the twin half by the tools above; its
+       confinement criterion is superseded by the refuse-to-confined ruling.
+       **Revisit by 2026-11-07.**
+     - **The raw route's export is REST-only (`#5699`).**
+       `GET /api/v1/inventory/software?format=csv|json` has no MCP tool: an
+       agent pages the same rows through the cursor on `query_installed_software`,
+       and a bulk file is a human/automation convenience. **Revisit by
+       2026-11-07.**
+     - **The raw route's `q`, `kind`, `ecosystem` and `source` filters are
+       REST-only (`#5699`).** `query_installed_software` takes `name`,
+       `agent_id`, `version`, `limit` and `cursor` only; the parity ledger row
+       stays `twinned` on the paged shape and the gap is recorded in
+       `docs/api-parity-ledger.md`. **Revisit by 2026-11-07.**
+     - **The exception relaxes no control.** The fleet view is gated on a
+       global `Inventory:Read` (the per-device view is admitted in scope),
+       denies service-scoped tokens on the catalogue fleet view (the raw route
+       admits them, confined), audits every
+       served page or file, and answers a degraded read with `503`, never an
+       empty `200`; wire reference: `docs/user-manual/rest-api.md`.
 
 ## Interim rules (until the named follow-ups ship)
 

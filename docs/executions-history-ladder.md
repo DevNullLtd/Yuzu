@@ -200,6 +200,18 @@ get no owner disjunct on the fragment, because a service-scoped token's session 
 minter; the other surfaces that read the disjunct still show a minter's executions to a
 service-scoped token (#5557). Full account: `docs/auth-architecture.md`'s "Sixth migration".
 
+**#3526 (per-agent execution-statistics rollup):** REST `GET /api/v1/execution-statistics/agents` and
+MCP `get_execution_statistics_by_agent` gate on `fleet_read_fn` and pass the visible set as
+`ExecutionStatsQuery::visible_agents`, which `ExecutionTracker::try_get_agent_statistics` applies as
+`a.agent_id = ANY(...)` before the GROUP BY and the LIMIT. Present-empty is deny-all and `nullopt` is
+unfiltered, as above; a present-empty set is answered with an empty page without taking a pool lease
+or running a query, but only after the tracker-open check, so a tracker that is not open is still a
+degraded read. The rollup is a bounded read (a row limit, at most 1000), not a complete-cohort
+proof, so **never feed it to `admit_confined_mutation`**. A degraded read (store not open, pool
+timeout, failed statement) is `nullopt` from the `try_get_*` form, which logs a warning naming the
+reader and the cause, and a `503` on REST or a retryable error on MCP, never an empty page. Full
+account: `docs/auth-architecture.md`'s "Execution-statistics per-agent rollup (#3526)".
+
 ## PR 3 — SSE live updates
 
 `ExecutionEventBus` (`server/core/src/execution_event_bus.{hpp,cpp}`) is the
@@ -317,6 +329,12 @@ touches drawer markup MUST keep these stamps stable** — they are the
 client SSE listener's binding contract. Renaming any of them is a silent
 regression: the listener falls back to no-op and the drawer freezes
 mid-execution with no error.
+
+The Executions page (`/executions`, `yuzu-operate.js`) is a second client of the same
+stamps. `GET /fragments/executions/{id}/detail?view=page` returns `<div data-slot="selected">`
+followed by `<div data-slot="devices">` (the Device results panel, rendered by
+`render_exec_devices`), keeps every stamp above, and caps the per-device table at 500 rows
+and the collapsed responses list at 50; the drawer's default view is unchanged and uncapped.
 
 ### Audit policy
 

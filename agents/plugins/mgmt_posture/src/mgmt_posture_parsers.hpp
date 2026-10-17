@@ -11,6 +11,7 @@
 //
 // The `status|posture|...` row is NOT built here; the legs' report_posture owns it.
 
+#include <ini_parse.hpp>
 #include <yuzu/string_utils.hpp>
 
 #include <algorithm>
@@ -67,56 +68,8 @@ inline std::string lower(std::string_view s) {
 
 } // namespace detail
 
-// ---------------------------------------------------------------------------
-// Minimal INI model
-// ---------------------------------------------------------------------------
-
-struct IniDoc {
-    std::vector<std::string> section_order; ///< first-seen order
-    std::map<std::string, std::map<std::string, std::string>> sections;
-};
-
-/// `[section]` headers, `key = value` (trimmed), `#` / `;` comment lines and blank
-/// lines skipped, CRLF tolerated, never throws. LAST value wins for a repeated
-/// (section, key) and a re-opened section merges: that is how SSSD merges
-/// sssd.conf with conf.d/*.conf (snippets later in byte order override), so
-/// a caller concatenating main + snippets in that order gets the merged view.
-inline IniDoc parse_ini(std::string_view text) {
-    IniDoc doc;
-    std::string current;
-    bool in_section = false;
-    size_t pos = 0;
-    while (pos <= text.size()) {
-        auto nl = text.find('\n', pos);
-        if (nl == std::string_view::npos)
-            nl = text.size();
-        const std::string line = detail::trim(text.substr(pos, nl - pos));
-        pos = nl + 1;
-        if (line.empty() || line[0] == '#' || line[0] == ';')
-            continue;
-        if (line.front() == '[') {
-            const auto close = line.find(']');
-            if (close == std::string::npos) {
-                in_section = false; // malformed header: ignore its keys
-                continue;
-            }
-            current = detail::trim(std::string_view(line).substr(1, close - 1));
-            in_section = true;
-            if (!doc.sections.contains(current))
-                doc.section_order.push_back(current);
-            doc.sections[current]; // create
-            continue;
-        }
-        const auto eq = line.find('=');
-        if (!in_section || eq == std::string::npos)
-            continue;
-        const std::string key = detail::trim(std::string_view(line).substr(0, eq));
-        if (key.empty())
-            continue;
-        doc.sections[current][key] = detail::trim(std::string_view(line).substr(eq + 1));
-    }
-    return doc;
-}
+using yuzu::shared::IniDoc;
+using yuzu::shared::parse_ini;
 
 // ---------------------------------------------------------------------------
 // SSSD

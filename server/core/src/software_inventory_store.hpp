@@ -38,6 +38,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu {
@@ -71,7 +72,7 @@ struct SoftwareEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat" (agent-side vocabulary)
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature
+    std::string ecosystem; // rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -140,6 +141,12 @@ struct SoftwareVersionCount {
     bool newest{false};
 };
 
+/// Hard ceiling on catalogue / version-drill rows one store read returns, independent of the
+/// caller's `limit` (the catalogue is one row per distinct title; the drill one per distinct
+/// version of a title - both bounded sets). The single source for the store clamp AND the
+/// catalogue model's export walk (a read shorter than asked for must mean "no more rows").
+inline constexpr int kCatalogRowCap = 2000;
+
 /// Fleet catalogue query. `q` is a case-insensitive LITERAL title-level predicate over
 /// name | publisher | ecosystems | sources of the (filtered) slice — `%` and `_` are not
 /// wildcards; it is clamped to 128 bytes at a UTF-8 boundary. A matched title keeps its
@@ -161,6 +168,14 @@ struct SoftwareCatalogQuery {
     int versions_min{0};
     int limit{100};
     std::optional<SoftwareCatalogCursor> after;
+};
+
+/// Totals for a catalogue query's filters, ignoring `limit`/`after`: matching titles and
+/// installs = SUM of the per-title exact distinct-device counts (a device carrying two
+/// matching titles counts twice; unfiltered fleet installs equal CatalogRollupMeta::total_installs).
+struct SoftwareCatalogTotals {
+    std::int64_t titles{0};
+    std::int64_t installs{0};
 };
 
 /// Installs-per-version drill for one title under the same filters as the catalogue.
@@ -229,6 +244,12 @@ struct SoftwareFleetQuery {
     /// install_id churns when an agent's list is fully replaced, so a walk concurrent with
     /// one agent's resync can repeat or skip that agent's same-name rows.
     std::optional<SoftwareCursor> after;
+    /// Rows to pass over AFTER `after` (SQL OFFSET, only when > 0) - the skipped rows never cross
+    /// the wire. Used by the post-filtered scope walk to re-anchor at the last row it served.
+    /// It counts positions, so that walk is best-effort under concurrent change: deleting an
+    /// out-of-scope row in the skipped span, or widening the caller's scope, between pages can
+    /// make the next page skip or repeat a row (same class as the install_id churn above).
+    std::int64_t skip{0};
 };
 
 class SoftwareInventoryStore {
@@ -300,6 +321,15 @@ public:
     [[nodiscard]] std::optional<std::int64_t> source_last_seen(std::string_view agent_id,
                                                                std::string_view source);
 
+    /// `source_last_seen` for a page of agents in one read: agent_id -> server-receipt
+    /// epoch-seconds of its last accepted `source` report (the value the Hardware record
+    /// shows as `software_last_seen`). An agent with no row is ABSENT from the map (never a
+    /// 0). Empty `source`/`agent_ids` -> empty map (precondition miss).
+    /// AUTHORITATIVE read: `std::nullopt` on a degrade. The caller bounds `agent_ids` (the
+    /// Software page passes at most one page, 100 ids); nothing here caps it.
+    [[nodiscard]] std::optional<std::unordered_map<std::string, std::int64_t>>
+    source_last_seen_bulk(std::string_view source, const std::vector<std::string>& agent_ids);
+
     /// Fleet-wide query ("which agents run X"). Capped at a hard ceiling regardless
     /// of `limit`. AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure
     /// (degraded — NEVER a silent empty; ADR-0016 §7). An empty value = no matches.
@@ -323,6 +353,11 @@ public:
     /// row 1) — the global gate alone is not sufficient for the host view.
     [[nodiscard]] std::optional<std::vector<SoftwareCatalogRow>>
     software_catalog(const SoftwareCatalogQuery& q);
+    /// Totals for the same filters as `software_catalog` (shared predicate; host `after` lives in
+    /// HAVING). Ignores `limit`/`after`. installs = sum of per-title exact distinct-device
+    /// counts. `std::nullopt` on degrade (incl. the 5 s bound), never a zero.
+    [[nodiscard]] std::optional<SoftwareCatalogTotals>
+    software_catalog_totals(const SoftwareCatalogQuery& q);
 
     /// Installs-per-version for ONE title under the filters of `SoftwareVersionsQuery`, most
     /// installed first, with the fleet-wide newest mark. The newest version is chosen by

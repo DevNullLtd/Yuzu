@@ -30,6 +30,7 @@ namespace yuzu::server {
 class AppPerfDailyStore;
 class AppPerfFleetStore;
 class AppPerfGroupReader;
+class DexAppVersionFailuresOwner;
 class ManagementGroupStore;
 class TagStore;
 
@@ -37,9 +38,10 @@ class TagStore;
 /// dex_perf_api.cpp — kept out of the abstract header so that header stays
 /// free of store references entirely).
 ///
-/// All FIVE store/reader pointers are NULLABLE — each mirrors the pre-seam
+/// All SIX store/reader/owner pointers are NULLABLE — each mirrors the pre-seam
 /// `AppPerfProviders` lambdas' own tolerance (a null store/reader degrades the
-/// corresponding method to `nullopt`, matching the resource's existing
+/// corresponding method to `nullopt` (a null `failures_owner` degrades only
+/// `app_fleet_report`), matching the resource's existing
 /// store-unavailable 503 today). `dex_perf_fn` may be empty (degrades
 /// `fleet_snapshot` to a default-constructed, all-empty `DexPerfSnapshot`,
 /// matching the handlers' own `dex_perf_fn ? dex_perf_fn(key) :
@@ -54,6 +56,7 @@ class TagStore;
 [[nodiscard]] std::shared_ptr<DexPerfApi>
 make_local_dex_perf_api(DexPerfFn dex_perf_fn, AppPerfFleetStore* fleet_store,
                         AppPerfDailyStore* daily_store, AppPerfGroupReader* group_reader,
-                        ManagementGroupStore* mgmt_group_store, TagStore* tag_store);
+                        ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
+                        DexAppVersionFailuresOwner* failures_owner = nullptr);
 
 } // namespace yuzu::server

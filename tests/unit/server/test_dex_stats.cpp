@@ -406,14 +406,38 @@ TEST_CASE("DexStats: dex_rate_ratio domain limit", "[dex][stats]") {
     CHECK_FALSE(b_short->reliable);
 }
 
+TEST_CASE("DexStats: the cohort floor is one device (maintainer ruling 2026-10-14)",
+          "[dex][stats]") {
+    // The ONE floor constant. A one-device cohort is published; only an empty
+    // cohort is below the floor. Fails against the previous value of 10.
+    CHECK(kDexCohortFloor == 1);
+    const auto one = dex_floored_proportion(1, 1);
+    REQUIRE(one.stats);
+    CHECK_FALSE(one.below_floor);
+    CHECK(one.stats->estimate == Approx(1.0));
+    const auto one_rate = dex_floored_rate(2, 1.0, 1);
+    REQUIRE(one_rate.stats);
+    CHECK_FALSE(one_rate.below_floor);
+    CHECK(one_rate.stats->estimate == Approx(2.0));
+    const auto three = dex_floored_proportion(1, 3);
+    REQUIRE(three.stats);
+    CHECK_FALSE(three.below_floor);
+    const auto empty = dex_floored_proportion(0, 0);
+    CHECK(empty.below_floor);
+    CHECK_FALSE(empty.stats);
+    // The rate-ratio exposure guard follows: one exposure unit per arm passes.
+    CHECK(kDexRateRatioMinExposure == 1.0);
+    CHECK(dex_rate_ratio(1, 1.0, 1, 1.0));
+}
+
 TEST_CASE("DexStats: floored helpers report the device count and the reason", "[dex][stats]") {
-    const auto below = dex_floored_proportion(3, kDexCohortFloor - 1);
+    const auto below = dex_floored_proportion(1, kDexCohortFloor - 1);
     CHECK(below.devices == kDexCohortFloor - 1);
     CHECK(below.below_floor);
     CHECK_FALSE(below.stats);
 
-    const auto at = dex_floored_proportion(3, kDexCohortFloor);
-    const auto at_want = dex_proportion(3, kDexCohortFloor);
+    const auto at = dex_floored_proportion(1, kDexCohortFloor);
+    const auto at_want = dex_proportion(1, kDexCohortFloor);
     REQUIRE(at.stats);
     REQUIRE(at_want);
     CHECK(at.devices == kDexCohortFloor);
@@ -514,8 +538,8 @@ TEST_CASE("DexStats: floored helpers clear the floor on devices alone and refuse
           "[dex][stats]") {
     // One above the floor and far above it, valid pairs: the statistic is present.
     for (const std::int64_t devices : {kDexCohortFloor + 1, std::int64_t{1000}}) {
-        const auto p = dex_floored_proportion(3, devices);
-        const auto p_want = dex_proportion(3, devices);
+        const auto p = dex_floored_proportion(1, devices);
+        const auto p_want = dex_proportion(1, devices);
         REQUIRE(p.stats);
         REQUIRE(p_want);
         CHECK(p.devices == devices);
@@ -591,4 +615,21 @@ TEST_CASE("DexStats: dex_rate_ratio converges at a slow large-arm pair", "[dex][
     REQUIRE(s);
     CHECK(s->lower == Approx(29240.202199451534).epsilon(2e-5));
     CHECK(s->upper == Approx(29870.889158898113).epsilon(2e-5));
+}
+
+TEST_CASE("DexStats: dex_rate_ratio with a lowered minimum exposure", "[dex][stats]") {
+    // (3 / 2) / (1 / 1) = 1.5. The default guard follows the one-device cohort
+    // floor, so one exposure unit passes with or without the explicit minimum.
+    CHECK(dex_rate_ratio(3, 2.0, 1, 1.0));
+    const auto lowered = dex_rate_ratio(3, 2.0, 1, 1.0, 1.0);
+    REQUIRE(lowered);
+    CHECK(lowered->estimate == Approx(1.5));
+    // A lowered minimum never admits a zero or negative exposure.
+    CHECK_FALSE(dex_rate_ratio(3, 0.0, 1, 1.0, 1.0));
+    CHECK_FALSE(dex_rate_ratio(3, 2.0, 1, 0.0, 0.0));
+    CHECK_FALSE(dex_rate_ratio(3, -1.0, 1, 1.0, -5.0));
+    // The default argument is the old guard.
+    const auto dflt = dex_rate_ratio(12, 15.0, 5, 12.0);
+    REQUIRE(dflt);
+    CHECK(dflt->estimate == dex_rate_ratio(12, 15.0, 5, 12.0, kDexRateRatioMinExposure)->estimate);
 }

@@ -1,6 +1,7 @@
 #include "workflow_engine.hpp"
 
 #include "mcp_jsonrpc.hpp" // json_exceeds_depth / kMcpMaxJsonDepth (#2437-class depth guard)
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -1130,6 +1131,152 @@ std::expected<std::vector<WorkflowExecution>, std::string> WorkflowEngine::list_
         result.push_back(std::move(exec));
     }
     return result;
+}
+
+// ── Execution list ───────────────────────────────────────────────────────────
+
+namespace {
+
+// `agent_ids_json` as jsonb, or an empty array when it is not valid JSON or not an array. Nested
+// CASE on purpose: AND does not fix evaluation order, and a bare `::jsonb` cast would error the
+// whole statement on one bad legacy row. Same intent as `workflow_execution_visible()`: malformed
+// or non-array input yields no agents, so a confined caller never sees the run (fail closed).
+// `pg_input_is_valid` is PostgreSQL 16+ (the documented floor).
+//
+// NOT a byte-for-byte image of that C++ oracle: jsonb and nlohmann accept different JSON. Every
+// document the engine writes (`nlohmann::json(vector<string>).dump()`, execute()) agrees on both
+// sides; the shapes below can only arrive by a write that bypasses the engine, and each is pinned
+// with its direction in the "SQL visibility predicate" tests:
+//   - jsonb refuses a `\u0000` escape or a UTF-8 byte-order mark; nlohmann takes both. The whole
+//     document is "not an array" here, so a confined caller does NOT see the run (safe direction).
+//   - jsonb takes a number past double range (`["a1",1e400]`); nlohmann rejects the document. A
+//     confined caller whose scope holds "a1" DOES see the run here while the oracle hides it, so a
+//     listed run's detail read can answer not-visible. The run still names an in-scope agent, so
+//     nothing out of scope is exposed. In latest-per-workflow mode it can change which run is a
+//     workflow's latest.
+//   - Probed on PostgreSQL 18.6 (default max_stack_depth, 2 MB): an array nested about 18,700
+//     levels deep (a document of about 37 KB) hits the stack-depth guard, a hard error
+//     `pg_input_is_valid` does not trap; 18,650 levels is accepted. A stored row that deep fails
+//     the statement, so every confined list answers the typed degrade (503, never rows) until the
+//     row is gone. The engine only ever writes a flat array of strings, so only a bypassing write
+//     can store one.
+constexpr const char* kGuardedAgentIdsJsonb =
+    "CASE WHEN pg_input_is_valid(e.agent_ids_json, 'jsonb') "
+    "THEN (CASE WHEN jsonb_typeof(e.agent_ids_json::jsonb) = 'array' "
+    "THEN e.agent_ids_json::jsonb ELSE '[]'::jsonb END) "
+    "ELSE '[]'::jsonb END";
+
+} // namespace
+
+ExecutionPageSql build_execution_page_sql(
+    const WorkflowExecutionListQuery& q,
+    const std::optional<std::vector<std::string>>& visible_agents,
+    std::chrono::milliseconds statement_timeout) {
+    ExecutionPageSql out;
+    int idx = 1;
+    const auto bind = [&](std::string v) {
+        out.params.push_back(std::move(v));
+        return "$" + std::to_string(idx++);
+    };
+    out.limit = std::clamp(q.limit, 1, kWorkflowExecutionListMax);
+    out.statement_timeout_sql =
+        "SET LOCAL statement_timeout = '" + std::to_string(std::max<std::int64_t>(statement_timeout.count(), 1)) + "ms'"; // 0 means no timeout in PG
+
+    out.sql = std::string("SELECT ") + (q.latest_per_workflow ? "DISTINCT ON (e.workflow_id) " : "") +
+              "e.id, e.workflow_id, w.name, (w.deleted_at <> 0), e.status, e.current_step, "
+              "e.started_at, e.completed_at "
+              "FROM workflow_engine.workflow_executions e "
+              "JOIN workflow_engine.workflows w ON w.id = e.workflow_id WHERE 1=1";
+    if (!q.workflow_id.empty())
+        out.sql += " AND e.workflow_id = " + bind(q.workflow_id);
+    if (!q.status.empty())
+        out.sql += " AND e.status = " + bind(q.status);
+    if (q.since)
+        out.sql += " AND e.started_at >= " + bind(std::to_string(*q.since)) + "::bigint";
+    if (q.until)
+        out.sql += " AND e.started_at < " + bind(std::to_string(*q.until)) + "::bigint";
+    // The position is ANDed with every other clause, including the visibility clause below, so a
+    // forged position can only narrow what the caller may already see.
+    if (q.after && !q.latest_per_workflow) {
+        const auto at = bind(std::to_string(q.after->key));
+        out.sql += " AND (e.started_at < " + at + "::bigint OR (e.started_at = " + at +
+                   "::bigint AND e.id < " + bind(q.after->id) + "))";
+    }
+    // Visibility MUST precede ORDER BY/LIMIT — ADR-0017 INV-3 (CRITICAL): applied after, an
+    // invisible run would consume a page slot and a confined caller would get a short page.
+    if (visible_agents) {
+        if (visible_agents->empty()) {
+            out.sql += " AND 1=0"; // visible to nobody
+        } else {
+            std::vector<std::string_view> sv(visible_agents->begin(), visible_agents->end());
+            out.sql += std::string(" AND EXISTS (SELECT 1 FROM jsonb_array_elements(") +
+                       kGuardedAgentIdsJsonb +
+                       ") AS a(v) WHERE jsonb_typeof(a.v) = 'string' AND (a.v #>> '{}') = ANY(" +
+                       bind(pg::to_text_array(sv)) + "::text[]))";
+        }
+    }
+    out.sql += q.latest_per_workflow ? " ORDER BY e.workflow_id, e.started_at DESC, e.id DESC"
+                                     : " ORDER BY e.started_at DESC, e.id DESC";
+    // +1 sentinel row: trimmed off by the caller; its presence is the "more exist" signal.
+    out.sql += " LIMIT " + bind(std::to_string(out.limit + 1)) + "::bigint";
+    return out;
+}
+
+std::expected<WorkflowExecutionPage, std::string> WorkflowEngine::query_executions_page(
+    const WorkflowExecutionListQuery& q,
+    const std::optional<std::vector<std::string>>& visible_agents,
+    std::chrono::milliseconds statement_timeout) const {
+    if (!open_)
+        return std::unexpected(std::string(kDbErrorPrefix) + "workflow engine not available");
+    if (visible_agents && visible_agents->empty())
+        return WorkflowExecutionPage{}; // deny-all: nothing to read, nothing to disclose
+    const auto built = build_execution_page_sql(q, visible_agents, statement_timeout);
+    const int limit = built.limit;
+
+    WorkflowExecutionPage page;
+    std::string err;
+    const bool committed = pool_.with_txn_for(kReadTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult t =
+            pg::exec_params(c, built.statement_timeout_sql.c_str(), std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK) {
+            err = PQresultErrorMessage(t.get());
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(c, built.sql.c_str(), built.params);
+        if (res.status() != PGRES_TUPLES_OK) {
+            err = PQresultErrorMessage(res.get());
+            return false;
+        }
+        const int rows = PQntuples(res.get());
+        const int take = std::min(rows, limit);
+        page.rows.reserve(static_cast<std::size_t>(take));
+        for (int i = 0; i < take; ++i) {
+            WorkflowExecutionSummary s;
+            s.id = col_str(res.get(), i, 0);
+            s.workflow_id = col_str(res.get(), i, 1);
+            s.workflow_name = col_str(res.get(), i, 2);
+            s.workflow_deleted = col(res.get(), i, 3)[0] == 't';
+            s.status = col_str(res.get(), i, 4);
+            s.current_step = static_cast<int>(to_i64(col(res.get(), i, 5)));
+            s.started_at = to_i64(col(res.get(), i, 6));
+            s.completed_at = to_i64(col(res.get(), i, 7));
+            page.rows.push_back(std::move(s));
+        }
+        if (rows > limit) {
+            if (q.latest_per_workflow)
+                page.truncated_by_cap = true;
+            else
+                page.next = keyset::Position{page.rows.back().started_at, page.rows.back().id};
+        }
+        return true;
+    });
+    if (!committed) {
+        if (err.empty())
+            err = "pool exhausted or transaction failed";
+        spdlog::warn("WorkflowEngine::query_executions_page degraded: {}", err);
+        return std::unexpected(std::string(kDbErrorPrefix) + err);
+    }
+    return page;
 }
 
 std::expected<void, std::string> WorkflowEngine::cancel_execution(const std::string& id) {

@@ -572,15 +572,17 @@ TEST_CASE("execution_routes: cancel success audits + emits; an unconfined caller
     CHECK(h.emits[0].event_type == "execution.completed");
     CHECK(h.emits[0].attrs["status"] == "cancelled");
 
-    // Cancelling an already-terminal execution -- mark_cancelled returns
-    // false (PR #3842's RETURNING id + terminal-status guard) -> audited
-    // "failure", 503.
+    // Cancelling an already-terminal execution is a state-guard refusal, not a store
+    // failure: 409, audited "denied", no second execution.completed event.
     auto recancel = h.sink.Post("/api/executions/" + *id + "/cancel", "{}");
     REQUIRE(recancel);
-    CHECK(recancel->status == 503);
+    CHECK(recancel->status == 409);
+    CHECK(recancel->body.find("execution already finished") != std::string::npos);
     REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[1].action == "execution.cancel");
-    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].result == "denied");
+    CHECK(h.audits[1].detail.find("already finished") != std::string::npos);
+    CHECK(h.emits.size() == 1);
 
     // A genuinely unknown id, unconfined -- the defense-in-depth
     // `if (!exec_opt)` 404 fires and is NOT audited.
@@ -607,4 +609,26 @@ TEST_CASE("execution_routes: wiring -- server.cpp still calls register_execution
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_execution_routes(") != std::string::npos);
+}
+
+// ── #4644: the legacy list reads `limit` strictly ────────────────────
+
+TEST_CASE("execution_routes: GET /api/executions rejects a trailing-garbage or overflowing "
+          "limit with 400 instead of reading its numeric prefix (#4644)",
+          "[pg][server][routes][execution_routes]") {
+    yuzu::test::ExecutionTrackerPg tracker;
+    Harness h;
+    h.execution_tracker = tracker.get();
+    h.wire();
+
+    for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=", "limit=4294967296"}) {
+        INFO(bad);
+        auto res = h.sink.Get(std::string("/api/executions?") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(body(res->body)["error"]["message"] == "invalid numeric query parameter");
+    }
+    auto ok = h.sink.Get("/api/executions?limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }

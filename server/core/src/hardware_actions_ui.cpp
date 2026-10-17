@@ -49,11 +49,11 @@ const char* class_label(DispatchClass c) {
 
 const char* class_css(DispatchClass c) {
     switch (c) {
-        case DispatchClass::ReadOnly: return "hw-badge ro";
-        case DispatchClass::Mutating: return "hw-badge mut";
-        case DispatchClass::Destructive: return "hw-badge dst";
+        case DispatchClass::ReadOnly: return "pill ok";
+        case DispatchClass::Mutating: return "pill warn";
+        case DispatchClass::Destructive: return "pill bad";
     }
-    return "hw-badge";
+    return "pill";
 }
 
 std::string field_html(const ActionFormField& f) {
@@ -128,38 +128,36 @@ std::string syntax_block(const ActionFormSpec& form) {
 std::string render_hardware_actions_lens(const std::string& agent_id, const std::string& hostname,
                                          const std::vector<HwActionRow>& rows, HwActionsState state) {
     std::string extra_css = R"css(<style>
-  .hw-actctrl{margin:.5rem 0}
-  details.hw-plugin{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.5rem;margin-bottom:.5rem}
-  details.hw-plugin>summary{padding:.5rem .8rem;cursor:pointer;font-weight:700;color:var(--white,#fff);font-size:.82rem}
-  .hw-act{padding:.5rem .8rem;border-top:1px solid var(--border,#2d4068)}
-  .hw-act-hdr{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
-  .hw-act-name{font-family:'JetBrains Mono',Consolas,monospace;font-size:.78rem;color:var(--white,#fff)}
-  .hw-act-desc{color:var(--muted,#8fa3bd);font-size:.72rem;flex:1}
-  .hw-badge{font-size:.58rem;text-transform:uppercase;letter-spacing:.04em;border-radius:.3rem;padding:.05rem .4rem;font-weight:700}
-  .hw-badge.ro{color:var(--green,#4ed27e);border:1px solid rgba(78,210,126,.4)}
-  .hw-badge.mut{color:var(--yellow,#ffcc00);border:1px solid rgba(255,204,0,.4)}
-  .hw-badge.dst{color:var(--red,#ff5765);border:1px solid rgba(255,87,101,.4)}
-  .hw-badge.warn{color:var(--red,#ff5765);border:1px solid rgba(255,87,101,.4)}
-  .hw-fld{margin:.4rem 0}
-  .hw-fld label{display:block;font-size:.68rem;color:var(--muted,#8fa3bd);margin-bottom:.15rem}
-  .hw-fld input,.hw-fld select,.hw-fld textarea{background:var(--bg,#0d1729);border:1px solid var(--border,#2d4068);border-radius:.35rem;color:var(--fg,#cfdbe8);padding:.3rem .5rem;font-size:.76rem;min-width:220px}
-  .hw-hint{font-size:.62rem;color:var(--muted,#8fa3bd);margin-top:.1rem}
-  .hw-result{margin-top:.5rem;font-size:.76rem}
-  .hw-result pre{background:var(--bg,#0d1729);border:1px solid var(--border,#2d4068);border-radius:.4rem;padding:.5rem;overflow:auto;max-height:320px;font-size:.72rem}
-  .hw-result table{width:100%;border-collapse:collapse;font-size:.72rem}
-  .hw-result th,.hw-result td{border-bottom:1px solid var(--border,#2d4068);padding:.25rem .4rem;text-align:left}
-  .hw-syntax{margin:.35rem 0 .2rem;font-size:.66rem;color:var(--muted,#8fa3bd);border-left:2px solid var(--border,#2d4068);padding-left:.5rem}
-  .hw-syntax table{border-collapse:collapse;font-size:.64rem;margin-top:.2rem}
-  .hw-syntax th,.hw-syntax td{padding:.1rem .45rem .1rem 0;text-align:left;vertical-align:top;border:0}
-  .hw-syntax th{color:var(--muted,#8fa3bd);font-weight:600;text-transform:uppercase;letter-spacing:.04em;font-size:.56rem}
-  .hw-syntax code{font-family:'JetBrains Mono',Consolas,monospace;color:var(--lightblue,#a5d6ff)}
-  .hw-rtool{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;margin:.3rem 0}
-  .hw-rtool input[type=text]{background:var(--bg,#0d1729);border:1px solid var(--border,#2d4068);border-radius:.35rem;color:var(--fg,#cfdbe8);padding:.22rem .45rem;font-size:.72rem;min-width:200px}
-  .hw-rtool input.bad{border-color:var(--red,#ff5765)}
-  .hw-rtool label{font-size:.66rem;color:var(--muted,#8fa3bd)}
-  .hw-rtool .cnt{font-size:.66rem;color:var(--muted,#8fa3bd);margin-left:auto}
+  .hw-actctrl{margin:0 0 12px}
+  details.hw-plugin{margin-bottom:12px;border:1px solid var(--line);border-radius:var(--rad-panel);background:var(--surface)}
+  details.hw-plugin>summary{padding:12px 16px;color:var(--ink);font-size:14px;font-weight:600;cursor:pointer}
+  .hw-act{padding:12px 16px;border-top:1px solid var(--line)}
+  .hw-act-hdr{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+  .hw-act-name{font-family:var(--mds-font-family-mono);font-size:12.5px;color:var(--ink)}
+  .hw-act-desc{flex:1;color:var(--mut);font-size:13px}
+  .hw-fld{margin:10px 0}
+  .hw-fld label{display:block;margin-bottom:5px;color:var(--ink2);font-size:13px;font-weight:500}
+  .hw-fld input,.hw-fld select,.hw-fld textarea{min-width:220px;height:var(--ctl);padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font-size:14px}
+  .hw-fld textarea{height:auto;min-height:56px;padding:8px 10px;font-family:var(--mds-font-family-mono);font-size:12.5px;resize:vertical}
+  .hw-hint{margin-top:4px;color:var(--mut);font-size:12.5px}
+  .hw-result{margin-top:10px;font-size:13.5px}
+  .hw-rbody{overflow-x:auto}
+  .hw-result pre{max-height:320px;overflow:auto;padding:10px 12px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink2);font-family:var(--mds-font-family-mono);font-size:12.5px}
+  .hw-result table{width:100%;border-collapse:collapse}
+  .hw-result th,.hw-result td{padding:6px 10px;border-bottom:1px solid var(--line);font-size:12.5px;text-align:left}
+  .hw-result th{background:var(--surface2);color:var(--mut);font-weight:500}
+  .hw-syntax{margin:8px 0;padding-left:10px;border-left:2px solid var(--line2);color:var(--mut);font-size:12.5px}
+  .hw-syntax table{margin-top:4px;border-collapse:collapse}
+  .hw-syntax th,.hw-syntax td{padding:2px 12px 2px 0;border:0;text-align:left;vertical-align:top}
+  .hw-syntax th{color:var(--mut);font-size:12px;font-weight:500}
+  .hw-syntax code{color:var(--ink);font-family:var(--mds-font-family-mono)}
+  .hw-rtool{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0}
+  .hw-rtool input[type=text]{height:28px;min-width:200px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font-size:13px}
+  .hw-rtool input.bad{border-color:var(--bad)}
+  .hw-rtool label{color:var(--mut);font-size:13px}
+  .hw-rtool .cnt{margin-left:auto;color:var(--mut);font-size:13px}
   .hw-line{display:block}
-  .hw-line.hit{background:rgba(0,188,235,.12)}
+  .hw-line.hit{background:color-mix(in srgb,var(--primary) 14%,transparent)}
 </style>)css";
 
     if (state == HwActionsState::Offline)
@@ -193,12 +191,12 @@ std::string render_hardware_actions_lens(const std::string& agent_id, const std:
             h += "<span class=\"" + std::string(class_css(row.cap->dispatch_class)) + "\">" +
                  class_label(row.cap->dispatch_class) + "</span>";
             if (row.cap->mutability == Mutability::Irreversible)
-                h += "<span class=\"hw-badge warn\">Irreversible</span>";
+                h += "<span class=\"pill warn\">Irreversible</span>";
             if (row.cap->execute_gate != ExecuteGate::None &&
                 row.cap->execute_gate != ExecuteGate::Unspecified)
-                h += "<span class=\"hw-badge warn\">Approval-gated</span>";
+                h += "<span class=\"pill warn\">Approval-gated</span>";
         } else {
-            h += "<span class=\"hw-badge warn\">" +
+            h += "<span class=\"pill warn\">" +
                  std::string(row.ambiguous ? "Ambiguous" : "Unclassified") + "</span>";
         }
         h += "<span class=\"hw-act-desc\">" + esc(row.description) + "</span></div>";

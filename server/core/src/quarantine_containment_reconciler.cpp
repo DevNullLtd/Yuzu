@@ -212,8 +212,10 @@ void QuarantineContainmentReconciler::tick() {
                     // re-apply, so a still-genuinely-contained reconnect
                     // doesn't needlessly contend with the agent-side
                     // mutation gate for no reason.
-                    auto sess = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
-                    if (sess && sess->session_id != st.confirmed_session_id) {
+                    // #5684: compared under the registry lock; an absent session is not churn.
+                    if (d_.registry &&
+                        !d_.registry->session_is(agent_id, st.confirmed_session_id) &&
+                        d_.registry->get_session(agent_id)) {
                         st.confirmed = false;
                         st.verify_first = true;
                     }
@@ -431,8 +433,8 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
             // the new one. Checking first avoids writing a misleading
             // `last_confirmed_at` for a session that was never actually
             // verified.
-            auto sess = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
-            const std::string confirmed_session_id = sess ? sess->session_id : std::string{};
+            const std::string confirmed_session_id =
+                d_.registry ? d_.registry->session_id_of(agent_id) : std::string{};
             // Plain equality, not an empty-string special case: some
             // deployment paths (and this component's own test harness) never
             // populate `AgentSession::session_id` at all, so "both empty"
@@ -566,6 +568,9 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         std::string command_id;
         int agents_reached = 0;
         bool threw = false;
+        // #5684: read under the registry lock, BEFORE the dispatch, so a session
+        // swapped during the dispatch call still mismatches at confirm time.
+        const std::string dispatch_session_id = d_.registry->session_id_of(agent_id);
         try {
             const auto outcome =
                 d_.dispatch_fn(std::string(kQuarantinePluginName), std::string(kQuarantineStatusAction),
@@ -597,7 +602,7 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         // actually sent — compared at confirm time against whatever session
         // is live THEN, so a reboot in between is caught rather than
         // silently attributing a stale response to the new session.
-        st.pending_session_id = session->session_id;
+        st.pending_session_id = dispatch_session_id;
         st.pending_since = std::chrono::steady_clock::now();
         st.verify_first = false;
         count("reapplied");

@@ -43,7 +43,13 @@ groups:
           description: >-
             The number of connected agents has dropped by more than 20% in the
             last 5 minutes. This may indicate a network outage, server issue,
-            or mass agent failure.
+            or mass agent failure. If the server process restarted while its
+            gateways stayed up, this is expected: the count rebuilds as the
+            gateways replay registrations, which takes about 20 minutes for
+            10,000 agents at a 100 ms round trip. Correlate with the gateway
+            "Registration replay" INFO lines. Do not restart the gateway during
+            that ramp: a restart disconnects every agent the node holds.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md#what-happens-when-the-server-restarts"
 
   - name: yuzu-commands
     rules:
@@ -164,10 +170,60 @@ groups:
             a full command-plane outage at rotation cutover. Fix it now (the
             gateway log names the entry).
 
+      # #4632: a request the gateway could not encode never leaves it, so the
+      # server never sees it and the circuit breaker is not touched (request
+      # faults do not count against the breaker). The consequence is that a
+      # SYSTEMATIC local encode failure (every Register answered INTERNAL)
+      # leaves the breaker closed and /readyz ready, and this counter is the
+      # signal for it. The series is pre-seeded at 0 for the RPC names that can
+      # fail to encode locally (register, inventory, notify_stream, guardian;
+      # yuzu_gw_telemetry:declare_metrics/0), so the first increase is visible.
+      # batch_heartbeat marshal failures are counted as code="exception", which
+      # this alert does not cover.
+      # Threshold: increase() >= 10 over 10m, i.e. about ten increases. One
+      # request that fails to encode, or one oversized daily-sync batch, counts
+      # once and must not warn; a systematic encoder fault (every Register failing)
+      # reaches 10 on a gateway fronting about 5 or more agents (one agent
+      # retries about 2.3 times per 10m at its steady 256 s backoff). A small
+      # gateway, or a low-rate RPC (inventory, notify_stream, guardian: the
+      # series is per rpc_name, there is no sum), can fault without reaching it:
+      # for those use the log line "Upstream RPC ... raised" and
+      # yuzu_gw_agents_current. A sustained burst of rejected requests can also
+      # reach 10 in 10m, which is worth a warning. Read the rate, not the
+      # existence.
+      # increase() extrapolates to the window edges, so on a counter already
+      # above zero a burst of nine inside one 10m window can read as 10 and fire.
+      # The promtool cases pin this at their 1m sample spacing; at the shipped
+      # 15 s scrape interval nine reads about 9.2 and stays quiet. Treat the
+      # threshold as "about ten", not "exactly ten".
+      - alert: YuzuGatewayUpstreamEncodeErrors
+        expr: |
+          increase(yuzu_gw_upstream_rpc_errors_total{code="encode"}[10m]) >= 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway could not encode about 10 or more {{ $labels.rpc_name }} requests in 10m"
+          description: >-
+            The gateway refused to send about 10 or more requests in 10 minutes
+            because it could not encode them here (a field that is not UTF-8,
+            or a request over the 4 MiB server limit). Such a failure leaves
+            the circuit breaker closed and /readyz ready, so this alert is the
+            signal for a systematic local encode fault (every Register of one
+            kind answered INTERNAL). A lone failure is most likely a single
+            rejected request and does not reach this alert, which needs about
+            10 in 10 minutes (increase() extrapolates, so nine can reach it):
+            read the rate, not the existence. The
+            gateway log line "Upstream RPC ... raised" names the RPC and the
+            error class, never the request.
+
       # HA WS-4 4.2b — `#4246` item #1's alert-rule half. Emitted by the
       # SERVER (gateway_service_impl.cpp's record_route_store_failure), not
       # the Erlang gateway, despite living in this group — it is the same
       # fenced agent->cluster routing-directory concern as the rules above.
+      # NOTE the metric name says "write", but two `op` values are directory
+      # READS: op="session_lookup" (HA WS-5 batched session_id resolution) and
+      # op="cluster_affinity_check" (#4669). Same counter, same pool-health
+      # root cause, so one rule covers reads and writes.
       # `op="register_fresh"` is the fail-CLOSED write (ProxyRegister's
       # fresh-registration branch returns UNAVAILABLE on this); the other
       # five writer SITES (announce_connected, both ProxyRegister renew
@@ -195,9 +251,10 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Gateway routing-directory write degraded (op={{ $labels.op }}, reason={{ $labels.reason }})"
+          summary: "Gateway routing-directory read/write degraded (op={{ $labels.op }}, reason={{ $labels.reason }})"
           description: >-
-            GatewayRouteStore write op="{{ $labels.op }}" has been failing
+            GatewayRouteStore op="{{ $labels.op }}" (a directory write, or
+            for session_lookup / cluster_affinity_check a READ) has been failing
             with reason="{{ $labels.reason }}" (Postgres pool-acquire timeout
             or a query error) for at least 5 minutes. FIRST REMEDIATION: check
             Postgres reachability and connection-pool saturation from the
@@ -213,12 +270,36 @@ groups:
             announce_connected leaves the row NON-ROUTABLE (cluster_id/gateway_node
             NULL) — lease renewal does NOT repopulate placement, so it does NOT
             self-heal on the lease TTL and needs another CONNECTED / agent
-            re-registration to restore routing. A lone fail-open failure is often
+            re-registration to restore routing. op="session_lookup" is the
+            batched READ that resolves gateway session ids (HA WS-5): while it
+            fails, BatchHeartbeat is fail-SOFT (locally hinted pairs are still
+            acked and renewed, unreadable ids with no local hint are neither
+            acked nor listed),
+            ProxyInventory ingests only with a hint, and NotifyStreamStatus
+            CONNECTED is rejected unless the local map vouches for it. A
+            Postgres outage lasting past 270s (90s lease + 180s grace)
+            tombstones rows; recovery is automatic (renew shortfall ->
+            unknown_session -> gateway replays ProxyRegister) and shows as a
+            renew_leases/unknown_session spike. op="cluster_affinity_check" is
+            the READ a NotifyStreamStatus CONNECTED makes before publishing
+            placement (fail-open). A lone fail-open failure is often
             an early low-cost signal of the same shared-store root cause a
             register_fresh failure hits harder. See ADR-2002 §7 "Ship the
             write-failure fail-closed posture" and docs/user-manual/metrics.md's
             Gateway routing directory section. INITIAL threshold, not yet tuned
             against real fleet data.
+
+      # #5686: no alert on yuzu_server_gateway_batch_heartbeat_duration_seconds
+      # or yuzu_server_agent_presence_upsert_skipped_total, by decision: a
+      # threshold needs fleet data (the #913 lesson above). NOT covered by
+      # YuzuGatewayRouteWriteFailed: presence-store failures
+      # (yuzu_server_agent_presence_store_failed_total{op="upsert"}) have no
+      # rule, and a presence upsert gives up at 250 ms against 500 ms for the
+      # route-directory ops, so milder pool saturation or a presence-only
+      # db_error degrades batches without moving that rule. YuzuPgPoolSaturated
+      # and YuzuPgAcquireWaitHigh are the covering pool-level signals. A
+      # presence-refresh ratio rule is a deferred follow-up. Revisit with fleet
+      # data.
 
       # HA WS-4 4.2b Task D's `route_unreadable` — a degraded batched
       # GatewayRouteStore read during confined dispatch (store_unavailable/
@@ -229,17 +310,22 @@ groups:
       # counter is expected at a low background rate (see its own doc
       # comment) and alerting on it needs real fleet data to set a threshold
       # that doesn't page on a routine post-restart/failover baseline rise;
-      # it remains unalerted this slice. `route_unreadable` fires the
+      # it remains unalerted EXCEPT two expected-zero pairs:
+      # (op="session_lookup", outcome="ambiguous_session") and
+      # (op="proxy_register", outcome="session_held_by_other_agent"), see
+      # YuzuGatewaySessionAmbiguous and YuzuGatewaySessionHeldByOtherAgent
+      # below. `route_unreadable` fires the
       # command outbox's retry-with-backoff path (the SAME reschedule
       # containment_unreadable takes, though the two flags are not otherwise
       # interchangeable — route_unreadable, unlike a fail-closed containment
       # read, does not force sent==0; see ConfinedDispatchOutcome::
       # route_unreadable), so ANY occurrence is worth
-      # surfacing — but FALLBACK-ONLY on today's single-replica monolith
-      # (the reader only ever consults the directory on a local-registry
-      # miss), so this should be rare until the reader becomes behaviorally
-      # live at WS-5. INITIAL / conservative threshold; tune once fleet data
-      # exists.
+      # surfacing. The dispatch reader consults the directory only on a
+      # local-registry miss, so it is rare on one replica. Since HA WS-5
+      # slice 2 a Postgres brownout is ALSO visible in heartbeat ingest
+      # (YuzuGatewayRouteWriteFailed op="session_lookup"), so expect the two
+      # to fire together. INITIAL / conservative threshold; tune once fleet
+      # data exists.
       - alert: YuzuGatewayRouteUnreadable
         expr: |
           increase(yuzu_server_command_outbox_deliver_retry_cause_total{cause="route_unreadable"}[15m]) > 0
@@ -260,6 +346,75 @@ groups:
             and docs/user-manual/metrics.md's Command outbox delivery / Gateway
             routing directory sections. INITIAL threshold, not yet tuned
             against real fleet data.
+
+      # HA WS-5 slice 2 (ADR-2002 §7f) — a presented gateway session_id that
+      # matches MORE than one live directory row. No `for:` (same reasoning as
+      # YuzuGatewayResponseAgentMismatch below): ambiguity means a duplicate
+      # placement or a forged/colliding presented id, never a background-rate
+      # class, so ANY occurrence is actionable. The counter increments on every
+      # heartbeat flush while the duplicate exists, so this fires continuously
+      # and keeps firing for 1h after the duplicate clears. (op,outcome) is
+      # pre-seeded at zero in gateway_service_impl.cpp.
+      - alert: YuzuGatewaySessionAmbiguous
+        expr: |
+          increase(yuzu_server_gateway_route_desync_total{op="session_lookup",outcome="ambiguous_session"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A gateway session_id matches more than one route-directory row"
+          description: >-
+            A session_id presented via BatchHeartbeat or ProxyInventory
+            matched more than one non-tombstoned row in
+            gateway_route_store.agent_routes, so the server refused to resolve
+            it (never acked, never listed, never ingested). Causes: a
+            duplicate placement, two concurrent ProxyRegister adopts of one id
+            for different agents (the cross-agent adopt guard is not a lock),
+            or a forged / colliding presented id.
+            FIRST REMEDIATION: the id is not a metric label, so list every
+            shared id from the directory: SELECT session_id,
+            array_agg(agent_id) FROM gateway_route_store.agent_routes WHERE
+            session_id IS NOT NULL GROUP BY session_id HAVING count(*) > 1;
+            The rows belong to different agents (agent_id is the primary key):
+            investigate the ProxyRegister adopt path and the presenting
+            gateway (a forged id is a CC6.6 signal; escalate to security),
+            then restart the affected agents so each re-registers under a new
+            session id. Evidence is
+            metrics and logs only (no audit row). See ADR-2002 §7f and
+            docs/user-manual/metrics.md's Gateway routing directory section.
+
+      # HA WS-5 (ADR-2002 §7f Security notes) — ProxyRegister's replay-ADOPT
+      # decision refused a presented session_id because a DIFFERENT agent's
+      # committed directory row already holds it (the reclaim statement's
+      # NOT EXISTS guard). Kept separate from YuzuGatewaySessionAmbiguous:
+      # nothing became ambiguous (the adopt was refused), so that alert's
+      # duplicate-row query finds nothing and the remediation differs. No
+      # `for:`: expected rate zero, every occurrence is actionable. The pair
+      # is pre-seeded at zero in gateway_service_impl.cpp.
+      - alert: YuzuGatewaySessionHeldByOtherAgent
+        expr: |
+          increase(yuzu_server_gateway_route_desync_total{op="proxy_register",outcome="session_held_by_other_agent"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A ProxyRegister replay presented a session_id another agent holds"
+          description: >-
+            A gateway replayed ProxyRegister for one agent presenting a
+            session_id that a different agent's directory row already holds,
+            and the server refused the adopt (FAILED_PRECONDITION; the gateway
+            disconnects that agent so it registers fresh). The expected rate
+            is zero: this means a forged or colliding presented id from a
+            pinned gateway peer, a CC6.6 signal.
+            FIRST REMEDIATION: find the server WARN "ProxyRegister: presented
+            session <id> for agent <agent> is already held by a different
+            agent's directory row" (the id is sanitized and truncated to 64
+            bytes), look up the holder with SELECT agent_id, gateway_node FROM
+            gateway_route_store.agent_routes WHERE session_id = '<id>', identify the
+            presenting gateway from its peer certificate, and escalate to
+            security. The guard only sees committed rows: two concurrent
+            adopts can both land, which YuzuGatewaySessionAmbiguous then
+            catches. Evidence is metrics and logs only (no audit row). See
+            ADR-2002 §7f and docs/user-manual/gateway.md "Forged or colliding
+            session ids".
 
       # HA WS-4 rest-of-4.3 (ADR-2002 §7d) — cross-cluster gateway fan-out.
       # No `for:`, matching YuzuGatewayMgmtAuthRejected's own reasoning
@@ -1133,7 +1288,20 @@ groups:
             create/PATCH/PUT targeted an account the SCIM provenance check
             refused to mutate — either the account was never provisioned by
             SCIM, or it was elevated/promoted outside SCIM's ownership
-            boundary (#2021). A single event is usually a misconfigured IdP
+            boundary (#2021), or a SCIM POST or active:true reactivation
+            named a username that already holds an Administrator grant or
+            whose deactivated record carries a non-user role. That last case
+            also fires for a benign re-enable of an account an operator
+            elevated or granted outside SCIM, on every IdP retry: if the
+            audit row shows an account an operator elevated on purpose, clear
+            the role or grant (rbac.md, "Last-Administrator guard for account
+            deactivation and demotion", the paragraph "Operator remedy");
+            otherwise investigate the IdP. It also fires, and keeps firing
+            while the IdP retries, after a SCIM deactivation whose SCIM
+            mirror write failed (the account is already deactivated, so the
+            retry meets the role guard; SCIM provisioning guide, "Known
+            limits of the Group role recompute", limit 7; #5214). A
+            single event is usually a misconfigured IdP
             attribute mapping; a sustained rate is worth treating as a
             possibly compromised or misbehaving IdP. Correlate via the
             scim provenance-denial audit row for the calling IdP/client.
@@ -1699,6 +1867,9 @@ groups:
             quarantine.reapply verb (system principal, detail carries
             record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
             record_id=... command_id=..." on success).
+            This alert also fires when the device's agent lacks the
+            quarantine plugin: the dispatch is accepted but never
+            confirmed, so upgrade the agent.
 
       - alert: YuzuDispatchTargetRejected
         expr: |
@@ -2650,7 +2821,8 @@ groups:
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
       # Two sources on the SAME counter, both keyed by reason
-      # (store_not_open/pool_acquire_timeout/query_error): "guardian_state"
+      # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
+      # on guardian_state for the Apps list's in-flight budget): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
@@ -2673,8 +2845,9 @@ groups:
             yuzu_server_guardian_read_degrade_total{reason="{{ $labels.reason }}",
             source="{{ $labels.source }}"} is non-zero. source="guardian_state"
             means a DEX/observation read (crash summary, top apps, device
-            score inputs, ...) is degrading and fails SOFT - callers keep
-            serving an empty/partial result, so this counter and the sampled
+            score inputs, ...) is degrading and fails SOFT (except the
+            per-device score, catalogue and Apps list reads, which fail closed)
+            - callers keep serving an empty/partial result, so this counter and the sampled
             warn log are the only external tell; do not read a "healthy"
             device compliance score as authoritative while this fires (#4855).
             source="guardian_rules" means an AUTHORITATIVE rule/status read
@@ -2694,6 +2867,10 @@ groups:
             saturation or outage; store_not_open means the store failed to
             open at boot (should not be reachable post-boot given fail-closed
             construction - investigate as a possible regression if seen).
+            reason="concurrency_budget" is not a substrate fault: the Apps
+            list read (GET /api/v1/dex/apps, list_dex_apps) was refused with a
+            retryable 503 because four were already running; look for a
+            caller polling it in parallel.
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
@@ -2725,7 +2902,8 @@ groups:
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
-            behavioural routes.
+            behavioural routes. The audit-first admin writes (webhooks, offload targets,
+            directory sync, group mappings, MCP settings) 503 the same way.
           runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would
@@ -4218,8 +4396,8 @@ groups:
   #       endpoints and the runbook advice to "identify the reporting agents" is
   #       unactionable without it;
   #   (b) the per-agent axis above (#2083-class work);
-  #   (c) a soak at fleet scale with all 30 families live concurrently with the
-  #       revocation sweep - the heartbeat tag-map grows by up to 30 entries per agent
+  #   (c) a soak at fleet scale with all 33 families live concurrently with the
+  #       revocation sweep - the heartbeat tag-map grows by up to 33 entries per agent
   #       the instant prefer_spark flips, which no pre-cutover soak can observe;
   #   (d) runbooks at the docs.yuzu.io URLs below, which do not exist yet.
   #
@@ -4233,7 +4411,7 @@ groups:
   # alert is the signal; the audit trail is the evidence.
   #
   # PIPELINE HEALTH: yuzu_fleet_guardian_journal_reporting and ..._tag_rejected are
-  # published on EVERY sweep including at 0, unlike the 30 counters. They are the only
+  # published on EVERY sweep including at 0, unlike the 33 counters. They are the only
   # rules here that CAN be sound, because they are server-owned counts rather than fleet
   # sums of agent monotonics. They differ from each other: TagRejected is
   # unconditionally sound, while TelemetryDark is sound only once Guardian is actually

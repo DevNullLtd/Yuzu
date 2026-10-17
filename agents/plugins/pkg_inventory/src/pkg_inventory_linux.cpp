@@ -1,33 +1,26 @@
 /**
- * pkg_inventory_linux.cpp — Linux leg entry point: `managers` is a PLANNED
- * placeholder, `packages` is UNSUPPORTED by design.
+ * pkg_inventory_linux.cpp — Linux leg entry point.
  *
- * `managers` reports `status|managers|unsupported|linux:planned` and no data
- * rows: the Linux manager identity/config leg follows as its own PR, and the
- * descriptor declares it YUZU_SUPPORT_PLANNED to match.
+ * `managers` reports which of dpkg, apt, rpm, dnf, pacman, apk, snap and flatpak
+ * are present (apt/snap/flatpak counts as facts; versions are not read).
+ * `store_packages` lists installed snaps and flatpak apps/runtimes from the
+ * system stores. Both are bounded, no-follow filesystem reads with no subprocess;
+ * the walks live in pkg_inventory_linux_parsers.hpp over an injected root.
  *
  * `packages` reports `status|packages|unsupported|linux:owned_by_installed_apps`
- * and no data rows: installed_apps.get_inventory_linux owns the Linux package
- * roster, and this plugin never enumerates a package in any form.
- *
- * Neither action reads anything from the host.
+ * and no data rows: installed_apps.list_inventory owns the Linux package roster,
+ * and this plugin never enumerates a distro package. It reads nothing.
  */
 #include "pkg_inventory_legs.hpp"
 
 #if defined(__linux__)
 
+#include "pkg_inventory_linux_parsers.hpp"
+
 namespace yuzu::pkg_inventory {
 
 int run_linux(yuzu::CommandContext& ctx, Action a) {
-    switch (a) {
-    case Action::managers:
-        emit_unsupported(ctx, a, kTokenLinuxPlanned);
-        break;
-    case Action::packages:
-        emit_unsupported(ctx, a, kTokenLinuxPackagesOwned);
-        break;
-    }
-    return 0;
+    return lnx::run_linux_guarded(ctx, a, "/");
 }
 
 } // namespace yuzu::pkg_inventory

@@ -4,6 +4,7 @@
 #include "oidc_principal.hpp"
 #include "saml_principal.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/scim_store.hpp>
 
@@ -77,7 +78,13 @@ std::string enumerate_principals_for_audit(const std::vector<std::string>& princ
     for (std::size_t i = 0; i < n; ++i) {
         if (i != 0)
             out += ",";
-        out += principals[i];
+        // CWE-117 (#4966): a linked principal's `sub` / NameID is chosen by the IdP, so each
+        // string is neutralised (`yuzu::log_id_token`: control bytes, space, '=' and ',' AND every
+        // byte >= 0x80 become '_', which also covers NEL and the Unicode line separators, and a
+        // string over 256 bytes is shortened to head~tail) before it joins this `k=v` detail.
+        // Lossy by design (two different principals can share one token, and a non-ASCII
+        // character collapses); the exact identity lives in the identity_links rows.
+        out += ::yuzu::log_id_token(principals[i]);
     }
     if (principals.size() > n)
         out += " (+" + std::to_string(principals.size() - n) + " more)";

@@ -309,7 +309,8 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         return stats;
 
     // Shutdown began: a prune pass is a full-journal scan plus one KvStore read per evicted key,
-    // each able to block on the 5 s busy timeout. Bail BEFORE starting so the drain-worker join
+    // each able to block on the KvStore busy budget (GuardianEngine::stop() lowers it, see its
+    // comment). Bail BEFORE starting so the drain-worker join
     // in GuardianEngine::stop() is not held up by retention work nobody will observe (C0 #2298).
     // read_ok stays false, so the page-side boot barrier does NOT latch on a stop-aborted pass.
     if (stopping_.load(std::memory_order_acquire))
@@ -378,7 +379,8 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     for (auto& row : *rows) {
         // Shutdown mid-scan: this loop issues one rename_key per MALFORMED-KEY row, so on a
         // corrupted journal it can be up to hard_max_batches_ KvStore writes, each able to
-        // block on the 5 s busy timeout. Bailing here is what makes the post-request_stop()
+        // block on the KvStore busy budget (GuardianEngine::stop() lowers it, see its comment).
+        // Bailing here is what makes the post-request_stop()
         // exit bounded (#2298 governance sec-M2): GuardianEngine::stop() holds mtx_ across
         // the drain-worker join, so every second spent here blocks dispatch(), journal_stats()
         // and the heartbeat too. Nothing is lost - the gauges were rebased to the scanned
@@ -1236,8 +1238,9 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // ingested server-side, on an agent that then neither reboots nor reconnects, is no longer
     // re-offered. That is the case the DEFERRED server ack closes properly; until it lands this
     // is the honest boundary of at-least-once here.
-    // Shutdown before the label scan. This is a full namespace scan able to block on the 5 s
-    // busy timeout, on the thread GuardianEngine::stop() joins while holding mtx_ - the one
+    // Shutdown before the label scan. This is a full namespace scan able to block on the KvStore
+    // busy budget (GuardianEngine::stop() lowers it, see its comment), on the thread
+    // GuardianEngine::stop() joins while holding mtx_ - the one
     // heavy KvStore call on this path that the candidate-build loop's gate does not cover,
     // because that gate is INSIDE the loop above. Prune states the rule for its identical
     // call: the stopping_ gates must PRECEDE the heavy calls, not merely straddle them
@@ -1364,7 +1367,8 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                     // Shutdown mid-scan. This loop used to be pure in-memory arithmetic; since
                     // the value read became lazy it issues a KvStore point read per candidate
                     // and can issue a quarantine rename, so at the 128 cap it is up to ~127
-                    // round trips each able to block on the 5 s busy timeout - on the thread
+                    // round trips each able to block on the KvStore busy budget
+                    // (GuardianEngine::stop() lowers it, see its comment) - on the thread
                     // GuardianEngine::stop() is joining while it holds mtx_. Every other
                     // KvStore-round-trip loop in this file is gated; this one has to be too
                     // (#2298 bounded-shutdown invariant). Breaking early is safe: `smallest` is

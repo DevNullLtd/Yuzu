@@ -376,7 +376,10 @@ class YuzuClient:
                                        for k, v in params.items()}}).encode()
         req = urllib.request.Request(
             f"{self.base}/api/instructions/{urllib.parse.quote(def_id)}/execute",
-            data=body, headers={"Content-Type": "application/json"})
+            data=body, headers={"Content-Type": "application/json",
+                                # A cookie-session write must carry a same-site
+                                # Origin, as the dashboard's own fetch does.
+                                "Origin": self.base})
         try:
             with self.opener.open(req, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read() or b"{}")

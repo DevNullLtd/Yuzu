@@ -58,7 +58,7 @@
 /// empty vector (not nullopt).
 ///
 /// Registered in the agent-decommission cascade (agent_decommission.hpp,
-/// AgentDecommissionStores::app_usage, the sixth and last store) — the
+/// AgentDecommissionStores::app_usage, the sixth store) — the
 /// DELETE /api/v1/sle/agents/{id} route erases this store under the scoped
 /// `Decommission:Delete` securable (ADR-0024 Decision 9 as amended). This
 /// header provides the honest two-table `delete_agent` the cascade calls;

@@ -224,8 +224,11 @@ follow-up rather than silently left unstated:
    serialize unrelated logins/role-changes). The residual -- a concurrent deactivation/demotion
    of the checked account landing between the read and the toggle's commit -- is the SAME ongoing
    case D2's own "cannot produce zero active Administrators... not only at enable time" clause
-   flags, tracked as [#4966](https://github.com/Tr3kkR/Yuzu/issues/4966) and Priority C item 4.1
-   (a joint-transaction primitive), not closed by this delivery.
+   flags. The account-lifecycle guard ([#4966](https://github.com/Tr3kkR/Yuzu/issues/4966), see
+   `docs/user-manual/rbac.md`) now serialises a deactivation or local-admin demotion made through
+   `AuthManager` behind the `rbac_enabled` row lock the toggle also takes; direct SQL and a
+   mixed-version fleet remain outside it, and Priority C item 4.1 (a joint-transaction primitive)
+   is not closed by this delivery.
 3. **MFA step-up is the existing `require_mfa_step_up` policy, not a fresh, uniform proof.** The
    REST route calls `step_up_fn` exactly where A2's role-assignment route does; the MCP tool
    carries no step-up call at all (supervised-tier approval instead). Because `api_token`/

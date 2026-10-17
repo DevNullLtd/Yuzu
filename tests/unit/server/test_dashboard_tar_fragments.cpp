@@ -126,6 +126,7 @@ struct FragmentHarness {
     std::vector<PermCall> perms;
     bool perm_allow{true}; ///< perm_fn verdict (false → handler's 403 path)
     bool auth_ok{true};    ///< auth_fn verdict (false → handler returns early)
+    std::string auth_source{"local"}; ///< resolved session source; "local" = a cookie session
     int dispatch_sent{1};  ///< agents reached per dispatch (0 → offline 404)
     /// #5294: ConfinedDispatchOutcome fields the zero-reach messages key on.
     bool dispatch_os_gate_unreadable{false};
@@ -166,6 +167,7 @@ struct FragmentHarness {
             auth::Session s;
             s.username = kUser;
             s.role = auth::Role::admin;
+            s.auth_source = auth_source;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -815,6 +817,33 @@ TEST_CASE("tar-execute REFUSES a supplied-but-empty scope (CDX-R8-01)",
     REQUIRE(res->status == 200); // HTMX fragment, not a status-code surface
     CHECK(h.calls.empty());      // the security property: nothing was dispatched
     CHECK(res->body.find("No target selected") != std::string::npos);
+}
+
+// Same-site gate (browser_write_is_cross_site) on the "Run on TAR history" form post.
+TEST_CASE("tar-execute: a cookie-session write without a same-site Origin is refused",
+          "[server][dashboard][tar-execute][csrf][security]") {
+    FragmentHarness h;
+    SECTION("no Origin and no Referer") {
+        auto res = h.post("/api/dashboard/tar-execute", "sql=SELECT+1", {{"Host", kHost}});
+        CHECK(res->status == 403);
+    }
+    SECTION("a foreign Origin") {
+        auto res = h.post("/api/dashboard/tar-execute", "sql=SELECT+1",
+                          {{"Host", kHost}, {"Origin", "https://evil.example"}});
+        CHECK(res->status == 403);
+    }
+    CHECK(h.calls.empty());
+    CHECK(h.audits_for("csrf.denied", "denied") == 1);
+}
+
+TEST_CASE("tar-execute: a token session is not gated by Origin",
+          "[server][dashboard][tar-execute][csrf]") {
+    FragmentHarness h;
+    h.auth_source = "mcp_token";
+    auto res = h.post("/api/dashboard/tar-execute", "sql=SELECT+1", {{"Host", kHost}});
+    CHECK(res->status == 200);
+    CHECK(h.calls.size() == 1);
+    CHECK(h.audits_for("csrf.denied", "denied") == 0);
 }
 
 TEST_CASE("tar-execute still broadcasts when scope is OMITTED entirely (CDX-R8-01)",

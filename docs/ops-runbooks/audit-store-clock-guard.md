@@ -60,7 +60,8 @@ page: [Limits](../user-manual/audit-log.md#the-retention-clock-guard).
 Not a retention problem, and much louder than one:
 `yuzu_server_audit_emit_failed_total` is rising, so events are not reaching
 PostgreSQL (schema `audit_store`) at all. Behavioural-PII REST routes
-are fail-closed, so they are returning `503` while this persists, and the
+are fail-closed, so they are returning `503` while this persists (as are the audit-first admin
+writes: webhooks, offload targets, directory sync, group mappings, MCP settings), and the
 evidence for whatever is happening right now is not being recorded.
 The response reads (`response.read`, on `/api/responses/*` and `/api/v1/responses/*`) are among them,
 and every served read there adds one audit INSERT, so a polling script on those routes raises audit

@@ -85,6 +85,16 @@ std::string render_devices(const NetPerfSnapshot& snap, NetPerfMetric metric, bo
                                            not_reporting, cooc, cohort_filter, limit);
 }
 
+// Exactly one <style> block, and it carries the DEX sheet (a known .dx- rule).
+bool one_dx_style(const std::string& h) {
+    const auto open = h.find("<style>");
+    if (open == std::string::npos || h.find("<style>", open + 1) != std::string::npos)
+        return false;
+    const auto close = h.find("</style>", open);
+    const auto rule = h.find(".dx-ctl{", open);
+    return close != std::string::npos && rule != std::string::npos && rule < close;
+}
+
 } // namespace
 
 // ── network_perf_rules ───────────────────────────────────────────────────────
@@ -270,6 +280,15 @@ TEST_CASE("overview render: cards, co-occurrence, honesty", "[network][ui]") {
     CHECK(html.find("not a verdict") != std::string::npos);           // honest evidence, never a verdict
 }
 
+TEST_CASE("network fragments: overview and devices each carry exactly one DEX style block",
+          "[network][ui]") {
+    NetPerfSnapshot snap;
+    snap.devices.push_back(dev("lnx-1", 40.0, 0.4, 3.0e6));
+    CHECK(one_dx_style(render_network_overview_fragment(net_perf_fleet_now(snap))));
+    CHECK(one_dx_style(
+        render_devices(snap, NetPerfMetric::kRtt, false, NetCoocFilter::kNone, std::nullopt, 50)));
+}
+
 TEST_CASE("overview render: empty population is honest", "[network][ui]") {
     NetPerfSnapshot snap;
     snap.devices.push_back(dev("silent", std::nullopt, std::nullopt, std::nullopt));
@@ -363,13 +382,14 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
         REQUIRE(page);
         CHECK(page->status == 200);
         CHECK(page->body.find("/fragments/network/overview") != std::string::npos);
-        // IA: Network is a DEX sub-view — the /network page shell marks DEX active
-        // in the global nav, and there is NO standalone Network top-nav link.
-        // Assert on the href (structurally stable) so a reintroduced top-nav link
-        // with any class/attribute spelling still trips this. The Network tab in
-        // the DEX sub-nav uses hx-get (not href="/network"), so this stays clean.
-        CHECK(page->body.find("class=\"nav-link active\">DEX</a>") != std::string::npos);
-        CHECK(page->body.find("href=\"/network\"") == std::string::npos);
+        // IA: Network is the sub-item of Fleet in the app shell — /network lights the Fleet
+        // family and its Network sub-item, and DEX stays unlit. (The Network tab in the
+        // DEX sub-nav uses hx-get, not href="/network", so the sub-item is the only link.)
+        CHECK(page->body.find("class=\"shell-nav on\" href=\"/viz/fleet\"") != std::string::npos);
+        CHECK(page->body.find("<a href=\"/network\" class=\"on\" aria-current=\"page\">Network</a>") !=
+              std::string::npos);
+        CHECK(page->body.find("class=\"shell-nav on\" href=\"/dex\"") == std::string::npos);
+        CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>Network</b>") != std::string::npos);
     }
 }
 
@@ -643,6 +663,18 @@ TEST_CASE("REST /network/devices: sort, filters, validation", "[network][rest]")
         REQUIRE(bad);
         CHECK(bad->status == 400);
     }
+    SECTION("a trailing-garbage limit is a 400, not its numeric prefix (#4644)") {
+        // from_chars alone accepted `2abc` as 2 (it only checked ec, not the end pointer).
+        for (const char* q : {"limit=2abc", "limit=1e1", "limit=0x2", "limit=", "limit=2.5"}) {
+            INFO(q);
+            auto bad = h.sink.Get(std::string("/api/v1/network/devices?") + q);
+            REQUIRE(bad);
+            CHECK(bad->status == 400);
+        }
+        auto ok = h.sink.Get("/api/v1/network/devices?limit=2");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
     SECTION("perm denied → 403") {
         h.grant_perms = false;
         auto denied = h.sink.Get("/api/v1/network/fleet");
@@ -669,4 +701,35 @@ TEST_CASE("OpenAPI spec lists the network endpoints (A2 discovery), stays valid 
     REQUIRE_NOTHROW(nlohmann::json::parse(res->body)); // whole doc stays valid JSON
     CHECK(res->body.find(R"("/network/fleet":)") != std::string::npos);
     CHECK(res->body.find(R"("/network/devices":)") != std::string::npos);
+}
+
+// #4644: the devices drill's `limit` is ONE base-10 integer or a 400 (it used to be
+// read with stoi, so `limit=50abc` silently became 50). A well-formed value is still clamped.
+TEST_CASE("network routes: a malformed devices limit is a 400 and a valid one is served",
+          "[network][routes][numeric_params]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto okAudit = [](const httplib::Request&, const std::string&, const std::string&,
+                      const std::string&, const std::string&, const std::string&) { return true; };
+    NetworkRoutes::NetworkApiPtr perf =
+        std::make_shared<yuzu::server::test::FnNetworkApi>([](const std::string&) {
+            NetPerfSnapshot snap;
+            snap.devices.push_back(degraded("deg-dev", 95.0, false));
+            return snap;
+        });
+    yuzu::server::test::TestRouteSink sink;
+    NetworkRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, okAudit, perf);
+    for (const char* bad : {"50abc", "0x10", "1e2", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto res = sink.Get(std::string("/fragments/network/devices?limit=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto ok = sink.Get("/fragments/network/devices?limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }
