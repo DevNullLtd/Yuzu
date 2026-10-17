@@ -1126,38 +1126,103 @@ connection; a large enough fleet of well-behaved connections, or a flood that ea
 stay just under their own ceiling, can still drive the node's total memory up. The
 memory shedder (`yuzu_gw_memory_shedder`) is the backstop: it samples
 `erlang:memory(total)` every `interval_ms` and, above a **high-water mark**, calls
-`ranch:suspend_listener/1` on the **agent** listener(s) — the socket stops accepting, new
-connections wait in the kernel backlog, and every connection already up is untouched —
-and below a **low-water mark** it resumes them. The two marks give hysteresis so a node
-hovering at the line does not flap. The **management listener is never suspended**: the
-operator and command plane stays reachable so you can drain the fleet and act on the
-pressure. While shed, `/readyz` reports not-ready (a suspended listener reads as not
-running), so a load balancer drains this node automatically.
+`ranch:suspend_listener/1` on the **agent** listener(s), and below a **low-water mark**
+it resumes them. The two marks give hysteresis so a node hovering at the line does not
+flap. The **management listener is never suspended**: the operator and command plane
+stays reachable so you can drain the fleet and act on the pressure.
+
+*What a new agent connection sees while shedding.* Suspending a listener closes its
+listen socket, so a new connection to the agent port is **refused** at once
+(`ECONNREFUSED`); connections the kernel had queued but the gateway had not yet
+accepted are reset. Every connection already established is untouched and keeps
+working. This is deliberate, rather than leaving new connections waiting in the kernel's
+listen backlog: a refused agent goes straight into its reconnect backoff (2, 4, 8 ...
+seconds, at most 256 s) and a load balancer retries a refused connect on another node,
+while a connection parked in the backlog completes the TCP handshake, makes the agent
+wait for a TLS handshake nobody answers until gRPC gives up (about 18 s, measured
+against a server that accepts TCP and never answers), is not
+retried elsewhere by the balancer, holds kernel socket memory that counts against a
+container's memory limit, and is accepted in one burst with all the others when the
+shedder resumes. Agents reconnect without jitter today (#5990), so a refused fleet
+retries in step; the backoff still spreads it over minutes. While shedding, `/readyz`
+reports not-ready (the agent listener reads as not running, `"listeners":false`), so a
+load balancer drains this node automatically.
+
+*When a suspend or resume fails.* Resuming opens the listen socket again, which can fail:
+`eaddrinuse` if another process took the port while it was closed, `emfile`/`enfile` if
+the gateway is out of file descriptors. The shedder then leaves that listener as it is
+and tries again on every tick. It logs the first failure (`could not resume agent
+listener(s) ... retrying every N ms`), then at most once a minute while it lasts, and
+the success; it counts each failed attempt in
+`yuzu_gw_memory_shedding_transition_failures_total{action}` and shows the listeners still
+not moved in `yuzu_gw_memory_shedding_transition_failing{action}`. `/readyz` stays 503
+until the listener is actually running again. The alert
+`YuzuGatewayMemorySheddingTransitionFailing` fires only when a failure has lasted 5
+minutes, and says what to do. The same applies the other way round to a suspend that
+fails (the listener keeps accepting and the shedder keeps trying). If the shedder process
+itself restarts while it has a listener suspended, the new process finds the listener
+suspended, treats it as shed and resumes it once memory is at or below the low-water mark.
 
 Configure it under `{yuzu_gw, [{memory_shedding, #{...}}]}`:
 
 | Key | Meaning | Default |
 |---|---|---|
-| `high_water_fraction` / `high_water_bytes` | The mark above which the agent listener(s) are suspended, as a fraction of system memory or absolute bytes (bytes win if both are set). | `0.75` of system memory |
-| `low_water_fraction` / `low_water_bytes` | The mark below which they resume. Must be below the high-water mark. | `0.65` of system memory |
-| `interval_ms` | How often `erlang:memory(total)` is sampled. | `1000` |
+| `high_water_fraction` / `high_water_bytes` | The mark above which the agent listener(s) are suspended, as a fraction of the memory limit (below) or absolute bytes (bytes win if both are set). | `0.75` of the memory limit |
+| `low_water_fraction` / `low_water_bytes` | The mark below which they resume. Must be below the high-water mark. | `0.65` of the memory limit |
+| `interval_ms` | How often `erlang:memory(total)` is sampled, and how often a failed suspend or resume is retried. | `1000` |
 | `enabled` | `false` turns the shedder off. | `true` |
 
-A fraction needs the system's total memory, read from `/proc/meminfo` (the Linux
-production target) without adding `os_mon`. Where it cannot be read (a host with no
-`/proc/meminfo` and no absolute bytes configured) the shedder runs **inactive** and logs
-it, rather than failing boot — it is a backstop, and the per-connection and per-stream
-bounds still hold. Set `high_water_bytes` / `low_water_bytes` to shed on such a host. The
-config shape is validated at boot; a malformed `memory_shedding` map refuses to start.
+*The memory limit* a fraction applies to is the smaller of the host's memory and the
+cgroup memory limit the gateway runs under, read once at start without adding `os_mon`:
 
-Metrics: `yuzu_gw_memory_shedding_active` is a gauge, `1` while the agent listener(s) are
-suspended and `0` otherwise; `yuzu_gw_memory_shedding_suspensions_total` counts each time
-shedding began. The shipped alert `YuzuGatewayMemorySheddingActive` fires while the gauge
-is `1` for several minutes (`docs/prometheus/yuzu-alerts.yml`). **Tuning:** if the node
-sheds under normal load, the node is undersized for the fleet (lower the fleet per node or
-raise the memory); if it never sheds under a flood that is hurting it, lower the high-water
-mark. Leave at least a few points between the two marks so it does not flap. The kill and
-receive-timeout counters above (`yuzu_gw_grpc_connection_killed_total`,
+- host memory: `MemTotal` in `/proc/meminfo` on Linux, the `hw.memsize` sysctl on macOS;
+- cgroup v2: `memory.max` (`max` means no limit); cgroup v1:
+  `memory/memory.limit_in_bytes` (a value of 2^62 or more means no limit). Both are read
+  in the gateway's own cgroup (from `/proc/self/cgroup`) and in each parent up to the root
+  of `/sys/fs/cgroup`, and the smallest limit wins, so a container's memory limit
+  (`docker run --memory`, a Kubernetes `resources.limits.memory`) and a systemd
+  `MemoryMax=` on the unit or its slice are all seen.
+
+Before this, the fraction was of the host's memory only, so a gateway in a container with
+a memory limit below the host's memory never shed before the kernel's OOM killer stopped
+it. The gauges `yuzu_gw_memory_shedding_high_water_bytes` and
+`yuzu_gw_memory_shedding_low_water_bytes` show the marks the shedder resolved, and its
+start-up log line names the limit and where it came from (`cgroup_v2`, `cgroup_v1` or
+`host`): check them against the container's limit after a deployment. A cgroup file that
+exists but cannot be read or parsed is logged as a warning and skipped; the shedder then
+uses the host's memory, which may be too high, so set `high_water_bytes` and
+`low_water_bytes` below the limit in that case. A configured `high_water_bytes` at or
+above the cgroup limit is also logged, since it can never trip first. `memory.high` (a
+throttling threshold, not a kill) is not read. A limit changed while the gateway runs
+(`docker update --memory`) takes effect at the next restart.
+
+*What is sampled* stays `erlang:memory(total)`, the memory the VM has allocated, not the
+cgroup's `memory.current`. It is what the agent connections cost and what shedding them
+relieves, it needs no file read per sample, and it does not move with the page cache
+(`memory.current` counts file cache that the kernel reclaims before it kills anything, so
+log writes alone could trip the shedder). The cost is that it leaves out what the cgroup
+also counts: allocator overhead (memory the VM holds from the OS but has not handed out),
+memory outside the VM's allocators and kernel socket buffers. The default high-water mark
+of 0.75 of the limit leaves that quarter for them. Compare
+`yuzu_gw_beam_memory_bytes{type="total"}` with the container's working set (cAdvisor's
+`container_memory_working_set_bytes`) under load; if the gap is more than about a quarter
+of the limit, lower the fractions.
+
+Where no limit can be read at all (no cgroup, no `/proc/meminfo`, not macOS) and no
+absolute bytes are configured, the shedder runs **inactive** and logs it, rather than
+failing boot: it is a backstop, and the per-connection and per-stream bounds still hold.
+The config shape is validated at boot; a malformed `memory_shedding` map refuses to start.
+
+Metrics: `yuzu_gw_memory_shedding_active` is a gauge, `1` while the gateway is shedding
+(memory passed the high-water mark and has not yet fallen to the low-water mark) and `0`
+otherwise; `yuzu_gw_memory_shedding_suspensions_total` counts each time shedding began.
+The failure metrics and mark gauges are described above. The shipped alert
+`YuzuGatewayMemorySheddingActive` fires while the gauge is `1` for 3 minutes
+(`docs/prometheus/yuzu-alerts.yml`). **Tuning:** if the node sheds under normal load, the
+node is undersized for the fleet (lower the fleet per node or raise the memory); if it
+never sheds under a flood that is hurting it, lower the high-water mark. Leave at least a
+few points between the two marks so it does not flap. The kill and receive-timeout
+counters above (`yuzu_gw_grpc_connection_killed_total`,
 `yuzu_gw_grpc_recv_timeout_total`) tell you whether the pressure is a flood of
 half-finished requests rather than genuine fleet growth.
 

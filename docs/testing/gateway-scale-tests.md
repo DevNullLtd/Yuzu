@@ -265,7 +265,9 @@ Across every case and both sizes:
   160 KB (14 KB after a collection). The rest is heap the processes no longer
   use and have not collected.
 - On the macOS host the gateway logged `gateway memory shedding is inactive:
-  system_memory_unknown`, so the shedder took no part.
+  system_memory_unknown`, so the shedder took no part. (The shedder now reads
+  the host's memory on macOS from `hw.memsize`, so a rerun there would have it
+  active, at 0.75 of the host's memory by default.)
 
 At 25,000 agents only the `fanout` case was run (18 min, half the agents on the
 `::1` listener). Its setup phase, which registers every agent with the server
