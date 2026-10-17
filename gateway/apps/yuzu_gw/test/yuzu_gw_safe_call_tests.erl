@@ -58,7 +58,7 @@ safe_call_test_() ->
        fun registry_noproc/0},
       {"registry: a registry that never answers times out without leaking",
        fun registry_died_serving/0},
-      {"agent: init fails with a fixed reason when the registry is not running",
+      {"agent: a registry that is not running refuses with a fixed reason, no crash report",
        fun agent_init_registry_down/0},
       {"the WARN names the exit class only, and at most one per second per server",
        fun warn_names_class_only_and_is_limited/0},
@@ -203,22 +203,26 @@ registry_died_serving() ->
     ?assertEqual({returned, {error, registry_unavailable}}, Result),
     assert_no_markers(Events).
 
-%% The agent is started the way the supervisor does, by proc_lib, and fails
-%% init with a fixed reason: the Subscribe handler logs it with ~p and the
-%% supervisor prints it.
+%% The agent is started the way the supervisor does (yuzu_gw_agent's start
+%% function returns once the process exists; the registration is its first
+%% event), and the caller waits for the outcome the way start_agent/1 does. A
+%% registry that is not running is answered with the fixed reason, the process
+%% stops `normal' (a refusal is not a crash: no crash report to print the
+%% request), and nothing logged meanwhile carries the request.
 agent_init_registry_down() ->
     stop_named(yuzu_gw_registry),
     capture_to_self(),
     Args = #{agent_id => <<"a-1">>, agent_info => #{hostname => <<"h">>},
              stream_pid => self(), peer_addr => <<"peer">>, session_id => <<"s-1">>,
              register_req => req()},
-    {error, Reason} = gen_statem:start(yuzu_gw_agent, Args, []),
-    ?assertEqual(registry_unavailable, Reason),
-    %% The process logs its crash report after it has answered the starter, so
-    %% wait for that report (it is the one that names the exit reason).
-    Events = collect_until(fun is_agent_crash_report/1),
-    ?assertMatch([_|_], [E || E <- Events, is_agent_crash_report(E)]),
-    ?assert(contains(events_text(Events), <<"registry_unavailable">>)),
+    Alias = alias([reply]),
+    {ok, Pid} = gen_statem:start(yuzu_gw_agent, Args#{registered_ack => Alias}, []),
+    ?assertEqual({error, registry_unavailable}, yuzu_gw_agent:await_registration(Pid, Alias)),
+    ?assertNot(is_process_alive(Pid)),
+    %% Give a late report (there should be none) time to arrive.
+    timer:sleep(100),
+    Events = drain_events(),
+    ?assertEqual([], [E || E <- Events, is_agent_crash_report(E)]),
     assert_no_markers(Events).
 
 %% The six closed kinds of warn_limited/3 each have a stamp as soon as init_limits/0
@@ -622,17 +626,6 @@ capture_to_self() ->
 log(Event, #{config := #{pid := Pid}}) ->
     Pid ! {captured, Event},
     ok.
-
-%% Events until one satisfies Pred (included); fails on a timeout.
-collect_until(Pred) ->
-    receive
-        {captured, E} ->
-            case Pred(E) of
-                true  -> [E];
-                false -> [E | collect_until(Pred)]
-            end
-    after ?WAIT_MS -> error(expected_event_not_logged)
-    end.
 
 is_agent_crash_report(#{msg := {report, #{label := {proc_lib, crash},
                                           report := [ProcInfo | _]}}}) when is_list(ProcInfo) ->

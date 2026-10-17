@@ -2,9 +2,27 @@
 %%% @doc gen_statem: one Erlang process per connected agent.
 %%%
 %%% States:
+%%%   registering  → the first event after init/1: the registry call
 %%%   connecting   → waiting for the subscribe handler to supply its pid
 %%%   streaming    → bidi stream active; commands routed via stream_pid
 %%%   disconnected → cleanup, deregister, terminate
+%%%
+%%% Registration runs after init/1 has returned, never inside it. There is one
+%%% agent supervisor per gateway and `supervisor:start_child' returns only when
+%%% init/1 does, so a registry call (30 s timeout) made in init/1 held every
+%%% other agent's start_child, and the supervisor's handling of child exits,
+%%% for as long as the registry took: in a reconnect storm the storm was
+%%% serialised through the supervisor. start_link_async/1 (the supervisor's
+%%% start function) returns as soon as the process exists. A caller that needs
+%%% the outcome (the Subscribe handler, through yuzu_gw_agent_sup:start_agent/1,
+%%% and start_link/1) passes an alias in `registered_ack' and waits for it in
+%%% await_registration/2, in its OWN process.
+%%%
+%%% A refused registration (session_limit, registry_unavailable) is answered on
+%%% the alias and the process stops with reason `normal': it has done nothing
+%%% that needs undoing, and a storm of refusals must not write a crash report
+%%% each. The agent supervisor's children are `temporary' (never restarted),
+%%% so no exit counts against its restart intensity either way.
 %%%
 %%% The subscribe handler process (yuzu_gw_agent_service:stream_loop/3)
 %%% owns the gRPC server stream and forwards data here as messages:
@@ -26,6 +44,8 @@
 
 %% API
 -export([start_link/1,
+         start_link_async/1,
+         await_registration/2,
          dispatch/3,
          get_info/1,
          disconnect/1,
@@ -33,7 +53,12 @@
 
 %% gen_statem callbacks
 -export([callback_mode/0, init/1, terminate/3, code_change/4, format_status/1]).
--export([connecting/3, streaming/3, disconnected/3]).
+-export([registering/3, connecting/3, streaming/3, disconnected/3]).
+
+%% How long a caller of await_registration/2 waits. The agent's registry call
+%% gives up after 30 s (yuzu_gw_registry:register_agent/7) and the agent then
+%% answers, so this is only reached by an agent that cannot run at all.
+-define(REGISTRATION_WAIT_MS, 35000).
 
 -record(data, {
     agent_id    :: binary(),
@@ -63,9 +88,59 @@
 %%% API
 %%%===================================================================
 
+%% @doc Start an agent process and return once its registration is decided:
+%% `{ok, Pid}' with the agent in the routing table, or `{error, Reason}' for a
+%% refused one (session_limit, registry_unavailable), the process then gone.
+%% The wait is in the caller; for direct callers and tests. The supervisor uses
+%% start_link_async/1.
 -spec start_link(map()) -> {ok, pid()} | {error, term()}.
 start_link(Args) ->
+    Alias = alias([reply]),
+    case start_link_async(Args#{registered_ack => Alias}) of
+        {ok, Pid} ->
+            await_registration(Pid, Alias);
+        Error ->
+            unalias(Alias),
+            Error
+    end.
+
+%% @doc Start an agent process and return as soon as it exists; the
+%% registration is its first event. The agent supervisor's start function.
+%% With `registered_ack => Alias' in Args the outcome is sent to Alias (see
+%% await_registration/2).
+-spec start_link_async(map()) -> {ok, pid()} | {error, term()}.
+start_link_async(Args) ->
     gen_statem:start_link(?MODULE, Args, []).
+
+%% @doc Wait, in the calling process, for the registration outcome of Pid,
+%% started with `registered_ack => Alias' (an alias the caller made with
+%% `alias([reply])'). `{error, session_limit | registry_unavailable}' as the
+%% registry answered; `{error, registry_unavailable}' too when the agent does
+%% not answer in time (it is then told to disconnect, which it does once its
+%% registry call returns) or dies first. Fixed reasons only: a crash reason
+%% could carry the stored RegisterRequest.
+-spec await_registration(pid(), reference()) -> {ok, pid()} | {error, term()}.
+await_registration(Pid, Alias) ->
+    MRef = monitor(process, Pid),
+    receive
+        {Alias, registered} ->
+            demonitor(MRef, [flush]),
+            {ok, Pid};
+        {Alias, {refused, Reason}} ->
+            %% The process stops right after answering; return once it is gone.
+            receive {'DOWN', MRef, process, Pid, _} -> ok
+            after 5000 -> demonitor(MRef, [flush])
+            end,
+            {error, Reason};
+        {'DOWN', MRef, process, Pid, _} ->
+            unalias(Alias),
+            {error, registry_unavailable}
+    after ?REGISTRATION_WAIT_MS ->
+        unalias(Alias),
+        demonitor(MRef, [flush]),
+        disconnect(Pid),
+        {error, registry_unavailable}
+    end.
 
 %% @doc Dispatch a command to this agent. Called by the router.
 -spec dispatch(pid(), map(), {pid(), reference()}) -> ok.
@@ -150,9 +225,25 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
         stream_home_id = StreamHomeId
     },
 
-    %% Register in the routing table. The RegisterRequest
-    %% is stashed in the registry so yuzu_gw_upstream can re-proxy it
-    %% when the upstream connection re-establishes.
+    %% Registration is the first event, run once init/1 has returned and the
+    %% supervisor is free (see the module doc). The connection key and the
+    %% caller's alias ride in the event, not in the data.
+    Ack = maps:get(registered_ack, Args, undefined),
+    {ok, registering, Data, [{next_event, internal, {register, ConnKey, Ack}}]}.
+
+%%--------------------------------------------------------------------
+%% State: registering — the registry call, then connecting or streaming
+%%--------------------------------------------------------------------
+
+registering(enter, _OldState, _Data) ->
+    keep_state_and_data;
+
+registering(internal, {register, ConnKey, Ack},
+            #data{agent_id = AgentId, session_id = SessionId, agent_info = AgentInfo,
+                  plugins = Plugins, register_req = RegisterReq} = Data) ->
+    %% Register in the routing table. The RegisterRequest is stashed in the
+    %% registry so yuzu_gw_upstream can re-proxy it when the upstream
+    %% connection re-establishes.
     Hostname = maps:get(<<"hostname">>, AgentInfo,
                         maps:get(hostname, AgentInfo, <<>>)),
     case yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
@@ -161,21 +252,31 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
             %% The cross-node lookup group, joined here and not by the registry
             %% (yuzu_gw_registry's module doc).
             ok = yuzu_gw_registry:join_agent_group(AgentId),
-            announce_connected(Data);
-        {error, registry_unavailable} ->
-            %% A fixed reason: an init failure is printed by the supervisor and
-            %% by the Subscribe handler, and must not carry the request.
-            {stop, registry_unavailable};
-        {error, session_limit} ->
-            %% The connection holds its quota of other agents' sessions (the
-            %% registry counted and logged it): refuse this one. A fixed reason,
-            %% for the same reason as above.
-            {stop, session_limit}
-    end.
+            Next = announce_connected(Data),
+            ack(Ack, registered),
+            {next_state, Next, Data};
+        {error, Reason} when Reason =:= registry_unavailable; Reason =:= session_limit ->
+            %% session_limit: the connection holds its quota of other agents'
+            %% sessions (the registry counted and logged it). A fixed reason
+            %% either way: it is printed by the Subscribe handler and must not
+            %% carry the request. Nothing was registered, so nothing to undo:
+            %% stop `normal', which writes no crash report.
+            ack(Ack, {refused, Reason}),
+            {stop, normal}
+    end;
 
-%% The rest of init/1, once the agent is in the routing table.
+registering(_EventType, _Event, _Data) ->
+    %% Unreachable in practice (the registration is the first event, and the
+    %% registry call runs inside it); anything else waits for its outcome.
+    {keep_state_and_data, [postpone]}.
+
+ack(undefined, _Result) -> ok;
+ack(Alias, Result)      -> Alias ! {Alias, Result}, ok.
+
+%% Once the agent is in the routing table: tell watchers, telemetry and the
+%% server, and name the state to enter.
 announce_connected(#data{agent_id = AgentId, session_id = SessionId, peer_addr = PeerAddr,
-                         stream_pid = StreamPid, stream_home_id = StreamHomeId} = Data) ->
+                         stream_pid = StreamPid, stream_home_id = StreamHomeId}) ->
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,
                       occurred_at => #{millis_epoch => erlang:system_time(millisecond)},
@@ -194,8 +295,8 @@ announce_connected(#data{agent_id = AgentId, session_id = SessionId, peer_addr =
                                            StreamHomeId),
 
     case StreamPid of
-        undefined -> {ok, connecting, Data};
-        _         -> {ok, streaming, Data}
+        undefined -> connecting;
+        _         -> streaming
     end.
 
 %%--------------------------------------------------------------------
@@ -375,7 +476,11 @@ disconnected(_EventType, _Event, _Data) ->
 %%--------------------------------------------------------------------
 
 terminate(normal, _State, _Data) ->
-    %% Already cleaned up in disconnected(enter, ...).
+    %% Already cleaned up in disconnected(enter, ...), or a refused
+    %% registration that registered nothing.
+    ok;
+terminate(_Reason, registering, _Data) ->
+    %% Not registered, not announced: nothing to undo.
     ok;
 terminate(_Reason, _State, Data) ->
     do_cleanup(Data),
