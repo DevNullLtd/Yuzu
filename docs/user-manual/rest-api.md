@@ -970,8 +970,8 @@ twin of `/fragments/create-group-form`'s own live count. This route and its MCP 
 shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
 dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
 (`DashboardRoutes::parse_filters`), except that for an over-bound filter it hides the count and
-shows a static sentence (#5623). The number it shows and this route's
-`agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
+shows a static sentence (#5623). For a filter within the bound, the number it shows and
+this route's `agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
 `preview_management_group_agent_count`.
 
 **Permission:** `ManagementGroup:Write` — matching the fragment's own gate exactly (only an
