@@ -150,8 +150,73 @@ ceiling(Entry, Kind) ->
     end.
 
 %%%-------------------------------------------------------------------
+%%% 2. The deadline hierarchy
+%%%-------------------------------------------------------------------
+
+%% 600 SendCommand streams on one connection share one client deadline, 2 s
+%% out, and every handler blocks (agents that never answer): the shape of a
+%% mass dispatch whose agents are gone, the server's calls all expiring
+%% together. The client does what a gRPC client does at its deadline: it resets
+%% (RST_STREAM CANCEL) every stream still open. More than 500 resets inside
+%% 10 s trip Cowboy's max_cancel_stream_rate, which closes the WHOLE connection
+%% (GOAWAY enhance_your_calm). With the gateway's deadline equal to the
+%% client's the gateway answers too late and the client cancels; answered a
+%% margin early, every stream ends DEADLINE_EXCEEDED before the client's
+%% deadline, the client has nothing to cancel, and the connection still serves.
+mgmt_deadline_before_caller_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     {timeout, 60, fun mgmt_deadline_before_caller/0}}.
+
+mgmt_deadline_before_caller() ->
+    {Port, L} = yuzu_gw_test_listener:start(prod_mgmt_entry(#{name => edge_deadline})),
+    {C, Mon} = open(Port),
+    try
+        N = 600,
+        Deadline = erlang:monotonic_time(microsecond) + 2000 * 1000,
+        Refs = [send_command(C, <<"sleep">>, <<>>,
+                             [{<<"grpc-timeout">>, timeout_header(Deadline)}]) ||
+                   _ <- lists:seq(1, N)],
+        {Results, Down} = collect(C, Mon, Refs, until(Deadline)),
+        %% the client's deadline: cancel what is still open, as gRPC does
+        Open = [R || R <- Refs, element(1, maps:get(R, Results)) =:= pending],
+        [gun:cancel(C, R) || R <- Open],
+        Probe = list_agents(C),
+        {ProbeResult, ProbeDown} = collect(C, Mon, [Probe], 5000),
+        ?assertEqual({alive, 0}, {Down, length(Open)}),
+        ?assertEqual(lists:duplicate(N, {<<"4">>, 0}), [maps:get(R, Results) || R <- Refs]),
+        ?assertEqual({alive, {<<"0">>, response_bytes_list()}},
+                     {ProbeDown, maps:get(Probe, ProbeResult)})
+    after
+        gun:close(C),
+        yuzu_gw_test_listener:stop(L)
+    end.
+
+%% The margin: a tenth of the client's timeout, at most one second.
+deadline_margin_test_() ->
+    [?_assertEqual(299000, yuzu_grpc_stream_h:deadline_ms(300000)),
+     ?_assertEqual(9000, yuzu_grpc_stream_h:deadline_ms(10000)),
+     ?_assertEqual(1800, yuzu_grpc_stream_h:deadline_ms(2000)),
+     ?_assertEqual(90, yuzu_grpc_stream_h:deadline_ms(100)),
+     ?_assertEqual(9, yuzu_grpc_stream_h:deadline_ms(9)),
+     ?_assertEqual(0, yuzu_grpc_stream_h:deadline_ms(0))].
+
+%%%-------------------------------------------------------------------
 %%% Helpers
 %%%-------------------------------------------------------------------
+
+%% Milliseconds from now until a monotonic deadline in microseconds, and the
+%% grpc-timeout that deadline is from now, rounded UP to the millisecond as gRPC
+%% does (a client never tells the server less time than it will wait).
+until(DeadlineUs) ->
+    max(0, (DeadlineUs - erlang:monotonic_time(microsecond)) div 1000).
+
+timeout_header(DeadlineUs) ->
+    Left = DeadlineUs - erlang:monotonic_time(microsecond),
+    <<(integer_to_binary((Left + 999) div 1000))/binary, "m">>.
+
+response_bytes_list() ->
+    byte_size(yuzu_grpc_frame:encode(
+                management_pb:encode_msg(#{agents => []}, 'yuzu.server.v1.ListAgentsResponse'))).
 
 response_bytes(Output) ->
     byte_size(yuzu_grpc_frame:encode(

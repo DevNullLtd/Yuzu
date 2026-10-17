@@ -52,6 +52,10 @@
 %%%     a bidirectional or client-streaming handler (an agent's Subscribe) is
 %%%     spawned before any message and is never cut by it. A grpc-timeout the
 %%%     client sent runs alongside; whichever fires first ends the stream.
+%%%
+%%% A grpc-timeout ends the call DEADLINE_EXCEEDED a margin before the client's
+%%% deadline (deadline_ms/1), so the client gets the status rather than having
+%%% to reset the stream: many resets at once close the whole connection.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_stream_h).
@@ -60,9 +64,14 @@
 -include("yuzu_grpc.hrl").
 
 -export([init/3, data/4, info/3, terminate/3, early_error/5]).
+-export([deadline_ms/1]).
 
 %% Cowboy kills a handler that ignores the shutdown signal after this long.
 -define(SHUTDOWN_MS, 5000).
+%% A call with a grpc-timeout is ended this much before the client's deadline:
+%% a tenth of the timeout, at most one second (deadline_ms/1).
+-define(DEADLINE_MARGIN_MAX_MS, 1000).
+-define(DEADLINE_MARGIN_DIVISOR, 10).
 
 -record(st, {
     phase = awaiting_request :: awaiting_request | running | running_single | ended,
@@ -289,11 +298,31 @@ origin(Env, {PeerIp, _Port}, Req, Headers) ->
     end,
     Origin.
 
+%% The client's grpc-timeout, less a margin: the call is answered
+%% DEADLINE_EXCEEDED BEFORE the client's own deadline passes, so a client that
+%% would reset the stream at its deadline (a gRPC client sends RST_STREAM CANCEL
+%% then) receives the status instead and has nothing to cancel. When many
+%% streams of one connection share a deadline (a fan-out whose agents are gone,
+%% each command a call with the same 300 s deadline) those resets arrive
+%% together, and past Cowboy's max_cancel_stream_rate (500 per 10 s) Cowboy
+%% closes the WHOLE connection, every call on it with it. See deadline_ms/1.
 arm_deadline(_StreamId, infinity) ->
     undefined;
 arm_deadline(StreamId, {ok, Ms}) ->
     Conn = self(),
-    erlang:send_after(Ms, Conn, {{Conn, StreamId}, grpc_deadline}).
+    erlang:send_after(deadline_ms(Ms), Conn, {{Conn, StreamId}, grpc_deadline}).
+
+%% @doc When the gateway ends a call whose client sent a grpc-timeout of Ms: a
+%% tenth of the timeout early, at most ?DEADLINE_MARGIN_MAX_MS. The margin has to
+%% cover the time the request took to arrive (the gateway's timer starts that
+%% much after the client's), the time the connection process takes to write the
+%% statuses of every stream expiring together (thousands of trailers, one
+%% process), and the time they take to reach the client: one second is far
+%% above all three on a LAN and still under 0.4% of the server's 300 s. A tenth
+%% keeps a short timeout useful (a 2 s call is answered at 1.8 s, not at 1 s).
+-spec deadline_ms(non_neg_integer()) -> non_neg_integer().
+deadline_ms(Ms) ->
+    Ms - min(?DEADLINE_MARGIN_MAX_MS, Ms div ?DEADLINE_MARGIN_DIVISOR).
 
 arm_recv_deadline(_StreamId, infinity) ->
     undefined;
