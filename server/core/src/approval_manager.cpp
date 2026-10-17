@@ -969,6 +969,8 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
         return std::unexpected("approval id is required");
     if (reviewer.empty())
         return std::unexpected("reviewer is required");
+    if (comment.size() > kMaxReviewCommentBytes)
+        return std::unexpected(std::string{kReviewCommentTooLong});
 
     // Fetch the current approval to validate state (a friendly error
     // message only — the real TOCTOU guard is the UPDATE's own

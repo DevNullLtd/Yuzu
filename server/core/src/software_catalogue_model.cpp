@@ -2,6 +2,7 @@
 
 #include "data_export.hpp"
 #include "device_api.hpp"
+#include "list_keyset.hpp"
 #include "software_catalog_rules.hpp"
 #include "utf8_sanitize.hpp"
 
@@ -106,43 +107,9 @@ std::expected<std::int64_t, std::string> read_limit(const std::string& v, std::i
 
 // ── base64url (RFC 4648 §5, no padding) ──────────────────────────────────────
 
-constexpr std::string_view kB64 =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-std::string b64url_encode(std::string_view in) {
-    std::string out;
-    std::uint32_t acc = 0;
-    int bits = 0;
-    for (const char c : in) {
-        acc = acc << 8 | static_cast<std::uint8_t>(c);
-        bits += 8;
-        while (bits >= 6) {
-            bits -= 6;
-            out += kB64[(acc >> bits) & 63];
-        }
-    }
-    if (bits > 0)
-        out += kB64[(acc << (6 - bits)) & 63];
-    return out;
-}
-
-// Strict: alphabet only (no '=' padding, no skipped bytes), tail length != 1 mod 4.
-std::optional<std::string> b64url_decode(std::string_view in) {
-    if (in.size() % 4 == 1 || in.find_first_not_of(kB64) != std::string_view::npos)
-        return std::nullopt;
-    std::string out;
-    std::uint32_t acc = 0;
-    int bits = 0;
-    for (const char c : in) {
-        acc = acc << 6 | static_cast<std::uint32_t>(kB64.find(c));
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out += static_cast<char>((acc >> bits) & 0xFF);
-        }
-    }
-    return out;
-}
+// The strict codec is shared with every other cursor in the server (list_keyset.hpp).
+using ::yuzu::server::keyset::b64url_decode;
+using ::yuzu::server::keyset::b64url_encode;
 
 // ── Fingerprints and tokens ──────────────────────────────────────────────────
 

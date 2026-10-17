@@ -6,6 +6,7 @@
  *   A. yuzu::browser_policy::run_guarded
  *   B. yuzu::update_source_trust::execute_sources
  *   C. yuzu::mgmt_posture::execute_posture
+ *   D. yuzu::shares::execute_list
  * Their catch arms must build a token, write a status row and set the typed
  * status without letting a second bad_alloc escape. The SDK export wrapper
  * (plugin.hpp) and the test-side LocalDispatcher::run (agent.cpp) do not catch, so an
@@ -36,14 +37,16 @@
  * surviving signal. The healthy-allocator behaviour (full `:bad_alloc` token)
  * is pinned by the two local-dispatcher tests and is not duplicated here.
  *
- * SEAM C differs in two respects. Its recovery writes the status ROW before it sets the typed
- * status, so under sustained failure the row build throws first and the surviving signal is
- * rc 1 (the double-throw arm), not a typed status. And its token (`<os>:leg:exception`)
- * carries no `:bad_alloc` suffix, so the provenance-shape check above does not apply to it.
+ * SEAMS C and D differ in two respects. Their recovery writes the status ROW before it sets
+ * the typed status, so under sustained failure the row build throws first and the surviving
+ * signal is rc 1 (the double-throw arm), not a typed status. And their token
+ * (`<os>:leg:exception`) carries no `:bad_alloc` suffix, so the provenance-shape check above
+ * does not apply to them.
  */
 
 #include "browser_policy_legs.hpp"
 #include "mgmt_posture_legs.hpp"
+#include "shares_legs.hpp"
 #include "update_source_trust_legs.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -200,6 +203,27 @@ TEST_CASE("mgmt_posture execute_posture contains a leg that throws under sustain
     REQUIRE(g_injected > 0);
     // The host must still learn of the failure: rc 1 from the double-throw arm, or a typed
     // UNAVAILABLE/UNKNOWN status if the recovery managed to land.
+    CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
+                       g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+}
+
+TEST_CASE("shares execute_list contains a leg that throws under sustained OOM",
+          "[plugin][abi][oom][shares]") {
+    yuzu::CommandContext ctx{nullptr};
+    reset_stubs();
+    bool escaped = false;
+    int rc = -1;
+    try {
+        rc = yuzu::shares::execute_list(ctx, "list", &oom_leg, "linux:leg:exception");
+    } catch (...) {
+        escaped = true;
+    }
+    g_fail_alloc = false;
+
+    REQUIRE_FALSE(escaped);
+    // The recovery's status row must have hit the failing allocator, or this case proves
+    // nothing on a stdlib whose containment is never exercised.
+    REQUIRE(g_injected > 0);
     CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
                        g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
 }

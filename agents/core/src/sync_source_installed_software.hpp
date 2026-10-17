@@ -9,6 +9,7 @@
 ///   installed_apps.list_inventory           blob contract v2 rows
 ///   pkg_inventory.packages                  Homebrew formulae/casks (ecosystem `brew`)
 ///   pkg_inventory.managers                  one `homebrew` presence row
+///   pkg_inventory.store_packages            active snaps/flatpaks (ecosystems `snap`, `flatpak`)
 ///   windows_optional_features.list          every DISM feature, state in `version`
 /// Every row carries `source` = "<plugin>.<action>". NO per-user data (machine
 /// scope only — no PII).
@@ -36,7 +37,7 @@ struct SwEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -57,9 +58,11 @@ using SyncPluginMap = std::map<std::string, const YuzuPluginDescriptor*, std::le
 /// answer ("brew present, no formulae"); `unsupported` = the action answered
 /// "not on this OS" (skipped silently); `failed` = skip the whole cycle.
 /// `ok` with a non-empty `reason` = constrained managers answer whose present
-/// row is kept. Collector rules: constrained managers with a present Homebrew row
-/// is ok (zero present rows still fails; another OS's managers leg maps its own
-/// rows and must decide its own constrained rule); typed PARTIAL completeness
+/// row is kept. Collector rules: a constrained managers answer is ok iff at
+/// least one PRESENT manager row was seen, whether or not it maps to an entry
+/// (Linux dpkg/apt rows map to nothing but are still evidence the read worked;
+/// zero present rows still fails); a constrained store_packages or packages
+/// answer always fails (a partial roster would delete stored rows); typed PARTIAL completeness
 /// skips the cycle unless the action opts in (an in-band `unsupported` answer
 /// wins first); an absent plugin is warned.
 struct AdaptedRows {
@@ -91,6 +94,14 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_managers_output(const std::string& o
 /// `package|homebrew|<id>|<version>|<formula|cask>`): formula -> kind `pkg`,
 /// cask -> kind `app`, ecosystem `brew`.
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& out);
+
+/// Adapt `pkg_inventory` `store_packages` output (`status|store_packages|<level>|...`
+/// plus nine-token `package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or
+/// ->|<arch or ->|<branch or ->|<state>`). ACTIVE rows only. snap -> ecosystem
+/// `snap`, version from snap.yaml, release = revision; flatpak -> ecosystem
+/// `flatpak`, version EMPTY (the branch is a ref, not a version), release =
+/// commit, arch. kind `app` iff the row's kind is `app`, else `pkg`.
+YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out);
 
 /// Adapt `windows_optional_features` `list` output (`feature|<name>|<state>|<0/1>`):
 /// EVERY feature becomes {kind=feat, ecosystem=optional_feature} with the DISM

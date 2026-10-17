@@ -242,6 +242,7 @@ agent_test_exe = executable(
     'unit/test_progress_listener.cpp', # #4018 per-test START/END progress log, env-gated
     'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
     'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
+    'unit/test_agent_ota_disabled_lifecycle.cpp', # registration → command → reconnect, OTA disabled
     'unit/test_update_signature_mode.cpp', # OTA update-signature mode report + env typo check (#5249)
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
@@ -320,6 +321,8 @@ agent_test_exe = executable(
     'unit/test_guardian_legacy_sink_executor.cpp',
     'unit/test_guardian_outbox_drain_worker.cpp',
     'unit/test_guardian_engine_spark_reconcile.cpp',
+    'unit/test_guardian_spark_reapply_skip_engine.cpp',   # #4415 PR-A: engine-level skip effect-set tests
+    'unit/test_guardian_spark_reapply_skip_runtime.cpp',  # #4415 PR-A: attach_core reuse / follower tests
     'unit/test_guardian_arm_ack.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
@@ -329,6 +332,7 @@ agent_test_exe = executable(
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
+    'unit/test_protective_actions.cpp', # shared protective-action predicate (common/include/yuzu/protective_actions.hpp), pure
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
@@ -566,6 +570,10 @@ agent_test_exe = executable(
     'unit/test_mgmt_posture_parsers.cpp',           # mgmt_posture: pure sssd/ipa/profiles parsers, plane classifier, row formatters; portable
     'unit/test_mgmt_posture_legs.cpp',              # mgmt_posture: OS-free posture_linux/posture_macos decision seams over injected fakes; portable
     'unit/test_mgmt_posture_local_dispatcher.cpp',  # mgmt_posture: real plugin via LocalDispatcher + execute seam, unguarded on every OS
+    'unit/test_shares_parsers.cpp',                 # shares: pure exports/smb.conf parsers + row formatters over labelled fixtures; portable
+    'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux decision seam over injected fakes; portable
+    'unit/test_shares_posix_fs.cpp',                # shares: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd); body #if !defined(_WIN32)
+    'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
     'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
@@ -589,8 +597,10 @@ agent_test_exe = executable(
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_pkg_inventory_parsers.cpp',          # Wave 10 PR10.1-c: pure row formatters/tokens + synthetic in-code macOS walk cases (no committed fixture)
     'unit/test_pkg_inventory_macos_parsers.cpp',    # Wave 10 PR10.1-c: injected-root Homebrew walk over a REAL CAPTURE Cellar tree
+    'unit/test_pkg_inventory_linux_parsers.cpp',    # pkg_inventory Linux legs: injected-root Linux snap/flatpak/managers walk over a REAL CAPTURE tree manifest (body POSIX-only)
     'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
     '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
+    '../agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp', # pkg_inventory Linux legs: run_linux (self-gated to __linux__, empty elsewhere)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp, config_checks.hpp
@@ -609,6 +619,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/mgmt_posture/src'),  # mgmt_posture_parsers.hpp / _legs.hpp
+    include_directories('../agents/plugins/shares/src'),  # shares_parsers.hpp / _legs.hpp / _posix_fs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
@@ -795,6 +806,7 @@ agent_test_exe = executable(
                 browser_policy_plugin_lib,  # Wave 10 PR10.2-b
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 mgmt_posture_plugin_lib,  # management-plane posture
+                shares_plugin_lib,  # shares
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 local_security_policy_plugin_lib,  # Wave 8 PR8.3
@@ -885,6 +897,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
     files('unit/test_plugin_abi_oom_containment.cpp'),
     include_directories: [include_directories('../agents/plugins/browser_policy/src'),
                           include_directories('../agents/plugins/mgmt_posture/src'),
+                          include_directories('../agents/plugins/shares/src'),
                           include_directories('../agents/plugins/update_source_trust/src'),
                           include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
                           include_directories('../agents/shared')],
@@ -1075,7 +1088,7 @@ endforeach
 # assert-suite-cover.py and `--suite agent` select it. Needs no fixtures: --list-tests
 # never runs a test body. It tolerates the `--test-args '[tag]'` that meson appends to
 # every test in the suite (the script ignores trailing extras in the agent family).
-_agent_shard_python3 = find_program('python3', 'python')
+_agent_shard_python3 = yuzu_python
 test('agent shard partition invariant',
   _agent_shard_python3,
   args: [files('../scripts/ci/check-pg-shard-partition.py'),
@@ -1304,6 +1317,7 @@ tar_test_exe = executable(
   ],
   cpp_args: tar_test_cpp_args,
   objcpp_args: tar_test_objcpp_args,
+  link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: tar_test_deps,
 )
 test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
@@ -1324,6 +1338,7 @@ if build_server
       'unit/server/test_auth_jit_elevation.cpp',
       'unit/server/test_auth_sso_identity.cpp',
       'unit/server/test_auth_routes_hardened.cpp',
+      'unit/server/test_login_routes.cpp',          # landing + sign-in routes (GET /home, GET /login, logout); no PG
       'unit/server/test_sso_boot_guard.cpp',
       'unit/server/test_settings_routes_mfa.cpp',
       'unit/server/test_totp.cpp',
@@ -1344,8 +1359,10 @@ if build_server
       'unit/server/test_update_registry.cpp',
       'unit/server/test_legacy_sqlite_probe.cpp',
       'unit/server/test_https_config.cpp',
+      'unit/server/test_healthcheck_probe.cpp', # #5906: --healthcheck target/verdict rules + loopback TLS probe
       'unit/server/test_response_store.cpp',
       'unit/server/test_response_routes.cpp', # #2542 PR-11: the 3-route legacy pre-v1 Responses API, extracted onto the HttpRouteSink seam
+      'unit/server/test_query_int_parse.cpp', # #4644: the shared strict integer primitive (query_int_parse.hpp)
       'unit/server/test_preflight_parse.cpp',
       'unit/server/test_preflight_eval.cpp',
       'unit/server/test_preflight_run_store.cpp',
@@ -1355,6 +1372,7 @@ if build_server
       'unit/server/test_deployment_run_store.cpp',
       'unit/server/test_deployment_engine.cpp',
       'unit/server/test_deployment_routes.cpp',
+      'unit/server/test_deployments_render.cpp',
       'unit/server/test_bundle_service.cpp',
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
@@ -1365,6 +1383,7 @@ if build_server
       'unit/server/test_log_token.cpp',
       'unit/server/test_sqlite_raii.cpp',
       'unit/server/test_rest_audit_sample.cpp',
+      'unit/server/test_rest_audit_query.cpp',
       'unit/server/test_rest_audit_helper.cpp',
       'unit/server/test_rest_scope_v1_routes.cpp', # #2146 Batch B2: POST /api/v1/scope/validate + /preview
       'unit/server/test_tag_store.cpp',
@@ -1380,13 +1399,26 @@ if build_server
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
+      'unit/server/test_compliance_fragments.cpp', # pure renderers for the Compliance page fragments + tag table
       'unit/server/test_policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes
       'unit/server/test_compliance_model.cpp',
       'unit/server/test_verify_routes.cpp',
       'unit/server/test_notification_routes.cpp',
       'unit/server/test_command_routes.cpp',
       'unit/server/test_page_routes.cpp',
+      'unit/server/test_dialog_module.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
+      'unit/server/test_developer_render.cpp', # System > Developer and API: pure renderers
+      'unit/server/test_developer_routes.cpp', # System > Developer and API: page + fragment gates
+      'unit/server/test_access_render.cpp', # Access pages (Phase 2): Users list + Account panel renderers
+      'unit/server/test_access_routes.cpp', # Access pages: /access/users + fragments + static glue (gate order, degraded states)
+      'unit/server/test_access_js.cpp', # Access pages: string pins on the template and yuzu-access.js
+      'unit/server/test_access_golden.cpp', # Access pages: four rendered-fragment goldens
+      'unit/server/test_access_tokens_render.cpp', # Tokens and principals page: pure renderers
+      'unit/server/test_access_tokens_routes.cpp', # Tokens and principals page: routes, gates, audit, degraded states
+      'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
+      'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
+      'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -1394,6 +1426,8 @@ if build_server
       'unit/server/test_legacy_diagnostic_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API (diagnostics_routes.cpp), extracted onto the HttpRouteSink seam -- named away from test_diagnostics_*/test_chargen_*/test_procfetch_* to avoid a plugin_doc_gen.py filename collision with the agent plugins of those names
       'unit/server/test_legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
       'unit/server/test_instruction_fragment_routes.cpp', # #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
+      'unit/server/test_instruction_extras_render.cpp', # Instructions extras: pure merge + fragment helpers
+      'unit/server/test_instruction_extras_ui.cpp', # Instructions extras UI: nothing-lost pins, controller CSP pins, sets/templates renderers
       'unit/server/test_approvals_fragment_routes.cpp', # #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
       'unit/server/test_mcp_disabled_routes.cpp', # #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
       'unit/server/test_agent_service_impl.cpp',
@@ -1406,6 +1440,8 @@ if build_server
       'unit/server/test_execution_tracker.cpp',
       'unit/server/test_execution_routes.cpp', # #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
       'unit/server/test_health_routes.cpp', # #2542 PR-10: the 6-route Health/Infra cluster, extracted onto the HttpRouteSink seam
+      'unit/server/test_home_panels_render.cpp', # HM-2: pure Dashboard panel renderers
+      'unit/server/test_home_panels_routes.cpp', # HM-2: Dashboard policies + events fragments
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
       'unit/server/test_coord_dsn.cpp',
@@ -1432,6 +1468,7 @@ if build_server
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
       'unit/server/test_workflow_executions_list_authz.cpp', # #3526: /fragments/executions real fleet-read confinement
+      'unit/server/test_workflow_executions_real_gate_authz.cpp', # GET /api/v1/workflow-executions real fleet-read confinement
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
@@ -1497,6 +1534,7 @@ if build_server
       'unit/server/test_quarantine_dispatch_gate.cpp',     # #881: containment gate at the dispatch chokepoint — pure arm/degradation logic, no store
       'unit/server/test_plugin_presence_dispatch_gate.cpp', # #3424/#3511: plugin-presence filter at the dispatch chokepoint — mirrors test_quarantine_dispatch_gate.cpp
       'unit/server/test_os_kill_switch_dispatch_gate.cpp', # #5294: per-OS kill-switch filter at the dispatch chokepoint — mirrors test_plugin_presence_dispatch_gate.cpp
+      'unit/server/test_protective_action_dispatch_gate.cpp', # protective actions are never refused by enablement - exact send-set, mirrors test_os_kill_switch_dispatch_gate.cpp
       'unit/server/test_quarantine_reapply.cpp',           # #3425: shared stored-containment re-dispatch recipe (Layer A) — pure, no store
       'unit/server/test_quarantine_containment_reconciler.cpp', # #3425: reconnect re-application state machine — real store/registry, mock dispatch
       'unit/server/test_result_set_store.cpp',
@@ -1525,7 +1563,19 @@ if build_server
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
+      'unit/server/test_software_sync_decision.cpp', # Software "Sync now": pure request grammar, partition, fleet-wide rule, 500 cap, cooldown, audit wording
+      'unit/server/test_software_sync_runner.cpp',   # Software sync: the shared Runner (REST + MCP) - cooldown, lease, bounded partition, audit-before-send
+      'unit/server/test_hardware_sync_routes.cpp', # Software "Sync now": POST /api/v1/hardware/sync route matrix (HwHarness pattern)
+      'unit/server/test_home_render.cpp',         # Dashboard summary: pure renderers, partitions, states
+      'unit/server/test_home_routes.cpp',         # Dashboard summary: gates, scope, degrade, caller matrix
+      'unit/server/test_dashboard_ui.cpp',        # Dashboard page: row order, moved placeholders, controls, part pins
+      'unit/server/test_home_ui.cpp',             # Home: page pins
+      'unit/server/test_device_containment.cpp',  # es-1: quarantine read/renderers/fragments + estate JS pins
+      'unit/server/test_device_data_render.cpp',  # Hardware record: custom properties + schemas panels
+      'unit/server/test_device_data_routes.cpp',  # Hardware record: properties fragment gates and states
       'unit/server/test_inventory_routes.cpp',
+      'unit/server/test_software_page_ui.cpp',
+      'unit/server/test_auto_fragments_ui.cpp',
       'unit/server/test_inventory_store.cpp',
       'unit/server/test_data_inventory_routes.cpp', # #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
       'unit/server/test_sle_routes.cpp',
@@ -1540,8 +1590,11 @@ if build_server
       # relative path.
       '../agents/plugins/tar/src/tar_schema_registry.cpp',
       'unit/server/test_dex_app_perf_model.cpp',
+      'unit/server/test_dex_app_perf_failures.cpp', # pure per-version crash/hang join + shared versions[] serializer - no store, no PG
+      'unit/server/test_dex_apps_stability.cpp', # pure application/version stability assembly + shared apps JSON serializer - no store, no PG
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
+      'unit/server/test_dex_app_perf_version_table.cpp', # per-version crash/hang table renderer + fragment route over the FnDexPerfApi double - no store, no PG
       'unit/server/test_dex_stability_score.cpp', # pure application/version stability score (dex_stability_score.hpp) - no store, no PG
       'unit/server/test_dex_stats.cpp', # pure known-answer statistics (dex_stats.hpp): no store, no I/O, no [pg]
       'unit/server/test_dex_score_policy.cpp', # pure DEX score policy + resolver (dex_score_policy.hpp): no store, no I/O, no [pg]
@@ -1555,6 +1608,9 @@ if build_server
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
       'unit/server/test_workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam (workflow read)
+      'unit/server/test_list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
+      'unit/server/test_workflow_execution_list_model.cpp', # pure shared REST+MCP list model (parse/rows/cursor)
+      'unit/server/test_workflow_execution_list_routes.cpp', # GET /api/v1/workflow-executions via TestRouteSink (no PG)
       'unit/server/test_guardian_api.cpp', # ADR-0031 WS-A4: the ninth per-family in-process API seam (Guardian read)
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
@@ -1578,6 +1634,9 @@ if build_server
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
       'unit/server/test_webhook_routes.cpp',
+      'unit/server/test_integrations_url_policy.cpp', # SYS-5: outbound URL policy + mapping audit detail (pure)
+      'unit/server/test_integrations_sync_render.cpp', # SYS-5: webhook / offload / directory-sync panel renderers (pure)
+      'unit/server/test_integrations_sync_routes.cpp', # SYS-5: the six fragments + controller script pins (TestRouteSink)
       'unit/server/test_migration_runner.cpp',
       'unit/server/test_rate_limiter.cpp',
       'unit/server/test_cert_reloader.cpp',
@@ -1592,6 +1651,7 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
@@ -1602,6 +1662,7 @@ if build_server
       'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
       'unit/server/test_body_cap_route_inventory.cpp', # #2407: architect-mandated route-inventory coverage — every ACTUALLY REGISTERED POST/PUT/PATCH route resolves to a deliberate class, mechanically scanned from server/core/src at test run time
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
+      'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
       'unit/server/test_shutdown_join_order.cpp', # #3495: agent_server_->Shutdown(deadline) runs before the policy-eval/pre-flight/quarantine/schedule joins + the heartbeat fn-null wait, mechanically scanned from server.cpp at test run time
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
@@ -1672,13 +1733,29 @@ if build_server
       'unit/server/test_settings_routes_enrollment.cpp', # WS-6 6.2 enrollment mutations: audit rows, atomic bulk, fail-closed
       'unit/server/test_settings_routes_dex_alerts.cpp',
       'unit/server/test_settings_routes_ota_audit.cpp',
+      'unit/server/test_settings_routes_cert_upload.cpp', # TLS server key created 0600 / dir 0700, symlink replaced not followed
       'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
+      'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 21 panels + static h1 on the /settings page
+      'unit/server/test_settings_general.cpp',      # System General page: runtime/events renderers, routes, page pins
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_nav_shells.cpp',            # app shell: nav model, renderer, marker swap, per-page active item
+      'unit/server/test_integrations_panels.cpp',   # System Integrations: MCP/Gateway panels, MCP form parser + POST handler
+      'unit/server/test_integrations_page.cpp',     # System Integrations: page route, page + script pins
+      'unit/server/test_name_lookup_memo.cpp',      # Operate O1: the per-render definition-name memo (stop on first read failure)
+      'unit/server/test_approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
+      'unit/server/test_executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
+      'unit/server/test_operate_pages_ui.cpp',      # Operate O1: CSP/token/literal-bound pins for the Operate page templates, CSS and controller
+      'unit/server/test_workflows_page_render.cpp', # Operate WF-A: the Workflows page's pure definitions/schedules renderers
+      'unit/server/test_workflows_page_routes.cpp', # Operate WF-A: the Workflows page fragments (fake gates, no PG)
+      'unit/server/test_workflows_page_authz.cpp',  # Operate WF-A: the Workflows page fragments over the real gates ([pg])
+      'unit/server/test_dashboard_scope_expression.cpp', # operate-extras E-1: scope_expression on /api/dashboard/execute
+      'unit/server/test_scope_attribute_guard.cpp', # operate-extras E-1: attribute allow-check for expression-targeted Send
+      'unit/server/test_operate_extras_ui.cpp',     # operate extras: ox- CSS chunk, Dashboard helper markup, controller script pins
       'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
@@ -1701,6 +1778,7 @@ if build_server
       'unit/server/test_pg_template_cleanup.cpp',
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_agent_registry_presence.cpp',
+      'unit/server/test_agent_registry_log_neutralisation.cpp',   # #5513: register_agent log lines neutralised
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_catalog_rules.cpp',
@@ -1727,6 +1805,7 @@ if build_server
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
       'unit/server/test_discovery_store.cpp',
+      'unit/server/test_discovered_devices.cpp', # Estate E-2: discovered-devices read twin (pure)
       'unit/server/test_discovery_scan_route.cpp',
     ),
     include_directories: [
@@ -1762,7 +1841,7 @@ if build_server
       # keys into one source of truth. NOTE THE SCOPE: that hoist is triggered by spark's
       # rung 2, "when the wire contract changes anyway" - but the GUARDIAN JOURNAL and
       # GUARDIAN HEALTH keys are not part of that wire-contract change, so a rung-2 hoist
-      # sweeping only spark would leave the 30 yuzu.guardian_journal_* and 3
+      # sweeping only spark would leave the 33 yuzu.guardian_* journal-family counters and 3
       # yuzu.guardian_unhealthy_*/guardian_priority_demoted literals behind while this
       # comment still read as though it covered them. ALL THREE key families must move
       # together; the journal and health sides must be added to #2298's cutover-gate
@@ -2755,7 +2834,7 @@ if build_server
   # 'server-pg-smoke') is a genuine subset: exactly one entry, the expected
   # name, the expected exact case count, --allow-running-no-tests present,
   # and every matched case also carries [pg] (script's check_smoke()).
-  _pg_shard_python3 = find_program('python3', 'python')
+  _pg_shard_python3 = yuzu_python
   test('server pg shard partition invariant',
     _pg_shard_python3,
     args: [files('../scripts/ci/check-pg-shard-partition.py'),
@@ -2874,7 +2953,20 @@ if build_server
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
-_python3_test = find_program('python3', 'python')
+_python3_test = yuzu_python
+test('macOS Endpoint Security app packaging',
+  _python3_test,
+  args: [files('test_macos_app_packaging.py')],
+  suite: 'agent',
+  # ~25 s on the macOS CI runner with 81 cases; more since (governance bci-2).
+  timeout: 90,
+)
+test('macOS development foundation checks',
+  _python3_test,
+  args: [files('test_macos_foundation.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 test('proto gen_proto version check',
   _python3_test,
   args: [files('test_gen_proto_version.py')],
@@ -2894,6 +2986,33 @@ test('gateway build wrapper',
   args: [files('test_build_gateway.py')],
   suite: 'docs',
   timeout: 180,
+)
+
+# OTP pin resolution (scripts/erlang_toolchain.py find-otp): the selection
+# rules Meson relies on at configure time, against fake installs. Hermetic.
+test('gateway OTP pin resolution',
+  _python3_test,
+  args: [files('test_erlang_toolchain_otp.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
+# scripts/ensure-erlang.sh sourced under `set -euo pipefail`, as
+# release-preflight.sh and integration-test.sh do. POSIX bash; skips itself on
+# Windows.
+test('ensure-erlang strict-mode callers',
+  _python3_test,
+  args: [files('test_ensure_erlang.py')],
+  suite: 'docs',
+  timeout: 180,
+)
+
+# Every script target uses yuzu_python (no ad-hoc find_program for python).
+test('meson python lookup is yuzu_python',
+  _python3_test,
+  args: [files('test_meson_python_lookup.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # Gateway image guards (#2150): the Dockerfile.gateway abi-guard's real text
@@ -2952,6 +3071,15 @@ test('compose wizard certs',
   _python3_test,
   args: [files('test_compose_wizard.py')],
   suite: 'docs',
+  timeout: 60,
+)
+
+# Shell notifications bell: runs kBellScript (cut from server/core/src/app_shell.cpp) under
+# node against a fake DOM/clock/fetch; skips (77) when node is absent.
+test('shell bell script behaviour',
+  _python3_test,
+  args: [files('test_bell_script_behaviour.py')],
+  suite: ['server', 'docs'],
   timeout: 60,
 )
 
@@ -3105,6 +3233,16 @@ test('update_source_trust definition columns',
 test('mgmt_posture definition columns',
   _python3_test,
   args: [files('test_mgmt_posture_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# shares' definition-column contract (content/definitions/shares.yaml): row_kind first, then the
+# generic field_1..field_7 sequence pinned to the wire rows shares_parsers.hpp emits (the test
+# holds the expected literals; it does not read the C++).
+test('shares definition columns',
+  _python3_test,
+  args: [files('test_shares_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -3383,6 +3521,30 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   timeout: 30,
 )
 
+# Access Users page: pins the production wiring in server.cpp (the real require_admin gate and the
+# AuthDB::list_users() account source), which every route test stubs. Source-text only, so Python.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# no-build gate labelled 'server' fails that check on the Windows legs.
+test('access users production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #5678: static lexical gate pinning that BOTH disconnect paths (direct Subscribe in
+# agent_service_impl.cpp, gateway DISCONNECTED in gateway_service_impl.cpp) mirror a departure into
+# durable presence only through mirror_departure_to_presence() with the real gate; the direct path
+# has no unit harness (bidi stream). Carries its own in-memory mutation self-test. No build required.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# no-build gate labelled 'server' fails that check on the Windows legs (see the gateway-upstream gate below).
+test('presence departure wiring lexical gate (#5678)',
+  _python3_test,
+  args: [files('test_presence_departure_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Gateway-upstream peer authorization: static lexical gate pinning that server.cpp registers
 # the gateway-upstream service ONLY through GatewayPeerGuardedService (nothing constructs
 # ServerImpl, so no unit test can see the registration site). Carries its own negative-control
@@ -3427,6 +3589,21 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
       yuzu_agent_core_lib,
       agent_actions_plugin_lib,
     ],
+  )
+endif
+
+# #5906: `yuzu-server --healthcheck` CLI contract against the real binary (no listener, no
+# Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
+# runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# gate labelled 'server' fails that check on the Windows legs.
+if _bash_test.found() and meson.can_run_host_binaries() and build_server
+  test('healthcheck CLI contract (#5906)',
+    _bash_test,
+    args: [files('shell/test_healthcheck_cli.sh'), meson.project_build_root()],
+    suite: ['server', 'docs'],
+    timeout: 60,
+    depends: [yuzu_server_exe],
   )
 endif
 

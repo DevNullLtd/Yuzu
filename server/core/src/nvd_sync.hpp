@@ -15,6 +15,19 @@
 
 namespace yuzu::server {
 
+/// How long the sync loop waits before its next attempt. While the catalog is still
+/// backfilling a failed window retries within a minute rather than waiting the full freshness
+/// interval; afterwards the periodic interval applies. Never below a minute: an interval of 0
+/// (or a refused fetch, see NvdClient's unusable-proxy refusal) would otherwise spin the loop and
+/// flood the log.
+[[nodiscard]] inline std::chrono::seconds nvd_sync_wait(std::chrono::seconds interval,
+                                                       bool backfill_complete) {
+    constexpr std::chrono::seconds kMinWait{60};
+    if (!backfill_complete && interval > kMinWait)
+        return kMinWait;
+    return interval < kMinWait ? kMinWait : interval;
+}
+
 class NvdSyncManager {
 public:
     // Production: builds an NvdClient as the fetcher. backfill_years bounds how

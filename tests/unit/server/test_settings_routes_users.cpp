@@ -127,6 +127,7 @@ struct SettingsRoutesHarness {
     // tests can act as different principals against the same harness.
     std::string session_user;
     auth::Role session_role{auth::Role::admin};
+    bool elevated{false};
 
     // Audit capture — each audit_fn_ call from the routes layer appends an
     // entry. Tests assert on this to verify CC7.2 evidence emission.
@@ -150,7 +151,9 @@ struct SettingsRoutesHarness {
         };
 
         auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
-            if (session_user.empty() || session_role != auth::Role::admin) {
+            // `elevated` models a JIT-elevated `user` session: require_admin admits it through
+            // effective_role while the session's own durable role stays `user`.
+            if (session_user.empty() || (session_role != auth::Role::admin && !elevated)) {
                 res.status = 403;
                 return false;
             }
@@ -290,6 +293,7 @@ struct SettingsAdr2001Harness {
 
     std::string session_user{"admin"};
     auth::Role session_role{auth::Role::admin};
+    bool elevated{false};
     std::vector<AuditCall> audit_calls;
 
     ~SettingsAdr2001Harness() {
@@ -330,7 +334,9 @@ struct SettingsAdr2001Harness {
             return s;
         };
         auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
-            if (session_user.empty() || session_role != auth::Role::admin) {
+            // `elevated` models a JIT-elevated `user` session: require_admin admits it through
+            // effective_role while the session's own durable role stays `user`.
+            if (session_user.empty() || (session_role != auth::Role::admin && !elevated)) {
                 res.status = 403;
                 return false;
             }
@@ -414,6 +420,43 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin cannot delete self",
     // SOC 2 CC7.2 evidence emission — denied destructive ops must reach
     // audit_store, not just spdlog (governance Gate 6 CO-1).
     CHECK(h.has_audit("user.delete", "denied", "User", "admin"));
+}
+
+TEST_CASE("SettingsRoutes POST role: a JIT-elevated user cannot change an account role",
+          "[settings][users][elevation]") {
+    SettingsRoutesHarness h;
+    h.session_user = "mallory";
+    h.session_role = auth::Role::user; // durable role
+    h.elevated = true;                 // admitted by admin_fn through the elevation
+    auto res = h.Post("/api/settings/users/bob/role", R"({"role":"admin"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.has_audit("user.role_change", "denied", "User", "bob"));
+    CHECK(h.audit_calls.back().detail == "elevated_session_role_change_blocked");
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::user); // unchanged
+}
+
+TEST_CASE("SettingsRoutes POST role: a JIT-elevated user cannot mint a standing admin; "
+          "an administrator still can",
+          "[pg][settings][users][elevation]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "mallory";
+    h.session_role = auth::Role::user;
+    h.elevated = true;
+    auto res = h.set_role("bob", "admin");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_detail("user.role_change", "denied", "bob") ==
+          "elevated_session_role_change_blocked");
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::user); // unchanged
+    // The same call from a session whose own role is admin still works.
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+    h.elevated = false;
+    res = h.set_role("bob", "admin");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::admin);
 }
 
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin can delete other users",
@@ -1120,6 +1163,67 @@ TEST_CASE("SettingsRoutes GET /fragments/settings/users: no password controls on
         CHECK(count_of(body, "data-pw-action=") == 2);
         CHECK(body.find("hx-on") == std::string::npos);
     }
+}
+
+// ── #4644: the API-token form's ttl_hours is strict, and refusal mints nothing ──
+// `ttl_hours` of `0x5` used to read as 0 (never expires) and a negative TTL still computes 0.
+// This form answers 200 with a feedback span (its existing convention), so the proof that
+// matters is that NO token exists afterwards. `0`, an empty field and `-0` keep their documented
+// meaning (no expiry).
+TEST_CASE("SettingsRoutes POST api-tokens: a malformed or negative ttl_hours mints nothing",
+          "[pg][settings][api_tokens][numeric_params]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    for (const char* body : {"name=t1&ttl_hours=0x5", "name=t1&ttl_hours=5h", "name=t1&ttl_hours=%205",
+                             "name=t1&ttl_hours=1e1", "name=t1&ttl_hours=-1",
+                             "name=t1&ttl_hours=99999999999999999999"}) {
+        SettingsAdr2001Harness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->body.find("Invalid TTL value") != std::string::npos);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        CHECK(listed->empty());
+    }
+}
+
+TEST_CASE("SettingsRoutes POST api-tokens: an empty or literal-zero ttl_hours still mints a token",
+          "[pg][settings][api_tokens][numeric_params]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    for (const char* body : {"name=t1", "name=t1&ttl_hours=", "name=t1&ttl_hours=0",
+                             "name=t1&ttl_hours=-0", "name=t1&ttl_hours=24"}) {
+        SettingsAdr2001Harness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->body.find("Invalid TTL value") == std::string::npos);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        CHECK(listed->size() == 1);
+    }
+}
+
+// The auto-approve rule index is a `(\d+)` path segment: a 21-digit value made `stoul` THROW (a
+// 500). It cannot name a rule, so the engine reports "not found": the page re-renders (200), a
+// denied `rule_not_found` row is audited, and the rule list is untouched.
+TEST_CASE("SettingsRoutes auto-approve: a rule index that overflows is not a 500 and changes nothing",
+          "[pg][settings][numeric_params]") {
+    SettingsAdr2001Harness h;
+    h.auto_approve.add_rule({});
+    const auto before = h.auto_approve.list_rules().size();
+    auto toggle = h.sink.Post("/api/settings/auto-approve/99999999999999999999/toggle", "",
+                              "application/x-www-form-urlencoded");
+    REQUIRE(toggle);
+    CHECK(toggle->status == 200);
+    auto del = h.sink.Delete("/api/settings/auto-approve/99999999999999999999");
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(h.auto_approve.list_rules().size() == before);
+    std::size_t not_found_rows = 0;
+    for (const auto& c : h.audit_calls)
+        if (c.result == "denied" && c.detail.find("rule_not_found") != std::string::npos)
+            ++not_found_rows;
+    CHECK(not_found_rows == 2);
 }
 
 // ── #4966: the last-Administrator guard on the dashboard delete and role routes ──────────────

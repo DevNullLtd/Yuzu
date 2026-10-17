@@ -14412,8 +14412,10 @@ TEST_CASE("File mechanism (direct): a commit failure landing inside watch()'s ow
     std::atomic<bool> last_faulted{false};
     mech->start([](const std::string&, SparkData) {},
                 [&](const std::string&, bool faulted, std::string_view) {
-                    faults.fetch_add(1, std::memory_order_acq_rel);
+                    // Value first, count second: the test spins on the count and then reads
+                    // the value, so the count must be the last thing published.
                     last_faulted.store(faulted, std::memory_order_release);
+                    faults.fetch_add(1, std::memory_order_acq_rel);
                 });
     const auto spec = file_spec(a.file.string());
     REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());

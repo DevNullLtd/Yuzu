@@ -1,12 +1,17 @@
 #include "dashboard_api_routes.hpp"
 
+#include "admin_gate.hpp"
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
+#include "response_query_params.hpp"
 #include "data_export.hpp"
 #include "http_route_sink.hpp"
 #include "json_extract.hpp" // extract_json_string — shared JSON body-extraction helper
+#include "mcp_jsonrpc.hpp"   // json_exceeds_depth / kMcpMaxJsonDepth
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"
+#include "web_utils.hpp"
 
 #include <exception>
 #include <stdexcept>
@@ -59,6 +64,21 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
             j["rbac_enabled"] = false;
             j["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
         }
+        // Session self-description (#5779, #4208). `role` stays the persisted
+        // role; these report what the server will actually honour. No store
+        // read and no gate call, so no audit row per page load.
+        const bool elevated = auth::is_elevated(*session);
+        j["effective_role"] = auth::role_to_string(auth::effective_role(*session));
+        j["elevated"] = elevated;
+        if (elevated) {
+            j["elevated_until"] = format_iso_utc(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    session->elevated_until.time_since_epoch())
+                    .count());
+        }
+        j["can_access_settings"] =
+            authz::admin_gate_verdict(*session) == authz::AdminGate::Admit;
+        res.set_header("Cache-Control", "no-store, private");
         res.set_content(j.dump(), "application/json");
     });
 
@@ -110,17 +130,53 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
             q.target_id = req.get_param_value("target_id");
         try {
             if (req.has_param("since"))
-                q.since = std::stoll(req.get_param_value("since"));
+                q.since = strict_stoll(req.get_param_value("since"));
             if (req.has_param("until"))
-                q.until = std::stoll(req.get_param_value("until"));
+                q.until = strict_stoll(req.get_param_value("until"));
             if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
             if (req.has_param("offset"))
-                q.offset = std::stoi(req.get_param_value("offset"));
+                q.offset = strict_stoi(req.get_param_value("offset"));
         } catch (const std::exception&) {
             res.status = 400;
             res.set_content(
                 R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        // A NUL (%00) or invalid UTF-8 in a percent-decoded filter breaks the bind (truncation
+        // widens the query; a bad byte becomes a false 503); the v1 route refuses both, so does this.
+        if (!audit_string_filters_wellformed(q)) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"string filters must be valid UTF-8 without NUL"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        // The bounds are presence-tracked (`AuditQuery::since/until` are optionals): omitted
+        // is unbounded, a supplied value is a literal inclusive bound. A negative epoch is no
+        // time at all, and `until=0` would bound the read at the epoch and match nothing --
+        // when it is a computed window that collapsed it used to mean "the whole log" -- so
+        // both are a 400. `since=0` is a harmless literal bound (every stored timestamp is
+        // positive) and matches exactly what omitting `since` matches.
+        if (q.since && *q.since < 0) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"since must not be negative"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        if (q.until && *q.until <= 0) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"until must be a positive epoch second or omitted"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        if (q.since && q.until && *q.since > *q.until) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"since must not be after until"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
@@ -137,6 +193,16 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+        // Same ceilings as the v1 and MCP twins: an unbounded limit/offset asks
+        // Postgres for the whole table (#4644/#4703 class).
+        if (q.offset > kAuditMaxOffset) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"offset must be 0..10000"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        q.limit = cap_query_limit(q.limit);
 
         // ADR-0040: reads are degrade-distinguishable. A store/pool failure
         // returns nullopt — surface 503, NEVER a false-empty 200 (an audit
@@ -186,6 +252,17 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
                                                 httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Response", "Read"))
             return;
+
+        // Depth guard before parse: json_array_to_csv dump()s non-string cells and
+        // nlohmann dump() is recursive -- a deeply nested body would SIGSEGV the
+        // process (same class as config_routes.cpp / #2437).
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"request body nests too deeply"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
 
         auto csv = data_export::json_array_to_csv(req.body);
         if (csv.empty()) {
@@ -267,11 +344,20 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
             int limit = 50;
             if (req.has_param("limit")) {
                 try {
-                    limit = std::stoi(req.get_param_value("limit"));
-                } catch (...) {}
+                    limit = strict_stoi(req.get_param_value("limit"));
+                } catch (const std::exception&) {
+                    // A value that is not ONE base-10 integer is a client error: it
+                    // used to be silently ignored (or truncated at the first
+                    // non-digit), which answered a different question than asked.
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
             }
-            // A non-positive limit isn't a client-error worth a 400 (this
-            // route has always silently ignored a malformed value), but
+            // A non-positive limit isn't a client-error worth a 400 (a
+            // well-formed integer is never rejected here), but
             // unlike SQLite's LIMIT -1 = "unlimited" idiom the old store
             // relied on, Postgres's LIMIT REJECTS a negative bind
             // outright — which query_recent() below can only report as

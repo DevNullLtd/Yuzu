@@ -23,10 +23,10 @@ namespace yuzu::server {
 /// Typed failure of the enrollment-token / pending-agent store surface
 /// (WS-6 slice 6.2), shared by `AuthDB` (the store) and `auth::AuthManager`
 /// (which routes every enrollment call to it). Defined here, not in
-/// auth_db.hpp, so this header stays free of store headers. Deliberately
-/// three-valued and distinct from "not found"/"rejected"/"absent", which are
-/// SUCCESSFUL outcomes carried in the value channel: a caller can never read a
-/// store outage as an empty result.
+/// auth_db.hpp, so this header stays free of store headers. Deliberately a
+/// closed set of failures (two outages, two caller-input refusals), distinct from
+/// "not found"/"rejected"/"absent", which are SUCCESSFUL outcomes carried in the
+/// value channel: a caller can never read a store outage as an empty result.
 enum class StoreError : std::uint8_t {
     /// The store could not be reached: pool lease not acquired, OR no AuthDB is
     /// attached to the AuthManager (shutdown / never wired) — fail CLOSED.
@@ -36,11 +36,17 @@ enum class StoreError : std::uint8_t {
     /// A caller-supplied value violated a bound (empty/oversize/embedded NUL/
     /// out-of-range). Not a store outage — maps to INVALID_ARGUMENT / 400.
     InvalidInput,
+    /// Only from `AuthDB::add_pending` / `ensure_enrolled` called with
+    /// `enforce_new_id_charset`: the write WOULD HAVE CREATED a row for an id that
+    /// fails `auth::is_valid_new_agent_id`, so it was refused and nothing was
+    /// written. Caller input like `InvalidInput`, but kept distinct so a handler can
+    /// answer it exactly like the door's charset refusal.
+    CharsetRefused,
 };
 
 /// True iff `e` is a store outage (fail-closed UNAVAILABLE/503), not bad input.
 [[nodiscard]] inline bool is_store_unavailable(StoreError e) noexcept {
-    return e != StoreError::InvalidInput;
+    return e != StoreError::InvalidInput && e != StoreError::CharsetRefused;
 }
 
 class AuthDB;
@@ -438,10 +444,14 @@ struct CreatedEnrollmentToken {
 ///  - `admin_denied`   : the token was valid but an administrator has denied
 ///                       this agent_id. The whole txn rolled back — the token's
 ///                       use_count is unchanged (closes #1135).
+///  - `charset_refused`: only when the caller asked for `enforce_new_id_charset`
+///                       and the upsert would have CREATED a row for an id that
+///                       fails `is_valid_new_agent_id`. The whole txn rolled back:
+///                       the use_count is unchanged and no row exists.
 /// A store outage is NOT a value here — it is the `StoreError` on the outer
 /// `std::expected`.
 struct ConsumeEnrollResult {
-    enum class Kind : std::uint8_t { enrolled, token_rejected, admin_denied };
+    enum class Kind : std::uint8_t { enrolled, token_rejected, admin_denied, charset_refused };
     Kind kind{Kind::token_rejected};
     EnrollmentClaim claim{};                                        ///< enrolled only
     EnrollmentTokenError token_error{EnrollmentTokenError::not_found}; ///< token_rejected only
@@ -468,6 +478,35 @@ inline constexpr std::size_t kMaxEnrollmentTokenLength = 256;
 /// 256 chars matches `kMaxEnrollmentTokenLength` for parity — any legitimate
 /// hostname-derived or UUID-derived agent_id fits in well under 100 chars.
 inline constexpr std::size_t kMaxAgentIdLength = 256;
+
+/// Charset a NEW agent_id must use at first registration: `[A-Za-z0-9._:-]`,
+/// not made only of dots. The agent daemon generates a UUID v4
+/// (`identity_store.cpp`, hex + `-`); an operator `--agent-id` is typically a
+/// hostname-style name. Anything else (`/ ? # % & space` and so on) never
+/// belongs in a page link or a path-routed API id, and a dot-only id is
+/// collapsed by browsers. Applied ONLY where the store holds no row for the id
+/// yet (`Register`/`ProxyRegister`): an id already enrolled, pending or denied
+/// keeps working unchanged, so no existing agent is locked out; renderers
+/// percent-encode and refuse dot-only ids for those (`url_path_segment`). The
+/// handlers decide this from a single status read, so the row-creating writes
+/// (`consume_and_enroll`, `ensure_enrolled`, `add_pending`) re-apply it at the
+/// moment they would INSERT, when asked to (`enforce_new_id_charset`): a legacy row
+/// removed between the read and the write cannot be re-created under a refused id.
+[[nodiscard]] inline bool is_valid_new_agent_id(std::string_view id) noexcept {
+    if (id.empty() || id.size() > kMaxAgentIdLength)
+        return false;
+    bool all_dots = true;
+    for (const char ch : id) {
+        const auto c = static_cast<unsigned char>(ch);
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-';
+        if (!ok)
+            return false;
+        if (c != '.')
+            all_dots = false;
+    }
+    return !all_dots;
+}
 
 /// Maximum length of any free-text field the enrollment/pending store accepts
 /// (label, hostname, os, arch, agent_version, acting principal). The store
@@ -1175,11 +1214,17 @@ public:
 
     /// THE atomic enrollment claim (one store transaction): count a token use,
     /// then approve the agent unless an admin denied it (a denial rolls the use
-    /// back). See `ConsumeEnrollResult`.
+    /// back). See `ConsumeEnrollResult`. `enforce_new_id_charset` makes the store
+    /// refuse (`Kind::charset_refused`, nothing consumed) a write that would CREATE
+    /// the row for an id failing `is_valid_new_agent_id`; an existing row is always
+    /// updated as before. A handler passes it because its own charset check reads
+    /// the status once, and the row can disappear before this write.
+    /// Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<ConsumeEnrollResult, StoreError>
     consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                        const std::string& hostname, const std::string& os,
-                       const std::string& arch, const std::string& agent_version);
+                       const std::string& arch, const std::string& agent_version,
+                       bool enforce_new_id_charset = false);
 
     /// All enrollment tokens, newest first (admin UI).
     [[nodiscard]] std::expected<std::vector<EnrollmentToken>, StoreError>
@@ -1192,19 +1237,28 @@ public:
 
     /// Queue an unenrolled agent as pending. `true` = NEWLY added (gates the
     /// analytics event + SSE publish); `false` = a row already existed.
+    /// `enforce_new_id_charset`: refuse with `StoreError::CharsetRefused` when this
+    /// would CREATE the row for an id failing `is_valid_new_agent_id` (an existing
+    /// row still yields `false`); see `consume_and_enroll`. Production registration
+    /// doors must pass true (pinned by test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<bool, StoreError>
     add_pending_agent(const std::string& agent_id, const std::string& hostname,
                       const std::string& os, const std::string& arch,
-                      const std::string& agent_version);
+                      const std::string& agent_version, bool enforce_new_id_charset = false);
 
     /// Mark an agent as enrolled (approved), creating the row if absent.
     /// `true` = enrolled; `false` = the agent was explicitly denied by an admin
     /// (tokens and auto-approve never override an admin denial). `by` is
-    /// recorded as the row's `status_changed_by`.
+    /// recorded as the row's `status_changed_by`. `enforce_new_id_charset`: refuse
+    /// with `StoreError::CharsetRefused` (rolled back, no row) when this would
+    /// CREATE the row for an id failing `is_valid_new_agent_id`; see
+    /// `consume_and_enroll`. Production registration doors must pass true (pinned by
+    /// test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<bool, StoreError>
     ensure_enrolled(const std::string& agent_id, const std::string& hostname,
                     const std::string& os, const std::string& arch,
-                    const std::string& agent_version, const std::string& by);
+                    const std::string& agent_version, const std::string& by,
+                    bool enforce_new_id_charset = false);
 
     /// Five-state lookup: a value = pending/approved/denied; `nullopt` = absent;
     /// `unexpected(StoreError)` = ERROR. A caller MUST NOT treat the error as

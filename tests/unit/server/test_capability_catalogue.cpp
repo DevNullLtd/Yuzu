@@ -44,6 +44,7 @@
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -164,6 +165,7 @@ struct LabeledSpan {
         {"system_hardening", capdecls::plugin_action_catalogue_system_hardening(), false},
         {"pkg_inventory", capdecls::plugin_action_catalogue_pkg_inventory(), false},
         {"mgmt_posture", capdecls::plugin_action_catalogue_mgmt_posture(), false},
+        {"shares", capdecls::plugin_action_catalogue_shares(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -172,7 +174,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-seven sources exactly as a live composition site would use.
+    // literally, twenty-eight sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -200,6 +202,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_system_hardening(),
         capdecls::plugin_action_catalogue_pkg_inventory(),
         capdecls::plugin_action_catalogue_mgmt_posture(),
+        capdecls::plugin_action_catalogue_shares(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -393,6 +396,25 @@ TEST_CASE("capability catalogue: mgmt_posture.posture pins its exact classificat
     CHECK(row.execute_gate == ExecuteGate::None);
 }
 
+/// Exact-row pin for `shares.list`. A read-only listing of what the host is configured to
+/// serve under `Infrastructure`:Read with no execute gate. Pinning it directly means a silent
+/// drift to a mutating class, a different securable, or a gate on a facts-only read fails here.
+TEST_CASE("capability catalogue: shares.list pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_shares();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "shares");
+    CHECK(row.action == "list");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Infrastructure");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+}
+
 TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across every "
           "source",
           "[server][dispatch][capability]") {
@@ -409,16 +431,16 @@ TEST_CASE("capability catalogue: classify() resolves every declared plugin.actio
     }
 }
 
-/// Exact-row pin for `pkg_inventory` (Wave 10 PR10.1-c). Both actions are
-/// zero-subprocess filesystem reads: ReadOnly/None under the Inventory
+/// Exact-row pin for `pkg_inventory` (Wave 10 PR10.1-c; `store_packages` added
+/// with the Linux legs). All three actions are zero-subprocess filesystem reads: ReadOnly/None under the Inventory
 /// securable, no execute gate. Pinning the fields directly means a future
 /// reclassification (e.g. to Security or a gated tier) fails here loudly.
-TEST_CASE("capability catalogue: pkg_inventory.managers and pkg_inventory.packages pin their "
+TEST_CASE("capability catalogue: pkg_inventory.managers, .packages and .store_packages pin their "
           "exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_pkg_inventory();
-    REQUIRE(rows.size() == 2);
-    for (const auto action : {"managers", "packages"}) {
+    REQUIRE(rows.size() == 3);
+    for (const auto action : {"managers", "packages", "store_packages"}) {
         const auto it =
             std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
         REQUIRE(it != rows.end());

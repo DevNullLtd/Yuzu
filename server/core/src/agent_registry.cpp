@@ -18,6 +18,7 @@
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
 #include "tar_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
@@ -28,6 +29,7 @@
 #include "web_utils.hpp"
 
 #include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
+#include <yuzu/log_token.hpp>
 
 namespace yuzu::server::detail {
 
@@ -59,6 +61,19 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     session->os = info.platform().os();
     session->arch = info.platform().arch();
     session->agent_version = info.agent_version();
+    // Every spdlog call in THIS function prints the claimed id (via safe_agent_id) and any
+    // agent-supplied free text (tag key, hostname) or store error text neutralised (CWE-117; the
+    // hostname takes the closed-set id fold, the tag key and store error text the key-token fold);
+    // the gateway path reaches here without the direct path's token checks. Both callers read
+    // the enrollment status first (get_pending_status) and return on error; AuthDB refuses any
+    // id with a control byte or ',' there (agent_id_ok). The agent registry's other log lines
+    // that print a session-table id (removal, rollback, session-timeout, sweep and
+    // dispatch-routing lines), and the enrollment store's own agent-id log lines in auth_db.cpp
+    // (the admin-denied warnings and the consumed, added-to-pending, approved, denied and
+    // removed-from-queue lines) and the server's command-forward, asset-tag push and quarantine
+    // dispatch-denied lines in server.cpp, print it as stored: it carries no control byte, but
+    // space and '=' are not neutralised there, so those lines are not wrapped.
+    const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
     // Ingest filter (#3295): validated and non-service, mirroring TagStore's
     // own sync_agent_tags gate (tag_store.cpp) so a service claim or an
     // oversized/malformed key never reaches scope-DSL evaluation via the
@@ -67,7 +82,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (authz::is_service_tag_key(k)) {
             spdlog::info("AgentRegistry::register_agent({}): dropping self-reported "
                          "'service' tag from session scopable_tags (#3295)",
-                         info.agent_id());
+                         safe_agent_id);
             // Gate 6 hardening: the store-side purge (tag_store.cpp,
             // sync_agent_tags) has yuzu_server_tag_store_agent_service_purge_total;
             // this session-level drop is the ONLY signal for a gateway-proxied
@@ -80,7 +95,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (!TagStore::validate_key(k) || !TagStore::validate_value(v)) {
             spdlog::info("AgentRegistry::register_agent({}): dropping invalid scopable_tag "
                          "'{}' at ingest",
-                         info.agent_id(), k);
+                         safe_agent_id, ::yuzu::log_key_token(k));
             continue;
         }
         session->scopable_tags[k] = v;
@@ -143,7 +158,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (!revoked) {
             spdlog::error("AgentRegistry::register_agent: device token revoke-by-device failed "
                           "for '{}', refusing registration: {}",
-                          info.agent_id(), revoked.error());
+                          safe_agent_id, ::yuzu::log_key_token(revoked.error()));
             metrics_
                 .counter("yuzu_agents_registration_refused_total",
                          {{"reason", "device_token_revoke_failed"}})
@@ -185,7 +200,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
             spdlog::warn("AgentRegistry::register_agent: superseded by a concurrent "
                          "registration for '{}', not installing (this call's revoke already "
                          "committed)",
-                         info.agent_id());
+                         safe_agent_id);
             metrics_
                 .counter("yuzu_agents_registration_refused_total",
                          {{"reason", "superseded_by_concurrent_registration"}})
@@ -199,8 +214,11 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     metrics_.counter("yuzu_agents_registered_total").increment();
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
     bus_.publish("agent-online", info.agent_id());
-    spdlog::info("Agent registered: id={}, hostname={}, plugins={}", info.agent_id(),
-                 info.hostname(), info.plugins_size());
+    // The hostname is agent-supplied and sits between two genuine `key=value` tokens, so it takes
+    // the closed-set id fold (space, '=', ',' and every non-ASCII byte become '_'): a hostname such
+    // as `x' plugins=0 id=victim '` cannot close the quote and add a same-line token.
+    spdlog::info("Agent registered: id={}, hostname='{}', plugins={}", safe_agent_id,
+                 ::yuzu::log_id_token(info.hostname()), info.plugins_size());
     return session;
 }
 
@@ -685,7 +703,8 @@ bool gateway_capability_missing(const AgentSession& session, yuzu::MetricsRegist
         .increment();
     spdlog::warn("send_to: refusing to route a dispatch-tagged command to agent {} via gateway "
                  "node '{}' — gateway has not advertised '{}'",
-                 agent_id, session.gateway_node, kGatewayWireCapabilityDispatchTagV1);
+                 agent_id, onbehalf::sanitize_for_log(session.gateway_node, 64),
+                 kGatewayWireCapabilityDispatchTagV1);
     return true;
 }
 
@@ -872,6 +891,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "Management-plane posture, facts only: which plane controls the device (none/ad/ipa on "
          "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
          "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
+        {"shares.list",
+         "Shares this host serves over SMB/NFS as configured: name, path, ro/rw, anonymous access "
+         "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
+         "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
+         "/etc/exports.d and /etc/samba/smb.conf, macOS and Windows are planned; read-only"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -1061,11 +1085,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // pkg_inventory
         {"pkg_inventory.managers",
          "List package managers present on the host with manager-level config facts "
-         "(macOS Homebrew prefixes with tap/formula/cask counts; read-only, no subprocess; "
-         "macOS only today, Linux and Windows report unsupported)"},
+         "(macOS Homebrew prefixes; Linux dpkg/apt/rpm/dnf/pacman/apk/snap/flatpak presence "
+         "with apt/snap/flatpak counts; read-only, no subprocess; Windows planned)"},
         {"pkg_inventory.packages",
-         "List macOS Homebrew formulae and casks by name, version and kind (macOS only "
-         "today; the Linux package roster is owned by installed_apps)"},
+         "List macOS Homebrew formulae and casks by name, version and kind (macOS only; "
+         "Linux unsupported by design; installed_apps owns the roster)"},
+        {"pkg_inventory.store_packages",
+         "List installed snaps and flatpak apps/runtimes from the system store (Linux; "
+         "read-only, no subprocess; macOS unsupported by design, Windows planned)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture
@@ -1297,7 +1324,7 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
     // OOB side-effects: context label + row count (extracted by HTMX
     // regardless of position, won't break the tbody parse context)
     result += "<span id=\"result-context\" hx-swap-oob=\"innerHTML\" "
-              "style=\"font-size:0.75rem;color:#8b949e\">" +
+              "class=\"result-context\">" +
               esc(context) + "</span>";
     result +=
         "<span id=\"row-count\" hx-swap-oob=\"innerHTML\">" + std::to_string(row_count) + "</span>";
@@ -1501,11 +1528,12 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
 std::vector<std::string> AgentRegistry::all_ids() const {
     // HA WS-5: live_presence() is cached (kPresenceCacheTtl) and runs OFF
     // mu_ — the same rule the evaluate_scope preloads follow, never holding
-    // the registry lock across Postgres I/O. A null presence_store_
-    // (unconfigured) makes this call cost nothing beyond the pointer check;
-    // a configured one (the production default — see live_presence()'s own
-    // doc comment for why this is NOT gated behind an HA-only signal) costs
-    // at most one cached-or-fresh read, never a bare per-call round trip.
+    // the registry lock across Postgres I/O. An empty presence_reader_
+    // (unconfigured) makes this call cost one uncontended mutex acquisition plus
+    // the pointer check; a configured one (the production default — see
+    // live_presence()'s own doc comment for why this is NOT gated behind an
+    // HA-only signal) costs at most one cached-or-fresh read, never a bare
+    // per-call round trip.
     //
     // #4981 PR-1: this method's signature/contract predates the typed
     // PresenceReadError split and stays a plain vector — a degraded read
@@ -1534,6 +1562,18 @@ std::vector<std::string> AgentRegistry::all_ids() const {
     return ids;
 }
 
+std::expected<std::size_t, PresenceReadError> AgentRegistry::known_agent_count() const {
+    auto presence = live_presence(); // cached, runs OFF mu_ (see all_ids)
+    if (!presence)
+        return std::unexpected(presence.error());
+    std::lock_guard lock(mu_);
+    std::size_t n = agents_.size();
+    for (const auto& p : *presence)
+        if (!agents_.contains(p.agent_id))
+            ++n;
+    return n;
+}
+
 std::size_t AgentRegistry::local_agent_count() const {
     std::lock_guard lock(mu_);
     return agents_.size();
@@ -1548,14 +1588,26 @@ bool AgentRegistry::has_remote_presence(const std::vector<std::string>& ids) con
 }
 
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
-    presence_store_ = store;
+    configure_presence(store ? PresenceReadFn{[store](std::chrono::seconds t) {
+                                   return store->query_live_ids(t);
+                               }}
+                             : PresenceReadFn{},
+                       ttl);
+}
+
+void AgentRegistry::configure_presence(PresenceReadFn reader, std::chrono::seconds ttl) {
+    // Wiring and teardown only; locked so a reconfigure can never race an
+    // in-flight read. The cache age resets so the next read hits the new reader.
+    std::lock_guard lock(presence_cache_mu_);
+    presence_reader_ = std::move(reader);
     presence_ttl_ = ttl;
+    presence_cache_at_ = {};
 }
 
 std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::live_presence() const {
-    if (!presence_store_)
-        return std::vector<PresenceIdentity>{};
     std::lock_guard lock(presence_cache_mu_);
+    if (!presence_reader_)
+        return std::vector<PresenceIdentity>{};
     const auto now = std::chrono::steady_clock::now();
     // `presence_cache_at_{}` (default-constructed epoch) is always stale on
     // the first call, so this always fetches at least once before serving a
@@ -1564,7 +1616,7 @@ std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::l
     // not just a success — so a sustained outage pays exactly one real query
     // per kPresenceCacheTtl window, not one per caller.
     if (now - presence_cache_at_ >= kPresenceCacheTtl) {
-        presence_cache_ = presence_store_->query_live_ids(presence_ttl_);
+        presence_cache_ = presence_reader_(presence_ttl_);
         presence_cache_at_ = now;
     }
     return presence_cache_; // copy out under the cache lock, never mu_
@@ -1622,8 +1674,13 @@ std::string AgentRegistry::session_id_of(const std::string& agent_id) const {
     return it != agents_.end() ? it->second->session_id : std::string{};
 }
 
-std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin) const {
+std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin,
+                                                                  std::string_view action) const {
     std::unordered_set<std::string> missing;
+    // Protective-action exemption: protective actions are never withheld on
+    // inventory grounds (see the declaration); decided before taking mu_.
+    if (yuzu::protective::is_protective_action(plugin, action))
+        return missing;
     std::lock_guard lock(mu_);
     for (const auto& [id, s] : agents_) {
         if (s->plugin_names.empty())
@@ -2477,7 +2534,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::array<double, kNGuardianJournalAgeMetrics> gja_max{};
     std::array<bool, kNGuardianJournalAgeMetrics> gja_reported{};
     // Meta-signals ABOUT the rollup (guardian_journal_fleet_tags.hpp). Published
-    // unconditionally, including at 0, unlike the 32 - they are server-owned counts
+    // unconditionally, including at 0, unlike the 33 - they are server-owned counts
     // that always have a true value, so 0 is a measurement, not a fabricated zero.
     // `gj_reporting` is the coverage denominator absence otherwise hides; without it a
     // dark telemetry pipeline is indistinguishable from a healthy quiet fleet.
@@ -2488,7 +2545,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int gj_tag_rejected = 0;
     // std::string twins of the table's C-string tag keys: get_view takes
     // const std::string&, so passing the char* directly would heap-construct a
-    // temporary key per lookup - 32 per agent per sweep. Built once (same pattern,
+    // temporary key per lookup - 33 per agent per sweep. Built once (same pattern,
     // and the same governance finding, as spark_mech_metric_keys above). It IS
     // registered for static destruction (non-trivial destructor), which is safe only
     // because health_recompute_thread_ - the sole production reader - is joined in
@@ -2513,7 +2570,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::array<double, kNGuardianHealthMetrics> gh_sum{};
     std::array<bool, kNGuardianHealthMetrics> gh_reported{};
     // rung 9c PR-3: the arm-ledger pair (Decision 1). SUM accumulate - same
-    // mechanical shape as the 32-row journal counter family (gj_sum above)
+    // mechanical shape as the 33-row journal counter family (gj_sum above)
     // despite being RE-STATABLE gauges rather than monotonic counters on the
     // agent side: this reader only ever sees one CURRENT value per agent per
     // sweep either way, so "sum the current values" is correct regardless of
@@ -3151,7 +3208,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
     // Guardian journal rollup (#2298 gate 3). Families were cleared at the top, so a
     // signal NOBODY reported this cycle stays ABSENT - never a fabricated 0. On a
-    // healthy, quiescent or inert fleet that is ALL 30, which is the correct reading:
+    // healthy, quiescent or inert fleet that is ALL 33, which is the correct reading:
     // the journal has nothing to report, and "nothing to report" must not be
     // presentable as "checked and clean".
     for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i)

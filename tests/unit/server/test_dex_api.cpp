@@ -25,7 +25,10 @@
 #include "../test_helpers.hpp"
 
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 
+#include <algorithm>
+#include <cstdio>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -65,6 +68,23 @@ void seed_crash(GuaranteedStateStore& store, const std::string& id, const std::s
     REQUIRE(store.insert_event(e));
 }
 
+// Like seed_crash, but any observation type and a reported app file version.
+void seed_obs_v(GuaranteedStateStore& store, const std::string& id, const std::string& agent,
+                const std::string& proc, const std::string& type, const std::string& version,
+                const std::string& ts, const std::string& platform = "windows") {
+    GuaranteedStateEventRow e;
+    e.event_id = id;
+    e.rule_id = "__observation__";
+    e.agent_id = agent;
+    e.event_type = type;
+    e.severity = "info";
+    e.detail_json = "{\"subject\":\"" + proc + "\",\"reason\":\"0xC0000005\",\"symbolic\":"
+                    "\"ACCESS_VIOLATION\",\"component\":\"ntdll.dll\",\"platform\":\"" + platform + "\","
+                    "\"version\":\"" + version + "\"}";
+    e.timestamp = ts;
+    REQUIRE(store.insert_event(e));
+}
+
 // Seed dates anchored a few days back from *now* so they stay inside the
 // default 7d window (same rationale as test_dex_routes.cpp's kDayA/kDayB).
 const std::string kTs = yuzu::server::dex_iso_since(2).substr(0, 10) + "T12:00:00Z";
@@ -87,6 +107,7 @@ TEST_CASE("DexApi: null store is the honest degrade, never a throw", "[pg][dex_a
     // Builder-backed degrade: score unavailable, empty model — never a crash.
     CHECK(api->device_score("a1", "7d").score == -1);
     CHECK(api->apps("7d").apps.empty());
+    CHECK(api->apps("7d").degraded); // a null store is a degrade, never an empty healthy list
 }
 
 TEST_CASE("DexApi: signals/scope/signal_detail match the direct store reads", "[pg][dex_api]") {
@@ -276,4 +297,555 @@ TEST_CASE("DexApi: builder-backed methods match their shared builders", "[pg][de
         CHECK(a.days.size() == b.days.size());
         CHECK(a.families.size() == b.families.size());
     }
+}
+
+// ── Apps read: per application and per version ───────────────────────────────
+//
+// Seeded events (all platform windows, inside the 7d window), FleetFn
+// windows_online = 20:
+//   app.exe     1.0.0.0  a1: 1 crash + 1 hang     a2: 1 crash
+//               2.0.0.0  a2: 1 crash   a3: 6 crashes (capped at 5)   a4: 1 crash
+//   aardvark.exe 1.0     b1: 1 crash   (lexically first, least active)
+// Hand-computed for app.exe: crashes 10, hangs 1, devices 4 (a2 is in both
+// versions and counts once), capped crash sum 1+2+5+1 = 9, capped hangs 1.
+// 2.0.0.0: 3 devices, 8 crashes, capped 1+5+1 = 7. 1.0.0.0: 2 devices,
+// 2 crashes + 1 hang.
+namespace {
+// 20 Windows devices online: the population every Apps case below uses. The
+// five fixture devices are among them, so their figures are online figures.
+yuzu::server::DexFleet fleet20() {
+    yuzu::server::DexFleet f;
+    f.windows_online = 20;
+    for (const char* id : {"a1", "a2", "a3", "a4", "b1"})
+        f.connected_agents.emplace_back(id, "windows");
+    for (int i = 0; i < 15; ++i)
+        f.connected_agents.emplace_back("idle-" + std::to_string(i), "windows");
+    f.total_online = 20;
+    return f;
+}
+
+void seed_apps_fixture(GuaranteedStateStore& store) {
+    int n = 0;
+    auto id = [&] { return "ap" + std::to_string(++n); };
+    seed_obs_v(store, id(), "a1", "app.exe", "process.crashed", "1.0.0.0", kTs);
+    seed_obs_v(store, id(), "a1", "app.exe", "process.hung", "1.0.0.0", kTs);
+    seed_obs_v(store, id(), "a2", "app.exe", "process.crashed", "1.0.0.0", kTs);
+    seed_obs_v(store, id(), "a2", "app.exe", "process.crashed", "2.0.0.0", kTs);
+    for (int i = 0; i < 6; ++i)
+        seed_obs_v(store, id(), "a3", "app.exe", "process.crashed", "2.0.0.0", kTs);
+    seed_obs_v(store, id(), "a4", "app.exe", "process.crashed", "2.0.0.0", kTs);
+    seed_obs_v(store, id(), "b1", "aardvark.exe", "process.crashed", "1.0", kTs);
+}
+} // namespace
+
+TEST_CASE("DexApi: apps carries per-version figures, activity order and the population",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+
+    auto api = make_local_dex_api(&store, fleet20);
+    const auto m = api->apps("7d");
+    REQUIRE_FALSE(m.degraded);
+    CHECK(m.population == std::optional<int64_t>{20});
+    REQUIRE(m.apps.size() == 2);
+    // Activity rank (11 events) beats lexical order ("aardvark.exe" sorts first).
+    CHECK(m.apps[0].subject == "app.exe");
+    CHECK(m.apps[1].subject == "aardvark.exe");
+
+    const auto& app = m.apps[0];
+    CHECK(app.figures.crashes == 10);
+    CHECK(app.figures.hangs == 1);
+    CHECK(app.figures.distinct_devices == 4);
+    REQUIRE(app.figures.share_affected);
+    CHECK(app.figures.share_affected->estimate == yuzu::server::dex_proportion(4, 20)->estimate);
+    REQUIRE(app.figures.rate_per_1000);
+    CHECK(app.figures.rate_per_1000->estimate == yuzu::server::dex_rate(11, 0.02)->estimate);
+    yuzu::server::StabilityInputs in;
+    in.reporting_devices = 20;
+    in.devices_affected = 4;
+    in.crash_events = 9;
+    in.hang_events = 1;
+    const auto expect = yuzu::server::compute_stability_score(in, 0);
+    REQUIRE(app.figures.score.score);
+    CHECK(*app.figures.score.score == *expect.score);
+
+    REQUIRE(app.versions.size() == 2);
+    CHECK(app.version_count == 2);
+    CHECK_FALSE(app.versions_truncated);
+    CHECK(app.versions[0].version == "2.0.0.0");
+    CHECK(app.versions[0].figures.distinct_devices == 3);
+    CHECK(app.versions[0].figures.crashes == 8);
+    in.devices_affected = 3;
+    in.crash_events = 7;
+    in.hang_events = 0;
+    CHECK(*app.versions[0].figures.score.score == *yuzu::server::compute_stability_score(in, 0).score);
+    CHECK(app.versions[1].version == "1.0.0.0");
+    CHECK(app.versions[1].figures.distinct_devices == 2);
+    CHECK(app.versions[1].figures.crashes == 2);
+    CHECK(app.versions[1].figures.hangs == 1);
+
+    // One affected device, published with every figure and no floor field.
+    CHECK(m.apps[1].figures.distinct_devices == 1);
+    CHECK(m.apps[1].figures.share_affected);
+    CHECK(m.apps[1].figures.score.score);
+    CHECK(yuzu::server::dex_apps_json(m).find("below_floor") == std::string::npos);
+}
+
+TEST_CASE("DexApi: apps without a FleetFn has an unknown population, scores withheld",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    const auto m = make_local_dex_api(&store, {})->apps("7d");
+    REQUIRE_FALSE(m.degraded);
+    CHECK_FALSE(m.population);
+    REQUIRE_FALSE(m.apps.empty());
+    CHECK_FALSE(m.apps[0].figures.share_affected);
+    CHECK_FALSE(m.apps[0].figures.rate_per_1000);
+    CHECK(std::string(m.apps[0].figures.score.withheld) == "no_population");
+    // No fleet source: which affected devices are online is unknown, not zero.
+    CHECK_FALSE(m.apps[0].figures.distinct_devices_online.has_value());
+    CHECK_FALSE(m.apps[0].versions[0].figures.distinct_devices_online.has_value());
+}
+
+TEST_CASE("DexApi: apps on a failed store read is degraded, never an empty list",
+          "[pg][dex][apps_model][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+    const auto m = make_local_dex_api(&store, {})->apps("7d");
+    CHECK(m.degraded);
+    CHECK(m.apps.empty());
+}
+
+TEST_CASE("DexApi: apps caps versions at 20 and flags it", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    std::vector<std::string> versions;
+    for (int i = 1; i <= 21; ++i) {
+        const std::string v = "1.0.0." + std::to_string(i);
+        versions.push_back(v);
+        seed_obs_v(store, "v" + std::to_string(i), "d" + std::to_string(i), "many.exe",
+                   "process.crashed", v, kTs);
+    }
+    // The lexically last version ("1.0.0.9") is the most affected: it must be
+    // kept and listed first, so the cut ranks by devices, not by name.
+    seed_obs_v(store, "v-extra", "d-extra", "many.exe", "process.crashed", "1.0.0.9", kTs);
+    const auto m = make_local_dex_api(&store, {})->apps("7d");
+    REQUIRE(m.apps.size() == 1);
+    CHECK(m.apps[0].version_count == 21);
+    CHECK(m.apps[0].versions_truncated);
+    // Then equal devices: the kept 19 are the lexically smallest, in order.
+    std::sort(versions.begin(), versions.end());
+    versions.pop_back(); // "1.0.0.9", listed first
+    versions.resize(19);
+    versions.insert(versions.begin(), "1.0.0.9");
+    REQUIRE(m.apps[0].versions.size() == 20);
+    for (std::size_t i = 0; i < 20; ++i)
+        CHECK(m.apps[0].versions[i].version == versions[i]);
+}
+
+// The injected score policy reaches the Apps read: a valid override moves one
+// application's (and its version's) band; an invalid one degrades the whole read
+// with the store open, so the policy branch (not the null-store one) decides.
+TEST_CASE("DexApi: apps uses the injected score policy, and an invalid one degrades",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    using yuzu::server::StabilityBand;
+
+    // Default edges: app.exe scores 86.12 (Good, edge 90), its 2.0.0.0 scores 89.6.
+    const auto base = make_local_dex_api(&store, fleet20)->apps("7d");
+    REQUIRE(base.apps.size() == 2);
+    REQUIRE(base.apps[0].figures.score.band);
+    CHECK(*base.apps[0].figures.score.band == StabilityBand::Good);
+
+    auto lowered = [] {
+        yuzu::server::DexScorePolicy p;
+        yuzu::server::DexScoreOverride o;
+        o.image = "app.exe";
+        o.excellent = 80.0;
+        p.overrides.push_back(o);
+        return p;
+    };
+    REQUIRE_FALSE(yuzu::server::dex_score_policy_fault(lowered()));
+    const auto m = make_local_dex_api(&store, fleet20, lowered)->apps("7d");
+    REQUIRE_FALSE(m.degraded);
+    REQUIRE(m.apps.size() == 2);
+    REQUIRE(m.apps[0].figures.score.band);
+    CHECK(*m.apps[0].figures.score.band == StabilityBand::Excellent);
+    REQUIRE(m.apps[0].versions.size() == 2);
+    REQUIRE(m.apps[0].versions[0].figures.score.band);
+    CHECK(*m.apps[0].versions[0].figures.score.band == StabilityBand::Excellent);
+    // The override is per image: aardvark.exe keeps the default edges.
+    REQUIRE(m.apps[1].figures.score.band);
+    CHECK(*m.apps[1].figures.score.band == *base.apps[1].figures.score.band);
+
+    auto duplicated = [] {
+        yuzu::server::DexScorePolicy p;
+        yuzu::server::DexScoreOverride o;
+        o.image = "dup.exe";
+        p.overrides = {o, o};
+        return p;
+    };
+    REQUIRE(yuzu::server::dex_score_policy_fault(duplicated()));
+    const auto bad = make_local_dex_api(&store, fleet20, duplicated)->apps("7d");
+    CHECK(bad.degraded);
+    CHECK(bad.apps.empty());
+}
+
+// Counts are Windows-scoped: Linux and macOS rows never reach the numerator, and
+// a subject seen only off Windows is not listed at all.
+TEST_CASE("DexApi: apps counts Windows rows only", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    seed_obs_v(store, "lx1", "a9", "app.exe", "process.crashed", "1.0.0.0", kTs, "linux");
+    seed_obs_v(store, "lx2", "a9", "app.exe", "process.crashed", "3.0.0.0", kTs, "linux");
+    for (int i = 1; i <= 3; ++i)
+        seed_obs_v(store, "mc" + std::to_string(i), "m1", "linux-only.exe", "process.crashed", "1.0",
+                   kTs, "macos");
+    const auto m = make_local_dex_api(&store, fleet20)->apps("7d");
+    REQUIRE(m.apps.size() == 2);
+    CHECK(m.apps[0].subject == "app.exe");
+    CHECK(m.apps[1].subject == "aardvark.exe");
+    CHECK(m.apps[0].figures.crashes == 10);
+    CHECK(m.apps[0].figures.hangs == 1);
+    CHECK(m.apps[0].figures.distinct_devices == 4);
+    CHECK(m.apps[0].version_count == 2);
+}
+
+// 102 subjects: the top 100 by devices affected then activity are kept, ties fall
+// to subject order, and the cut is made on that rank, not on name.
+TEST_CASE("DexApi: apps keeps the top 100 applications by activity", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int n = 0;
+    auto crashes = [&](const std::string& subject, int count) {
+        for (int i = 0; i < count; ++i)
+            seed_obs_v(store, "cap" + std::to_string(++n), "d" + subject, subject, "process.crashed",
+                       "1.0", kTs);
+    };
+    crashes("zz-top.exe", 3);  // most active, lexically last
+    crashes("a-least.exe", 1); // least active, lexically first
+    for (int i = 1; i <= 100; ++i) {
+        char name[16];
+        std::snprintf(name, sizeof name, "m%03d.exe", i);
+        crashes(name, 2); // a 100-wide tie that spans the cut
+    }
+    const auto m = make_local_dex_api(&store, fleet20)->apps("7d");
+    REQUIRE_FALSE(m.degraded);
+    REQUIRE(m.apps.size() == static_cast<std::size_t>(yuzu::server::kDexAppsLimit));
+    CHECK(m.apps.front().subject == "zz-top.exe");
+    CHECK(m.apps.back().subject == "m099.exe");
+    for (const auto& a : m.apps) {
+        CHECK(a.subject != "a-least.exe");
+        CHECK(a.subject != "m100.exe");
+    }
+}
+
+// An intact store with no observations is a successful empty read, not a degrade.
+TEST_CASE("DexApi: apps on an intact empty store is a healthy empty list", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    const auto m = make_local_dex_api(&store, {})->apps("7d");
+    CHECK_FALSE(m.degraded);
+    CHECK(m.apps.empty());
+}
+
+// One sick device crash-looping three applications must not displace an
+// application on eight devices from the top-N cut: membership is the most
+// devices affected, and apps_total/apps_truncated name the cut.
+TEST_CASE("DexApi: apps top-N membership is devices affected, not raw events",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int n = 0;
+    for (const char* app : {"sick-a.exe", "sick-b.exe", "sick-c.exe"})
+        for (int i = 0; i < 9; ++i)
+            seed_obs_v(store, "sk" + std::to_string(++n), "sick", app, "process.crashed", "1.0", kTs);
+    for (int i = 0; i < 8; ++i)
+        seed_obs_v(store, "wd" + std::to_string(++n), "w" + std::to_string(i), "widespread.exe",
+                   "process.crashed", "1.0", kTs);
+    const auto rows = store.dex_app_stability_checked(yuzu::server::dex_iso_since(7), "windows",
+                                                      /*app_limit=*/2, 20, 5, {});
+    REQUIRE(rows);
+    int totals = 0;
+    bool widespread = false;
+    for (const auto& r : *rows) {
+        if (r.version)
+            continue;
+        ++totals;
+        CHECK(r.apps_total == 4);
+        widespread = widespread || r.subject == "widespread.exe";
+    }
+    CHECK(totals == 2);
+    CHECK(widespread);
+    const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20,
+                                                          yuzu::server::dex_default_score_policy());
+    CHECK(m.apps_total == 4);
+    CHECK(m.apps_truncated);
+}
+
+// Store-level pins for the window, the per-device cap and last_seen.
+TEST_CASE("DexApi: apps store read honours the window, the per-device cap and last_seen",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    const std::string later = yuzu::server::dex_iso_since(1).substr(0, 10) + "T12:00:00Z";
+    const std::string old_ts = yuzu::server::dex_iso_since(40).substr(0, 10) + "T12:00:00Z";
+    int n = 0;
+    auto id = [&] { return "q" + std::to_string(++n); };
+    // One device, 4 crashes in each of two versions: capped at 5 per device, 4 per version.
+    for (int i = 0; i < 4; ++i) {
+        seed_obs_v(store, id(), "c1", "cap.exe", "process.crashed", "1.0", kTs);
+        seed_obs_v(store, id(), "c1", "cap.exe", "process.crashed", "2.0", i == 0 ? later : kTs);
+    }
+    for (int i = 0; i < 7; ++i)
+        seed_obs_v(store, id(), "c2", "cap.exe", "process.hung", "1.0", kTs);
+    seed_obs_v(store, id(), "c3", "cap.exe", "process.crashed", "2.0", old_ts); // outside 7d
+    const std::vector<std::string> online{"c1", "c2", "c3"};
+    auto total_of = [](const std::vector<yuzu::server::DexAppStabilityRow>& rows) {
+        for (const auto& r : rows)
+            if (!r.version)
+                return r;
+        FAIL("no total row");
+        return yuzu::server::DexAppStabilityRow{};
+    };
+    const auto week =
+        store.dex_app_stability_checked(yuzu::server::dex_iso_since(7), "windows", 10, 20, 5, online);
+    REQUIRE(week);
+    const auto t = total_of(*week);
+    CHECK(t.crashes == 8);
+    CHECK(t.capped_crashes == 5);
+    CHECK(t.hangs == 7);
+    CHECK(t.capped_hangs == 5);
+    CHECK(t.affected_devices == 2);
+    CHECK(t.affected_online == 2); // c3 is online but outside the window
+    CHECK(t.crashes_online == 8);
+    CHECK(t.hangs_online == 7);
+    CHECK(t.last_seen == later);
+    for (const auto& r : *week) // a version row caps its hangs per device too
+        if (r.version == "1.0.0.0")
+            CHECK(r.capped_hangs == 5);
+    const auto all = store.dex_app_stability_checked("", "windows", 10, 20, 5, online);
+    REQUIRE(all);
+    CHECK(total_of(*all).affected_devices == 3);
+    CHECK(total_of(*all).crashes == 9);
+    for (const auto& r : *all) // a version row's last_seen is its newest observation
+        if (r.version == "2.0.0.0")
+            CHECK(r.last_seen == later);
+}
+
+// Membership and version cuts: each SECTION seeds its own small store and reads the
+// statement directly, so a changed ORDER BY, COUNT or collation shows in the rows.
+TEST_CASE("DexApi: apps store cuts rank by devices, then events, then byte-order name",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int n = 0;
+    auto obs = [&](const char* agent, const char* app, const char* type, const char* ver) {
+        seed_obs_v(store, "mb" + std::to_string(++n), agent, app, type, ver, kTs);
+    };
+    const std::string since = yuzu::server::dex_iso_since(7);
+    auto kept = [&](int app_limit, int version_limit, bool versions) {
+        std::vector<std::string> out;
+        const auto rows = store.dex_app_stability_checked(since, "windows", app_limit, version_limit, 5, {});
+        REQUIRE(rows);
+        for (const auto& r : *rows)
+            if (r.version.has_value() == versions)
+                out.push_back(r.subject + (r.version ? "@" + *r.version : ""));
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    using Names = std::vector<std::string>;
+    SECTION("the version cut ranks by devices, not events, and breaks ties in byte order") {
+        obs("d1", "v.exe", "process.crashed", "2.0.0.0");
+        obs("d2", "v.exe", "process.crashed", "2.0.0.0");
+        for (int i = 0; i < 3; ++i)
+            obs("d3", "v.exe", "process.crashed", "1.0.0.9");
+        CHECK(kept(10, 1, true) == Names{"v.exe@2.0.0.0"});
+        // Under a locale collation that ignores dots "1.0.10.0" sorts before "1.0.1.9".
+        obs("d4", "t.exe", "process.crashed", "1.0.10.0");
+        obs("d5", "t.exe", "process.crashed", "1.0.1.9");
+        CHECK(kept(10, 1, true) == Names{"t.exe@1.0.1.9", "v.exe@2.0.0.0"});
+    }
+    SECTION("membership counts a device once even when it spans versions") {
+        for (const char* ver : {"1.0", "2.0"})
+            for (int i = 0; i < 5; ++i)
+                obs("sick", "sick.exe", "process.crashed", ver);
+        obs("p1", "pair.exe", "process.crashed", "1.0");
+        obs("p2", "pair.exe", "process.crashed", "1.0");
+        CHECK(kept(1, 20, false) == Names{"pair.exe"});
+    }
+    SECTION("an equal-devices equal-crashes tie is broken by hangs, then byte-order name") {
+        obs("d1", "a-plain.exe", "process.crashed", "1.0");
+        obs("d2", "z-hang.exe", "process.crashed", "1.0");
+        obs("d2", "z-hang.exe", "process.hung", "1.0");
+        CHECK(kept(1, 20, false) == Names{"z-hang.exe"});
+    }
+    SECTION("an all-equal tie falls to byte order, not database collation") {
+        obs("d1", "a.exe", "process.crashed", "1.0");
+        obs("d2", "B.exe", "process.crashed", "1.0");
+        CHECK(kept(1, 20, false) == Names{"B.exe"});
+    }
+    SECTION("apps_total names the cut exactly at app_limit and app_limit + 1") {
+        for (const char* app : {"x.exe", "y.exe", "z.exe"})
+            obs("d1", app, "process.crashed", "1.0");
+        const auto policy = yuzu::server::dex_default_score_policy();
+        for (int limit : {3, 2}) {
+            const auto rows = store.dex_app_stability_checked(since, "windows", limit, 20, 5, {});
+            REQUIRE(rows);
+            const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20, policy);
+            CHECK(m.apps_total == 3);
+            CHECK(m.apps_truncated == (limit == 2));
+        }
+    }
+}
+
+// Churn: the share's numerator is the affected devices that are ONLINE, drawn in the
+// statement from the same ids whose count is the population, so a device that crashed
+// and went offline is in the window-wide counts and nowhere in the share.
+TEST_CASE("DexApi: apps share numerator is the affected devices that are online",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int n = 0;
+    // Seven devices crash app.exe (2 versions for gone1) and go offline.
+    for (int i = 1; i <= 7; ++i)
+        seed_obs_v(store, "ch" + std::to_string(++n), "gone" + std::to_string(i), "app.exe",
+                   "process.crashed", "1.0.0.0", kTs);
+    seed_obs_v(store, "ch" + std::to_string(++n), "gone1", "app.exe", "process.hung", "2.0.0.0", kTs);
+    // One online device crashes it too (twice), and one more hangs a different app.
+    seed_obs_v(store, "ch" + std::to_string(++n), "up1", "app.exe", "process.crashed", "1.0.0.0", kTs);
+    seed_obs_v(store, "ch" + std::to_string(++n), "up1", "app.exe", "process.crashed", "2.0.0.0", kTs);
+    seed_obs_v(store, "ch" + std::to_string(++n), "up2", "other.exe", "process.hung", "1.0.0.0", kTs);
+
+    yuzu::server::DexFleet fleet;
+    fleet.windows_online = 999; // deliberately not the id count: the population follows the ids
+    fleet.connected_agents.emplace_back("up1", "windows");
+    fleet.connected_agents.emplace_back("up2", "windows");
+    fleet.connected_agents.emplace_back("lin1", "linux"); // not Windows: never in the set
+    for (int i = 0; i < 48; ++i)
+        fleet.connected_agents.emplace_back("idle" + std::to_string(i), "windows");
+    const auto m = make_local_dex_api(&store, [&] { return fleet; })->apps("7d");
+    REQUIRE_FALSE(m.degraded);
+    CHECK(m.population == std::optional<int64_t>{50});
+    REQUIRE(m.apps.size() == 2);
+    const auto& app = m.apps[0]; // 10 events beat other.exe's 1
+    REQUIRE(app.subject == "app.exe");
+    CHECK(app.figures.crashes == 9);
+    CHECK(app.figures.hangs == 1);
+    CHECK(app.figures.distinct_devices == 8);        // seven gone + up1
+    CHECK(app.figures.distinct_devices_online == 1); // up1 alone
+    REQUIRE(app.figures.share_affected);
+    CHECK(app.figures.share_affected->estimate == yuzu::server::dex_proportion(1, 50)->estimate);
+    REQUIRE(app.figures.rate_per_1000);
+    CHECK(app.figures.rate_per_1000->estimate == yuzu::server::dex_rate(2, 0.05)->estimate);
+    // Seven of the eight affected devices are offline: the score is withheld, not 99.
+    CHECK_FALSE(app.figures.score.score);
+    CHECK(std::string(app.figures.score.withheld) == "offline_affected");
+    // Versions: 1.0.0.0 has eight devices (one online), 2.0.0.0 has two (one online).
+    REQUIRE(app.versions.size() == 2);
+    CHECK(app.versions[0].version == "1.0.0.0");
+    CHECK(app.versions[0].figures.distinct_devices == 8);
+    CHECK(app.versions[0].figures.distinct_devices_online == 1);
+    CHECK(app.versions[1].figures.distinct_devices == 2);
+    CHECK(app.versions[1].figures.distinct_devices_online == 1);
+    // Version rows use the online figures too: each has one online device (up1) with one crash.
+    for (const auto& v : app.versions) {
+        REQUIRE(v.figures.share_affected);
+        CHECK(v.figures.share_affected->estimate == yuzu::server::dex_proportion(1, 50)->estimate);
+        REQUIRE(v.figures.rate_per_1000);
+        CHECK(v.figures.rate_per_1000->estimate == yuzu::server::dex_rate(1, 0.05)->estimate);
+        CHECK(std::string(v.figures.score.withheld) == "offline_affected");
+    }
+    // other.exe: its only device is online.
+    CHECK(m.apps[1].figures.distinct_devices_online == 1);
+}
+
+// A fleet with no Windows device online has an empty set: counts stay, share is withheld.
+TEST_CASE("DexApi: apps with nothing online keeps the counts and publishes no share",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    const auto m = make_local_dex_api(&store, [] { return DexFleet{}; })->apps("7d");
+    REQUIRE_FALSE(m.degraded);
+    CHECK(m.population == std::optional<int64_t>{0});
+    REQUIRE(m.apps.size() == 2);
+    CHECK(m.apps[0].figures.distinct_devices == 4);
+    CHECK(m.apps[0].figures.distinct_devices_online == 0);
+    CHECK_FALSE(m.apps[0].figures.share_affected);
+    CHECK(std::string(m.apps[0].figures.score.withheld) == "no_population");
+}
+
+// One Apps read holds a lease for seconds, so reads over the budget are refused at once
+// as a degrade (the handler's retryable 503), never queued behind the pool or served empty.
+TEST_CASE("DexApi: apps read over its concurrency budget is refused as a degrade",
+          "[pg][dex][apps_model][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the store so it outlives it
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    store.set_metrics(&metrics);
+    const auto counter = [&] {
+        return metrics
+            .counter("yuzu_server_guardian_read_degrade_total",
+                     {{"reason", "concurrency_budget"}, {"source", "guardian_state"}})
+            .value();
+    };
+    CHECK(GuaranteedStateStore::kDexAppsConcurrentReads == 4); // the documented budget
+    const auto api = make_local_dex_api(&store, fleet20);
+    REQUIRE_FALSE(api->apps("7d").degraded);
+    CHECK(counter() == 0.0);
+    store.set_apps_read_budget_for_test(0);
+    const auto refused = api->apps("7d");
+    CHECK(refused.degraded);
+    CHECK(refused.apps.empty());
+    CHECK(counter() == 1.0); // counted once under the documented reason and source
+    CHECK_FALSE(store.dex_app_stability_checked("", "windows", 10, 20, 5, {}));
+    CHECK(counter() == 2.0);
+    // A refusal releases its slot: with a budget of one, two reads in a row both serve,
+    // and a leaked slot would refuse the first (the count would already be at the budget).
+    store.set_apps_read_budget_for_test(1);
+    CHECK_FALSE(api->apps("7d").degraded);
+    CHECK_FALSE(api->apps("7d").degraded);
 }

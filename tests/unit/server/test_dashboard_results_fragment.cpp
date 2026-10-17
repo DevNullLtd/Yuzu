@@ -402,7 +402,7 @@ TEST_CASE("/fragments/results: Create Group button still renders for an "
     CHECK(contains(res->body, "Create Group from 1 Agent"));
 }
 
-// ── #4644 Gate 7 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──
+// ── #4644 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──
 
 TEST_CASE("/fragments/results: an unfiltered read cut by the payload cap shows a truncation "
           "notice an uncut one does not",
@@ -490,4 +490,41 @@ TEST_CASE("/fragments/results: a cut read that parses to zero lines still says i
     CHECK(contains(cut->body, "data-result-truncated=\"true\""));
     CHECK(contains(cut->body, "so these rows and counts are partial"));
     CHECK_FALSE(contains(cut->body, " results across "));
+}
+
+// #4644: `page` / `per_page` are ONE base-10 integer or a 400: a malformed page used to
+// fall back to the default silently, so the operator read page 1 as the page they asked for.
+TEST_CASE("/fragments/results: a malformed page or per_page is a 400 and valid values are served",
+          "[pg][server][dashboard][fragment][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-page-1";
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-1";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = "page fragment output";
+    rs.store(r);
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    const std::string base = "/fragments/results?command_id=" + command_id + "&plugin=registry";
+    for (const char* bad : {"page=2x", "page=0x2", "page=1e1", "page=", "per_page=50abc",
+                            "per_page=", "per_page=99999999999999999999"}) {
+        INFO(bad);
+        auto res = h.get(base + "&" + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto ok = h.get(base + "&page=1&per_page=50");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(contains(ok->body, "page fragment output"));
 }

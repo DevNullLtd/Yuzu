@@ -985,6 +985,7 @@ sys.exit(0 if d.get("status") == "ready" else 1)
     local help_html
     help_html=$(curl -s -b "$UAT_DIR/cookies.txt" \
         -X POST http://localhost:8080/api/dashboard/execute \
+        -H "Origin: http://localhost:8080" \
         -d "instruction=help&scope=__all__" 2>/dev/null)
     local plugin_count
     plugin_count=$(echo "$help_html" | grep -o 'result-row' | wc -l)

@@ -997,31 +997,44 @@ std::expected<void, std::string> DirectorySync::sync_ldap(const LdapConfig& /*co
 
 std::vector<DirectoryUser> DirectorySync::get_synced_users(
     const std::string& group_filter) const {
+    return get_synced_users_checked(group_filter, 0, /*require_groups=*/false)
+        .value_or(std::vector<DirectoryUser>{});
+}
+
+std::expected<std::vector<DirectoryUser>, DirectoryReadError>
+DirectorySync::get_synced_users_checked(const std::string& group_filter, int limit,
+                                        bool require_groups) const {
     if (!open_)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
     PGconn* conn = lease.get();
 
+    // `limit` is an int formatted here, never caller text.
+    const std::string cap = limit > 0 ? " LIMIT " + std::to_string(limit) : std::string{};
     pg::PgResult res;
     if (group_filter.empty()) {
         res = pg::exec_params(conn,
-                              "SELECT id, display_name, email, upn, enabled, synced_at "
-                              "FROM directory_sync.directory_users ORDER BY display_name",
+                              ("SELECT id, display_name, email, upn, enabled, synced_at "
+                               "FROM directory_sync.directory_users ORDER BY display_name" +
+                               cap)
+                                  .c_str(),
                               std::vector<std::string>{});
     } else {
         res = pg::exec_params(conn,
-                              "SELECT u.id, u.display_name, u.email, u.upn, u.enabled, u.synced_at "
-                              "FROM directory_sync.directory_users u "
-                              "JOIN directory_sync.directory_memberships m ON m.user_id = u.id "
-                              "WHERE m.group_id = $1 ORDER BY u.display_name",
+                              ("SELECT u.id, u.display_name, u.email, u.upn, u.enabled, u.synced_at "
+                               "FROM directory_sync.directory_users u "
+                               "JOIN directory_sync.directory_memberships m ON m.user_id = u.id "
+                               "WHERE m.group_id = $1 ORDER BY u.display_name" +
+                               cap)
+                                  .c_str(),
                               std::vector<std::string>{group_filter});
     }
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("DirectorySync::get_synced_users: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return {};
+        return std::unexpected(DirectoryReadError::query_failed);
     }
 
     const int rows = PQntuples(res.get());
@@ -1050,6 +1063,8 @@ std::vector<DirectoryUser> DirectorySync::get_synced_users(
     if (mres.status() != PGRES_TUPLES_OK) {
         spdlog::error("DirectorySync::get_synced_users: membership query failed: {}",
                       PQresultErrorMessage(mres.get()));
+        if (require_groups)
+            return std::unexpected(DirectoryReadError::query_failed);
         return result; // users still returned — group enrichment is best-effort
     }
 
@@ -1102,11 +1117,16 @@ std::optional<DirectoryUser> DirectorySync::get_user(const std::string& id) cons
 }
 
 std::vector<DirectoryGroup> DirectorySync::get_synced_groups() const {
+    return get_synced_groups_checked().value_or(std::vector<DirectoryGroup>{});
+}
+
+std::expected<std::vector<DirectoryGroup>, DirectoryReadError>
+DirectorySync::get_synced_groups_checked() const {
     if (!open_)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
 
     // mapped_role is resolved via LEFT JOIN, not a column on directory_groups
     // — see store_group's comment for why a denormalized copy raced
@@ -1122,7 +1142,7 @@ std::vector<DirectoryGroup> DirectorySync::get_synced_groups() const {
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("DirectorySync::get_synced_groups: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return {};
+        return std::unexpected(DirectoryReadError::query_failed);
     }
 
     const int rows = PQntuples(res.get());
@@ -1133,15 +1153,42 @@ std::vector<DirectoryGroup> DirectorySync::get_synced_groups() const {
     return result;
 }
 
+std::expected<std::int64_t, DirectoryReadError> DirectorySync::get_synced_user_count_checked() const {
+    if (!open_)
+        return std::unexpected(DirectoryReadError::store_unavailable);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(DirectoryReadError::store_unavailable);
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT count(*) FROM directory_sync.directory_users",
+                                       std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+        spdlog::error("DirectorySync::get_synced_user_count_checked: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(DirectoryReadError::query_failed);
+    }
+    return to_i64(col(res.get(), 0, 0));
+}
+
 SyncStatus DirectorySync::get_status() const {
+    SyncStatus fallback;
+    fallback.provider = "entra";
+    fallback.status = "idle";
+    return get_status_checked().value_or(fallback);
+}
+
+std::expected<SyncStatus, DirectoryReadError> DirectorySync::get_status_checked() const {
+    // No stored row is a legitimate answer ("never synced": provider entra,
+    // status idle, last_sync_at 0). A closed store, a lease timeout and a
+    // failed query are errors, so a caller never renders them as never-synced.
     SyncStatus s;
     s.provider = "entra";
     s.status = "idle";
     if (!open_)
-        return s;
+        return std::unexpected(DirectoryReadError::store_unavailable);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return s;
+        return std::unexpected(DirectoryReadError::store_unavailable);
 
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -1151,7 +1198,7 @@ SyncStatus DirectorySync::get_status() const {
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("DirectorySync::get_status: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return s;
+        return std::unexpected(DirectoryReadError::query_failed);
     }
     if (PQntuples(res.get()) > 0) {
         s.provider = col_str(res.get(), 0, 0);
@@ -1247,11 +1294,16 @@ void DirectorySync::remove_group_role_mapping(const std::string& group_id) {
 }
 
 std::map<std::string, std::string> DirectorySync::get_group_role_mappings() const {
+    return get_group_role_mappings_checked().value_or(std::map<std::string, std::string>{});
+}
+
+std::expected<std::map<std::string, std::string>, DirectoryReadError>
+DirectorySync::get_group_role_mappings_checked() const {
     if (!open_)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
 
     pg::PgResult res = pg::exec_params(
         lease.get(), "SELECT group_id, role_name FROM directory_sync.directory_group_role_mappings",
@@ -1259,7 +1311,7 @@ std::map<std::string, std::string> DirectorySync::get_group_role_mappings() cons
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("DirectorySync::get_group_role_mappings: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return {};
+        return std::unexpected(DirectoryReadError::query_failed);
     }
 
     std::map<std::string, std::string> result;

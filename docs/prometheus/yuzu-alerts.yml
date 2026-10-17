@@ -1867,6 +1867,9 @@ groups:
             quarantine.reapply verb (system principal, detail carries
             record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
             record_id=... command_id=..." on success).
+            This alert also fires when the device's agent lacks the
+            quarantine plugin: the dispatch is accepted but never
+            confirmed, so upgrade the agent.
 
       - alert: YuzuDispatchTargetRejected
         expr: |
@@ -2818,7 +2821,8 @@ groups:
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
       # Two sources on the SAME counter, both keyed by reason
-      # (store_not_open/pool_acquire_timeout/query_error): "guardian_state"
+      # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
+      # on guardian_state for the Apps list's in-flight budget): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
@@ -2841,8 +2845,9 @@ groups:
             yuzu_server_guardian_read_degrade_total{reason="{{ $labels.reason }}",
             source="{{ $labels.source }}"} is non-zero. source="guardian_state"
             means a DEX/observation read (crash summary, top apps, device
-            score inputs, ...) is degrading and fails SOFT - callers keep
-            serving an empty/partial result, so this counter and the sampled
+            score inputs, ...) is degrading and fails SOFT (except the
+            per-device score, catalogue and Apps list reads, which fail closed)
+            - callers keep serving an empty/partial result, so this counter and the sampled
             warn log are the only external tell; do not read a "healthy"
             device compliance score as authoritative while this fires (#4855).
             source="guardian_rules" means an AUTHORITATIVE rule/status read
@@ -2862,6 +2867,10 @@ groups:
             saturation or outage; store_not_open means the store failed to
             open at boot (should not be reachable post-boot given fail-closed
             construction - investigate as a possible regression if seen).
+            reason="concurrency_budget" is not a substrate fault: the Apps
+            list read (GET /api/v1/dex/apps, list_dex_apps) was refused with a
+            retryable 503 because four were already running; look for a
+            caller polling it in parallel.
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
@@ -2893,7 +2902,8 @@ groups:
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
-            behavioural routes.
+            behavioural routes. The audit-first admin writes (webhooks, offload targets,
+            directory sync, group mappings, MCP settings) 503 the same way.
           runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would
@@ -4386,8 +4396,8 @@ groups:
   #       endpoints and the runbook advice to "identify the reporting agents" is
   #       unactionable without it;
   #   (b) the per-agent axis above (#2083-class work);
-  #   (c) a soak at fleet scale with all 30 families live concurrently with the
-  #       revocation sweep - the heartbeat tag-map grows by up to 30 entries per agent
+  #   (c) a soak at fleet scale with all 33 families live concurrently with the
+  #       revocation sweep - the heartbeat tag-map grows by up to 33 entries per agent
   #       the instant prefer_spark flips, which no pre-cutover soak can observe;
   #   (d) runbooks at the docs.yuzu.io URLs below, which do not exist yet.
   #
@@ -4401,7 +4411,7 @@ groups:
   # alert is the signal; the audit trail is the evidence.
   #
   # PIPELINE HEALTH: yuzu_fleet_guardian_journal_reporting and ..._tag_rejected are
-  # published on EVERY sweep including at 0, unlike the 30 counters. They are the only
+  # published on EVERY sweep including at 0, unlike the 33 counters. They are the only
   # rules here that CAN be sound, because they are server-owned counts rather than fleet
   # sums of agent monotonics. They differ from each other: TagRejected is
   # unconditionally sound, while TelemetryDark is sound only once Guardian is actually

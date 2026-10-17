@@ -184,6 +184,8 @@ docs/dex-brd-coverage.md
 # Local-only working directories — scratch notes, throwaway spikes, agent
 # skill-install stray targets, and personal tuning prefs. Never track.
 .scratch/
+# Private local execution evidence may contain authenticated UAT session files.
+/.agent-runs/
 .lora-prefs/
 .agents/
 spike/

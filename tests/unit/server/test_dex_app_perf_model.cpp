@@ -178,14 +178,15 @@ TEST_CASE("app_perf_group_trend: sub-floor points suppress stats, keep device_co
 
 TEST_CASE("app_perf_fleet_trend: sub-floor points are suppressed (singling-out)",
           "[dex][app_perf]") {
-    // A niche app on FEWER than kDexCohortFloor devices fleet-wide must not emit
-    // exact stats — only the honest count survives (works-council / GDPR
-    // singling-out). The fleet path floors exactly like the group path.
+    // A point on FEWER than kDexCohortFloor devices must not emit exact stats —
+    // only the honest count survives. The floor is one device (maintainer ruling
+    // 2026-10-14), so the only sub-floor point is an empty one; the fleet path
+    // floors exactly like the group path.
     AppPerfFleetRow row;
     row.app_name = "niche.exe";
     row.version = "1.0";
     row.day = 1'700'000'000;
-    row.device_count = kDexCohortFloor - 1; // below the floor
+    row.device_count = kDexCohortFloor - 1; // below the floor: an empty point
     row.cpu_sum = 50.0;
     row.cpu_max = 40.0;
     row.ws_sum = 1000;
@@ -210,6 +211,14 @@ TEST_CASE("app_perf_fleet_trend: sub-floor points are suppressed (singling-out)"
     REQUIRE(ok.size() == 1);
     CHECK_FALSE(ok[0].suppressed);
     CHECK(ok[0].cpu_mean == 5.0);
+
+    // Three devices: published with the exact mean (withheld at the old floor of 10).
+    row.device_count = 3;
+    row.cpu_sum = 30.0;
+    auto three = app_perf_fleet_trend({row});
+    REQUIRE(three.size() == 1);
+    CHECK_FALSE(three[0].suppressed);
+    CHECK(three[0].cpu_mean == 10.0);
 }
 
 TEST_CASE("app_perf_version_summaries: groups by version, latest-day headline + chronological series",

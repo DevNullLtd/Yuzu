@@ -710,20 +710,22 @@ number of heartbeats), so at the 30 s default heartbeat the forced Reapply is ab
 (eleven pushes) after the hold starts, about 275 s at a 25 s heartbeat (later if jitter
 delays a push to the next heartbeat), and other
 heartbeat intervals scale. The forced Reapply re-arms every
-rule in the push but does NOT unstick the wedged claim (an identical re-observation
+rule in the push that is not healthy and unchanged (#4415, flip gate AC-18; every rule before
+it) but does NOT unstick the wedged claim (an identical re-observation
 returns the existing claim); it bounds the dependence on the suppress classification
 and is not a recovery guarantee against a classifier that misidentifies a dead claim.
 Two side effects are accepted and recorded in the flip gate (AC-10, AC-16): re-arming
-every rule can recapture a Spark-first `FileHashEquals` baseline that was lost, never written or overwritten (#4045), and
+a rule can recapture a Spark-first `FileHashEquals` baseline that was lost, never written or overwritten (#4045), and
 while a same-type mechanism call is hung, the Disarm of a healthy same-type rule queues
 behind it on `SparkEngine`'s per-type mechanism lock, so that rule is logically
 withdrawn at once and its re-arm may expire as `CongestionExpired`; the same collateral
-already occurred on every Reapply before #5459. It occurs at most about every 330 s only
-while no same-type sibling's re-arm expires (a pure retained-wedge hold). With a healthy
-same-type sibling in the push the valve only delays its onset: the first forced Reapply
-withdraws the sibling, the sibling's expired re-arm is a counted non-wedge failure, so the
-`resolved_failed != failed_receipts.size()` check below answers Reapply on every later push
-(about one per heartbeat) for as long as the hang lasts. Pinned by `[5459fu10]`.
+already occurred on every Reapply before #5459. Since #4415 a healthy, unchanged same-type
+sibling is skipped (flip gate AC-18), so this applies only to a sibling the push changes or
+that is not skip-eligible. Before #4415 the valve only delayed the onset for a healthy
+sibling: the first forced Reapply withdrew it, its expired re-arm was a counted non-wedge
+failure, and the `resolved_failed != failed_receipts.size()` check below answered Reapply on
+every later push (about one per heartbeat) for as long as the hang lasted. `[5459fu10]`
+now pins the skip, not the old cascade.
 A wedged key stays wedged until its own worker returns or the agent restarts
 (**restart is a
 remediation only for a *transient* wedge — for a *permanently* wedged target, restart
@@ -798,10 +800,10 @@ apply failure also holds the generation (`can_advance()` needs `resolved_failed 
 retries), so corroborate with `yuzu.guardian_arm_failed`/`arm_pending`, the
 compensation age/deadline tags and the agent log before concluding wedge); (2) the server applies no back-off (none is added by #5459; FU-13 in the flip gate, tracked on #5504), so a held agent
 costs one `guaranteed_state.reconcile` audit row per push, about one per 30 s
-heartbeat at the default (the push interval is `ceil(25 s / heartbeat) x heartbeat`, so other intervals scale), plus a forced full teardown and
-re-arm about every 330 s from the safety valve (for a pure retained-wedge hold; with a
-healthy same-type sibling in the push, every push after the first forced one is a full
-teardown and re-arm, AC-16) (re-arm recaptures only
+heartbeat at the default (the push interval is `ceil(25 s / heartbeat) x heartbeat`, so other intervals scale), plus a forced Reapply
+about every 330 s from the safety valve (before #4415 a full teardown and re-arm of every rule;
+since then only of a rule that is not healthy and unchanged, AC-18, and a healthy same-type
+sibling no longer turns every later push into a Reapply, AC-16) (re-arm recaptures only
 a Spark-first-captured `FileHashEquals` baseline that was lost, never written or overwritten, #4045: the
 remaining cases are enumerated in the flip gate's AC-10; `apply_rules` persists staged
 captures within its pass budget first (the remainder is handed to the new arm from memory)
@@ -825,8 +827,9 @@ Application opens at the loaded acknowledged generation with an empty `content_i
 a failed boot re-arm, formerly never retried, is resolved by #5513: the agent reports
 generation 0 (intermittently, with an agent-side back-off between failed catch-ups) with the
 `yuzu.guardian_boot_rearm_unresolved` tag until a push applies cleanly; a legacy guard that returns false at arm is the boot-path analogue of #2797's
-`apply_rules` defect and stays uncovered); a content-identity gap (an
-identical re-observation matches `rule_id` and spec only, #5512); a wedge that is adopted or
+`apply_rules` defect and stays uncovered); a content-identity gap (before #4415 an
+identical re-observation matched `rule_id` and spec only, #5512; since then it also requires
+identical content, and changed content over a wedge queues a follower, flip gate AC-14); a wedge that is adopted or
 settles before the agent has retained it costs one avoidable Reapply on the next identical
 push: one minted in the Dispatching window is counted in `resolved_failed` but never retained
 in `failed_receipts`, and one not yet drained (before its first drain, or beyond one tick's
@@ -905,10 +908,11 @@ itself; only an agent restart could. This is corrected in
 immediately, restoring exactly the pre-PR-2 behavior for that case - a full
 re-run, NOT a free one (correction, Gate 8: three independent reviewers caught
 an earlier draft of this paragraph claiming the reapply "costs nothing" -
-`attach_core()` rebuilds eval state from scratch on every push, identical
-re-push included, so a `full_sync` retry still pays the same real
-teardown+re-arm cycle it always paid before this ledger existed; what changes
-is that the retry runs AT ALL again, not that it becomes cheap). Two further
+`attach_core()` rebuilt eval state from scratch on every push, identical
+re-push included, so a `full_sync` retry still paid the same real
+teardown+re-arm cycle it always paid before this ledger existed; what changed
+was that the retry ran AT ALL again, not that it became cheap. Since #4415 that cycle is
+skipped for a healthy, unchanged rule, flip gate AC-18, and still paid for every other rule). Two further
 precision fixes landed alongside it: (a) a
 `content_id` that is not a real 64-hex-char SHA-256 digest (the `start_local()`
 boot placeholder, or `guardian_push_content_id()`'s own throw fallback) is now
@@ -1160,8 +1164,9 @@ design is mentioned it is named as the earlier design.
   `decide_retry()` treats it as outstanding while it still reads wedge-eligible or
   compensation pending, and answers Reapply once it has been ADOPTED (its late success
   commits) or has settled, because a settled `Wedged` receipt is no longer outstanding.
-  Either way the next identical push is a Reapply: a teardown and re-arm of the rule that
-  has just armed, which was avoidable. (A claim that
+  Either way the next identical push is a Reapply, which was avoidable: before #4415 it tore
+  the rule that had just armed down and re-armed it, and since then it skips that rule
+  (healthy, committed, unchanged; flip gate AC-18). (A claim that
   pops without recovery is a genuine failure, for which the Reapply is correct.) The safe
   direction: the Reapply never acknowledges anything, and the application it opens
   re-observes the true state. Accepted by the operator; retaining such entries in
@@ -1185,13 +1190,13 @@ design is mentioned it is named as the earlier design.
   same), dormant, and no current production route emits an omitting delta (see the
   known-limits list above); follow-up FU-12 in the flip gate (#5547). Recovery needs a
   live connection (the maintenance tick runs on the per-connection heartbeat thread).
-  Content identity: an identical re-observation
-  matches `rule_id` and spec only (#5512): an edit that leaves the watch target the same
-  (a registry rule's value name lives in the assertion, not the spec) is not rebuilt, so the
-  late success arms the content the claim started with; the adopted claim is acknowledged
-  (`can_advance()` ignores content) and the server stops re-pushing, so the stale content
-  stays until the next generation. #4045: a forced Reapply re-arms the whole
-  push, but persisted baselines are re-seeded on every arm
+  Content identity (#5512, closed by the #4415 PR): an identical re-observation now requires
+  identical content as well as `rule_id` and spec, so an edit that leaves the watch target the
+  same (a registry rule's value name lives in the assertion, not the spec) queues as a follower
+  behind the wedge instead of being discarded (flip gate AC-14); before it, the late success
+  armed the content the claim started with and the stale content stayed until the next
+  generation. #4045: a forced Reapply re-arms every rule in the push that is not skipped (AC-18),
+  but persisted baselines are re-seeded on every arm
   (`guardian_engine.cpp`), `apply_rules` persists staged captures within its pass budget first
   (a leftover is handed to the new arm from memory), and a capture an
   in-flight evaluation stages after that drain is seeded from the runtime's staging at attach
@@ -1430,7 +1435,7 @@ call. It does NOT make `stop()` prompt in general - overstating that was #4322's
 defect (see below). `GuardianEngine::stop()` (`guardian_engine.cpp:613`) and
 `apply_rules()` (`:1001`) share `mtx_`, and `apply_rules()` still does real
 synchronous work under that lock: a full_sync's KV sweep and
-`spark_runtime_->detach_all()` (`:1176`, scales with the rule count being torn down -
+`spark_runtime_->detach_rules_except()` (`detach_all()` before #4415; `:1176`, scales with the rule count being torn down -
 `detach_all()` itself, `guardian_spark_runtime.cpp:1647`, reserves and iterates
 `rule_ids.size()`), the per-rule reconcile loop, and an unbounded lifecycle-journal
 persist via `GuardianRollback`'s destructor on every exit. `apply_rules()` is not the
@@ -1695,7 +1700,7 @@ consumer of `inert` needs and two further recorded limits.
    `Unsupported` for the whole episode. That branch (`RulePlacement::Unsupported`) also DETACHES a
    rule already armed through Spark and withdraws its legacy guard, and a full sync tears both
    backends down first (`stop_all_guards_locked()` and `spark_runtime_->detach_all()` in
-   `apply_rules()`), so live File rules were disarmed for the episode and clearing `inert` notified
+   `apply_rules()`; since #4415 the spark half detaches only the rules the push omits), so live File rules were disarmed for the episode and clearing `inert` notified
    no consumer - they stayed disarmed (enforced by neither backend, recorded in
    `unsupported_rules_`) until the next reconcile or an agent restart. The fix adds an additive
    `boot_inert` field to `SparkMechanismStats` (see (2) below) and moves Guardian's capability
@@ -1805,7 +1810,7 @@ is decided by an explicit APPLICATION FENCE, not by timestamp order: `detach_all
 monotonic `detach_epoch_` (bumped first, before any of its own mutation) and logs it in a new
 `Guardian spark: detach_all complete (epoch=, incarnation_floor=, ...)` line as its LAST
 statement; every T2 line then carries that epoch, so a stale in-flight commit from a PREVIOUS
-full_sync (which can land between the new `full_sync cleared` line and `detach_all()`, since
+full_sync (which can land between the new `full_sync cleared` line (now `full_sync removed N prior rule(s) absent from the push`, logged only when a row was removed) and `detach_all()` (`detach_rules_except()` since #4415, same body and same log line), since
 both run under `registry_mu_`, not the engine's own `mtx_`) is rejected by epoch identity
 rather than by an insufficient timestamp check - a real gap an Astra adversarial review found
 in this item's own first design round, before implementation. `--spark-disable` never

@@ -1,0 +1,1 @@
+- **Ad-hoc TAR SQL moved to Result sets.** The TAR page no longer carries the Ad-hoc TAR SQL form; a short note links to Result sets, where **From TAR query** takes the same parent scope, SQL, name and include-empty fields and shows the SQL in a confirm before anything is sent.

@@ -17,6 +17,7 @@
 /// server.cpp's `build_hw_roster` (endpoint_state + device_ci join); this header only
 /// orders, filters, and paginates that roster — it never fetches it.
 
+#include "device_containment_render.hpp" // kContainmentUi
 #include "device_inventory_store.hpp"    // DeviceCiRecord, CiReadError
 #include "inventory_routes.hpp"          // InventoryDeviceRow
 #include "offline_endpoint_store.hpp"    // OfflineEndpoint, PresenceReadError (stdlib-only header)
@@ -34,6 +35,8 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -91,8 +94,23 @@ struct HardwareListQuery {
 [[nodiscard]] bool hw_row_matches(const InventoryDeviceRow& row, const std::vector<std::string>& tokens,
                                   std::string_view os, std::string_view status, std::string_view tag);
 
+/// Median installed memory over the rows that have a synced, positive RAM figure, in GiB.
+/// nullopt when no row has one (the readout is hidden, never "0 GB"). `count` receives the
+/// number of devices the median is over.
+[[nodiscard]] std::optional<double> median_ram_gb(const std::vector<InventoryDeviceRow>& rows,
+                                                  std::size_t* count = nullptr);
+
+/// Device counts per manufacturer (case-folded, whitespace-trimmed), highest first; rows
+/// with no synced manufacturer are not counted. At most `top_n` entries, the remainder
+/// summed into a final "Other" entry. Empty when nothing has synced.
+[[nodiscard]] std::vector<std::pair<std::string, std::size_t>>
+count_by_manufacturer(const std::vector<InventoryDeviceRow>& rows, std::size_t top_n = 8);
+
 struct HardwareKpis {
     std::size_t total{0};
+    std::optional<double> median_ram_gb;  ///< see median_ram_gb(); nullopt = hidden
+    std::size_t ram_devices{0};           ///< devices the median is over
+    std::vector<std::pair<std::string, std::size_t>> by_manufacturer; ///< top 8 + Other
     std::size_t online{0};
     std::size_t offline{0}; // non-online, including stale
     std::size_t stale{0};
@@ -108,6 +126,14 @@ struct HardwareListPage {
     std::size_t total_matching{0};        // after q/os/status, before paging
     HardwareKpis kpis;                    // see hardware_kpis()
     HardwareListQuery query;              // the normalised, canonical echo
+    // Quarantine state for the page's rows ONLY (never the whole roster): ids whose
+    // active record the caller may read. `quarantine_degraded` = the read or a
+    // per-record authz check failed, so absence of a pill proves nothing.
+    std::unordered_set<std::string> quarantined_ids;
+    bool quarantine_degraded{false};
+    /// Render the Quarantined pill, row link, degrade banner and panel placeholder. The routes
+    /// copy it from HardwareRoutes::Deps; the default is the compile-time kContainmentUi.
+    bool containment_ui{kContainmentUi};
 };
 
 /// Filters, sorts, and paginates `roster` per `normalised` (already validated —

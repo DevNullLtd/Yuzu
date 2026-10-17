@@ -104,6 +104,8 @@ Response:
 }
 ```
 
+`count`, `max_uses` and `ttl_hours` may each be a JSON integer or a numeric string (`"count": "10"`); an empty string or an omitted key keeps the default (`count` 10, `max_uses` 1, `ttl_hours` 0 = no expiry). A float, boolean, `null`, a number outside the 32-bit range, a negative `ttl_hours` or `max_uses`, a `count` outside 1 to 10000, or a body that is not one JSON object is `400` and mints nothing. Before this check a JSON number was silently ignored, so the example above minted single-use tokens that never expired.
+
 **Agent side:**
 
 ```bash
@@ -144,7 +146,9 @@ Administrators can configure rules that automatically approve agents matching sp
 
 **Add an auto-approval rule:**
 
-The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments.
+The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments. The four writes below are dashboard writes: a request whose `Origin` (or `Referer`) names a different site is refused with `403`; a request with neither header (curl, automation) is accepted, as for the other Settings writes.
+
+Every write is recorded before it is applied: an `attempt` audit row is written first and, if it cannot be stored, the write is refused with `503` (`Sec-Audit-Failed: true`) and nothing changes. A rule that cannot be saved to disk is refused with `500` and nothing changes. Error responses are the standard JSON error body; the dashboard shows a toast.
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve \
@@ -154,7 +158,11 @@ curl -s -X POST http://localhost:8080/api/settings/auto-approve \
 
 This rule automatically approves any agent whose hostname matches the glob pattern `web-*.example.com`.
 
-Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`.
+Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. A value is at most 253 characters and a label at most 128. A rule that would match every machine (a hostname glob of only `*`, or an `ip_subnet` of `/0`) is refused.
+
+**These rules are not a strong admission control.** `hostname_glob` and `cloud_provider` match strings the registering agent states about itself (its hostname and attestation provider); any client that can reach the Register endpoint can claim a matching value, which makes such a rule no stronger than `*`. `ip_subnet` matches the connection's peer address. `trusted_ca` can never match today because Register does not yet populate the CA fingerprint. Verified proof for the first two is reserved for a later tier. Treat `any`-mode `hostname_glob`/`cloud_provider` rules as a convenience for a trusted network, not as a security boundary.
+
+If the saved policy file (`auto-approve.cfg`) is damaged (a line with an unknown type, a short line, or a `mode:` other than exactly `any` or `all`), the server activates no auto-approve rules at start (every agent waits for manual approval), logs an error, and keeps the original as `auto-approve.cfg.rejected`; re-create the rules in Settings.
 
 **Set the auto-approve match mode:**
 
@@ -170,6 +178,7 @@ Supported modes:
 |---|---|
 | `any` | First matching enabled rule auto-approves the agent (default) |
 | `all` | All enabled rules must match for auto-approval |
+
 
 Note: Auto-approval only applies when rules exist and are enabled. When no rules are configured, all agents enter the pending queue regardless of mode. To disable auto-approval entirely, remove or disable all rules.
 
@@ -461,7 +470,7 @@ curl -s -X POST http://localhost:8080/api/settings/updates/upload \
 | `file` | Yes | The agent binary to upload |
 | `platform` | Yes | Target platform (`linux`, `windows`, `darwin`) |
 | `arch` | Yes | Target architecture (`x86_64`, `aarch64`) |
-| `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`) |
+| `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`). An empty value is the default; a malformed value (`0x5`, `5abc`, `1e1`) is `400` and nothing is stored, it never becomes `100`; an out-of-range integer is clamped to 0--100 |
 | `mandatory` | No | Whether agents must apply this update (`true`/`false`, default: `false`) |
 
 ### View Available Updates
@@ -524,12 +533,12 @@ Unless noted, these endpoints accept form-encoded parameters and return HTML fra
 | `POST` | `/api/settings/enrollment-tokens` | Generate an enrollment token (form-encoded) | HTMX |
 | `POST` | `/api/settings/enrollment-tokens/batch` | Generate tokens in batch (JSON in, JSON out) | JSON |
 | `DELETE` | `/api/settings/enrollment-tokens/{token_id}` | Revoke a token | HTMX |
-| `POST` | `/api/settings/auto-approve` | Add a rule (form: `type`, `value`, `label`) | HTMX |
-| `POST` | `/api/settings/auto-approve/mode` | Set match mode (form: `mode=any\|all`) | HTMX |
+| `POST` | `/api/settings/auto-approve` | Add a rule (form: `type`, `value`, `label`); `400` and nothing saved for an unknown type, empty value, `:` or control character in value or label, malformed `ip_subnet` (IPv4 with optional `/0-32`) or `trusted_ca` that is not 64 hex characters | HTMX |
+| `POST` | `/api/settings/auto-approve/mode` | Set match mode (form: `mode=any\|all`); other values return `400` | HTMX |
 | `POST` | `/api/settings/auto-approve/{index}/toggle` | Enable/disable a rule | HTMX |
 | `DELETE` | `/api/settings/auto-approve/{index}` | Delete a rule | HTMX |
 | `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart) | HTMX |
-| `POST` | `/api/settings/updates/{platform}/{arch}/{version}/rollout` | Set rollout percentage (form: `rollout_pct`) | HTMX |
+| `POST` | `/api/settings/updates/{platform}/{arch}/{version}/rollout` | Set rollout percentage (form: `rollout_pct`; a malformed value is `400` with an error toast and nothing changes) | HTMX |
 | `DELETE` | `/api/settings/updates/{platform}/{arch}/{version}` | Remove an uploaded binary | HTMX |
 
 ---

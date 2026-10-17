@@ -75,10 +75,18 @@
  *   computed double lands on either side of the tie; band and display always
  *   agree with each other, and two such apps can display one tenth apart.
  * - `floor` is the reporting-device minimum: fewer devices withholds the score
- *   as below_floor, so that no small cohort reads as an individual device's
- *   behaviour. Callers pass kDexCohortFloor literally; the module enforces
- *   whatever floor it is handed. `reporting_devices` is the distinct devices
- *   that reported THIS application/version in the window, never fleet size.
+ *   as below_floor. Callers pass kDexCohortFloor literally; the module enforces
+ *   whatever floor it is handed. kDexCohortFloor is one device (maintainer
+ *   ruling, 2026-10-14), and no_population is checked first, so a caller
+ *   passing it never sees below_floor: the token stays in the vocabulary for a
+ *   caller handing in a larger floor. `reporting_devices` is the distinct
+ *   devices that reported THIS application/version in the window; the Apps list
+ *   read (DexApi::apps) is the one caller for which it is the fleet reporting
+ *   population (Windows devices online now), since a per-application reporting
+ *   count is not available there. That caller draws `devices_affected` and the
+ *   event sums from the same online ids, so the numerator is a subset of this
+ *   population by construction. That caller withholds the score as
+ *   "offline_affected" (not a core reason) when an affected device is not in it.
  * - Missing or contradictory population data is withheld (score and band
  *   empty, `withheld` names why), never shown as 0 or 100. A missing or
  *   unusable rate_ratio is NOT withheld: the result is scored with an
@@ -93,13 +101,12 @@
  *   deductions are present together exactly when `withheld` is empty. No
  *   withheld result carries N, A or any count, whatever the reason. A page
  *   that shows a count from its own input may show N, and only N, for
- *   below_floor (a count under the floor identifies nobody); never A, crash or
- *   hang counts, which are the individual behaviour the floor withholds, and
- *   never any count for no_population, inconsistent, invalid_weights or
- *   invalid_edges.
+ *   below_floor; never A, crash or hang counts, which are the individual
+ *   behaviour the floor withholds, and never any count for no_population,
+ *   inconsistent, invalid_weights or invalid_edges.
  * - The string vocabulary is closed and wire-stable: withheld reasons
  *   (no_population, invalid_weights, invalid_edges, inconsistent,
- *   below_floor), deduction names (breadth, crashes, hangs, regression) and
+ *   below_floor; the Apps list adds offline_affected outside this module), deduction names (breadth, crashes, hangs, regression) and
  *   band labels (excellent, good, fair, poor). Renaming one is a contract
  *   break. `name` and `withheld` are always string literals (static storage),
  *   never owned, never freed; compare them by content (std::string_view(x) ==

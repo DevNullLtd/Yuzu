@@ -310,3 +310,17 @@ and `RbacAdminAuthorityOwner` takes `principal_roles` before `auth.users` and ne
 audit lock. Like the RBAC owner, it is correct only because `AuthDB`, `SessionStore` and
 `AuditStore` share ONE pool/database (ADR-0006); a split onto separate databases fails every
 statement closed, never a silent partial write.
+
+## Update (2026-10-12) -- a fifth query owner: DexAppVersionFailuresOwner
+
+A fifth query owner: `DexAppVersionFailuresOwner` (`dex_app_version_failures_owner.{hpp,cpp}`), the
+read behind the per-version crash and hang join of the fleet app-performance report. It is a READ
+join across `guaranteed_state_store.guardian_observations` and `app_perf_daily_store.app_perf_daily`
+on one lease (`pool.with_txn_for`, `SET LOCAL statement_timeout`, one statement), so the crash and
+hang events and the devices that were sampled for the same version come from one population, one
+window and one snapshot: the rate's numerator (events on exposed devices) and denominator (exposed
+devices) cannot be taken from two stores without risking a version that was sampled on few of its
+devices reading as a regression. A degraded read returns `std::nullopt` (the typed failure the REST
+and MCP surfaces turn into a 503 / internal error), distinct from an engaged empty result. Nothing
+about the rule changes: the owner borrows the pool, issues schema-qualified SQL, and no per-store
+class gained a cross-schema method.
