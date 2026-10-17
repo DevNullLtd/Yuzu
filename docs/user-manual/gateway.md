@@ -109,7 +109,8 @@ The gateway source lives in `gateway/apps/yuzu_gw/src/`:
 | `yuzu_gw_agent` | `gen_statem`: one process per agent bidi stream |
 | `yuzu_gw_registry` | Process groups + ETS routing table, plus the node-local session index used by heartbeat admission |
 | `yuzu_gw_router` | Command fanout coordinator |
-| `yuzu_gw_upstream` | Caller of the C++ server: runs the proxy RPCs of registration and inventory one at a time, with the circuit breaker (see "Registration rate per gateway" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
+| `yuzu_gw_upstream` | Owner of the circuit breaker, the held stream-status notifications and the registration replay; makes no RPC itself (proxied calls run in the caller, notifications and replays in workers; #5695) |
+| `yuzu_gw_upstream_regulator` | Permits for proxied `Register` and inventory calls and for replays, with a bounded wait queue whose entries carry the caller's deadline (see "Upstream call permits") |
 | `yuzu_grpc_client`, `yuzu_grpc_client_channel`, `yuzu_grpc_client_config` | The upstream gRPC client, unary calls only (see [The upstream client](#the-upstream-client)): `yuzu_grpc_client` makes one call over a connection the channel hands it, `yuzu_grpc_client_channel` keeps a pool of HTTP/2 connections (gun) per endpoint open and reopens them, `yuzu_grpc_client_config` reads `{yuzu_gw, upstream_client}` |
 | `yuzu_gw_agent_service` | Agent-facing gRPC server (AgentService proxy) |
 | `yuzu_gw_conn` | Connection key (the HTTP/2 connection pid) of an agent-facing gRPC call, read from the call's context or stream |
@@ -137,15 +138,22 @@ server handles enrollment logic (token validation, pending approval queue)
 and returns a `RegisterResponse` with a session ID. The gateway relays the
 response to the agent and starts an agent process.
 
-If the agent's call is cancelled while the registration waits for the server (the stream
-is reset, the deadline passes or the connection closes), the handler is stopped and its
-reservation is released at once. A `ProxyRegister` or `ProxyInventory` that is still queued
-in the upstream client behind a slower call is skipped instead of being sent: the client
-works one upstream call at a time, so abandoned requests would otherwise be worked off in
-turn, registering agents with the server that nobody is waiting for. A call already in
-flight to the server is not cancelled, and a skipped call does not count as a failure of the
-upstream for the circuit breaker. Stream status, Guardian forwards and registration
-replays are casts, not calls, and always run.
+The `ProxyRegister` (and `ProxyInventory`) call runs in the process of the agent's
+own gRPC request, not inside the `yuzu_gw_upstream` process (#5695), so registrations
+go to the server in parallel. Each needs a permit first ("Upstream call permits"
+below): 48 at a time for `Register` by default, 8 for inventory. A request that finds
+every permit taken waits in a bounded queue with its own deadline, the agent's
+`grpc-timeout` less the stream handler's margin; it is refused `UNAVAILABLE` (the agent
+retries) when the queue is full or its deadline passes first, and a request that ran
+out of time while it waited is never sent, so the server never registers an agent
+nobody is waiting for. The call to the server gets what is left of that deadline, at
+most `upstream_rpc_timeout_ms` (5 s), and sends it as `grpc-timeout`. If the agent's
+call is cancelled (the stream is reset, the deadline passes or the connection closes),
+the request's process is stopped: its permit or its place in the queue is freed by its
+exit, and its reservation is released at once. A call already in flight to the server
+is not cancelled. An open breaker, a full queue, a passed deadline and a planned stop
+are all answered `UNAVAILABLE`. Stream status, Guardian forwards and registration
+replays are not affected.
 
 When the server's built-in CA is active, that `RegisterResponse` now also carries
 a signed **per-agent client certificate** — the same certificate an agent would
@@ -653,9 +661,9 @@ runs are marked below.)
   `infinity`, which no shipped configuration does, or a connection process blocked in
   initialisation); the gateway's deadline does not depend on them. The default sits above the client's default bounds; a `did not answer` WARN that repeats while the server is healthy points at raising `notify_probe_timeout_ms`, and a value below about 5000 kills probes that would have answered (a killed probe is requeued, so delivery stays at least once). The deadline was exercised in
   unit tests with a mocked client, not against a real unresponsive upstream on a
-  rig. It covers the notification probe only: the `ProxyRegister`, `ProxyInventory`
-  and replay RPCs run inside the upstream process and have no deadline of the
-  gateway's own. Without the probe, held notifications could sit
+  rig. It covers the notification probe only: a proxied `ProxyRegister` or
+  `ProxyInventory` is bounded by its caller's deadline and a replay by
+  `upstream_rpc_timeout_ms`. Without the probe, held notifications could sit
   indefinitely after the server recovers, because a disconnected session produces
   no heartbeat to trigger a replay. A probe that timed out may still have reached
   the server, and its notification is sent again after the requeue, so delivery of
@@ -667,27 +675,51 @@ runs are marked below.)
   the server six times. A held `CONNECTED` used as the probe was also delivered
   twice (the timed-out copy executed when the frozen server resumed, then the
   resend) and changed no server desync counter; all 300 agents ended routable.
-- **Cap.** `notify_pending_max` (default 10000, see "Upstream client tuning")
-  bounds the number of held keys, not agents. A notification for a new key that
-  arrives when the store is full is dropped and counted in
-  `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`. While a half open
-  probe is out its key still counts as held, so the store admits a new key only
-  while the held keys plus the probe's key stay below the cap (one key fewer than
-  the cap). A newer notification for the probe's own key is never refused at the
-  cap: it is held in the probe's reserved slot, at the tail of the queue. If the
-  probe fails, it supersedes the probe's older notification (counted in
-  `yuzu_gw_upstream_notify_coalesced_total`); if the probe succeeds, the older
-  notification has already been sent and the newer one is sent after it (not
-  counted as coalesced). With `notify_pending_max` set to 1 the reserved slot is
-  the whole cap, so every other new key is refused as `at_capacity` for as long
-  as a probe is out; use 2 or more. The cap bounds
-  the retained keys only: it is not a memory ceiling, and casts still queue in
-  the upstream client's mailbox while a `ProxyRegister`, `ProxyInventory` or
-  replay call runs synchronously.
-- **Replay fairness.** While a registration replay is active, one of the 10
-  in-flight slots is kept free for it, so a long backlog of held notifications
-  cannot stop the replay from advancing. Notification throughput is one slot
-  lower during a replay.
+- **Cap.** `notify_pending_max` bounds the number of held keys, not agents (#5695).
+  Its default is three per connection the agent listeners admit (the sum of their
+  `limits.max_connections`), and at least 15,000; the shipped `sys.config.prod`
+  sets 180,000 for its 60,000 connections. Why three: a server that is down lets
+  no agent get a new session, so an outage holds at most one `DISCONNECTED` per
+  agent; a server that is up but slow lets an agent that flaps register again,
+  which holds its old session's `DISCONNECTED` and its new session's `CONNECTED`,
+  two per agent for one flap of the whole fleet; the third leaves room for a
+  second flap. Each send in flight (the half open probe included) still counts
+  toward the cap, because its notification comes back if the send fails: a new
+  key is admitted only while the held keys plus the sends in flight stay below
+  the cap. A newer notification for a key that is in flight is never refused at
+  the cap: it replaces what would come back. Memory: about 0.9 KB per held key
+  (855 bytes measured with 100,000 synthetic notifications), so 180,000 is a
+  ceiling of about 160 MB, reached only with that many keys held.
+- **When the store is full** (#5695). A `DISCONNECTED` evicts the oldest held
+  `CONNECTED` and is held in its place (counted in
+  `yuzu_gw_upstream_notify_lost_total{event="connected",reason="evicted"}`). A
+  `CONNECTED`, or a `DISCONNECTED` when no `CONNECTED` is held, is refused
+  (`yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}` and
+  `yuzu_gw_upstream_notify_lost_total{reason="at_capacity"}` by event). The two
+  losses are not alike, and neither is put right by the heartbeat verdict: the
+  server already knows the session, so it never lists it as unknown. A lost
+  `CONNECTED` leaves a live agent that the server cannot dispatch to; the gateway
+  puts it right itself: the loss arms a full registration replay, run once the
+  breaker is closed and the store has drained below half, and every agent
+  re-sends its `CONNECTED` after its adopted replay (counted in
+  `yuzu_gw_registration_replay_triggered_total{trigger="notify_loss"}`). A lost
+  `DISCONNECTED` leaves the server listing a session as online until that agent
+  registers again, which nothing on the gateway can repair; that is why it is
+  the one kept.
+- **Failed sends are retried** (#5695). A send that fails is held again at the
+  head of the store and retried (`yuzu_gw_upstream_notify_requeued_total`), in any
+  breaker state. While the breaker is closed each failure counts against it, so a
+  server that keeps failing gets at most the failure threshold (5) of retries
+  before the breaker opens and the half open probe takes over. A notification the
+  server answers as a bad request, or one that cannot be encoded, is not retried
+  (`notify_lost_total{reason="rejected"}`), nor is one whose worker died without a
+  result (`reason="crashed"`).
+- **Order.** A notification whose key has a send in flight waits until that send
+  has finished, so a `CONNECTED` and the `DISCONNECTED` after it for one session
+  cannot reach the server the other way round.
+- **High-water mark.** `yuzu_gw_upstream_notify_pending_hwm` is the most keys held
+  at once over the last one to two minutes, so a spike between two scrapes is
+  seen; `yuzu_gw_upstream_notify_pending_max` is the cap in force.
 - **Peer address.** The peer address of a notification is the agent's
   `:authority` header (or `x-forwarded-for`), so the agent controls every byte of
   it. The gateway sanitises it where the `Register` call reads it and again where
@@ -775,8 +807,8 @@ connection with the issued certificate dropped 0 notifications, left 1000
 routable rows, made 2000 `ProxyRegister` calls and got 1000 certificates, with
 notifications in flight never above 10 (OBSERVED). All were registered in 4.6 to
 5.8 s against 1.95 s without a signing request: a signing-request `Register` took
-about 3.3 ms against 2.0 ms, and every `Register` runs one at a time in the
-gateway's upstream process. The 1000 first-`Register` entries stay in the
+about 3.3 ms against 2.0 ms, and every `Register` ran one at a time in the
+gateway's upstream process (before #5695; they now run in parallel under permits). The 1000 first-`Register` entries stay in the
 gateway's pending registry until the bootstrap connection's dead-connection grace
 clears them (about 19 s after connect, with gateway memory about 75 MB higher
 meanwhile; the cause is INFERRED from the registry code and the 15 s default
@@ -1226,22 +1258,66 @@ makes every notification fail to encode would silently lose all stream status. A
 empty name is still accepted, and the default is `default`. What a cluster id means
 for routing is in [ADR-2002](../adr/2002-high-availability-architecture.md) section 7.
 
-**Upstream client tuning** (registration replay and pending notifications; application env keys read by the upstream
-client at start, except `upstream_call_timeout_ms`, which is read on every call; set them in the `yuzu_gw` section of `sys.config`. No
+**Upstream client tuning** (proxied calls, registration replay and pending notifications; application env keys read by the upstream
+client at start, except `upstream_call_timeout_ms` and `upstream_rpc_timeout_ms`, which are read on every call; set them in the `yuzu_gw` section of `sys.config`. No
 `YUZU_GW_*` environment variable maps to any of them):
 
 | Key | Default | Valid range | Meaning |
 |---|---|---|---|
-| `registration_replay_spacing_ms` | 20 | 0 to 60000 | Gap between two replay `ProxyRegister` calls in the replay drip |
+| `registration_replay_start_jitter_ms` | 1000 | 0 to 60000 | A full replay (after the upstream recovered) starts after a random delay of 0 to this many ms, so gateways that saw the same server come back do not all start at once. `registration_replay_spacing_ms`, which paced the old one-at-a-time drip, is no longer read (#5695) |
+| `upstream_register_concurrency` | 48 | 1 to 1024 | Permits for `ProxyRegister` calls in flight at once (live registrations and replays together). See "Upstream call permits" |
+| `upstream_replay_concurrency` | half of the above (24) | 1 to `upstream_register_concurrency` | Most of those permits a registration replay may hold, so live registrations always have the rest |
+| `upstream_inventory_concurrency` | 8 | 1 to 1024 | Permits for `ProxyInventory` calls in flight at once |
+| `upstream_register_queue_max` | 10000 | 0 to 1000000 | Most `Register` requests that wait for a permit; one more is refused `UNAVAILABLE` at once |
+| `upstream_inventory_queue_max` | 1000 | 0 to 1000000 | The same for inventory reports |
+| `upstream_rpc_timeout_ms` | 5000 | 100 to 60000 | The longest one proxied call or replay may take; a caller with less time left gets what it has left |
 | `registration_replay_session_guard_ms` | 10000 | 0 to 3600000 | A session that was just replayed is not queued again by a heartbeat verdict until this many ms have passed. The stamp is taken when the replay is sent, so a stale verdict can arrive up to the 5 s flush deadline (the upstream client's default per-call timeout, 5000 ms in `yuzu_grpc_client`) plus the replay RPC time later (INFERRED from the code): do not set it below 5000 plus the expected replay RPC time, because a smaller guard lets such a stale verdict replay a session the server already knows; the default 10000 is safe (see "Replaying a session the server already knows is not free" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
 | `registration_replay_queue_max` | 10000 | 1 to 1000000 | Most agents the replay queue holds when a heartbeat verdict appends to it; there is one pending entry per agent, and an id past the cap is counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}` (so is an id in a verdict that the heartbeat buffer did not cast because the upstream client's mailbox held more than 100 messages, see "Heartbeat batching interval" below). The cap bounds only verdict appends: the snapshot a breaker recovery seeds is not capped (it is bounded by the number of agents the node holds, as before), and while a snapshot of this size or larger drains, every verdict id for an agent not already queued counts as `queue_full` |
-| `notify_pending_max` | 10000 | 1 to 1000000 | Most stream-status notification keys (agent id, session id and stream home id) the upstream client holds while they cannot be sent, because 10 are already in flight or the circuit breaker is not closed. The cap counts keys, not agents. A notification for a new key past the cap is dropped and counted in `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`; a newer notification for a key already held replaces it and never counts against the cap. It bounds the retained keys only, not memory or the upstream client's mailbox. The key of a `half_open` probe that is out counts toward the cap: a new key is admitted only while the held keys plus the probe's key stay below the cap, while a newer notification for the probe's own key is held in the probe's reserved slot and is not refused. A value of 1 refuses every other new key while a probe is out, so use 2 or more. Memory: each held key costs about 0.9 to 1.2 KB of the upstream client process heap (measured on the queue module with synthetic events at 10000 entries, not on a rig), so the default holds about 10 MB and 1000000 keys up to about 1.2 GB, with a transient copy during garbage collection; size to the burst, not to the maximum. Sizing: set it at least as high as the largest `Subscribe` burst the gateway can receive; the measured held peak was about the burst size (event-level maximum 989 for 1000 agents; 100 ms sample peaks up to 1906 for 2000 agents). An agent holds two keys (the old session's `DISCONNECTED` and the new session's `CONNECTED`) when its new `Register` succeeded before the breaker opened, or when the in-flight cap was full: `ProxyRegister` is refused while the breaker is open, so an agent that reconnects during the open interval holds only the old session's `DISCONNECTED` until it can register again. Size for the agents that may reconnect together, not only the new ones (INFERRED from the key). Read once at start and logged in the start line of the upstream client |
+| `notify_pending_max` | three per agent-listener connection (sum of `limits.max_connections`), at least 15000 | 1 to 1000000 | Most stream-status notification keys (agent id, session id and stream home id) the upstream client holds while they cannot be sent, counting the sends in flight. The cap counts keys, not agents. When full, a `DISCONNECTED` evicts the oldest held `CONNECTED`; anything else past the cap is refused and counted. The derivation, the drop policy and the memory per key are under "Stream Status Notification" above. `sys.config.prod` and the reference compose config ship 180000 for their 60,000 connections; change it with `max_connections`. Read once at start and logged in the start line of the upstream client |
 | `notify_probe_timeout_ms` | 15000 | 100 to 300000 | The gateway's own deadline for the half-open notification probe. A probe worker that has not reported after this many ms is killed, and the probe fails like any failed probe: its notification goes back to the head of the held queue, the breaker opens again with the doubled backoff, and the next half-open cycle sends a new probe. One WARN `Notify probe worker for <agent> did not answer within <ms>ms and was killed; the notification is held again` is logged per timeout. It bounds the notification probe only, not the call-path RPCs (`ProxyRegister`, `ProxyInventory`, replay), and it does not depend on the upstream client's connect and call bounds. Tuning: 15000 sits above the upstream client's default bounds (a 5000 ms connect and a 5000 ms call), so a healthy upstream answers in milliseconds and a silent one is cut off after one deadline. A `did not answer` WARN that repeats while the server is healthy points at RAISING the value, not lowering it. A value below about 5000 kills probes that would have answered. A killed probe is requeued, so delivery stays at least once. Read once at start (a change needs a gateway restart). Not present in any shipped `sys.config`. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
-| `upstream_call_timeout_ms` | 30000 | 100 to 300000 | How long `yuzu_gw_upstream:proxy_register/1` and `proxy_inventory/1` wait for the upstream client before the call gives up with `{error, upstream_unavailable}` and one caller-side warning that names the class `timeout`. Read on every call, not at start. It exists so a test can exercise the timeout without waiting 30 s, and it also works as a setting. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
+| `upstream_call_timeout_ms` | 30000 | 100 to 300000 | The budget of a proxied `Register` or inventory report whose agent sent no `grpc-timeout`, from the call's arrival: the wait for a permit and the call itself must fit in it. Read on every call. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
+| `shutdown_flush_budget_ms` | 20000 | 0 to 600000 | How long a planned stop may spend ending the agent sessions and sending their `DISCONNECTED` notices before the processes stop. See "Planned stop". The container's or unit's stop timeout must be larger (40 s is shipped) |
 
 An invalid value for any of these keys falls back to the default and logs a
 warning that names the key. See
 [What happens when the server restarts](#what-happens-when-the-server-restarts).
+
+**Upstream call permits** (#5695). `ProxyRegister` and `ProxyInventory` run in the
+process of the agent's own request, under a permit from
+`yuzu_gw_upstream_regulator`, not inside one upstream process. The pools:
+
+| Class | Permits | Wait queue | Notes |
+|---|---|---|---|
+| `register` | 48 (`upstream_register_concurrency`) | 10000 | live `Register`, served before replays |
+| `replay` | at most 24 of the register pool | not counted | registration replays; live registrations always keep the other 24 |
+| `inventory` | 8 (`upstream_inventory_concurrency`) | 1000 | `ProxyInventory`; large payloads, not on the connect path |
+
+Why these numbers. The ceiling: the server registers the gateway-upstream service
+on the same gRPC builder as its agent service, so each gateway connection may carry
+at most the server's `--grpc-max-concurrent-streams` streams (128 by default). A
+request past that is refused by the gateway's own HTTP/2 client (`too_many_streams`)
+and counts as a failed upstream call, which feeds the circuit breaker. Everything a
+gateway sends at once must stay under 128 times the channel's `pool_size` (1 by
+default): notifications (10), Guardian forwards (50), the heartbeat flush (1) and
+these pools: 61 + 48 + 8 = 117. Raise the permits only with `pool_size` or the
+server's stream limit. The register pool, by Little's law: a restarted gateway can
+see its whole fleet register at once; 5,000 agents inside the agent's 30 s `Register`
+deadline (25 s with margin) is 200 per second, and at 50 to 200 ms per server call
+that is 10 to 40 calls in flight, so 48 serves the storm with margin even at 200 ms
+(240 per second, 5,000 in about 21 s). Measured with a mocked server at 50 ms per
+call: a burst of 600 `Register` calls was served with 0 refused and 48 in flight at
+most, in 0.67 s; the previous serial path refused 503 of the 600 within a 5 s budget.
+
+A request that finds every permit of its pool taken waits in the queue, each with
+its own deadline (the agent's `grpc-timeout` less the stream handler's margin, or
+`upstream_call_timeout_ms` when it sent none). It is refused `UNAVAILABLE` when the
+queue is full (`yuzu_gw_upstream_permit_refused_total{reason="queue_full"}`) or when
+its deadline passes first (`reason="deadline"`, and the request is not sent:
+`yuzu_gw_upstream_calls_dropped_total`); the agent retries. A request whose process
+is stopped (a reset stream, a closed connection) frees its permit or its place by
+its exit. The wait is in `yuzu_gw_upstream_permit_wait_seconds`; held and waiting
+permits are `yuzu_gw_upstream_permits_held` and `yuzu_gw_upstream_permits_waiting`
+by class.
 
 **Upstream channel tuning** (read when the upstream channel configuration is parsed,
 at start-up; set it in the `yuzu_gw` section of `sys.config`. No `YUZU_GW_*`
@@ -1423,7 +1499,7 @@ never below the base, see the max row):
 |---|---|---|---|
 | `circuit_breaker_failure_threshold` | `YUZU_GW_CB_FAILURE_THRESHOLD` | 5 (valid range 1 to 1000) | Consecutive failed upstream calls that open the breaker. A value that is not an integer in 1 to 1000 logs `Invalid circuit_breaker_failure_threshold value <V> (expected an integer in 1..1000); using 5` and takes the default; before this check a threshold of 0 opened the breaker on the first failure. An environment override that is not an integer is ignored with the `ENV override` line, as for the timeouts (INFERRED from the code and unit tests, not run on a rig). A failed stream-status notification (CONNECTED or DISCONNECTED) sent while the breaker is closed counts by the same rule as a failed `ProxyRegister` or `ProxyInventory` (see "What counts as a failure" above), and so does a success after failures: it replays the registrations. A Guardian forward and a heartbeat batch do not count. While the breaker is not closed the notifications are held, not sent (the head held one is the half-open probe), and an answer to a notification sent before the breaker opened is ignored (INFERRED from the code and unit tests, not run on a rig) |
 | `circuit_breaker_reset_timeout_ms` | `YUZU_GW_CB_RESET_TIMEOUT_MS` | 10000 (valid range 100 to 3600000) | How long the breaker stays open the first time before it goes half open and allows one probe: a call-path RPC or, when stream-status notifications are held, the head held notification. A successful probe closes the breaker and starts the registration replay of every agent the node holds (OBSERVED on a rig). A value that is not an integer in 100 to 3600000 (0, a negative number, a float, a string, more than an hour) logs a WARN that names the key (`Invalid circuit_breaker_reset_timeout_ms value <V> (expected an integer in 100..3600000); using 10000`) and takes the default. The floor is 100 because the probe is timer driven: 0 would stay 0 and make the half open probe a hot loop forever, and a base or cap of 1 ms would still give a probe loop of about 1000 attempts a second. An environment override that is not an integer never reaches that check: `yuzu_gw_app` logs `ENV override: <VAR> has invalid value '<value>', ignoring` and the `sys.config` value (or the default) applies. An environment override that is an integer is stored and checked against the same range when the upstream client starts, so only an out-of-range integer produces the WARN above. A value above 3600000 does not clamp to one hour: it takes the default 10000, with the WARN (INFERRED from the code and unit tests, not run on a rig) |
-| `circuit_breaker_max_reset_timeout_ms` | `YUZU_GW_CB_MAX_RESET_TIMEOUT_MS` | 300000 (valid range 100 to 3600000) | Cap on the open duration, which doubles each time a trip or a failed probe reopens the breaker (10 s, 20 s, 40 s, 80 s and so on) and returns to the first value when a probe succeeds. This is the 300 s the recovery bounds in "What happens when the server restarts" cite. An invalid value takes the default 300000 with a WARN that names the key (`Invalid circuit_breaker_max_reset_timeout_ms value <V> (expected an integer in 100..3600000); using 300000`), and an environment override that is not an integer is ignored with the `ENV override` line, both as for the reset timeout; a value above 3600000 takes the default, not the limit. When the base is above the cap the effective cap is the base and one WARN is logged, with a different text for each case. An operator-set valid cap below the base logs `circuit_breaker_max_reset_timeout_ms (<Max>) is below circuit_breaker_reset_timeout_ms (<Base>); using <Base> for both`. A cap that is not set, or was rejected as invalid (the default 300000 applies), logs `circuit_breaker_reset_timeout_ms (<Base>) is above the default circuit_breaker_max_reset_timeout_ms (<Max>, not set or rejected); the maximum backoff is raised to <Base>. Set circuit_breaker_max_reset_timeout_ms to choose it.` (a base of 600000 with the default cap of 300000 used to stay open 600 s the first time and 300 s afterwards; it is now 600 s each time) |
+| `circuit_breaker_max_reset_timeout_ms` | `YUZU_GW_CB_MAX_RESET_TIMEOUT_MS` | 30000 (valid range 100 to 3600000; 300000 before #5695) | Cap on the open duration, which doubles each time a trip or a failed probe reopens the breaker (10 s, 20 s, then 30 s with the defaults) and returns to the first value when a probe succeeds. 30 s means a server that comes back is used again within about 30 s, while a server that stays down gets one probe (a held notification or a proxied call) twice a minute; the `YuzuGatewayUpstreamCircuitOpened` alert relies on reopens at least every few minutes (its 5-minute window), so an operator who raises the cap above about 4 minutes must widen that rule with it. An invalid value takes the default 30000 with a WARN that names the key (`Invalid circuit_breaker_max_reset_timeout_ms value <V> (expected an integer in 100..3600000); using 30000`), and an environment override that is not an integer is ignored with the `ENV override` line, both as for the reset timeout; a value above 3600000 takes the default, not the limit. When the base is above the cap the effective cap is the base and one WARN is logged, with a different text for each case. An operator-set valid cap below the base logs `circuit_breaker_max_reset_timeout_ms (<Max>) is below circuit_breaker_reset_timeout_ms (<Base>); using <Base> for both`. A cap that is not set, or was rejected as invalid (the default applies), logs `circuit_breaker_reset_timeout_ms (<Base>) is above the default circuit_breaker_max_reset_timeout_ms (<Max>, not set or rejected); the maximum backoff is raised to <Base>. Set circuit_breaker_max_reset_timeout_ms to choose it.` |
 
 
 **`YUZU_GW_ADVERTISE_ADDR`** (env var only, no `sys.config` key — consumed by
@@ -2418,11 +2494,14 @@ re-proxied an agent, the restarted server has no local session for it:
 for a fleet of 10,000 or more; correlate it with the gateway
 `Registration replay` INFO lines). Heartbeats are acknowledged and leases
 renewed throughout, so nothing is reaped meanwhile and you must not restart the
-gateway. The replay is paced: the per-session guard is
-`registration_replay_session_guard_ms` (default 10 s), and the drip sends one
-`ProxyRegister` at a time with a 20 ms gap by default, so the rate is set by the
-round trip: at 100 ms per call that is about 8.3 agents per second, and 10,000
-agents take about 1,200 s (the table under "Several agents and a long outage" gives the rest),
+gateway. The replay is paced by permits (#5695): the per-session guard is
+`registration_replay_session_guard_ms` (default 10 s), and up to 24 `ProxyRegister`
+replays run at once (`upstream_replay_concurrency`), so the rate is 24 divided by the
+round trip: at 100 ms per call that is about 240 agents per second, and 10,000
+agents take about 42 s (arithmetic; measured with a mocked server: 5,000 agents in
+10.7 s at 50 ms per call; before #5695 the drip sent one at a time with a 20 ms gap:
+about 8.3 agents per second and 1,200 s; the table under "Several agents and a long
+outage" gives the older figures),
 and the queue holds `registration_replay_queue_max` (10,000) entries. Each
 response lists at most 4,096 ids, so a larger fleet converges over several
 rounds. Scope targeting and command dispatch reach agents through the directory
@@ -2452,7 +2531,7 @@ do not.
 | gateway | metric | `up == 0` for the gateway job, `YuzuGatewayDown`, or a unit that stays `failed` after a `cluster_id` refusal | The refusal is a boot failure, so the supervisor decides what you see. Under systemd, `deploy/systemd/yuzu-gateway.service` sets `Restart=on-failure`, `RestartSec=5`, `StartLimitIntervalSec=60` and `StartLimitBurst=3`: the unit is started at most three times in 60 s (the initial start plus two restarts) and is then left `failed`, which is reached within roughly 15 to 20 s of the first start (derived from those values, not measured). The unit's journal tag is `yuzu-gateway`, so `journalctl -t yuzu-gateway` shows the `Refusing to start` line (it names the source and never the value). Under the reference compose files the gateway has `restart: unless-stopped`, so it loops without ever being marked failed; read `docker logs` for the same line. In both cases the metrics endpoint is down, so Prometheus sees `up == 0` and `YuzuGatewayDown` fires after its 2 minute `for` (shipped in `docs/prometheus/yuzu-alerts.yml`). Fix the named source and start the unit again (`systemctl reset-failed yuzu-gateway` first if the start limit was hit). Whether the process exits with a non-zero status on this refusal, so that systemd counts it under `Restart=on-failure`, was not run; check `systemctl status yuzu-gateway` on your first rollout (INFERRED from the unit file, not run on a rig). |
 | gateway | WARN | `ENV override: YUZU_GW_CLUSTER_ID cannot be represented as UTF-8; ignoring it (the value is not logged)` | The variable could not be converted. It is not applied, and because the variable is still set the gateway then refuses to start with the critical line above. |
 | gateway | WARN | `Registration replay aborted: circuit open (N agent(s) not yet re-proxied)` | The breaker opened while the drip was running. The queue is dropped; the agents come back on a later verdict or on the next breaker recovery. |
-| gateway | WARN | `Registration replay aborted: registry unavailable (N queued entries dropped)` | The gateway's registry process was down when the drip popped an entry, so nothing queued could be re-verified and the queue was dropped. This abort disconnects no agent. INFERRED from the code (not tested): a registry that died has lost its tables (see [Heartbeat admission](#heartbeat-admission)), so a later verdict finds no local session for these agents and counts them `not_local`; they are not listed again into the replay. They come back only through their own `NOT_FOUND` re-register path, which released v0.13.0 and v0.14.0-rc6 agents do not complete (see "Agent dependency" below). |
+| gateway | WARN | `Registration replay aborted: registry unavailable (N agent(s) not yet re-proxied)` | The gateway's registry process was down when the drip popped an entry, so nothing queued could be re-verified and the queue was dropped. This abort disconnects no agent. INFERRED from the code (not tested): a registry that died has lost its tables (see [Heartbeat admission](#heartbeat-admission)), so a later verdict finds no local session for these agents and counts them `not_local`; they are not listed again into the replay. They come back only through their own `NOT_FOUND` re-register path, which released v0.13.0 and v0.14.0-rc6 agents do not complete (see "Agent dependency" below). |
 | gateway | WARN | `Registration replay: <agent> failed: <reason>` | A replay `ProxyRegister` failed. It counts as a failure for the shared circuit breaker (see "Replay failures feed the shared circuit breaker" below). |
 | gateway | metric | `yuzu_gw_registration_replay_triggered_total{trigger="breaker"}` rising | The circuit breaker closed after an outage and the gateway replayed every agent this node holds. Expected after a long outage when the breaker opened (see "Several agents and a long outage" below). No action. |
 | gateway | metric | `yuzu_gw_heartbeat_coalesced_total` rising | Newer heartbeats of a session are replacing older buffered ones, one at a time. Expected during a server outage: heartbeats pile up between failed flushes and are merged, so the buffer stays at one entry per session. No action. The server's `yuzu_heartbeats_received_total{via="gateway"}` falls short of the number of heartbeats the agents sent for the same reason; that is not a loss of agents. |
@@ -2505,9 +2584,10 @@ the rig runs under "Observed on a rig" below are the measured evidence).
 - **Breaker open.** A verdict that arrives while the breaker is open is
   dropped and counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="circuit_open"}`.
   The replay then waits for the breaker to go half open, so recovery is bounded
-  by the breaker's remaining backoff (capped at 300 s,
-  `circuit_breaker_max_reset_timeout_ms`, see "Circuit breaker tuning" under
-  Configuration), plus up to one heartbeat interval, plus one flush, plus the drip position. A
+  by the breaker's remaining backoff (capped at 30 s by default since #5695, 300 s on
+  the builds the runs below used; `circuit_breaker_max_reset_timeout_ms`, see
+  "Circuit breaker tuning" under Configuration), plus up to one heartbeat interval,
+  plus one flush, plus the agent's turn in the replay. A
   long outage can open the breaker because other upstream calls the agent keeps
   retrying feed it. Wait: do not restart anything for this (the 58 s recovery
   in R2d and the recoveries in runs F3a (all agents online at T0 + 85.2 s) and
@@ -2553,12 +2633,11 @@ itself was accepted on the first flush after the server returned in these runs
 - Action: wait. Do not restart the gateway: a restart disconnects every agent the
   node holds.
 - How long: the wait after the server is back is the remaining breaker backoff.
-  The backoff doubles from 10 s up to `circuit_breaker_max_reset_timeout_ms`
-  (300 s by default). The steps up to 160 s were observed (F3a); a wait on the
-  300 s step was not observed and a longer outage with several agents was not
-  run, so the worst case is bounded by the configured maximum but not measured
-  beyond 160 s. The rig used a failure threshold of 5, a reset timeout of 10 s
-  and a maximum of 300 s, the defaults.
+  The backoff doubles from 10 s up to `circuit_breaker_max_reset_timeout_ms`,
+  30 s by default since #5695 (it was 300 s), so the wait is at most about 30 s plus
+  one probe. The runs above used the old 300 s cap: the steps up to 160 s were
+  observed (F3a). The rig used a failure threshold of 5 and a reset timeout of 10 s,
+  the defaults.
 
 The gateway-side counters move as follows: `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}`
 rises by one each time a verdict queued at least one agent,
@@ -3015,7 +3094,14 @@ Details of what these runs showed:
   forwarder only touched responses without unknown ids, so the injections landed
   on an otherwise healthy upstream.
 
-**Load and convergence bounds.** The drip sends one ProxyRegister at a time.
+**Load and convergence bounds.** This paragraph and the next two describe the
+replay drip as it was before #5695 and the runs made on it. Since #5695 a full
+replay walks the agents table in chunks of 500 and replays up to 24 agents at once
+under permits, so the period per agent is the call time divided by 24. Measured
+with a mocked server (no network, no notifications, one laptop): 5,000 agents
+replayed in 4.5 s at 20 ms per call and 10.7 s at 50 ms, against 217 s and 365 s
+for the drip on the same harness with its default 20 ms spacing (OBSERVED, #5695).
+The drip sent one ProxyRegister at a time.
 The period per agent is the ProxyRegister RPC time plus the spacing
 (`registration_replay_spacing_ms`, 20 ms by default) plus scheduling. The
 figures below are arithmetic on those constants, not measurements: the
@@ -3097,8 +3183,9 @@ as the upstream client, which held one HTTP/2 connection (the new client's defau
 channel. Neither exists now: the client is `yuzu_grpc_client` over gun with a channel of
 `pool_size` connections per endpoint (default 1, as before; see [The upstream client](#the-upstream-client)),
 TCP_NODELAY is set when each connection is opened, and the gateway logs no line about it.
-The calls of registration still run one at a time in `yuzu_gw_upstream`, so a larger
-pool would not raise the registration rate. The rate figures above were not
+Since #5695 the calls of registration run in parallel under permits (48, of which
+replays at most 24), so the rate is the permits divided by the call time; a larger
+pool raises the stream ceiling the permits must stay under, not the rate itself. The rate figures above were not
 re-measured with the new client. A single measurement on a live stack with TLS, reported by
 the author of the change and not repeated on the rig, put the `ProxyRegister` mean at
 about 3 ms with nodelay on and about 45 ms with it off.
@@ -3146,18 +3233,17 @@ plus the call.
 
 | Symptom | What you see | Cause | Action |
 |---|---|---|---|
-| Agents slow to come back after a server restart on a large fleet | The server log shows more than one `[gateway] ProxyRegister succeeded` line per agent (5.9 attempts per agent in the 2000-agent stock run); agents give up on a `Register` after 30 s; `yuzu_gw_upstream_rpc_duration_ms` for the `register` rpc name has a mean near 40 ms | Before the `upstream_tcp_nodelay` change, the 43 ms per-`Register` Nagle delay (OBSERVED on a rig, see above); also a slow server, because the upstream process runs one call at a time | Confirm `upstream_tcp_nodelay` is not `false` in the `yuzu_gw` section of `sys.config` (and that no endpoint has a hand-set `{nodelay, false}`); check the server's `ProxyRegister` latency. A slow server shows as `yuzu_gw_upstream_slow` 1 and a duty cycle (`yuzu_gw_upstream_backpressure_duty_cycle`) near 1; see "Slow server" below |
-| Registrations are being abandoned while the gateway is busy | `yuzu_gw_upstream_calls_dropped_total{rpc_name="register"}` rises; agents log `Register` deadline errors or retry in a loop | The serial upstream process is saturated and clients reset the stream or hit their deadline while their `Register` was still queued; the queued call is skipped (counted) instead of creating a server session for a request nobody is waiting for | Look at the cause of the saturation (a slow server `ProxyRegister`, a restart herd; see the table above). A caller that is alive but has stopped waiting is not detected, so a skip count of 0 does not prove no call ran for an abandoned request. The share of attempts skipped is the ratio query in the metrics table |
+| Agents slow to come back after a server restart on a large fleet | The server log shows more than one `[gateway] ProxyRegister succeeded` line per agent; agents give up on a `Register` after 30 s; `yuzu_gw_upstream_rpc_duration_ms` for the `register` rpc name has a high mean | Before the `upstream_tcp_nodelay` change, the 43 ms per-`Register` Nagle delay (OBSERVED on a rig, see above); otherwise a slow server: the register pool (48) drains at 48 divided by the server's answer time | Confirm `upstream_tcp_nodelay` is not `false` in the `yuzu_gw` section of `sys.config` (and that no endpoint has a hand-set `{nodelay, false}`); check the server's `ProxyRegister` latency and `yuzu_gw_upstream_permits_waiting{class="register"}`. A slow server shows as `yuzu_gw_upstream_slow` 1 and a duty cycle near 1; see "Slow server" below |
+| Registrations are being refused or abandoned while the gateway is busy | `yuzu_gw_upstream_permit_refused_total{class="register"}` rises (`queue_full` or `deadline`), with `yuzu_gw_upstream_calls_dropped_total{rpc_name="register"}` for the deadline case; agents log `UNAVAILABLE` and retry | Every register permit is held and the wait queue is full, or a request's deadline passed while it waited; nothing is sent for it, so no server session is created for a request nobody waits for | Look at the cause (a slow server `ProxyRegister`, a restart herd; see the table above). The refused agents retry; a sustained `queue_full` with a healthy server points at raising `upstream_register_concurrency` together with the channel's `pool_size` (see "Upstream call permits") |
 
 **Slow server.** A gateway reaches the server through lanes of bounded capacity, and
 "slow" is defined from how often those lanes are full, not from a latency figure.
 
 - A lane is *saturated* at an instant when work is waiting on it or would be refused. There are
-  three. `serial`: the `yuzu_gw_upstream` process is inside an RPC of its own (a proxied
-  `Register` or `Inventory`, a registration-replay step) and at least one message waits in its
-  mailbox; it runs one RPC at a time, so everything that arrives during one waits. `notify`: every
-  stream-status notification slot the gateway may fill is held (10, or 9 while a registration
-  replay is queued, which keeps one back for the replay), so the next notification waits in the held store
+  three. `permits` (`serial` before #5695): a live `Register` or inventory report waits for a
+  permit, because every permit of its pool is held (a replay waiting for one does not count; it
+  waits behind live registrations by design). `notify`: every
+  stream-status notification slot is held (10), so the next notification waits in the held store
   until a slot frees (it is dropped, `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`,
   only when the held store itself is full). `guardian`: all 50 Guardian
   forward slots are held.
@@ -3178,26 +3264,22 @@ plus the call.
 | Slow, or just a lot of work | `histogram_quantile(0.5, sum by (le) (rate(yuzu_gw_upstream_rpc_duration_ms_bucket{rpc_name="register"}[5m])))` beside the duty cycle |
 
 How it is measured: a process in the gateway samples the lanes every 100 ms. It reads the
-`yuzu_gw_upstream` process's state without calling it (a call would wait for the slow RPC being
-measured), credits each sample with the time until the next, and credits one step at most 1 s, so a
+published counts of the upstream process and of the permit regulator without calling them, credits each sample with the time until the next, and credits one step at most 1 s, so a
 stalled VM does not credit a minute. It is a sampled estimate with a resolution of 100 ms: a state
 that begins and ends between two samples is missed.
 
 What it does not tell apart, and does not do:
 
-- A server that answers slowly, and more work than one serial lane drains at a healthy server's pace
+- A server that answers slowly, and more work than the permits drain at a healthy server's pace
   (every agent of a restarted fleet registering at once), both read as a slow server: the server's
   service rate is below the rate work arrives, which is the thing measured. The latency histogram in
   the table says which it was.
-- The mailbox condition counts any waiting message, including the bookkeeping message that follows a
-  finished notification, so the `serial` lane can read slightly high while notifications flow.
 - It is one figure for the gateway, not one per upstream endpoint. With several servers behind a
   channel it does not say which server is slow; per-endpoint state is not exported yet (#5648,
   #5655).
 - It does not change what the gateway does. The breaker still counts only failed calls, so a
   server that answers every call in 3 to 5 s never opens it; this is how that case is seen. What
-  the gateway should do about it is open (#5681). The process still runs one RPC at a time
-  (#5381).
+  the gateway should do about it is open (#5681).
 - A slow server is not a readiness input. The `/readyz` `circuit_breaker` check reads the breaker
   state the `yuzu_gw_upstream` process publishes at each breaker transition, without a call into
   that process, so it answers at once while the process is inside a slow RPC: a closed breaker
@@ -3384,36 +3466,23 @@ env keys with defaults, which a reverted build ignores.
   it is fixed. (5) An exit that escapes the flush RPC no longer ends the
   buffer process (it used to be able to, losing every buffered heartbeat), and
   the buffer's crash-report status shows counts only, not heartbeat contents.
-- **Registration is still serialised through one process.** The proxy RPC of a
-  `Register` runs inside the `yuzu_gw_upstream` process, so calls queue behind
-  each other even with nodelay on, and a slow server still limits how fast a
-  gateway registers agents (a call is as slow as the server's answer). The call
-  carries no deadline of its own (only the upstream client's default per-call timeout of
-  5 s, `yuzu_grpc_client`, applies, connection wait included; read from the code, not
-  run); the caller waits `upstream_call_timeout_ms`
-  (30 s by default, the same as the agents' `Register` deadline). A queued
-  `Register` or `Inventory` call whose requesting process has **exited** (the client
-  reset the stream, its deadline passed or the connection closed, which stops the
-  request's process) is skipped when its turn comes, without an RPC, and counted in
-  `yuzu_gw_upstream_calls_dropped_total{rpc_name}`; the reservation it held is already
-  freed. A caller that is **alive but has stopped waiting** (it passed
-  `upstream_call_timeout_ms`) is not detected: its call still runs and its answer goes
-  nowhere. Calls from a process on another node count as alive. Planned follow-ups, with
-  no issue numbers yet: run the proxy RPC outside the gen_server, and give the upstream
-  call a deadline shorter than the agent's 30 s. The `upstream_pool_size` key in the
-  shipped `sys.config` files does nothing (nothing reads it); the connections per endpoint are
-  the channel's `pool_size` option (default 1, see [The upstream client](#the-upstream-client)),
-  and since the calls of registration and inventory run one at a time, a larger pool does not
-  speed them up.
+- **Registration runs in parallel, bounded by permits** (#5695; it was serialised
+  through one process). See "Upstream call permits". A request that waits for a permit
+  and runs out of time is refused and never sent; a call already in flight to the server
+  is not cancelled when the agent gives up, but the server is told the deadline
+  (`grpc-timeout`) and may stop it. The `upstream_pool_size` key in the shipped
+  `sys.config` files does nothing (nothing reads it); the connections per endpoint are the
+  channel's `pool_size` option (default 1, see [The upstream client](#the-upstream-client)),
+  and a larger pool raises the stream ceiling the permits must stay under.
 - **Queued upstream calls are not bounded per connection (accepted residual risk, part of
   the unauthenticated-port family).** The agent listener is unauthenticated by design, and
   a request is decoded in full before any handler sees it. A client that repeatedly sends
-  a large `Register` and resets the stream can leave decoded messages queued in the
-  serial upstream process's mailbox while it is busy; they are bounded by
-  Cowboy's cancel-stream rate limit (`max_cancel_stream_rate`, an `http2` option) and by memory, not by a per-connection quota, and the
-  skip above frees them only when their turn comes. The same family covers the decode
-  amplification of a message that fits `max_message_bytes`, the single serial upstream
-  and the half-open connection flood described under "Connection ceilings and the
+  a large `Register` and resets the stream can keep decoded requests waiting for a
+  permit (each in its own request process, freed when the stream is reset); they are
+  bounded by the register wait queue (10000), Cowboy's cancel-stream rate limit
+  (`max_cancel_stream_rate`, an `http2` option) and memory, not by a per-connection
+  quota. The same family covers the decode amplification of a message that fits
+  `max_message_bytes` and the half-open connection flood described under "Connection ceilings and the
   unauthenticated ports". The decode-side bound is the first follow-up; until it lands,
   limit connections and request rate per source at the L4 balancer or firewall.
 - **R2b: a route row tombstoned while the server stayed up is not repaired by this
@@ -3857,6 +3926,50 @@ env keys with defaults, which a reverted build ignores.
 
 ---
 
+### Planned stop
+
+A planned stop (`application:stop/1`, which the release runs on SIGTERM: `docker
+stop`, `systemctl stop`) tells the server about every session the gateway gives up
+(#5695). Before the processes stop (`yuzu_gw_app:prep_stop/1`), within one budget,
+`shutdown_flush_budget_ms` (20 s by default):
+
+1. Proxied `Register` and inventory calls are refused `UNAVAILABLE`, so agents
+   register through another gateway; no registration replay runs; the
+   held-notification cap is raised by twice the sessions held.
+2. The agent listeners are suspended (Ranch keeps the established connections;
+   new ones are refused) after the memory shedder is stopped, so nothing resumes
+   them. The router stops taking commands, and in-flight commands get up to 3 s
+   (or 30% of the budget) to finish.
+3. Every session is ended through its own agent process, which closes its stream
+   and sends the `DISCONNECTED` notice with the session's stream home id (the
+   server matches a `DISCONNECTED` to the placement by it; it lives only in the
+   agent process). Up to 5 s (or 40% of the budget) for them to finish.
+4. The heartbeat buffer is flushed.
+5. Every held notification is sent, whatever the breaker state, 64 at a time,
+   until none is left or the budget ends. What is left is counted in
+   `yuzu_gw_upstream_notify_lost_total{reason="shutdown"}` and named in one WARN
+   (`Planned stop: <n> stream-status notification(s) sent, <m> not sent by the
+   flush deadline`); a failed send is not retried. Later notifications are
+   counted, not sent.
+
+Measured with a mocked server: 100 sessions, 100 `DISCONNECTED` notices delivered
+before `application:stop/1` returned (0 before #5695: the drain ran after the
+processes were gone); with a server that never answers, the stop returned 1.5 s
+after a 1.5 s budget and counted all 100 as lost.
+
+**Stop timeout coupling.** The budget must fit inside the container's or unit's
+stop timeout, with room for the processes to stop after it. Docker's default is
+10 s before SIGKILL, so every shipped compose file sets `stop_grace_period: 40s` on
+the gateway service, and `deploy/systemd/yuzu-gateway.service` sets
+`TimeoutStopSec=40`. Raise them together with `shutdown_flush_budget_ms`. A SIGKILL,
+a crash or a stop that outlasts the timeout sends nothing: the server keeps those
+sessions listed as online until the agents register again. At 5,000 sessions and
+50 ms per server call the flush takes about 4 s (64 at a time); a server at 200 ms
+per call needs about 16 s, close to the default budget (arithmetic, not measured at
+that scale). A server batch call ("this
+gateway is going away; these sessions are gone") would make it one call; it is not
+implemented.
+
 ## Building and Testing
 
 ### Prerequisites
@@ -4068,9 +4181,20 @@ that are actually emitted are listed.
 | `yuzu_gw_heartbeat_session_mismatch_total` | counter | Agent `Heartbeat` calls rejected because the session is held by this node but the call arrived on a different connection than the one that opened it (label `event`, always `security`, for SIEM routing; created at 0 at start). Also rises when an HTTP/2 proxy between agents and the gateway spreads one agent's calls over several connections. A rise of one per affected agent is expected when an agent's connection is replaced while its session is still held (observed with an injected GOAWAY, a test-only trigger; not observed with an abrupt close or a gateway restart). There is no audit row (the sender of a rejected heartbeat is not a resolved principal): the counter and a rate-limited summary log line are the signal. |
 | `yuzu_gw_grpc_origin_ignored_total` | counter | gRPC calls on a listener configured as behind a proxy whose claimed client address was not used (labels `mode` = `proxy_protocol` or `forwarded_for`, `reason` = `untrusted_source`, `no_claim` or `bad_claim`). The call is served either way: for `untrusted_source` it is attributed to the TCP peer, for `no_claim` and `bad_claim` it is sent upstream with no observed address (empty `gateway_observed_peer`; the server records `origin_observed=false`). Created at 0 for every pair at start; no listener label. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy) and [Origin counters](#origin-counters). |
 | `yuzu_gw_grpc_dropped_data_bytes_total` | counter | Request bytes the gRPC layer discarded in a state that must not run a handler (label `reason`, closed set: `extra_request_data` = a second message on a unary call, `stream_ended` = data after the stream's status). |
-| `yuzu_gw_upstream_calls_dropped_total` | counter | Queued upstream proxy calls skipped because the requesting gRPC call had already ended: the client reset the stream or its deadline passed while the call waited behind the serial `yuzu_gw_upstream` process (label `rpc_name`, closed set `register` and `inventory`, both created at 0 at start; any other value would be counted as `unknown`, and none is emitted today). A skipped `Register` is never sent to the server, so it creates no server session. Only a requesting process that has exited is detected; a caller that is alive but has stopped waiting (it passed `upstream_call_timeout_ms`) is not, and its call still runs. A steady rate means clients are abandoning registrations while the upstream is saturated. The share skipped, relative to registrations successfully forwarded upstream (errors are not in the denominator, so the figure overstates the share while the server is returning errors), is `rate(yuzu_gw_upstream_calls_dropped_total{rpc_name="register"}[5m]) / (rate(yuzu_gw_upstream_calls_dropped_total{rpc_name="register"}[5m]) + rate(yuzu_gw_upstream_rpc_duration_ms_count{rpc_name="register"}[5m]))`. |
-| `yuzu_gw_upstream_backpressure_seconds_total` | counter | Seconds during which the path to the server was backed up: at least one lane saturated (the `yuzu_gw_upstream` process inside an RPC of its own with a message waiting, every usable stream-status notification slot held (10, or 9 during a registration replay), or all 50 Guardian forward slots held). `rate()` of it over a window is the backpressure duty cycle, 0 to 1. Sampled every 100 ms. See "Slow server" in the gateway manual |
-| `yuzu_gw_upstream_lane_saturated_seconds_total` | counter | The same, per lane (label `lane`: `serial`, `notify`, `guardian`; all three created at 0 at start). The lanes overlap, so never add them: the figure for the gateway as a whole is the counter above |
+| `yuzu_gw_upstream_calls_dropped_total` | counter | Proxied `Register` or inventory calls not sent because the caller's deadline passed while it waited for a permit, or left too little time (250 ms) to make the call (label `rpc_name`, closed set `register` and `inventory`, both created at 0 at start). Nothing is sent for them, so no server session is created. Before #5695 it counted queued calls of callers that had exited. |
+| `yuzu_gw_upstream_permits_held` | gauge | Upstream call permits held now, by `class` (`register`, `replay`, `inventory`; created at 0). `register` and `replay` share one pool (see "Upstream call permits") |
+| `yuzu_gw_upstream_permits_waiting` | gauge | Callers waiting for a permit now, by `class`. Non-zero for `register` or `inventory` means every permit of the pool is held |
+| `yuzu_gw_upstream_permit_limit` | gauge | Configured permits, by `class` (`replay` is the most of the register pool a replay may hold) |
+| `yuzu_gw_upstream_permit_refused_total` | counter | Permits refused, by `class` and `reason` (`queue_full`, `deadline`, `stopping`; every pair created at 0). The agent is told `UNAVAILABLE` and retries |
+| `yuzu_gw_upstream_permit_wait_seconds` | histogram | Seconds a granted permit was waited for, by `class` |
+| `yuzu_gw_registration_replay_outcomes_total` | counter | Registration replay entries by `outcome` (`adopted`, `superseded`, `rejected`, `failed`, `skipped`, `aborted`; created at 0) |
+| `yuzu_gw_registration_replay_last_duration_seconds` | gauge | Seconds the last finished registration replay took (0 until one finished). Measured with a mocked server: 2,000 agents at 10 ms per call in 0.94 s, 24 in flight |
+| `yuzu_gw_upstream_notify_lost_total` | counter | Stream-status notifications lost, by `event` (`connected`, `disconnected`) and `reason`: `at_capacity` (refused at a full store), `evicted` (a held `CONNECTED` evicted for a `DISCONNECTED`; a full replay re-sends it), `rejected` (a bad-request answer or an encode failure), `crashed` (the send's worker died without a result), `shutdown` (left by a planned stop's flush). Every pair created at 0 |
+| `yuzu_gw_upstream_notify_requeued_total` | counter | Stream-status notifications whose send failed and that were held again to be retried |
+| `yuzu_gw_upstream_notify_pending_hwm` | gauge | Most stream-status notifications held at once over the last one to two minutes |
+| `yuzu_gw_upstream_notify_pending_max` | gauge | The held-notification cap in force (`notify_pending_max`) |
+| `yuzu_gw_upstream_backpressure_seconds_total` | counter | Seconds during which the path to the server was backed up: at least one lane saturated (a live `Register` or inventory report waiting for a permit, all 10 stream-status notification slots held, or all 50 Guardian forward slots held). `rate()` of it is the backpressure duty cycle, 0 to 1. Sampled every 100 ms. See "Slow server" |
+| `yuzu_gw_upstream_lane_saturated_seconds_total` | counter | The same, per lane (label `lane`: `permits` (`serial` before #5695), `notify`, `guardian`; all three created at 0 at start). The lanes overlap, so never add them: the figure for the gateway as a whole is the counter above |
 | `yuzu_gw_upstream_backpressure_duty_cycle` | gauge | The backpressure duty cycle over the last 60 s, 0 to 1. Reads low for the first minute after a start (the missing seconds count as not saturated) |
 | `yuzu_gw_upstream_slow` | gauge | 1 when the duty cycle above is 0.5 or more (a slow server, as this gateway sees it), else 0. Not a readiness input |
 | `yuzu_gw_session_limit_rejected_total` | counter | Registrations refused because one connection already holds the configured number of agent sessions, pending plus live (`max_sessions_per_connection`, default 8). Unlabelled, created at 0 at start. A `Register` over the cap is answered `UNAVAILABLE` (14); a `Subscribe` over the cap is also answered `UNAVAILABLE` (14) and is counted the same. A stock agent holds one session per connection (INFERRED), so a rise points to an L4 balancer, forwarder or client that carries several agents on one connection; see "Per-connection session cap" under Configuration. |
