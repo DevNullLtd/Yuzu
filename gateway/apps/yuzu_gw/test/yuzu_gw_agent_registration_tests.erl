@@ -12,10 +12,11 @@
 %%% answers only once the registration is decided, with the same results as
 %%% before, but it waits in the CALLER, not in the supervisor.
 %%%
-%%% Refusals must never take the agent tree down. The supervisor has restart
-%%% intensity 0, and its children are `temporary', which the supervisor never
-%%% restarts, so an exit never counts against the intensity; a refused agent
-%%% also exits `normal', so a storm of refusals writes no crash reports.
+%%% Refusals must never take the agent tree down. A refused agent exits
+%%% `normal': its children are `transient' (OWNER-RESTART, #5695), which the
+%%% supervisor restarts only after an abnormal exit, so a refusal never counts
+%%% against the restart intensity, and a storm of refusals writes no crash
+%%% reports.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_agent_registration_tests).
