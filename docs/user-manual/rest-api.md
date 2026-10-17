@@ -4800,8 +4800,8 @@ whether to rotate.
 { "error": { "code": 503, "message": "runtime config store unavailable" }, "meta": { "api_version": "v1" } }
 ```
 
-**Response** (shape corrected - the handler returns `config`, `overrides` and
-`allowed_keys`, not a `data`/`meta` envelope):
+**Response** (shape corrected - the handler returns `config`, `overrides`, `allowed_keys` and
+`read_only_keys`, not a `data`/`meta` envelope):
 
 ```json
 {
@@ -4810,12 +4810,14 @@ whether to rotate.
     "log_level":          { "value": "debug", "updated_by": "admin", "updated_at": 1754150400 },
     "oidc_client_secret": { "is_set": true,   "updated_by": "admin", "updated_at": 1754150400 }
   },
-  "allowed_keys": ["heartbeat_timeout", "log_level", "oidc_client_secret"]
+  "allowed_keys": ["heartbeat_timeout", "log_level", "oidc_client_secret"],
+  "read_only_keys": ["dex_score_policy"]
 }
 ```
 
 `allowed_keys` above is abridged for readability; the real response lists every key in the
-[allowed-keys table](#put-apiconfigkey). `config` reports effective values and `overrides` only the
+[allowed-keys table](#put-apiconfigkey). `read_only_keys` lists the allowed keys this route does not
+write (see the note under that table). `config` reports effective values and `overrides` only the
 keys with a stored override, so a key can appear in `config` without appearing in `overrides`.
 
 ---
@@ -4855,6 +4857,12 @@ Update a single runtime configuration value. The key must be one of the allowed 
 | `dex_blast_window_seconds` | integer | **persisted only - see note** | Blast-radius window |
 | `dex_blast_cooldown_seconds` | integer | **persisted only - see note** | Blast-radius cooldown |
 | `dex_cohort_export_key` | string | **persisted only - see note** | Cohort export tag key; `""` disables export |
+| `dex_score_policy` | string (JSON document) | **within 5 seconds, on every instance** | The customer score policy (tier edges and names, deduction weights, per-application overrides). **Read-only here:** a `PUT` to this route is refused, see below |
+
+`GET /api/config` also returns `read_only_keys`: the allowed keys that this route lists but does not
+write. It currently holds `dex_score_policy`. `PUT /api/config/dex_score_policy` is refused with a `400` (A4 envelope, no audit row) naming
+`PUT /api/v1/dex/score-policy`: the policy is one document that is validated whole by its own route,
+and a generic single-value write could leave it half-edited.
 
 ##### When a change takes effect
 
@@ -4885,6 +4893,9 @@ most keys:
   which runs at server startup and from the DEX -> Alerts tab save handlers - never from this
   endpoint. A `PUT` through this API is inert on the running server until one of those two happens.
   To change DEX alerting and have it apply at once, use the DEX -> Alerts tab.
+- **within 5 seconds, on every instance** - `dex_score_policy`. Every server instance reads the
+  stored document through a short-lived cache, so a change is in use on each instance within 5
+  seconds with no restart. It is read-only through this API (see above).
 - **never** - `auto_approve_enabled` is accepted by the allow-list and written to the store, but no
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
@@ -9423,9 +9434,10 @@ App-centric stability list — every application with a Windows crash/hang signa
 
 - **Permission:** `GuaranteedState:Read`.
 - **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
-- **Response:** `data` object `{window, population, population_basis, apps_total, apps_truncated, apps[]}`. `apps[]` holds the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order, not database collation); `apps_total` counts every application with a Windows crash or hang signal in the window and `apps_truncated` is `true` when the cut dropped any. Each `{subject, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (up to 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when that cut dropped any. A full response is about 1.2 MB at 100 applications with 20 versions each; MCP clients should request it only when the per-version rows are needed. `crashes`, `hangs` and `distinct_devices` are window-wide. `share_affected`, `rate_per_1000` and `score` are over one population, the Windows devices online now: `distinct_devices_online` is how many of the affected devices are online now (`null` when no fleet source is wired, because membership is then unknown), `share_affected` is that count over the population (95 percent Wilson interval), `rate_per_1000` is those devices' events per 1,000 online devices (exact interval), and the score's inputs are the same online devices' figures. A device that crashed and then went offline is therefore in the counts and in `distinct_devices`, not in the share or rate, and the **score is withheld as `offline_affected`** when it would otherwise be published and `distinct_devices` exceeds `distinct_devices_online`, because a score built from the online devices alone would read healthy for an application that takes its devices offline. Read `distinct_devices_online` against `distinct_devices` before trusting a low share: figures over "online now" vary with the time of day (laptops overnight, weekends) for the same window. Expect this often: on a fleet with laptops or off-hours devices most applications with several affected devices will show a withheld score at any given moment, so use the share and rate, read against `distinct_devices_online` / `distinct_devices`, until an offline-aware score is decided (#5894). The online devices' events are not published separately; the rate is derived from them. `share_affected` carries `reliable: false` under 20 online affected devices and `rate_per_1000` under 20 online events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
+- **Response:** `data` object `{window, population, population_basis, apps_total, apps_truncated, policy, apps[]}`. `apps[]` holds the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order, not database collation); `apps_total` counts every application with a Windows crash or hang signal in the window and `apps_truncated` is `true` when the cut dropped any. Each `{subject, profile, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (up to 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when that cut dropped any. A full response is about 1.2 MB at 100 applications with 20 versions each; MCP clients should request it only when the per-version rows are needed. `crashes`, `hangs` and `distinct_devices` are window-wide. `share_affected`, `rate_per_1000` and `score` are over one population, the Windows devices online now: `distinct_devices_online` is how many of the affected devices are online now (`null` when no fleet source is wired, because membership is then unknown), `share_affected` is that count over the population (95 percent Wilson interval), `rate_per_1000` is those devices' events per 1,000 online devices (exact interval), and the score's inputs are the same online devices' figures. A device that crashed and then went offline is therefore in the counts and in `distinct_devices`, not in the share or rate, and the **score is withheld as `offline_affected`** when it would otherwise be published and `distinct_devices` exceeds `distinct_devices_online`, because a score built from the online devices alone would read healthy for an application that takes its devices offline. Read `distinct_devices_online` against `distinct_devices` before trusting a low share: figures over "online now" vary with the time of day (laptops overnight, weekends) for the same window. Expect this often: on a fleet with laptops or off-hours devices most applications with several affected devices will show a withheld score at any given moment, so use the share and rate, read against `distinct_devices_online` / `distinct_devices`, until an offline-aware score is decided (#5894). The online devices' events are not published separately; the rate is derived from them. `share_affected` carries `reliable: false` under 20 online affected devices and `rate_per_1000` under 20 online events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
+- **Score policy:** `policy` names the score policy every figure in the response was scored under: `{source, revision, fault, tiers}`. `source` is `default` (nothing stored, or a stored policy was refused) or `custom`; `revision` identifies the stored policy document (`default` when none is stored); `tiers` holds `excellent`, `good`, `fair` and `poor`, each `{edge, name}`, where `edge` is the lowest score in that tier and `name` its display name (a label for people: key on `score.band`, whose tokens never change). Poor's edge is the fixed `0`, not a stored value. Each application's `profile` is `override` when a per-application override shaped its tiers or weights and `default` otherwise; its versions inherit it and carry no `profile` of their own, and `tiers` shows the global policy. A change to the stored policy reaches every server instance within 5 seconds. An invalid stored policy is never half-applied: the shipped defaults score and `fault` says why (`source` is `default`). If the stored policy cannot be read, the last good one is used for up to 60 seconds, after which the read fails as below. The policy is read-only on this surface; its own route (`PUT /api/v1/dex/score-policy`) is coming and is not yet available, so every response currently reports `source: "default"`. The cohort floor and the statistics are not part of the policy.
 - **Population and scope:** counts are Windows-scoped and `population` is the number of Windows devices online now (`population_basis: "windows_online"`; `null` = no fleet source wired (unknown); `0` = no Windows device online now). With an unknown or zero population there is no share and no rate, and the score is withheld as `no_population`. The share is a proportion over that one population: its numerator is drawn from the same online devices the population counts, so the affected set can never exceed it. No device floor applies: figures are published at any device count.
-- **Failure:** a failed store read, an invalid score policy or a read over its concurrency budget returns `503` with `retry_after_ms: 2000`, never an empty list. The read holds a database connection for several seconds on a large window, so at most four run at once per server; a fifth answers `503` immediately (counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`) and the caller retries.
+- **Failure:** a failed store read, a stored score policy that cannot be read within its 60-second staleness bound (the message ends `(score_policy_unavailable)`) or a read over its concurrency budget returns `503` with `retry_after_ms: 2000`, never an empty list. The read holds a database connection for several seconds on a large window, so at most four run at once per server; a fifth answers `503` immediately (counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`) and the caller retries.
 - No per-agent identity (a distinct-device **count** per app, never an `agent_id`) — not audited.
 
 #### `GET /api/v1/dex/catalogue`

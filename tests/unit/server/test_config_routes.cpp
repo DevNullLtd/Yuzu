@@ -41,6 +41,7 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -166,6 +167,28 @@ TEST_CASE("config_routes: PUT /api/config/:key gates on Infrastructure:Write",
     h.wire();
     auto res = h.sink.Put("/api/config/log_level", R"({"value":"debug"})");
     REQUIRE(res);
+    REQUIRE(h.perm_calls.size() == 1);
+    CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Infrastructure", "Write"});
+}
+
+// The score policy is one document with its own writer; the generic write refuses it. The
+// refusal does not depend on the store, so a null store reaches it (a 503 here would mean
+// the refusal sits behind the store gate).
+TEST_CASE("config_routes: PUT /api/config/dex_score_policy is refused with a typed 400 naming "
+          "the policy route, no audit row",
+          "[server][routes][config_routes]") {
+    MockHarness h;
+    h.wire();
+    auto res = h.sink.Put("/api/config/dex_score_policy", R"({"value":"{}"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    const auto b = body(res->body);
+    CHECK(b["error"]["code"] == 400);
+    CHECK(b["error"]["message"].get<std::string>().find("PUT /api/v1/dex/score-policy") !=
+          std::string::npos);
+    CHECK(b["error"].contains("remediation"));
+    CHECK(h.audits.empty());
+    // The permission gate still runs first.
     REQUIRE(h.perm_calls.size() == 1);
     CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Infrastructure", "Write"});
 }
@@ -303,6 +326,13 @@ TEST_CASE("config_routes: GET /api/config returns effective config + overrides +
     CHECK(b["config"]["response_retention_days"] == 42);
     CHECK(b["overrides"].is_object());
     CHECK(b["allowed_keys"].is_array());
+    // The score policy is listed as an allowed key and as read-only here.
+    const auto has = [](const json& arr, const std::string& k) {
+        return std::find(arr.begin(), arr.end(), json(k)) != arr.end();
+    };
+    CHECK(has(b["allowed_keys"], "dex_score_policy"));
+    REQUIRE(b["read_only_keys"].is_array());
+    CHECK(has(b["read_only_keys"], "dex_score_policy"));
     CHECK(h.audits.empty()); // pure read, never audited
 }
 

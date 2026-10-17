@@ -18,6 +18,7 @@
 #include "dex_read_builders.hpp"        // build_dex_*_model parity oracles (store-reaching)
 #include "dex_read_model.hpp"          // the pure model structs
 #include "dex_routes.hpp"              // dex_iso_since / dex_window_to_days
+#include "dex_score_policy_json.hpp"   // dex_policy_in_force_from_stored
 #include "guaranteed_state_store.hpp"  // seed + direct-read parity oracles
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"              // PgConn/PgResult -- the DROP-TABLE degrade tests below
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <expected>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -462,15 +464,18 @@ TEST_CASE("DexApi: apps caps versions at 20 and flags it", "[pg][dex][apps_model
 }
 
 // The injected score policy reaches the Apps read: a valid override moves one
-// application's (and its version's) band; an invalid one degrades the whole read
-// with the store open, so the policy branch (not the null-store one) decides.
-TEST_CASE("DexApi: apps uses the injected score policy, and an invalid one degrades",
+// application's (and its version's) band and the model names the policy and the
+// override; a stored document that is invalid scores under the shipped defaults
+// and says so; an unreadable policy degrades the whole read with the store open,
+// so the policy branch (not the null-store one) decides.
+TEST_CASE("DexApi: apps uses the injected score policy, and an unreadable one degrades",
           "[pg][dex][apps_model]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     seed_apps_fixture(store);
+    using yuzu::server::DexPolicyInForce;
     using yuzu::server::StabilityBand;
 
     // Default edges: app.exe scores 86.12 (Good, edge 90), its 2.0.0.0 scores 89.6.
@@ -478,38 +483,49 @@ TEST_CASE("DexApi: apps uses the injected score policy, and an invalid one degra
     REQUIRE(base.apps.size() == 2);
     REQUIRE(base.apps[0].figures.score.band);
     CHECK(*base.apps[0].figures.score.band == StabilityBand::Good);
+    CHECK(base.policy.source == "default"); // an empty policy function is the shipped defaults
+    CHECK(base.policy.fault.empty());
 
-    auto lowered = [] {
-        yuzu::server::DexScorePolicy p;
-        yuzu::server::DexScoreOverride o;
-        o.image = "app.exe";
-        o.excellent = 80.0;
-        p.overrides.push_back(o);
-        return p;
+    const std::string lowered_doc = R"({"overrides":[{"image":"app.exe","tiers":{"edges":{"excellent":80}}}]})";
+    auto lowered = [&]() -> std::expected<DexPolicyInForce, std::string> {
+        return yuzu::server::dex_policy_in_force_from_stored(lowered_doc);
     };
-    REQUIRE_FALSE(yuzu::server::dex_score_policy_fault(lowered()));
     const auto m = make_local_dex_api(&store, fleet20, lowered)->apps("7d");
     REQUIRE_FALSE(m.degraded);
     REQUIRE(m.apps.size() == 2);
+    CHECK(m.policy.source == "custom");
+    CHECK(m.policy.revision == yuzu::server::dex_score_policy_revision(lowered_doc));
     REQUIRE(m.apps[0].figures.score.band);
     CHECK(*m.apps[0].figures.score.band == StabilityBand::Excellent);
+    CHECK(m.apps[0].profile == yuzu::server::DexPolicyProfile::Override);
     REQUIRE(m.apps[0].versions.size() == 2);
     REQUIRE(m.apps[0].versions[0].figures.score.band);
     CHECK(*m.apps[0].versions[0].figures.score.band == StabilityBand::Excellent);
     // The override is per image: aardvark.exe keeps the default edges.
     REQUIRE(m.apps[1].figures.score.band);
     CHECK(*m.apps[1].figures.score.band == *base.apps[1].figures.score.band);
+    CHECK(m.apps[1].profile == yuzu::server::DexPolicyProfile::Default);
 
-    auto duplicated = [] {
-        yuzu::server::DexScorePolicy p;
-        yuzu::server::DexScoreOverride o;
-        o.image = "dup.exe";
-        p.overrides = {o, o};
-        return p;
+    // A stored document with a duplicate override scores under the shipped defaults,
+    // with the fault named, never half-applied.
+    auto duplicated = []() -> std::expected<DexPolicyInForce, std::string> {
+        return yuzu::server::dex_policy_in_force_from_stored(
+            std::string(R"({"overrides":[{"image":"dup.exe"},{"image":"dup.exe"}]})"));
     };
-    REQUIRE(yuzu::server::dex_score_policy_fault(duplicated()));
-    const auto bad = make_local_dex_api(&store, fleet20, duplicated)->apps("7d");
+    const auto refused = make_local_dex_api(&store, fleet20, duplicated)->apps("7d");
+    REQUIRE_FALSE(refused.degraded);
+    CHECK(refused.policy.source == "default");
+    CHECK(refused.policy.fault == "override_key_duplicate at overrides[1].image");
+    REQUIRE(refused.apps.size() == 2);
+    CHECK(*refused.apps[0].figures.score.band == *base.apps[0].figures.score.band);
+
+    // A policy that cannot be read is a degrade with its own reason, no apps.
+    auto unreadable = []() -> std::expected<DexPolicyInForce, std::string> {
+        return std::unexpected(std::string("store down"));
+    };
+    const auto bad = make_local_dex_api(&store, fleet20, unreadable)->apps("7d");
     CHECK(bad.degraded);
+    CHECK(bad.degraded_reason == "score_policy_unavailable");
     CHECK(bad.apps.empty());
 }
 
@@ -609,7 +625,7 @@ TEST_CASE("DexApi: apps top-N membership is devices affected, not raw events",
     CHECK(totals == 2);
     CHECK(widespread);
     const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20,
-                                                          yuzu::server::dex_default_score_policy());
+                                                          yuzu::server::DexPolicyInForce{});
     CHECK(m.apps_total == 4);
     CHECK(m.apps_truncated);
 }
@@ -723,7 +739,7 @@ TEST_CASE("DexApi: apps store cuts rank by devices, then events, then byte-order
     SECTION("apps_total names the cut exactly at app_limit and app_limit + 1") {
         for (const char* app : {"x.exe", "y.exe", "z.exe"})
             obs("d1", app, "process.crashed", "1.0");
-        const auto policy = yuzu::server::dex_default_score_policy();
+        const yuzu::server::DexPolicyInForce policy;
         for (int limit : {3, 2}) {
             const auto rows = store.dex_app_stability_checked(since, "windows", limit, 20, 5, {});
             REQUIRE(rows);

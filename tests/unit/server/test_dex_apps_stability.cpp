@@ -58,9 +58,15 @@ DexAppStabilityRow version_row(const std::string& subject, const std::string& ve
     return r;
 }
 
-const DexScorePolicy& def() {
-    return dex_default_score_policy();
+const DexPolicyInForce& def() {
+    static const DexPolicyInForce d;
+    return d;
 }
+
+constexpr const char* kDefaultPolicyBlock =
+    R"("policy":{"fault":null,"revision":"default","source":"default","tiers":{)"
+    R"("excellent":{"edge":90.0,"name":"excellent"},"fair":{"edge":60.0,"name":"fair"},)"
+    R"("good":{"edge":75.0,"name":"good"},"poor":{"edge":0.0,"name":"poor"}}},)";
 
 } // namespace
 
@@ -201,27 +207,70 @@ TEST_CASE("apps model: a one-device application is published with no floor", "[d
 }
 
 TEST_CASE("apps model: a per-image override changes one application's band only", "[dex][apps_model]") {
-    DexScorePolicy p;
+    DexPolicyInForce in_force;
     DexScoreOverride o;
     o.image = "strict.exe";
     o.excellent = 95.0;
-    p.overrides.push_back(o);
-    REQUIRE_FALSE(dex_score_policy_fault(p));
+    in_force.policy.overrides.push_back(o);
+    REQUIRE_FALSE(dex_score_policy_fault(in_force.policy));
     const auto m = dex_apps_model_from_rows(
         "7d",
         {total_row("Strict.EXE", 12, 3, 7, 10, 3), total_row("plain.exe", 12, 3, 7, 10, 3, 1),
          version_row("Strict.EXE", "1.0", 12, 3, 7)},
-        50, p);
+        50, in_force);
     for (const auto& a : m.apps) {
         REQUIRE(a.figures.score.band);
         if (a.subject == "Strict.EXE") {
+            CHECK(a.profile == DexPolicyProfile::Override);
             CHECK(*a.figures.score.band == StabilityBand::Good); // 90.7 < 95
             REQUIRE(a.versions.size() == 1);
             CHECK(*a.versions[0].figures.score.band == StabilityBand::Good);
         } else {
+            CHECK(a.profile == DexPolicyProfile::Default);
             CHECK(*a.figures.score.band == StabilityBand::Excellent);
         }
     }
+    // The profile marker is on the application row; its versions inherit it and
+    // carry no marker of their own.
+    const auto j = nlohmann::json::parse(dex_apps_json(m));
+    for (const auto& a : j["apps"]) {
+        CHECK(a["profile"] == (a["subject"] == "Strict.EXE" ? "override" : "default"));
+        for (const auto& v : a["versions"])
+            CHECK_FALSE(v.contains("profile"));
+    }
+}
+
+TEST_CASE("apps json: a custom policy's source, revision and fault appear verbatim",
+          "[dex][apps_model]") {
+    DexPolicyInForce f;
+    f.policy.tiers.edges.excellent = 95.0;
+    f.policy.tiers.names[0] = "Great";
+    f.source = "custom";
+    f.revision = "00112233aabbccdd";
+    auto j = nlohmann::json::parse(dex_apps_json(dex_apps_model_from_rows("7d", {}, 50, f)));
+    CHECK(j["policy"]["source"] == "custom");
+    CHECK(j["policy"]["revision"] == "00112233aabbccdd");
+    CHECK(j["policy"]["fault"].is_null());
+    CHECK(j["policy"]["tiers"]["excellent"]["edge"].get<double>() == Approx(95.0));
+    CHECK(j["policy"]["tiers"]["excellent"]["name"] == "Great");
+    CHECK(j["policy"]["tiers"]["poor"]["edge"].get<double>() == Approx(0.0));
+
+    DexPolicyInForce refused; // a refused stored document: defaults in force, fault named
+    refused.revision = "ffffffffffffffff";
+    refused.fault = "weight_invalid at weights";
+    j = nlohmann::json::parse(dex_apps_json(dex_apps_model_from_rows("7d", {}, 50, refused)));
+    CHECK(j["policy"]["source"] == "default");
+    CHECK(j["policy"]["fault"] == "weight_invalid at weights");
+}
+
+TEST_CASE("apps builder: a hand-built invalid in-force policy still degrades", "[dex][apps_model]") {
+    DexPolicyInForce f;
+    f.policy.tiers.edges.good = 95.0; // not below excellent
+    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z",
+                                        std::vector<std::string>(50, "id"), f);
+    CHECK(m.degraded);
+    CHECK(m.degraded_reason == "score_policy_invalid");
+    CHECK(m.apps.empty());
 }
 
 // The invalid-policy arm needs an open store to discriminate, so it lives in
@@ -236,15 +285,17 @@ TEST_CASE("apps builder: a null store degrades, never scores", "[dex][apps_model
 TEST_CASE("apps json: exact golden for the unknown-population model", "[dex][apps_model]") {
     const auto m = dex_apps_model_from_rows(
         "7d", {total_row("a.exe", 2, 1, 2, 2, 1), version_row("a.exe", "1.0", 2, 1, 2)}, std::nullopt, def());
-    const std::string fig =
+    const std::string head =
         R"("crashes":2,"distinct_devices":2,"distinct_devices_online":null,"hangs":1,)"
-        R"("last_seen":"2026-10-14T00:00:00Z",)"
+        R"("last_seen":"2026-10-14T00:00:00Z",)";
+    const std::string tail =
         R"("rate_per_1000":null,"score":{"band":null,"deductions":[],"score":null,"withheld":"no_population"},)"
         R"("share_affected":null)";
     const std::string expect =
-        R"({"apps":[{)" + fig + R"(,"subject":"a.exe","version_count":1,"versions":[{)" + fig +
-        R"(,"version":"1.0"}],"versions_truncated":false}],"apps_total":0,"apps_truncated":false,"population":null,)"
-        R"("population_basis":"windows_online","window":"7d"})";
+        R"({"apps":[{)" + head + R"("profile":"default",)" + tail +
+        R"(,"subject":"a.exe","version_count":1,"versions":[{)" + head + tail +
+        R"(,"version":"1.0"}],"versions_truncated":false}],"apps_total":0,"apps_truncated":false,)" +
+        kDefaultPolicyBlock + R"("population":null,"population_basis":"windows_online","window":"7d"})";
     CHECK(dex_apps_json(m) == expect);
 }
 
@@ -268,8 +319,10 @@ TEST_CASE("apps json: pre-existing keys survive and the key set is the documente
     for (auto it = a.begin(); it != a.end(); ++it)
         keys.insert(it.key());
     CHECK(keys == std::set<std::string>{"subject", "crashes", "hangs", "distinct_devices",
-                                        "distinct_devices_online", "last_seen", "share_affected", "rate_per_1000", "score", "versions",
+                                        "distinct_devices_online", "last_seen", "profile", "share_affected", "rate_per_1000", "score", "versions",
                                         "version_count", "versions_truncated"});
+    CHECK(a["profile"] == "default");
+    CHECK(j.contains("policy"));
     CHECK(a["score"]["score"] == Approx(90.7));
     CHECK(a["score"]["band"] == "excellent");
     CHECK(a["score"]["deductions"].size() == 4);
@@ -296,8 +349,8 @@ TEST_CASE("apps json: an empty model", "[dex][apps_model]") {
     DexAppsModel m;
     m.window = "7d";
     CHECK(dex_apps_json(m) ==
-          R"({"apps":[],"apps_total":0,"apps_truncated":false,"population":null,)"
-          R"("population_basis":"windows_online","window":"7d"})");
+          std::string(R"({"apps":[],"apps_total":0,"apps_truncated":false,)") + kDefaultPolicyBlock +
+              R"("population":null,"population_basis":"windows_online","window":"7d"})");
 }
 
 TEST_CASE("apps json: a populated row carries the score object, rate and both cap flags",

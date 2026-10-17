@@ -1,5 +1,6 @@
 #include "config_routes.hpp"
 
+#include "dex_score_policy_json.hpp" // kDexScorePolicyKey
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
@@ -72,17 +73,38 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         for (const auto& k : RuntimeConfigStore::allowed_keys())
             allowed.push_back(k);
 
-        res.set_content(
-            nlohmann::json(
-                {{"config", config_obj}, {"overrides", overrides}, {"allowed_keys", allowed}})
-                .dump(),
-            "application/json");
+        // Allowed keys that this route lists but does not write: the generic PUT
+        // refuses them (they have their own route).
+        const nlohmann::json read_only = nlohmann::json::array({std::string(kDexScorePolicyKey)});
+
+        res.set_content(nlohmann::json({{"config", config_obj},
+                                        {"overrides", overrides},
+                                        {"allowed_keys", allowed},
+                                        {"read_only_keys", read_only}})
+                            .dump(),
+                        "application/json");
     });
 
     sink.Put(R"(/api/config/([a-z_]+))", [deps](const httplib::Request& req,
                                                 httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Infrastructure", "Write"))
             return;
+
+        // The score policy is one document with its own writer, which validates it
+        // whole; a generic single-value write could leave it half-edited. Refused
+        // before the store gate (the answer does not depend on the store) and with
+        // no audit row, like the unknown-key refusal below.
+        if (req.matches[1].str() == kDexScorePolicyKey) {
+            res.status = 400;
+            res.set_content(
+                detail::a4_error(res, "dex_score_policy is written only through "
+                                      "PUT /api/v1/dex/score-policy",
+                                 detail::A4ErrorOpts{
+                                     .remediation = "send the whole policy document to "
+                                                    "PUT /api/v1/dex/score-policy with If-Match"}),
+                "application/json");
+            return;
+        }
         if (!deps.runtime_config_store || !deps.runtime_config_store->is_open()) {
             res.status = 503;
             res.set_content(

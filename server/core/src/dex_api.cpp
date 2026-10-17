@@ -5,6 +5,8 @@
 #include "dex_window.hpp"     // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (PURE)
 #include "guaranteed_state_store.hpp" // the builder-less signal reads
 
+#include <spdlog/spdlog.h>
+
 #include <string>
 #include <vector>
 
@@ -67,8 +69,20 @@ public:
                 if (os == "windows")
                     online->push_back(std::move(id));
         }
-        return build_dex_apps_model(store_, window, since_of(window), online,
-                                    policy_fn_ ? policy_fn_() : dex_default_score_policy());
+        DexPolicyInForce in_force; // empty policy_fn_: the shipped defaults
+        if (policy_fn_) {
+            auto p = policy_fn_();
+            if (!p) {
+                spdlog::warn("DexApi::apps: score policy unavailable: {}", p.error());
+                DexAppsModel m;
+                m.window = window;
+                m.degraded = true;
+                m.degraded_reason = "score_policy_unavailable";
+                return m;
+            }
+            in_force = std::move(*p);
+        }
+        return build_dex_apps_model(store_, window, since_of(window), online, in_force);
     }
 
     [[nodiscard]] DexCatalogueModel catalogue(const std::string& os_filter,

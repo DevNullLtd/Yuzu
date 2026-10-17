@@ -8422,6 +8422,12 @@ TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregat
         if (a["subject"] == "chrome.exe")
             saw_chrome = true;
     CHECK(saw_chrome);
+    // The policy in force and the per-application profile ride the shared serializer.
+    CHECK(payload["policy"]["source"] == "default");
+    CHECK(payload["policy"]["revision"] == "default");
+    CHECK(payload["policy"]["fault"].is_null());
+    CHECK(payload["policy"]["tiers"].contains("poor"));
+    CHECK(payload["apps"][0]["profile"] == "default");
     // Fleet aggregate — only the generic tool-call audit, never a domain verb.
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|success");
     for (const auto& a : ts.audit_log)
@@ -8608,16 +8614,22 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         REQUIRE(t.contains("outputSchema"));
         const auto& out = t["outputSchema"];
         CHECK(out["required"] ==
-              nlohmann::json::array({"window", "apps", "population", "population_basis", "apps_total",
-                                     "apps_truncated"}));
+              nlohmann::json::array({"window", "apps", "policy", "population", "population_basis",
+                                     "apps_total", "apps_truncated"}));
+        const auto& policy = out["properties"]["policy"];
+        CHECK(policy["required"] == nlohmann::json::array({"source", "revision", "fault", "tiers"}));
+        CHECK(policy["properties"]["source"]["enum"] == nlohmann::json::array({"default", "custom"}));
+        CHECK(policy["properties"]["fault"]["type"] == nlohmann::json::array({"string", "null"}));
         CHECK(out["properties"]["population"]["type"] == nlohmann::json::array({"integer", "null"}));
         CHECK(out["properties"]["apps_total"]["type"] == "integer");
         CHECK(out["properties"]["apps_truncated"]["type"] == "boolean");
         const auto& row = out["properties"]["apps"]["items"]["properties"];
         for (const char* k : {"share_affected", "rate_per_1000", "score", "versions", "version_count",
-                              "versions_truncated"})
+                              "versions_truncated", "profile"})
             CHECK(row.contains(k));
+        CHECK(row["profile"]["enum"] == nlohmann::json::array({"default", "override"}));
         CHECK(row["versions"]["items"]["properties"].contains("version"));
+        CHECK_FALSE(row["versions"]["items"]["properties"].contains("profile"));
         // The nested objects are always emitted in full: pin their required keys.
         const auto interval_req = nlohmann::json::array({"estimate", "lower", "upper", "reliable"});
         const auto deduction_req = nlohmann::json::array({"name", "points", "assessed"});

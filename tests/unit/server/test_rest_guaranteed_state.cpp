@@ -2735,10 +2735,22 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
     CHECK(j["data"]["apps_truncated"] == false);
     CHECK_FALSE(j["data"].contains("stat_failures"));
     const auto& first = j["data"]["apps"][0];
-    for (const char* k : {"share_affected", "rate_per_1000", "score", "version_count", "versions_truncated"})
+    for (const char* k : {"share_affected", "rate_per_1000", "score", "version_count", "versions_truncated",
+                          "profile"})
         CHECK(first.contains(k));
+    CHECK(first["profile"] == "default");
     CHECK(first["versions"].is_array());
     CHECK(res->body.find("below_floor") == std::string::npos);
+
+    // The policy every figure was scored under is named on the payload.
+    const auto& policy = j["data"]["policy"];
+    CHECK(policy["source"] == "default");
+    CHECK(policy["revision"] == "default");
+    CHECK(policy["fault"].is_null());
+    for (const char* t : {"excellent", "good", "fair", "poor"}) {
+        CHECK(policy["tiers"][t]["edge"].is_number());
+        CHECK(policy["tiers"][t]["name"].is_string());
+    }
 }
 
 TEST_CASE("REST dex/apps: an intact empty store is a 200 with an empty list, not a 503",

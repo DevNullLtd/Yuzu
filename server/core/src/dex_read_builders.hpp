@@ -72,8 +72,8 @@ DexAppModel build_dex_app_model(GuaranteedStateStore* store, const std::string& 
                                 const std::string& window, const std::string& since,
                                 const std::set<std::string>* visible);
 
-/// Degrade contract: `policy` failing `dex_score_policy_fault` (checked FIRST,
-/// warn-logged), a null `store`, or a failed read all return `degraded = true`
+/// Degrade contract: `policy.policy` failing `dex_score_policy_fault` (checked
+/// FIRST, warn-logged; `degraded_reason` = "score_policy_invalid"), a null `store`, or a failed read all return `degraded = true`
 /// with no apps, never a score under an invalid policy and never an empty list.
 /// `online_windows` is the ids of the Windows devices online now (nullopt = no
 /// fleet source, population unknown); its size is the population, and the same
@@ -82,7 +82,7 @@ DexAppModel build_dex_app_model(GuaranteedStateStore* store, const std::string& 
 DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string& window,
                                   const std::string& since,
                                   const std::optional<std::vector<std::string>>& online_windows,
-                                  const DexScorePolicy& policy);
+                                  const DexPolicyInForce& policy);
 
 std::optional<DexCatalogueGroupModel> build_dex_catalogue_group_model(
     GuaranteedStateStore* store, const std::string& group_name, const std::string& os_filter,

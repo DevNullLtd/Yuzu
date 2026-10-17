@@ -52,6 +52,11 @@ static const std::vector<std::string> kAllowedKeys = {
     "dex_blast_cooldown_seconds",    //
     // F2a PR3 cohort metrics export (Settings → DEX alerts; next gauge sweep)
     "dex_cohort_export_key",         // tag key; "" = export disabled (validated on apply)
+    // Customer score policy (tiers, names, weights, per-app overrides).
+    "dex_score_policy",              // JSON document; route-owned - written only through the
+                                     // policy route's writer, which validates it whole; the
+                                     // generic PUT refuses it. Spelled as
+                                     // kDexScorePolicyKey in dex_score_policy_json.hpp.
 };
 
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {

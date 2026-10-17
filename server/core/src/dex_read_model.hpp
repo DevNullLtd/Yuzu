@@ -141,6 +141,9 @@ struct DexAppVersionStability {
 
 struct DexAppStability {
     std::string subject;
+    /// Whether a per-application override shaped this row's policy. Versions
+    /// inherit it.
+    DexPolicyProfile profile{DexPolicyProfile::Default};
     DexStabilityFigures figures;
     std::vector<DexAppVersionStability> versions;
     int64_t version_count{0};
@@ -150,6 +153,19 @@ struct DexAppStability {
 inline constexpr int kDexAppsLimit = 100;
 inline constexpr int kDexAppsVersionCap = 20;
 inline constexpr const char* kDexAppsPopulationBasis = "windows_online";
+
+/// The score policy an Apps read scored under, and where it came from.
+/// `source` is "default" (nothing stored, or the stored document was refused and
+/// the shipped defaults are in force) or "custom". `revision` identifies the
+/// stored document ("default" when none). `fault` is empty unless a stored
+/// document was refused, in which case it says why and `policy` is the shipped
+/// defaults: a policy is never half-applied.
+struct DexPolicyInForce {
+    DexScorePolicy policy;
+    std::string source{"default"};
+    std::string revision{"default"};
+    std::string fault;
+};
 
 /// The whole-fleet apps-by-reliability list - no per-agent identity (a
 /// distinct-device COUNT per app, never an agent_id). `degraded` means the
@@ -165,7 +181,9 @@ struct DexAppsModel {
     /// Every application with a Windows crash/hang signal in the window.
     int64_t apps_total{0};
     bool apps_truncated{false}; ///< apps_total > apps.size(): the top-N cut dropped some
+    DexPolicyInForce policy;    ///< the policy every figure in this model was scored under
     bool degraded{false};
+    std::string degraded_reason;
 };
 
 /// PURE assembly of the Apps model from grouped store rows. OWNS the published
@@ -178,7 +196,7 @@ struct DexAppsModel {
 DexAppsModel dex_apps_model_from_rows(const std::string& window,
                                       const std::vector<DexAppStabilityRow>& rows,
                                       std::optional<int64_t> population,
-                                      const DexScorePolicy& policy);
+                                      const DexPolicyInForce& policy);
 
 std::string dex_apps_json(const DexAppsModel& model);
 
