@@ -11,10 +11,11 @@ cadences.
 
 - **Machine-wide installed software** (blob contract v2): name, version,
   publisher, install date, plus the package-manager fields below. The daily
-  sync calls four inventory actions in-process and merges their rows:
+  sync calls five inventory actions in-process and merges their rows:
   `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
-  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew), and
+  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
+  `store_packages` (Linux snaps and flatpaks), and
   `windows_optional_features` `list`. An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
@@ -25,9 +26,9 @@ cadences.
   `unavailable` answer, a malformed status row, no feature rows from
   `windows_optional_features`, or no applications at all from `installed_apps`)
   skips that day's report and keeps the last good state — nothing is deleted. A
-  `constrained` Homebrew `managers` answer that still names a present prefix is
-  accepted: the constraint concerns tap/Cellar/Caskroom facts the presence row
-  never carried. A skipped cycle is retried sooner on a phase-aligned backoff:
+  `constrained` `managers` answer that still names at least one present manager
+  is accepted: the constraint concerns manager facts the presence row never
+  carried. A skipped cycle is retried sooner on a phase-aligned backoff:
   waits that double from 1 h after each consecutive skip (1 h, 2 h, 4 h, 8 h, …),
   each retry capped so it never lands after the next daily slot — up to four
   extra attempts — then one attempt per daily slot until a collection succeeds.
@@ -38,7 +39,8 @@ cadences.
   returns them yet, so read the reason from the agent's own log. Every row's
   `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
-  `pkg_inventory.managers`, `windows_optional_features.list`); `package_id` is
+  `pkg_inventory.managers`, `pkg_inventory.store_packages`,
+  `windows_optional_features.list`); `package_id` is
   empty for these producers. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
   the same order and appends two trailing columns, `install_location` and
@@ -76,19 +78,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature |
-  |---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -101,8 +103,23 @@ cadences.
   that records Homebrew itself is present — one row however many prefixes
   exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
   Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew is
-  mapped today; other package managers `pkg_inventory` may report are not
-  collected here.
+  mapped from `managers` today: the Linux manager rows (dpkg, apt, rpm, dnf,
+  pacman, apk, snap, flatpak) are read but not collected as software, and a
+  constrained `managers` answer keeps the sync cycle as long as it names at
+  least one present manager.
+
+  Linux snaps and flatpaks are collected through `pkg_inventory`
+  `store_packages` (`source` `pkg_inventory.store_packages`), active
+  revisions only. A snap is `ecosystem` `snap`, `kind` `app` when its
+  `snap.yaml` type is `app` (the default) and `pkg` for any other type (base,
+  core, kernel, gadget, snapd), with `version` from `snap.yaml` and `release` the
+  snap revision; an active snap whose `snap.yaml` cannot be read is collected
+  with an empty version and kind `pkg`. A flatpak is `ecosystem` `flatpak`, `kind` `app` for an application
+  and `pkg` for a runtime, with `release` the 64-digit commit and `arch` set;
+  `version` is empty because a flatpak branch (`stable`, `51`) is a ref, not a
+  version. An inactive revision is not installed software and is not
+  collected, and an incomplete listing (for example an unreadable flatpak
+  directory) skips the cycle rather than publishing a partial roster.
 
   **Windows optional features** are collected with `ecosystem`
   `optional_feature` and `kind` `feat`, every feature the host knows, enabled or
@@ -746,9 +763,14 @@ enrolled agent populates within minutes (jittered first sync), not instantly.
 actions failed, and a failure skips the WHOLE report for that day — the
 applications too — and keeps the last good inventory (nothing is deleted).
 Typical causes: Windows DISM busy or `api_unavailable` (the
-`windows_optional_features` action answers `feature|unavailable|…`), or a
+`windows_optional_features` action answers `feature|unavailable|…`), a
 constrained Homebrew `packages` read on macOS (a constrained `managers` answer
-with a present prefix no longer skips). The warning names the action and the
+that names a present manager no longer skips), or on Linux an unreadable,
+symlinked or over-cap snap or flatpak store directory, or a MAC (SELinux or
+AppArmor) denial, which makes `store_packages` constrained; the skip reason
+reads `pkg_inventory.store_packages:linux:<source>:<detail>`, and the remedy is
+read access for the agent identity to `/var/lib/snapd/snaps` and
+`/var/lib/flatpak/{app,runtime}`. The warning names the action and the
 reason. The same reason is published on the agent's heartbeat as
 `yuzu.sync.installed_software.last_skip` (characters outside
 `A-Z a-z 0-9 _ . : = , -` become `_`, and the value is cut at 64 bytes, so a long

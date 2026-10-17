@@ -1,0 +1,15 @@
+name: core24
+version: '20260824'
+summary: Runtime environment based on Ubuntu 24.04
+description: |
+  The base snap based on the Ubuntu 24.04 release.
+type: base
+architectures:
+- amd64
+assumes:
+- snapd2.55.5
+confinement: strict
+grade: stable
+environment:
+  LD_LIBRARY_PATH: ${SNAP_LIBRARY_PATH}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}:$SNAP/lib:$SNAP/usr/lib:$SNAP/lib/x86_64-linux-gnu:$SNAP/usr/lib/x86_64-linux-gnu
+  PATH: $SNAP/usr/sbin:$SNAP/usr/bin:$SNAP/sbin:$SNAP/bin:$PATH
