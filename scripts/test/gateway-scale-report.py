@@ -42,9 +42,10 @@ def scenario(r):
                         get(r, "register", "first_attempt_failure_reasons"),
                         get(r, "register", "unregistered_at_budget"), get(r, "time_to_all_registered_ms")))
         lines.append("  first-attempt latency: %s" % pcts(get(r, "register", "first_attempt_latency_ms")))
-        lines.append("  server: peak Register in flight %s; Register calls %s, of which wasted (the agent never got the session) %s, stale (arrived after the agent gave up) %s"
+        lines.append("  server: peak Register in flight %s; Register calls %s, of which wasted (the agent never got the session) %s, stale (arrived after the agent gave up) %s; cut before answering %s"
                      % (get(r, "upstream", "register_peak_inflight"), get(r, "upstream", "fresh_register_rpcs"),
-                        get(r, "upstream", "wasted_register_rpcs"), get(r, "upstream", "stale_register_rpcs")))
+                        get(r, "upstream", "wasted_register_rpcs"), get(r, "upstream", "stale_register_rpcs"),
+                        get(r, "upstream", "register_rpcs_cut")))
     elif s == "server_crash":
         lines.append("  replay: %s of %s, full replay %s ms after restart, peak in flight %s"
                      % (get(r, "replay", "replayed"), get(r, "replay", "expected"),
