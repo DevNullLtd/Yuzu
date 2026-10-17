@@ -72,6 +72,19 @@ TEST_CASE("dashboard page: rows appear in the delta's order", "[dashboard][ui]")
     CHECK(count_of(html, "<!--yuzu:shell-->") == 1);
 }
 
+TEST_CASE("dashboard page: the user-visible name is Console; not Dashboard", "[dashboard][ui]") {
+    const std::string html = page();
+    // Title, heading, footer and the command-palette entry for `/`.
+    CHECK(count_of(html, "<title>Yuzu — Console</title>") == 1);
+    CHECK(count_of(html, "<h1>Console</h1>") == 1);
+    CHECK(count_of(html, "<span>Yuzu Server &mdash; Console</span>") == 1);
+    CHECK(count_of(html, "{ name: 'Console', desc: 'Main console view', url: '/'") == 1);
+    // The old user-visible forms are gone.
+    CHECK(count_of(html, "<h1>Dashboard</h1>") == 0);
+    CHECK(count_of(html, "Yuzu — Dashboard") == 0);
+    CHECK(count_of(html, "name: 'Dashboard'") == 0);
+}
+
 TEST_CASE("dashboard page: the moved panels load from /fragments/dashboard/*", "[dashboard][ui]") {
     const std::string html = page();
     for (const char* frag : {"summary", "health", "activity", "policies"}) {

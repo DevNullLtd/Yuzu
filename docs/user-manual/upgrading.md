@@ -2,6 +2,87 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the macOS agent package installs transactionally and can refuse
+
+This applies to every macOS `.pkg`, including the release package.
+
+**What changed.**
+
+- The installer stages the new agent beside the running one and validates it.
+  The running agent is stopped only after that succeeds. If a running agent was
+  replaced and the new one does not stay running, the previous version is
+  restored and restarted.
+- The installer now **refuses** in these cases, before anything is stopped or
+  changed, and says which one applies:
+  - `/usr/local`, `/usr/local/lib` or `/usr/local/lib/yuzu`, or `/usr/local/bin`
+    for the loose-binary package, is not root-owned or is group- or
+    world-writable. That is typical of Macs whose Homebrew lives in
+    `/usr/local`: Intel Macs, and Apple silicon Macs running an Intel or
+    migrated Homebrew.
+  - An agent binary, rollback file or plugin (at any depth) in those directories
+    is a symlink, or another account could have written it, including through
+    an access control list. The installer lists each entry.
+  - `/etc/yuzu-agent` or `/etc/yuzu-agent/certs` is not root-owned, or is group-
+    or world-writable.
+  - `/Library/Application Support/Yuzu` or `/Library/Logs/Yuzu`, or anything
+    in them, is not root-owned, is group- or world-writable, or has an access
+    control list that lets another account write to it; or an entry in them is
+    a symlink, a special file or a hard-linked file. The agent runs as root and
+    opens files there by name. A Mac where `scripts/install-agent-user.sh` gave
+    them to `_yuzu` needs them returned to root first. The refusal lists each
+    entry; inspect and fix them one at a time, and never `chown -R`, which would
+    make a planted symlink look root-owned (see the packaging README).
+  - `/var/db/yuzu-agent`, or a recovery snapshot in it, has an access control
+    list. The installer never sets one, so it refuses rather than remove it.
+  - A new plugin has the same name as one no Yuzu package installed, or as a
+    Yuzu plugin whose bytes were changed after installation.
+  - The existing service requires signed plugins (`--plugin-require-signature`)
+    and the package contains an unsigned plugin. Every release `.pkg` does.
+- A first install of the stock package is **installed but not started**,
+  because the agent will not run without a server trust anchor. An agent that
+  was stopped is left stopped, including one disabled with
+  `launchctl disable system/com.yuzu.agent`; a disabled agent that was still
+  running is restarted and stays disabled for the next boot. Previously the installer loaded
+  the service every time.
+- Upgrades keep the existing service definition's arguments, every `YUZU_*`
+  environment variable and the standard proxy variables. Previously an upgrade
+  replaced `/Library/LaunchDaemons/com.yuzu.agent.plist`, losing anything added
+  to it. Any other environment variable is dropped and named in
+  `/var/log/install.log`. If the existing definition cannot be parsed, the
+  package default is installed with a warning and the agent is not started;
+  earlier settings must be re-applied.
+- An unrecognized development app under the data directory is moved to
+  `/var/db/yuzu-agent/quarantine/` and reported; it no longer blocks the install
+  or `uninstall.sh`.
+
+**What to check.**
+
+- If a refusal names a `/usr/local` directory, make it root-owned and remove
+  the group and world write bits. Then inspect the files it lists: changing
+  the directory's mode does not change who wrote what is already in it. Do not
+  `chown -R` them: that makes another account's files look root-installed.
+- If the data directory is refused, never delete it: it holds the agent's
+  identity and enrolment. Run `chmod go-w` on it, or restore its owner.
+- For signed-plugin enforcement, remove `--plugin-require-signature` before
+  upgrading to an unsigned package, or build a signed one.
+- Fleet deployment: pre-stage the server address and trust anchor so the first
+  install starts the agent. See
+  [Deploying with MDM](../../deploy/packaging/macos/README.md#deploying-with-mdm).
+- Rolling a fleet back to an older package and forward again is supported. A
+  package from before this installer replaces the service definition with its
+  default, so re-apply the server and trust settings after such a rollback.
+- After a failed install there is nothing to clean up: the next package run
+  repairs or discards any recovery state it finds under `/var/db/yuzu-agent`.
+
+The opt-in signed-app development lane (Endpoint Security) additionally moves
+the executable into `/Library/Application Support/YuzuAgent/YuzuAgent.app` and
+always runs with `--no-auto-update`, which preserves the bundle signature.
+Update that lane by installing a new package (for example through MDM), not
+over the air. The development `.pkg` is intentionally unsigned; it is not a
+customer-distribution lane. Before switching lanes, read the
+[packaging and recovery runbook](../../deploy/packaging/macos/README.md) and the
+[macOS development foundation](../macos-development-foundation.md).
+
 ## Version Compatibility
 
 | Server Version | Min Agent Version | Min Gateway Version | Notes |
@@ -22,11 +103,54 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway heartbeat admission is now bound to the connection that opened the session (gateway restart required; breaking for L7-fronted gateways).** The gateway admits an agent `Heartbeat` only on the HTTP/2 connection that opened the session's `Subscribe` stream; any other heartbeat is answered `NOT_FOUND` and not forwarded. Deploy with a gateway restart, and check for an HTTP/2-terminating hop in front of `:50051` first. A rejected agent recovers by re-registering. That logic exists from v0.13.0, but the released v0.13.0 and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, in no release yet) and recover only with `--no-auto-update`; v0.12.0 never recovers by itself (observed; older versions were not tested). Upgrade the agents first, then the gateway, with a build that includes the #2182 fix once released; until then restart an agent that stays rejected. Agents that do not connect through the gateway are not affected by this requirement (see Older agents). No wire or server change. See the section "Breaking: gateways fronted by an HTTP/2-terminating proxy or mesh sidecar" below and [Heartbeat admission](gateway.md#heartbeat-admission). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`--gateway-upstream` now refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs).** The gateway-upstream service admits only a gateway whose certificate key (SPKI SHA-256) is pinned, which carries `serverAuth` and is inside its validity window; the server exits at boot, before binding a port, when `--gateway-upstream` is set and that cannot be arranged. Generated default certificates are pinned automatically; your own certificates need `--gateway-peer-pin` / `--gateway-peer-pin-file` first; a plaintext (`--no-tls`) rig needs `--insecure-gateway-peer`; the Linux package unit passes `--gateway-upstream` unconditionally. Agents and gateways are unaffected on the wire. See the section "Breaking: `--gateway-upstream` now refuses to start without gateway peer authorization" below. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The gateway now holds stream-status notifications instead of dropping them (#4632; gateway restart required).** Deploy it with a gateway restart, which disconnects every agent the node holds, so read "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) first (released v0.13.0 and v0.14.0-rc6 agents do not recover by themselves after a gateway restart). **Read the [Gateway upgrade note for #4632](#gateway-upgrade-note-stream-status-notifications-and-startup-checks-4632) before you restart: a gateway whose configured `cluster_id` cannot be represented as UTF-8 now refuses to start.** There is no hot code load for this change: the upstream client's `code_change` is the identity function while its state gained fields, so deploy it by restart, not by a hot upgrade (INFERRED from the code, not run). No wire change and no change to the minimum agent or server version: `NotifyStreamStatus` is unchanged, so any pairing interoperates. What changes: a `CONNECTED` or `DISCONNECTED` notification that arrives while 10 are in flight or the circuit breaker is open is held in a bounded, memory-only store and sent first in first out, where the old gateway dropped it; when the breaker goes half open the new gateway sends one held notification as the probe, where the old one let up to 10 notifications through; and an agent-supplied peer address is sanitised and capped before it is held (a value that is not valid UTF-8 becomes `invalid`, and one over 255 bytes is cut at a character boundary). New settings `notify_pending_max` (default 10000, valid range 1 to 1000000, not present in any shipped `sys.config`; a value outside the range or not an integer falls back to the default with a WARN that names the key; see "Upstream client tuning" in [gateway.md](gateway.md)); size it at least as large as the largest `Subscribe` burst you expect; and `notify_probe_timeout_ms` (default 15000, valid range 100 to 300000, not present in any shipped `sys.config`, same fallback rule), the gateway's own deadline for the half-open notification probe: a probe worker that has not reported by then is killed and the probe fails like any failed probe. The other behaviour changes of the same restart are listed in the upgrade note below the table. Metrics: new gauges `yuzu_gw_upstream_notify_pending` and `yuzu_gw_upstream_notify_inflight` and counter `yuzu_gw_upstream_notify_coalesced_total`. The `reason` label of `yuzu_gw_upstream_notify_dropped_total` is now the closed set `at_capacity` and `unknown`: the value `circuit_open` is retired, so during a rolling upgrade old nodes still export `circuit_open` and new nodes export `at_capacity`, and a rule or dashboard that sums the family sees both. A rule or panel of your own that selects `reason="circuit_open"` stops matching once every node is upgraded: use `yuzu_gw_upstream_notify_pending` for held notifications and `reason="at_capacity"` for lost ones. The rollback is the previous gateway release. A rollback is itself a gateway restart: it disconnects every agent the node holds and carries the same agent-reconnect cost as the upgrade (see "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts), and the released-agent caveat above), so weigh it against the problem you are fixing. It also brings back the earlier behaviours: notifications dropped at 10 in flight or with the breaker open, a request that the gateway's own validation or encoder rejected (or a server status that means the request itself was wrong) counted as an upstream failure that can open the breaker, and no `cluster_id` boot refusal. The pending store is memory only, so nothing persists and nothing needs to be cleaned up; the notifications held at that moment are lost, as they were dropped before. Runbook rows and the measured evidence: [Stream Status Notification](gateway.md#stream-status-notification) and the [evidence record](../security-reviews/gateway-notify-pending-store-2026-10-05.md). |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **The plain-HTTP port answers the four health probes when HTTPS is on (#5906).** `GET`/`HEAD` on `/livez`, `/readyz`, `/health` and `/api/health` on the redirect port now return `200` (or `503` while the HTTPS listener is not serving, the server is draining, or Postgres is down) instead of `301`, in cleartext; every other request still redirects. Server restart only; see the section below. |
 | 0.14.x | 0.12.0 | 0.12.0 | **Fleet visualization intra-cube edges (PR 8).** `/viz/fleet` now draws faint white lines (opacity `0.3`) inside each machine cube connecting process dots that are reciprocal ends of a loopback TCP socket (127.0.0.1 / ::1). Two operator-visible changes: (a) **wire shape** — `/api/v1/viz/fleet/topology` `schema_minor` bumps `1 → 2` and a new optional `dst_pid` field appears on `scope: local` connection edges. Renderers that ignore unknown keys per the contract see no break; strict-validating consumers pinned to `schema_minor == 1` should relax their validator to `minimum: 1`. (b) **dropped unmatched halves** — unpaired Local-scope edges (kernel snapshot race during teardown, agent's 4096-connection cap cutting a partner) are now dropped server-side before serialisation. Integrations counting `connections` array length per machine as a proxy for active IPC pairs should re-baseline after upgrade; the count trends marginally lower. Lines appear only when the host has active loopback flows (e.g. Prometheus scraping node_exporter, a client talking to local Redis / Postgres); a fresh agent with no inter-process loopback shows process dots but no lines — expected, not a regression. **Windows agent (#5196):** set update-signing options in the `YuzuAgent` service's `Environment` registry value, not its binary path. Every installer run rewrites the binary path and silently drops them, and uninstalling deletes the `Environment` value, so a deployment that uninstalls first must set it again (*Windows: the service's `Environment` value* in `server-admin.md`). Agent installers from 0.14.0-rc1 to rc5 also stop with exit code 7 wherever PowerShell runs in Constrained Language Mode; use this release's. **Before upgrading Windows agents:** this installer stops with exit code 7, naming the reason in its `/LOG=` file, if `C:\ProgramData\Yuzu\agent-certs` exists but is not secured (for example a folder created or pre-staged by hand, or one a Group Policy adds permissions to), if a file in it is not owned by Administrators or SYSTEM, or if it or anything in it is a junction, symbolic link, hard link or subdirectory (a backup subfolder, say). The agent service is left running when it stops. Provision the bundle after installing, by copying it in as an administrator. The trust-anchor procedure block in `server-admin.md` stops on the same conditions, naming the reason (and on a healthy or rc1–rc5 endpoint completes, repairing rc files, as long as each file in it is owned by Administrators or SYSTEM; `icacls "<file>" /setowner *S-1-5-32-544 /L` fixes one you placed yourself): run it on a few endpoints first, and pilot the upgrade before a fleet-wide push. **Linux native packages need a recent distribution:** the server needs Ubuntu 26.04 or Fedora 42 class, the agent Ubuntu 24.04 class or newer; Ubuntu 22.04, Debian 12 and RHEL/Rocky 9 are not supported by the native packages. Check before upgrading older hosts, or use the container images (*Supported Platforms* in the user manual README, #5143). |
 | 0.13.x | 0.12.0 | 0.12.0 | **Fleet visualization process layer.** `/viz/fleet` now renders interior process dots inside each machine cube, coloured by category (system/browser/database/web/runtime/other) — no operator action required, but operators upgrading from a 0.12.x build will see the dashboard suddenly populated with thousands of small spheres on next page load. Process data was already collected via `tar.fleet_snapshot` since 0.12.x; PR 7 only renders it. To suppress process visibility for specific agents (privacy-sensitive hosts, regulated workloads), set `process_enabled=false` on those agents via `tar.configure` — this also suppresses their dots on the visualization. Hover a dot to see pid/name/user/category; agent-controlled string fields are HTML-escaped and length-clamped before render. Per-cube dot count is soft-capped at 1000 for graceful degradation on heavily-threaded hosts; the cube tooltip still shows the true reported count. |
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
+
+## Behaviour change: web UI wording and layout (Console, Home after sign-in, hidden quarantine controls)
+
+- **"Dashboard" is now "Console".** The navigation item, the Home tile, the page title,
+  the "back to" links and the related Settings labels use the new name. Routes
+  (`/`, `/fragments/dashboard/...`), API paths, MCP tool names and permission names are
+  unchanged, so bookmarks and scripts keep working. Prose elsewhere in this manual still
+  says "dashboard" for the web UI as a whole.
+- **Home lists the screens only after sign-in.** Signed out, `/home` shows the sign-in
+  form and nothing else; the fifteen screen tiles appear once you are signed in. Health
+  probes that fetch `/home` still receive `200`.
+- **The Hardware pages no longer show quarantine controls.** The Quarantine link, the
+  Quarantined pill, the Quarantined devices panel, the containment banner and tab, and the
+  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
+  plugin and the role-gated quarantine instructions on the Instructions page all work as
+  before, and server-side enforcement does not depend on the UI. While the controls are
+  hidden, use `GET /api/v1/quarantine` to list records. `DELETE /api/v1/quarantine/{agent_id}`
+  ends the server record only; to remove the device's firewall rules, run the quarantine
+  plugin's release instruction (`security.quarantine.release`, "Release Device from Quarantine")
+  from the Instructions page (or through `execute_instruction`) and confirm with the
+  status instruction. No configuration change is needed.
+- **Colour schemes.** Settings > General > Appearance now offers six schemes (Slate stays
+  the default). The choice is stored in the browser, not on the server.
+
+## Behaviour change: the plain-HTTP port answers the four health probes when HTTPS is on (#5906)
+
+**What changed.** With HTTPS on, `GET` and `HEAD` on `/livez`, `/readyz`, `/health` and `/api/health` on the redirect port (`--web-port`, `8080` by default) now return the probe's answer instead of `301`: `200`, or `503` while the HTTPS listener is not bound or has exited (`https_listener_not_serving`), the server is draining, or Postgres is down. Every other request on that port still redirects. The bodies are the unauthenticated ones the HTTPS port already served, now also readable in cleartext on this port (version, store names, `agents.online` and the `tls` block). `--no-https-redirect` removes the listener.
+
+**What to check.**
+
+- A monitor that expected `301` on the plain port, or followed it to the TLS listener, now sees a probe answer. Point it at `https://<host>:8443/readyz`, or run `yuzu-server --healthcheck` in the container.
+- A Kubernetes `httpGet` probe on the plain port keeps working but now reads the plain port's own answer (for `/livez`, `503` only while the HTTPS listener is not bound or has exited; `/readyz` also answers `503` while draining or when Postgres is down). The kubelet used to follow the `301` to the TLS listener (same host name, port ignored), so a wedged HTTPS listener failed the probe; for TLS-listener liveness use `httpGet` with `scheme: HTTPS` on 8443, or the `exec` probe. A probe with a custom `Host` header never followed the redirect and now sees real `503`s.
+- Port 8080 now serves health data without encryption or authentication. Publish it only to the orchestrator network, or set `--no-https-redirect`. `--web-address 127.0.0.1` binds the HTTPS dashboard to loopback too, so it does not restrict only the plain port.
+- Responses on the plain port (the `301`s, `400`s and probe answers) now count in `yuzu_http_requests_total` with their own method and status labels, so request-rate totals and the 5xx error ratio include them; a plain-port `503` while the HTTPS listener is down is counted, but while that listener is down plain `/metrics` is itself a `301` to it, and the listener binds once per process, so recovery is a restart that resets the counter: those `503`s never reach an error-ratio alert such as the example `YuzuHighErrorRate`. Use `--healthcheck` or `up == 0` to catch that state.
+- That port's responses now carry the same security headers as the HTTPS port, minus HSTS and the CSP `upgrade-insecure-requests` directive. Its worker pool is fixed-size (at most 64 threads, created at boot), and shutdown waits at most 15 s for its thread.
+- Images built before this change are unchanged: they redirect, and have no `--healthcheck`.
+
+## Behaviour change: new agent, policy and fragment identifiers are restricted; page links encode identifiers
+
+- A `Register` (direct or through the gateway) with an agent id the server has not seen before is now refused with `INVALID_ARGUMENT` unless the id uses only letters, digits, `.`, `_`, `:` and `-` and is not only dots (counted in `yuzu_register_invalid_agent_id_total{reason="charset"}`). Agents that are already enrolled, pending or denied are not affected, and the agent's own generated UUID always passes. If you set `--agent-id` or `YUZU_AGENT_ID` to a value with other characters (for example `DOMAIN\HOST`, `user@host` or a space), change it before the agent first registers. An agent whose enrollment row no longer exists is treated as new again: a pending row an administrator removed, or an enrollment store restored from an older backup, reset or rebuilt. Such an agent, if its id has other characters, gets the refusal on every attempt (retrying with backoff up to 300 seconds) until you change its `--agent-id` / `YUZU_AGENT_ID` to a conforming value. Through the gateway the agent sees the server message wrapped in an `INTERNAL` status. Before upgrading, check any explicit agent ids you set against the rule.
+- A new policy or policy fragment with an explicit `id` must use letters, digits, `.`, `_` and `-` (up to 128 characters) and not only dots, the same rule instruction definitions use. Existing records are not changed.
+- Dashboard links and actions that carry an agent, policy or update-package identifier now percent-encode it. A row whose identifier is empty, `.` or `..` is shown without actions, and the pending-agent approve, deny and remove routes answer `400` for such an identifier.
 
 ## Behaviour change: the Settings link follows the server's own admin decision (#5779, #4208)
 
@@ -81,6 +205,12 @@ ignoring it.
 `GET /api/v1/rbac/roles/{role}/permissions` now answer `503` when the permission
 store is degraded (previously an empty `200`) and `404` for an unknown role
 (previously `200 {"data":[]}`).
+
+## Behaviour change: `POST /api/v1/hardware/{id}/sync` refuses cross-site cookie writes
+
+**What changed.** A call to `POST /api/v1/hardware/{id}/sync` (and the new fleet form `POST /api/v1/hardware/sync`) authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise it answers `403 cross-site request refused` and is audited as `csrf.denied`. API, MCP and engine token callers are not affected.
+
+**What to check.** A script that signs in with a cookie and calls the per-device sync route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. The Hardware and Software pages already send it. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`.
 
 ## Behaviour change: `PUT /api/config/{key}` is audit-first, refuses cross-site cookie writes and floors `heartbeat_timeout` at 30 seconds
 
@@ -241,6 +371,10 @@ too large for its type were already `400`.
   `now - n` that went past the epoch silently returned the whole result. Omit the parameter for
   "no bound on that side". `since=0` stays valid and matches exactly what omitting `since`
   matches; no script that sends `since=0` changes behaviour.
+- Scripts that send a **negative** `since` or `until`, or `until=0`, to other epoch-bounded reads
+  (the execution-statistics, legacy audit, auth-sample and inventory-query routes): it is `400`
+  now too, with the same fix (omit the parameter for no bound). The list is under
+  [Behaviour change: numeric query parameters on other routes](#behaviour-change-numeric-query-parameters-on-other-routes-are-parsed-strictly-too-4644).
 - MCP clients that send `"limit": null` or `"status": null`, or a float or string for either: omit
   the key to get the default. A `status` above `2147483647` and an unsigned value above
   `9223372036854775807` are `-32602` too (the latter used to wrap to `-1`, "any status"; the same
@@ -278,6 +412,184 @@ migration is needed. Two new counters report the effect:
 `yuzu_server_response_param_rejected_total{surface}` and
 `yuzu_server_response_export_truncated_total{surface,cause}`
 ([Metrics](metrics.md#response-store-metrics)).
+
+## Behaviour change: numeric query parameters on other routes are parsed strictly too (#4644)
+
+**Breaking for scripts that relied on a malformed value being silently misread.** The strict
+parsing the response routes got (above) now also covers the routes listed in the REST API
+reference under [Numeric Query Parameters](rest-api.md#numeric-query-parameters-4644): the
+execution-statistics routes, the executions lists, the audit routes, the instruction, product-pack,
+workflow and compliance lists, the patch lists, the software-inventory list, the fleet-topology
+`machines_max` and the app-performance compare `window`. A value that is not one whole base-10
+integer now returns `400` where it used to be read as something else: `limit=100abc` (was `100`),
+`since=junk` on the statistics routes (was `0`, "from the beginning"), `?limit=abc` on
+`/api/analytics/recent` and the patch lists (was ignored), `window=7days` (was `7`).
+
+On MCP, `query_audit_log` answers `-32602` for a `since`, `until` or `limit` that is not a JSON
+integer or does not fit a signed 64-bit value (a string used to mean `0`, unbounded, and
+`18446744073709551615` wrapped to `-1`), and the app-performance compare tool does the same for
+`window`. Other integer arguments that do not fit saturate instead of wrapping, except three tools
+where a saturated value would be harmful and the argument is strict and bounded instead (`-32602`
+otherwise): `create_offload_target` `batch_size` must be 1 to 10000 (the declared schema range, now
+enforced), `mint_upload_grant` `declared_max_size` must be a JSON integer that fits a signed 64-bit
+value, and `create_guardian_rule` `version` must be 1 to 2147483647. `mint_engine_credential`
+`ttl_days` of the wrong JSON type is `-32602` too (nothing is minted; it used to fall back to the
+90-day maximum). Security-gating MCP arguments are strict too: `issue_code_signing_cert` `validity_days` must be a
+JSON integer from 1 to 730 (`4294967297` wrapped to a 1-day certificate; a string, float or `null` took the
+365-day default), `mint_upload_grant` `ttl_secs` must be a JSON integer of at least 1 (a wrong type, `0` or a
+negative value minted the 900 s maximum; larger values still clamp), `create_api_token` `expires_at` must be `0`
+or a future epoch (a negative value minted a token that never expires), and `activate_platform_license`
+`seat_count` and `expires_at` must be integers of at least 0 (a negative `expires_at` was perpetual); each is
+`-32602` and creates nothing. A wrong-typed boolean on `create_guardian_rule`/`update_guardian_rule` `enabled`,
+`push_guardian_rules` `full_sync` and the engine-principal `include_revoked` is `-32602` instead of a bare
+HTTP 500, and `create_offload_target` now neutralises the name it writes to audit rows. The two bounds now hold
+at the REST twins and in the stores, so no writer bypasses them: `POST /api/v1/offload-targets`
+reads `batch_size` as a 64-bit value and answers `400` outside 1 to 10000 (an oversized number is
+rejected, not wrapped) and for a float, string, boolean or `null` (a float such as `5.5` used to be
+truncated), `POST /api/v1/guaranteed-state/rules` answers `400`
+for a `version` outside 1 to 2147483647, and `PUT /api/v1/guaranteed-state/rules/{id}` and MCP
+`update_guardian_rule` refuse a rule whose stored version is already at 2147483647 or above (`409` on REST,
+`-32602` on MCP) instead of overflowing the version bump. The store enforces the range only when a
+write changes the version, so a rule that already holds an out-of-range stored version can still be
+enabled or disabled from the dashboard. The MCP tools `get_execution_statistics_by_agent` and
+`get_execution_statistics_by_definition` answer `-32602` for a `limit` below 1 (the schema minimum;
+it used to be replaced by the default 50), and so do their REST twins, `GET /api/v1/execution-statistics/agents` and `/definitions` (`400` for a `limit` below 1 or malformed). Two more REST inputs are new `400`s: the `limit` in the body of `POST /api/v1/inventory/query` and `POST /api/inventory/query` (below 1 or not an integer; above 1000 still clamps to 1000, and 4294967297 no longer wraps to 1), and the `ttl_days` of `POST /api/v1/engine-principals/{id}/credentials` (present but not a JSON integer from 1 to 90; absent still means 90). That mint route's body is optional only when it is empty or whitespace-only: a truncated document or a body that is not a JSON object (`[]`, `5`, `"x"`, `null`) is now `400` and mints nothing, where it used to mint the default 90-day credential. `{}` and an object without `ttl_days` still mint 90 days.
+
+A negative `since` is refused (`400`, `-32602` on MCP) on the legacy `GET /api/audit` and MCP
+`query_audit_log`, and so is an `until` of `0` or below (a negative `since` or `until`, and an `until`
+of `0`, each used to mean no bound and are new `400`s here). The same holds for a negative `since` on
+`GET /api/v1/execution-statistics/definitions`/`agents` and their MCP twins, for `to=0` on
+`GET /api/v1/audit/auth-sample`, and for an `until` of `0` or below (or a non-integer bound) in the
+body of `POST /api/v1/inventory/query` and `POST /api/inventory/query`; a non-integer `since` or
+`until` in an inventory query body made the body read throw and is a clean `400` now. The bounds are
+presence-tracked now: `-3600` and `until=0` used to mean no bound and returned the whole log,
+statistics set or inventory. Omit the parameter for no bound; `since=0` (`from=0` on the auth sample)
+is accepted and matches the same rows as omitting it. On the auth-sample export a present but empty
+`from` or `to` is accepted as unbounded on that side. `GET /api/v1/audit` follows the same rule: an
+earlier build of this release line read `0` as unbounded there; an `until` of `0` or below (or a
+negative `since`) is now `400`.
+
+The same strictness now covers the dashboard fragments' `page`/`per_page`, the software
+inventory (the three software fragments answer `200` with an `inv-caveat` note for a malformed
+`limit` and ignore a well-formed one, which uses a fixed page size), DEX perf, network quality, hardware and CA-issued lists, the notification, webhook and
+offload delivery lists, the DEX, network and result-set `limit` and the Guaranteed State events `limit`/`offset` (trailing characters are `400`; an integer outside the result-set page range still uses the default page size),
+the pre-flight run list `limit`, the pre-flight run form's `min_gib` and `window` (a malformed value
+or a negative `min_gib` is `400`; an empty field keeps its default; a `window` of zero or below uses 30
+minutes and a larger value is clamped to 1 to 2880 as a 64-bit value, so one beyond a signed 64-bit
+integer is `400`; see [Pre-flight](preflight.md)), the hardware sync poll's `await_since`
+(a malformed freshness bound used to read as "no bound"), the TAR process-tree `node` and the
+`GET /api/v1/events` `?since` cursor (the workflow stream has the header only). A malformed
+`Last-Event-ID` header is served live only (nothing replayed, never the whole buffer) rather than
+a `400`, and `-1` and `5abc` are never accepted as cursors (`5abc` used to replay from 5). On the
+query-parameter routes, a parameter that is present but empty (`?limit=`) is malformed, not
+absent, `GET /api/v1/audit` `limit` included, except `limit` on the software list and catalogue
+routes and fragments, where an empty `limit=` means the default (see
+[the software installs read](#behaviour-change-the-software-installs-read-validates-its-inputs-and-audits-an-out-of-scope-target)).
+The verify fragment's `window`
+is refused with its usual `200` note instead of a `4xx` (the dashboard drops `4xx` bodies).
+
+Four admin forms stop silently saving a different value than the one typed. A malformed
+`min_devices`, `window_seconds` or `cooldown_seconds` on the DEX blast-radius thresholds is a `400`
+and saves nothing (it used to persist the clamped minimum). On the enrollment-token forms and the
+API-token `ttl_hours`, `0x5` used to read as `0`; `max_uses` `0` means unlimited and a TTL of `0`
+means no expiry, so a mistyped limit minted an unlimited or never-expiring credential. Only an
+empty field, or a value that parses to a literal `0` (`0`, `-0`, `00`), means unlimited or no
+expiry now, and a negative `ttl_hours` is refused (it would have computed `0`). The API-token form
+refuses with its usual `200` feedback span and mints nothing; the other forms answer `400` plus an
+error toast. On the batch route an empty `max_uses` defaults to `1`. A malformed `rollout_pct` on an OTA
+package upload or rollout change is a `400` instead of silently becoming `100`. **Behaviour change on
+the rollout change route only:** an empty `rollout_pct` and a value above `100` are now `400` as well
+(an empty value used to mean `100` and a larger one was clamped to `100`); a negative value still
+clamps to `0`; the upload route keeps an empty value as `100`, clamps a larger one to `100` and a negative one to `0`, and refuses only a malformed value. A negative `limit` or `offset` on `GET /api/notifications`, and a negative `limit` on the patch lists
+(`GET /api/patches`, `GET /api/patches/deployments`), is `400` too (the store answered an empty `200`),
+and so is a negative `limit` on the legacy `GET /api/policy-fragments` and `GET /api/policies` (it
+reached Postgres as `LIMIT -1` and answered `503`; the `/api/v1/` policy routes clamp it as before).
+A malformed or out-of-range enrollment-token number now also writes an `enrollment.token_create` or
+`enrollment.bulk_token_create` row with `result=denied` and `detail=invalid_numeric_parameter` (see
+[Audit Log](audit-log.md)).
+
+Security-gating numbers in JSON request bodies are strict too. **Before / after:** `POST /api/v1/tokens` `expires_at` of `-1`, or a value above 9223372036854775807 that wrapped to `-1`, minted a token that never expires, `5.5` or `1e3` minted an already-expired one, and a string, boolean or `null` (or a non-object body) was a bare `500`; now each is `400` and mints nothing (`0` or omitted still means never expires, and a past epoch is refused). `overlap_secs` on `POST /api/v1/tokens/{id}/rotate` and `POST /api/v1/engine-principals/{id}/credentials/rotate` must be a JSON integer, and a non-blank body that is truncated or not an object is `400` instead of rotating with the 7-day default (an empty body still takes the default). `version` on `POST /api/v1/guaranteed-state/rules` must be a JSON integer in range (`5.5` was stored as `5`). `ttl_secs` on `POST /api/v1/upload-grants` must be a JSON integer of at least 1 when present (a wrong type, `0` or a negative value used to mint the 900 s maximum). On `POST /api/settings/enrollment-tokens/batch` a JSON number for `count`, `max_uses` or `ttl_hours` used to be silently ignored, so the documented curl example minted single-use tokens that never expired; numbers and numeric strings are now both honoured, a float, boolean, `null`, overflow or malformed body is `400`, and an empty string still means the default. An `ip_subnet` auto-approve rule with a malformed prefix is refused when added (`400`); a malformed one already stored used to throw out of agent registration and now never matches, so it never auto-approves. `POST /api/schedules` `interval_minutes` (1 to 35791394), `day_of_week` (0 to 6) and `day_of_month` (1 to 28) must be JSON integers in range (`4294967297` minutes became an every-minute schedule); `POST /api/schedules/{id}/enable` `enabled` must be a JSON boolean, the integer `0` or `1`, or the exact string `"true"` or `"false"` (an omitted key or a blank, empty or whitespace-only, body still enables), and any other string, another number, `null` or a malformed body is `400` and changes nothing (`{"enabled":0}` used to arm the schedule). `POST /api/command` `stagger` and `delay` must be integers from 0 to 300 (a float, string or `null` read as 0, so a delayed command ran immediately; a value above 300 was silently capped by the agent at 300 seconds and is now a 400). A result-set matcher `{"kind":"tar_rows_ge","n":N}` needs an integer N from 1 to 2147483647 on `POST /api/v1/result-sets/from-instruction-result` and the MCP `create_result_set_from_instruction_result` (`400` / `-32602`), and a `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too (it used to be dropped, so every responder qualified; omit `matcher` for that default); a malformed `n` or `kind` already stored, or an `n` below 1, now matches no device instead of throwing in the maintenance tick or admitting everyone. The pre-flight form's `app_min`, `app_max` and `os_min` must be empty or a dotted-decimal version with an optional `-beta` / `+build` suffix; `abc`, `v4.2.0` or `4.2.x` is `400` and starts no run (it read as version 0 and passed every device). `POST /api/v1/license` `seat_count` and `expires_at` follow the MCP twin: JSON integers of at least 0, else `400` (the licence surface is dormant until the `LicenseStore` is wired, ADR-0048). Rolling upgrade: replicas on the old and new build answer these inputs differently.
+
+Three more inputs that used to be read as something else are refused (`400` on REST, `-32602` on MCP), and one stored value is repaired:
+a `conditions[].value` on the inventory evaluate and result-set routes that is a JSON number is
+accepted with `==`, `!=`, `>`, `>=`, `<`, `<=` (and a boolean with `==` or `!=`); all six compare it
+as a number against the raw stored value (exact for integers and for integer against a decimal, a stored
+numeric string counting as that number; JSON integers are exact and every JSON float (a number written with a decimal point or exponent, such as `5.0`, `1e3` or `5.5`, or an integer outside `-9223372036854775808` to `18446744073709551615`, which arrives as a float) is refused because its original text is lost once parsed: send the decimal as a JSON string under `>`, `>=`, `<` or `<=`, which is accepted as a whole number within int64/uint64 (digits or an integer-valued exponent form such as `"1e16"`, read exactly) or with at most 15 significant digits, a magnitude below 2^53, a value that is zero or at least the smallest normal double, and a value within the range of a double, and a plain-decimal string such as `"1e400"` is refused instead of ordering lexically; `==` and `!=` with a string stay a text compare, so numeric equality covers JSON integers only; write a whole number as an integer up to `18446744073709551615` or as digits, and a string such as `"9007199254740993.0"` is read as that exact integer; a non-integer at or above 2^53 such as `"9007199254740992.5"` is refused), so **behaviour change:** a stored value that is not a number,
+such as `"5 GB"` or `"N/A"`, no longer satisfies `>`, `>=`, `<` or `<=` against a numeric operand (it was read as `5`
+or compared as text), and any other operand type is refused (a number used to become the empty string, so `{"op":">","value":5}`
+selected every device that had the field); a string operand that is a plain decimal number (`"4"`, `"2e-7"`) is ordered numerically under `>`, `>=`, `<`, `<=`: a stored number or fully numeric string compares exactly (a stored integer within int64/uint64, including an integer-valued exponent spelling that fits (such as `"564141138995e7"`), and a stored decimal with a fraction of at most 15 significant digits and a magnitude below 2^53 compare exactly; any other stored decimal, one of more digits or a non-integer at or above 2^53, or a stored negative integer below `-9223372036854775808`, is compared as the nearest double), a stored string that merely starts with a number (a dotted version `"1.2.3"`, `"5 GB"`) has its leading number read and compared the same way (use `version_gte` / `version_lte` for dotted versions), and any other stored value (`"N/A"`, `""`, a boolean) never matches, where a JSON number operand never matches a stored string that is not a number in full; while `==` / `!=` and a non-numeric string operand such as `"v2"` are unchanged; a result-set matcher whose `column`, `op` or `value` is
+present with the wrong type no longer qualifies every responder; the DEX `window` on
+`GET /api/v1/dex/signals`, `/dex/scope`, `/dex/signals/{obs_type}` and their MCP tools (and `get_dex_device_score`) must be
+`24h`, `7d`, `30d` or `all` (`90d`, a non-string such as `30` or `null`, or an empty `?window=` was answered with 7 days; only an omitted `window` keeps `7d`). Separately, a stored schedule `interval_minutes`
+above 35791394 now advances instead of failing in Postgres on every tick (new schedules are capped at
+that value).
+
+Still lenient, and not an exhaustive list: the `n` retry-attempt counter on the live-snapshot poll
+fragments (the deployment, device, hardware, DEX, pre-flight and TAR process-tree polls), which is
+clamped to a fixed range per poll (1 to 100000 on the deployment and pre-flight polls, at most 50 on
+the others), and values parsed from stored rows, agent output or server configuration rather than
+from a request. Numeric path segments matched by a `(\d+)`
+pattern (notification read/dismiss and the webhook routes) now answer `404` for an id that does
+not fit a signed 64-bit integer; they used to fail with `500`. The auto-approve rule index answers
+`200` with an audited `denied` row (`rule_not_found`) and changes nothing.
+
+**What to do.** Send whole integers, and omit a parameter to get its default. No configuration or
+data migration is needed, but review Settings > Auto-Approve for `ip_subnet` rules with a sign or an odd prefix (they match nothing, so those agents go to the pending queue), and optionally list API tokens with `expires_at=0` and enrollment tokens minted before the upgrade. During a rolling upgrade, replicas on the old and new build answer a
+malformed value differently (`200` versus `400`).
+
+## Changed: a degraded execution-statistics read is a 503, not an empty 200 (#4644)
+
+`GET /api/v1/execution-statistics`, `/agents`, `/definitions`, `GET /api/v1/statistics` and the
+four MCP statistics tools used to answer a store failure (execution store not open, pool timeout,
+failed query) with `200` and an empty list or an all-zero summary, which reads as "no
+executions". They now answer `503` with `retry_after_ms: 2000` on REST and a retryable error with
+`retry_after_ms` on MCP. A filter or confined scope that genuinely matches nothing is still `200`
+with an empty `data` array. Each degraded read also logs a warning on the server
+(`ExecutionTracker::try_get_<reader> degraded: tracker not open`, `pool exhausted` or `query failed`).
+
+**What to do.** Treat a `503` from these routes as retryable. A dashboard or script that read
+`data: []` as "nothing to report" during an outage will now see the error instead.
+
+## Changed: a saturated pre-flight response window is inconclusive (#4644)
+
+Each pre-flight check reads its newest 50,000 responses for a run. On a very large cohort a
+device that had answered could be pushed out of that window and then read as "no response" while
+the runner kept re-dispatching. A device absent from a full window now shows **"inconclusive:
+response cap reached"**, stays Incomplete (never in Deploy's go cohort) and the runner stops
+re-dispatching that run; the run still completes at its deadline. Re-run against a smaller group
+to resolve those devices.
+
+## Behaviour change: per-agent execution statistics are confined to the caller's scope (#3526)
+
+`GET /api/v1/execution-statistics/agents` and the MCP tool `get_execution_statistics_by_agent` used
+to gate on a bare `Execution:Read` check. That check admits only a holder of a global grant, and it
+returned one row per agent across every execution of every operator with no per-agent filter. A
+management-group-scoped-only operator (no global grant) was refused with `403`. Both now go through
+the same admit-then-filter fleet-read gate as `GET /api/v1/executions` (ADR-0017): the visible-agent
+set is applied in the query before the grouping and the row limit, and an empty visible set returns
+no rows, never the fleet. This widens who is admitted and narrows what a confined caller sees:
+nothing a caller could read before is now refused, with one exception: the gate fails closed, so
+when the RBAC or management-group store is not open the route answers a retryable `503`
+(`retry_after_ms` 5000), even to a global admin, where the bare check answered `200`.
+
+- **A group-scoped-only operator** goes from `403` to a `200` that carries only the rows of the
+  agents it can see. A holder of a global grant sees the same rows as before.
+- **A service-scoped API token on the REST route** used to be refused (`403`) by the bare gate. With
+  RBAC enforcement on it is now admitted as a confined view: the token must clear the
+  `ITServiceOwner` authority ceiling (the seeded role holds `Execution:Read`), and the rows are then
+  intersected with the agents tagged for its service. A degraded tag store answers `503`. The MCP
+  tool still denies service-scoped tokens, and widening that is a separate decision, not made here.
+- **Confinement is effective only with RBAC enforcement on.** With RBAC off (the shipped default)
+  the rollup is unfiltered for every authenticated caller other than a service-scoped token or an
+  engine principal (a service-scoped token is refused `403` with RBAC off). Treat the confined view
+  as available once you enable RBAC enforcement, not before.
+- `GET /api/v1/execution-statistics/definitions` and the fleet summary carry no agent identity and
+  keep the plain `Execution:Read` gate (the summary's `active_agents` is a fleet-wide count).
+  `GET /fragments/executions` is not changed by this entry.
+- A negative `since` on `/agents` and `/definitions` is `400` (see the previous section).
+
+During a rolling upgrade, replicas on the old and the new build admit and return different row sets to
+a confined caller.
 
 ## Behaviour change: the software installs read validates its inputs and audits an out-of-scope target
 
@@ -794,8 +1106,9 @@ plus one new prerequisite.**
   whole-registry agent count (tracked in #4753, whose checklist, including `kind=fleet` and
   `get_fleet_posture_fast`, stays open; the executions-list move covers only `kind=execution`). The same
   whole-registry branch is also reached by `kind=execution` or `kind=agent` with an EMPTY id, or
-  when the execution tracker is unavailable (not separately tracked). `GET
-  /api/v1/execution-statistics/agents` has no per-agent filter (#3526).
+  when the execution tracker is unavailable (not separately tracked). (`GET
+  /api/v1/execution-statistics/agents` was listed here and is now confined; see "Behaviour change:
+  per-agent execution statistics are confined to the caller's scope (#3526)".)
 
 **Rollback.** Redeploy the previous binary. The plain `Execution:Read` gate returns, so
 group-scoped-only operators go back to `403` on the fragment. The `visible_agents` filter is a

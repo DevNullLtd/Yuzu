@@ -3,9 +3,12 @@
 /// Extracted from server.cpp — Phase 1 of the god-object decomposition.
 
 #include "settings_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "cert_upload_files.hpp"
 #include "ota_signature_sidecar.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
+#include "rollout_pct_reject.hpp" // the shared malformed-rollout_pct 400 + toast
 
 #include <atomic>
 #include <cstdio>
@@ -45,6 +48,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -285,6 +289,29 @@ std::string highlight_yaml_kv(const std::string& line) {
 // extract_json_string moved to json_extract.hpp (#2557) — SettingsRoutes
 // lives in namespace yuzu::server, so this unqualified name still resolves.
 
+// One OPTIONAL number of the batch enrollment-token body (#4644): `out` keeps its default when
+// the key is absent or an EMPTY string (the documented "empty or omitted" default). A JSON
+// integer and a numeric string are both accepted (the shipped curl example sends numbers,
+// scripts/ci/qa-stack.sh and the form-style callers send strings); a float, bool, null, array,
+// object, a non-numeric string and anything outside the `int` range throw std::invalid_argument
+// (the caller's single `invalid_numeric_parameter` branch). Before this, a JSON number was
+// silently ignored, so the documented example minted single-use tokens that never expire.
+void read_enrollment_int(const nlohmann::json& body, const char* key, int& out) {
+    if (!body.contains(key))
+        return;
+    const auto& v = body[key];
+    if (v.is_string()) {
+        const auto s = v.get<std::string>();
+        if (!s.empty())
+            out = yuzu::server::strict_stoi(s);
+        return;
+    }
+    const auto wide = yuzu::server::read_json_int_strict(body, key, 0);
+    if (!wide || *wide < std::numeric_limits<int>::min() || *wide > std::numeric_limits<int>::max())
+        throw std::invalid_argument("not an integer");
+    out = static_cast<int>(*wide);
+}
+
 // #4028 — success-envelope wrapper matching rest_api_v1.cpp's ok_json() wire
 // shape ({"data":...,"meta":{"api_version":"v1"}}) exactly. ok_json() itself
 // is TU-local to rest_api_v1.cpp (declared in its own anonymous namespace,
@@ -340,12 +367,12 @@ std::string SettingsRoutes::render_server_config_fragment() {
             "s</code></td></tr>";
     {
         const auto idle = v.at("session_inactivity_seconds").get<std::int64_t>();
-        html += "<tr><td>Dashboard idle timeout</td><td>" +
+        html += "<tr><td>Console idle timeout</td><td>" +
                 (idle > 0 ? "<code>" + std::to_string(idle) + "s</code>"
                           : std::string("Off")) +
                 "</td></tr>";
     }
-    html += "<tr><td>Dashboard session lifetime</td><td><code>" +
+    html += "<tr><td>Console session lifetime</td><td><code>" +
             std::to_string(v.at("session_absolute_lifetime_seconds").get<std::int64_t>()) +
             "s</code></td></tr>";
     html += "<tr><td>Max Agents</td><td><code>" +
@@ -1936,17 +1963,25 @@ std::string SettingsRoutes::render_pending_fragment() {
                     "</span></td>"
                     "<td>";
 
-            if (a.status == auth::PendingStatus::pending) {
+            if (a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id)) {
+                // The id is empty, `.` or `..`: a browser collapses a dot-only
+                // path segment, so no per-row URL can be built for it. Offer no
+                // row action (the bulk buttons below act on the whole queue and show for it).
+                html += "<span class=\"muted\">identifier not supported for row actions</span>";
+            } else if (a.status == auth::PendingStatus::pending) {
+                // The id is agent-supplied: percent-encode it as ONE path segment
+                // (html_escape alone leaves `/`, `?`, `#` and `.` live in the URL).
+                const std::string seg = url_path_segment(a.agent_id);
                 html += "<button class=\"btn btn-primary\" "
                         "style=\"margin-right:0.3rem\" "
                         "hx-post=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
+                        seg +
                         "/approve\" "
                         "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
                         ">Approve</button>"
                         "<button class=\"btn btn-danger\" "
                         "hx-post=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
+                        seg +
                         "/deny\" "
                         "hx-target=\"#pending-section\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Deny agent enrollment?\""
@@ -1972,7 +2007,13 @@ std::string SettingsRoutes::render_pending_fragment() {
     auto pending_count = std::count_if(agents.begin(), agents.end(), [](const auto& a) {
         return a.status == auth::PendingStatus::pending;
     });
-    if (pending_count > 1) {
+    // The bulk bar also shows for a lone pending row whose id cannot be addressed
+    // per-row, so such a row is never left with no action at all.
+    const bool has_unaddressable_pending =
+        std::any_of(agents.begin(), agents.end(), [](const auto& a) {
+            return a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id);
+        });
+    if (pending_count > 1 || (pending_count == 1 && has_unaddressable_pending)) {
         html += "<div style=\"margin-top:0.75rem;display:flex;gap:0.5rem\">"
                 "<button class=\"btn btn-primary\" "
                 "onclick=\"twoClickConfirm(this, function() { "
@@ -2338,6 +2379,49 @@ std::string SettingsRoutes::render_updates_fragment() {
                                 ? std::to_string(pkg.file_size / 1024) + " KB"
                                 : std::to_string(pkg.file_size / (1024 * 1024)) + " MB";
 
+            // platform/arch/version are operator-uploaded path segments: encode
+            // each, and offer no rollout/delete URL when one is empty or only
+            // `.`/`..` (a browser collapses a dot segment).
+            const bool pkg_actionable = path_segment_ok(pkg.platform) &&
+                                        path_segment_ok(pkg.arch) && path_segment_ok(pkg.version);
+            std::string rollout_cell;
+            std::string delete_cell;
+            if (pkg_actionable) {
+                const std::string pkg_path = url_path_segment(pkg.platform) + "/" +
+                                             url_path_segment(pkg.arch) + "/" +
+                                             url_path_segment(pkg.version);
+                rollout_cell =
+                    "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
+                    "hx-post=\"/api/settings/updates/" +
+                    pkg_path +
+                    "/rollout\" "
+                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
+                    "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
+                    "value=\"" +
+                    std::to_string(pkg.rollout_pct) +
+                    "\" "
+                    "style=\"width:60px\" "
+                    "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
+                    "<span style=\"width:2.5em\">" +
+                    std::to_string(pkg.rollout_pct) +
+                    "%</span>"
+                    "<button class=\"btn btn-secondary\" type=\"submit\">Set</button>"
+                    "</form>";
+                delete_cell = "<button class=\"btn btn-danger\" "
+                              "hx-delete=\"/api/settings/updates/" +
+                              pkg_path +
+                              "\" "
+                              "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
+                              "hx-confirm=\"Delete update package " +
+                              html_escape(pkg.version) + " for " + html_escape(pkg.platform) +
+                              "/" + html_escape(pkg.arch) +
+                              "?\""
+                              ">Delete</button>";
+            } else {
+                rollout_cell = delete_cell =
+                    "<span class=\"muted\">identifier not supported for actions</span>";
+            }
+
             html += "<tr>"
                     "<td>" +
                     html_escape(pkg.platform) +
@@ -2392,38 +2476,14 @@ std::string SettingsRoutes::render_updates_fragment() {
                                        "--update-require-signature will refuse this "
                                        "package.\">unsigned</span>")) +
                     "</td>"
-                    "<td>"
-                    "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
-                    "hx-post=\"/api/settings/updates/" +
-                    html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "/" +
-                    html_escape(pkg.version) +
-                    "/rollout\" "
-                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
-                    "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
-                    "value=\"" +
-                    std::to_string(pkg.rollout_pct) +
-                    "\" "
-                    "style=\"width:60px\" "
-                    "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
-                    "<span style=\"width:2.5em\">" +
-                    std::to_string(pkg.rollout_pct) +
-                    "%</span>"
-                    "<button class=\"btn btn-secondary\" type=\"submit\">Set</button>"
-                    "</form></td>"
+                    "<td>" +
+                    rollout_cell +
+                    "</td>"
                     "<td>" +
                     std::string(pkg.mandatory ? "Yes" : "No") +
                     "</td>"
-                    "<td><button class=\"btn btn-danger\" "
-                    "hx-delete=\"/api/settings/updates/" +
-                    html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "/" +
-                    html_escape(pkg.version) +
-                    "\" "
-                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Delete update package " +
-                    html_escape(pkg.version) + " for " + html_escape(pkg.platform) + "/" +
-                    html_escape(pkg.arch) +
-                    "?\""
-                    ">Delete</button></td></tr>";
+                    "<td>" +
+                    delete_cell + "</td></tr>";
         }
     }
 
@@ -3748,18 +3808,33 @@ void SettingsRoutes::register_routes(
         // Clamp server-side to the same ranges update_alert_shape enforces, so
         // the STORED values always match the LIVE values (no silent divergence
         // between what the UI shows and what the detector runs).
+        // A present-but-malformed field is a 400 with NOTHING saved: `stoi("0x10")` is 0 and
+        // `stoi("5abc")` is 5, so a typo used to persist a different (clamped) threshold
+        // than the one the operator typed (#4644). Empty/absent keeps the default.
+        bool malformed = false;
         auto clamp_int = [&](const char* field, int lo, int hi, int fallback) {
-            try {
-                const auto v = extract_form_value(req.body, field);
-                if (!v.empty())
-                    return std::clamp(std::stoi(v), lo, hi);
-            } catch (...) {}
-            return fallback;
+            const auto v = extract_form_value(req.body, field);
+            if (v.empty())
+                return fallback;
+            const auto parsed = yuzu::server::parse_query_int<int>(v);
+            if (!parsed) {
+                malformed = true;
+                return fallback;
+            }
+            return std::clamp(*parsed, lo, hi);
         };
         const BlastRadiusConfig d{};
         const int min_dev = clamp_int("min_devices", 2, 100000, d.min_devices);
         const int win_s = clamp_int("window_seconds", 60, 86400, d.window_seconds);
         const int cool_s = clamp_int("cooldown_seconds", 0, 7 * 86400, d.cooldown_seconds);
+        if (malformed) {
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Thresholds must be whole numbers","level":"error"}})");
+            res.set_content(detail::a4_error(res, "invalid numeric parameter"),
+                            "application/json");
+            return;
+        }
         auto session = auth_fn_(req, res);
         const std::string by = session ? session->username : "unknown";
         bool ok = true;
@@ -4325,9 +4400,9 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto cert_dir = auth::default_cert_dir();
+        auto cert_dir = cert_dir_override_.empty() ? auth::default_cert_dir() : cert_dir_override_;
         std::error_code ec;
-        std::filesystem::create_directories(cert_dir, ec);
+        cert_upload::create_cert_dir(cert_dir, ec);
         if (ec) {
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Cannot create cert directory.</span>",
@@ -4350,15 +4425,12 @@ void SettingsRoutes::register_routes(
         }
 
         auto out_path = cert_dir / out_name;
-        {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-            if (!f.is_open()) {
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            f.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!cert_upload::write_cert_file(cert_dir, out_name, type == "key", content)) {
+            audit_fn_(req, "cert.upload", "failure", "Certificate", type, "write failed");
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
 
         if (type == "cert")
@@ -4367,14 +4439,6 @@ void SettingsRoutes::register_routes(
             cfg_->tls_server_key = out_path;
         else if (type == "ca")
             cfg_->tls_ca_cert = out_path;
-
-#ifndef _WIN32
-        if (type == "key") {
-            std::filesystem::permissions(
-                out_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                std::filesystem::perm_options::replace);
-        }
-#endif
 
         spdlog::info("Certificate uploaded: {} -> {}", type, out_path.string());
         audit_fn_(req, "cert.upload", "success", "Certificate", type, "");
@@ -4439,9 +4503,9 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto cert_dir = auth::default_cert_dir();
+        auto cert_dir = cert_dir_override_.empty() ? auth::default_cert_dir() : cert_dir_override_;
         std::error_code ec;
-        std::filesystem::create_directories(cert_dir, ec);
+        cert_upload::create_cert_dir(cert_dir, ec);
         if (ec) {
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Cannot create cert directory.</span>",
@@ -4450,24 +4514,13 @@ void SettingsRoutes::register_routes(
         }
 
         auto out_path = cert_dir / out_name;
-        {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-            if (!f.is_open()) {
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            f.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!cert_upload::write_cert_file(cert_dir, out_name, type == "key", content)) {
+            audit_fn_(req, "cert.paste", "failure", "Certificate", type, "write failed");
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
-
-#ifndef _WIN32
-        if (type == "key") {
-            std::filesystem::permissions(
-                out_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                std::filesystem::perm_options::replace);
-        }
-#endif
 
         if (type == "cert")
             cfg_->tls_server_cert = out_path;
@@ -4490,6 +4543,26 @@ void SettingsRoutes::register_routes(
     sink.Post("/api/settings/oidc", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        // admin_fn_ admits a JIT-elevated session, but the sign-in provider (issuer, client,
+        // admin group) decides who becomes a STANDING administrator at the next SSO login, so
+        // an elevated session must not change it. Same own-role rule as the role-change route.
+        const auto caller = auth_fn_(req, res);
+        if (!caller) {
+            res.status = 401;
+            return;
+        }
+        if (caller->role != auth::Role::admin) {
+            audit_fn_(req, "oidc.configure", "denied", "OidcConfig", "",
+                      "elevated_session_oidc_change_blocked");
+            res.status = 403;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Changing sign-in provider settings needs your own administrator role, not an elevation","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Changing sign-in provider settings needs your "
+                                                  "own administrator role, not a temporary "
+                                                  "elevation"),
+                            "application/json");
+            return;
+        }
 
         auto issuer = extract_form_value(req.body, "issuer");
         auto client_id = extract_form_value(req.body, "client_id");
@@ -5208,6 +5281,24 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // admin_fn_ admits a JIT-elevated session (effective_role). An elevation is temporary
+        // authority, and an account role is a STANDING grant: letting an elevated `user`
+        // change an account's role would turn the elevation into a durable administrator that
+        // outlives the window (the same principle as rbac_admin_predicate.hpp, decision 1).
+        // Require the session's own role (`session->role`, not `effective_role`): a local
+        // account's role, or the IdP-mapped role of an SSO session. Sessions are wiped on a
+        // role change, which bounds how stale that cached role can be.
+        if (session->role != auth::Role::admin) {
+            audit_fn_(req, "user.role_change", "denied", "User", req.matches[1].str(),
+                      "elevated_session_role_change_blocked");
+            res.status = 403;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Changing an account role needs your own administrator role, not an elevation","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Changing an account role needs your own "
+                                                  "administrator role, not a temporary elevation"),
+                            "application/json");
+            return;
+        }
         // PR2 — MFA step-up gate. Role changes promote/demote a
         // principal's authority; require fresh MFA proof.
         if (step_up_fn_ &&
@@ -5407,14 +5498,25 @@ void SettingsRoutes::register_routes(
         int max_uses = 0;
         int ttl_hours = 0;
         try {
+            // Strict: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit
+            // used to mint an unlimited token. Only an EMPTY field or a literal 0 means
+            // "unlimited" / "no expiry"; anything else must be one base-10 integer.
             if (!max_uses_s.empty())
-                max_uses = std::stoi(max_uses_s);
+                max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
-                ttl_hours = std::stoi(ttl_s);
+                ttl_hours = yuzu::server::strict_stoi(ttl_s);
+            // A negative TTL computes `ttl_hours > 0 ? ... : 0` and 0 means NEVER EXPIRES, so a
+            // typed `-1` used to mint a credential with no expiry. Refuse it. (`-0` and `00`
+            // parse to a literal 0 and keep the documented meaning.)
+            if (ttl_hours < 0)
+                throw std::invalid_argument("negative ttl_hours");
         } catch (const std::exception&) {
             audit_fn_(req, "enrollment.token_create", "denied", "EnrollmentToken", "",
                       "invalid_numeric_parameter");
             res.status = 400;
+            // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Invalid numeric parameter - nothing was created","level":"error"}})");
             res.set_content(detail::a4_error(res, "invalid numeric parameter"),
                             "application/json");
             return;
@@ -5490,25 +5592,47 @@ void SettingsRoutes::register_routes(
                                                               httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        auto label = extract_json_string(req.body, "label");
-        auto count_s = extract_json_string(req.body, "count");
-        auto max_uses_s = extract_json_string(req.body, "max_uses");
-        auto ttl_s = extract_json_string(req.body, "ttl_hours");
+        // A blank body keeps every default; any other body must be one JSON object (a truncated
+        // document used to mint the default 10 single-use tokens with no expiry).
+        nlohmann::json batch_body = nlohmann::json::object();
+        const bool body_blank =
+            std::all_of(req.body.begin(), req.body.end(),
+                        [](unsigned char c) { return std::isspace(c) != 0; });
+        if (!body_blank) {
+            batch_body = nlohmann::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+            if (batch_body.is_discarded() || !batch_body.is_object()) {
+                audit_fn_(req, "enrollment.bulk_token_create", "denied", "EnrollmentToken", "",
+                          "invalid_body");
+                res.status = 400;
+                res.set_header("HX-Trigger",
+                               R"({"showToast":{"message":"Request body must be a JSON object - nothing was created","level":"error"}})");
+                res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                                "application/json");
+                return;
+            }
+        }
+        auto label = extract_json_string(batch_body, "label");
 
         int count = 10;
         int max_uses = 1;
         int ttl_hours = 0;
         try {
-            if (!count_s.empty())
-                count = std::stoi(count_s);
-            if (!max_uses_s.empty())
-                max_uses = std::stoi(max_uses_s);
-            if (!ttl_s.empty())
-                ttl_hours = std::stoi(ttl_s);
+            // Strict (see the single-token route): a malformed limit must never read as 0.
+            read_enrollment_int(batch_body, "count", count);
+            read_enrollment_int(batch_body, "max_uses", max_uses);
+            read_enrollment_int(batch_body, "ttl_hours", ttl_hours);
+            // A negative TTL computes `ttl_hours > 0 ? ... : 0` and 0 means NEVER EXPIRES, so a
+            // typed `-1` used to mint a credential with no expiry. Refuse it. (`-0` and `00`
+            // parse to a literal 0 and keep the documented meaning.)
+            if (ttl_hours < 0)
+                throw std::invalid_argument("negative ttl_hours");
         } catch (const std::exception&) {
             audit_fn_(req, "enrollment.bulk_token_create", "denied", "EnrollmentToken", "",
                       "invalid_numeric_parameter");
             res.status = 400;
+            // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Invalid numeric parameter - nothing was created","level":"error"}})");
             res.set_content(detail::a4_error(res, "invalid numeric parameter"),
                             "application/json");
             return;
@@ -5613,7 +5737,10 @@ void SettingsRoutes::register_routes(
         int64_t expires_at = 0;
         if (!ttl_s.empty()) {
             try {
-                int ttl_hours = std::stoi(ttl_s);
+                // Strict: a mistyped TTL ("0x5" -> 0) used to mint a token that never expires.
+                int ttl_hours = yuzu::server::strict_stoi(ttl_s);
+                if (ttl_hours < 0) // would mint a token that never expires; refused, nothing minted
+                    throw std::invalid_argument("negative ttl_hours");
                 if (ttl_hours > 0) {
                     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                                    std::chrono::system_clock::now().time_since_epoch())
@@ -5914,13 +6041,33 @@ void SettingsRoutes::register_routes(
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
+    // A pending-agent id that is empty, `.` or `..` can never be addressed by a
+    // browser-built URL (dot segments collapse), so an API call carrying one is
+    // refused outright rather than matched against the store.
+    auto refuse_unaddressable_agent_id = [this](const httplib::Request& req,
+                                                httplib::Response& res, const char* verb,
+                                                const std::string& agent_id,
+                                                const std::string& by) -> bool {
+        if (path_segment_ok(agent_id))
+            return false;
+        audit_fn_(req, verb, "denied", "Agent", agent_id, "invalid_agent_id by=" + by);
+        res.status = 400;
+        res.set_header("HX-Trigger",
+                       R"({"showToast":{"message":"Invalid agent id","level":"error"}})");
+        res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+        return true;
+    };
+
     sink.Post(R"(/api/settings/pending-agents/(.+)/approve)",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto agent_id = req.matches[1].str();
                   auto session = auth_fn_(req, res);
                   if (!session)
+                      return;
+                  if (refuse_unaddressable_agent_id(req, res, "enrollment.approve", agent_id,
+                                                    session->username))
                       return;
                   auto approved = auth_mgr_->approve_pending_agent(agent_id, session->username);
                   if (!approved) {
@@ -5945,12 +6092,15 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Post(R"(/api/settings/pending-agents/(.+)/deny)",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto agent_id = req.matches[1].str();
                   auto session = auth_fn_(req, res);
                   if (!session)
+                      return;
+                  if (refuse_unaddressable_agent_id(req, res, "enrollment.deny", agent_id,
+                                                    session->username))
                       return;
                   auto denied = auth_mgr_->deny_pending_agent(agent_id, session->username);
                   if (!denied) {
@@ -5975,12 +6125,15 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Delete(R"(/api/settings/pending-agents/(.+))",
-                [this](const httplib::Request& req, httplib::Response& res) {
+                [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
                     auto agent_id = req.matches[1].str();
                     auto session = auth_fn_(req, res);
                     if (!session)
+                        return;
+                    if (refuse_unaddressable_agent_id(req, res, "enrollment.remove", agent_id,
+                                                      session->username))
                         return;
                     auto removed = auth_mgr_->remove_pending_agent(agent_id);
                     if (!removed) {
@@ -6438,15 +6591,14 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        int rollout_pct = 100;
-        try {
-            if (!rollout_s.empty())
-                rollout_pct = std::stoi(rollout_s);
-        } catch (...) {}
-        if (rollout_pct < 0)
-            rollout_pct = 0;
-        if (rollout_pct > 100)
-            rollout_pct = 100;
+        // A malformed percentage must NOT fall back to 100 (a full-fleet rollout the operator
+        // did not ask for): 400, nothing stored. Shared with the rollout route.
+        const auto rollout_parsed = yuzu::server::parse_rollout_pct(rollout_s);
+        if (!rollout_parsed) {
+            yuzu::server::reject_bad_rollout_pct(res, yuzu::server::RolloutRejectEffect::kStored);
+            return;
+        }
+        const int rollout_pct = *rollout_parsed;
 
         // Shape-check the signature BEFORE the binary is written. A well-sized
         // file of garbage would otherwise be stored, reported "signed" by the
@@ -6733,15 +6885,16 @@ void SettingsRoutes::register_routes(
                   auto version = req.matches[3].str();
                   auto pct_s = extract_form_value(req.body, "rollout_pct");
 
-                  int pct = 100;
-                  try {
-                      if (!pct_s.empty())
-                          pct = std::stoi(pct_s);
-                  } catch (...) {}
-                  if (pct < 0)
-                      pct = 0;
-                  if (pct > 100)
-                      pct = 100;
+                  // Malformed, EMPTY or above 100 => 400, never the 100% default or a clamp to
+                  // it: on an EXISTING package either would silently make it a full-fleet
+                  // rollout. (The upload route keeps its lenient default; it creates the row.)
+                  const auto pct_parsed = yuzu::server::parse_rollout_pct_strict(pct_s);
+                  if (!pct_parsed) {
+                      yuzu::server::reject_bad_rollout_pct(
+                          res, yuzu::server::RolloutRejectEffect::kChanged);
+                      return;
+                  }
+                  const int pct = *pct_parsed;
 
                   // Capture the PRIOR percentage before the write. It is the whole
                   // evidentiary value of this row: #3692's scenario is an admin —

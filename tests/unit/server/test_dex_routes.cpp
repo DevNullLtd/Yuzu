@@ -21,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1287,6 +1288,66 @@ TEST_CASE("DEX routes: /dex lights DEX in the sidebar and ends the breadcrumb on
     CHECK(page->body.find("<a class=\"shell-nav on\" href=\"/dex\" aria-current=\"page\">") !=
           std::string::npos);
     CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>DEX</b>") != std::string::npos);
+}
+
+// Kills: the Trends depth rules in the page shell (guardian_page_ui.cpp) going missing or turning
+// into literal colours. They sit in the baked page, not in a /fragments/dex payload, so the
+// fragment goldens never see them. Same Postgres-free harness as the sidebar test above.
+TEST_CASE("DEX routes: /dex page shell carries the Trends depth rules; tokens only",
+          "[dex][routes][ui]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, /*perm_fn=*/{}, /*store=*/nullptr, /*fleet_fn=*/{},
+                           /*audit_fn=*/{});
+
+    auto page = sink.Get("/dex");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+
+    // One rule's text, selector through closing brace, whitespace collapsed so the source's
+    // line wrapping cannot break a match.
+    auto rule = [&](const std::string& selector) {
+        const auto open = page->body.find(selector + " {");
+        REQUIRE(open != std::string::npos);
+        const auto close = page->body.find('}', open);
+        REQUIRE(close != std::string::npos);
+        std::string out;
+        for (auto i = open; i <= close; ++i) {
+            if (std::isspace(static_cast<unsigned char>(page->body[i]))) {
+                if (out.back() != ' ')
+                    out += ' ';
+            } else {
+                out += page->body[i];
+            }
+        }
+        return out;
+    };
+    auto has = [](const std::string& r, const char* decl) { return r.find(decl) != std::string::npos; };
+
+    const auto card = rule(".gp-sm");
+    CHECK(has(card, "box-shadow: var(--mds-elevation-2);"));
+    const auto lift = rule(".gp-sm:hover");
+    CHECK(has(lift, "transform: translateY(-1px);"));
+    CHECK(has(lift, "border-color: var(--line2);"));
+
+    const auto grid = rule(".gp-heat");
+    CHECK(has(grid, "gap: 2px;"));
+    const auto row = rule(".gp-heat .hrow");
+    CHECK(has(row, "gap: 2px;"));
+    const auto cell = rule(".gp-heat .hrow > i, .gp-hleg i");
+    CHECK(has(cell, "width: 16px; height: 16px;"));
+    CHECK(has(cell, "border-radius: 3px;"));
+    CHECK(has(cell, "box-shadow: inset 0 0 0 1px var(--line);"));
+    const auto hover = rule(".gp-heat .hrow > i:hover");
+    CHECK(has(hover, "outline: 2px solid var(--hl);"));
+    CHECK(has(hover, "transform: scale(1.15);"));
+
+    // Tokens only: none of these rules may carry a hex colour (or any '#').
+    for (const auto* r : {&card, &lift, &grid, &row, &cell, &hover})
+        CHECK(r->find('#') == std::string::npos);
 }
 
 TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") {
@@ -3099,4 +3160,39 @@ TEST_CASE("DEX perf/apps picker route: q/platform/sort params reach the render "
         CHECK(r->status == 200);
         CHECK(r->body.find("chrome.exe") < r->body.find("sshd")); // c before s
     }
+}
+
+// #4644: the perf-devices fragment `limit` is ONE base-10 integer or a 400; it used to
+// fall back to 50 silently on `5x`, `0x10`, `1e2`.
+TEST_CASE("DEX perf devices fragment: a malformed limit is a 400 and a valid one is served",
+          "[pg][dex][perf][routes][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+    yuzu::server::DexPerfFn perf_fn = [](const std::string&) {
+        return yuzu::server::DexPerfSnapshot{};
+    };
+    test::TestRouteSink sink;
+    DexRoutes routes;
+    auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+        perf_fn, yuzu::server::test::FnDexPerfApi::Providers{});
+    routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                           /*responses_fn=*/{}, {}, {}, dex_perf_api);
+    for (const char* bad : {"5x", "0x10", "1e2", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto r = sink.Get(std::string("/fragments/dex/perf/devices?metric=cpu&limit=") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
+    auto ok = sink.Get("/fragments/dex/perf/devices?metric=cpu&limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status != 400);
 }

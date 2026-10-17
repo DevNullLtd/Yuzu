@@ -41,6 +41,7 @@
 #include "../test_helpers.hpp"
 
 #include <chrono>
+#include <cstring>
 #include <ctime>
 #include <optional>
 #include <string>
@@ -568,6 +569,51 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: a non-owner presenting the COR
     auto ok = h.confirm(successor_id, secret);
     REQUIRE(ok);
     CHECK(ok->status == 200);
+}
+
+TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: overlap_secs is strict and a malformed or "
+          "non-object body rotates nothing, a blank body keeps the default (#4644)",
+          "[pg][rest][token][rotation][numeric_params]") {
+    RestTokenRotationHarness h;
+    int n = 0;
+    // The key itself was already an integer check, but 18446744073709551615 wrapped to -1 and a
+    // truncated or non-object body silently rotated with the 7-day default. Each probe is a 400
+    // and the owner keeps exactly one active token (a rotation adds a successor).
+    for (const char* bad : {R"({"overlap_secs":"86400"})", R"({"overlap_secs":86400.5})",
+                            R"({"overlap_secs":1e5})", R"({"overlap_secs":true})",
+                            R"({"overlap_secs":null})", R"({"overlap_secs":[]})",
+                            R"({"overlap_secs":4294967297})",
+                            R"({"overlap_secs":9223372036854775808})",
+                            R"({"overlap_secs":18446744073709551615})", R"({"overlap_secs":-1})",
+                            R"({"overlap_secs":0})", R"({"overlap_secs":86400)", "[]", "5", R"("x")",
+                            "null", "not json"}) {
+        INFO(bad);
+        const auto name = "strict-" + std::to_string(n++);
+        h.create_token_for("alice", name);
+        const auto before = h.token_store->list_active_for_principal("alice").size();
+        auto tokens = h.token_store->list_tokens("alice").value();
+        std::string token_id;
+        for (const auto& t : tokens)
+            if (t.name == name)
+                token_id = t.token_id;
+        REQUIRE_FALSE(token_id.empty());
+        auto res = h.sink.Post("/api/v1/tokens/" + token_id + "/rotate", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.token_store->list_active_for_principal("alice").size() == before);
+    }
+
+    // A blank body and an object without the key keep the 7-day default and rotate.
+    for (const char* ok : {"", "  \r\n\t ", "{}"}) {
+        INFO("body size " << std::strlen(ok));
+        const auto name = "default-" + std::to_string(n++);
+        const auto token_id = h.create_token_for("alice", name);
+        const auto before = h.token_store->list_active_for_principal("alice").size();
+        auto res = h.sink.Post("/api/v1/tokens/" + token_id + "/rotate", ok);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.token_store->list_active_for_principal("alice").size() == before + 1);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

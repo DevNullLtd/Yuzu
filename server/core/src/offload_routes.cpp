@@ -1,13 +1,17 @@
 #include "offload_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "offload_target_model.hpp" // adversarial-review fix (#2146 Batch B5): shared REST+MCP JSON builders (Rule 1)
 #include "outbound_url_policy.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
+#include "web_utils.hpp"             // audit_token (CWE-117: the caller-supplied name is a target_id)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace yuzu::server {
@@ -91,7 +95,10 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       return;
                   }
                   std::string name, url, auth_type_str, auth_credential, event_types;
-                  int batch_size = 1;
+                  // Read WIDE and range-check before narrowing: `body.value("batch_size", 1)`
+                  // as int wrapped 4294967297 to 1 and 4294977296 to 10000 (#4644).
+                  std::int64_t batch_size_wide = 1;
+                  bool batch_size_is_integer = true;
                   bool enabled = true;
                   try {
                       name = body.value("name", std::string{});
@@ -99,12 +106,30 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       auth_type_str = body.value("auth_type", std::string{"none"});
                       auth_credential = body.value("auth_credential", std::string{});
                       event_types = body.value("event_types", std::string{"*"});
-                      batch_size = body.value("batch_size", 1);
+                      if (const auto it = body.find("batch_size"); it != body.end()) {
+                          if (!it->is_number_integer())
+                              batch_size_is_integer = false;
+                          else if (it->is_number_unsigned() &&
+                                   it->get<std::uint64_t>() >
+                                       static_cast<std::uint64_t>(
+                                           std::numeric_limits<std::int64_t>::max()))
+                              batch_size_wide = std::numeric_limits<std::int64_t>::max();
+                          else
+                              batch_size_wide = it->get<std::int64_t>();
+                      }
                       enabled = body.value("enabled", true);
                   } catch (const nlohmann::json::exception&) {
                       // A present-but-wrong-typed field (e.g. batch_size as a
                       // string) throws type_error out of body.value() — that's
                       // still a caller mistake, not a server fault (#3097).
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
+                               "invalid_field_type");
+                      send_bad_json(res);
+                      return;
+                  }
+                  if (!batch_size_is_integer) {
+                      // A float/bool/null/string batch_size: same caller mistake as a
+                      // wrong-typed field above (a float used to truncate silently).
                       (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
                                "invalid_field_type");
                       send_bad_json(res);
@@ -116,6 +141,17 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                                       "application/json");
                       return;
                   }
+                  if (batch_size_wide < 1 || batch_size_wide > kMaxOffloadBatchSize) {
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
+                               "validation_failed");
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res, "batch_size must be an integer from 1 to " +
+                                                    std::to_string(kMaxOffloadBatchSize)),
+                          "application/json");
+                      return;
+                  }
+                  const int batch_size = static_cast<int>(batch_size_wide);
                   auto auth_type = offload_auth_type_from_string(auth_type_str);
                   if (offload_auth_type_to_string(auth_type) != auth_type_str) {
                       // offload_auth_type_from_string() folds any unrecognized
@@ -299,8 +335,16 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                  // ceiling.
                  int limit = 50;
                  auto limit_str = req.get_param_value("limit");
-                 if (!limit_str.empty()) {
-                     try { limit = std::stoi(limit_str); } catch (...) {}
+                 if (req.has_param("limit")) {
+                     const auto v = yuzu::server::parse_query_int<int>(limit_str);
+                     if (!v) {
+                         res.status = 400;
+                         res.set_content(
+                             detail::a4_error(res, "invalid numeric query parameter: limit"),
+                             "application/json");
+                         return;
+                     }
+                     limit = *v;
                  }
                  limit = std::clamp(limit, 1, 1000);
                  auto deliveries = offload_store->get_deliveries(*id_opt, limit);

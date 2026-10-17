@@ -1123,6 +1123,9 @@ struct McpTestServer {
     /// inject the read seam so the tool runs against fixtures, no Postgres.
     /// Empty keeps every other test on the "discovery store unavailable" path.
     yuzu::server::DiscoveredDevicesReadFn discovered_devices_reader_for_test{};
+    /// sync_hardware_software: the shared fleet-run Runner (REST POST /api/v1/hardware/sync uses
+    /// the same type). Empty keeps every other test on the "not configured" path.
+    std::shared_ptr<yuzu::server::software_sync::Runner> software_sync_runner_for_test;
 
     /// #2146 Batch B2 — optionally wire a real ResultSetStore so the 12
     /// result-set MCP tools can be exercised end-to-end against live
@@ -1643,6 +1646,8 @@ private:
         mcp.set_deployment_run_store(deployment_run_store_for_test);
         if (discovered_devices_reader_for_test)
             mcp.set_discovered_devices_reader(discovered_devices_reader_for_test);
+        if (software_sync_runner_for_test)
+            mcp.set_software_sync_runner(software_sync_runner_for_test);
         // #2146 Batch B2: result_set_store ALSO rides a setter, same pattern
         // as preflight_run_store immediately above — wire before the
         // handlers are built.
@@ -2517,6 +2522,50 @@ TEST_CASE("MCP #3937: mint_engine_credential fails CLOSED and withholds the secr
     // The one-time secret is WITHHELD — the raw_token key never appears.
     CHECK(r->body.find("\"raw_token\"") == std::string::npos);
     // Attribution: the credential DID commit (mutation happened) though audit dropped.
+    CHECK(store.list_active_for_principal(principal).size() == 1);
+}
+
+// A wrong-typed `ttl_days` used to fall to `param_int`'s default of 90, i.e. the MAXIMUM lifetime:
+// a typo'd short lifetime silently minted the longest credential the tool allows (#4644).
+TEST_CASE("MCP mint_engine_credential: a wrong-typed ttl_days is -32602 and mints nothing",
+          "[mcp][pg][engine_principal][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-mint-ttl-type";
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+
+    for (const char* bad : {"\"7\"", "7.5", "true", "null", "18446744073709551615"}) {
+        INFO("ttl_days=" << bad);
+        auto r = ts.call(
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+                        R"("params":{"name":"mint_engine_credential","arguments":)"
+                        R"({"principal_id":"engine:mcp-mint-ttl-type","ttl_days":)") +
+            bad + "}}}");
+        REQUIRE(r->status == 200);
+        auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("ttl_days") != std::string::npos);
+    }
+    CHECK(store.list_active_for_principal(principal).empty());
+
+    // Control: an in-range integer ttl_days is accepted by the same call shape, so the -32602s
+    // above are the value's doing and not a broken request.
+    auto ok = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"mint_engine_credential","arguments":)"
+        R"({"principal_id":"engine:mcp-mint-ttl-type","ttl_days":7}}})");
+    REQUIRE(ok->status == 200);
+    auto ok_body = nlohmann::json::parse(ok->body);
+    CHECK_FALSE(ok_body.contains("error"));
     CHECK(store.list_active_for_principal(principal).size() == 1);
 }
 
@@ -4874,6 +4923,44 @@ TEST_CASE("MCP Guardian: create_guardian_rule creates a legacy yaml_source rule,
     CHECK(get_data["yaml_source"] == "# legacy\n");
 }
 
+// #4644: an update bumps the stored version by one, so a lenient read
+// that saturated an above-INT64_MAX `version` to INT64_MAX made the next bump a signed
+// overflow. Strict and bounded to 1..INT32_MAX instead.
+TEST_CASE("MCP Guardian: create_guardian_rule bounds version to 1..2147483647",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+    int rpc_id = 300;
+    auto create = [&](const std::string& rid, const std::string& version_json) {
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(++rpc_id) +
+            R"(,"params":{"name":"create_guardian_rule","arguments":{"rule_id":")" + rid +
+            R"(","name":"n-)" + rid + R"(","yaml_source":"# legacy\n","version":)" +
+            version_json + R"(}}})";
+        auto res = ts.call(body);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const char* bad : {"0", "-1", "2147483648", "4294967296", "9223372036854775807",
+                            "18446744073709551615", "\"3\"", "1.5"}) {
+        INFO("version=" << bad);
+        auto b = create(std::string("v-bad-") + std::to_string(rpc_id), bad);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(b["error"]["message"].get<std::string>().find("1 to 2147483647") !=
+              std::string::npos);
+    }
+    for (const char* ok : {"1", "2147483647"}) {
+        INFO("version=" << ok);
+        auto b = create(std::string("v-ok-") + ok, ok);
+        CHECK_FALSE(b.contains("error"));
+    }
+}
+
 TEST_CASE("MCP Guardian: create_guardian_rule denies a service-scoped token "
           "(fleet-wide authoring, no per-service slice to confine to)",
           "[mcp][integration][guardian][security]") {
@@ -5032,6 +5119,42 @@ TEST_CASE("MCP Guardian: update_guardian_rule bumps version and rejects an "
     auto mode_body = nlohmann::json::parse(mode_res->body);
     REQUIRE(mode_body.contains("error"));
     CHECK(ts.audit_log.back() == "guaranteed_state.rule.update|denied");
+}
+
+// Same exhausted-counter guard as REST: a row stored at the bound (or written out of band)
+// must refuse the bump with -32602 and a denied audit row, never overflow the increment.
+TEST_CASE("MCP Guardian: update_guardian_rule refuses an exhausted version counter",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r-exh", "rule-exhausted");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto r = yuzu::server::pg::exec_params(
+            conn.get(),
+            "UPDATE guaranteed_state_store.guaranteed_state_rules SET version = "
+            "9223372036854775807 WHERE rule_id = 'r-exh'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":208,"params":{"name":"update_guardian_rule",)"
+        R"("arguments":{"rule_id":"r-exh","severity":"high"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("counter exhausted") !=
+          std::string::npos);
+    auto stored = store.get_rule("r-exh");
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->has_value());
+    CHECK((*stored)->version == std::numeric_limits<int64_t>::max()); // untouched
 }
 
 TEST_CASE("MCP Guardian: update_guardian_rule denies a service-scoped token",
@@ -7726,6 +7849,56 @@ TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without a
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
 
+// #4644: `window` on the three DEX reads that did not validate it silently resolved junk to 7d,
+// so a caller asking for `90d`, `30` or a number got 7 days of data under a window it never named.
+TEST_CASE("MCP DEX: list_dex_signals / get_dex_signal_scope / get_dex_signal_detail refuse a "
+          "window outside 24h|7d|30d|all, an empty one included; only an absent one keeps the default (#4644)",
+          "[pg][mcp][integration][dex][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    int call_id = 100;
+    auto call = [&](const char* tool, const std::string& window_member) {
+        std::string args = std::string(R"({"obs_type":"process.crashed")") + window_member + "}";
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(call_id++) + R"(,"params":{"name":")" + tool +
+                       R"(","arguments":)" + args + "}}");
+    };
+    for (const char* tool : {"list_dex_signals", "get_dex_signal_scope", "get_dex_signal_detail"}) {
+        for (const char* bad : {R"(,"window":"90d")", R"(,"window":"7D")", R"(,"window":"30")",
+                                R"(,"window":5)", R"(,"window":null)", R"(,"window":["7d"])",
+                                R"(,"window":true)", R"(,"window":"")"}) {
+            INFO(tool << " " << bad);
+            auto res = call(tool, bad);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find("invalid window") !=
+                  std::string::npos);
+        }
+        for (const char* ok : {"", R"(,"window":"24h")", R"(,"window":"7d")",
+                               R"(,"window":"30d")", R"(,"window":"all")"}) {
+            INFO(tool << " " << ok);
+            auto res = call(tool, ok);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            CHECK(body.contains("result"));
+        }
+    }
+    // A refused window leaves no behavioural-view audit row for a read that never ran; the
+    // accepted get_dex_signal_detail calls above wrote exactly one per call (5).
+    int views = 0;
+    for (const auto& a : ts.audit_log)
+        if (a.find("dex.signal.view") != std::string::npos)
+            ++views;
+    CHECK(views == 5);
+}
+
 // WS-A4 PR-1 Gate 7 fix round: this tool reverted off `fleet_read_fn_`/real RBAC composition
 // back onto `perm_fn` + `deny_fleet_wide_service_scoped`, so the two rounds'
 // worth of fleet-read-gate coverage this test replaced (a fixture-faked
@@ -7930,6 +8103,60 @@ TEST_CASE("MCP DEX: get_dex_device_score off-enum window -> invalid params, neve
     REQUIRE(res);
     CHECK(res->body.find("invalid window") != std::string::npos);
     CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+// #4644 round 3 (K3): get_dex_device_score read `window` through param_str, which turned a PRESENT
+// non-string (30, null, true) into 7d. It now shares dex_window_arg with the three fleet tools.
+TEST_CASE("MCP DEX: get_dex_device_score refuses a present non-string or empty window; only an "
+          "absent one defaults to 7d (#4644)",
+          "[pg][mcp][integration][dex][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    int call_id = 1000;
+    auto call = [&](const std::string& window_member) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(call_id++) +
+                       R"(,"params":{"name":"get_dex_device_score","arguments":{"agent_id":"WS-1")" +
+                       window_member + "}}}");
+    };
+    for (const char* bad : {R"(,"window":30)", R"(,"window":null)", R"(,"window":true)",
+                            R"(,"window":"")", R"(,"window":["7d"])", R"(,"window":"90d")"}) {
+        INFO(bad);
+        auto res = call(bad);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("invalid window") !=
+              std::string::npos);
+    }
+    {
+        auto res = call("");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        auto payload =
+            nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        CHECK(payload["window"] == "7d");
+    }
+    for (const char* ok : {"24h", "7d", "30d", "all"}) {
+        INFO(ok);
+        auto res = call(std::string(R"(,"window":")") + ok + "\"");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        auto payload =
+            nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        CHECK(payload["window"] == ok);
+    }
 }
 
 TEST_CASE("MCP DEX: list_dex_apps off-enum window -> invalid params, never a "
@@ -10253,6 +10480,22 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    SECTION("#4644: a wrong-typed or oversized window is kInvalidParams, not 7 days") {
+        for (const char* window : {R"("7")", "1.5", "true", "18446744073709551615",
+                                   "9223372036854775808"}) {
+            INFO(window);
+            auto res = ts.call(
+                std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0","window":)") +
+                window + "}}}");
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        }
+        // An in-range window (clamped to the retention) still works.
+        auto ok = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0","window":30}}})");
+        CHECK(nlohmann::json::parse(ok->body).contains("result"));
     }
 }
 
@@ -13385,6 +13628,44 @@ TEST_CASE("MCP list_executions: confined caller sees only own dispatches (#1634)
     auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"]["executions"];
     REQUIRE(sc.size() == 1);
     CHECK(sc[0]["dispatched_by"] == "bob");
+}
+
+// param_int32 narrows its int64 reading by SATURATING: 4294967296 used to wrap to 0, which
+// list_executions then served as a zero-row page. Now a huge limit is a large limit and reaches
+// the tool's own ceiling (500), so the caller's two executions are both returned.
+TEST_CASE("MCP list_executions: a limit above INT_MAX reaches the ceiling instead of wrapping "
+          "to an empty page",
+          "[pg][mcp][integration][execution]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    for (int i = 0; i < 2; ++i) {
+        yuzu::server::Execution e;
+        e.definition_id = "def-list-wrap";
+        e.dispatched_by = "bob";
+        e.status = "running";
+        REQUIRE(tracker.create_execution(e).has_value());
+    }
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+    const auto token = authz.mint_bob();
+    for (const char* limit : {"4294967296", "2147483648", "9223372036854775807",
+                              "18446744073709551615"}) {
+        INFO("limit=" << limit);
+        auto res = ts.call_raw(
+            "POST",
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":733,"params":{"name":"list_executions",)"
+                        R"("arguments":{"definition_id":"def-list-wrap","limit":)") + limit + "}}}",
+            {{"Authorization", "Bearer " + token}});
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"]["executions"];
+        CHECK(sc.size() == 2);
+    }
 }
 
 TEST_CASE("MCP list_executions: confined caller's counts reflect only in-scope, "
@@ -18459,6 +18740,80 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
     CHECK(ts.audit_log.back() == "mcp.list_issued_certs|success");
 }
 
+TEST_CASE("MCP CA: list_issued_certs reads limit/offset as 64 bits, saturates, and refuses a "
+          "non-integer (#4644)",
+          "[mcp][integration][pki][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* serial : {"A1", "A2", "A3"}) {
+        yuzu::server::IssuedCertRecord rec;
+        rec.serial_hex = serial;
+        rec.subject = "agent-limit";
+        rec.purpose = "agent";
+        rec.not_after = 4102444800;
+        rec.issued_at = 1700000000;
+        REQUIRE(store.record_issued(rec).has_value());
+    }
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("operator");
+
+    const auto call = [&ts](const std::string& args) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{)"
+                           R"("name":"list_issued_certs","arguments":)" +
+                           args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto payload_of = [&call](const std::string& args) {
+        auto body = call(args);
+        REQUIRE(body.contains("result"));
+        return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    };
+
+    // Absent: the documented defaults.
+    {
+        auto p = payload_of("{}");
+        CHECK(p["limit"] == 200);
+        CHECK(p["offset"] == 0);
+        CHECK(p["count"] == 3);
+    }
+    // In range, and the boundaries.
+    CHECK(payload_of(R"({"limit":2})")["count"] == 2);
+    CHECK(payload_of(R"({"limit":1})")["limit"] == 1);
+    CHECK(payload_of(R"({"limit":1000})")["limit"] == 1000);
+    CHECK(payload_of(R"({"limit":1001})")["limit"] == 1000);
+    CHECK(payload_of(R"({"offset":2})")["count"] == 1);
+    CHECK(payload_of(R"({"offset":1000000})")["offset"] == 1000000);
+    CHECK(payload_of(R"({"offset":1000001})")["offset"] == 1000000);
+    // Below the range clamps to the nearest bound, as it always did.
+    CHECK(payload_of(R"({"limit":0})")["limit"] == 1);
+    CHECK(payload_of(R"({"limit":-5})")["limit"] == 1);
+    CHECK(payload_of(R"({"offset":-1})")["offset"] == 0);
+    // The wrapped values: 4294967297 narrowed to 1 and 4294967296 to 0 through the int read.
+    {
+        auto p = payload_of(R"({"limit":4294967297})");
+        CHECK(p["limit"] == 1000);
+        CHECK(p["count"] == 3);
+    }
+    CHECK(payload_of(R"({"limit":4294967296})")["limit"] == 1000);
+    CHECK(payload_of(R"({"offset":4294967296})")["offset"] == 1000000);
+    CHECK(payload_of(R"({"offset":4294967297})")["offset"] == 1000000);
+    // A present non-integer is -32602 (the old read threw a type error on a string), as is an
+    // unsigned value that does not fit a signed 64-bit integer.
+    for (const char* bad :
+         {R"({"limit":"5"})", R"({"limit":5.5})", R"({"limit":null})", R"({"limit":true})",
+          R"({"limit":18446744073709551615})", R"({"offset":"5"})", R"({"offset":5.5})",
+          R"({"offset":null})", R"({"offset":false})", R"({"offset":18446744073709551615})"}) {
+        INFO(bad);
+        auto body = call(bad);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == -32602);
+    }
+}
+
 TEST_CASE("MCP CA: list_issued_certs is allowed on the readonly tier (Security:Read)",
           "[mcp][integration][pki][security][pg]") {
     // #1240 L3: the readonly tier permits ALL Read ops, so a read-only agentic
@@ -20296,6 +20651,46 @@ TEST_CASE("MCP operator surface: mint_upload_grant writes a real UploadGrantStor
     REQUIRE(ts.audit_log.size() == 2);
     CHECK(ts.audit_log[0] == "upload_grant.mint|success");
     CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
+}
+
+// #4644: a lenient read saturated an above-INT64_MAX declared_max_size
+// to INT64_MAX, which the store accepts (it only rejects <= 0); the old wrap to -1 was
+// refused. Strict now: reject the value, accept every positive int64 below it.
+TEST_CASE("MCP operator surface: mint_upload_grant rejects a declared_max_size that does not "
+          "fit a signed 64-bit integer",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+    int rpc_id = 0;
+    auto mint = [&](const std::string& size_json) {
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(++rpc_id) +
+            R"(,"params":{"name":"mint_upload_grant","arguments":{"agent_id":"agent-strict",)"
+            R"("declared_max_size":)" + size_json + R"(}}})";
+        auto res = ts.call(body);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const char* bad : {"18446744073709551615", "9223372036854775808", "\"4096\"", "4096.5"}) {
+        INFO("declared_max_size=" << bad);
+        auto b = mint(bad);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(b["error"]["message"].get<std::string>().find("signed 64-bit") !=
+              std::string::npos);
+    }
+    auto ok = mint("4294967296");  // > INT_MAX is a legitimate size (4 GiB)
+    CHECK_FALSE(ok.contains("error"));
+    auto rows = store.list_for_agent("agent-strict");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].declared_max_size == 4294967296LL);
 }
 
 TEST_CASE("MCP operator surface: list_upload_grants is confined to what's actually in the "
@@ -26682,6 +27077,8 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"create_api_token", nlohmann::json::parse(R"({"name":"ci-key"})")},
         {"revoke_api_token", nlohmann::json::parse(R"({"token_id":"abc123"})")},
         {"unlock_account", nlohmann::json::parse(R"({"username":"alice"})")},
+        // Execution:Execute twin of POST /api/v1/hardware/sync.
+        {"sync_hardware_software", nlohmann::json::parse(R"({"scope":"__all__"})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()
@@ -30236,6 +30633,42 @@ TEST_CASE("MCP get_execution_statistics_by_agent: reads LIVE per-agent rollup, s
     CHECK(ts.audit_log[0] == "mcp.get_execution_statistics_by_agent|success");
 }
 
+// The REST twin is confined through require_fleet_read and admits a service-scoped token as a
+// confined view; the MCP tool deliberately stays `denied` (the default ServiceScopeClass: it
+// is not classified `confined` because that needs a tested downstream mechanism on this
+// transport). Pin both halves of the decided divergence so flipping either is a visible,
+// reviewed change (the REST half is in test_rest_executions_v1_twins.cpp).
+TEST_CASE("MCP get_execution_statistics_by_agent: a service-scoped token is denied before "
+          "fleet_read_fn runs",
+          "[mcp][integration][security][service_scope]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.metrics_for_test = &reg;
+    bool fleet_read_fn_reached = false; // captured bool: see the #4980 test above for why
+    ts.fleet_read_fn_for_test = [&fleet_read_fn_reached](
+                                    const httplib::Request&, httplib::Response&,
+                                    const std::string&,
+                                    const std::string&) -> yuzu::server::authz::FleetReadGate {
+        fleet_read_fn_reached = true;
+        return {.admitted = true, .scope = {}};
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":51,"params":{"name":)"
+        R"("get_execution_statistics_by_agent","arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK_FALSE(fleet_read_fn_reached);
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.get_execution_statistics_by_agent|denied")
+            saw_denied = true;
+    CHECK(saw_denied);
+}
+
 TEST_CASE("MCP get_execution_statistics_by_agent: an invalid limit answers kInvalidParams, "
           "not a silent default (retry-hint-exempt: malformed input)",
           "[pg][mcp][integration][operator_surface]") {
@@ -30253,6 +30686,97 @@ TEST_CASE("MCP get_execution_statistics_by_agent: an invalid limit answers kInva
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == mcp::kInvalidParams);
+}
+
+// The schema declares limit minimum:1, so a non-positive limit is -32602 rather than the old
+// silent substitution of the default 50 (which made the declared schema untrue).
+TEST_CASE("MCP execution statistics by-agent and by-definition tools: a limit below 1 is "
+          "kInvalidParams matching the declared schema",
+          "[pg][mcp][integration][operator_surface][numeric_params]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    int next_id = 200;
+    for (const char* tool :
+         {"get_execution_statistics_by_agent", "get_execution_statistics_by_definition"}) {
+        for (const char* limit : {"0", "-1", "-9223372036854775807"}) {
+            INFO(tool << " limit=" << limit);
+            auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                               std::to_string(next_id++) + R"(,"params":{"name":")" + tool +
+                               R"(","arguments":{"limit":)" + limit + "}}}");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == mcp::kInvalidParams);
+        }
+        auto ok = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                          std::to_string(next_id++) + R"(,"params":{"name":")" + tool +
+                          R"(","arguments":{"limit":1}}})");
+        REQUIRE(ok);
+        CHECK_FALSE(nlohmann::json::parse(ok->body).contains("error"));
+    }
+}
+
+TEST_CASE("MCP execution statistics tools: since is presence-tracked and since of zero matches what "
+          "omitting it matches while a negative or non-integer since is kInvalidParams (#4644)",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-since", "succeeded", 1, 1, 0, now - 300, now - 290);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+    b3_insert_agent_status(tracker, *id1, "agent-since-1", "success", 0, now - 300, now - 290);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    int next_id = 100;
+    const auto call = [&](const char* tool, const std::string& args) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                           std::to_string(next_id++) + R"(,"params":{"name":")" + tool +
+                           R"(","arguments":)" + args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const char* tool :
+         {"get_execution_statistics_by_agent", "get_execution_statistics_by_definition"}) {
+        INFO(tool);
+        const auto rows = [&](const std::string& args) {
+            auto body = call(tool, args);
+            REQUIRE_FALSE(body.contains("error"));
+            auto payload =
+                nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+            return payload["data"].size();
+        };
+        const auto absent = rows("{}");
+        CHECK(absent == 1);
+        CHECK(rows(R"({"since":0})") == absent);
+        CHECK(rows(R"({"since":1})") == absent);
+        // A bound in the future excludes the row: a supplied since is a literal bound.
+        CHECK(rows("{\"since\":" + std::to_string(now + 3600) + "}") == 0);
+        for (const char* bad : {R"({"since":-1})", R"({"since":-9223372036854775807})"}) {
+            INFO(bad);
+            auto body = call(tool, bad);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == mcp::kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>() == "since must not be negative");
+        }
+        for (const char* bad : {R"({"since":"0"})", R"({"since":null})", R"({"since":1.5})",
+                                R"({"since":18446744073709551615})"}) {
+            INFO(bad);
+            auto body = call(tool, bad);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == mcp::kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>() == "since must be a JSON integer");
+        }
+    }
 }
 
 TEST_CASE("MCP get_execution_statistics_by_agent: a too-long or control-character "
@@ -30293,8 +30817,18 @@ TEST_CASE("MCP get_execution_statistics_by_agent: denies without Execution:Read"
 
     McpTestServer ts;
     ts.execution_tracker_for_test = &tracker;
-    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
-        return !(sec == "Execution" && op == "Read");
+    // #3526: the tool's SOLE gate is now fleet_read_fn_ (the admit-then-filter chokepoint),
+    // which owns the Execution:Read decision, so the denial is modelled on that fake, not on
+    // perm_override_for_test (which only the bare perm_fn consults).
+    std::string securable_seen, operation_seen;
+    ts.fleet_read_fn_for_test = [&](const httplib::Request&, httplib::Response& r,
+                                    const std::string& sec,
+                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
+        securable_seen = sec;
+        operation_seen = op;
+        r.status = 403;
+        r.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
+        return {false, yuzu::server::authz::deny_all()};
     };
     ts.start("readonly");
 
@@ -30303,6 +30837,8 @@ TEST_CASE("MCP get_execution_statistics_by_agent: denies without Execution:Read"
         R"("get_execution_statistics_by_agent","arguments":{}}})");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(securable_seen == "Execution");
+    CHECK(operation_seen == "Read");
 }
 
 // ── get_execution_statistics_by_definition ────────────────────────────────
@@ -30853,17 +31389,93 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
         CHECK(body["error"]["code"] == kInvalidParams);
     }
 
-    SECTION("create_result_set_from_inventory_query: a condition field with the wrong JSON type "
-            "(e.g. a number instead of a string) is treated as absent, never an uncaught "
+    SECTION("create_result_set_from_inventory_query: a numeric condition value under a "
+            "comparison operator is accepted (rendered as text), never an uncaught "
             "nlohmann::json::type_error") {
         ts.start();
         auto res = ts.call(
             R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":123}]}}})");
         REQUIRE(res);
-        // Reaches the store-unavailable branch in this fixture (no InventoryStore wired) rather
-        // than crashing - proves the type-mismatched "value" field was safely defaulted, not
-        // thrown on, before the store call.
-        CHECK(res->status != 500);
+        REQUIRE(res->status == 200);
+        // This fixture wires no result-set / inventory store, so the call ends at the
+        // store-unavailable gate with kInternalError. kInvalidParams here would mean the numeric
+        // operand was refused at the conditions parse, the defect this section guards.
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(body["error"]["code"] != kInvalidParams);
+    }
+
+    SECTION("create_result_set_from_inventory_query: a JSON integer or a decimal string is "
+            "accepted; EVERY JSON float (1e3, 5.0, 5.5) is -32602 with the string hint") {
+        ts.start();
+        int call_id = 70;
+        for (const char* value : {"1000", "5", R"("5.0")", R"("1234567890123456.0")"}) {
+            const std::string req =
+                R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
+                R"(,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"p","field":"f","op":">=","value":)" +
+                value + R"(}]}}})";
+            INFO(req);
+            auto res = ts.call(req);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInternalError); // no store wired: past the parse
+        }
+        for (const char* value : {"1e3", "5.0", "5.5", "-0.0", "1234567890123456.0"}) {
+            const std::string req =
+                R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
+                R"(,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"p","field":"f","op":">=","value":)" +
+                value + R"(}]}}})";
+            INFO(req);
+            auto res = ts.call(req);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find("JSON string") !=
+                  std::string::npos);
+        }
+    }
+
+    SECTION("create_result_set_from_inventory_query: a condition operand that cannot be read "
+            "as the declared type is -32602, never the empty string (#4644: value 5 under `>` "
+            "became \"\" and selected every device that had the field)") {
+        ts.start();
+        int call_id = 60;
+        for (const char* cond :
+             {R"({"plugin":"p","field":"f","op":">","value":null})",
+              R"({"plugin":"p","field":"f","op":">","value":[5]})",
+              R"({"plugin":"p","field":"f","op":">","value":{"n":5}})",
+              R"({"plugin":"p","field":"f","op":">","value":true})",
+              R"({"plugin":"p","field":"f","op":"contains","value":5})",
+              R"({"plugin":"p","field":"f","op":5,"value":"5"})",
+              R"({"plugin":["p"],"field":"f","op":">","value":"5"})",
+              // Every JSON float is refused (CDX-P1-01: 9007199254740993.0 is already 2^53 once
+              // parsed); a decimal string of 2^53 or more is refused under the ordering operators.
+              R"({"plugin":"p","field":"f","op":">","value":9007199254740993.0})",
+              R"({"plugin":"p","field":"f","op":"==","value":1e300})",
+              R"({"plugin":"p","field":"f","op":"<=","value":"9007199254740993.5"})",
+              // A JSON float with a fraction is refused (its text is gone): send it as a string
+              // under an ordering operator. A plain decimal string out of the double range is
+              // refused too (Gate 8 round 13).
+              R"({"plugin":"p","field":"f","op":">=","value":0.5})",
+              R"({"plugin":"p","field":"f","op":"==","value":22359.09411})",
+              R"({"plugin":"p","field":"f","op":">","value":"5.00000000000000001"})",
+              R"({"plugin":"p","field":"f","op":">","value":"1e400"})"}) {
+            const std::string req =
+                R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
+                R"(,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[)" +
+                cond + R"(]}}})";
+            INFO(req);
+            auto res = ts.call(req);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find("conditions[]") !=
+                  std::string::npos);
+        }
     }
 }
 
@@ -30983,6 +31595,53 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
         CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
                           {{"tool", "reevaluate_result_set"}, {"reason", "arg_too_large"}})
                   .value() == 1.0);
+    }
+
+    SECTION("create_result_set_from_instruction_result: a malformed matcher n is -32602 and "
+            "nothing is dispatched (#4644)") {
+        YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+        yuzu::server::pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore instr(instr_pool);
+        REQUIRE(instr.is_open());
+        ts.instruction_store_for_test = &instr;
+        ts.start("operator");
+        int call_id = 40;
+        for (const char* n :
+             {"4294967297", "9223372036854775808", "18446744073709551615", "-1", "0", "1e3", "5.5",
+              "\"7\"", "\"\"", "null", "true", "[]", "{}"}) {
+            const std::string req =
+                R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
+                R"(,"params":{"name":"create_result_set_from_instruction_result","arguments":{)"
+                R"("instruction_id":"x","matcher":{"kind":"tar_rows_ge","n":)" +
+                n + R"(}}}})";
+            INFO(req);
+            auto res = ts.call(req);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find("matcher.n") !=
+                  std::string::npos);
+        }
+        // A PRESENT matcher that is not a JSON object, or whose kind is not a string, used to be
+        // dropped silently ("accept every responder"): -32602 now.
+        for (const char* m : {"\"x\"", "5", "[]", "null", "true", "{\"kind\":1}", "{\"kind\":null}",
+                              "{\"column\":5,\"op\":\"eq\"}", "{\"column\":\"c\",\"op\":[]}",
+                              "{\"column\":\"c\",\"op\":\"eq\",\"value\":5}"}) {
+            const std::string req =
+                R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
+                R"(,"params":{"name":"create_result_set_from_instruction_result","arguments":{)"
+                R"("instruction_id":"x","matcher":)" +
+                m + R"(}}})";
+            INFO(req);
+            auto res = ts.call(req);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find("matcher") !=
+                  std::string::npos);
+        }
     }
 
     SECTION("create_result_set_from_instruction_result: oversized instruction_id, matcher "
@@ -34405,6 +35064,147 @@ TEST_CASE("MCP B5: create_offload_target rejects a non-integer batch_size",
     CHECK(body["error"]["message"].get<std::string>().find("batch_size") != std::string::npos);
 }
 
+// The lenient param_int saturates an unsigned value above INT64_MAX to INT64_MAX instead of
+// wrapping it to -1. get_offload_target reads `id` with it and treats anything below 1 as a
+// malformed id, so the wrapped value would answer "id must be a positive integer" where the
+// saturated one is a positive id that simply does not exist ("not found").
+TEST_CASE("MCP get_offload_target: an unsigned id above INT64_MAX saturates to a not-found id "
+          "never the -1 sentinel",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+    auto call = [&](const std::string& id_json) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"get_offload_target",)"
+            R"("arguments":{"id":)" + id_json + "}}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const char* huge : {"18446744073709551615", "9223372036854775808", "9223372036854775807"}) {
+        INFO("id=" << huge);
+        auto b = call(huge);
+        REQUIRE(b.contains("error"));
+        const auto msg = b["error"]["message"].get<std::string>();
+        CHECK(msg.find("not found") != std::string::npos);
+        CHECK(msg.find("positive integer") == std::string::npos);
+    }
+    // Control: 0 and -1 are still the malformed-id answer.
+    for (const char* bad : {"0", "-1"}) {
+        INFO("id=" << bad);
+        auto b = call(bad);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["message"].get<std::string>().find("positive integer") !=
+              std::string::npos);
+    }
+}
+
+// #4644: the tool schema declares batch_size 1..10000. The saturating
+// narrowing turned 4294967296 (and UINT64_MAX) into INT_MAX, an accepted value that
+// lets the offload buffer grow without bound before its first flush. Enforce the range.
+TEST_CASE("MCP B5: create_offload_target enforces batch_size 1..10000 and rejects the "
+          "values a narrowing would alias",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+    int rpc_id = 0;
+    auto create = [&](const std::string& name, const std::string& batch_json) {
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(++rpc_id) +
+            R"(,"params":{"name":"create_offload_target","arguments":{"name":")" + name +
+            R"(","url":"https://example.com/hook","batch_size":)" + batch_json + R"(}}})";
+        auto res = ts.call(body);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const char* bad : {"0", "-1", "10001", "2147483648", "4294967296",
+                            "18446744073709551615", "9223372036854775807"}) {
+        INFO("batch_size=" << bad);
+        auto b = create(std::string("bad-") + bad, bad);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        // An unsigned value above INT64_MAX is refused earlier, as not representable;
+        // every other bad value reaches the range check.
+        const auto msg = b["error"]["message"].get<std::string>();
+        CHECK(msg.find(std::string_view(bad) == "18446744073709551615" ? "JSON integer"
+                                                                         : "1 to 10000") !=
+              std::string::npos);
+    }
+    for (const char* ok : {"1", "10000"}) {
+        INFO("batch_size=" << ok);
+        auto b = create(std::string("ok-") + ok, ok);
+        CHECK_FALSE(b.contains("error"));
+    }
+}
+
+// REST parity: a refused batch_size leaves a denied offload_target.create row, like the REST
+// twin (invalid_field_type for a wrong type, validation_failed for an out-of-range integer),
+// and creates nothing. An empty name writes no range row, as on REST.
+TEST_CASE("MCP B5: create_offload_target audits a refused batch_size as a denied row",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+    int rpc_id = 0;
+    auto create = [&](const std::string& name, const std::string& batch_json,
+                      bool with_url = true) {
+        nlohmann::json args = nlohmann::json::object();
+        if (with_url)
+            args["url"] = "https://example.com/hook";
+        if (!name.empty())
+            args["name"] = name;
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(++rpc_id) +
+            R"(,"params":{"name":"create_offload_target","arguments":)" +
+            args.dump().substr(0, args.dump().size() - 1) + R"(,"batch_size":)" + batch_json +
+            "}}}";
+        auto res = ts.call(body);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    struct Case {
+        const char* batch;
+        const char* detail;
+    };
+    // 18446744073709551615 is refused as not-an-integer by the strict reader (REST saturates it
+    // and records validation_failed), so MCP records invalid_field_type for it.
+    for (const Case c : {Case{"\"10\"", "invalid_field_type"}, Case{"1.5", "invalid_field_type"},
+                         Case{"18446744073709551615", "invalid_field_type"},
+                         Case{"0", "validation_failed"}, Case{"10001", "validation_failed"}}) {
+        INFO("batch_size=" << c.batch);
+        const auto before = ts.audit_log.size();
+        auto b = create("audited-target", c.batch);
+        REQUIRE(b.contains("error"));
+        REQUIRE(ts.audit_log.size() == before + 1);
+        CHECK(ts.audit_log.back() == "offload_target.create|denied");
+        CHECK(ts.audit_target_ids.back() == "audited-target");
+        CHECK(ts.audit_details.back() == c.detail);
+    }
+    // No empty-target row for a range reject with no name, or with a name and no url.
+    const auto before = ts.audit_log.size();
+    auto noname = create("", "0");
+    REQUIRE(noname.contains("error"));
+    CHECK(ts.audit_log.size() == before);
+    auto nourl = create("audited-target", "0", /*with_url=*/false);
+    REQUIRE(nourl.contains("error"));
+    CHECK(ts.audit_log.size() == before);
+    // A wrong-typed batch_size is audited even with no name (REST parity), with an empty target.
+    auto typed = create("", "\"10\"");
+    REQUIRE(typed.contains("error"));
+    REQUIRE(ts.audit_log.size() == before + 1);
+    CHECK(ts.audit_log.back() == "offload_target.create|denied");
+    CHECK(ts.audit_target_ids.back().empty());
+    CHECK(ts.audit_details.back() == "invalid_field_type");
+    // Nothing was created.
+    auto listed = store->list();
+    REQUIRE(listed.has_value());
+    CHECK(listed->empty());
+}
+
 // Gate 8 fix (#2146 Batch B5 review): fail-OPEN type confusion - a
 // non-boolean enabled (e.g. the JSON string "false") previously silently
 // created an ENABLED target via args.contains()+is_boolean() short-circuit
@@ -35323,6 +36123,591 @@ TEST_CASE("MCP B5: software-deployment mutations are tier-denied below supervise
     CHECK(list_res->status == 403);
 }
 
+// ── #4644: MCP integer handling never wraps a value into a different one ──
+
+TEST_CASE("MCP query_audit_log: a wrong-typed or out-of-range since/until/limit is -32602 "
+          "never a wrapped or defaulted value",
+          "[pg][mcp][integration][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.audit_store_for_test = &store;
+    ts.start("readonly");
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":77,"params":{"name":"query_audit_log","arguments":)" +
+            args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    // The lenient reader turned each of these into a DIFFERENT valid-looking window:
+    // a string became 0 ("unbounded"), and UINT64_MAX wrapped to -1.
+    for (const char* bad : {R"({"since":"1700000000"})", R"({"since":1.5})", R"({"until":"x"})",
+                            R"({"since":18446744073709551615})",
+                            R"({"until":18446744073709551615})",
+                            R"({"since":9223372036854775808})", R"({"limit":"50"})",
+                            R"({"limit":18446744073709551615})"}) {
+        INFO(bad);
+        auto body = call(bad);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    // The bounds are presence-tracked (#4644): a negative since is refused, and so is an `until`
+    // of zero or below -- a literal -3600 or 0 used to mean "the whole log".
+    for (const char* neg : {R"({"since":-1})", R"({"since":-3600,"until":5})",
+                            R"({"since":-9223372036854775807})"}) {
+        INFO(neg);
+        auto body = call(neg);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() == "since must not be negative");
+    }
+    for (const char* bad_until : {R"({"until":0})", R"({"until":-1})", R"({"since":0,"until":0})",
+                                  R"({"since":5,"until":-9223372036854775807})"}) {
+        INFO(bad_until);
+        auto body = call(bad_until);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "until must be a positive epoch second or omitted");
+    }
+    // Omitted and well-formed values (including since 0, which matches what omitting it matches,
+    // and the int64 maximum) still work.
+    for (const char* ok : {R"({})", R"({"since":0,"until":1,"limit":10})", R"({"since":0})",
+                           R"({"since":9223372036854775807})"}) {
+        INFO(ok);
+        auto body = call(ok);
+        CHECK(body.contains("result"));
+    }
+}
+
+TEST_CASE("MCP get_execution_statistics_by_agent: a limit above INT_MAX saturates instead of "
+          "wrapping to the 50-row default",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-wrap", "succeeded", 60, 60, 0, now - 300, now - 290);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+    for (int i = 0; i < 60; ++i)
+        b3_insert_agent_status(tracker, *id1, "agent-wrap-" + std::to_string(i), "success", 0,
+                               now - 300, now - 290);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+    auto rows_for = [&](const std::string& limit_literal) -> std::size_t {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":)"
+            R"("get_execution_statistics_by_agent","arguments":{"limit":)" +
+            limit_literal + "}}}");
+        REQUIRE(res);
+        auto payload = operator_surface_payload(res);
+        REQUIRE(payload["data"].is_array());
+        return payload["data"].size();
+    };
+    // static_cast<int>(4294967296) is 0, which the tracker reads as "default page (50)".
+    // Saturated, it is a very large limit that the route's own 1000 ceiling then applies to.
+    CHECK(rows_for("4294967296") == 60);
+    CHECK(rows_for("10") == 10);
+}
+
+// ── #3526 (ADR-0017): get_execution_statistics_by_agent is confined ────────
+
+TEST_CASE("MCP get_execution_statistics_by_agent: a confined caller sees exactly its visible "
+          "agents deny-all sees none the scope applies before the limit (#3526)",
+          "[pg][mcp][integration][operator_surface][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-scope-a", "succeeded", 3, 3, 0, now - 300, now - 290);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+    b3_insert_agent_status(tracker, *id1, "agent-busy", "success", 0, now - 300, now - 290);
+    b3_insert_agent_status(tracker, *id1, "agent-quiet", "success", 0, now - 300, now - 290);
+    for (int i = 0; i < 2; ++i) {
+        auto e = b3_make_exec("def-scope-b", "succeeded", 1, 1, 0, now - 200, now - 190);
+        auto id = tracker.create_execution(e);
+        REQUIRE(id.has_value());
+        b3_insert_agent_status(tracker, *id, "agent-busy", "success", 0, now - 200, now - 190);
+    }
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+    auto agents_for = [&](const std::string& args) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":)"
+            R"("get_execution_statistics_by_agent","arguments":)" + args + "}}");
+        REQUIRE(res);
+        auto payload = operator_surface_payload(res);
+        std::vector<std::string> ids;
+        for (const auto& row : payload["data"])
+            ids.push_back(row["agent_id"].get<std::string>());
+        return ids;
+    };
+
+    // Unconfined (the fixture default admits nullopt): every agent, busiest first.
+    CHECK(agents_for("{}") == std::vector<std::string>{"agent-busy", "agent-quiet"});
+
+    // Confined to the lower-ranked agent: only it, and still present at limit 1 (the scope is
+    // applied in SQL before the LIMIT, not as a post-fetch filter).
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-quiet"}}};
+    };
+    ts.start();
+    CHECK(agents_for("{}") == std::vector<std::string>{"agent-quiet"});
+    CHECK(agents_for(R"({"limit":1})") == std::vector<std::string>{"agent-quiet"});
+    // Naming an out-of-scope agent explicitly yields the same empty answer.
+    CHECK(agents_for(R"({"agent_id":"agent-busy"})").empty());
+
+    // Present-empty is deny-all, never "no filter".
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::deny_all()};
+    };
+    ts.start();
+    CHECK(agents_for("{}").empty());
+}
+
+TEST_CASE("MCP get_execution_statistics_by_agent: an unwired fleet-read gate fails closed and a "
+          "gate denial serves nothing (#3526)",
+          "[pg][mcp][integration][operator_surface][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-gate", "succeeded", 1, 1, 0, now - 300, now - 290);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+    b3_insert_agent_status(tracker, *id1, "agent-gate", "success", 0, now - 300, now - 290);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = {}; // genuinely unwired, not the fixture default
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":)"
+        R"("get_execution_statistics_by_agent","arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(res->body.find("agent-gate") == std::string::npos);
+
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& r, const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        r.status = 403;
+        r.set_content(R"({"jsonrpc":"2.0","id":8,"error":{"code":-32001,"message":"denied"}})",
+                      "application/json");
+        return {false, yuzu::server::authz::deny_all()};
+    };
+    ts.start();
+    auto denied = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":)"
+        R"("get_execution_statistics_by_agent","arguments":{}}})");
+    REQUIRE(denied);
+    CHECK(denied->body.find("agent-gate") == std::string::npos);
+}
+
+// #4644: a degraded statistics read is a retryable error, never an empty array or a
+// zeroed summary serialized as a measurement.
+TEST_CASE("MCP execution statistics tools: a degraded tracker read is a retryable error",
+          "[pg][mcp][integration][operator_surface][degrade]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    auto now = operator_surface_now();
+    auto id = tracker.create_execution(b3_make_exec("def-b3-degrade", "succeeded", 1, 1, 0,
+                                                   now - 300, now - 290));
+    REQUIRE(id.has_value());
+    b3_insert_agent_status(tracker, *id, "agent-b3-d", "success", 0, now - 300, now - 290);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+    {
+        auto lease = tracker_bundle.pool().try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(), "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_4644",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    int i = 0;
+    for (const char* tool : {"get_execution_statistics", "get_execution_statistics_by_agent",
+                             "get_execution_statistics_by_definition", "get_fleet_statistics"}) {
+        auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+                           std::to_string(100 + i++) + R"(,"params":{"name":")" + tool +
+                           R"(","arguments":{}}})");
+        REQUIRE(res);
+        INFO(tool);
+        const auto body = res->body;
+        CHECK(body.find("Execution statistics store degraded") != std::string::npos);
+        CHECK(body.find("retry_after_ms") != std::string::npos);
+    }
+}
+
+// ── #4644 sweep batch 2: strict numeric / boolean arguments on the MCP security-gating tools ──
+//
+// The probes every numeric site is held to: a value that wraps or saturates into a different VALID
+// value, a wrong JSON type, null, and the boundary integers. A rejected call must answer -32602
+// AND leave nothing behind.
+
+namespace {
+constexpr const char* kStrictProbes[] = {"4294967297",           "9223372036854775808",
+                                         "18446744073709551615", "-1",
+                                         "0",                    "5.5",
+                                         "\"7\"",                "null",
+                                         "true"};
+
+nlohmann::json sweep_call(McpTestServer& ts, int rpc_id, const std::string& tool,
+                          const std::string& args_json) {
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(rpc_id) +
+                       R"(,"params":{"name":")" + tool + R"(","arguments":)" + args_json + "}}");
+    REQUIRE(res);
+    return nlohmann::json::parse(res->body);
+}
+} // namespace
+
+TEST_CASE("MCP #4644: issue_code_signing_cert validity_days is a strict integer in 1..730, "
+          "range-checked before narrowing",
+          "[pg][mcp][integration][pki][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    int calls = 0;
+    std::optional<int> seen;
+    ts.issue_code_signing_fn_for_test =
+        [&](const std::string&, const std::string&, std::optional<int> validity_days,
+            const std::string&) -> std::expected<yuzu::server::CodeSigningIssuance, std::string> {
+        ++calls;
+        seen = validity_days;
+        return yuzu::server::CodeSigningIssuance{.certificate_pem = "leaf",
+                                                 .chain_pem = "root",
+                                                 .serial_hex = "C0FFEE",
+                                                 .not_after = "2027-01-01T00:00:00Z"};
+    };
+    // Untiered session: the generic supervised-tier schema gate is not in the path, so this
+    // exercises the handler's own validation (what an operator-tier or RBAC caller reaches).
+    ts.start();
+
+    int rpc = 0;
+    auto issue = [&](const std::string& days_json) {
+        std::string args = R"({"csr_pem":"csr","label":"signer-1")";
+        if (!days_json.empty())
+            args += R"(,"validity_days":)" + days_json;
+        args += "}";
+        return sweep_call(ts, ++rpc, "issue_code_signing_cert", args);
+    };
+
+    // 4294967297 wrapped to a 1-day certificate through get<int>(); 0 and 731 sit outside 1..730.
+    std::vector<std::string> bad(std::begin(kStrictProbes), std::end(kStrictProbes));
+    bad.push_back("731");
+    bad.push_back("1e3");
+    for (const auto& probe : bad) {
+        INFO("validity_days=" << probe);
+        auto b = issue(probe);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(b["error"]["message"].get<std::string>().find("validity_days") != std::string::npos);
+    }
+    CHECK(calls == 0); // no certificate was issued for any rejected value
+
+    // ABSENT keeps the documented default (the issuer's own); the bounds are inclusive.
+    auto absent = issue("");
+    CHECK(absent.contains("result"));
+    CHECK(calls == 1);
+    CHECK_FALSE(seen.has_value());
+    CHECK(issue("1").contains("result"));
+    CHECK(seen == 1);
+    CHECK(issue("730").contains("result"));
+    CHECK(seen == 730);
+    CHECK(calls == 3);
+}
+
+TEST_CASE("MCP #4644: mint_upload_grant ttl_secs is a strict integer >= 1 that still clamps "
+          "to the maximum",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    int rpc = 0;
+    auto mint = [&](const std::string& ttl_json) {
+        std::string args = R"({"agent_id":"agent-ttl","declared_max_size":4096)";
+        if (!ttl_json.empty())
+            args += R"(,"ttl_secs":)" + ttl_json;
+        args += "}";
+        return sweep_call(ts, ++rpc, "mint_upload_grant", args);
+    };
+
+    // A wrong type, 0 or a negative value used to be ignored and fall to the default, which is
+    // also the MAXIMUM: a caller asking for a short grant got the longest one.
+    std::vector<std::string> bad;
+    for (const char* p : kStrictProbes)
+        if (std::string_view(p) != "4294967297") // a huge int is valid and clamps, below
+            bad.push_back(p);
+    for (const auto& probe : bad) {
+        INFO("ttl_secs=" << probe);
+        auto b = mint(probe);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(b["error"]["message"].get<std::string>().find("ttl_secs") != std::string::npos);
+    }
+    auto none = store.list_for_agent("agent-ttl");
+    REQUIRE(none.has_value());
+    CHECK(none->empty()); // nothing was minted for any rejected value
+
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    for (const auto& [ttl_json, expect_secs] :
+         std::vector<std::pair<std::string, int64_t>>{{"60", 60},
+                                                      {"4294967297", 900},
+                                                      {"", 900}}) {
+        INFO("ttl_secs=" << ttl_json);
+        auto b = mint(ttl_json);
+        REQUIRE(b.contains("result"));
+        auto payload = nlohmann::json::parse(b["result"]["content"][0]["text"].get<std::string>());
+        const int64_t lifetime = payload["expires_at"].get<int64_t>() - now;
+        CHECK(lifetime >= expect_secs - 5);
+        CHECK(lifetime <= expect_secs + 5);
+    }
+    auto three = store.list_for_agent("agent-ttl");
+    REQUIRE(three.has_value());
+    CHECK(three->size() == 3);
+}
+
+TEST_CASE("MCP #4644: create_api_token expires_at is 0 or a future epoch, never negative or "
+          "past, and nothing is minted for a rejected value",
+          "[mcp][pg][token]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    int rpc = 0;
+    // Supervised tier: ApiToken:Write is approval-gated, so a value the tool schema accepts
+    // reaches the handler only on RECALL. Drive the whole ticket round trip and return the
+    // final body (a schema rejection ends at the mint call, before any ticket exists).
+    auto create = [&](const std::string& expires_json) {
+        const std::string tail =
+            expires_json.empty() ? std::string{} : R"(,"expires_at":)" + expires_json;
+        auto mint = sweep_call(ts, ++rpc, "create_api_token",
+                               R"({"name":"sweep-key")" + tail + "}");
+        if (!mint.contains("error") ||
+            mint["error"]["code"] != yuzu::server::mcp::kApprovalRequired)
+            return mint;
+        const std::string approval_id = mint["error"]["data"]["approval_id"].get<std::string>();
+        REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+        return sweep_call(ts, ++rpc, "create_api_token",
+                          R"({"name":"sweep-key")" + tail + R"(,"approval_id":")" + approval_id +
+                              R"("})");
+    };
+
+    std::vector<std::string> bad;
+    for (const char* p : kStrictProbes)
+        if (std::string_view(p) != "4294967297" && std::string_view(p) != "0") // valid, below
+            bad.push_back(p);
+    bad.push_back("1");      // a past epoch
+    bad.push_back("-86400"); // a "relative" time computed the wrong way round
+    for (const auto& probe : bad) {
+        INFO("expires_at=" << probe);
+        auto b = create(probe);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    auto none = store.list_tokens("test-user");
+    REQUIRE(none.has_value());
+    CHECK(none->empty()); // a negative or past expiry used to mint a PERMANENT token
+
+    // 0 / absent keep the documented "never expires"; 4294967297 is a valid future epoch (2106).
+    for (const char* ok : {"", "0", "4294967297"}) {
+        INFO("expires_at=" << ok);
+        CHECK(create(ok).contains("result"));
+    }
+    auto three = store.list_tokens("test-user");
+    REQUIRE(three.has_value());
+    CHECK(three->size() == 3);
+}
+
+TEST_CASE("MCP #4644: activate_platform_license seat_count and expires_at reject a negative, "
+          "non-integer or overflowing value and store nothing",
+          "[pg][mcp][integration][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_b5_license_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.license_store_for_test = &store;
+    ts.start();
+
+    int rpc = 0;
+    auto activate = [&](const char* field, const std::string& value_json) {
+        const std::string key = "KEY-" + std::to_string(rpc + 1);
+        std::string args = R"({"organization":"Org","license_key":")" + key + "\"";
+        if (!value_json.empty())
+            args += std::string(R"(,")") + field + R"(":)" + value_json;
+        args += "}";
+        return sweep_call(ts, ++rpc, "activate_platform_license", args);
+    };
+
+    // A negative expires_at was stored and read back as PERPETUAL by every expiry reader.
+    std::vector<std::string> bad;
+    for (const char* p : kStrictProbes)
+        if (std::string_view(p) != "4294967297" && std::string_view(p) != "0") // valid, below
+            bad.push_back(p);
+    for (const char* field : {"seat_count", "expires_at"}) {
+        for (const auto& probe : bad) {
+            INFO(field << "=" << probe);
+            auto b = activate(field, probe);
+            REQUIRE(b.contains("error"));
+            CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(b["error"]["message"].get<std::string>().find(field) != std::string::npos);
+        }
+    }
+    auto none = store.list_licenses();
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+    CHECK(ts.audit_log.empty());
+
+    // 0 keeps its documented meaning (unlimited seats / perpetual); a large value is stored as is.
+    for (const char* field : {"seat_count", "expires_at"})
+        for (const char* ok : {"", "0", "4294967297"}) {
+            INFO(field << "=" << ok);
+            CHECK(activate(field, ok).contains("result"));
+        }
+    auto six = store.list_licenses();
+    REQUIRE(six.has_value());
+    CHECK(six->size() == 6);
+}
+
+TEST_CASE("MCP #4644: create_offload_target neutralises the caller-supplied name in every audit "
+          "row (CWE-117), like the REST twin",
+          "[pg][mcp][integration][b5][security]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+
+    // CR/LF would split the audit line, a space or '=' would forge a `k=v` field, ',' separates
+    // fields: each maps to '_' in what is recorded.
+    const std::string evil = "evil\r\nresult=success x,y";
+    const std::string neutral = "evil__result_success_x_y";
+
+    // Denied before the store call (unrecognized auth_type): the name is the audit target_id.
+    nlohmann::json denied = {{"name", evil},
+                             {"url", "https://example.com/hook"},
+                             {"auth_type", "bogus-type"}};
+    auto d = sweep_call(ts, 1, "create_offload_target", denied.dump());
+    REQUIRE(d.contains("error"));
+    REQUIRE_FALSE(ts.audit_target_ids.empty());
+    CHECK(ts.audit_log.back() == "offload_target.create|denied");
+    CHECK(ts.audit_target_ids.back() == neutral);
+
+    // Success: the name rides in the detail of the domain row (the target_id is the new row id).
+    // (The store itself refuses control bytes in a name, so the success and duplicate rows use
+    // the same shape without the CR/LF.)
+    const std::string evil_plain = "evil result=success x,y";
+    nlohmann::json ok = {{"name", evil_plain}, {"url", "https://example.com/hook"}};
+    auto s = sweep_call(ts, 2, "create_offload_target", ok.dump());
+    REQUIRE(s.contains("result"));
+    REQUIRE(ts.audit_log.size() >= 2);
+    const auto domain_row = ts.audit_log.size() - 2;
+    CHECK(ts.audit_log[domain_row] == "offload_target.create|success");
+    // Create-row detail shape: `name=<neutralised> url=<scheme>://<host> url_fp=<12 hex>`.
+    CHECK(ts.audit_details[domain_row].rfind("name=evil_result_success_x_y url=https://example.com "
+                                             "url_fp=", 0) == 0);
+
+    // A duplicate name (rejected by the store) records the neutralised name too.
+    auto dup = sweep_call(ts, 3, "create_offload_target", ok.dump());
+    REQUIRE(dup.contains("error"));
+    CHECK(ts.audit_log.back() == "offload_target.create|denied");
+    CHECK(ts.audit_target_ids.back() == "evil_result_success_x_y");
+}
+
+TEST_CASE("MCP #4644: query_inventory advertises its documented limit bounds (1..1000)",
+          "[mcp][integration][inventory]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "query_inventory") {
+            tool = &t;
+            break;
+        }
+    REQUIRE(tool != nullptr);
+    const auto& limit = (*tool)["inputSchema"]["properties"]["limit"];
+    CHECK(limit["minimum"] == 1);
+    CHECK(limit["maximum"] == 1000);
+    CHECK(limit["default"] == 100);
+    // The behaviour is saturating, not rejecting, and the description must say so.
+    CHECK(limit["description"].get<std::string>().find("clamped to 1000") != std::string::npos);
+}
+
+TEST_CASE("MCP #4644: a wrong-typed boolean on the Guardian rule tools is -32602, not a bare 500",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r-bool", "rule-bool");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+
+    int rpc = 0;
+    for (const char* bad : {"\"false\"", "0", "null", "1.5"}) {
+        INFO("enabled=" << bad);
+        auto c = sweep_call(ts, ++rpc, "create_guardian_rule",
+                            std::string(R"({"rule_id":"r-new","name":"n","yaml_source":"# y\n",)"
+                                        R"("enabled":)") + bad + "}");
+        REQUIRE(c.contains("error"));
+        CHECK(c["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        auto u = sweep_call(ts, ++rpc, "update_guardian_rule",
+                            std::string(R"({"rule_id":"r-bool","enabled":)") + bad + "}");
+        REQUIRE(u.contains("error"));
+        CHECK(u["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        auto p = sweep_call(ts, ++rpc, "push_guardian_rules",
+                            std::string(R"({"full_sync":)") + bad + "}");
+        REQUIRE(p.contains("error"));
+        CHECK(p["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    auto none = store.get_rule("r-new");
+    REQUIRE(none.has_value());
+    CHECK_FALSE(none->has_value()); // the rejected create wrote nothing
+
+    // A real boolean still works.
+    auto ok = sweep_call(ts, ++rpc, "update_guardian_rule",
+                         R"({"rule_id":"r-bool","enabled":false})");
+    CHECK(ok.contains("result"));
+}
+
 // ── Network discovery read twin: list_discovered_devices ───────────────────
 // Fixture reader, no Postgres: the tool and the REST/fragment twins all sit on
 // the same DiscoveredDevicesReadFn seam and discovered_devices_json builder.
@@ -35496,5 +36881,219 @@ TEST_CASE("MCP list_discovered_devices: invalid arguments are refused and an unw
         auto res = ts.call(std::string(kListDiscoveredCall) + "{}}}");
         REQUIRE(res);
         CHECK(nlohmann::json::parse(res->body).contains("error"));
+    }
+}
+
+
+// ── sync_hardware_software: MCP twin of POST /api/v1/hardware/sync ────────────────
+
+namespace {
+
+struct SyncToolRig {
+    int dispatches = 0;
+    std::vector<std::string> dispatched;
+    std::int64_t wall = 1'700'000'000;
+
+    std::shared_ptr<yuzu::server::software_sync::Runner> runner() {
+        namespace ss = yuzu::server::software_sync;
+        ss::Env e;
+        e.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
+            ss::Resolved r;
+            r.status = ss::Resolved::Status::Ok;
+            r.caller_unfiltered = true;
+            r.ids = {"d0", "d1", "d2"};
+            return r;
+        };
+        e.dispatch = [this](const yuzu::server::auth::Session&, const std::vector<std::string>& ids) {
+            ++dispatches;
+            dispatched = ids;
+            return ss::DispatchResult{ids.size(), "__sync__-mcp-test"};
+        };
+        e.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
+        e.agent_version = [](const std::string& id) -> std::optional<std::string> {
+            if (id == "d2")
+                return std::nullopt; // offline
+            return std::string("0.13.1");
+        };
+        e.now = [this] { return wall; };
+        return std::make_shared<ss::Runner>(std::move(e));
+    }
+};
+
+constexpr const char* kSyncCall =
+    R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"sync_hardware_software","arguments":)";
+
+} // namespace
+
+TEST_CASE("MCP sync_hardware_software: a fleet run is accepted with counts only, audited before the send",
+          "[mcp][integration][sync_fanout]") {
+    SyncToolRig rig;
+    McpTestServer ts;
+    ts.software_sync_runner_for_test = rig.runner();
+    ts.start("");
+
+    auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["requested"] == 3);
+    CHECK(payload["agents_reached"] == 2);
+    CHECK(payload["skipped_offline"] == 1);
+    CHECK(payload["command_id"] == "__sync__-mcp-test");
+    CHECK(res->body.find("d0") == std::string::npos); // counts only, never a device id
+    CHECK(rig.dispatches == 1);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.front() == "inventory.sync.request|requested");
+}
+
+TEST_CASE("MCP sync_hardware_software: shares the cooldown with every other caller of the runner",
+          "[mcp][integration][sync_fanout]") {
+    SyncToolRig rig;
+    McpTestServer ts;
+    ts.software_sync_runner_for_test = rig.runner();
+    ts.start("");
+
+    REQUIRE(ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})"));
+    auto again = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+    REQUIRE(again);
+    auto body = nlohmann::json::parse(again->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() > 0);
+    CHECK(rig.dispatches == 1);
+}
+
+TEST_CASE("MCP sync_hardware_software: refuses a service-scoped token, bad arguments and an unwired runner",
+          "[mcp][integration][sync_fanout][security]") {
+    {
+        SyncToolRig rig;
+        McpTestServer ts;
+        ts.mock_token_scope_service = "printers";
+        ts.software_sync_runner_for_test = rig.runner();
+        ts.start("");
+        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(rig.dispatches == 0);
+    }
+    {
+        SyncToolRig rig;
+        McpTestServer ts;
+        ts.software_sync_runner_for_test = rig.runner();
+        ts.start("");
+        // Both spellings at once is ambiguous.
+        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__","scope_expression":"x"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(rig.dispatches == 0);
+    }
+    {
+        McpTestServer ts; // no runner wired
+        ts.start("");
+        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().find("not configured") != std::string::npos);
+    }
+}
+
+TEST_CASE("MCP sync_hardware_software: a lost outcome row is flagged audit_persisted=false; the run still stands",
+          "[mcp][integration][sync_fanout][security]") {
+    SyncToolRig rig;
+    McpTestServer ts;
+    ts.software_sync_runner_for_test = rig.runner();
+    // The pre-dispatch domain row persists (the run is admitted); only the generic MCP row is lost.
+    ts.audit_succeeds_for_action_ = [](const std::string& action) {
+        return action != "mcp.sync_hardware_software";
+    };
+    ts.start("");
+    auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["audit_persisted"] == false);
+    CHECK(payload["agents_reached"] == 2);
+    CHECK(rig.dispatches == 1);
+}
+
+TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended JSON-RPC class",
+          "[mcp][integration][sync_fanout]") {
+    namespace ss = yuzu::server::software_sync;
+    struct Case {
+        const char* name;
+        std::function<void(ss::Env&)> tweak;
+        int code;
+        bool hint;
+    };
+    const std::vector<Case> cases = {
+        {"over the cap -> invalid params, no hint",
+         [](ss::Env& e) {
+             e.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
+                 ss::Resolved r;
+                 r.status = ss::Resolved::Status::Ok;
+                 r.caller_unfiltered = true;
+                 for (int i = 0; i < 600; ++i)
+                     r.ids.push_back("d" + std::to_string(i));
+                 return r;
+             };
+         },
+         yuzu::server::mcp::kInvalidParams, false},
+        {"confined caller naming the fleet -> permission denied",
+         [](ss::Env& e) {
+             e.caller_unfiltered = [](const yuzu::server::auth::Session&) { return false; };
+         },
+         yuzu::server::mcp::kPermissionDenied, false},
+        {"scope not evaluable -> internal error with a 5 s hint",
+         [](ss::Env& e) {
+             e.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
+                 ss::Resolved r;
+                 r.status = ss::Resolved::Status::Aborted;
+                 return r;
+             };
+         },
+         yuzu::server::mcp::kInternalError, true},
+        {"every send refused -> internal error with a hint",
+         [](ss::Env& e) {
+             e.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>&) {
+                 return ss::DispatchResult{0, "x"};
+             };
+         },
+         yuzu::server::mcp::kInternalError, true},
+    };
+    for (const auto& c : cases) {
+        INFO(c.name);
+        SyncToolRig rig;
+        ss::Env env;
+        env.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
+            ss::Resolved r;
+            r.status = ss::Resolved::Status::Ok;
+            r.caller_unfiltered = true;
+            r.ids = {"d0", "d1"};
+            return r;
+        };
+        env.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>& ids) {
+            return ss::DispatchResult{ids.size(), "__sync__-t"};
+        };
+        env.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
+        env.agent_version = [](const std::string&) { return std::optional<std::string>("0.13.1"); };
+        c.tweak(env);
+        McpTestServer ts;
+        ts.software_sync_runner_for_test = std::make_shared<ss::Runner>(std::move(env));
+        ts.start("");
+        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == c.code);
+        const bool has_hint = body["error"].contains("data") && body["error"]["data"].contains("retry_after_ms") &&
+                              !body["error"]["data"]["retry_after_ms"].is_null();
+        CHECK(has_hint == c.hint);
     }
 }

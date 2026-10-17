@@ -95,10 +95,19 @@ public:
     [[nodiscard]] std::expected<bool, UpdateError> check_and_apply(void* stub);
 
     /// On startup: delete .old files from successful prior updates.
+    /// No-op when the updater is disabled (UpdateConfig::enabled == false).
     void cleanup_old_binary();
 
     /// On startup: if .old exists and current binary seems broken, roll back.
+    /// No-op returning false when the updater is disabled.
     [[nodiscard]] bool rollback_if_needed();
+
+    /// Run the startup rollback/cleanup protocol when OTA is enabled.
+    ///
+    /// A disabled updater is a no-write mode: it must not inspect or alter files
+    /// adjacent to the executable. This matters for a sealed macOS app bundle,
+    /// where even the rollback marker would invalidate the code signature.
+    [[nodiscard]] bool perform_startup_maintenance();
 
     /// The interval run_check_loop actually waits: `interval` clamped to [1s, 8760h]. A
     /// non-positive value would spin, and an absurd one overflows wait_for's deadline. Callers

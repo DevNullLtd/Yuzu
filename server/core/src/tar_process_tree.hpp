@@ -23,6 +23,7 @@
 ///     rows, never in SQL.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -211,8 +212,16 @@ TarWindow resolve_tar_window(const std::string& preset, std::int64_t custom_from
 /// datetime-local value `YYYY-MM-DDTHH:MM[:SS]` interpreted as UTC. Returns 0 for
 /// empty/invalid/out-of-range input (callers treat 0 as "unset"). Overflow-guarded:
 /// an oversized digit string or an absurd year yields 0, never signed-overflow UB.
+/// The day is range-checked as 1..31 only, so a day beyond the month length (2026-02-31)
+/// rolls into the next month; operator-supplied windows go through `parse_ts_param_strict`.
 /// Pure + free so it is unit-testable without the HTTP layer.
 std::int64_t parse_ts_param(const std::string& s);
+
+/// Strict twin of `parse_ts_param` for the operator-supplied `from`/`to` window (#4644). Empty is
+/// absent (0). Anything else must be all digits (at most 18) or exactly `YYYY-MM-DDTHH:MM[:SS]`
+/// with every field in range; otherwise `std::nullopt`, so a caller can refuse the request
+/// instead of silently rendering an unbounded or shifted window. Never throws.
+std::optional<std::int64_t> parse_ts_param_strict(const std::string& s);
 
 /// Reconstruct the per-host tree: build per-pid alive intervals from the event
 /// stream, keep incarnations whose lifetime overlaps `[from, to]`, link each to the

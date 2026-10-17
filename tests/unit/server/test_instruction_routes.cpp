@@ -583,6 +583,13 @@ TEST_CASE("instruction_routes: GET /api/instructions lists real rows and honors 
     CHECK(by_name->status == 200);
     CHECK(has_id(body(by_name->body)["definitions"], id_a));
 
+    // #4644: a numeric prefix is not an integer.
+    for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=4294967296"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/instructions?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
     auto limited = h.sink.Get("/api/instructions?limit=1");
     REQUIRE(limited);
     CHECK(limited->status == 200);

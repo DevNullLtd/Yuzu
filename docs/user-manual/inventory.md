@@ -627,6 +627,48 @@ place, **Hardware** and **Software**, each its own page:
   - **Exports** are plain download links to the REST routes: the matching install rows as
     JSON or CSV (up to 10,000; the file says if it was cut off) and the titles as CSV.
     The sprawl filter is not applied to install exports.
+  - **Sync now.** The button at the top of the page asks devices to re-send their
+    installed-software inventory now instead of waiting for the ~24 h cadence. A dialog
+    offers three choices: **This device** (offered while the Host box names a listed host),
+    **Devices matching a scope expression or group** (a scope expression, or `group:<id>`),
+    and **Whole fleet**. For a scope expression the Review step previews the match count
+    through `POST /api/v1/scope/preview`; that route needs `Infrastructure:Read`, so if it is
+    refused for lack of permission the dialog goes on to the confirm step without a count; any
+    other preview error (an invalid expression, for example) is shown in the dialog before you
+    can confirm. After you confirm, a
+    notice says how many devices were asked to sync and how many were skipped. It calls
+    `POST /api/v1/hardware/sync`.
+    - **Who may.** The route needs `Execution:Execute`, checked as a **global** grant (or
+      RBAC off). An operator whose `Execution:Execute` is limited to management groups is
+      refused with `403` for every choice, including a single device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The route also
+      confines its targets to the caller's own `Execution:Execute` visible set and refuses
+      **Whole fleet** (`403`) unless that set is unfiltered; with a global grant neither
+      changes the outcome today, and both stay in place as defence in depth for when the
+      gate becomes scope-aware.
+    - **Which devices.** A run reaches agents attached to **this server process** only.
+      `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability).
+      Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing.
+      `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents older than 0.13.1 are skipped
+      and counted separately (`skipped_version`). One request reaches at most 500 devices (`413` above that, counted after the skips:
+      narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
+      up to 256 bytes.
+    - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds
+      (`429` with `Retry-After`; an attempt refused for exceeding 500 devices, or with no live target, counts as a run, a send every device refused does not) and one at a time per server process (`409`); a single device
+      is exempt from both. A `409` can follow a slow agent connection: the server sends to its
+      targets one after another, and a connected agent that has stopped reading holds the run
+      for at most 120 seconds, after which the next request takes the run over (`retry_after_ms` on the `409` is the time until that lease lapses; the stalled send itself is not cancelled). At most three runs are alive at once: while three stalled sends are still alive, no further takeover is allowed, the `409` keeps answering, and a WARN line is logged, until one of those sends unwinds (the agent reads, or its connection is cut) or the server restarts. A server clock that steps backwards
+      cannot lock an operator out: a last-run time in the future is ignored. Both limits are
+      held in each server process, not across a cluster: with several active servers every
+      one allows its own run and keeps its own per-operator cooldown, and each run is still
+      bounded by the 500-device cap. One run can make up to 500 agents upload their
+      inventory at nearly the same moment; see the connection-pool note in
+      [Server administration](server-admin.md).
+    - **Audit and result.** The request is audited as `inventory.sync.request` before
+      anything is sent, and is refused if the audit row cannot be written. `202` means the
+      request was sent, not that the devices have synced: the page's figures change when each
+      device reports back. In the `202` body `agents_reached` is the number of agents that
+      accepted the request; the audit row's `reached` is the number the run planned to send
+      to.
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused

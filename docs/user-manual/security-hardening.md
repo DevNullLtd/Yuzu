@@ -75,7 +75,7 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 
 | Port | Protocol | Direction | Purpose | Restrict To |
 |------|----------|-----------|---------|-------------|
-| 8080 | TCP | Inbound | Web dashboard + REST API | Admin network |
+| 8080 | TCP | Inbound | HTTP→HTTPS redirect + unauthenticated health probes in cleartext (the dashboard with `--no-https`) | Orchestrator/admin network |
 | 8443 | TCP | Inbound | HTTPS dashboard | Admin network |
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
 | 50052 | TCP | Inbound | Management gRPC | Admin network |
@@ -566,6 +566,8 @@ releasing — the usual repair when a device has been contained without a reacha
 address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
 ### Containment from the Hardware page
+
+> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added (the buttons here act directly, without the approval step the quarantine plugin carries). The quarantine REST API and MCP tools, and the quarantine plugin's actions on the Instructions page (role-gated approval), are unchanged.
 
 The dashboard shows and drives quarantine records without a separate page:
 

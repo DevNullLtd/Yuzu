@@ -1,4 +1,5 @@
 #include "dex_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
@@ -406,12 +407,12 @@ input.dx-ctl{min-width:220px}
 .gp-stack>span{background:var(--c4)}
 .gp-stack>.health{background:var(--line2);color:var(--ink)}
 .gp-ded .bar.zero{background:var(--line2)}
-.gp-heat i{background:var(--surface2)}
-.gp-heat i.h1{background:color-mix(in srgb,var(--c1) 20%,var(--surface2))}
-.gp-heat i.h2{background:color-mix(in srgb,var(--c1) 40%,var(--surface2))}
-.gp-heat i.h3{background:color-mix(in srgb,var(--c1) 60%,var(--surface2))}
-.gp-heat i.h4{background:color-mix(in srgb,var(--c1) 80%,var(--surface2))}
-.gp-heat i.h5{background:var(--c1)}
+:is(.gp-heat,.gp-hleg) i{background:var(--surface2)}
+:is(.gp-heat,.gp-hleg) i.h1{background:color-mix(in srgb,var(--c1) 20%,var(--surface2))}
+:is(.gp-heat,.gp-hleg) i.h2{background:color-mix(in srgb,var(--c1) 40%,var(--surface2))}
+:is(.gp-heat,.gp-hleg) i.h3{background:color-mix(in srgb,var(--c1) 60%,var(--surface2))}
+:is(.gp-heat,.gp-hleg) i.h4{background:color-mix(in srgb,var(--c1) 80%,var(--surface2))}
+:is(.gp-heat,.gp-hleg) i.h5{background:var(--c1)}
 .dx-days{display:flex;align-items:flex-end;gap:6px}
 .dx-day{display:flex;flex:1;flex-direction:column;align-items:center;gap:4px}
 .dx-day i{display:block;width:60%;max-width:48px;border-radius:2px 2px 0 0;background:var(--c1)}
@@ -438,7 +439,13 @@ input.dx-ctl{min-width:220px}
 .dx-apphead td:first-child{color:var(--ink);font-weight:600}
 .gp-table td.dx-indent{padding-left:32px}
 .dx-off td{color:var(--faint)}
-.gp-sm svg{display:block;width:100%;height:auto;margin-top:6px}
+.gp-sm .spark{display:block;width:100%;height:40px;margin-top:10px;overflow:visible;color:var(--c1)}
+.gp-sm .spark.off{color:var(--faint)}
+.spark *{vector-effect:non-scaling-stroke}
+.spark .sp-base{stroke:var(--line);stroke-width:1}
+.spark .sp-line{fill:none;stroke:currentColor;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.spark .sp-halo{fill:none;stroke:var(--surface);stroke-width:10;stroke-linecap:round}
+.spark .sp-dot{fill:none;stroke:currentColor;stroke-width:6;stroke-linecap:round}
 )CSS";
 
 std::string dex_fragment_style() {
@@ -568,7 +575,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
                 ++mon_types;
 
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("catalogue", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Signal catalogue</h1></div>"
          "<div class=\"gp-sub\"><b>" +
@@ -1086,7 +1093,7 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
     const int64_t N = fleet.windows_online; // scored over reporting Windows agents
 
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("health", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>DEX health</h1></div>"
          "<div class=\"gp-sub\">A single roll-up of the measured signal rates &mdash; it "
@@ -1207,25 +1214,38 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
 // above `dex_signal_groups`) — the Trends renderer below calls the exact same
 // declaration.
 
-// Inline-SVG sparkline from a daily series.
-std::string dex_sparkline(const std::vector<int64_t>& series, const char* color) {
+// Inline-SVG sparkline from a daily series: 2 px line over a gradient area, faint
+// baseline, end-point dot. Colour and strokes live in `.gp-sm .spark` (kDexCss), so the
+// markup carries geometry only; the SVG stretches to the card width, hence the `sp-`
+// non-scaling strokes and a zero-length round-capped path for the (circular) dot.
+// `n` keeps the gradient id unique within the fragment; `active` false greys a flat series.
+std::string dex_sparkline(const std::vector<int64_t>& series, bool active, std::size_t n) {
     if (series.empty())
         return {};
-    const double wpx = 130, hpx = 28;
+    const double wpx = 130, hpx = 40, pad = 4;
     int64_t mx = 1;
     for (auto v : series)
         if (v > mx)
             mx = v;
     std::string pts;
+    double lx = 0, ly = hpx - pad;
     for (std::size_t i = 0; i < series.size(); ++i) {
-        const double x = series.size() > 1 ? static_cast<double>(i) / (series.size() - 1) * wpx : 0;
-        const double y = hpx - static_cast<double>(series[i]) / mx * (hpx - 3) - 1;
+        lx = series.size() > 1 ? static_cast<double>(i) / (series.size() - 1) * wpx : 0;
+        ly = hpx - pad - static_cast<double>(series[i]) / mx * (hpx - 2 * pad);
         if (!pts.empty())
             pts += " ";
-        pts += std::format("{:.1f},{:.1f}", x, y);
+        pts += std::format("{:.1f},{:.1f}", lx, ly);
     }
-    return "<svg width=\"130\" height=\"28\" viewBox=\"0 0 130 28\"><polyline points=\"" + pts +
-           "\" fill=\"none\" stroke=\"" + color + "\" stroke-width=\"1.5\"/></svg>";
+    const std::string id = "sg-" + std::to_string(n);
+    const std::string dot = std::format("d=\"M{:.1f},{:.1f}h0\"/>", lx, ly);
+    return "<svg class=\"spark" + std::string(active ? "" : " off") +
+           "\" viewBox=\"0 0 130 40\" preserveAspectRatio=\"none\" role=\"img\" aria-label=\"Daily trend\">"
+           "<defs><linearGradient id=\"" + id + "\" x1=\"0\" y1=\"0\" x2=\"0\" y2=\"1\">"
+           "<stop offset=\"0\" stop-color=\"currentColor\" stop-opacity=\".22\"/>"
+           "<stop offset=\"1\" stop-color=\"currentColor\" stop-opacity=\"0\"/></linearGradient></defs>"
+           "<line class=\"sp-base\" x1=\"0\" y1=\"39.5\" x2=\"130\" y2=\"39.5\"/><polygon points=\"0,40 " +
+           pts + std::format(" {:.1f},40", lx) + "\" fill=\"url(#" + id + ")\"/><polyline class=\"sp-line\" "
+           "points=\"" + pts + "\"/><path class=\"sp-halo\" " + dot + "<path class=\"sp-dot\" " + dot + "</svg>";
 }
 const char* dex_heat_class(double t) { // t in 0..1, within-row scaled -> `.gp-heat i.hN` step token
     if (t <= 0.0)
@@ -1263,7 +1283,7 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
     };
 
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("trends", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Cross-OS &amp; signal trends"
          "</h1></div><div class=\"gp-sub\">Coverage-honest by design: each OS collects a different "
@@ -1342,7 +1362,7 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
             total += v;
         h += "<div class=\"gp-sm\"><div class=\"smh\"><span class=\"smn\">" + esc(g.name) +
              "</span><span class=\"smv\">" + num(total) + "</span></div>" +
-             dex_sparkline(cell[fi], total > 0 ? "var(--c1)" : "var(--faint)") + "</div>";
+             dex_sparkline(cell[fi], total > 0, static_cast<std::size_t>(fi)) + "</div>";
         ++fi;
     }
     h += "</div>";
@@ -1368,7 +1388,9 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
         h += "</div>";
         ++fi;
     }
-    h += "</div>";
+    h += "</div><div class=\"gp-hleg\" aria-label=\"Legend\"><span>none</span><i></i><span>less</span>"
+         "<i class=\"h1\"></i><i class=\"h2\"></i><i class=\"h3\"></i><i class=\"h4\"></i><i class=\"h5\"></i>"
+         "<span>more</span></div>";
     h += "<div class=\"gp-note\">Rows are scaled <b>independently</b> (within-family) so a small "
          "family and a busy one both show their shape. Read a row left-to-right for a family's "
          "trend.</div>";
@@ -1395,7 +1417,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
     };
     std::string head;
-    head += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    head += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     head += dex_subnav("overview", window_days);
     head += "<div class=\"gp-head\"><div>"
             "<div class=\"gp-titleline\"><h1>DEX</h1></div>"
@@ -2062,7 +2084,7 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& r) {
 
 std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const std::string& since,
                                      int window_days) {
-    std::string h = "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    std::string h = "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("apps", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Applications</h1></div>"
          "<div class=\"gp-sub\">Stability per application across the fleet &mdash; crashes &amp; "
@@ -2839,9 +2861,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             cohort_filter = req.get_param_value("cohort_value");
         int limit = 50;
         if (req.has_param("limit")) {
-            try {
-                limit = std::clamp(std::stoi(req.get_param_value("limit")), 1, 500);
-            } catch (...) {}
+            const auto parsed = yuzu::server::parse_query_int<int>(req.get_param_value("limit"));
+            if (!parsed) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter: limit"),
+                                "application/json");
+                return;
+            }
+            limit = std::clamp(*parsed, 1, 500);
         }
         const auto vis = resolve_visible(req); // scope the per-device perf list
         // Behavioral-PII access audit — same verb/target as the REST and MCP

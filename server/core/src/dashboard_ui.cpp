@@ -26,7 +26,7 @@ constexpr char kDashHead[] = R"HTM(<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Yuzu — Dashboard</title>
+  <title>Yuzu — Console</title>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
   <script>htmx.config.useTemplateFragments = true;</script>
@@ -325,7 +325,7 @@ constexpr char kDashBodyScope[] = R"HTM(<body data-page="dashboard" data-secret-
 
   <div class="page-header">
     <div>
-      <h1>Dashboard</h1>
+      <h1>Console</h1>
       <p class="subtitle">Run an instruction against the fleet and watch responses arrive.</p>
     </div>
   </div>
@@ -521,7 +521,7 @@ constexpr char kDashBodyRows[] = R"HTM(
   </div>
 
   <footer class="dash-foot">
-    <span>Yuzu Server &mdash; Dashboard</span>
+    <span>Yuzu Server &mdash; Console</span>
     <span>Press <kbd>Ctrl+K</kbd> to search</span>
   </footer>
 
@@ -1027,7 +1027,7 @@ constexpr char kDashJs6[] = R"HTM(
         { name: 'API Tokens', desc: 'Manage API tokens', url: '/settings#api-tokens', type: 'Settings' }
       ],
       navEntries: [
-        { name: 'Dashboard', desc: 'Main dashboard view', url: '/', type: 'Navigation' },
+        { name: 'Console', desc: 'Main console view', url: '/', type: 'Navigation' },
         { name: 'Instructions', desc: 'Browse instruction definitions', url: '/instructions', type: 'Navigation' },
         { name: 'Inventory', desc: 'Installed software & device inventory', url: '/inventory', type: 'Navigation' },
         { name: 'Settings', desc: 'Server settings', url: '/settings', type: 'Navigation' },

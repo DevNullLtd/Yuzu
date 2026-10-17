@@ -17,6 +17,7 @@
 /// server.cpp's `build_hw_roster` (endpoint_state + device_ci join); this header only
 /// orders, filters, and paginates that roster — it never fetches it.
 
+#include "device_containment_render.hpp" // kContainmentUi
 #include "device_inventory_store.hpp"    // DeviceCiRecord, CiReadError
 #include "inventory_routes.hpp"          // InventoryDeviceRow
 #include "offline_endpoint_store.hpp"    // OfflineEndpoint, PresenceReadError (stdlib-only header)
@@ -130,6 +131,9 @@ struct HardwareListPage {
     // per-record authz check failed, so absence of a pill proves nothing.
     std::unordered_set<std::string> quarantined_ids;
     bool quarantine_degraded{false};
+    /// Render the Quarantined pill, row link, degrade banner and panel placeholder. The routes
+    /// copy it from HardwareRoutes::Deps; the default is the compile-time kContainmentUi.
+    bool containment_ui{kContainmentUi};
 };
 
 /// Filters, sorts, and paginates `roster` per `normalised` (already validated —

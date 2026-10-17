@@ -408,6 +408,32 @@ TEST_CASE("general page: both confirms and the audit-failure header are present"
     CHECK(section_end < feedback);
 }
 
+TEST_CASE("general page: six colour schemes as radios; whitelisted on read and write; guarded",
+          "[general][settings][page][theme]") {
+    const std::string html = kSettingsGeneralHtml;
+    // One radio per scheme, slate pre-checked, each with its own inline swatch colours (the live
+    // tokens can only show the current palette).
+    CHECK(count_of(html, "name=\"theme\"") == 6);
+    for (const char* v : {"slate", "navy", "jade", "light", "light-baby", "light-hot"})
+        CHECK_THAT(html, ContainsSubstring(std::string("name=\"theme\" value=\"") + v + "\""));
+    CHECK_THAT(html, ContainsSubstring("name=\"theme\" value=\"slate\" checked"));
+    CHECK(count_of(html, "class=\"sw-row\" aria-hidden=\"true\" style=\"--bg:#") == 6);
+    CHECK_THAT(html, ContainsSubstring("<b>Light Baby Pink</b>"));
+    CHECK_THAT(html, ContainsSubstring("<b>Light Hot Pink</b>"));
+    CHECK_THAT(html, ContainsSubstring("role=\"radiogroup\" aria-labelledby=\"lb-scheme\""));
+    CHECK_THAT(html, !ContainsSubstring("Slate is the only colour scheme"));
+    // Same key and the same exact-match whitelist as the boot script in every page head; the
+    // store is touched only inside try/catch, and a blocked store says so.
+    CHECK_THAT(html, ContainsSubstring("'yuzu-theme'"));
+    CHECK_THAT(html, ContainsSubstring("/^(slate|navy|jade|light|light-baby|light-hot)$/"));
+    CHECK_THAT(html, ContainsSubstring("THEMES.test(v) ? v : 'slate'"));
+    CHECK_THAT(html, ContainsSubstring("THEMES.test(t.value) ? t.value : 'slate'"));
+    CHECK_THAT(html, ContainsSubstring("document.documentElement.setAttribute('data-theme', v)"));
+    CHECK_THAT(html, ContainsSubstring("id=\"theme-blocked\" role=\"status\" hidden"));
+    CHECK(count_of(html, "localStorage.setItem(THEME_KEY, v)") == 1);
+    CHECK(count_of(html, "localStorage.getItem(THEME_KEY)") == 1);
+}
+
 TEST_CASE("general page: density is whitelisted on read, guarded, and admin-page only",
           "[general][settings][page]") {
     const std::string html = kSettingsGeneralHtml;
@@ -415,7 +441,7 @@ TEST_CASE("general page: density is whitelisted on read, guarded, and admin-page
     CHECK_THAT(html, ContainsSubstring("getItem(DENSITY_KEY) === 'compact' ? 'compact' : 'comfortable'"));
     CHECK(count_of(html, "catch (err)") >= 2); // read and write are both try/catch
     CHECK_THAT(html, ContainsSubstring("Saved in this browser"));
-    CHECK_THAT(html, ContainsSubstring("Applies to the results table on the Dashboard."));
+    CHECK_THAT(html, ContainsSubstring("Applies to the results table on the Console."));
     // The drawn controls that have no route are not on the page.
     CHECK_THAT(html, !ContainsSubstring("Time zone"));
     CHECK_THAT(html, !ContainsSubstring("Server name"));

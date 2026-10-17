@@ -36,14 +36,16 @@ struct Harness {
     int perm_calls{0};
     int perm_denial_rows{0}; // what the real require_permission would have written
     std::string last_deny_verb;
+    std::string last_deny_message;
 
     home_panels::Deps deps() {
         home_panels::Deps d;
         d.deny_service_scoped_fn = [this](const httplib::Request&, httplib::Response& res,
-                                          const std::string& verb, const std::string&,
+                                          const std::string& verb, const std::string& message,
                                           const std::string&, const std::string&) {
             order.push_back("deny");
             last_deny_verb = verb;
+            last_deny_message = message;
             if (deny_scoped) {
                 res.status = 403;
                 res.set_content("GATE-BODY-TEXT", "text/plain");
@@ -162,6 +164,8 @@ TEST_CASE("home_panels_routes: policies refusals are 200 notes, never the gate b
         CHECK(has(r->body, "It needs Policy:Read."));
         CHECK(h.policies_calls == 0);
         CHECK(h.order.size() == 1); // auth_fn never ran
+        // The audited denial names the panel.
+        CHECK(h.last_deny_message == "service-scoped tokens may not read the Dashboard policies panel");
     }
     SECTION("RBAC denied") {
         Harness h;
@@ -294,6 +298,7 @@ TEST_CASE("home_panels_routes: activity degraded and service-scoped states", "[s
         CHECK_FALSE(has(r->body, "GATE-BODY-TEXT"));
         CHECK(h.order.size() == 1);
         CHECK(h.audit_calls == 0);
+        CHECK(h.last_deny_message == "service-scoped tokens may not read the Dashboard events panel");
     }
 }
 

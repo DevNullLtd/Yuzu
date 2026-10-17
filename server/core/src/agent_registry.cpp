@@ -870,6 +870,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "Management-plane posture, facts only: which plane controls the device (none/ad/ipa on "
          "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
          "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
+        {"shares.list",
+         "Shares this host serves over SMB/NFS as configured: name, path, ro/rw, anonymous access "
+         "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
+         "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
+         "/etc/exports.d and /etc/samba/smb.conf, macOS and Windows are planned; read-only"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},

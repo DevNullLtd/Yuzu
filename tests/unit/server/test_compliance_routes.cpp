@@ -361,6 +361,22 @@ TEST_CASE("/fragments/compliance/{policy_id}: an ordinary session reaches the de
     }
 }
 
+TEST_CASE("/fragments/compliance/{policy_id}: ids with '.', '_' and '-' anywhere reach the "
+          "detail handler",
+          "[compliance][url_path_segment]") {
+    // Every id the create check allows ([A-Za-z0-9._-]{1,128}) must be openable from its
+    // View link, including ones that start with '.' or '-'.
+    for (const std::string id : {"pol.one_2", ".hidden", "-lead", "a..b", "v1.2.3"}) {
+        INFO("id=" << id);
+        ComplianceHarness h{nullptr, true, empty_seam()};
+        auto res = h.sink.Get("/fragments/compliance/" + id);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("No compliance data yet") != std::string::npos);
+        CHECK(h.fleet_read_calls == 1);
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // #4034 — GET /api/v1/compliance* + /api/v1/polic* REST v1 twins. The
 // harness's `policy_store` is always nullptr (matching the pre-existing
@@ -648,6 +664,48 @@ TEST_CASE("GET /api/v1/compliance/{id}: audit succeeds -> 200 with the per-agent
         if (c.action == "compliance.agent_statuses.view" && c.result == "success")
             saw_success = true;
     CHECK(saw_success);
+}
+
+// #4644: the policy-fragment and policy list routes read `limit` strictly.
+// The LEGACY list routes hand `limit` straight to the store's SQL LIMIT (the v1 twins clamp it
+// to 1..1000 first, see the negative-limit case above): a negative one is PG's `LIMIT must not
+// be negative`, a store degrade that surfaced as a 503 for a client mistake.
+TEST_CASE("GET /api/policy-fragments and /api/policies: a negative limit is a 400 not a 503",
+          "[pg][compliance][rest][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    ComplianceHarness h{&store};
+    for (const char* route : {"/api/policy-fragments", "/api/policies"}) {
+        auto res = h.sink.Get(std::string(route) + "?limit=-1");
+        INFO(route);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto ok = h.sink.Get(std::string(route) + "?limit=10");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
+}
+
+TEST_CASE("GET /api/v1/policy-fragments and /policies: a trailing-garbage or overflowing limit "
+          "is a 400 not its numeric prefix",
+          "[pg][compliance][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    ComplianceHarness h{&store};
+    for (const char* route : {"/api/v1/policy-fragments", "/api/v1/policies",
+                              "/api/policy-fragments", "/api/policies"}) {
+        for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=", "limit=99999999999999999999"}) {
+            INFO(route << "?" << bad);
+            auto res = h.sink.Get(std::string(route) + "?" + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        auto ok = h.sink.Get(std::string(route) + "?limit=10");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════

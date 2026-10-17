@@ -1,4 +1,5 @@
 #include "verify_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_perf_compare.hpp"  // app_perf_param_valid (PURE — no store dep)
 #include "http_route_sink.hpp"   // HttpRouteSink, HttplibRouteSink
@@ -40,16 +41,28 @@ std::string qparam(const httplib::Request& req, const char* name) {
     return req.has_param(name) ? req.get_param_value(name) : std::string();
 }
 
-int parse_window(const httplib::Request& req) {
+// `window` is a FILTER (the compare span in days): a present-but-malformed value must
+// not silently become the 7-day default, or the operator reads a verdict computed over
+// a different window than the one they asked for. Absent => 7; malformed => nullopt
+// (the caller answers the 200 note); an integer that does not fit an `int` fails the parse and
+// is rejected like any malformed value, while an in-range integer clamps to [1, kMaxWindowDays].
+std::optional<int> parse_window(const httplib::Request& req) {
     int window = 7;
     if (req.has_param("window")) {
-        const std::string w = req.get_param_value("window");
-        char* end = nullptr;
-        const long v = std::strtol(w.c_str(), &end, 10);
-        if (end != w.c_str() && *end == '\0')
-            window = static_cast<int>(v);
+        const auto v = yuzu::server::parse_query_int<int>(req.get_param_value("window"));
+        if (!v)
+            return std::nullopt;
+        window = *v;
     }
     return std::clamp(window, 1, kMaxWindowDays);
+}
+
+// Same convention as this file's other input rejections: an honest 200 note, because the
+// dashboard htmx config drops 4xx/5xx bodies and the operator would see nothing at all.
+// Nothing is computed and nothing is audited.
+void reject_bad_window(httplib::Response& res) {
+    res.set_content(render_verify_note("The window must be a whole number of days."),
+                    "text/html");
 }
 
 } // namespace
@@ -112,7 +125,12 @@ void VerifyRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 "text/html");
             return;
         }
-        const int window = parse_window(req);
+        const auto window_opt = parse_window(req);
+        if (!window_opt) {
+            reject_bad_window(res);
+            return;
+        }
+        const int window = *window_opt;
         if (!api_) {
             res.set_content(render_verify_note("The app-perf store is still warming up; retry."),
                             "text/html");
@@ -187,7 +205,12 @@ void VerifyRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 "text/html");
             return;
         }
-        const int window = parse_window(req);
+        const auto window_opt = parse_window(req);
+        if (!window_opt) {
+            reject_bad_window(res);
+            return;
+        }
+        const int window = *window_opt;
         if (!api_) {
             res.set_content(render_verify_note("The app-perf store is still warming up; retry."),
                             "text/html");

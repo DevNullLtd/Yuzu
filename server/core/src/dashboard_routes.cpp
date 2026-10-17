@@ -1,4 +1,5 @@
 #include "dashboard_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
 #include "on_behalf_guard.hpp"              // sanitize_for_log
@@ -28,7 +29,7 @@
 #include "http_route_sink.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
-#include "response_query_params.hpp" // export_body_byte_cap (#4644 Gate 7, row 6a)
+#include "response_query_params.hpp" // export_body_byte_cap (#4644, row 6a)
 #include "response_store.hpp"
 #include "response_templates_engine.hpp"
 #include "visualization_engine.hpp"
@@ -82,11 +83,13 @@ static int64_t now_epoch() {
                std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// -- Helper: safe int from query param ----------------------------------------
-static int param_int(const httplib::Request& req, const char* name, int def) {
+// -- Helper: strict int from query param --------------------------------------
+// Absent => `def`. Present-but-malformed (trailing garbage, empty, overflow) => nullopt,
+// and the caller answers 400: a page size that silently became the default is a
+// different, valid-looking query (#4644).
+static std::optional<int> param_int(const httplib::Request& req, const char* name, int def) {
     if (!req.has_param(name)) return def;
-    try { return std::stoi(req.get_param_value(name)); }
-    catch (...) { return def; }
+    return yuzu::server::parse_query_int<int>(req.get_param_value(name));
 }
 
 // -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
@@ -310,8 +313,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 if (sort_col.empty()) sort_col = "agent";
                 if (sort_dir.empty()) sort_dir = "asc";
 
-                int page = clamp(param_int(req, "page", 1), 1, 100000);
-                int per_page = clamp(param_int(req, "per_page", 50), 10, 200);
+                const auto page_opt = param_int(req, "page", 1);
+                const auto per_page_opt = param_int(req, "per_page", 50);
+                if (!page_opt || !per_page_opt) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                    "application/json");
+                    return;
+                }
+                int page = clamp(*page_opt, 1, 100000);
+                int per_page = clamp(*per_page_opt, 10, 200);
 
                 auto filters = parse_filters(req, plugin);
                 bool filters_explicit = !filters.empty();
@@ -1351,9 +1362,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // which keeps the chart deck rendered as filters change.
                  html += "<div id=\"filter-bar\" hx-swap-oob=\"true\""
                          " hx-get=\"/fragments/results/filter-bar?command_id=" +
-                         html_escape(command_id) + "&amp;plugin=" + html_escape(plugin);
+                         url_query_value(command_id) + "&amp;plugin=" + url_query_value(plugin);
                  if (!def_id.empty())
-                     html += "&amp;definition_id=" + html_escape(def_id);
+                     html += "&amp;definition_id=" + url_query_value(def_id);
                  html += "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"></div>";
 
                  // OOB: chart deck — empty initially, self-refreshes once
@@ -1367,8 +1378,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (!def_id.empty()) {
                      html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\""
                              " hx-get=\"/fragments/results?command_id=" +
-                             html_escape(command_id) + "&amp;plugin=" + html_escape(plugin) +
-                             "&amp;definition_id=" + html_escape(def_id) +
+                             url_query_value(command_id) + "&amp;plugin=" + url_query_value(plugin) +
+                             "&amp;definition_id=" + url_query_value(def_id) +
                              "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
                  } else {
                      // Clear any deck left over from a prior command.
@@ -2357,7 +2368,7 @@ std::string DashboardRoutes::render_results(
     // sites below (tbody empty-state, #result-summary) so an operator sees "store
     // degraded, not zero matches" rather than a silently wrong "no results".
     bool store_degraded = false;
-    // #4644 Gate 7 (row 6a): set when the unfiltered read below was cut by the row or the
+    // #4644 (row 6a): set when the unfiltered read below was cut by the row or the
     // byte cap, so the render says "partial" instead of presenting a cut result as complete.
     bool result_truncated = false;
     if (filters.empty()) {
@@ -2490,16 +2501,16 @@ std::string DashboardRoutes::render_results(
     // Build base URL for sort/page links (preserving all current params)
     auto base_url = [&](const std::string& new_sort, const std::string& new_dir,
                         int new_page) {
-        std::string url = "/fragments/results?command_id=" + html_escape(command_id) +
-                          "&amp;plugin=" + html_escape(plugin) +
-                          "&amp;sort=" + html_escape(new_sort) +
-                          "&amp;dir=" + html_escape(new_dir) +
+        std::string url = "/fragments/results?command_id=" + url_query_value(command_id) +
+                          "&amp;plugin=" + url_query_value(plugin) +
+                          "&amp;sort=" + url_query_value(new_sort) +
+                          "&amp;dir=" + url_query_value(new_dir) +
                           "&amp;page=" + std::to_string(new_page) +
                           "&amp;per_page=" + std::to_string(per_page);
         if (!definition_id.empty())
-            url += "&amp;definition_id=" + html_escape(definition_id);
+            url += "&amp;definition_id=" + url_query_value(definition_id);
         if (!template_id.empty())
-            url += "&amp;template_id=" + html_escape(template_id);
+            url += "&amp;template_id=" + url_query_value(template_id);
         for (const auto& f : filters) {
             // Reconstruct f_<col> params
             if (f.col_idx >= 0 && f.col_idx + 1 < static_cast<int>(col_names.size())) {
@@ -2508,11 +2519,11 @@ std::string DashboardRoutes::render_results(
                     if (c == ' ' || c == '-') pname += '_';
                     else pname += static_cast<char>(std::tolower(c));
                 }
-                url += "&amp;" + pname + "=" + html_escape(f.value);
+                url += "&amp;" + url_query_value(pname) + "=" + url_query_value(f.value);
             }
         }
         if (!text_query.empty())
-            url += "&amp;q=" + html_escape(text_query);
+            url += "&amp;q=" + url_query_value(text_query);
         return url;
     };
 
@@ -2675,12 +2686,12 @@ std::string DashboardRoutes::render_results(
                         if (c == ' ' || c == '-') pname += '_';
                         else pname += static_cast<char>(std::tolower(c));
                     }
-                    filter_params += "&amp;" + pname + "=" + html_escape(f.value);
+                    filter_params += "&amp;" + url_query_value(pname) + "=" + url_query_value(f.value);
                 }
             }
             html += " <button class=\"btn-create-group\" hx-get=\"/fragments/create-group-form"
-                    "?command_id=" + html_escape(command_id) +
-                    "&amp;plugin=" + html_escape(plugin) + filter_params +
+                    "?command_id=" + url_query_value(command_id) +
+                    "&amp;plugin=" + url_query_value(plugin) + filter_params +
                     "\" hx-target=\"#group-form-slot\" hx-swap=\"innerHTML\">"
                     "Create Group from " + std::to_string(total_agent_count) +
                     " Agent" + (total_agent_count != 1 ? "s" : "") + "</button>";
@@ -2711,12 +2722,14 @@ std::string DashboardRoutes::render_results(
             chart_count = VisualizationEngine::count((*def_result)->visualization_spec);
     }
     html += R"(<div id="chart-deck-host" hx-swap-oob="innerHTML">)";
-    if (chart_count > 0) {
+    // command_id is request-supplied and becomes a path segment below: no chart
+    // URL for an empty, `.` or `..` value (browsers collapse dot segments).
+    if (chart_count > 0 && path_segment_ok(command_id)) {
         html += R"(<div class="yuzu-chart-deck">)";
         for (int i = 0; i < chart_count; ++i) {
             html += R"(<div class="yuzu-chart-card" data-yuzu-chart-url=")";
-            html += "/api/v1/executions/" + html_escape(command_id) +
-                    "/visualization?definition_id=" + html_escape(definition_id) +
+            html += "/api/v1/executions/" + url_path_segment(command_id) +
+                    "/visualization?definition_id=" + url_query_value(definition_id) +
                     "&amp;index=" + std::to_string(i);
             html += R"("></div>)";
         }
@@ -3078,7 +3091,7 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
     // "every collector is running normally" — the operator-facing claim this
     // view exists to make.
     //
-    // #4644 Gate 7 (row 6a): the read is byte-aware (ResponseStore::query_bounded applies the
+    // #4644 (row 6a): the read is byte-aware (ResponseStore::query_bounded applies the
     // 50 MiB payload cap in SQL), because a buggy or hostile agent can store many large
     // responses under one command_id. A cut is NOT silent: dropped rows would read as agents
     // that never answered, i.e. as "collecting normally", so `result_truncated_by_cap` is set
@@ -3288,7 +3301,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
     html += "</div>";
     if (scan.result_truncated_by_cap) {
         // A cut read drops whole responses, which reads as agents that never answered, i.e. as
-        // "collecting normally". Say the picture is partial (#4644 Gate 7, row 6a).
+        // "collecting normally". Say the picture is partial (#4644, row 6a).
         html += "<div class=\"result-degrade-banner\" data-result-truncated=\"true\">"
                 "<b>Partial result.</b> The scan's response read reached its "
                 "10,000-row / 50 MiB cap, so some agents' responses are missing "
