@@ -492,7 +492,7 @@ TEST_CASE("remote_access_audit legs: a network mount is never touched", "[remote
     f.homes = {HomeEntry{"alice", "/net/home/alice"}};
     f.key_files["/net/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
     l = list_posix(f.build());
-    CHECK(f.resolved == std::vector<std::string>{"/home"});
+    CHECK(std::ranges::count(f.resolved, "/home") == 1); // the config half asks about its own paths too
     CHECK(has_token(l, "linux:remote_access_audit:keys:network_mount_skipped"));
     CHECK(row_with(l.rows, "key|alice|").empty());
     CHECK(f.open_home_calls == 0);
@@ -522,6 +522,192 @@ TEST_CASE("remote_access_audit legs: a network mount is never touched", "[remote
     CHECK(has_token(l, "linux:remote_access_audit:keys:mounts_unreadable"));
     CHECK(row_with(l.rows, "key|alice|") != "");
     CHECK(l.status == StatusState::constrained);
+}
+
+TEST_CASE("remote_access_audit legs: the config half honours the same run-start mount snapshot",
+          "[remote_access_audit][legs]") {
+    const auto touched_mentions = [](const Fake& x, std::string_view needle) {
+        return std::ranges::any_of(x.touched, [&](const std::string& t) { return t.find(needle) != std::string::npos; });
+    };
+
+    // the sshd_config path itself is under a mount: never read, a failed source, the rows say `-`
+    auto f = healthy();
+    f.prefixes = std::vector<std::string>{"/etc/ssh"};
+    f.config_files["/etc/ssh/sshd_config"] = ok("PermitRootLogin yes\n");
+    auto l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "sshd_config"));
+    CHECK(l.rows[0] == "source|sshd_config|failed|-");
+    CHECK(has_token(l, "linux:remote_access_audit:sshd_config:network_mount_skipped"));
+    CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|-|-");
+    CHECK(l.status == StatusState::constrained);
+
+    // a direct Include under a mount: never read; the parent's own directives still are
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/network"};
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /network/ssh.conf\nPermitRootLogin no\n");
+    f.config_files["/network/ssh.conf"] = ok("PermitRootLogin yes\n");
+    l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "network"));
+    CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    CHECK(l.rows[0] == "source|sshd_config|read|1"); // the parent was read, the include was not
+    CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|no|sshd_config");
+    CHECK(l.status == StatusState::constrained);
+
+    // the same path spelled with `..`, `.` and `//` is judged on its lexical form
+    for (const char* spelling : {"/etc/ssh/../../network/ssh.conf", "//network//./ssh.conf"}) {
+        f.config_files["/etc/ssh/sshd_config"] = ok(std::string("Include ") + spelling + "\n");
+        l = list_posix(f.build());
+        CHECK_FALSE(touched_mentions(f, "network"));
+        CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    }
+
+    // a glob Include whose DIRECTORY is under a mount: never listed, nothing in it read
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/network"};
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /network/conf.d/*.conf\n");
+    f.listings["/network/conf.d|*.conf"] = {"a.conf"};
+    f.dir_files["/network/conf.d/a.conf"] = ok("PermitRootLogin yes\n");
+    l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "network"));
+    CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|-|-");
+    CHECK(l.status == StatusState::constrained);
+
+    // the config path is itself a link whose single readlink hop lands under a mount
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/net"};
+    f.resolve = [](const std::string& p) {
+        return p == "/etc/ssh/sshd_config" ? std::string{"/net/ssh/sshd_config"} : p;
+    };
+    f.config_files["/etc/ssh/sshd_config"] = ok("PermitRootLogin yes\n");
+    l = list_posix(f.build());
+    CHECK(std::ranges::count(f.resolved, "/etc/ssh/sshd_config") == 1);
+    CHECK_FALSE(touched_mentions(f, "sshd_config"));
+    CHECK(has_token(l, "linux:remote_access_audit:sshd_config:network_mount_skipped"));
+    CHECK(l.rows[0] == "source|sshd_config|failed|-");
+
+    // an Include file that is a link into a mount (relative argument: SSHDIR-prefixed) is skipped likewise
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/net"};
+    f.resolve = [](const std::string& p) { return p == "/etc/ssh/extra.conf" ? std::string{"/net/extra.conf"} : p; };
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include extra.conf\n");
+    f.config_files["/etc/ssh/extra.conf"] = ok("PermitRootLogin yes\n");
+    l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "extra.conf"));
+    CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    CHECK(l.rows[0] == "source|sshd_config|read|1");
+
+    // segment boundary: /networking is not under the /network mount and is read
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/network"};
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /networking/x.conf\n");
+    f.config_files["/networking/x.conf"] = ok("PermitRootLogin no\n");
+    l = list_posix(f.build());
+    CHECK(touched_mentions(f, "/networking/x.conf"));
+    CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|no|include:x.conf");
+    CHECK(l.status == StatusState::supported);
+
+    // an unreadable mount table is ONE token, and the config half reads unguarded
+    f = healthy();
+    f.prefixes = std::nullopt;
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /network/ssh.conf\n");
+    f.config_files["/network/ssh.conf"] = ok("PermitRootLogin yes\n");
+    l = list_posix(f.build());
+    const std::string unreadable = "linux:remote_access_audit:keys:mounts_unreadable";
+    CHECK(touched_mentions(f, "/network/ssh.conf"));
+    CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|yes|include:ssh.conf");
+    CHECK(l.reason.find(unreadable) != std::string::npos);
+    CHECK(l.reason.find(unreadable) == l.reason.rfind(unreadable));
+    CHECK(l.status == StatusState::constrained);
+}
+
+TEST_CASE("remote_access_audit legs: add_data_volume_aliases adds the other spelling of every mount prefix",
+          "[remote_access_audit][legs]") {
+    std::vector<std::string> p{"/System/Volumes/Data/Users/alice", "/Users/bob", "/"};
+    add_data_volume_aliases(p);
+    CHECK(p == std::vector<std::string>{"/System/Volumes/Data/Users/alice", "/Users/bob", "/", "/Users/alice",
+                                        "/System/Volumes/Data/Users/bob"});
+
+    // the Data volume's own root, a relative or empty entry and an empty table add nothing
+    std::vector<std::string> none{"/System/Volumes/Data", "relative/path", ""};
+    add_data_volume_aliases(none);
+    CHECK(none.size() == 3);
+    std::vector<std::string> empty;
+    add_data_volume_aliases(empty);
+    CHECK(empty.empty());
+
+    // a sibling directory that merely shares the name prefix is aliased as an ordinary path
+    std::vector<std::string> sibling{"/System/Volumes/DataX/y"};
+    add_data_volume_aliases(sibling);
+    REQUIRE(sibling.size() == 2);
+    CHECK(sibling[1] == "/System/Volumes/Data/System/Volumes/DataX/y");
+}
+
+TEST_CASE("remote_access_audit legs: a mount recorded under the macOS Data volume covers the firmlinked spelling",
+          "[remote_access_audit][legs]") {
+    const auto macos_fake = [] {
+        auto f = healthy();
+        f.os = "macos";
+        f.launchd = true;
+        f.roots = {"/Users"};
+        f.runner = [](const std::vector<std::string>&) {
+            return ran("disabled services = {\n\t\"com.openssh.sshd\" => enabled\n}\n");
+        };
+        return f;
+    };
+    const auto with_aliases = [](std::vector<std::string> v) {
+        add_data_volume_aliases(v);
+        return std::optional<std::vector<std::string>>{std::move(v)};
+    };
+
+    // The mount is named /System/Volumes/Data/Users/alice, the home is walked as /Users/alice.
+    auto f = macos_fake();
+    f.prefixes = with_aliases({"/System/Volumes/Data/Users/alice"});
+    f.homes = {HomeEntry{"alice", "/Users/alice"}, HomeEntry{"bob", "/Users/bob"}};
+    f.account_probe = [](const HomeEntry&) { return true; };
+    f.key_files["/Users/alice/.ssh/authorized_keys"] = ok(kAliceKey);
+    f.key_files["/Users/bob/.ssh/authorized_keys"] = ok(kAliceKey);
+    auto l = list_posix(f.build());
+    CHECK(f.probe_calls == 1);                     // bob only: alice is never asked about
+    CHECK(f.open_home_calls == 1);                 // bob only
+    CHECK_FALSE(f.touched_under("/Users/alice"));  // not probed, opened or read
+    CHECK(row_with(l.rows, "file|alice|authorized_keys|") == "file|alice|authorized_keys|failed|-|-|-");
+    CHECK(row_with(l.rows, "file|alice|authorized_keys2|") == "file|alice|authorized_keys2|failed|-|-|-");
+    CHECK(has_token(l, "macos:remote_access_audit:keys:network_mount_skipped"));
+    CHECK(row_with(l.rows, "key|bob|") != "");     // the local home is still audited
+    CHECK(l.status == StatusState::constrained);
+
+    // negative control: the table as recorded, without the alias, is what let the home open
+    f = macos_fake();
+    f.prefixes = std::vector<std::string>{"/System/Volumes/Data/Users/alice"};
+    f.homes = {HomeEntry{"alice", "/Users/alice"}};
+    f.key_files["/Users/alice/.ssh/authorized_keys"] = ok(kAliceKey);
+    l = list_posix(f.build());
+    CHECK(f.open_home_calls == 1);
+    CHECK_FALSE(has_token(l, "network_mount_skipped"));
+
+    // the other direction: a mount recorded as /Users/alice covers an absolute AuthorizedKeysFile
+    // entry spelled through the Data volume, and the entry's reader is never called
+    f = macos_fake();
+    f.config_files["/etc/ssh/sshd_config"] = ok("AuthorizedKeysFile /System/Volumes/Data/Users/alice/.ssh/k\n");
+    f.prefixes = with_aliases({"/Users/alice"});
+    f.homes = {HomeEntry{"bob", "/Users/bob"}};
+    f.abs_files["/System/Volumes/Data/Users/alice/.ssh/k"] = ok(kAliceKey);
+    l = list_posix(f.build());
+    CHECK(f.key_reads == 0);
+    CHECK_FALSE(f.touched_under("/System/Volumes/Data/Users/alice"));
+    CHECK(row_with(l.rows, "file|bob|custom|") == "file|bob|custom|failed|-|-|-");
+    CHECK(has_token(l, "macos:remote_access_audit:keys:network_mount_skipped"));
+    CHECK(row_with(l.rows, "key|bob|").empty());
+
+    // ... and a configured Include through the Data volume is covered the same way
+    f = macos_fake();
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /System/Volumes/Data/net/ssh.conf\n");
+    f.config_files["/System/Volumes/Data/net/ssh.conf"] = ok("PermitRootLogin yes\n");
+    f.prefixes = with_aliases({"/net"});
+    l = list_posix(f.build());
+    CHECK_FALSE(f.touched_under("/System/Volumes/Data/net"));
+    CHECK(has_token(l, "macos:remote_access_audit:include:network_mount_skipped"));
 }
 
 TEST_CASE("remote_access_audit legs: service state arms", "[remote_access_audit][legs]") {
@@ -691,6 +877,25 @@ TEST_CASE("remote_access_audit legs: the row budget is dispatch-wide and the fix
     CHECK(has_token(l, "linux:remote_access_audit:keys:row_cap"));
     CHECK(has_token(l, "linux:remote_access_audit:keys:field_oversized"));
     CHECK(l.rows.size() < 600);
+
+    // the byte budget counts the ESCAPED account: a 255-byte pipe basename is 510 bytes on the wire in
+    // every key row, and 1900 valid key lines would otherwise be charged for half of it (1,143,023
+    // bytes admitted against 1 MiB with no token)
+    f = healthy();
+    f.homes = {HomeEntry{std::string(255, '|'), "/home/pipes"}};
+    std::string many_keys;
+    for (int i = 0; i < 1900; ++i)
+        many_keys += kAliceKey;
+    f.key_files["/home/pipes/.ssh/authorized_keys"] = ok(many_keys);
+    l = list_posix(f.build());
+    std::size_t wire_bytes = 0;
+    for (const auto& r : l.rows)
+        wire_bytes += r.size();
+    CHECK(has_token(l, "linux:remote_access_audit:keys:row_cap"));
+    CHECK(l.status == StatusState::constrained);
+    CHECK(wire_bytes <= kMaxBytes); // every emitted row, status/source/config/service/file/key alike
+    CHECK(kind_rows(l, "key").size() < 1900);
+    CHECK(kind_rows(l, "source").size() == 3);
 
     // the file-read attempt cap: 300 accounts x 5 entries would be 1500 reads; 1024 are made
     f = healthy();

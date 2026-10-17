@@ -449,6 +449,36 @@ TEST_CASE("remote_access_audit keys: the row budget is charged before a row exis
     CHECK_FALSE(parse(key + key, 2).kp.truncated); // an exact fill is admitted
 }
 
+TEST_CASE("remote_access_audit keys: the byte budget is charged with the escaped wire size of each row",
+          "[remote_access_audit][keys]") {
+    // CONSTRUCTED: a legal 255-byte home-directory basename of pipes. Every pipe is written as
+    // two bytes on the wire (`\|`), so the account field alone is 510 bytes in each of 1900 rows;
+    // a charge computed from the raw 255 bytes admitted 1,143,023 bytes against a 1 MiB budget.
+    const std::string account(255, '|');
+    const std::string key = kAliceEd25519Type + " " + kAliceEd25519B64 + " c\n";
+    std::string text;
+    for (int i = 0; i < 1900; ++i)
+        text += key;
+
+    yuzu::shared::RowByteBudget budget{kMaxRows, kMaxBytes};
+    KeysParse kp;
+    parse_authorized_keys(text, account, "authorized_keys", budget, kp);
+
+    std::size_t charged = 0;
+    for (const auto& r : kp.rows)
+        charged += r.size() + kRowOverhead;
+    CHECK(kp.truncated);
+    CHECK(kp.keys == kp.rows.size());
+    CHECK(kp.keys < 1900);
+    CHECK(charged <= kMaxBytes);
+    CHECK(charged == budget.bytes); // the budget saw exactly what the rows weigh on the wire
+    std::string escaped;
+    for (int i = 0; i < 255; ++i)
+        escaped += "\\|";
+    REQUIRE_FALSE(kp.rows.empty());
+    CHECK(kp.rows.front().rfind("key|" + escaped + "|authorized_keys|", 0) == 0); // the pipes really are doubled
+}
+
 TEST_CASE("remote_access_audit keys: row formatters escape and file rows carry counts",
           "[remote_access_audit][keys]") {
     bool ov = false;

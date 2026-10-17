@@ -33,6 +33,7 @@ std::optional<std::vector<std::string>> macos_network_prefixes() {
         if (yuzu::shared::is_network_mount_fstype(mnt.get()[i].f_fstypename))
             out.emplace_back(mnt.get()[i].f_mntonname);
     }
+    add_data_volume_aliases(out); // a system-created mount is listed under /System/Volumes/Data
     return out;
 }
 

@@ -48,8 +48,6 @@ namespace yuzu::remote_access_audit {
 /// sshd's authorized_keys reader has no line cap (getline); this one does, and counts the
 /// lines it did not parse.
 inline constexpr std::size_t kMaxKeyLine = 16 * 1024;
-/// Upper bound of a key row's fixed-width fields: fingerprint 50, bits 5, flags 64, separators.
-inline constexpr std::size_t kKeyRowFixed = 128;
 
 // ---------------------------------------------------------------------------
 // Key blob decoding (sshkey.c sshkey_from_blob_internal)
@@ -599,10 +597,11 @@ struct KeysParse {
 /// Parses one authorized_keys file's text into `out.rows` (one `key|...` row per accepted
 /// line, in file order, duplicates kept). Blank and `#` lines are ignored and uncounted. A
 /// line over kMaxKeyLine is counted oversized and not parsed; a line sshd would not accept is
-/// counted malformed and not emitted. Charges `budget` BEFORE materialising each row and
-/// stops at the first refusal (`out.truncated`). A line is cut at its first NUL byte before it
-/// is parsed (`out.nul_truncated`): sshd reads each line with getline() and treats it as a C
-/// string, so a key before the NUL is a key it trusts and the file is still accepted.
+/// counted malformed and not emitted. Formats each row, charges its wire size plus overhead
+/// and retains it only when admitted; stops at the first refusal (`out.truncated`). A line is
+/// cut at its first NUL byte before it is parsed (`out.nul_truncated`): sshd reads each line
+/// with getline() and treats it as a C string, so a key before the NUL is a key it trusts and
+/// the file is still accepted.
 inline void parse_authorized_keys(std::string_view text, std::string_view account, std::string_view kind,
                                   yuzu::shared::RowByteBudget& budget, KeysParse& out) {
     std::size_t at = 0;
@@ -644,21 +643,12 @@ inline void parse_authorized_keys(std::string_view text, std::string_view accoun
             opts = *parsed;
         }
 
-        // Charge the would-be (uncut) size first; a refusal stops the whole parse.
         std::string options_field;
         for (const auto& n : opts.names) {
             if (!options_field.empty())
                 options_field += ',';
             options_field += n;
         }
-        // fingerprint (50) + bits + flags are bounded constants; the rest is measured.
-        const std::size_t cost = account.size() + kind.size() + key->type_token.size() +
-                                 options_field.size() + kKeyRowFixed + kRowOverhead;
-        if (!budget.charge(cost)) {
-            out.truncated = true;
-            return;
-        }
-
         std::string flags;
         const auto flag = [&](bool on, std::string_view name) {
             if (!on)
@@ -673,12 +663,22 @@ inline void parse_authorized_keys(std::string_view text, std::string_view accoun
         flag(opts.has_from, "has_from");
         flag(opts.has_principals, "has_principals");
         flag(key->unknown, "unknown_type");
+
+        // Charge the row as it goes on the wire (escaped and cut), never an estimate of its
+        // parts: a pipe in the account doubles on the wire. A refusal stops the whole parse
+        // and leaves every counter and flag as the last admitted row left it.
+        bool row_oversized = false;
+        std::string row = key_row(account, kind, key->type_token, fingerprint_sha256(key->facts.plain_blob),
+                                  key->unknown ? std::string{} : std::to_string(key->facts.bits), flags,
+                                  options_field, row_oversized);
+        if (!budget.charge(row.size() + kRowOverhead)) {
+            out.truncated = true;
+            return;
+        }
+        out.field_oversized = out.field_oversized || row_oversized;
         if (key->unknown)
             out.unknown_type = true;
-
-        out.rows.push_back(key_row(account, kind, key->type_token, fingerprint_sha256(key->facts.plain_blob),
-                                   key->unknown ? std::string{} : std::to_string(key->facts.bits), flags,
-                                   options_field, out.field_oversized));
+        out.rows.push_back(std::move(row));
         ++out.keys;
     }
 }

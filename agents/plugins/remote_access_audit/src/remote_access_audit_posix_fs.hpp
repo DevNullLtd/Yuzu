@@ -30,8 +30,11 @@
  * those descriptors, so it is not thread-safe and not for sharing.
  *
  * Blocking: open and read carry no deadline of their own (posix_secure_read.hpp). The legs
- * decision logic skips every path under a network mount named by the mount table BEFORE any
- * call here; stacked filesystems and a bare `fuse` mount over a dead server still block (#4875).
+ * decision logic skips every configured path under a network mount named by the mount table
+ * BEFORE any call here: the config file, an Include file or directory (each also at its one
+ * readlink hop via resolve_root), a home parent, a home and a key path. Stacked filesystems,
+ * a bare `fuse` mount over a dead server, link chains and links among the entries of a listed
+ * Include directory still block (#4875).
  */
 #pragma once
 

@@ -12,7 +12,9 @@
  *
  * The cut line (config + service half vs keys half) is kept clean: audit_config and
  * audit_service_* use only the config/service members of PosixFs and the config parsers
- * header; audit_keys uses only the keys members and the keys parsers header.
+ * header; audit_keys uses only the keys members and the keys parsers header. The one thing
+ * both halves share is the run-start network mount snapshot (and `resolve_root`, its one
+ * readlink hop): list_posix takes it ONCE, before any path is touched, and hands it to both.
  *
  * Row contract (pipe rows, status row first):
  *   status|list|<supported|constrained|permission_denied|unsupported>|<tokens or ->
@@ -44,6 +46,7 @@
 #include <cerrno>
 #include <chrono>
 #include <functional>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -338,11 +341,13 @@ struct PosixFs {
     // --- keys half ---
     /// Mount points of network filesystems; nullopt = the mount table could not be read.
     std::function<std::optional<std::vector<std::string>>()> network_mount_prefixes;
-    /// Optional. Resolves a configured home PARENT that is itself a symlink (Fedora Atomic's
-    /// /home -> var/home) by ONE readlink hop to the absolute, normalised path it names; any
-    /// other root, a single home, and any failure answer `root` unchanged. It reads the link
-    /// only, never the target, so the mount-table decision below runs on the real path before
-    /// anything is opened. Unset = every root is taken as written.
+    /// Optional. Resolves any configured path that is itself a symlink (a home PARENT such as
+    /// Fedora Atomic's /home -> var/home, the sshd_config path, an Include file or directory)
+    /// by ONE readlink hop to the absolute, normalised path it names; a path that is not a
+    /// link, a single home, and any failure answer `root` unchanged. It reads the link only,
+    /// never the target, so the mount-table decision runs on the real path before anything is
+    /// opened. Link chains, and links among the entries of a listed Include directory, are NOT
+    /// resolved (a disclosed residual, README caveat 4). Unset = every path is taken as written.
     std::function<std::string(const std::string& root)> resolve_root;
     /// Lists the account homes under `roots` (already resolved): errno of the first failed
     /// root, ENOENT when every root is absent.
@@ -370,12 +375,87 @@ struct ConfigOutcome {
     std::size_t files_read = 0;
 };
 
+/// The firmlinked read-write volume's spelling on macOS: a mount the system creates under it is
+/// listed as `/System/Volumes/Data/<path>`, though the same object is reached as `/<path>`. A
+/// firmlink is not a symlink, so neither the prefix compare nor a no-follow open tells the two
+/// apart.
+inline constexpr std::string_view kDataVolume = "/System/Volumes/Data";
+
+/// Adds the other spelling of every mount prefix: the stripped form of a `/System/Volumes/Data/<p>`
+/// prefix, and the Data-volume form of every other absolute prefix (not "/"), so a home or key
+/// path is matched under either spelling. Pure: no stat, no realpath. Segment boundaries stay
+/// `detail::under_prefix`'s job.
+inline void add_data_volume_aliases(std::vector<std::string>& prefixes) {
+    std::vector<std::string> aliases;
+    for (const std::string_view p : prefixes) {
+        if (p.size() <= kDataVolume.size() && p.starts_with(kDataVolume))
+            continue; // the Data volume's own root: no alias
+        if (p.starts_with(kDataVolume) && p[kDataVolume.size()] == '/')
+            aliases.emplace_back(p.substr(kDataVolume.size()));
+        else if (p.size() > 1 && p.front() == '/')
+            aliases.push_back(std::string{kDataVolume} + std::string{p});
+    }
+    prefixes.insert(prefixes.end(), std::make_move_iterator(aliases.begin()),
+                    std::make_move_iterator(aliases.end()));
+}
+
 namespace detail {
+
+/// True when `path` is on or under a listed mount point (segment-boundary match; "/" covers all).
+inline bool under_prefix(std::string_view path, const std::vector<std::string>& prefixes) {
+    for (const auto& m : prefixes) {
+        if (m == "/")
+            return true;
+        if (path.size() >= m.size() && path.compare(0, m.size(), m) == 0 &&
+            (path.size() == m.size() || path[m.size()] == '/'))
+            return true;
+    }
+    return false;
+}
+
+/// `path` with empty and `.` components dropped and `..` folded (never above "/"): the one
+/// spelling the prefix compare sees, so `//`, `/./` and `/x/../` cannot slip past a byte compare.
+/// Lexical only, no filesystem call (a link before a `..` is the disclosed residual).
+inline std::string lexical_normal(std::string_view path) {
+    std::vector<std::string_view> parts;
+    for (std::size_t i = 0; i <= path.size();) {
+        const auto slash = path.find('/', i);
+        const auto part = path.substr(i, slash == std::string_view::npos ? std::string_view::npos : slash - i);
+        if (part == "..") {
+            if (!parts.empty())
+                parts.pop_back();
+        } else if (!part.empty() && part != ".") {
+            parts.push_back(part);
+        }
+        if (slash == std::string_view::npos)
+            break;
+        i = slash + 1;
+    }
+    std::string out;
+    for (const auto part : parts) {
+        out += '/';
+        out += part;
+    }
+    return out.empty() ? "/" : out;
+}
+
+/// True when a CONFIGURED path (the config file, an Include file or directory) is on a network
+/// mount, judged without touching the mount: the lexically normalised path, then the single
+/// readlink hop `resolve_root` answers when the path is itself a link. Nothing is opened,
+/// stat'ed or realpath'ed.
+inline bool configured_path_on_network(const PosixFs& fs, const std::vector<std::string>& prefixes,
+                                       const std::string& path) {
+    if (prefixes.empty())
+        return false;
+    const std::string norm = lexical_normal(path);
+    return under_prefix(norm, prefixes) || (fs.resolve_root && under_prefix(fs.resolve_root(norm), prefixes));
+}
 
 struct IncludeCtx {
     const PosixFs& fs;
     Tally& t;
     SshdConfigState& st;
+    const std::vector<std::string>& prefixes; ///< the run-start network mount snapshot
     std::size_t files_read = 0;
 };
 
@@ -405,6 +485,13 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
     }
     if (c.files_read >= kMaxIncludeFiles) {
         c.t.acc.add_failure(src_token(os, "include", "too_many"));
+        return;
+    }
+    // The readers carry no deadline, so an Include file (or a listed directory) on a network
+    // mount is never opened; the directory is checked, not its entries (README caveat 4).
+    if (configured_path_on_network(c.fs, c.prefixes,
+                                   spec.kind == IncludeSpec::Kind::single ? spec.path : spec.dir)) {
+        c.t.acc.add_failure(src_token(os, "include", "network_mount_skipped"));
         return;
     }
 
@@ -455,9 +542,17 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
 } // namespace detail
 
 /// Reads sshd_config and follows every Include in directive order. Fills `st`; adds the
-/// sshd_config/include tokens; never emits a row.
-inline ConfigOutcome audit_config(const PosixFs& fs, Tally& t, SshdConfigState& st) {
+/// sshd_config/include tokens; never emits a row. `prefixes` is the run-start network mount
+/// snapshot: neither the config file nor an Include path on a mount is opened (`failed` +
+/// `network_mount_skipped`).
+inline ConfigOutcome audit_config(const PosixFs& fs, Tally& t, SshdConfigState& st,
+                                  const std::vector<std::string>& prefixes) {
     ConfigOutcome out;
+    if (detail::configured_path_on_network(fs, prefixes, fs.config_path)) {
+        out.state = SourceState::failed;
+        t.note(SrcOutcome{SourceState::failed, src_token(fs.os, "sshd_config", "network_mount_skipped")});
+        return out;
+    }
     const FileReadLike r = fs.read_config(fs.config_path);
     const SrcOutcome o = classify_read(r, fs.os, "sshd_config");
     out.state = o.state;
@@ -465,7 +560,7 @@ inline ConfigOutcome audit_config(const PosixFs& fs, Tally& t, SshdConfigState& 
     if (o.state != SourceState::read)
         return out;
     ++t.read_sources;
-    detail::IncludeCtx c{fs, t, st, 1};
+    detail::IncludeCtx c{fs, t, st, prefixes, 1};
     detail::parse_with_includes(c, r.data, "sshd_config", 0);
     out.files_read = c.files_read;
     if (st.invalid_quotes)
@@ -599,18 +694,6 @@ struct KeysOutcome {
 
 namespace detail {
 
-/// True when `path` is on or under a listed mount point (segment-boundary match; "/" covers all).
-inline bool under_prefix(std::string_view path, const std::vector<std::string>& prefixes) {
-    for (const auto& m : prefixes) {
-        if (m == "/")
-            return true;
-        if (path.size() >= m.size() && path.compare(0, m.size(), m) == 0 &&
-            (path.size() == m.size() || path[m.size()] == '/'))
-            return true;
-    }
-    return false;
-}
-
 inline std::string join_path(std::string_view home, const std::vector<std::string>& components) {
     std::string p{home};
     for (const auto& c : components) {
@@ -624,8 +707,10 @@ inline std::string join_path(std::string_view home, const std::vector<std::strin
 
 /// Walks every account home. Entries are RESOLVED first (P7) so a readable absolute
 /// AuthorizedKeysFile entry never depends on the home being openable; the home is opened
-/// only when at least one entry is home-relative. A network mount is never touched (P8).
-inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tally& t) {
+/// only when at least one entry is home-relative. A network mount named by `prefixes` (the
+/// run-start snapshot) is never touched (P8).
+inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tally& t,
+                              const std::vector<std::string>& prefixes) {
     KeysOutcome out;
     const auto& os = fs.os;
     const auto token = [&](std::string_view cause) { return src_token(os, "keys", cause); };
@@ -638,12 +723,6 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
         entries = {".ssh/authorized_keys", ".ssh/authorized_keys2"};
     else if (!(cfg.akf.size() == 1 && detail::lower(cfg.akf[0]) == "none"))
         entries = cfg.akf;
-
-    std::vector<std::string> prefixes;
-    if (auto p = fs.network_mount_prefixes())
-        prefixes = std::move(*p);
-    else
-        t.acc.add_failure(token("mounts_unreadable"));
 
     // A home root on a network mount is never listed. The configured path is checked first (no
     // syscall); a root that is itself a link is then resolved by readlink alone and its target
@@ -803,7 +882,16 @@ inline Listing list_posix(const PosixFs& fs) {
     Tally t;
     SshdConfigState cfg;
 
-    const ConfigOutcome co = audit_config(fs, t, cfg);
+    // ONE mount snapshot for the whole listing, taken before the first path is touched: the
+    // config half and the keys half both decide against it (the table itself is a bounded
+    // no-follow read of /proc/self/mountinfo or the kernel's getmntinfo cache, never a mount).
+    std::vector<std::string> prefixes;
+    if (auto p = fs.network_mount_prefixes())
+        prefixes = std::move(*p);
+    else
+        t.acc.add_failure(src_token(fs.os, "keys", "mounts_unreadable"));
+
+    const ConfigOutcome co = audit_config(fs, t, cfg, prefixes);
     std::vector<std::string> config_rows_out;
     {
         bool oversized = false;
@@ -814,7 +902,7 @@ inline Listing list_posix(const PosixFs& fs) {
         t.field_oversized = t.field_oversized || oversized;
     }
     const ServiceOutcome so = fs.launchd ? audit_service_macos(fs, t) : audit_service_linux(fs, t);
-    const KeysOutcome ko = audit_keys(fs, cfg, t);
+    const KeysOutcome ko = audit_keys(fs, cfg, t, prefixes);
 
     if (t.truncated)
         t.acc.add_failure(src_token(fs.os, "keys", "row_cap"));
