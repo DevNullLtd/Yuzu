@@ -34,7 +34,7 @@ prod_mgmt_entry(Extra) ->
                  listen => #{port => 0},
                  acceptors => 4,
                  limits => #{max_connections => 256, max_message_bytes => 4194304},
-                 http2 => #{idle_timeout => 600000, max_concurrent_streams => 1024,
+                 http2 => #{idle_timeout => 600000, max_concurrent_streams => 4096,
                             max_received_frame_rate => {100000, 10000}}},
                Extra).
 
@@ -266,6 +266,25 @@ cowboy_log_lines_test() ->
 in_fresh_process(Fun) ->
     {Pid, Mon} = spawn_monitor(Fun),
     receive {'DOWN', Mon, process, Pid, normal} -> ok end.
+
+%%%-------------------------------------------------------------------
+%%% 4. The management listener's stream cap
+%%%-------------------------------------------------------------------
+
+%% A listener that routes the ManagementService defaults to 4096 concurrent
+%% streams (the fan-out of 5,000 agents answering within 10 s completes in about
+%% 12 s, against about 31 s at 1024; see http2_opts/1). An agent listener keeps
+%% 1024, and an explicit value wins.
+mgmt_stream_cap_default_test_() ->
+    Streams = fun(E) -> maps:get(max_concurrent_streams, yuzu_grpc_listener:http2_opts(E)) end,
+    Bare = #{name => m, service_protos => [management_pb],
+             services => #{?MGMT_SVC => yuzu_gw_edge_stub_svc}, listen => #{port => 0}},
+    [{"management listener: 4096", ?_assertEqual(4096, Streams(Bare))},
+     {"agent listener: 1024",
+      ?_assertEqual(1024, Streams(Bare#{service_protos => [agent_pb],
+                                        services => #{?AGENT_SVC => yuzu_grpc_stub_svc}}))},
+     {"explicit value wins",
+      ?_assertEqual(512, Streams(Bare#{http2 => #{max_concurrent_streams => 512}}))}].
 
 %%%-------------------------------------------------------------------
 %%% Helpers

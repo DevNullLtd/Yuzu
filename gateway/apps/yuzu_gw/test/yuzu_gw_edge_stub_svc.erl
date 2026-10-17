@@ -10,6 +10,8 @@
 %%%   sleep    block until the stream is torn down (an agent that never answers)
 %%%   delay    sleep command_id milliseconds, then send one small response (an
 %%%            agent that answers after a while)
+%%%   delay_big  command_id is "Ms:Bytes": sleep Ms, then send one response
+%%%            whose output is Bytes long
 %%%
 %%% State is an ETS table the test creates with init/1 and removes with
 %%% stop/0; `waiting' events go to the pid given to init/1.
@@ -69,6 +71,13 @@ run(<<"delay">>, Ms, Stream) ->
     timer:sleep(binary_to_integer(Ms)),
     _ = yuzu_grpc_stream:send(Stream, #{agent_id => <<"a">>,
                                         response => #{output => <<"done">>}}),
+    ok;
+run(<<"delay_big">>, Arg, Stream) ->
+    [Ms, Bytes] = binary:split(Arg, <<":">>),
+    timer:sleep(binary_to_integer(Ms)),
+    _ = yuzu_grpc_stream:send(Stream, #{agent_id => <<"a">>,
+                                        response => #{output => binary:copy(<<"r">>,
+                                                                            binary_to_integer(Bytes))}}),
     ok;
 run(_Other, _Arg, _Stream) ->
     {grpc_error, {3, <<"unknown action">>}}.

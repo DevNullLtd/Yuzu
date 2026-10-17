@@ -271,6 +271,14 @@
               %% (Before this key the listener's ceiling was infinity.)
               %% 4 MiB messages: a command step carries at most 32 parameters of
               %% 64 KiB each (about 2 MiB).
+              %% No max_connection_memory_bytes: on a management-only listener
+              %% the per-connection memory ceiling is OFF unless set here. Its
+              %% one peer is the pinned server, and the ceiling (which also
+              %% counts responses waiting to be written) killed the server's
+              %% connection, every call on it, when a fan-out's agents answered
+              %% together. Cowboy's output-buffer alarm paces the senders
+              %% instead; what the connection can then hold is about 16 MB plus
+              %% one response per stream in flight (max_concurrent_streams below).
               limits => #{max_connections => 256, max_message_bytes => 4194304},
               %% The server's command client does not ping: 10 minutes idle.
               %% The server sends every command of a fan-out over its ONE
@@ -279,7 +287,17 @@
               %% connection with enhance_your_calm and fails every call in
               %% flight; 100000 per 10 s is the management listener's default
               %% (yuzu_grpc_listener:http2_opts/1), set here so it is visible.
-              http2 => #{idle_timeout => 600000, max_concurrent_streams => 1024,
+              %% max_concurrent_streams 4096 (the management default, set here
+              %% so it is visible): the server's client queues calls past the
+              %% cap, so a fan-out takes about agents x mean answer time / cap
+              %% when that exceeds the answer time. Measured with 5,000 agents
+              %% answering in 0-10 s over one connection: 30.7 s at 1024,
+              %% 11.9 s at 4096, 10.1 s at 8192. Not higher: every stream in
+              %% flight can hold one response waiting to be written, so the cap
+              %% also bounds that memory (5,000 answers of 256 KiB inside 1 s
+              %% peaked at ~1 GB at 4096, ~1.2 GB at 8192). See
+              %% docs/user-manual/gateway.md, "gRPC listeners".
+              http2 => #{idle_timeout => 600000, max_concurrent_streams => 4096,
                          max_received_frame_rate => {100000, 10000}}}
         ]},
 
