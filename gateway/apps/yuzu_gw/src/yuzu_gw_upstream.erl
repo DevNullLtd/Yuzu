@@ -275,6 +275,8 @@
          proxy_inventory/1,
          proxy_inventory/2,
          notify_stream_status/5,
+         notify_settled/4,
+         reregister_session/3,
          forward_guardian_message/2,
          replay_sessions/1,
          replay_sessions/2,
@@ -580,7 +582,13 @@
     %% which cluster owns an agent's live stream. Read once at init; a
     %% pre-WS-4 build has no such config and the env default (<<"default">>)
     %% keeps a single-cluster deployment's id stable and non-empty.
-    cluster_id      :: binary()
+    cluster_id      :: binary(),
+    %% OWNER-RESTART (#5695): who waits for a key to settle, i.e. to have no
+    %% event held and no send in flight (notify_settled/4). A restarted agent
+    %% owner registers here after casting its predecessor's DISCONNECTED, and
+    %% presents the session to the server again only once that notice is done,
+    %% so the server never sees the DISCONNECTED after the re-registration.
+    settle_waiters = #{} :: #{yuzu_gw_notify_queue:key() => [reference() | pid()]}
 }).
 
 %%%===================================================================
@@ -634,6 +642,31 @@ proxy_inventory(InventoryReport, Opts) ->
 notify_stream_status(AgentId, SessionId, Event, PeerAddr, StreamHomeId) ->
     gen_server:cast(?SERVER, {notify_stream_status, AgentId, SessionId, Event, PeerAddr,
                                StreamHomeId}).
+
+%% @doc Tell `Ack' (an alias or a pid) once the stream-status key {AgentId,
+%% SessionId, StreamHomeId} has no event held and no send in flight: the
+%% message is `{Ack, notify_settled}'. Cast after a notify_stream_status/5 from
+%% the same process, it answers once that notice is retired (sent, or counted
+%% lost); for a key with nothing pending it answers at once. Nothing answers if
+%% this process stops first: the caller bounds its own wait (OWNER-RESTART,
+%% #5695; see yuzu_gw_agent's recovering state).
+-spec notify_settled(binary(), binary() | undefined, binary(), reference() | pid()) -> ok.
+notify_settled(AgentId, SessionId, StreamHomeId, Ack) ->
+    gen_server:cast(?SERVER, {notify_settled,
+                              {AgentId, ensure_binary(SessionId), StreamHomeId}, Ack}).
+
+%% @doc Present an existing session to the server again: a ProxyRegister of the
+%% stored RegisterRequest carrying SessionId as `x-yuzu-session-id', the same
+%% request a registration replay makes (HA WS-4 4.4: the server adopts the
+%% session if its directory still owns it or can reclaim it, and answers
+%% FAILED_PRECONDITION when a different live session holds the agent). Used by
+%% a restarted agent owner to re-establish its predecessor's session
+%% (OWNER-RESTART, #5695). Runs in the calling process under a `register'
+%% permit, with the options and errors of proxy_register/2.
+-spec reregister_session(map(), binary(), map()) -> {ok, term()} | {error, term()}.
+reregister_session(RegisterReq, SessionId, Opts) when is_binary(SessionId), SessionId =/= <<>> ->
+    proxied_call('ProxyRegister', register, RegisterReq,
+                 Opts#{metadata => #{<<"x-yuzu-session-id">> => SessionId}}).
 
 %% @doc Forward an unsolicited Guardian side-channel CommandResponse
 %% (plugin="__guard__") upstream to the C++ control plane via the
@@ -873,9 +906,10 @@ proxy_gate() ->
     end.
 
 proxied_call(Method, Class, Request, Opts) ->
-    proxied_attempt(Method, Class, Request, caller_deadline(Opts), ?STREAM_LIMIT_PAUSE_MS).
+    proxied_attempt(Method, Class, Request, caller_deadline(Opts), ?STREAM_LIMIT_PAUSE_MS,
+                    maps:get(metadata, Opts, #{})).
 
-proxied_attempt(Method, Class, Request, Deadline, Pause) ->
+proxied_attempt(Method, Class, Request, Deadline, Pause, Metadata) ->
     case proxy_gate() of
         undefined -> {error, upstream_unavailable};
         stopping  -> {error, stopping};
@@ -885,7 +919,7 @@ proxied_attempt(Method, Class, Request, Deadline, Pause) ->
             %% call; a caller with less than that left is not worth a permit.
             case yuzu_gw_upstream_regulator:ask(Class, Deadline - ?MIN_USEFUL_MS) of
                 {ok, Permit} ->
-                    Result = try permitted_call(Method, Class, Request, Deadline)
+                    Result = try permitted_call(Method, Class, Request, Deadline, Metadata)
                              after yuzu_gw_upstream_regulator:done(Permit)
                              end,
                     case Result of
@@ -893,7 +927,7 @@ proxied_attempt(Method, Class, Request, Deadline, Pause) ->
                             stream_limit_pause(Class, Deadline, Pause,
                                                fun(Next) ->
                                                        proxied_attempt(Method, Class, Request,
-                                                                       Deadline, Next)
+                                                                       Deadline, Next, Metadata)
                                                end);
                         _ ->
                             Result
@@ -930,7 +964,7 @@ stream_limit_pause(Class, Deadline, Pause, Retry) ->
 %% read before the call, and is returned to the caller without waiting for it.
 %% A call gun refused locally for the server's stream limit is `stream_limit':
 %% it is not cast (the breaker does not see it) and proxied_attempt/5 retries it.
-permitted_call(Method, Class, Request, Deadline) ->
+permitted_call(Method, Class, Request, Deadline, Metadata) ->
     case proxy_gate() of
         undefined -> {error, upstream_unavailable};
         stopping  -> {error, stopping};
@@ -942,7 +976,7 @@ permitted_call(Method, Class, Request, Deadline) ->
                     drop_call(Class),
                     {error, deadline};
                 true ->
-                    case do_rpc(Method, Request, Class, #{}, min(rpc_timeout(), Left)) of
+                    case do_rpc(Method, Request, Class, Metadata, min(rpc_timeout(), Left)) of
                         {error, too_many_streams} ->
                             stream_limit;
                         Result ->
@@ -1292,6 +1326,9 @@ handle_cast(replay_registrations, State) ->
     %% meanwhile is already gone and is not replayed. A targeted replay already
     %% queued (a verdict) keeps running; the walk is pumped after it.
     {noreply, start_full_replay(manual, State)};
+
+handle_cast({notify_settled, Key, Ack}, #state{settle_waiters = W} = State) ->
+    {noreply, release_settled(State#state{settle_waiters = W#{Key => [Ack | maps:get(Key, W, [])]}})};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -1729,7 +1766,14 @@ code_change(_OldVsn, State, _Extra) ->
     %% A cell put by an older version has fewer slots than this one writes:
     %% replace it with one that keeps the old slots.
     ok = grow_cell(),
-    {ok, State}.
+    {ok, add_settle_waiters(State)}.
+
+%% A state from before OWNER-RESTART has no settle_waiters (the last field).
+add_settle_waiters(State) when is_tuple(State), element(1, State) =:= state,
+                               tuple_size(State) =:= tuple_size(#state{}) - 1 ->
+    erlang:append_element(State, #{});
+add_settle_waiters(State) ->
+    State.
 
 %% @doc What a crash report and sys:get_status/1 show of this process.
 %%
@@ -1781,7 +1825,11 @@ redact_state(#state{replay_queue = Queue, recent_replays = Recent,
     Fields = maps:from_list(lists:zip(record_info(fields, state),
                                       tl(tuple_to_list(State)))),
     (maps:without([replay_queue, recent_replays, notify_pending, notify_probe,
-                   replay_pids, replay_walk, notify_pids], Fields))#{
+                   replay_pids, replay_walk, notify_pids, settle_waiters], Fields))#{
+        settle_waiters => case Fields of
+                              #{settle_waiters := W} when is_map(W) -> map_size(W);
+                              _ -> '$redacted'
+                          end,
         notify_inflight => map_size(NPids),
         replay_queue_len => length(Queue),
         replay_inflight => map_size(RPids),
@@ -1808,6 +1856,7 @@ redact_message({replay_sessions, _Ids})           -> {replay_sessions, '$redacte
 redact_message({replay_sessions, _Ids, Verdict})  -> {replay_sessions, '$redacted', Verdict};
 redact_message({forward_guardian_message, AgentId, _Frame}) ->
     {forward_guardian_message, AgentId, '$redacted'};
+redact_message({notify_settled, _Key, _Ack})      -> {notify_settled, '$redacted', '$redacted'};
 redact_message({notify_stream_status, AgentId, _SessionId, Event, _PeerAddr, _Home}) ->
     {notify_stream_status, AgentId, '$redacted', Event, '$redacted', '$redacted'};
 redact_message({'$gen_call', From, Msg})          -> {'$gen_call', From, redact_message(Msg)};
@@ -2335,7 +2384,18 @@ emit_notify_queue(Pending, Inflight) ->
 %% notifications, then pump the replay. The caller reports the notify gauges
 %% (report_notify_counts/2 with the counts taken at the top of its handler).
 settle(State) ->
-    maybe_end_flush(pump_replay(drain(State))).
+    release_settled(maybe_end_flush(pump_replay(drain(State)))).
+
+%% Answer every notify_settled/4 waiter whose key has no event held and no send
+%% in flight (the half_open probe is in notify_pids too). O(waiters x sends in
+%% flight); there are waiters only while restarted agent owners recover.
+release_settled(#state{settle_waiters = W} = State) when map_size(W) =:= 0 ->
+    State;
+release_settled(#state{settle_waiters = W, notify_pending = Pending, notify_pids = Pids} = State) ->
+    Settled = [K || K <- maps:keys(W), not yuzu_gw_notify_queue:is_held(K, Pending),
+                    not key_in_flight(K, Pids)],
+    [[Ack ! {Ack, notify_settled} || Ack <- maps:get(K, W)] || K <- Settled],
+    State#state{settle_waiters = maps:without(Settled, W)}.
 
 %% Start replay workers while there is work and room:
 %%   - fewer workers than the replay cap (upstream_replay_concurrency, the

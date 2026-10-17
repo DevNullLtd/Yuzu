@@ -47,7 +47,7 @@
 -module(yuzu_gw_notify_queue).
 
 -export([new/1, put/4, put/5, push_front/3, push_front/4, take/1, peek_key/1, size/1,
-         cap/1, set_cap/2, to_list/1]).
+         cap/1, set_cap/2, to_list/1, is_held/2]).
 
 -export_type([t/0, key/0, event/0, class/0]).
 
@@ -157,6 +157,11 @@ peek_key(#nq{keys = Keys, events = Events} = Q) ->
 -spec size(t()) -> non_neg_integer().
 size(#nq{events = Events}) ->
     map_size(Events).
+
+%% @doc Whether an event is held for `Key' (O(1)).
+-spec is_held(key(), t()) -> boolean().
+is_held(Key, #nq{events = Events}) ->
+    maps:is_key(Key, Events).
 
 %% @doc The cap.
 -spec cap(t()) -> pos_integer().
