@@ -107,7 +107,7 @@ The gateway source lives in `gateway/apps/yuzu_gw/src/`:
 | `yuzu_gw_sup` | Top-level supervisor |
 | `yuzu_gw_agent_sup` | `simple_one_for_one` supervisor for agent processes |
 | `yuzu_gw_agent` | `gen_statem`: one process per agent bidi stream |
-| `yuzu_gw_registry` | Process groups + ETS routing table, plus the node-local session index used by heartbeat admission |
+| `yuzu_gw_registry` | ETS routing table, plus the node-local session index used by heartbeat admission. It makes no `pg` call: each agent process joins its own `{agent, Id}` group, which a node reads to find an agent held by another node |
 | `yuzu_gw_router` | Command fanout coordinator |
 | `yuzu_gw_upstream` | Caller of the C++ server: runs the proxy RPCs of registration and inventory one at a time, with the circuit breaker (see "Registration rate per gateway" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
 | `yuzu_grpc_client`, `yuzu_grpc_client_channel`, `yuzu_grpc_client_config` | The upstream gRPC client, unary calls only (see [The upstream client](#the-upstream-client)): `yuzu_grpc_client` makes one call over a connection the channel hands it, `yuzu_grpc_client_channel` keeps a pool of HTTP/2 connections (gun) per endpoint open and reopens them, `yuzu_grpc_client_config` reads `{yuzu_gw, upstream_client}` |
@@ -3505,8 +3505,11 @@ env keys with defaults, which a reverted build ignores.
   run). The third site matters because a failed registry call in the per-agent
   process's init used to exit that init with a reason that embedded the
   `RegisterRequest`, which the Subscribe handler then logged (INFERRED from the
-  code; not run). The agent init now stops with the fixed reason
-  `registry_unavailable`. Before this, the gRPC server library logged the exit of
+  code; not run). The agent process now answers a failed registry call with the
+  fixed reason `registry_unavailable` to the Subscribe handler that waits for it,
+  and stops with reason `normal`, which writes no crash report (since PR #5695 the
+  registration runs after the agent's `init/1` has returned, so the agent
+  supervisor never waits for the registry). Before this, the gRPC server library logged the exit of
   the calling handler process at INFO together with the whole request (OBSERVED by a
   security reviewer running the real application with a real gRPC client, for three
   triggers on the upstream client: a crash with a call queued, a 30 s stall with no
