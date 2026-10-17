@@ -15,6 +15,13 @@
 %%%   notify_latency_ms   {Min, Max}  the same for NotifyStreamStatus
 %%%   register_fail       none | {Status, Message}  answer every ProxyRegister
 %%%                                   with that gRPC status instead
+%%%   notify_refuse_connected_until  0 | OS ms  answer every CONNECTED
+%%%                                   NotifyStreamStatus received before that time
+%%%                                   with acknowledged=false (not recorded: it is
+%%%                                   counted in refused_connected_notices only,
+%%%                                   not in notices/0 or the session table), as
+%%%                                   a server that cannot record sessions does
+%%%                                   (default 0, never)
 %%%
 %%% close_connections/1 closes the connections the gateway holds to this server
 %%% while the server keeps running with its state (sessions, notices): `abort'
@@ -72,7 +79,8 @@
 -define(A_TIMEOUT_MIN, 14).
 -define(A_TIMEOUT_UNDER_1S, 15).
 -define(A_CONN_QLEN_MAX, 16).
--define(A_SLOTS, 16).
+-define(A_REFUSED, 17).
+-define(A_SLOTS, 17).
 %% The most unknown session ids one verdict names (the gateway reads at most
 %% 4096, yuzu_gw_upstream ?MAX_REPLAY_SESSION_IDS).
 -define(MAX_UNKNOWN, 4096).
@@ -123,6 +131,7 @@ stats() ->
       register_rpcs_cut_reasons => maps:from_list([{R, C} || {{cut, R}, C} <- ets:tab2list(?CFG)]),
       connected_notices => atomics:get(A, ?A_CONNECTED),
       disconnected_notices => atomics:get(A, ?A_DISCONNECTED),
+      refused_connected_notices => atomics:get(A, ?A_REFUSED),
       heartbeat_batches => atomics:get(A, ?A_HB_BATCHES),
       heartbeats => atomics:get(A, ?A_HEARTBEATS),
       unknown_sessions_reported => atomics:get(A, ?A_UNKNOWN)}.
@@ -203,7 +212,8 @@ init(Opts) ->
     persistent_term:put({?MODULE, atomics}, atomics:new(?A_SLOTS, [{signed, true}])),
     set_config(maps:merge(#{register_latency_ms => {0, 0},
                             notify_latency_ms => {0, 0},
-                            register_fail => none},
+                            register_fail => none,
+                            notify_refuse_connected_until => 0},
                           maps:without([port, max_streams], Opts))),
     Entry = #{name => {yuzu_gw_scale_upstream, erlang:unique_integer([positive])},
               service_protos => [gateway_pb],
@@ -325,10 +335,19 @@ notify_stream_status(Ctx, Req) ->
                 1 -> disconnected;
                 _ -> connected
             end,
-    atomics:add(A, case Event of connected -> ?A_CONNECTED; disconnected -> ?A_DISCONNECTED end, 1),
-    ets:insert(?NOTICES, {atomics:add_get(A, ?A_SEQ, 1), AgentId, Session, Event, now_ms()}),
-    ets:insert(?SESSIONS, {Session, AgentId, Event}),
-    {ok, #{acknowledged => true}, Ctx}.
+    Now = now_ms(),
+    case Event =:= connected andalso Now < cfg(notify_refuse_connected_until) of
+        true ->
+            %% Refused: answered, not recorded (the gateway must send it again).
+            atomics:add(A, ?A_REFUSED, 1),
+            {ok, #{acknowledged => false}, Ctx};
+        false ->
+            atomics:add(A, case Event of connected -> ?A_CONNECTED;
+                                         disconnected -> ?A_DISCONNECTED end, 1),
+            ets:insert(?NOTICES, {atomics:add_get(A, ?A_SEQ, 1), AgentId, Session, Event, Now}),
+            ets:insert(?SESSIONS, {Session, AgentId, Event}),
+            {ok, #{acknowledged => true}, Ctx}
+    end.
 
 batch_heartbeat(Ctx, Req) ->
     A = persistent_term:get({?MODULE, atomics}),
