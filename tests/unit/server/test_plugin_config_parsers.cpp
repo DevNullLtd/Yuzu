@@ -326,3 +326,31 @@ TEST_CASE("resolve_kill_switch: base layer ANDed with the per-OS layer",
     // rows for a different action are ignored.
     CHECK(resolve("a", {{"b", "", false}, {"b", "linux", false}}) == Set{});
 }
+
+// ── kill_switch_set_detail: the reason reaches the audit evidence ────────────
+
+TEST_CASE("kill_switch_set_detail without a reason is the unchanged evidence format",
+          "[server][config][killswitch]") {
+    const KillSwitchScope plain{"tar", "sql", ""};
+    CHECK(kill_switch_set_detail(plain, false) == "enabled=false");
+    CHECK(kill_switch_set_detail(plain, true, "") == "enabled=true");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"quarantine", "", ""}, false) ==
+          "enabled=false, protective_exempt=true");
+}
+
+TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped reason",
+          "[server][config][killswitch]") {
+    const KillSwitchScope plain{"tar", "sql", ""};
+    CHECK(kill_switch_set_detail(plain, false, "incident INC-42") ==
+          "enabled=false, reason=\"incident INC-42\"");
+    // Protective marker first, then the reason.
+    CHECK(kill_switch_set_detail(KillSwitchScope{"quarantine", "", ""}, false, "drill") ==
+          "enabled=false, protective_exempt=true, reason=\"drill\"");
+    // Quote and backslash cannot close the field; tab and other controls flatten to a space.
+    CHECK(kill_switch_set_detail(plain, false, "a\"b\\c\td\x01" "e") ==
+          "enabled=false, reason=\"a\\\"b\\\\c d e\"");
+    // A reason longer than the cap is cut at 512 bytes: the evidence line stays bounded even
+    // for a caller that skipped is_valid_reason.
+    const auto long_detail = kill_switch_set_detail(plain, false, std::string(2000, 'x'));
+    CHECK(long_detail == "enabled=false, reason=\"" + std::string(512, 'x') + "\"");
+}

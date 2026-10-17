@@ -399,8 +399,11 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
     CHECK(h.audits[0].action == "plugin_config.kill_switch.set");
     CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[0].target_id == "firewall.block");
-    CHECK(h.audits[0].detail == "enabled=false"); // ordinary pair: no protective label
+    // ordinary pair: no protective label; the operator's reason rides on the attempted row
+    // and the outcome row (the live row keeps only the latest reason).
+    CHECK(h.audits[0].detail == "enabled=false, reason=\"incident 99\"");
     CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].detail == "enabled=false, reason=\"incident 99\"");
     CHECK(h.audits[1].target_id == "firewall.block");
 
     auto get = h.sink.Get("/api/v1/plugin-config/firewall/kill-switch?action=block");
@@ -445,8 +448,8 @@ TEST_CASE("plugin_config_routes: kill-switch PUT writes and reads the reserved-n
     // The audit evidence says the row is inert for dispatch: a stored OFF row
     // on a protective pair must never read as proof of a stop.
     REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[0].detail == "enabled=false, protective_exempt=true");
-    CHECK(h.audits[1].detail == "enabled=false, protective_exempt=true");
+    CHECK(h.audits[0].detail == "enabled=false, protective_exempt=true, reason=\"incident\"");
+    CHECK(h.audits[1].detail == "enabled=false, protective_exempt=true, reason=\"incident\"");
 
     // Proven against the real store accessor, not the echoed response (the
     // stored row, not the dispatch decision: a protective pair is exempt).

@@ -20435,7 +20435,11 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch actually flips PluginCon
     auto off_payload = operator_surface_payload(off_res);
     CHECK(off_payload["enabled"] == false);
     CHECK(off_payload["set_by"] == "test-user");
-    CHECK(ts.audit_details[0] == "enabled=false"); // ordinary pair: no protective label
+    // ordinary pair: no protective label; the operator's reason rides on the attempted row
+    // and the outcome row (the live row keeps only the latest reason).
+    REQUIRE(ts.audit_details.size() >= 2);
+    CHECK(ts.audit_details[0] == "enabled=false, reason=\"incident 99\"");
+    CHECK(ts.audit_details[1] == "enabled=false, reason=\"incident 99\"");
 
     // The proof: the REAL fail-closed chokepoint every dispatch caller
     // shares — not a re-read through get_plugin_kill_switch — now says no.
@@ -20576,8 +20580,8 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch writes the reserved-name
     // The audit evidence says the row is inert for dispatch: a stored OFF row
     // on a protective pair must never read as proof of a stop.
     REQUIRE(ts.audit_details.size() >= 2);
-    CHECK(ts.audit_details[0] == "enabled=false, protective_exempt=true");
-    CHECK(ts.audit_details[1] == "enabled=false, protective_exempt=true");
+    CHECK(ts.audit_details[0] == "enabled=false, protective_exempt=true, reason=\"incident\"");
+    CHECK(ts.audit_details[1] == "enabled=false, protective_exempt=true, reason=\"incident\"");
 
     // Proven against the real store accessor, same as the ordinary-plugin case
     // above — not by trusting the tool's own echoed response. This is the

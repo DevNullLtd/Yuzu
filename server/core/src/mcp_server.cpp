@@ -21631,7 +21631,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // A row on a protective pair is stored but never gates dispatch;
                 // label the evidence so it is never read as proof of a stop.
                 const std::string ks_detail =
-                    plugin_config::kill_switch_set_detail(*scope, enabled);
+                    plugin_config::kill_switch_set_detail(*scope, enabled, reason);
                 if (!audit_fn(req, "plugin_config.kill_switch.set", "attempted", "PluginConfig",
                               target_id, ks_detail)) {
                     res.set_content(
