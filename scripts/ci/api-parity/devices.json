@@ -19,7 +19,7 @@
       "path": "/api/v1/management-groups/{param}"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
   },
   {
     "method": "GET",
@@ -98,7 +98,7 @@
       "path": "/api/v1/hardware/{param}"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
   },
   {
     "method": "GET",
@@ -149,7 +149,7 @@
       "path": "/api/v1/hardware"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
   },
   {
     "method": "GET",
@@ -157,7 +157,7 @@
     "capability_id": "get.fragments-dashboard-summary",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.fragments-hardware-list,get.api-approvals-pending-count,get.fragments-executions,get.api-compliance"
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.fragments-hardware-list,get.api-approvals-pending-count,get.fragments-executions,get.api-compliance; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
   },
   {
     "method": "GET",
@@ -168,7 +168,7 @@
       "path": "/api/v1/quarantine"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
   },
   {
     "method": "GET",

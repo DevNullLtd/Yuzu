@@ -357,10 +357,22 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                          log_id_token(ev_row.rule_id));
             return;
         case EventInsertOutcome::Error:
-            // res.error is server-constructed (SQLite errmsg / fixed strings) — no agent
-            // input — but the identifiers still get neutralised.
+            // res.error is server-constructed (fixed strings plus libpq error text such as
+            // "insert failed: " + PQresultErrorMessage, guaranteed_state_store.cpp), not an
+            // agent-supplied field, but that text can in principle quote an offending value
+            // (guaranteed_state_events has TEXT columns, BIGINT columns bound from numbers the
+            // server formats, and one BOOLEAN (remediation_success) bound from the fixed
+            // literals "true" and "false", with no CHECK or foreign key). Embedded NULs are
+            // rejected before the insert ("event field contains an embedded NUL byte"). A
+            // duplicate event_id is resolved to Redelivered or Conflict before this path unless
+            // the compare SELECT or the ROLLBACK TO SAVEPOINT itself errors ("redelivery
+            // compare failed"), which also returns libpq text. detail_json is capped at 16 KiB
+            // (kMaxDetailJson, earlier in this function). So it is wrapped: log_key_token folds
+            // control bytes and keeps spaces, so the message stays readable on one line, and
+            // caps the length at 256 bytes, keeping the head and the tail of a longer message.
             spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}",
-                         log_id_token(agent_id), log_id_token(ev_row.rule_id), res.error);
+                         log_id_token(agent_id), log_id_token(ev_row.rule_id),
+                         log_key_token(res.error));
             return;
         }
         if (ev_row.rule_id != kObservationRuleId) {
@@ -439,11 +451,19 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                 if (alert_router)
                     alert_router->observe(obs_type, subject, safe_agent, now);
             } catch (const std::exception& e) {
-                spdlog::warn("Guardian ingest: observer threw for {} from agent {}: {}", obs_type,
-                             safe_agent, e.what());
+                // The token wrappers allocate, so a bad_alloc here would otherwise leave the
+                // handler and tear down the stream this catch-all exists to protect.
+                try {
+                    spdlog::warn("Guardian ingest: observer threw for {} from agent {}: {}",
+                                 log_id_token(obs_type), log_id_token(safe_agent), e.what());
+                } catch (...) {
+                }
             } catch (...) {
-                spdlog::warn("Guardian ingest: observer threw (non-std) for {} from agent {}",
-                             obs_type, safe_agent);
+                try { // same reason as above: the wrappers allocate
+                    spdlog::warn("Guardian ingest: observer threw (non-std) for {} from agent {}",
+                                 log_id_token(obs_type), log_id_token(safe_agent));
+                } catch (...) {
+                }
             }
         }
         return;
@@ -454,7 +474,7 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
     // enters the response store / executions drawer.
     spdlog::debug("Guardian: ignoring __guard__ action '{}' from agent {} (only 'event' ingested "
                   "in A1)",
-                  resp.action(), agent_id);
+                  log_id_token(resp.action()), log_id_token(agent_id));
 }
 
 } // namespace yuzu::server::detail
