@@ -736,8 +736,8 @@ database, so the fix is a restart with the flag relaxed — no data surgery:
 sudo systemctl edit yuzu-server     # --mfa-enforcement=optional
 sudo systemctl restart yuzu-server
 
-# 2. Log in with password alone, enroll via Settings → Multi-Factor
-#    Authentication, and SAVE the recovery codes.
+# 2. Log in with password alone, enroll via Settings → Security and
+#    sign-in → Two-factor sign-in, and SAVE the recovery codes.
 
 # 3. Restore enforcement and restart.
 ```

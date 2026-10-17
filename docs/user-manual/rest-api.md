@@ -9603,6 +9603,7 @@ outcome's granularity.
 
 - **Permission:** Admin only
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
+- **Behaviour today:** an empty `issuer` falls back to the stored issuer; the stored skip-TLS flag is OR-ed with the posted one (a posted `false` cannot turn off a stored `true`); the typed issuer is not trimmed here (unlike the save route); and the check fetches the issuer's discovery document only.
 - **Response:** HTML feedback span — green on success, red on failure with specific error.
 
 #### `GET /api/v1/settings/oidc`

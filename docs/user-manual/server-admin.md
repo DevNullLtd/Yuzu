@@ -2938,7 +2938,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 |---|---|---|
 | TLS Configuration | `/fragments/settings/tls` | Agent (gRPC) certificate, key and CA upload or paste, plus the in-memory mTLS display switch. Does not control dashboard HTTPS (see `/fragments/settings/https`, read-only). Shown on **Settings → Security and sign-in** as "Agent connections (mTLS)". |
 | User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. The accounts are also listed, read-only, on the **Users** page (`/access/users`) in the Access section of the sidebar. |
-| Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
+| Two-factor sign-in (MFA) | `/fragments/settings/mfa` | Shown on **Settings → Security and sign-in**. Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
 | Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
 | Auto-Approval Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). |
@@ -3112,7 +3112,7 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 
 The **Settings → Security and sign-in** page has two certificate panels, and neither one turns HTTPS on:
 
-1. **Dashboard HTTPS** is read-only. It shows whether HTTPS is on, the port, the certificate and key paths and the HTTP redirect. The dashboard certificate and key come from `--https-cert` / `--https-key` and reload from disk when the files change. There is no HTTPS toggle and no dashboard-certificate upload.
+1. **Dashboard HTTPS** is read-only. It shows whether HTTPS is on, the port, the certificate and key paths and the HTTP redirect. The dashboard certificate and key come from `--https-cert` / `--https-key` and reload from disk when the files change (not when the server runs with `--no-cert-reload`). There is no HTTPS toggle and no dashboard-certificate upload.
 2. **Agent connections (mTLS)** uploads or pastes the three agent (gRPC) files: server certificate, private key and CA certificate. Each replace asks for confirmation, overwrites the file with no backup, and does not change the running listeners (gRPC certificate hot-reload is not supported). After a restart the server uses the uploaded file only if `--cert`, `--key` and `--ca-cert` name it; if they do and the material is wrong, the server will not start. The gateway command plane pins the server certificate, so changing it can stop command forwarding. The mTLS switch on this panel changes only the value this server reports; it is not saved.
 
 ### Certificate Requirements

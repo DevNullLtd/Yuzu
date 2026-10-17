@@ -110,8 +110,8 @@ std::string render_https(const HttpsView& v) {
     if (v.enabled) {
         out += "<p class=\"hint\" style=\"padding:12px 16px 0\">The dashboard certificate and key "
                "are set by the <code>--https-cert</code> and <code>--https-key</code> start-up "
-               "flags and reload from disk when the files change. They are not changed on this "
-               "page.</p>";
+               "flags. They reload from disk when the files change, unless the server runs with "
+               "<code>--no-cert-reload</code>. They are not changed on this page.</p>";
     } else {
         out += "<p class=\"hint\" style=\"padding:12px 16px 0\">Start the server with "
                "<code>--https --https-cert &lt;path&gt; --https-key &lt;path&gt;</code> to "
