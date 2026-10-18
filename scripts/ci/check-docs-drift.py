@@ -25,7 +25,8 @@ Two layers, one script:
    A gap not in the baseline fails (new drift). A baseline entry that is no
    longer a gap also fails, so the baseline can only shrink as docs are fixed:
    delete the entry in the same change. A named set rather than a count means
-   fixing one old gap can never hide a new one. `--write-baseline` rewrites the
+   fixing one old gap can never hide a new one. `--update-baseline` (alias
+   `--write-baseline`) rewrites the
    file from the current tree but refuses to ADD entries without
    `--allow-growth`, so growing the baseline is always a visible, deliberate
    diff to that file.
@@ -54,7 +55,7 @@ Usage (every form also accepts a leading `--root DIR`: check that tree, read
 as data only; the extractor code always comes from this script's own tree):
   check-docs-drift.py                           fact parity + manifest self-check
   check-docs-drift.py --list                    print every current gap (worklist), exit 0
-  check-docs-drift.py --write-baseline [--allow-growth]
+  check-docs-drift.py --update-baseline [--allow-growth]
   check-docs-drift.py --touch BASE HEAD [PR_BODY_FILE]
 
 Exit: 0 ok, 1 drift / rule violated / cannot evaluate (fail closed), 2 usage.
@@ -64,7 +65,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -84,7 +87,9 @@ BASELINE = ROOT / BASELINE_REL
 MANIFEST = ROOT / MANIFEST_REL
 
 # Files whose CLI11 add_option/add_flag calls define a binary's flags. A new
-# options header must be added here or its flags go unchecked.
+# options header must be added here or its flags go unchecked; the self-test
+# fails if any file under the two src/ trees calls add_option/add_flag and is
+# not listed. Each listed file must yield at least one flag (fail closed).
 FLAG_SOURCES = (
     "server/core/src/main.cpp",
     "server/core/src/server_ota_options.hpp",
@@ -103,6 +108,10 @@ GIT_SAFE = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 # tree). A broken extractor otherwise reads as "nothing undocumented", which
 # the ratchet cannot see once a category's baseline has reached zero.
 MIN_EXTRACTED = {"routes": 120, "tools": 90, "flags": 60}
+
+# Where `inline constexpr std::string_view kFooFlag = "--foo";` constants live,
+# for calls written `add_option(std::string{kFooFlag}, ...)`.
+FLAG_CONSTANT_GLOBS = ("server/core/src/*.hpp", "agents/core/src/*.hpp")
 
 CATEGORIES = ("rest_undocumented", "rest_stale", "mcp_undocumented", "flag_undocumented")
 
@@ -126,11 +135,20 @@ def read_tree_file(root, path):
     real = path.resolve()
     if real != root and root not in real.parents:
         raise ValueError(f"{path} resolves outside the tree")
-    if not real.is_file():
-        raise ValueError(f"{path} is not a regular file")
-    if real.stat().st_size > MAX_READ_BYTES:
+    # Check the OPEN file, not the path, and read at most one byte past the
+    # cap, so a file swapped or grown after the checks cannot slip through.
+    # O_NONBLOCK keeps a FIFO from blocking the open.
+    try:
+        fd = os.open(real, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as e:
+        raise ValueError(f"{path} cannot be opened ({e.strerror})") from None
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        data = f.read(MAX_READ_BYTES + 1)
+    if len(data) > MAX_READ_BYTES:
         raise ValueError(f"{path} is larger than {MAX_READ_BYTES} bytes")
-    return real.read_text(encoding="utf-8")
+    return data.decode("utf-8").replace("\r\n", "\n")
 
 
 def load_parity(root=ROOT):
@@ -164,12 +182,8 @@ def doc_heading_routes(text, canonicalize):
     """{(METHOD, canonical path): line_no} for every route named in a heading.
     `GET`/`DELETE /api/v1/x` in one heading yields both methods."""
     out = {}
-    in_fence = False
-    for no, line in enumerate(text.splitlines(), 1):
-        if line.lstrip().startswith(("```", "~~~")):
-            in_fence = not in_fence
-            continue
-        if in_fence or not re.match(r"#{2,6} ", line):
+    for no, line in unfenced_lines(text):
+        if not re.match(r"#{2,6} ", line):
             continue
         for m in _HEADING_ROUTE.finditer(line):
             path = normalize_doc_path(m.group(2), canonicalize)
@@ -178,16 +192,53 @@ def doc_heading_routes(text, canonicalize):
     return out
 
 
-_ADD_OPT = re.compile(r'add_(?:option|flag)\(\s*"([^"]+)"')
+_FENCE = re.compile(r"(`{3,}|~{3,})(.*)$")
 
 
-def extract_flags(sources):
-    """{flag: source} for every `--long` name in a literal CLI11 name string,
-    including the `!--no-x` negated form."""
+def fence_open(line):
+    """The fence run if `line` opens or closes a CommonMark code fence. A
+    backtick fence's info string may not contain a backtick."""
+    m = _FENCE.match(re.sub(r"^[ \t]{0,3}", "", line))
+    if m and (m.group(1)[0] == "~" or "`" not in m.group(2)):
+        return m
+    return None
+
+
+def unfenced_lines(text):
+    """(line_no, line) outside fenced code blocks. A fence closes only on a
+    run of the SAME character at least as long as its opener, with no info
+    string - so a ``` line inside a ```` block does not end it."""
+    fence = None
+    for no, line in enumerate(text.splitlines(), 1):
+        m = fence_open(line)
+        if fence:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+                fence = None
+            continue
+        if m:
+            fence = m.group(1)
+            continue
+        yield no, line
+
+
+_ADD_OPT = re.compile(r'add_(?:option|flag)\(\s*(?:"([^"]+)"|(?:std::string\s*\{\s*)?(k\w+))')
+_FLAG_CONST = re.compile(r'constexpr\s+(?:std::string_view|const\s+char\s*\*|auto)\s+(k\w+)\s*=\s*"([^"]+)"')
+
+
+def flag_constants(texts):
+    """{kName: "--name"} from string constants in the given header texts."""
+    return {m.group(1): m.group(2) for t in texts for m in _FLAG_CONST.finditer(t)}
+
+
+def extract_flags(sources, constants=None):
+    """{flag: source} for every `--long` name in a CLI11 name string - a
+    literal, or a `k*` constant resolved through `constants` - including the
+    `!--no-x` negated form."""
     out = {}
     for rel, text in sources.items():
         for m in _ADD_OPT.finditer(text):
-            for tok in m.group(1).split(","):
+            names = m.group(1) if m.group(1) is not None else (constants or {}).get(m.group(2), "")
+            for tok in names.split(","):
                 tok = tok.strip().lstrip("!").split("{", 1)[0]
                 if tok.startswith("--"):
                     out.setdefault(tok, rel)
@@ -226,8 +277,11 @@ def current_drift(root=ROOT):
     doc_routes = doc_heading_routes(read_tree_file(root, root / REST_DOC), parity.canonicalize)
     tools = parity.extract_mcp_tools()
     manual = "\n".join(read_tree_file(root, p) for p in sorted((root / USER_MANUAL).glob("*.md")))
-    flags = extract_flags({rel: read_tree_file(root, root / rel) for rel in FLAG_SOURCES})
+    constants = flag_constants(read_tree_file(root, f) for g in FLAG_CONSTANT_GLOBS for f in sorted(root.glob(g)))
+    flags = extract_flags({rel: read_tree_file(root, root / rel) for rel in FLAG_SOURCES}, constants)
     floors = extraction_floor_errors({"routes": len(versioned), "tools": len(tools), "flags": len(flags)})
+    floors += [f"{rel} yields no flags - its add_option/add_flag calls are not extractable"
+               for rel in FLAG_SOURCES if rel not in flags.values()]
     if floors:
         raise RuntimeError("; ".join(floors))
     return compute_drift(versioned, doc_routes, tools, read_tree_file(root, root / MCP_DOC),
@@ -236,8 +290,9 @@ def current_drift(root=ROOT):
 
 # ── Ratchet ───────────────────────────────────────────────────────────────
 
-def load_baseline(path):
-    data = json.loads(read_tree_file(Path(path).parents[2], path))
+def load_baseline(path, root=None):
+    """`root` is the tree the file must stay inside (default: its own dir)."""
+    data = json.loads(read_tree_file(root or Path(path).parent, path))
     return {c: set(data.get(c, [])) for c in CATEGORIES}
 
 
@@ -248,7 +303,7 @@ def ratchet_errors(drift, baseline):
         for item in sorted(now - known):
             errors.append(f"new {cat}: {item} - {FIX_HINT[cat]}")
         for item in sorted(known - now):
-            errors.append(f"fixed {cat}: {item} - delete it from "
+            errors.append(f"stale {cat}: {item} - no longer a gap; delete it from "
                           f"scripts/ci/docs-drift-baseline.json (the baseline only shrinks)")
     return errors
 
@@ -301,8 +356,9 @@ def glob_to_regex(glob):
     return re.compile("^" + "".join(out) + "$")
 
 
-def load_manifest(path):
-    data = json.loads(read_tree_file(Path(path).parents[2], path))
+def load_manifest(path, root=None):
+    """`root` is the tree the file must stay inside (default: its own dir)."""
+    data = json.loads(read_tree_file(root or Path(path).parent, path))
     rules = []
     for r in data["rules"]:
         rules.append({"id": r["id"], "code": list(r["code"]), "docs": list(r["docs"]),
@@ -377,12 +433,21 @@ def visible_lines(body):
             html_block = bool(raw.strip())
             continue
         if not comment:
+            # CommonMark HTML blocks that end at a marker, not a blank line.
+            end = None
             rb = re.match(r"<(script|pre|style|textarea)\b", t, re.I)
             if rb:
                 end = re.compile(r"</" + rb.group(1) + r"\s*>", re.I)
-                raw_end = None if end.search(t) else end
+            elif t.startswith("<![CDATA["):
+                end = re.compile(re.escape("]]>"))
+            elif t.startswith("<?"):
+                end = re.compile(re.escape("?>"))
+            elif re.match(r"<![A-Za-z]", t):
+                end = re.compile(">")
+            if end:
+                raw_end = None if end.search(t, 2) else end
                 continue
-            if re.match(r"</?[A-Za-z]|<\?|<!(?!--)", t):
+            if re.match(r"</?[A-Za-z]", t):
                 html_block = True
                 open_tag = re.search(r"<[A-Za-z][^>]*$", raw) is not None
                 continue
@@ -467,9 +532,9 @@ def run_facts(root=ROOT):
     errors = []
     try:
         drift = current_drift(root)
-        baseline = load_baseline(root / BASELINE_REL)
+        baseline = load_baseline(root / BASELINE_REL, root)
         errors += ratchet_errors(drift, baseline)
-        rules = load_manifest(root / MANIFEST_REL)
+        rules = load_manifest(root / MANIFEST_REL, root)
         errors += manifest_errors(rules, repo_files(root), lambda rel: (root / rel).is_file())
     except Exception as e:  # an unreadable anchor is a red gate, never a silent pass
         print(f"check-docs-drift: cannot evaluate ({type(e).__name__}: {e}) - failing closed",
@@ -489,7 +554,7 @@ def run_facts(root=ROOT):
 def run_touch(base, head, body_file, root=ROOT):
     root = Path(root)
     try:
-        rules = load_manifest(root / MANIFEST_REL)
+        rules = load_manifest(root / MANIFEST_REL, root)
         changed = changed_files(base, head, root)
         body = Path(body_file).read_text(encoding="utf-8", errors="replace") if body_file else ""
     except Exception as e:
@@ -516,7 +581,7 @@ def main(argv):
             for i in items:
                 print(f"{cat}\t{i}")
         return 0
-    if argv[0] == "--write-baseline":
+    if argv[0] in ("--update-baseline", "--write-baseline"):
         return write_baseline(root / BASELINE_REL, current_drift(root), "--allow-growth" in argv[1:])
     if argv[0] == "--touch" and len(argv) in (3, 4):
         return run_touch(argv[1], argv[2], argv[3] if len(argv) == 4 else None, root)

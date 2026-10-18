@@ -132,18 +132,6 @@ jobs:
       - name: Seam-closure gate self-test
         run: python3 tests/test_seam_closure_selftest.py
 
-      # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
-      # route, MCP tool and server/agent CLI flag is named in its owning
-      # user-manual doc, ratcheted against a by-name baseline that only
-      # shrinks. Reuses check-api-parity.py's extractors; also self-checks
-      # the doc-coupling manifest that doc-coupling.yml's touch rule reads.
-      # Hosted in this required job so drift blocks merge.
-      - name: Docs drift gate (fact parity)
-        run: python3 -I scripts/ci/check-docs-drift.py
-
-      - name: Docs drift gate self-test
-        run: python3 -I tests/test_docs_drift_selftest.py
-
       # check-seam-closure.py's LINK-level twin, scripts/ci/check_core_
       # presentation_link.py (ADR-0031 WS-A4 PR-1 F1 fix), needs COMPILED
       # objects to run `nm` over, so the gate itself runs as a meson test()
@@ -225,6 +213,20 @@ jobs:
       # and a release missing one fails before publishing. Stdlib + bash.
       - name: Release artifact gate
         run: python3 tests/test_check_release_artifacts.py
+
+      # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
+      # route, MCP tool and server/agent CLI flag is named in the user manual,
+      # ratcheted against a by-name baseline that only
+      # shrinks. Reuses check-api-parity.py's extractors; also self-checks
+      # the doc-coupling manifest that doc-coupling.yml's touch rule reads.
+      # Hosted in this required job so drift blocks merge, and LAST in it so a
+      # drift failure cannot hide a later step's result (the steps above have
+      # no `if:`, so a red step stops the job).
+      - name: Docs drift gate (fact parity)
+        run: python3 -I scripts/ci/check-docs-drift.py
+
+      - name: Docs drift gate self-test
+        run: python3 -I tests/test_docs_drift_selftest.py
 
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md

@@ -21,7 +21,7 @@ replacement for that review.
 | `rest_undocumented` | every `/api/vN/` route registration (not `OPTIONS`) | a heading `` #### `METHOD /api/vN/...` `` in `docs/user-manual/rest-api.md` |
 | `rest_stale` | — | every such heading names a route that still exists |
 | `mcp_undocumented` | every `kTools[]` entry in `mcp_server.cpp` | the backticked tool name in `docs/user-manual/mcp.md` |
-| `flag_undocumented` | every `--flag` in a literal CLI11 `add_option`/`add_flag` name in `FLAG_SOURCES` | the flag anywhere under `docs/user-manual/` |
+| `flag_undocumented` | every `--flag` named in a CLI11 `add_option`/`add_flag` call in `FLAG_SOURCES`, as a literal or a `k*` string constant defined in a `server/core/src` or `agents/core/src` header | the flag anywhere under `docs/user-manual/` |
 
 Route and tool extraction is shared with `scripts/ci/check-api-parity.py`, never
 re-implemented, so the two gates can't disagree about the route or tool table.
@@ -29,9 +29,11 @@ Path parameters are keyed alike in every style (`{id}`, `<id>`, `:id`, a regex
 capture group). A heading may name several methods: `` `GET`/`DELETE /api/v1/x` ``.
 
 It is a **lexical tripwire, not a proof**: a route registered through a non-literal
-path, or a flag whose name is not a string literal, is invisible to it, exactly as it
-is to `check-api-parity.py`. A new options header must be added to `FLAG_SOURCES`, and
-the self-test pins that tuple, so the change is a reviewed diff.
+path, or a flag whose name is built at runtime, is invisible to it, exactly as it is to
+`check-api-parity.py`. A new options header must be added to `FLAG_SOURCES`: the
+self-test fails if any file under `server/core/src` or `agents/core/src` calls
+`add_option`/`add_flag` and isn't listed, and the gate fails closed if a listed file
+yields no flags.
 
 A broken extractor would read as "nothing undocumented", so the gate **fails closed**
 when it extracts fewer routes, tools or flags than `MIN_EXTRACTED` (about half of
@@ -42,13 +44,21 @@ today's counts). If that fires, fix the extractor; don't lower the floor.
 `scripts/ci/docs-drift-baseline.json` lists today's known gaps **by name**:
 
 - a gap not in the baseline fails: that's new drift;
-- a baseline entry that is no longer a gap also fails, so you must delete it in the
-  same change, and the file only ever shrinks;
+- a baseline entry that is no longer a gap also fails (reported as `stale`), so you
+  must delete it in the same change, and the file only ever shrinks;
 - a named set, not a count, means fixing one old gap can't hide a new one.
 
-`--write-baseline` regenerates the file but refuses to **add** entries unless passed
-`--allow-growth`. Growing the baseline needs a reason in the PR description; the
+`--update-baseline` (alias `--write-baseline`) regenerates the file but refuses to
+**add** entries unless passed `--allow-growth`. Growing the baseline needs a reason in the PR description; the
 expected answer to new drift is to write the docs.
+
+**Known limit: two PRs can each pass and still break `dev` together.** The ratchet
+requires an exact match, so two PRs that each pass against `dev` can, once both merge,
+leave a stale entry or a heading for a deleted route. Git merges two identical line
+deletions cleanly, so nothing conflicts. The fix is a one-line follow-up. Requiring
+branches to be up to date before merge, or a merge queue, prevents it; both are
+branch-protection settings. The other by-name ratchets (personal data, definition
+descriptions) share this limit.
 
 ## Layer 2: the touch rule
 
@@ -129,5 +139,6 @@ audit verbs against `audit-log.md`, RBAC securables (partly covered by
 
 Known gap in a sibling gate: the plugin README touch rule's bash parser
 (`scripts/ci/check-plugin-readme-touch.sh`) still honours a `docs-unchanged:` line
-inside raw HTML, and its job still lives in `docs-lint.yml` without `edited`. This gate
+inside raw HTML, its job still lives in `docs-lint.yml` without `edited`, and it diffs
+the payload's `base.sha`, which goes stale once `dev` advances. This gate
 closes both for itself; the sibling is tracked separately.

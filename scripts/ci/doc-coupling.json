@@ -305,12 +305,13 @@
     },
     {
       "id": "ha",
-      "why": "fenced leader election",
+      "why": "fenced leader election (operator docs live in server-admin.md)",
       "code": [
         "server/core/src/leader_elector.{hpp,cpp}",
         "server/core/src/leader_gate.hpp"
       ],
       "docs": [
+        "docs/user-manual/server-admin.md",
         "docs/user-manual/ha-postgres.md"
       ]
     }

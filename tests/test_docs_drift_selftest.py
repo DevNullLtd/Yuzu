@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -70,13 +71,14 @@ def synthetic_tree(root, routes=130, tools=100, flags=70, documented=True):
     write(root, src + "mcp_server.cpp", "static const ToolDef kTools[] = {\n" +
           "".join(f'    {{"tool_{i}", "d"}},\n' for i in range(tools)) + "};\n")
     write(root, src + "main.cpp", "".join(f'app.add_option("--flag-{i}", x);\n' for i in range(flags)))
-    for rel in d.FLAG_SOURCES[1:]:
-        write(root, rel, "\n")
+    for j, rel in enumerate(d.FLAG_SOURCES[1:]):
+        write(root, rel, f'app.add_flag("--src{j}-flag", y);\n')
     write(root, src + "coupled_a.cpp", "int a;\n")
     n = 1 if documented else 0
     write(root, "docs/user-manual/rest-api.md", "".join(f"#### `GET /api/v1/r{i}`\n" for i in range(routes * n)))
     write(root, "docs/user-manual/mcp.md", "".join(f"`tool_{i}`\n" for i in range(tools * n)))
-    write(root, "docs/user-manual/server-admin.md", "".join(f"`--flag-{i}`\n" for i in range(flags * n)))
+    write(root, "docs/user-manual/server-admin.md", "".join(f"`--flag-{i}`\n" for i in range(flags * n)) +
+          "".join(f"`--src{j}-flag`\n" for j in range(len(d.FLAG_SOURCES) - 1)))
     write(root, "docs/user-manual/coupled.md", "coupled\n")
     write(root, d.BASELINE_REL, json.dumps({c: [] for c in d.CATEGORIES}))
     write(root, d.MANIFEST_REL, json.dumps({"rules": [{"id": "coupled", "why": "t",
@@ -131,6 +133,45 @@ class Extraction(unittest.TestCase):
                         'app.add_flag("--on,!--no-on", z);\napp.add_flag("--d{true}", w);\napp.add_option(name, v);\n'}
         self.assertEqual(set(d.extract_flags(src)), {"--a", "--bee", "--on", "--no-on", "--d"})
 
+    def test_flag_constants_resolve(self):
+        consts = d.flag_constants(['inline constexpr std::string_view kPinFlag = "--pin";\n'
+                                   'constexpr const char* kOther = "--other";\n'])
+        self.assertEqual(consts, {"kPinFlag": "--pin", "kOther": "--other"})
+        src = {"o.hpp": "app.add_option(std::string{kPinFlag}, v);\napp.add_flag(kOther, w);\napp.add_flag(kUnknown, z);\n"}
+        self.assertEqual(set(d.extract_flags(src, consts)), {"--pin", "--other"})
+
+    def test_real_gateway_peer_flags_are_extracted(self):
+        # The UP-4 case: these three are defined through constants.
+        consts = d.flag_constants(d.read_tree_file(ROOT, f) for g in d.FLAG_CONSTANT_GLOBS for f in ROOT.glob(g))
+        flags = d.extract_flags({rel: (ROOT / rel).read_text() for rel in d.FLAG_SOURCES}, consts)
+        for f in ("--gateway-peer-pin", "--gateway-peer-pin-file", "--insecure-gateway-peer"):
+            self.assertIn(f, flags)
+
+    def test_every_cli11_caller_is_a_flag_source(self):
+        callers = set()
+        for top in ("server/core/src", "agents/core/src"):
+            for f in (ROOT / top).rglob("*"):
+                if f.suffix in (".cpp", ".hpp", ".h") and re.search(r"\badd_(?:option|flag)\s*\(",
+                                                                    f.read_text(errors="replace")):
+                    callers.add(f.relative_to(ROOT).as_posix())
+        self.assertLessEqual(callers, set(d.FLAG_SOURCES), "add the file to FLAG_SOURCES")
+
+    def test_heading_parser_respects_commonmark_fences(self):
+        text = ("````md\n```\n#### `GET /api/v1/in-example`\n```\n````\n"
+                "#### `GET /api/v1/after`\n")
+        self.assertEqual(set(d.doc_heading_routes(text, canon)), {("GET", "/api/v1/after")})
+
+    def test_parity_extractors_read_only_the_repointed_globals(self):
+        """--root works by repointing SERVER_SRC and MCP_SERVER_CPP; an
+        extractor reading any other path global would silently check the
+        trusted tree instead."""
+        mod = d.load_parity()
+        path_globals = {k for k, v in vars(mod).items() if isinstance(v, Path)}
+        used = set()
+        for fn in (mod.extract_all_routes, mod.extract_mcp_tools, mod._read_mcp_server_cpp):
+            used |= set(fn.__code__.co_names) & path_globals
+        self.assertEqual(used, {"SERVER_SRC", "MCP_SERVER_CPP"})
+
     def test_flag_documented_is_token_exact(self):
         self.assertTrue(d.documented("--tls", "use `--tls` here"))
         self.assertFalse(d.documented("--tls", "use --tls-system-roots"))
@@ -157,7 +198,7 @@ class Ratchet(unittest.TestCase):
     def test_fixed_gap_still_in_baseline_fires(self):
         errs = d.ratchet_errors(self.drift(), self.base(mcp_undocumented=["t"]))
         self.assertEqual(len(errs), 1)
-        self.assertIn("fixed mcp_undocumented: t", errs[0])
+        self.assertIn("stale mcp_undocumented: t", errs[0])
 
     def test_swap_cannot_hide_behind_count(self):
         # one gap fixed, a different one added: counts equal, still two errors
@@ -231,8 +272,12 @@ class Exemptions(unittest.TestCase):
             "<details>\ndoc-coupling-exempt: mcp — in an html block\n": set(),
             "<details>\nx\n\ndoc-coupling-exempt: mcp — after the block's blank line": {"mcp"},
             "<br>\n\ndoc-coupling-exempt: mcp — after a one-line tag": {"mcp"},
-            "<!DOCTYPE html>\ndoc-coupling-exempt: mcp — stripped by GitHub": set(),
-            "<?xml version='1.0'?>\ndoc-coupling-exempt: mcp — stripped by GitHub": set(),
+            # CommonMark: these blocks end at their marker, not at a blank line
+            "<!DOCTYPE html>\ndoc-coupling-exempt: mcp — after a one-line doctype": {"mcp"},
+            "<?xml version='1.0'?>\ndoc-coupling-exempt: mcp — after a one-line pi": {"mcp"},
+            "<!DOCTYPE html\n\ndoc-coupling-exempt: mcp — inside an open doctype\n>": set(),
+            "<?\n\ndoc-coupling-exempt: mcp — inside a processing instruction\n?>": set(),
+            "<![CDATA[\n\ndoc-coupling-exempt: mcp — inside cdata\n]]>": set(),
         }
         for body, want in cases.items():
             self.assertEqual(set(d.exemptions(body)), want, repr(body))
@@ -272,6 +317,11 @@ class Floors(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
             synthetic_tree(tmp)
             self.assertEqual(d.current_drift(tmp)["mcp_undocumented"], [])  # control: above the floor
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
+            synthetic_tree(tmp)
+            write(tmp, d.FLAG_SOURCES[1], "// no flags here\n")
+            with self.assertRaisesRegex(RuntimeError, "yields no flags"):
+                d.current_drift(tmp)
         for short in ({"routes": 5}, {"tools": 5}, {"flags": 5}):
             with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
                 synthetic_tree(tmp, **short)
@@ -312,7 +362,7 @@ class SyntheticRepo(unittest.TestCase):
     def test_write_baseline_via_main(self):
         self.add_undocumented_tool()
         baseline = self.repo / d.BASELINE_REL
-        self.assertEqual(d.main(["--root", str(self.repo), "--write-baseline"]), 1)
+        self.assertEqual(d.main(["--root", str(self.repo), "--update-baseline"]), 1)
         self.assertEqual(json.loads(baseline.read_text())["mcp_undocumented"], [])
         self.assertEqual(d.main(["--root", str(self.repo), "--write-baseline", "--allow-growth"]), 0)
         self.assertEqual(json.loads(baseline.read_text())["mcp_undocumented"], ["zz_new"])
@@ -382,6 +432,26 @@ class SyntheticRepo(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"] if r.stdout else ""
 
+    def run_hook_from(self, cwd, command):
+        env = hermetic_env(CLAUDE_PROJECT_DIR=str(ROOT))
+        payload = json.dumps({"tool_name": "Bash", "cwd": str(cwd), "tool_input": {"command": command}})
+        r = subprocess.run([sys.executable, "-I", str(HOOK)], input=payload, capture_output=True,
+                           text=True, env=env, timeout=120)
+        return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"] if r.stdout else ""
+
+    def test_hook_follows_a_leading_cd(self):
+        write(self.repo, "server/core/src/coupled_a.cpp", "int a = 1;\n")
+        self.commit()
+        reason = self.run_hook_from(self.repo.parent, f"cd {self.repo.name} && gh pr create --title t")
+        self.assertIn("coupled:", reason)
+
+    def test_hook_allows_a_branch_that_predates_the_gate(self):
+        (self.repo / d.MANIFEST_REL).unlink()
+        (self.repo / d.BASELINE_REL).unlink()
+        write(self.repo, "server/core/src/coupled_a.cpp", "int a = 1;\n")
+        self.commit()
+        self.assertEqual(self.run_hook("gh pr create --title t"), "")
+
     def test_hook_plumbing(self):
         """Touch-only failure, then allowed by --body, by -F (relative to the
         command's cwd), and via a doc change; then a facts-only failure. The
@@ -439,6 +509,12 @@ class Hook(unittest.TestCase):
         for cmd, want in cases.items():
             self.assertEqual(hook.pr_create_args(cmd), want, repr(cmd))
 
+    def test_cd_target(self):
+        self.assertEqual(hook.cd_target("cd wt && gh pr create"), "wt")
+        self.assertEqual(hook.cd_target("cd a; cd b && gh pr create"), "b")
+        self.assertIsNone(hook.cd_target("gh pr create && cd x"))
+        self.assertIsNone(hook.cd_target("echo cd x && gh pr create"))
+
     def test_pr_args(self):
         self.assertEqual(hook.pr_args(["--base=main", "--body", "b"], "/"), ("main", "b"))
         self.assertEqual(hook.pr_args([], "/"), ("dev", ""))
@@ -453,13 +529,14 @@ class Hook(unittest.TestCase):
 
     def test_never_executes_the_cwd_trees_gate(self):
         """The cwd is a repo whose own gate is planted. The hook must run the
-        PROJECT's gate against it as data: it denies (the planted tree has no
-        docs, so the trusted gate fails closed on it) and the plant never runs.
-        The deny is what makes this non-vacuous - an early fail-open return
-        would also leave no marker."""
+        PROJECT's gate against it as data: it denies naming the tree's drift
+        and the plant never runs. The specific deny is what makes this
+        non-vacuous - an early fail-open return would also leave no marker."""
         with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
             repo = Path(tmp)
-            (repo / "scripts" / "ci").mkdir(parents=True)
+            synthetic_tree(repo)
+            mcp = repo / "server/core/src/mcp_server.cpp"
+            mcp.write_text(mcp.read_text().replace("};", '    {"zz_planted_drift", "d"},\n};'))
             for name in ("check-docs-drift.py", "check-api-parity.py"):
                 (repo / "scripts" / "ci" / name).write_text(PLANT)
             subprocess.run(["git", "init", "-q", tmp], check=True, env=hermetic_env())
@@ -468,7 +545,9 @@ class Hook(unittest.TestCase):
             git(repo, "update-ref", "refs/remotes/origin/dev", "HEAD")
             out = self.run_hook(repo, "gh pr create --title x")
             self.assertFalse((repo / "scripts" / "ci" / "EXECUTED").exists())
-            self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+            decision = json.loads(out)["hookSpecificOutput"]
+            self.assertEqual(decision["permissionDecision"], "deny")
+            self.assertIn("new mcp_undocumented: zz_planted_drift", decision["permissionDecisionReason"])
             self.assertEqual(self.run_hook(repo, 'git commit -m "gh pr create"'), "")
 
     def test_project_without_gate_does_nothing(self):
