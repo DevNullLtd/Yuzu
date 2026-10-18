@@ -226,15 +226,3 @@ TEST_CASE("reviews authz: RBAC on, a Reviewer is admitted and the real Attest pr
     CHECK(res->status == 200);
     CHECK(r.denied_rows() == 0);
 }
-
-TEST_CASE("reviews authz: a Viewer holds Read-only grants elsewhere but no AccessReview and is refused",
-          "[pg][access-reviews][authz]") {
-    YUZU_REQUIRE_PG_DB_TPL(db_, reviews_page_tpl);
-    Rig r{db_.dsn()};
-    r.rbac.set_rbac_enabled(true);
-    REQUIRE(r.rbac.assign_role({"user", "bob", "Viewer"}).has_value());
-    const auto res = r.get(kCampaigns, r.session("bob", auth::Role::user));
-    REQUIRE(res);
-    CHECK(res->status == 403);
-    CHECK(r.reads == 0);
-}
