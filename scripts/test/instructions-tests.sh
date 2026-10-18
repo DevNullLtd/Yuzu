@@ -39,9 +39,11 @@
 #   0    every runnable instruction passed (or returned expected pending_approval)
 #   1    one or more failed / errored, the run stopped early, or a destructive/forensic
 #        run executed nothing (every such row skipped or pending approval)
-#   2    argument, infrastructure or pre-flight error (login, content-dir empty,
-#        destructive/forensic targeting, --params-override, --run-id, an unwritable
-#        --output); nothing dispatched
+#   2    argument, infrastructure or pre-flight error with nothing dispatched
+#        (login, content-dir empty, destructive/forensic targeting, --params-override,
+#        --run-id, --poll-timeout below 1 for a targeted run, --output equal to
+#        --manifest, an --output that is a symlink (POSIX) or not a regular file or
+#        (targeted run) already exists)
 #   130  interrupted (Ctrl-C or SIGTERM)
 
 set -uo pipefail
@@ -104,7 +106,8 @@ Optional:
                            destructive or forensic is selected)
   --poll-timeout SECONDS   per-instruction response poll cap (when not given the
                            runner uses 30 s, and 120 s for destructive/forensic
-                           rows; the deadline can overrun by up to one poll. A
+                           rows; the deadline can overrun by up to two polls,
+                           about 20 s. A
                            targeted row that ends without a verdict - no rows,
                            still running, polls failing - fails and stops the
                            run; raise it for a slow or quiet action)

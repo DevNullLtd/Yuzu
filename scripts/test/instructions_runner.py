@@ -57,31 +57,47 @@ run that selects either class with --risks is a targeted run and needs all of:
                            every required parameter; every other one is skipped, never guessed
   loopback --dashboard     127.0.0.1, ::1 or localhost, else --allow-remote
 
-Anything missing is a configuration error: exit 2, nothing dispatched. These instructions change
-or read a real device, so a targeted run is serial, appends each dispatch to a manifest before
-sending it, and polls each targeted row until every response row is terminal or the poll deadline
-passes (--poll-timeout; 120 s for these classes unless it is given; the deadline is checked per
-poll, so it can overrun by up to one poll, about 10 s). A RUNNING row exists
-only for flushed output, so a quiet long-running action shows no rows at all until it finishes. A
-row passes only if every response row is SUCCESS with no error_detail. A row that ends without a
-verdict from terminal rows (no rows, rows still running, polls failing for any reason, or a row
-the runner does not recognise) fails and stops further dispatch, so a following action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED
-row is a known outcome and does not stop the run. Ctrl-C and SIGTERM stop dispatching (exit 130); a
-dispatch already sent is reported as in_flight_unknown. A dispatch_unknown row (a transport failure
-after the POST was sent, a non-object 200 body, an HTTP 500/502/504 or an unexplained 503, or any
-failure after an accepted POST) also stops the run. Three consecutive 401/403 answers to execute, or
-401/403/503 to a targeted poll, stop it too. A 202 pending_approval (approval mode always,
-role-gated for a non-admin caller, or an unrecognised mode; never auto) executed nothing. Dispatch
-needs Execution:Execute, polling Response:Read and the agent lookup Infrastructure:Read.
+Anything missing is a configuration error: exit 2, nothing dispatched. These instructions change or
+read a real device, so a targeted run is serial, appends each dispatch to a manifest before sending
+it, and polls each targeted row until every response row is terminal or the poll deadline passes
+(--poll-timeout; 120 s for these classes unless it is given). The deadline is checked per poll, so
+it can overrun by up to two polls (one in flight at the deadline plus the one final poll, about 20
+s). A RUNNING row exists only for flushed output, so a quiet long-running action shows no rows at
+all until it finishes. A row passes only if every response row is SUCCESS with no error_detail. A
+row that ends without a verdict from terminal rows (no rows, rows still running, polls failing for
+any reason, or a row the runner does not recognise) fails and stops further dispatch, so a following
+action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED row is a known outcome and does not
+stop the run. Ctrl-C and SIGTERM stop dispatching (exit 130); a dispatch already sent is reported as
+in_flight_unknown.
 
-Exit codes: 0 all passed; 1 a failure or error, an early stop, or a targeted run in which no
-destructive/forensic row was executed (every one skipped or pending approval); 2 configuration,
-login or pre-flight error (including an unwritable, symlinked or - for a targeted run - already
-existing --output, or --poll-timeout below 1) with nothing dispatched; 130 interrupted. The manifest
-is an attempt log, not outcome evidence: its first line is run-start, then a dispatch line per
-attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at creation
-only) and an accepted line when the server answers it. --output is written through an owner-only
-descriptor that refuses a symlink; a SIGKILL leaves only the manifest.
+After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a recognised
+pre-dispatch refusal reason (or "no agents reached"), a 202 pending_approval (approval mode always,
+role-gated for a non-admin caller, or an unrecognised mode; never auto), and a refused connection or
+unresolvable name. HTTP 200 means the server started it. Everything else is dispatch_unknown and
+stops the run (do not re-run blindly): a transport failure after send, any other 5xx, any 3xx, any
+2xx other than 200 and a pending_approval 202, a 202 without pending_approval, and any exception
+after an accepted POST. Three consecutive 401/403 answers to execute, or 401/403/503 to a targeted
+poll, also stop the run. Permissions: Execution:Execute to dispatch, Response:Read to poll,
+Infrastructure:Read for the agent lookup.
+
+Exit codes: 0 every dispatched instruction passed (or is pending approval); 1 one or more failed or
+errored, the run stopped early, or a targeted run executed nothing (every destructive/forensic row
+skipped or pending approval); 2 a configuration, login or pre-flight error with nothing dispatched,
+including --poll-timeout below 1 (targeted runs only), --output equal to --manifest, an --output
+that is a symlink (POSIX only) or not a regular file, or (targeted runs) an --output that already
+exists; 130 interrupted (Ctrl-C or SIGTERM). A failed write of --output at the end only warns.
+
+The manifest is an attempt log, not outcome evidence: the first line is run-start, then a dispatch
+line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
+creation only; .gitignore covers only the default name) and an accepted line when the server answers
+it. --output is written through an owner-only descriptor that refuses a symlink (POSIX only); a
+targeted run creates it exclusively and refuses an existing one (rename it first: it holds the
+command_id record of an earlier run). A SIGKILL leaves only the manifest. --output holds command_id
+for accepted rows; rows rebuilt at an abort may have none (use the manifest accepted line). A closed
+stdout may still end the process with exit 120 at interpreter flush: --output and the metrics are
+written first and it fails closed, never a false 0. The stderr list of not-started ids is capped at
+30; the rest are in --output and the manifest. Forensic rows read behavioural data from the target,
+and the responses are stored in the server's response store.
 
 --confirm-target is a wrong-target typo guard against what the connected server reports. It cannot
 detect an ssh -L tunnel or a port forward to a different stack, and it is not an authorisation or
@@ -98,7 +114,6 @@ import argparse
 import concurrent.futures
 import contextlib
 import datetime
-import errno
 import http.client
 import http.cookiejar
 import json
@@ -442,7 +457,8 @@ def esc(text: Any) -> str:
 
 def say(*args: Any, **kw: Any) -> None:
     """print() that never raises: a closed or broken stdout/stderr must not cost the exit code,
-    the --output file or the metrics."""
+    the --output file or the metrics. (A closed stdout may still end the process with exit 120 at
+    interpreter flush; --output and the metrics are written first, and it never reads as success.)"""
     try:
         print(*args, **kw)
     except (OSError, ValueError):
@@ -705,32 +721,49 @@ def a4_permission(body: Any) -> str:
     return perm if isinstance(perm, str) else ""
 
 
-# Server evidence for the rule below (workflow_routes.cpp, the instruction execute handler): the
-# listed 503 reasons (and the "no agents reached" 503 when `sent == 0`) are recognised as refusals
-# made before anything was sent, and so is any 4xx. Other pre-dispatch refusals (a 500 for an
-# invalid stored schema, a 500 for a failed approval submit, a reasonless 503 for an unavailable
-# store, approval queue or registry) cannot be told apart from a post-dispatch failure by status
-# alone, and neither can a 500 "dispatch failed" (thrown after sends began) or a 502/504 from a
-# proxy in front of it: all of those are conservatively treated as unknown.
+# What a targeted execute POST can tell us. ONLY the "no" rows mean the action was not executed;
+# every other outcome is "unknown" and stops the run (an allow-list: a new status, a proxy page or
+# an odd exception can never read as "nothing happened").
+#
+#   answer / exception                                          executed?   action
+#   ----------------------------------------------------------  ---------   ---------------------
+#   200 with a JSON object                                      started     poll for a verdict
+#   202 with status == "pending_approval"                       no          pending_approval, go on
+#   any 4xx                                                     no          fail, go on
+#   503 with error.reason in PRE_DISPATCH_503_REASONS, or the   no          fail, go on
+#       "no agents reached" message (workflow_routes.cpp)
+#   URLError whose .reason is ConnectionRefusedError or         no          error, go on
+#       socket.gaierror (the connect phase: nothing was sent)
+#   every other 5xx, every 3xx and 1xx, any other 2xx, a 202    UNKNOWN     dispatch_unknown, stop
+#       without pending_approval, a 200 without an object,
+#       any other exception (a timeout, a reset, a bare OSError
+#       from getresponse, a decode error, a bug)
+#
+# Other pre-dispatch refusals (a 500 for an invalid stored schema, a 500 for a failed approval
+# submit, a reasonless 503 for an unavailable store, approval queue or registry) cannot be told
+# apart from a post-dispatch failure by status alone, so they are conservatively UNKNOWN too.
 PRE_DISPATCH_503_REASONS = ("containment_unreadable", "route_unreadable", "os_gate_unreadable",
                             "quarantined", "plugin_not_found", "kill_switched_os")
 
 
-def _post_outcome_unknown(code: int, payload: Any) -> bool:
-    """Whether a targeted execute answer leaves it unknown if the action started."""
-    if code in (500, 502, 504):
-        return True
-    if code != 503:
-        return False
+def _is_pre_dispatch_503(payload: Any) -> bool:
     err = payload.get("error") if isinstance(payload, dict) else None
-    tokens = []
-    if isinstance(err, dict):
-        tokens += [err.get("reason"), err.get("code")]
-    if isinstance(payload, dict):
-        tokens.append(payload.get("reason"))
-    if any(tok in PRE_DISPATCH_503_REASONS for tok in tokens if isinstance(tok, str)):
-        return False
-    return "no agents reached" not in error_message(payload).lower()
+    if isinstance(err, dict) and err.get("reason") in PRE_DISPATCH_503_REASONS:
+        return True
+    return "no agents reached" in error_message(payload).lower()
+
+
+def _post_verdict(code: int, payload: Any) -> str:
+    """"started", "not_executed" or "unknown" for a targeted execute answer (table above)."""
+    if code == 200 and isinstance(payload, dict):
+        return "started"
+    if code == 202 and isinstance(payload, dict) and payload.get("status") == "pending_approval":
+        return "not_executed"
+    if 400 <= code < 500:
+        return "not_executed"
+    if code == 503 and _is_pre_dispatch_503(payload):
+        return "not_executed"
+    return "unknown"
 
 
 def targeted_skip_reason(defn: Definition, param_overrides: dict[str, dict[str, Any]],
@@ -816,19 +849,15 @@ def grade_targeted(responses: list, target: str = "") -> tuple[str, bool, bool]:
 
 
 def _may_have_been_sent(e: BaseException) -> bool:
-    """Whether a failed targeted POST may have reached the server.
+    """Whether a failed targeted POST may have reached the server (table above).
 
-    The default is YES: any exception (a timeout, a reset, a body that cannot be decoded, a
-    RecursionError, a MemoryError, a bug here) raised once the request may have left is unknown.
-    Only a failure that provably happened before any byte was written is "not sent": the
-    connection was refused, the name did not resolve, or the network/host was unreachable.
+    Only a connect-phase failure is provably unsent: urllib raises URLError(ConnectionRefusedError)
+    or URLError(socket.gaierror) before a byte is written. Anything else, including a bare OSError
+    from getresponse() (a reset, an unreachable host on a reused connection), a timeout, a decode
+    error or a bug, is unknown.
     """
-    cause = getattr(e, "reason", e)
-    if isinstance(cause, (ConnectionRefusedError, socket.gaierror)):
-        return False
-    if isinstance(cause, OSError) and cause.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH,
-                                                      errno.EADDRNOTAVAIL):
-        return False
+    if isinstance(e, urllib.error.URLError) and not isinstance(e, urllib.error.HTTPError):
+        return not isinstance(e.reason, (ConnectionRefusedError, socket.gaierror))
     return True
 
 
@@ -1017,10 +1046,13 @@ def _exercise(client: YuzuClient, defn: Definition,
             say(f"instructions_runner: warning: could not record the answer for {esc(defn.id)} "
                 f"in the manifest: {esc(e)}", file=sys.stderr)
 
+    if targeted and _post_verdict(code, payload) == "unknown":
+        detail = f"HTTP {code} {error_message(payload)}".strip()
+        if not isinstance(payload, dict):
+            detail += " (body is not a JSON object)"
+        return _dispatch_unknown(defn, control, ms(), detail, manifest, payload)
+
     if code in (200, 202) and not isinstance(payload, dict):
-        if targeted and code == 200:  # the server said OK: the action may have started
-            return _dispatch_unknown(defn, control, ms(), "HTTP 200 body is not a JSON object",
-                                     manifest)
         return Outcome(defn.id, defn.risk, "error", ms(), http_code=code,
                        note=f"dispatch: HTTP {code} body is not a JSON object")
 
@@ -1029,10 +1061,6 @@ def _exercise(client: YuzuClient, defn: Definition,
                        http_code=code,
                        execution_id=payload.get("approval_id", ""),
                        note=f"approval={defn.approval_mode}")
-
-    if targeted and (_post_outcome_unknown(code, payload) or 200 < code < 300 and code != 202):
-        return _dispatch_unknown(defn, control, ms(), f"HTTP {code} {error_message(payload)}".strip(),
-                                 manifest, payload)
 
     if code != 200:
         msg = error_message(payload)
@@ -1249,11 +1277,13 @@ def preflight(client: YuzuClient, args: argparse.Namespace) -> tuple[dict | None
     return agent, ""
 
 
-def write_output(path: str, payload: dict) -> None:
+def write_output(path: str, payload: dict, exclusive: bool = False) -> None:
     """Write the summary through a descriptor opened owner-only that refuses a symlink where the
-    platform can say so (the same pattern as the manifest); a failure only warns."""
+    platform can say so (the same pattern as the manifest); a failure only warns. A targeted run
+    creates the file exclusively (O_EXCL): a file planted since the pre-flight is never written."""
     try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        flags = (os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                 | (os.O_EXCL if exclusive else os.O_TRUNC))
         with os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, indent=2))
     except OSError as e:  # never lose the exit code over the summary file
@@ -1270,6 +1300,8 @@ def check_output_writable(path: str, refuse_existing: bool = False) -> str:
     if os.path.islink(path):
         return f"--output {esc(path)}: refusing to write through a symlink"
     existed = p.exists()
+    if existed and not p.is_file():   # a FIFO, device or directory: never opened, never written
+        return f"--output {esc(path)} exists and is not a regular file"
     if existed and refuse_existing:
         return (f"--output {esc(path)} already exists: rename it first, it holds the command_id "
                 "record of an earlier run")
@@ -1286,24 +1318,51 @@ def check_output_writable(path: str, refuse_existing: bool = False) -> str:
     return ""
 
 
-@contextlib.contextmanager
-def _ignore_second_interrupt() -> Any:
-    """A second SIGINT/SIGTERM while the summary is being written must not cost the record."""
-    _INTERRUPT["ignore"] = "1"
-    previous = None
-    try:
-        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    except (ValueError, OSError):  # not the main thread
-        pass
-    try:
-        yield
-    finally:
-        _INTERRUPT.pop("ignore", None)
-        if previous is not None:
-            try:
-                signal.signal(signal.SIGINT, previous)
-            except (ValueError, OSError):
-                pass
+class _SignalGuard:
+    """Ignore SIGINT/SIGTERM while held, so a second signal cannot cost the --output record.
+
+    Re-entrant: the abort handler takes it first thing, and the --output write takes it again;
+    the handlers are put back only when the last holder lets go.
+    """
+
+    def __init__(self) -> None:
+        self._depth = 0
+        self._previous: Any = None
+        self._lock = threading.Lock()
+
+    def enter(self) -> None:
+        with self._lock:
+            if self._depth == 0:
+                _INTERRUPT["ignore"] = "1"
+                try:
+                    self._previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+                except (ValueError, OSError):  # not the main thread
+                    self._previous = None
+            self._depth += 1
+
+    def exit(self) -> None:
+        with self._lock:
+            if self._depth == 0:
+                return
+            self._depth -= 1
+            if self._depth == 0:
+                _INTERRUPT.pop("ignore", None)
+                if self._previous is not None:
+                    try:
+                        signal.signal(signal.SIGINT, self._previous)
+                    except (ValueError, OSError):
+                        pass
+                    self._previous = None
+
+    def __enter__(self) -> "_SignalGuard":
+        self.enter()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.exit()
+
+
+_GUARD = _SignalGuard()
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1457,6 +1516,7 @@ def run(args: argparse.Namespace) -> int:
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=parallelism)
     pending: set = set()
+    abort_hold = False
     try:
         for d in runnable:
             future_map[pool.submit(exercise, client, d, param_overrides, args.poll_timeout,
@@ -1470,6 +1530,8 @@ def run(args: argparse.Namespace) -> int:
             for fut in done:
                 collect(fut)
     except BaseException as e:  # KeyboardInterrupt included: stop further dispatch, keep the record
+        _GUARD.enter()   # first thing: a second signal must not interrupt the abort handler
+        abort_hold = True
         interrupted = isinstance(e, KeyboardInterrupt)
         aborted = (_INTERRUPT.get("signal") or "SIGINT") if interrupted else type(e).__name__
         control.request_stop()
@@ -1500,16 +1562,21 @@ def run(args: argparse.Namespace) -> int:
                                     note=f"not started: {aborted or control.abort_reason or 'run ended'}"))
 
     outcomes.sort(key=lambda o: order.get(o.id, len(order)))
-    with _ignore_second_interrupt():
-        return _finish(args, outcomes, skipped, runnable, classes, control, aborted, interrupted,
-                       started_at, run_id, selected_risks, manifest_path, repo_root)
+    return _finish(args, outcomes, skipped, runnable, classes, control, aborted, interrupted,
+                   started_at, run_id, selected_risks, manifest_path, repo_root, abort_hold)
 
 
 def _finish(args: argparse.Namespace, outcomes: list[Outcome], skipped: list[Definition],
             runnable: list[Definition], classes: list[str], control: RunControl, aborted: str,
             interrupted: bool, started_at: float, run_id: str, selected_risks: set[str],
-            manifest_path: str, repo_root: Path) -> int:
-    """Tally, write --output FIRST, record metrics, then print (a dead stdout costs nothing)."""
+            manifest_path: str, repo_root: Path, abort_hold: bool = False) -> int:
+    """Tally, write --output FIRST, record metrics, then print.
+
+    Signals are ignored only around the --output write itself (the handlers are back before the
+    metrics subprocess calls and the printing). say() swallows a dead stdout/stderr, so --output
+    and the metrics are written first; a closed stdout may still end the process with exit 120
+    when the interpreter flushes it, which fails closed and is never a false 0.
+    """
     total_ms = int((time.monotonic() - started_at) * 1000)
 
     # Tally
@@ -1534,23 +1601,29 @@ def _finish(args: argparse.Namespace, outcomes: list[Outcome], skipped: list[Def
     # targeted run that executed nothing a success.
     nothing_executed = bool(classes) and not targeted_dispatched
 
-    if args.output:
-        write_output(args.output, {
-            "summary": counts,
-            "total_ms": total_ms,
-            "run_id": run_id,
-            "risks": sorted(selected_risks),
-            "target_agent_id": args.target_agent_id,
-            "dashboard": redact_url(args.dashboard),
-            "user": args.user,
-            "skipped": counts["skip"],
-            "dispatched": dispatched,
-            "manifest": manifest_path,
-            "aborted": aborted,
-            "stop_reason": control.abort_reason,
-            "dispatch_unknown": unknown,
-            "outcomes": [asdict(o) for o in outcomes],
-        })
+    record = {
+        "summary": counts,
+        "total_ms": total_ms,
+        "run_id": run_id,
+        "risks": sorted(selected_risks),
+        "target_agent_id": args.target_agent_id,
+        "dashboard": redact_url(args.dashboard),
+        "user": args.user,
+        "skipped": counts["skip"],
+        "dispatched": dispatched,
+        "manifest": manifest_path,
+        "aborted": aborted,
+        "stop_reason": control.abort_reason,
+        "dispatch_unknown": unknown,
+        "outcomes": [asdict(o) for o in outcomes],
+    }
+    try:
+        if args.output:
+            with _GUARD:   # signals are ignored for this write only
+                write_output(args.output, record, exclusive=bool(classes))
+    finally:
+        if abort_hold:
+            _GUARD.exit()
 
     if args.run_id:
         db_record_metric(repo_root, args.run_id, "instructions_pass",
@@ -1617,8 +1690,10 @@ def _finish(args: argparse.Namespace, outcomes: list[Outcome], skipped: list[Def
 EPILOG = """\
 Exit codes: 0 every dispatched instruction passed (or is pending approval); 1 one or more failed or
 errored, the run stopped early, or a targeted run executed nothing (every destructive/forensic row
-skipped or pending approval); 2 a configuration, login, pre-flight or --output error, with nothing
-dispatched; 130 interrupted (Ctrl-C or SIGTERM). A failed write of --output at the end only warns.
+skipped or pending approval); 2 a configuration, login or pre-flight error with nothing dispatched,
+including --poll-timeout below 1 (targeted runs only), --output equal to --manifest, an --output
+that is a symlink (POSIX only) or not a regular file, or (targeted runs) an --output that already
+exists; 130 interrupted (Ctrl-C or SIGTERM). A failed write of --output at the end only warns.
 
 Destructive and forensic runs (--risks destructive forensic)
   Example, against a dedicated disposable stack on loopback:
@@ -1633,40 +1708,52 @@ Destructive and forensic runs (--risks destructive forensic)
   match (case-insensitive). Definitions run one at a time, each with exactly its --params-override
   entry (no synthesised values) and only if that entry supplies every required parameter; every
   other definition is skipped, not dispatched. Each dispatch is appended to a manifest
-  (--manifest PATH, default instructions-runner-<run-id>.manifest.jsonl) before it is sent. The
-  runner polls each targeted row until every response row is terminal or the poll deadline passes
-  (--poll-timeout; 120 s for these classes unless it is given; the deadline is checked per poll, so
-  it can overrun by up to one poll, about 10 s). A RUNNING row exists only for flushed output, so a quiet long-running action shows no rows until it finishes. A row passes
-  only when every response row is SUCCESS with no error_detail. A row that ends without a verdict
-  from terminal rows (no rows, rows still running, polls failing for any reason, or a row the
-  runner does not recognise) fails the row and stops further dispatch; a terminal FAILURE/TIMEOUT/REJECTED row does not stop the run.
-  Ctrl-C and SIGTERM stop further dispatch; a dispatch already sent is reported in_flight_unknown.
-  dispatch_unknown (a transport failure after a POST was sent, a non-object 200 body, any failure
-  after an accepted POST, or an HTTP 500/502/504 or unexplained 503) also stops the run: do not
-  re-run blindly. Three consecutive 401/403 answers to execute, or 401/403/503 to a targeted poll,
-  stop the run. A 202 pending_approval (approval mode always, role-gated for a non-admin caller, or
-  an unrecognised mode; never auto) executed nothing. Permissions: Execution:Execute to dispatch,
-  Response:Read to poll, Infrastructure:Read for the agent lookup.
+  (--manifest PATH, default instructions-runner-<run-id>.manifest.jsonl) before it is sent.
+  The runner polls each targeted row until every response row is terminal or the poll deadline
+  passes (--poll-timeout; 120 s for these classes unless it is given). The deadline is checked per
+  poll, so it can overrun by up to two polls (one in flight at the deadline plus the one final poll,
+  about 20 s). A RUNNING row exists only for flushed output, so a quiet long-running action shows no
+  rows at all until it finishes. A row passes only if every response row is SUCCESS with no
+  error_detail. A row that ends without a verdict from terminal rows (no rows, rows still running,
+  polls failing for any reason, or a row the runner does not recognise) fails and stops further
+  dispatch, so a following action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED row is a
+  known outcome and does not stop the run. Ctrl-C and SIGTERM stop dispatching (exit 130); a
+  dispatch already sent is reported as in_flight_unknown.
+
+  After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a
+  recognised pre-dispatch refusal reason (or "no agents reached"), a 202 pending_approval (approval
+  mode always, role-gated for a non-admin caller, or an unrecognised mode; never auto), and a
+  refused connection or unresolvable name. HTTP 200 means the server started it. Everything else is
+  dispatch_unknown and stops the run (do not re-run blindly): a transport failure after send, any
+  other 5xx, any 3xx, any 2xx other than 200 and a pending_approval 202, a 202 without
+  pending_approval, and any exception after an accepted POST. Three consecutive 401/403 answers to
+  execute, or 401/403/503 to a targeted poll, also stop the run. Permissions: Execution:Execute to
+  dispatch, Response:Read to poll, Infrastructure:Read for the agent lookup.
 
   The manifest is an attempt log, not outcome evidence: the first line is run-start, then a dispatch
-  line per attempt with the exact params sent (treat it as sensitive; it is created 0600 on POSIX
-  only, at creation only; .gitignore covers only the default name) and an accepted line when the
-  server answers it. --output is written through an owner-only descriptor that refuses a symlink; a
-  targeted run refuses an existing --output (rename it first: it holds the command_id record of an
-  earlier run) and one that is the manifest. --poll-timeout below 1 is refused. A SIGKILL leaves
-  only the manifest. Forensic rows read behavioural data from the target, and the responses are
-  stored in the server's response store.
+  line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
+  creation only; .gitignore covers only the default name) and an accepted line when the server
+  answers it. --output is written through an owner-only descriptor that refuses a symlink (POSIX
+  only); a targeted run creates it exclusively and refuses an existing one (rename it first: it
+  holds the command_id record of an earlier run). A SIGKILL leaves only the manifest. --output holds
+  command_id for accepted rows; rows rebuilt at an abort may have none (use the manifest accepted
+  line). A closed stdout may still end the process with exit 120 at interpreter flush: --output and
+  the metrics are written first and it fails closed, never a false 0. The stderr list of not-started
+  ids is capped at 30; the rest are in --output and the manifest. Forensic rows read behavioural
+  data from the target, and the responses are stored in the server's response store.
 
-  Recovery after a stop. In the manifest a "dispatch" line is an attempt, and an "accepted" line means
-  the server answered it (with its http status and, when it gave them, command_id, execution_id or
-  approval_id). A dispatch line with no accepted line may or may not have run (a SIGKILL leaves only the
-  manifest, and no --output). A 202/4xx accepted line was not executed, although an open approval ticket
-  may remain. --output holds command_id for every row whose POST was accepted, plus the in_flight_unknown
-  and dispatch_unknown rows (a dispatch_unknown row may have no command_id: a POST that failed in flight
-  has none). A definition with no dispatch line was never sent. Check the target by hand (and the
-  dashboard's executions) before retrying. To resume, pass --match with an anchored regex for the
-  remaining ids only after verifying, e.g. --match '^(device\\.tags\\.clear|device\\.filesystem\\.append)$'
-  (--only-id takes exactly one id).
+  Recovery after a stop. In the manifest a dispatch line is an attempt and an accepted line means
+  only that the server answered it (http status and, when given, command_id, execution_id or
+  approval_id): 200 means the server started it; an accepted line with a 5xx status may have run;
+  202 and 4xx were not executed (an open approval ticket may remain). A dispatch line with no
+  accepted line may or may not have run (a SIGKILL leaves only the manifest and no --output).
+  --output holds command_id for every accepted row, plus the in_flight_unknown and dispatch_unknown
+  rows (a dispatch_unknown row may have no command_id: a POST that failed in flight has none). A
+  definition with no dispatch line was never sent. Check the target by hand (and the dashboard's
+  executions) before retrying. To resume, rename the old --output first (a targeted run refuses an
+  existing one), then pass --match with an anchored regex for the remaining ids only after
+  verifying, e.g. --match '^(device\\.tags\\.clear|device\\.filesystem\\.append)$' (--only-id takes
+  exactly one id).
 
   --confirm-target is a wrong-target typo guard against what the connected server reports. It cannot
   detect an ssh -L tunnel or a port forward to a different stack, and it is not an authorisation or
@@ -1746,7 +1833,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--poll-timeout", type=int, default=None,
                    help=f"per-instruction response poll timeout (default: {DEFAULT_POLL_TIMEOUT_S}s; "
                         f"{TARGETED_POLL_TIMEOUT_S}s for destructive/forensic rows; the deadline can "
-                        "overrun by up to one poll). A targeted row that ends without a verdict "
+                        "overrun by up to two polls, about 20 s). A targeted row that ends without a verdict "
                         "(no rows, still running, polls failing) fails and stops the run; raise it "
                         "for a slow or quiet action")
     p.add_argument("--content-dir", default="",
