@@ -743,7 +743,8 @@ TEST_CASE("crypto routes: a degraded read whose failure audit row is lost shows 
     CHECK(cont->body.rfind("<tr", 0) == 0);
 }
 
-TEST_CASE("crypto routes: the four scoped data routes are no-store and private and vary on Cookie",
+TEST_CASE("crypto routes: the four scoped data routes are no-store and private and vary on every "
+          "credential",
           "[crypto][routes][security]") {
     Harness h;
     h.api->summary_result = sample_summary();
@@ -755,7 +756,7 @@ TEST_CASE("crypto routes: the four scoped data routes are no-store and private a
         auto res = h.sink.dispatch("GET", path);
         REQUIRE(res);
         CHECK(res->get_header_value("Cache-Control") == "no-store, private");
-        CHECK(res->get_header_value("Vary") == "Cookie");
+        CHECK(res->get_header_value("Vary") == "Authorization, Cookie, X-Yuzu-Token");
     }
     // A refusal keeps the headers too (set before the gate).
     h.admitted = false;
@@ -887,4 +888,118 @@ TEST_CASE("crypto routes: every HTML sink escapes hostile text", "[crypto][route
     assert_escaped(crypto_html::render_unavailable(evil("what")), "what");
     assert_escaped(crypto_html::render_unavailable_row(evil("rwhat"), evil("rurl")), "rwhat");
     assert_escaped(crypto_html::render_unavailable_row("x", evil("rurl")), "rurl");
+    // The first-page drill banner: its `what` is escaped, and a hostile family id reaches the
+    // Retry hx-get and the hx-target id only url-encoded (never a raw <, quote or &).
+    CryptoDevicesQuery dq;
+    dq.family = evil("dfam");
+    const auto ud = crypto_html::render_unavailable_drill(evil("dwhat"), dq);
+    assert_escaped(ud, "dwhat");
+    CHECK_THAT(ud, !ContainsSubstring("<script>dfam"));
+    CHECK_THAT(ud, !ContainsSubstring("dfam</script>"));
+    CHECK_THAT(ud, ContainsSubstring("family=%3Cscript%3Edfam%3C%2Fscript%3E%22%27%26"));
+    CHECK_THAT(ud, ContainsSubstring("hx-target=\"#cry-exp-%3Cscript%3Edfam%3C%2Fscript%3E%22%27%26\""));
+    CHECK(crypto_html::drill_box_id(evil("bid")) == "cry-exp-%3Cscript%3Ebid%3C%2Fscript%3E%22%27%26");
+}
+
+TEST_CASE("crypto routes: a hostile family id in the summary is url-encoded in the drill URL and "
+          "the drill box id",
+          "[crypto][routes][ui][security]") {
+    Harness h;
+    CryptoSummary s;
+    CryptoFamilyRow f;
+    f.id = "<script>sfam</script>\"'& x";
+    f.display = "Shown";
+    f.device_count = 1;
+    f.versions.push_back({"1.0", "deb", 1, {"pkg"}});
+    s.families.push_back(f);
+    h.api->summary_result = s;
+    const auto lib = h.sink.dispatch("GET", "/fragments/crypto/libraries")->body;
+    const std::string enc = "%3Cscript%3Esfam%3C%2Fscript%3E%22%27%26%20x";
+    CHECK_THAT(lib, !ContainsSubstring("<script>sfam"));
+    CHECK_THAT(lib, !ContainsSubstring("sfam</script>"));
+    // The row and the chip drill URL, and the box id the row, the chip and the box itself use.
+    CHECK_THAT(lib, ContainsSubstring("hx-get=\"/fragments/crypto/libraries/devices?family=" + enc + "\""));
+    CHECK_THAT(lib, ContainsSubstring("hx-target=\"#cry-exp-" + enc + "\""));
+    CHECK_THAT(lib, ContainsSubstring("id=\"cry-exp-" + enc + "\""));
+}
+
+TEST_CASE("crypto routes: the summary's unavailable answer carries the component CSS once",
+          "[crypto][routes][ui]") {
+    auto count = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+    const std::string css = ".cry-degrade .cry-btn{"; // one rule of the block, unique in it
+    SECTION("a store degrade, with and without the audit notice") {
+        for (const bool audit_ok : {true, false}) {
+            INFO("audit_ok " << audit_ok);
+            Harness h;
+            h.audit_ok = audit_ok;
+            h.api->summary_result =
+                std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+            const auto body = h.sink.dispatch("GET", "/fragments/crypto/libraries")->body;
+            CHECK(body.rfind("<style>", 0) == 0);
+            CHECK(count(body, css) == 1);
+            CHECK(count(body, "<style>") == 1);
+            CHECK(body.find("<style>") < body.find("class=\"cry-degrade\""));
+            CHECK((body.find(std::string(crypto_html::kAuditNotPersistedNotice)) !=
+                   std::string::npos) == !audit_ok);
+        }
+    }
+    SECTION("no seam, a degraded gate and an unwired gate") {
+        Harness no_api(true, false);
+        CHECK(count(no_api.sink.dispatch("GET", "/fragments/crypto/libraries")->body, css) == 1);
+        Harness gate;
+        gate.admitted = false;
+        gate.deny_status = 503;
+        CHECK(count(gate.sink.dispatch("GET", "/fragments/crypto/libraries")->body, css) == 1);
+        Harness unwired(false, true);
+        auto res = unwired.sink.dispatch("GET", "/fragments/crypto/libraries");
+        CHECK(res->status == 503);
+        CHECK(count(res->body, css) == 1);
+    }
+    SECTION("the success path keeps its single style block; drills add none") {
+        Harness h;
+        h.audit_ok = false;
+        h.api->summary_result = sample_summary();
+        h.api->devices_result = sample_page();
+        CHECK(count(h.sink.dispatch("GET", "/fragments/crypto/libraries")->body, "<style>") == 1);
+        h.api->devices_result =
+            std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+        CHECK(count(h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl")
+                        ->body,
+                    "<style>") == 0);
+    }
+}
+
+TEST_CASE("crypto routes: a degraded access gate names the access check; not the inventory store",
+          "[crypto][routes][ui]") {
+    Harness h;
+    h.admitted = false;
+    h.deny_status = 503;
+    for (const char* path : {"/fragments/crypto/libraries",
+                             "/fragments/crypto/libraries/devices?family=nss",
+                             "/fragments/crypto/libraries/devices?family=nss&cursor=k1:x"}) {
+        INFO(path);
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
+        CHECK_THAT(res->body, ContainsSubstring("access check could not be completed"));
+        CHECK_THAT(res->body, ContainsSubstring("permission store could not be read"));
+        CHECK_THAT(res->body, !ContainsSubstring("inventory store"));
+        CHECK_THAT(res->body, ContainsSubstring("Retry"));
+    }
+    // A real store degrade still names the inventory store.
+    Harness store;
+    store.api->summary_result =
+        std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+    const auto body = store.sink.dispatch("GET", "/fragments/crypto/libraries")->body;
+    CHECK_THAT(body, ContainsSubstring("inventory store could not be read"));
+    CHECK_THAT(body, !ContainsSubstring("access check"));
+    // REST keeps the gate's own 503; no crypto audit row is written for the gate's degrade.
+    CHECK(h.sink.dispatch("GET", "/api/v1/crypto/libraries")->status == 503);
+    CHECK(h.audits.empty());
 }

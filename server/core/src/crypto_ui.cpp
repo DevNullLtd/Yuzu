@@ -275,6 +275,10 @@ std::string unavailable_reason(CryptoReadCause cause) {
         reason = "Temporarily busy: two reads are already running on this server; retry "
                  "shortly. This is <b>not</b> \"no library installed\".";
         break;
+    case CryptoReadCause::kAccessCheck:
+        reason = "The access check could not be completed: the permission store could not be "
+                 "read. This is <b>not</b> \"no library installed\" and not a refusal.";
+        break;
     case CryptoReadCause::kNone:
     case CryptoReadCause::kStoreDegraded:
         reason = "The inventory store could not be read (Postgres pool/query degraded). This is "
@@ -306,6 +310,15 @@ std::string render_unavailable(std::string_view what, CryptoReadCause cause) {
            "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Retry</button></div>";
 }
 
+std::string render_summary_unavailable(std::string_view what, CryptoReadCause cause,
+                                       bool audit_lost) {
+    // The summary answer that is NOT render_libraries replaces the whole page body, so it carries
+    // the component CSS itself (render_libraries is the only other emitter, and a response holds
+    // one or the other, never both), else `.cry-degrade` renders unstyled on a failed first load.
+    return style() + (audit_lost ? render_audit_notice() : std::string{}) +
+           render_unavailable(what, cause);
+}
+
 std::string render_unavailable_drill(std::string_view what, const CryptoDevicesQuery& q,
                                      CryptoReadCause cause) {
     // A first page carries no cursor: Retry re-requests this drill, not a continuation.
@@ -330,6 +343,10 @@ std::string render_unavailable_row(std::string_view what, std::string_view retry
     case CryptoReadCause::kCapacity:
         reason = "Temporarily busy: two reads are already running on this server; retry "
                  "shortly. This is <b>not</b> \"no more devices\".";
+        break;
+    case CryptoReadCause::kAccessCheck:
+        reason = "The access check could not be completed: the permission store could not be "
+                 "read. This is <b>not</b> \"no more devices\".";
         break;
     case CryptoReadCause::kNone:
     case CryptoReadCause::kStoreDegraded:

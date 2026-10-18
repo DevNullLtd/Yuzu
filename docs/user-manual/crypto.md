@@ -211,7 +211,7 @@ the summary shows can be drilled. A repeated parameter with differing values is 
 and matches no rows.
 
 Both routes, and the two `/fragments/crypto/*` fragments the page loads, answer
-`Cache-Control: no-store, private` and `Vary: Cookie`, because the answer depends on the caller's
+`Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`, because the answer depends on the caller's
 scope and must not be served from a shared cache.
 
 Full parameters, response shapes and error tables are in [rest-api.md](rest-api.md#crypto).
@@ -289,7 +289,11 @@ an empty list, because an empty list would read as "no library installed".
 - **Dashboard fragments** answer HTTP 200 so the page can show the problem in place, except a
   server misconfiguration (an unwired access gate), which is a `503`: an "unavailable" banner
   with a **Retry** button for a store failure or an unreadable authorization store, and a plain
-  notice box for a refused permission or a bad parameter. **Retry** re-requests what failed: the
+  notice box for a refused permission or a bad parameter. The banner names what could not be
+  read: "The inventory store could not be read" for a store failure, and "The access check could
+  not be completed: the permission store could not be read" when the access gate itself could not
+  read the authorization store (neither is "no library installed", and the second is not a
+  refusal). **Retry** re-requests what failed: the
   summary on the summary banner, the same drill on a failed first drill page, and the same page on
   a failed **Load more** page. On a **Load more** page the banner or notice is a single table row,
   so the list above it stays intact.
@@ -304,8 +308,9 @@ row on the page. It is a shed, not a fault; retry after the hint. An agentic wor
 serialise its `list_crypto_library_devices` calls (one page at a time, following `next_cursor`)
 rather than fan them out: parallel drills compete for the same two slots.
 
-**Diagnosing a degrade.** A banner or `503` here has one of two causes, told apart by the
-message, the audit row and the counter (the third row is how to tell a catalogue problem from the first).
+**Diagnosing a degrade.** A banner or `503` here has one of three causes, told apart by the
+message, the audit row and the counter (the third row is how to tell a catalogue problem from the
+first; the fourth is the access gate, not the inventory read).
 The audit row is attempted, not guaranteed: when the cause is the database connection pool
 (`pool_acquire_timeout`), the audit write needs the same pool and can be lost too, so rely on the
 message and the counter, and check `yuzu_server_audit_emit_failed_total`:
@@ -315,6 +320,7 @@ message and the counter, and check `yuzu_server_audit_emit_failed_total`:
 | The inventory read failed or ran past its 5 s bound | `crypto library read degraded` | `store degraded` | `reason` is `store_not_open`, `pool_acquire_timeout` or `query_error` |
 | The concurrent-read bound was full | `crypto read capacity in use; retry` | `capacity in use` | `reason="admission_full"` |
 | The same `crypto library read degraded` while `YuzuInventoryCatalogRollupStale` or `YuzuInventoryCatalogRollupFailing` is firing | `crypto library read degraded` | `store degraded` | `reason="query_error"` (the 5 s statement timeout) |
+| The access gate could not read the authorization store | the gate's own `503` envelope (REST and MCP); on the page the banner "The access check could not be completed: the permission store could not be read" | none here; the gate writes `auth.fleet_read_required` | not moved; `yuzu_server_rbac_read_degrade_total` moves instead |
 
 The last row most likely means the live name scan exceeded its 5 s bound: there are too many
 distinct package names for a live read, and retrying will not help (a Postgres overload also
@@ -328,12 +334,13 @@ two hours, can send `/crypto` to live reads with neither alert firing; compare `
 the database `now()`.
 On the dashboard page and its **Load more** row the capacity shed reads "Temporarily busy: two
 reads are already running on this server; retry shortly" and a store fault reads "The inventory
-store could not be read"; REST and MCP use the same `503` message per cause.
+store could not be read" (a degraded access gate reads "The access check could not be completed"
+instead); REST and MCP use the same `503` message per cause.
 
 Every such response also attempts a `failure` row for the `crypto.libraries.*` verb in the audit
-log. Under connection-pool exhaustion that row can be lost; each lost row increments
-`yuzu_server_audit_emit_failed_total`, and on the page the "Audit not recorded" notice appears
-above the banner. A banner or `503` that comes
+log. Under connection-pool exhaustion that row can be lost; a failed audit store write increments
+`yuzu_server_audit_emit_failed_total` (an audit sink that throws instead is caught and only logged,
+not counted), and either way the page shows the "Audit not recorded" notice above the banner. A banner or `503` that comes
 from the authorization store instead moves `yuzu_server_rbac_read_degrade_total`, not the
 inventory counter, and writes no `crypto.libraries.*` failure row (the gate writes its own).
 
@@ -363,8 +370,8 @@ has two sources, chosen on every read. While the hourly software-catalogue refre
 (it has run, and started at most two hours ago) the names come from it: `names_source` is
 `catalogue` and `names_as_of` is the refresh time (epoch seconds in the API; "Package names as of
 ..." on the page). A package name first reported after that time appears after the next hourly
-refresh. When the catalogue has never been built (a new server, or an upgrade), or is older than
-two hours, the names are read **live** from the installed-software inventory instead:
+refresh. When the catalogue has never been built (a new server, or an upgrade), is older than
+two hours, or its last refresh found zero titles, the names are read **live** from the installed-software inventory instead:
 `names_source` is `live`, `names_as_of` is `null` and the page says "Package names read live".
 Either way counts and versions for the listed names are live: a device that reports an
 already-listed name is counted at once. The two sources return the same answer for the same data;

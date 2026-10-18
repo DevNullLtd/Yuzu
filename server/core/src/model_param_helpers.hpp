@@ -10,8 +10,6 @@
 /// Pure: no httplib, no MCP, no libpq, no store types. Every function is `inline` (header-only),
 /// so both translation units see one definition.
 
-#include "utf8_sanitize.hpp"
-
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
@@ -25,6 +23,8 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+#include "utf8_sanitize.hpp"
 
 namespace yuzu::server::model_detail {
 

@@ -556,6 +556,22 @@ TEST_CASE("crypto routes real gate: confined; global; ungranted and service-scop
         }
         CHECK(api->scopes.empty());
     }
+    SECTION("RBAC enforcement off (the shipped default): a non-service caller is TOP on every route") {
+        // gary holds no Inventory:Read grant at all; with enforcement off the legacy fallback
+        // admits every authenticated Read unfiltered, on REST and on the fragments alike.
+        r.rig.rbac.set_rbac_enabled(false);
+        const auto tok = mint("gary");
+        for (const auto& path : rest)
+            CHECK(call(tok, path).first == 200);
+        for (const auto& path : frags) {
+            auto [code, body] = call(tok, path);
+            CHECK(code == 200);
+            CHECK_FALSE(has(body, "not available to this account"));
+        }
+        REQUIRE(api->scopes.size() == 4);
+        for (const auto& s : api->scopes)
+            CHECK_FALSE(s.has_value());
+    }
     SECTION("a service-scoped token: 403 while RBAC enforcement is off, its tagged devices when on") {
         const auto svc = r.mint_service("ivan", "printers"); // bob-agent is tagged service=printers
         for (const auto& path : rest)

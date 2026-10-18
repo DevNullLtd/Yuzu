@@ -30,9 +30,11 @@ inline constexpr std::string_view kEvidenceCaveat =
 /// The audit-loss notice (review #6056 UP-8): a fragment whose access-audit row did not persist
 /// still renders (set-and-proceed), but says so on the page as well as in the
 /// `Sec-Audit-Failed` header, so a lost row is visible to the operator, not only to a client
-/// that reads headers. `yuzu_server_audit_emit_failed_total` is bumped by every AuditStore write
-/// failure (store not open, pool acquire timeout, INSERT error); the shipped
-/// YuzuAuditPersistFailures alert watches it.
+/// that reads headers. `yuzu_server_audit_emit_failed_total` is bumped by an AuditStore write
+/// failure (store not open, pool acquire timeout, INSERT error), which the shipped
+/// YuzuAuditPersistFailures alert watches; a sink that THROWS (`bad_alloc`-class) is caught in
+/// `detail::try_persist_audit` (rest_audit.hpp) and only logged, never counted, so the notice
+/// still shows but the counter does not move.
 inline constexpr std::string_view kAuditNotPersistedNotice =
     "This view could not be recorded in the audit log. Audit store write failures are counted in "
     "yuzu_server_audit_emit_failed_total, which the shipped YuzuAuditPersistFailures alert "
@@ -52,9 +54,17 @@ inline constexpr std::string_view kAuditNotPersistedNotice =
 
 /// Store degrade or capacity shed on the SUMMARY: a retry banner (re-requests the whole page),
 /// never an empty table. The text follows the cause: a shed says the server is busy, a store fault says the
-/// inventory store could not be read.
+/// inventory store could not be read, and a degraded access gate (kAccessCheck) says the
+/// permission store could not be read.
 [[nodiscard]] std::string render_unavailable(std::string_view what,
                                              CryptoReadCause cause = CryptoReadCause::kStoreDegraded);
+
+/// The SUMMARY fragment's whole answer when it is not render_libraries: the component CSS (once;
+/// render_libraries carries its own), the audit-loss notice when `audit_lost`, then the
+/// render_unavailable banner. Without the CSS `.cry-degrade` is unstyled on a failed first load.
+[[nodiscard]] std::string render_summary_unavailable(
+    std::string_view what, CryptoReadCause cause = CryptoReadCause::kStoreDegraded,
+    bool audit_lost = false);
 
 /// The first-page drill twin of render_unavailable: its Retry re-requests the SAME drill
 /// fragment (family, version, ecosystem) into the family's own drill box, never the summary.

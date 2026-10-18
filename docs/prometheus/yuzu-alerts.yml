@@ -2897,7 +2897,10 @@ groups:
             dex.signal.view, dex.perf.device.view, network.device.view, plus
             response.read on the v1 query, aggregate and export routes and on the
             legacy get, aggregate and export routes) is returning 503 and withholding PII or response
-            data, so a ServiceNow / CMDB poll blackouts fleet-wide. Check audit_store health (/healthz
+            data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
+            crypto.libraries.*, keep serving data and flag the loss with Sec-Audit-Failed,
+            audit_persisted:false and an on-page "Audit not recorded" notice, rather than 503ing.
+            Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
             throw in the audit pipeline fails closed the same way but does NOT bump this

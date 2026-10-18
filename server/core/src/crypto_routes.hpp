@@ -20,7 +20,7 @@
 /// `Sec-Audit-Failed: true` on every route, `audit_persisted: false` in the REST body, and a
 /// visible notice on the fragment (crypto_html::kAuditNotPersistedNotice). The detail carries
 /// `scope=fleet|confined` (ADR-0017 INV-9). Every data route answers `Cache-Control: no-store,
-/// private` and `Vary: Cookie` (per-caller, scope-filtered data).
+/// private` and `Vary: Authorization, Cookie, X-Yuzu-Token` (per-caller, scope-filtered data).
 ///
 /// Fragments answer HTTP 200 with a caveat box for a refusal, a bad parameter or a store
 /// degrade (htmx does not swap a 4xx); REST returns the real codes.

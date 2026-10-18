@@ -23702,9 +23702,13 @@ TEST_CASE("MCP crypto twins: a confined caller with an EMPTY visible set gets an
             CHECK(dev["result"]["structuredContent"]["devices"].empty());
             CHECK(dev["result"]["structuredContent"]["next_cursor"].is_null());
             for (const char* key : {"mcp.get_crypto_libraries|success",
-                                    "mcp.list_crypto_library_devices|success"})
-                for (const auto& d : mcp_audit_details(ts, key))
+                                    "mcp.list_crypto_library_devices|success"}) {
+                INFO(key);
+                const auto details = mcp_audit_details(ts, key);
+                REQUIRE(!details.empty()); // else the loop below passes vacuously
+                for (const auto& d : details)
                     CHECK_THAT(d, Catch::Matchers::ContainsSubstring("scope=confined"));
+            }
         } else {
             CHECK(sum.contains("error")); // the broken backend IS reached without a scope
             CHECK(dev.contains("error"));

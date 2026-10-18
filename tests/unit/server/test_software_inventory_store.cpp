@@ -6,6 +6,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "agent.pb.h"
+#include "crypto_library_model.hpp"
 #include "inventory_ingestion.hpp"
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <format>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -3869,7 +3871,7 @@ TEST_CASE("name-pattern rollup: coverage is counted in the same statement as the
 
 // The per-bucket name list is capped at kNamePatternNamesPerRow (8): one past the cap is read so a
 // cut list says names_truncated, and a bucket holding exactly the cap does not (review #6056).
-TEST_CASE("name-pattern rollup: the 8-name cap per bucket is flagged, never silent",
+TEST_CASE("name-pattern rollup: the 8-name cap per bucket is flagged; never silent",
           "[pg][software_inventory][crypto]") {
     SWINV_SHARED(store, pool);
     static_assert(yuzu::server::kNamePatternNamesPerRow == 8);
@@ -3899,6 +3901,111 @@ TEST_CASE("name-pattern rollup: the 8-name cap per bucket is flagged, never sile
     }
     CHECK(saw_nine);
     CHECK(saw_eight);
+}
+
+// Review #6109: a corpus differential between the SQL the /crypto table generates
+// (crypto_library::sql_patterns - escaped LIKE patterns plus 3-character leads) and the C++
+// classifier (crypto_library::classify). The CryptoApi seam re-classifies every name it shows,
+// which would HIDE an over-matching pattern, so this compares at the STORE: for every family the
+// set of names the rollup and the drill return must be exactly the set classify() assigns to it,
+// on the catalogue path and on the live path. A wrong pattern (an unescaped `_`, a lost `%`, a
+// wrong lead, an exact rule emitted as a prefix) changes one side only and fails here.
+TEST_CASE("name-pattern reads: the crypto table's SQL patterns and classify() agree on a corpus",
+          "[pg][software_inventory][crypto]") {
+    namespace cl = yuzu::server::crypto_library;
+    SWINV_SHARED(store, pool);
+    std::set<std::string> corpus;
+    auto mixed = [](std::string s) { // alternate ASCII case: OpEnSsL
+        for (std::size_t i = 0; i < s.size(); i += 2)
+            if (s[i] >= 'a' && s[i] <= 'z')
+                s[i] = static_cast<char>(s[i] - 'a' + 'A');
+        return s;
+    };
+    for (const auto& r : cl::rules()) {
+        const std::string v(r.value);
+        corpus.insert(v);
+        corpus.insert(mixed(v));
+        corpus.insert(v.substr(0, v.size() - 1)); // one short
+        corpus.insert("x" + v);                   // not a prefix of anything
+        for (const char* suffix : {"-dev", "t64", ".so.3", "-1.2_3", "X", "%", "_", "\\"})
+            corpus.insert(v + suffix);
+        if (r.kind == cl::MatchKind::kPrefix)
+            corpus.insert(mixed(v) + "-Dev");
+    }
+    for (const char* near : {
+             "libcrypto++8", "libcrypto++-dev", "nss-mdns", "nss-pam-ldapd", "libnss3x",
+             "libssl-ocaml", "libssl", "libcrypto", "gnutlsx", "mbedtls2", "ab", "op", "x",
+             "libopenssl1x1", "openssl-1x1", "openssl-1%1", "%openssl", "_openssl", "o_enssl",
+             "lib%ssl3", "libssl_3", "\\openssl", "openssl@", "openssl@3", "OPENSSL@3",
+             "l\xC4\xB0" "bssl3",                                 // U+0130: not ASCII-foldable
+             "lib\xC5\xBF" "sl3",                                 // U+017F long s
+             "\xEF\xBD\x8C\xEF\xBD\x89\xEF\xBD\x82ssl3",          // fullwidth "lib" + ssl3
+             "libssl3\xC3\xA9", "\xC3\xA9openssl", "nss\xE2\x80\x8B" // e-acute, zero-width space
+         })
+        corpus.insert(near);
+
+    // One device; every name in its own version bucket, so no 8-name cut can hide a name.
+    std::vector<SoftwareEntry> rows;
+    int i = 0;
+    for (const auto& n : corpus)
+        rows.push_back(np_entry(n, "v" + std::to_string(i++)));
+    REQUIRE(rows.size() < static_cast<std::size_t>(yuzu::server::kNamePatternRollupRowCap));
+    np_seed(store, "corpus", std::move(rows));
+
+    std::map<std::string, std::set<std::string>> expected;
+    std::size_t unmatched = 0;
+    for (const auto& n : corpus) {
+        if (const auto f = cl::classify(n))
+            expected[std::string(*f)].insert(n);
+        else
+            ++unmatched;
+    }
+    // Not vacuous: every family has names, and many names belong to none.
+    for (const auto& f : cl::families())
+        REQUIRE(!expected[std::string(f.id)].empty());
+    REQUIRE(unmatched > 100);
+
+    for (const bool stale : {false, true}) { // catalogue names, then live skip-scan names
+        INFO("stale=" << stale);
+        // The summary path: every rule of every family in one statement.
+        const auto all = cl::sql_patterns();
+        yuzu::server::NamePatternQuery q;
+        q.patterns = all.patterns;
+        q.labels = all.labels;
+        q.leads = all.leads;
+        const auto r = np_rollup(store, q, stale);
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->truncated);
+        std::map<std::string, std::set<std::string>> got;
+        for (const auto& row : r->rows) {
+            CHECK_FALSE(row.names_truncated);
+            got[row.label].insert(row.names.begin(), row.names.end());
+        }
+        for (const auto& f : cl::families()) {
+            const std::string id(f.id);
+            INFO("rollup family " << id);
+            CHECK(got[id] == expected[id]);
+        }
+        CHECK(got.size() == cl::families().size()); // no label outside the table
+
+        // The drill path: one family's rules at a time.
+        for (const auto& f : cl::families()) {
+            const std::string id(f.id);
+            INFO("drill family " << id);
+            const auto fam = cl::sql_patterns(id);
+            yuzu::server::NamePatternDevicesQuery dq;
+            dq.patterns = fam.patterns;
+            dq.leads = fam.leads;
+            dq.limit = yuzu::server::kNamePatternPageMax;
+            const auto page = np_devices(store, dq, stale);
+            REQUIRE(page.has_value());
+            CHECK_FALSE(page->has_more);
+            std::set<std::string> names;
+            for (const auto& row : page->rows)
+                names.insert(row.entry.name);
+            CHECK(names == expected[id]);
+        }
+    }
 }
 
 // Review #6056 (A7): the drill's keyset predicate is evaluated INSIDE the OFFSET 0 fence, in the
