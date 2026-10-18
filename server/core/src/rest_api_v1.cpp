@@ -291,7 +291,8 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
 // proceed.
 static bool deny_engine_session(const auth::Session& s, const httplib::Request& req,
                                 httplib::Response& res, const RestApiV1::AuditFn& audit,
-                                const char* action, const char* target) {
+                                const char* action, const char* target,
+                                const char* target_id = "") {
     if (s.principal_kind == "engine" || s.auth_source == "engine_token") {
         // #2466/#2406: surface a dropped denial-audit via Sec-Audit-Failed (the
         // 403 stands — a denial commits no mutation, so it does not fail closed;
@@ -303,7 +304,7 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
         // Sec-Audit-Failed uniform across every response whose audit dropped is a
         // monitoring virtue, and defenders get the drop server-side regardless via
         // the audit-emit-failed metric + warn log independent of this header.
-        (void)detail::emit_behavioral_audit(audit, req, res, action, "denied", target, "",
+        (void)detail::emit_behavioral_audit(audit, req, res, action, "denied", target, target_id,
                                             "engine_session_denied");
         res.status = 403;
         res.set_content(detail::a4_error(res, "engine principals cannot access this endpoint"),
@@ -338,10 +339,11 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
 static bool deny_mcp_token_session(
     const auth::Session& s, const httplib::Request& req, httplib::Response& res,
     const RestApiV1::AuditFn& audit, const char* action, const char* target,
-    const char* tool_names = "assign_rbac_role/unassign_rbac_role/set_rbac_enforcement") {
+    const char* tool_names = "assign_rbac_role/unassign_rbac_role/set_rbac_enforcement",
+    const char* target_id = "") {
     if (!s.mcp_tier.empty()) {
         (void)detail::emit_behavioral_audit(
-            audit, req, res, action, "denied", target, "",
+            audit, req, res, action, "denied", target, target_id,
             "MCP token blocked from admin route (mcp_tier='" + s.mcp_tier + "')");
         res.status = 403;
         res.set_content(
@@ -1281,7 +1283,7 @@ const std::string& openapi_spec() {
         // literals are concatenated at compile time, byte-identical JSON.
         R"json(,
     "/guaranteed-state/policy-generation/raise": {
-      "post": {"summary": "Raise the Guardian policy generation (administrator only)", "tags": ["Guaranteed State"], "description": "Raises the fleet-wide Guardian policy generation to target_generation, never lowering it. This is the supported recovery when the stored generation was restored below what agents already hold, so agents treat every server push as stale. Gated on a durable is_rbac_administrator check (not GuaranteedState:Push) plus MFA step-up. Raising the generation converges EVERY agent behind it to the rule set this server holds now, replacing the rules those agents hold under the higher number: the request must carry acknowledge_rule_set_replaced=true. Nothing is pushed: agents converge on their next heartbeat reconcile. target_generation must be an integer from 1 to 9007199254740991 (2^53-1, the ceiling echoed in the response). Idempotent: a target at or below the current generation changes nothing and returns raised=false with 200. The response reports previous_generation, the resulting generation, the rule count and the deployed Baseline count. Audited as guaranteed_state.policy_generation.raise: an attempted row is written first and the change is refused with 503 if it cannot be stored, then an outcome row. MCP twin raise_guardian_policy_generation.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"target_generation": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "acknowledge_rule_set_replaced": {"type": "boolean", "enum": [true]}}, "required": ["target_generation", "acknowledge_rule_set_replaced"]}}}}, "responses": {"200": {"description": "{data:{previous_generation,generation,raised,rules,deployed_baselines,ceiling}}; raised=false when the generation was already at or above the target"}, "400": {"description": "Invalid JSON, target_generation missing, not an integer or outside 1..9007199254740991, or acknowledge_rule_set_replaced missing or not true (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Not authenticated, or MFA step-up required or failed (api_token/mcp_token bearer sessions are exempt) - see meta.challenge_url"}, "403": {"description": "Caller is not a durable Administrator, is a service-scoped or engine session, or presented an MCP-tier bearer token (use the MCP tool instead) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Guardian or Baseline store unavailable or degraded, the admin gate could not confirm authority, or the audit record could not be stored (Sec-Audit-Failed: true). When the attempted row failed nothing was changed; when only the outcome row failed the raise took effect and the response says so. retry_after_ms is set where a retry is safe (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "post": {"summary": "Raise the Guardian policy generation (administrator only)", "tags": ["Guaranteed State"], "description": "Raises the fleet-wide Guardian policy generation to target_generation, never lowering it. This is the supported recovery when the stored generation was restored below what agents already hold, so agents treat every server push as stale. Gated on a durable is_rbac_administrator check (not GuaranteedState:Push), then MFA step-up, which applies when a local account is enrolled and its proof is stale, or, for a single-sign-on (OIDC) session, when the identity provider has not asserted MFA under an enforcement mode that protects the role (see the MFA documentation); api_token and mcp_token sessions are exempt, SAML sessions are refused with 403, and --mfa-step-up-window-secs 0 disables the gate. A cookie session must also name this site in Origin or Referer. Raising the generation converges EVERY agent behind it to the rule set this server holds now, replacing the rules those agents hold under the higher number: the request must carry acknowledge_rule_set_replaced=true. Nothing is pushed: agents converge on their next heartbeat reconcile. target_generation must be an integer from 1 to 9007199254740991 (2^53-1, the ceiling echoed in the response). Idempotent: a target at or below the current generation changes nothing and returns raised=false with 200. The response reports previous_generation, the resulting generation, the rule count and the deployed Baseline count. Audited as guaranteed_state.policy_generation.raise: an attempted row is written first and the change is refused with 503 if it cannot be stored, then an outcome row. MCP twin raise_guardian_policy_generation.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"target_generation": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "acknowledge_rule_set_replaced": {"type": "boolean", "enum": [true]}}, "required": ["target_generation", "acknowledge_rule_set_replaced"]}}}}, "responses": {"200": {"description": "{data:{previous_generation,generation,raised,rules,deployed_baselines,ceiling}}; raised=false when the generation was already at or above the target"}, "400": {"description": "Invalid JSON, target_generation missing, not an integer or outside 1..9007199254740991, or acknowledge_rule_set_replaced missing or not true (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Not authenticated, or MFA step-up required or failed for an enrolled local account or an OIDC session without an identity-provider MFA assertion (api_token/mcp_token bearer sessions are exempt) - see meta.challenge_url"}, "403": {"description": "Caller is not a durable Administrator, is a service-scoped or engine session, presented an MCP-tier bearer token (use the MCP tool instead), is a SAML session (no MFA step-up available), or sent a cookie-session write without a same-site Origin or Referer (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Guardian or Baseline store unavailable or degraded, the admin gate could not confirm authority, or the audit record could not be stored (Sec-Audit-Failed: true). When the attempted row failed nothing was changed; when only the outcome row failed the raise took effect and the response says so. A store failure during the raise leaves the outcome unconfirmed (a lost commit acknowledgement can hide a committed change); repeating the request is safe because it is idempotent. retry_after_ms is set where a retry is safe (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the two
         // guaranteed-state/status route descriptions grew this segment past the
@@ -15810,8 +15812,9 @@ void RestApiV1::register_routes(
     sink.Post(
         "/api/v1/guaranteed-state/policy-generation/raise",
         [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, guaranteed_state_store,
-         baseline_store, deny_fleet_wide_service_scoped,
-         metrics_registry](const httplib::Request& req, httplib::Response& res) {
+         baseline_store, deny_fleet_wide_service_scoped, metrics_registry,
+         trusted_origins = csrf_trusted_origins_](const httplib::Request& req,
+                                                  httplib::Response& res) {
             const std::string action = guardian::kRaiseAuditAction;
             const std::string target_type = "GuaranteedState";
             const std::string target_id = "policy_generation";
@@ -15832,10 +15835,11 @@ void RestApiV1::register_routes(
             if (!session)
                 return;
             if (deny_engine_session(*session, req, res, audit_fn, action.c_str(),
-                                    target_type.c_str()))
+                                    target_type.c_str(), target_id.c_str()))
                 return;
             if (deny_mcp_token_session(*session, req, res, audit_fn, action.c_str(),
-                                       target_type.c_str(), "raise_guardian_policy_generation"))
+                                       target_type.c_str(), "raise_guardian_policy_generation",
+                                       target_id.c_str()))
                 return;
             if (!rbac_store || !rbac_store->is_open()) {
                 res.status = 503;
@@ -15872,9 +15876,57 @@ void RestApiV1::register_routes(
                                         "application/json");
                     }))
                 return;
+            // The predicate's branch selection reads a replica-local cached enforcement view
+            // that can lag a real commit, so the caller is re-verified against the regime
+            // that is durably true right now, as the RBAC grant routes above do. A raise
+            // converges the whole fleet, so a caller admitted under a stale view must not
+            // reach it.
+            {
+                const auto regime =
+                    rbac_store->check_caller_authorized_under_current_regime(session->username);
+                if (regime == RbacRegimeAuthority::kUnavailable) {
+                    spdlog::warn("{}: {} (user={})", action,
+                                 kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, action, "denied", target_type, target_id,
+                        std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(
+                            res, "service unavailable - cannot confirm administrator authority",
+                            detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                        "application/json");
+                    return;
+                }
+                if (regime != RbacRegimeAuthority::kAuthorized) {
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, action, "denied", target_type, target_id,
+                        "caller does not hold authority under the regime that is durably true "
+                        "right now");
+                    res.status = 403;
+                    res.set_content(detail::a4_error(res, "administrator role required"),
+                                    "application/json");
+                    return;
+                }
+            }
             if (step_up_fn &&
                 !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/policy-generation/raise"))
                 return;
+            // A cookie session must name this site in Origin or Referer (token callers are
+            // exempt), the same refusal the other cookie-authorised writes apply. It runs
+            // after the administrator gate and step-up so a caller who is not an
+            // administrator learns nothing, and before the body is read.
+            if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
+                                            req.get_header_value("Origin"),
+                                            req.get_header_value("Referer"), trusted_origins)) {
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "csrf.denied", "denied", "Endpoint", target_id,
+                    "cross-site or header-less browser write refused");
+                res.status = 403;
+                res.set_content(detail::a4_error(res, "cross-site request refused"),
+                                "application/json");
+                return;
+            }
 
             // Checked after the administrator gate so a caller who is not one learns nothing
             // about the Guardian stores' state.
@@ -15960,11 +16012,14 @@ void RestApiV1::register_routes(
                 count("failed");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, action, "failure", target_type, target_id,
-                    "policy generation store unavailable; target=" + std::to_string(target));
+                    "policy generation store unavailable; target=" + std::to_string(target) +
+                        "; the outcome is unconfirmed");
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(
-                        res, "Guardian store unavailable; the policy generation was not changed",
+                        res,
+                        "Guardian store unavailable; the outcome of the raise is unconfirmed, "
+                        "and repeating the same request is safe because it is idempotent",
                         detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
                     "application/json");
                 return;

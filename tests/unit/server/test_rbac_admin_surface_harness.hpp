@@ -135,7 +135,8 @@ struct RbacRoleHarness {
     bool auth_enabled{true};
     bool audit_allow{true};
     // When non-empty, an audit row whose result equals this value is not persisted (the audit
-    // function returns false for it) while every other row is. Lets a test drop one stage of a
+    // function returns false for it) while every other row is; empty (the default) drops
+    // nothing, including a row whose own result is empty. Lets a test drop one stage of a
     // multi-row sequence, e.g. "attempted" or "success", without `audit_allow`'s all-or-nothing.
     std::string audit_fail_result;
 
@@ -228,7 +229,7 @@ struct RbacRoleHarness {
                                const std::string& result, const std::string&,
                                const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
-            return audit_allow && result != audit_fail_result;
+            return audit_allow && (audit_fail_result.empty() || result != audit_fail_result);
         };
 
         api.register_routes(sink, rest_auth_fn, perm_fn, audit_fn,
@@ -296,7 +297,7 @@ struct RbacRoleHarness {
                                    const std::string& result, const std::string&,
                                    const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
-            return audit_allow && result != audit_fail_result;
+            return audit_allow && (audit_fail_result.empty() || result != audit_fail_result);
         };
         auto agents_fn = []() -> nlohmann::json { return nlohmann::json::array(); };
 

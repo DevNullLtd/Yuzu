@@ -1575,7 +1575,8 @@ static const ToolDef kTools[] = {
      "tier (Security:Write, approval-gated: the first call returns an approval ticket, re-call "
      "with the returned approval_id to consume it). Denied outright to a service-scoped API "
      "token. An MCP-tier-less caller (empty mcp_tier) is denied outright; use the REST twin, "
-     "which applies an MFA step-up. Every call is audited: an 'attempted' row is written before "
+     "which applies an MFA step-up when a local account is enrolled and its proof is stale, or when "
+     "a single-sign-on session lacks an identity-provider MFA assertion (see the MFA documentation). Every call is audited: an 'attempted' row is written before "
      "the change and the outcome row after it.",
      R"j({"type":"object","properties":{)j"
      R"j("target_generation":{"type":"integer","minimum":1,"maximum":9007199254740991,"description":"The generation to raise the stored counter to; a value at or below the current generation is a no-op"},)j"
@@ -1583,7 +1584,7 @@ static const ToolDef kTools[] = {
      R"j(},"required":["target_generation","acknowledge_rule_set_replaced"]})j",
      R"j({"type":"object","properties":{)j"
      R"j("previous_generation":{"type":"integer","minimum":0},"generation":{"type":"integer","minimum":0},"raised":{"type":"boolean"},)j"
-     R"j("rules":{"type":"integer","minimum":0,"description":"Guards the server holds now, which every agent behind the new generation converges to"},)j"
+     R"j("rules":{"type":"integer","minimum":0,"description":"Count of all Guard rows the server holds now, enabled or not; agents converge only to the enabled rules that are members of deployed Baselines"},)j"
      R"j("deployed_baselines":{"type":"integer","minimum":0},"ceiling":{"type":"integer","description":"Largest accepted target_generation"})j"
      R"j(},"required":["previous_generation","generation","raised","rules","deployed_baselines","ceiling"]})j"},
 
@@ -15719,6 +15720,41 @@ McpServer::HandlerFn McpServer::build_handler(
                                             "application/json");
                         }))
                     return;
+                // The predicate's branch selection reads a replica-local cached enforcement
+                // view that can lag a real commit, so the caller is re-verified against the
+                // regime that is durably true right now, as assign_rbac_role does. A raise
+                // converges the whole fleet, so a caller admitted under a stale view must not
+                // reach it.
+                {
+                    const auto regime = rbac_store->check_caller_authorized_under_current_regime(
+                        session->username);
+                    if (regime == RbacRegimeAuthority::kUnavailable) {
+                        spdlog::warn("{}: {} (user={})", raise_action,
+                                     kRbacRegimeAuthorityUnavailableAuditReason,
+                                     session->username);
+                        (void)audit_fn(req, raise_action, "denied", "GuaranteedState",
+                                       "policy_generation",
+                                       std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                        // retry-hint-exempt: N/A, a4_error below carries retry_after_ms.
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "service unavailable - cannot confirm administrator "
+                                     "authority",
+                                     "retry shortly",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (regime != RbacRegimeAuthority::kAuthorized) {
+                        (void)audit_fn(
+                            req, raise_action, "denied", "GuaranteedState", "policy_generation",
+                            "caller does not hold authority under the regime that is durably "
+                            "true right now");
+                        res.set_content(a4_error(kPermissionDenied, "administrator role required"),
+                                        "application/json");
+                        return;
+                    }
+                }
                 // Empty mcp_tier guard: see set_rbac_enforcement's identical guard above for
                 // the full reasoning (#4309 gap class). Such a caller has neither the MFA
                 // step-up the REST twin applies nor an approval ticket.
@@ -15759,6 +15795,8 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 const auto target_req = yuzu::server::guardian::parse_raise_request(args);
                 if (!target_req) {
+                    // Defence in depth: the input-schema check rejects a malformed request
+                    // before this handler runs, so in practice `refused` is a REST result.
                     count_raise("refused");
                     // retry-hint-exempt: a malformed or unacknowledged request is a
                     // client-input error, not a store fault.
@@ -15774,7 +15812,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto baselines = baseline_store_->deployed_baseline_count_checked();
                 if (!rules || !baselines) {
                     spdlog::warn("{}: count read failed: {}", raise_action,
-                                 !rules ? rules.error() : baselines.error());
+                                 ::yuzu::log_key_token(!rules ? rules.error()
+                                                              : baselines.error()));
                     count_raise("failed");
                     const bool denied_audit_ok = yuzu::server::detail::try_persist_audit(
                         audit_fn, req, raise_action, "denied", "GuaranteedState",
@@ -15838,9 +15877,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         a4_error(kInternalError,
                                  "Guardian store unavailable; the outcome of the raise is "
-                                 "unconfirmed",
-                                 "retry shortly; the raise is idempotent, so repeating the same "
-                                 "request is safe",
+                                 "unconfirmed, and repeating the same request is safe because it "
+                                 "is idempotent",
+                                 "retry shortly; repeating the same request is safe because it "
+                                 "is idempotent",
                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs,
                                  /*cid_override=*/{}, failure_audit_ok),
                         "application/json");
@@ -15855,14 +15895,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                                                *rules, *baselines));
                 if (!audit_ok) {
                     mcp_audit("error", "audit_persist_failed");
-                    // retry-hint-exempt: the change took effect; a retry is a no-op, so the
-                    // caller should verify rather than repeat.
+                    // retry-hint-exempt: the change took effect; repeating the request is a
+                    // no-op that reports raised=false, so no delay is needed before it.
                     res.set_content(
                         a4_error(503,
                                  "the policy generation change took effect but its audit record "
-                                 "could not be persisted; treat as unconfirmed and reconcile via "
-                                 "a read",
-                                 "verify via a read; do not retry the mutation",
+                                 "could not be persisted; treat as unconfirmed and repeat the "
+                                 "same request, which is idempotent",
+                                 "repeat the same request; it is idempotent and reports "
+                                 "raised=false if the value already moved",
                                  /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
                         "application/json");
                     return;

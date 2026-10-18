@@ -16,7 +16,9 @@
 
 #include "guardian_generation_raise.hpp"
 #include "mcp_jsonrpc.hpp"
+#include "openapi_spec_access.hpp"
 #include "pg/pg_exec.hpp"
+#include "rbac_admin_predicate.hpp" // kRbacAdminGate*AuditReason, kRbacRegimeAuthority*
 
 #include "test_rbac_admin_surface_harness.hpp" // AuditRecord, RbacRoleHarness, GuardianStores
 
@@ -26,6 +28,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -39,6 +42,15 @@ constexpr std::int64_t kCeiling = guardian::kMaxPolicyGenerationTarget;
 constexpr const char* kRoute = "/api/v1/guaranteed-state/policy-generation/raise";
 constexpr const char* kTool = "raise_guardian_policy_generation";
 constexpr const char* kCounter = "yuzu_server_guardian_policy_generation_raise_total";
+
+// RbacRoleHarness whose REST requests carry a same-site Host and Origin by default, as a
+// browser's cookie-session write does; a test overrides `sink.default_headers` to vary that.
+struct RaiseHarness : RbacRoleHarness {
+    explicit RaiseHarness(GuardianStores stores = GuardianStores::kBoth)
+        : RbacRoleHarness(stores) {
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+    }
+};
 
 json valid_body(std::int64_t target = 5) {
     return {{"target_generation", target}, {"acknowledge_rule_set_replaced", true}};
@@ -77,6 +89,59 @@ void run_sql(RbacRoleHarness& h, const char* sql) {
     pg::PgResult r = pg::exec_params(lease.get(), sql, std::vector<std::string>{});
     INFO(PQresultErrorMessage(r.get()));
     REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+GuaranteedStateRuleRow make_rule(const std::string& id) {
+    GuaranteedStateRuleRow rule;
+    rule.rule_id = id;
+    rule.name = "guard-" + id;
+    rule.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: GuaranteedStateRule\n";
+    rule.version = 1;
+    rule.enabled = true;
+    rule.enforcement_mode = "enforce";
+    rule.severity = "high";
+    rule.os_target = "windows";
+    rule.scope_expr = "tag:workstations";
+    rule.created_at = "2026-04-19T12:00:00Z";
+    rule.updated_at = "2026-04-19T12:00:00Z";
+    rule.created_by = "alice";
+    rule.updated_by = "alice";
+    return rule;
+}
+
+// Two rules, one deployed Baseline and one draft Baseline. Returns the generation after the
+// seeding, which the rule creates bumped.
+std::uint64_t seed_rules_and_baselines(RbacRoleHarness& h) {
+    REQUIRE(h.guardian_store->create_rule(make_rule("r1")));
+    REQUIRE(h.guardian_store->create_rule(make_rule("r2")));
+    Baseline draft;
+    draft.name = "draft-only";
+    draft.created_by = "alice";
+    draft.updated_by = "alice";
+    Baseline live = draft;
+    live.name = "will-deploy";
+    const auto draft_id = h.baseline_store->create_baseline(draft);
+    const auto live_id = h.baseline_store->create_baseline(live);
+    REQUIRE(draft_id.has_value());
+    REQUIRE(live_id.has_value());
+    // The deploy handler's effect: snapshot the member set and flip the lifecycle.
+    auto members = h.baseline_store->get_members_checked(*live_id);
+    REQUIRE(members.has_value());
+    auto b = h.baseline_store->get_baseline(*live_id);
+    REQUIRE(b.has_value());
+    b->lifecycle = kBaselineDeployed;
+    b->deployed_snapshot = json(*members).dump();
+    b->deployed_by = "bob";
+    REQUIRE(h.baseline_store->update_baseline(*b).has_value());
+    return generation(h);
+}
+
+bool has_row_with_detail(const RbacRoleHarness& h, const std::string& result,
+                         const std::string& detail_prefix) {
+    for (const auto& a : rows_for_raise(h))
+        if (a.result == result && a.detail.rfind(detail_prefix, 0) == 0)
+            return true;
+    return false;
 }
 
 auto raise_rest(RbacRoleHarness& h, const json& body) { return h.sink.Post(kRoute, body.dump()); }
@@ -207,7 +272,7 @@ TEST_CASE("raise_audit_detail and raise_result_json shape the shared text and bo
 TEST_CASE("REST POST policy-generation/raise: an administrator raises the generation; response, "
           "store, audit rows and counter agree",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     int hook_fired = 0;
     h.guardian_store->set_on_rule_mutation([&] { ++hook_fired; });
@@ -245,44 +310,48 @@ TEST_CASE("REST POST policy-generation/raise: an administrator raises the genera
     CHECK(h.step_up_actions[0] == std::string("POST ") + kRoute);
 }
 
-TEST_CASE("REST POST policy-generation/raise: the response counts the rules and the deployed "
-          "Baselines it will converge agents to",
+TEST_CASE("REST POST policy-generation/raise: the response counts every rule row and only the "
+          "deployed Baselines",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
-    GuaranteedStateRuleRow rule;
-    rule.rule_id = "r1";
-    rule.name = "guard-one";
-    rule.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: GuaranteedStateRule\n";
-    rule.version = 1;
-    rule.enabled = true;
-    rule.enforcement_mode = "enforce";
-    rule.severity = "high";
-    rule.os_target = "windows";
-    rule.scope_expr = "tag:workstations";
-    rule.created_at = "2026-04-19T12:00:00Z";
-    rule.updated_at = "2026-04-19T12:00:00Z";
-    rule.created_by = "alice";
-    rule.updated_by = "alice";
-    REQUIRE(h.guardian_store->create_rule(rule));
-    const auto before = generation(h); // the create bumped it
+    const auto before = seed_rules_and_baselines(h);
 
     auto res = raise_rest(h, valid_body(static_cast<std::int64_t>(before) + 10));
     REQUIRE(res);
     CHECK(res->status == 200);
     const auto body = json::parse(res->body);
-    CHECK(body["data"]["rules"] == 1);
+    CHECK(body["data"]["rules"] == 2);
+    CHECK(body["data"]["deployed_baselines"] == 1); // the draft Baseline is not counted
     CHECK(body["data"]["previous_generation"] == before);
     CHECK(body["data"]["generation"] == before + 10);
     const auto rows = rows_for_raise(h);
     REQUIRE(rows.size() == 2);
-    CHECK(rows[0].detail.find("rules=1") != std::string::npos);
+    CHECK(rows[0].detail.find("rules=2") != std::string::npos);
+    CHECK(rows[0].detail.find("deployed_baselines=1") != std::string::npos);
+    CHECK(rows[1].detail.find("rules=2; deployed_baselines=1") != std::string::npos);
+}
+
+TEST_CASE("REST POST policy-generation/raise: a stored value below zero is reported as previous 0",
+          "[pg][rest][guardian][raise]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    run_sql(h, "UPDATE guaranteed_state_store.guardian_meta SET value = -5 "
+               "WHERE key = 'policy_generation'");
+
+    auto res = raise_rest(h, valid_body(10));
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto body = json::parse(res->body);
+    CHECK(body["data"]["previous_generation"] == 0);
+    CHECK(body["data"]["generation"] == 10);
+    CHECK(body["data"]["raised"] == true);
 }
 
 TEST_CASE("REST POST policy-generation/raise: a target at or below the current generation is "
           "200 raised=false, changes nothing, fires no hook, counts unchanged",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     REQUIRE(h.guardian_store->raise_policy_generation(100).has_value());
     int hook_fired = 0;
@@ -311,7 +380,7 @@ TEST_CASE("REST POST policy-generation/raise: a target at or below the current g
 
 TEST_CASE("REST POST policy-generation/raise: the ceiling itself is accepted",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     auto res = raise_rest(h, valid_body(kCeiling));
     REQUIRE(res);
@@ -325,7 +394,7 @@ TEST_CASE("REST POST policy-generation/raise: the ceiling itself is accepted",
 TEST_CASE("REST POST policy-generation/raise: a non-administrator is denied 403 before the body "
           "is read; nothing changes, a denied row is written, the counter is untouched",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     REQUIRE(h.auth_db->upsert_user("plainuser", "hash", "salt", auth::Role::user).has_value());
     h.session_user = "plainuser";
 
@@ -353,23 +422,35 @@ TEST_CASE("REST POST policy-generation/raise: a non-administrator is denied 403 
 }
 
 TEST_CASE("REST POST policy-generation/raise: a service-scoped token, an engine session and an "
-          "MCP-tier bearer token are each denied 403 with no mutation",
+          "MCP-tier bearer token are each denied 403 by their own gate, with no mutation",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
 
+    // The administrator predicate also refuses each of these callers with a 403, so the audit
+    // row's reason is what shows WHICH gate answered: deleting the dedicated gate would leave
+    // the status unchanged and change only this text.
     SECTION("service-scoped token") {
         h.session_token_scope_service = "some-service";
         auto res = raise_rest(h, valid_body(9));
         REQUIRE(res);
         CHECK(res->status == 403);
-        CHECK_FALSE(json::parse(res->body)["error"].contains("permission"));
+        const auto body = json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK_FALSE(body["error"].contains("permission"));
+        CHECK(has_row_with_detail(h, "denied",
+                                  "service-scoped token blocked from Guardian policy generation "
+                                  "raise"));
     }
     SECTION("engine session") {
         h.session_principal_kind = "engine";
         auto res = raise_rest(h, valid_body(9));
         REQUIRE(res);
         CHECK(res->status == 403);
+        CHECK(has_row_with_detail(h, "denied", "engine_session_denied"));
+        // The denial names the resource it refused, like every other row of this action.
+        for (const auto& a : rows_for_raise(h))
+            CHECK(a.target_id == "policy_generation");
     }
     SECTION("MCP-tier bearer token") {
         h.rest_session_mcp_tier = "supervised";
@@ -378,6 +459,9 @@ TEST_CASE("REST POST policy-generation/raise: a service-scoped token, an engine 
         CHECK(res->status == 403);
         CHECK(json::parse(res->body)["error"]["message"].get<std::string>().find(kTool) !=
               std::string::npos);
+        CHECK(has_row_with_detail(h, "denied", "MCP token blocked from admin route"));
+        for (const auto& a : rows_for_raise(h))
+            CHECK(a.target_id == "policy_generation");
     }
     CHECK(generation(h) == 0);
     CHECK_FALSE(has_row(h, "attempted"));
@@ -386,10 +470,155 @@ TEST_CASE("REST POST policy-generation/raise: a service-scoped token, an engine 
         CHECK(counter_value(h, "rest", r) == 0);
 }
 
+// -- REST: same-site gate for cookie sessions -----------------------------------------------
+
+namespace {
+bool has_csrf_denied_row(const RbacRoleHarness& h) {
+    for (const auto& a : h.audit_log)
+        if (a.action == "csrf.denied" && a.result == "denied")
+            return true;
+    return false;
+}
+} // namespace
+
+TEST_CASE("REST POST policy-generation/raise: a cookie session with a cross-site Origin is "
+          "refused 403 with a csrf.denied row and no mutation",
+          "[pg][rest][guardian][raise][csrf]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = raise_rest(h, valid_body(42));
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    CHECK(has_csrf_denied_row(h));
+    CHECK(generation(h) == 0);
+    CHECK_FALSE(has_row(h, "attempted"));
+    CHECK_FALSE(has_row(h, "success"));
+    // The gate runs after the step-up and before anything is read or counted.
+    CHECK(h.step_up_actions.size() == 1);
+    for (const char* r : {"applied", "unchanged", "refused", "failed"})
+        CHECK(counter_value(h, "rest", r) == 0);
+}
+
+TEST_CASE("REST POST policy-generation/raise: a cookie session with no Origin and no Referer is "
+          "refused, a same-site Referer alone is accepted",
+          "[pg][rest][guardian][raise][csrf]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+
+    SECTION("neither header") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}};
+        auto res = raise_rest(h, valid_body(42));
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(has_csrf_denied_row(h));
+        CHECK(generation(h) == 0);
+    }
+    SECTION("same-site Referer only") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Referer", "https://yuzu.test/guardian"}};
+        auto res = raise_rest(h, valid_body(42));
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_FALSE(has_csrf_denied_row(h));
+        CHECK(generation(h) == 42);
+    }
+}
+
+TEST_CASE("REST POST policy-generation/raise: an api_token session is exempt from the same-site "
+          "gate even with a foreign Origin",
+          "[pg][rest][guardian][raise][csrf]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    h.session_auth_source = "api_token";
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = raise_rest(h, valid_body(42));
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(has_csrf_denied_row(h));
+    CHECK(generation(h) == 42);
+}
+
+TEST_CASE("REST POST policy-generation/raise: a non-administrator with a cross-site Origin learns "
+          "only the administrator denial",
+          "[pg][rest][guardian][raise][csrf]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    REQUIRE(h.auth_db->upsert_user("plainuser", "hash", "salt", auth::Role::user).has_value());
+    h.session_user = "plainuser";
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = raise_rest(h, valid_body(42));
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(json::parse(res->body)["error"]["message"] != "cross-site request refused");
+    CHECK_FALSE(has_csrf_denied_row(h));
+    CHECK(has_row_with_detail(h, "denied", std::string(kRbacAdminGateDeniedAuditReason)));
+}
+
+// -- REST and MCP: the fresh regime re-check and gate degradation -----------------------------
+
+TEST_CASE("REST POST policy-generation/raise: a caller whose Administrator grant belongs to a "
+          "deactivated account is refused by the fresh regime check",
+          "[pg][rest][guardian][raise][a2]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    h.rbac->set_rbac_enabled(true);
+    REQUIRE(h.auth_db->upsert_user(h.session_user, "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+    REQUIRE(h.auth_db->remove_user(h.session_user).has_value()); // deactivate
+
+    auto res = raise_rest(h, valid_body(42));
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(has_row_with_detail(h, "denied", "caller does not hold authority under the regime"));
+    CHECK(generation(h) == 0);
+    CHECK_FALSE(has_row(h, "attempted"));
+    CHECK(h.step_up_actions.empty());
+}
+
+TEST_CASE("REST POST policy-generation/raise: an RBAC-on Administrator with an active account "
+          "passes both administrator checks",
+          "[pg][rest][guardian][raise][a2]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    h.make_caller_admin(/*rbac_on=*/true);
+
+    auto res = raise_rest(h, valid_body(42));
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(generation(h) == 42);
+}
+
+TEST_CASE("REST POST policy-generation/raise: an administrator gate that cannot confirm is 503 "
+          "with an audited denial, the same for the fresh regime read",
+          "[pg][rest][guardian][raise][a2]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    h.make_caller_admin(/*rbac_on=*/true);
+
+    SECTION("is_rbac_administrator cannot read the grants") {
+        run_sql(h, "DROP TABLE rbac_store.principal_roles CASCADE");
+        auto res = raise_rest(h, valid_body(42));
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_row_with_detail(h, "denied", std::string(kRbacAdminGateUnavailableAuditReason)));
+    }
+    SECTION("the fresh regime read cannot join auth.users") {
+        run_sql(h, "DROP TABLE auth.users CASCADE");
+        auto res = raise_rest(h, valid_body(42));
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_row_with_detail(
+            h, "denied", std::string(kRbacRegimeAuthorityUnavailableAuditReason)));
+    }
+    CHECK(generation(h) == 0);
+    CHECK_FALSE(has_row(h, "attempted"));
+    CHECK(h.step_up_actions.empty());
+}
+
 TEST_CASE("REST POST policy-generation/raise: a missing or failed MFA step-up is refused before "
           "anything is read or changed",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     h.step_up = [](const httplib::Request&, httplib::Response& res, const auth::Session&,
                    const std::string&) {
@@ -414,7 +643,7 @@ TEST_CASE("REST POST policy-generation/raise: a missing or failed MFA step-up is
 TEST_CASE("REST POST policy-generation/raise: a malformed body, a missing or false "
           "acknowledgement and an out-of-range target are 400 with no mutation",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
 
     const std::vector<std::string> bodies = {
@@ -452,7 +681,7 @@ TEST_CASE("REST POST policy-generation/raise: a malformed body, a missing or fal
 TEST_CASE("REST POST policy-generation/raise: when the attempted audit row cannot be stored the "
           "request is 503 with Sec-Audit-Failed and NOTHING is changed",
           "[pg][rest][guardian][raise][audit_failclose]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     int hook_fired = 0;
     h.guardian_store->set_on_rule_mutation([&] { ++hook_fired; });
@@ -472,7 +701,7 @@ TEST_CASE("REST POST policy-generation/raise: when the attempted audit row canno
 TEST_CASE("REST POST policy-generation/raise: when only the outcome audit row cannot be stored "
           "the response is 503 and says the raise took effect",
           "[pg][rest][guardian][raise][audit_failclose]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     h.audit_fail_result = "success";
 
@@ -491,7 +720,7 @@ TEST_CASE("REST POST policy-generation/raise: when only the outcome audit row ca
 TEST_CASE("REST POST policy-generation/raise: a degraded rule-count read is 503 with no attempted "
           "row and no mutation",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     run_sql(h, "ALTER TABLE guaranteed_state_store.guaranteed_state_rules "
                "RENAME TO guaranteed_state_rules_off");
@@ -511,7 +740,7 @@ TEST_CASE("REST POST policy-generation/raise: a degraded rule-count read is 503 
 TEST_CASE("REST POST policy-generation/raise: a store that cannot write the counter is 503 with "
           "a failure row and no change",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     int hook_fired = 0;
     h.guardian_store->set_on_rule_mutation([&] { ++hook_fired; });
@@ -525,6 +754,14 @@ TEST_CASE("REST POST policy-generation/raise: a store that cannot write the coun
     CHECK_FALSE(has_row(h, "success"));
     CHECK(hook_fired == 0);
     CHECK(counter_value(h, "rest", "failed") == 1);
+    // A lost commit acknowledgement can hide a committed change, so the response claims
+    // neither outcome and says a repeat is safe.
+    const auto message = json::parse(res->body)["error"]["message"].get<std::string>();
+    CHECK(message.find("unconfirmed") != std::string::npos);
+    CHECK(message.find("idempotent") != std::string::npos);
+    CHECK(message.find("was not changed") == std::string::npos);
+    CHECK(has_row_with_detail(h, "failure", "policy generation store unavailable; target=42"));
+    CHECK(rows_for_raise(h).back().detail.find("unconfirmed") != std::string::npos);
 
     run_sql(h, "ALTER TABLE guaranteed_state_store.guardian_meta_off RENAME TO guardian_meta");
     CHECK(generation(h) == 0);
@@ -532,7 +769,7 @@ TEST_CASE("REST POST policy-generation/raise: a store that cannot write the coun
 
 TEST_CASE("REST POST policy-generation/raise: a missing Baseline store is 503 with no mutation",
           "[pg][rest][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kGuardianOnly);
+    RaiseHarness h(GuardianStores::kGuardianOnly);
     admin_caller(h);
     auto res = raise_rest(h, valid_body(42));
     REQUIRE(res);
@@ -547,7 +784,7 @@ TEST_CASE("REST POST policy-generation/raise: a missing Baseline store is 503 wi
 TEST_CASE("MCP raise_guardian_policy_generation: an administrator with an approved ticket raises "
           "the generation; structuredContent, store, audit rows and counter agree",
           "[pg][mcp][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     int hook_fired = 0;
     h.guardian_store->set_on_rule_mutation([&] { ++hook_fired; });
@@ -580,7 +817,7 @@ TEST_CASE("MCP raise_guardian_policy_generation: an administrator with an approv
 TEST_CASE("MCP raise_guardian_policy_generation: the first call mints an approval ticket and "
           "changes nothing",
           "[pg][mcp][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     auto res = h.mcp_call_tool(kTool, valid_body(42));
     REQUIRE(res);
@@ -595,7 +832,7 @@ TEST_CASE("MCP raise_guardian_policy_generation: the first call mints an approva
 TEST_CASE("MCP raise_guardian_policy_generation: a target at or below the current generation is "
           "a success with raised=false and fires no hook",
           "[pg][mcp][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     REQUIRE(h.guardian_store->raise_policy_generation(100).has_value());
     int hook_fired = 0;
@@ -615,15 +852,27 @@ TEST_CASE("MCP raise_guardian_policy_generation: a target at or below the curren
 TEST_CASE("MCP raise_guardian_policy_generation: a non-administrator, a service-scoped token and "
           "an empty-tier caller are each denied with no mutation",
           "[pg][mcp][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
 
     SECTION("non-administrator") {
         REQUIRE(h.auth_db->upsert_user("plainuser", "hash", "salt", auth::Role::user).has_value());
         h.session_user = "plainuser";
         auto res = h.mcp_call_tool_approved(kTool, valid_body(42));
         REQUIRE(res);
-        CHECK(json::parse(res->body).contains("error"));
-        CHECK(has_row(h, "denied"));
+        const auto body = json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kPermissionDenied);
+        CHECK(has_row_with_detail(h, "denied", std::string(kRbacAdminGateDeniedAuditReason)));
+    }
+    SECTION("engine session") {
+        admin_caller(h);
+        h.session_principal_kind = "engine";
+        auto res = h.mcp_call_tool_approved(kTool, valid_body(42));
+        REQUIRE(res);
+        const auto body = json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kPermissionDenied);
+        CHECK(has_row_with_detail(h, "denied", std::string(kRbacAdminGateDeniedAuditReason)));
     }
     SECTION("service-scoped token") {
         admin_caller(h);
@@ -657,7 +906,7 @@ TEST_CASE("MCP raise_guardian_policy_generation: a non-administrator, a service-
 TEST_CASE("MCP raise_guardian_policy_generation: a missing acknowledgement or an out-of-range "
           "target is rejected with no ticket, no mutation and no success row",
           "[pg][mcp][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     const std::vector<json> bad = {
         json{{"target_generation", 5}},
@@ -671,7 +920,9 @@ TEST_CASE("MCP raise_guardian_policy_generation: a missing acknowledgement or an
         INFO("args=" << args.dump());
         auto res = h.mcp_call_tool(kTool, args);
         REQUIRE(res);
-        CHECK(json::parse(res->body).contains("error"));
+        const auto body = json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kInvalidParams);
     }
     CHECK(h.appr->pending_count() == 0);
     CHECK(generation(h) == 0);
@@ -681,7 +932,7 @@ TEST_CASE("MCP raise_guardian_policy_generation: a missing acknowledgement or an
 TEST_CASE("MCP raise_guardian_policy_generation: when the attempted audit row cannot be stored "
           "the call fails with audit_persisted=false and NOTHING is changed",
           "[pg][mcp][guardian][raise][audit_failclose]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     const std::string approval_id = h.mcp_mint_and_approve(kTool, valid_body(42));
     h.audit_fail_result = "attempted";
@@ -701,7 +952,7 @@ TEST_CASE("MCP raise_guardian_policy_generation: when the attempted audit row ca
 TEST_CASE("MCP raise_guardian_policy_generation: when only the outcome audit row cannot be "
           "stored the call is a 503 shape saying the change took effect",
           "[pg][mcp][guardian][raise][audit_failclose]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
     const std::string approval_id = h.mcp_mint_and_approve(kTool, valid_body(42));
     h.audit_fail_result = "success";
@@ -714,7 +965,14 @@ TEST_CASE("MCP raise_guardian_policy_generation: when only the outcome audit row
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == 503);
     CHECK(body["error"]["data"]["audit_persisted"] == false);
-    CHECK(body["error"]["message"].get<std::string>().find("took effect") != std::string::npos);
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.find("took effect") != std::string::npos);
+    // No read exists to reconcile through: the instruction is to repeat the idempotent request.
+    CHECK(message.find("repeat the same request") != std::string::npos);
+    CHECK(message.find("a read") == std::string::npos);
+    const std::string remediation = body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("repeat the same request") != std::string::npos);
+    CHECK(remediation.find("do not retry") == std::string::npos);
     CHECK(generation(h) == 42);
 }
 
@@ -722,7 +980,7 @@ TEST_CASE("MCP raise_guardian_policy_generation: a store that cannot write the c
           "missing Baseline store, each fail with no mutation",
           "[pg][mcp][guardian][raise]") {
     SECTION("counter table unreadable") {
-        RbacRoleHarness h(GuardianStores::kBoth);
+        RaiseHarness h(GuardianStores::kBoth);
         admin_caller(h);
         run_sql(h, "ALTER TABLE guaranteed_state_store.guardian_meta RENAME TO guardian_meta_off");
         auto res = h.mcp_call_tool_approved(kTool, valid_body(42));
@@ -731,11 +989,15 @@ TEST_CASE("MCP raise_guardian_policy_generation: a store that cannot write the c
         CHECK(has_row(h, "failure"));
         CHECK_FALSE(has_row(h, "success"));
         CHECK(counter_value(h, "mcp", "failed") == 1);
+        const auto message =
+            json::parse(res->body)["error"]["message"].get<std::string>();
+        CHECK(message.find("unconfirmed") != std::string::npos);
+        CHECK(message.find("idempotent") != std::string::npos);
         run_sql(h, "ALTER TABLE guaranteed_state_store.guardian_meta_off RENAME TO guardian_meta");
         CHECK(generation(h) == 0);
     }
     SECTION("rule count unreadable") {
-        RbacRoleHarness h(GuardianStores::kBoth);
+        RaiseHarness h(GuardianStores::kBoth);
         admin_caller(h);
         run_sql(h, "ALTER TABLE guaranteed_state_store.guaranteed_state_rules "
                    "RENAME TO guaranteed_state_rules_off");
@@ -748,7 +1010,7 @@ TEST_CASE("MCP raise_guardian_policy_generation: a store that cannot write the c
         CHECK(generation(h) == 0);
     }
     SECTION("no Baseline store") {
-        RbacRoleHarness h(GuardianStores::kGuardianOnly);
+        RaiseHarness h(GuardianStores::kGuardianOnly);
         admin_caller(h);
         auto res = h.mcp_call_tool_approved(kTool, valid_body(42));
         REQUIRE(res);
@@ -762,7 +1024,7 @@ TEST_CASE("MCP raise_guardian_policy_generation: a store that cannot write the c
 TEST_CASE("MCP raise_guardian_policy_generation: advertised in tools/list as a destructive, "
           "idempotent write with a bounded input schema",
           "[pg][mcp][guardian][raise]") {
-    RbacRoleHarness h(GuardianStores::kBoth);
+    RaiseHarness h(GuardianStores::kBoth);
     auto res = h.mcp_call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
     const auto body = json::parse(res->body);
@@ -779,8 +1041,99 @@ TEST_CASE("MCP raise_guardian_policy_generation: advertised in tools/list as a d
         CHECK(props["target_generation"]["minimum"] == 1);
         CHECK(props["target_generation"]["maximum"] == kCeiling);
         CHECK(props["acknowledge_rule_set_replaced"]["enum"][0] == true);
+        // The prose names the same ceiling as the schema.
+        CHECK(t["description"].get<std::string>().find(std::to_string(kCeiling)) !=
+              std::string::npos);
+        // The rules figure counts every rule row; only enabled members of deployed Baselines
+        // reach agents, and the schema says so.
+        const auto& rules_text = t["outputSchema"]["properties"]["rules"]["description"];
+        CHECK(rules_text.get<std::string>().find("enabled") != std::string::npos);
         const auto req = t["inputSchema"]["required"];
         CHECK(req.size() == 2);
     }
     CHECK(found);
+}
+
+TEST_CASE("MCP raise_guardian_policy_generation: the result counts every rule row and only the "
+          "deployed Baselines",
+          "[pg][mcp][guardian][raise]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    const auto before = seed_rules_and_baselines(h);
+
+    auto res = h.mcp_call_tool_approved(kTool, valid_body(static_cast<std::int64_t>(before) + 10));
+    REQUIRE(res);
+    const auto body = json::parse(res->body);
+    REQUIRE_FALSE(body.contains("error"));
+    const auto sc = body["result"]["structuredContent"];
+    CHECK(sc["rules"] == 2);
+    CHECK(sc["deployed_baselines"] == 1); // the draft Baseline is not counted
+    CHECK(sc["previous_generation"] == before);
+    CHECK(has_row_with_detail(h, "success", "target="));
+    CHECK(rows_for_raise(h)[0].detail.find("rules=2; deployed_baselines=1") != std::string::npos);
+}
+
+TEST_CASE("MCP raise_guardian_policy_generation: a caller whose Administrator grant belongs to a "
+          "deactivated account is refused by the fresh regime check",
+          "[pg][mcp][guardian][raise][a2]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    h.rbac->set_rbac_enabled(true);
+    REQUIRE(h.auth_db->upsert_user(h.session_user, "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+    REQUIRE(h.auth_db->remove_user(h.session_user).has_value()); // deactivate
+
+    auto res = h.mcp_call_tool_approved(kTool, valid_body(42));
+    REQUIRE(res);
+    const auto body = json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == mcp::kPermissionDenied);
+    CHECK(has_row_with_detail(h, "denied", "caller does not hold authority under the regime"));
+    CHECK(generation(h) == 0);
+    CHECK_FALSE(has_row(h, "attempted"));
+}
+
+TEST_CASE("MCP raise_guardian_policy_generation: an administrator gate that cannot confirm is an "
+          "internal error with an audited denial, the same for the fresh regime read",
+          "[pg][mcp][guardian][raise][a2]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    h.make_caller_admin(/*rbac_on=*/true);
+
+    SECTION("is_rbac_administrator cannot read the grants") {
+        run_sql(h, "DROP TABLE rbac_store.principal_roles CASCADE");
+        auto res = h.mcp_call_tool_approved(kTool, valid_body(42));
+        REQUIRE(res);
+        const auto body = json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kInternalError);
+        CHECK(has_row_with_detail(h, "denied", std::string(kRbacAdminGateUnavailableAuditReason)));
+    }
+    SECTION("the fresh regime read cannot join auth.users") {
+        run_sql(h, "DROP TABLE auth.users CASCADE");
+        auto res = h.mcp_call_tool_approved(kTool, valid_body(42));
+        REQUIRE(res);
+        const auto body = json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kInternalError);
+        CHECK(has_row_with_detail(
+            h, "denied", std::string(kRbacRegimeAuthorityUnavailableAuditReason)));
+    }
+    CHECK_FALSE(has_row(h, "attempted"));
+}
+
+// -- OpenAPI and MCP prose name the same ceiling as the code --------------------------------
+
+TEST_CASE("the OpenAPI entry for the raise route bounds target_generation at the code's ceiling",
+          "[guardian][raise][openapi]") {
+    const json spec = json::parse(openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& entry = spec["paths"]["/guaranteed-state/policy-generation/raise"]["post"];
+    REQUIRE(entry.is_object());
+    const auto& target =
+        entry["requestBody"]["content"]["application/json"]["schema"]["properties"]
+             ["target_generation"];
+    CHECK(target["maximum"] == kCeiling);
+    CHECK(target["minimum"] == 1);
+    // The prose names the same number, formatted from the constant.
+    CHECK(entry["description"].get<std::string>().find(std::to_string(kCeiling)) !=
+          std::string::npos);
 }

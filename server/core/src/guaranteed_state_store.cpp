@@ -9,7 +9,7 @@
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
 
-#include <yuzu/log_token.hpp> // log_id_token
+#include <yuzu/log_token.hpp> // log_id_token, log_key_token
 #include <yuzu/metrics.hpp>
 #include <yuzu/version_string.hpp> // shared canon_version — re-canon agent input at the boundary
 
@@ -659,7 +659,7 @@ GuaranteedStateStore::raise_policy_generation(std::int64_t target) {
             std::vector<std::string>{});
         if (cur.status() != PGRES_TUPLES_OK) {
             spdlog::warn("GuaranteedStateStore::raise_policy_generation: read failed: {}",
-                         PQerrorMessage(conn));
+                         ::yuzu::log_key_token(PQerrorMessage(conn)));
             return false;
         }
         if (PQntuples(cur.get()) == 0) {
@@ -675,7 +675,7 @@ GuaranteedStateStore::raise_policy_generation(std::int64_t target) {
             std::vector<std::string>{std::to_string(target)});
         if (upd.status() != PGRES_TUPLES_OK || PQntuples(upd.get()) == 0) {
             spdlog::warn("GuaranteedStateStore::raise_policy_generation: write failed: {}",
-                         PQerrorMessage(conn));
+                         ::yuzu::log_key_token(PQerrorMessage(conn)));
             return false;
         }
         const std::int64_t after = to_i64(PQgetvalue(upd.get(), 0, 0));
@@ -2533,7 +2533,7 @@ std::expected<std::size_t, std::string> GuaranteedStateStore::rule_count_checked
                                               sampler);
             d.should_log)
             spdlog::warn("GuaranteedStateStore::rule_count_checked: query failed: {}",
-                         PQresultErrorMessage(res.get()));
+                         ::yuzu::log_key_token(PQresultErrorMessage(res.get())));
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
     }
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));

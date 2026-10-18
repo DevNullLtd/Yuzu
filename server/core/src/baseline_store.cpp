@@ -816,7 +816,7 @@ std::expected<std::size_t, std::string> BaselineStore::deployed_baseline_count_c
                         std::vector<std::string>{kBaselineDeployed});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
         spdlog::warn("BaselineStore::deployed_baseline_count_checked: query failed: {}",
-                     PQresultErrorMessage(res.get()));
+                     ::yuzu::log_key_token(PQresultErrorMessage(res.get())));
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
     }
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));

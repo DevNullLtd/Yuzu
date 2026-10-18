@@ -2161,9 +2161,13 @@ public:
             "Outcomes of the Guardian policy-generation raise, by transport (rest/mcp) and "
             "result (applied/unchanged/refused/failed). applied raised the stored generation; "
             "unchanged was a target at or below it; refused is a rejected request body or a "
-            "target outside the accepted range; failed is a store read or write failure, or an "
-            "attempted audit row that could not be stored (nothing was changed). Zero-seeded for "
-            "all 8 series so an idle server carries every dimension from boot.",
+            "target outside the accepted range (in practice REST only: the MCP schema check "
+            "rejects a malformed request before the handler counts it); failed is a store "
+            "read failure or an attempted audit row that could not be stored (nothing was "
+            "changed), or a store write failure whose outcome is unconfirmed (a lost commit "
+            "acknowledgement can hide a committed change; repeating the request is safe because "
+            "it is idempotent). Zero-seeded for all 8 series so an idle server carries every "
+            "dimension from boot.",
             "counter");
         for (const auto transport : {"rest", "mcp"})
             for (const auto result : {"applied", "unchanged", "refused", "failed"})
