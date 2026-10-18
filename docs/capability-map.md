@@ -996,7 +996,7 @@ The `command_id → execution_id` map + `ExecutionEventBus` SSE stream unifying 
 
 ### 21.2 Audit Trail of User Actions :white_check_mark: `T2` *(verified 2026-09-07)*
 
-`AuditStore` (migrated to PostgreSQL, ADR-0040/Wave 1.3, PR #2697 — fail-hard writes, degrade→deny reads, SOC-2 evidence chain; verified 2026-09-07 via `pg::PgPool`/`pg::PgMigration` usage in `audit_store.cpp`, previous row text stale-claimed SQLite). Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention.
+`AuditStore` (migrated to PostgreSQL, ADR-0040/Wave 1.3, PR #2697 — fail-hard writes, degrade→deny reads, SOC-2 evidence chain; verified 2026-09-07 via `pg::PgPool`/`pg::PgMigration` usage in `audit_store.cpp`, previous row text stale-claimed SQLite). Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention. The dashboard reads the trail at Access > Audit and reviews (`/access/audit`): exact principal and action filters, a 1 h / 24 h / 7 d window, 50-row pages, and a degraded store shown as such, never as an empty log.
 
 ### 21.3 System Notifications :white_check_mark: `T2`
 
@@ -1391,7 +1391,7 @@ Cohort-floor suppression on fleet/group app-perf reads (the floor is one device 
 
 ### 32.7 Experience Scoring and Sentiment :large_orange_diamond: `T3` *(verified 2026-10-14)*
 
-Partly implemented — deliberately narrow. A transparent, decomposed secondary composite (0-100 stability score with its named deductions) is published beside the measured rates and intervals on `GET /api/v1/dex/apps` / `list_dex_apps`; nothing in the product acts on it. Opaque composite experience scores and sentiment scoring (which would additionally need the §14.4 survey primitive as an input) remain out.
+Partly implemented — deliberately narrow. A transparent, decomposed secondary composite (0-100 stability score with its named deductions) is published beside the measured rates and intervals on `GET /api/v1/dex/apps` / `list_dex_apps`; nothing in the product acts on it. The tier edges, tier names, deduction weights and per-application overrides are customer-defined policy, persisted as one document under a single runtime-config key, read by every instance (typically within 5 seconds; each instance refreshes at most every 5 seconds while it serves requests, and the policy in use is up to 60 seconds old when the store is unreadable) and named on the Apps payload (`policy`, and `profile` per application; weights and per-application override values are not echoed); the cohort floor and the statistics are not settings. Only the read side ships so far: the route that writes the policy follows. Opaque composite experience scores and sentiment scoring (which would additionally need the §14.4 survey primitive as an input) remain out.
 
 ---
 

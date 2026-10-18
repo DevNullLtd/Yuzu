@@ -2258,7 +2258,10 @@ not the CRL); the CRL is then republished. Request body (max 64 KB):
 ```
 
 `serial_hex` is required (1–64 hex digits, case-insensitive). Unknown JSON fields
-are rejected. Response:
+are rejected. A `reason` equal (trimmed, case-insensitive) to one of the system
+markers `superseded` or `unpublished` is stored as `operator-supplied: <text>`
+(the revoke still succeeds), so an operator-typed reason can never be mistaken
+for the bookkeeping revocations the server writes itself. Response:
 
 ```json
 { "revoked": true, "serial_hex": "3A4B5C6D...", "crl_republished": true, "meta": { "api_version": "v1" } }
@@ -4807,8 +4810,8 @@ whether to rotate.
 { "error": { "code": 503, "message": "runtime config store unavailable" }, "meta": { "api_version": "v1" } }
 ```
 
-**Response** (shape corrected - the handler returns `config`, `overrides` and
-`allowed_keys`, not a `data`/`meta` envelope):
+**Response** (shape corrected - the handler returns `config`, `overrides`, `allowed_keys` and
+`read_only_keys`, not a `data`/`meta` envelope):
 
 ```json
 {
@@ -4817,12 +4820,14 @@ whether to rotate.
     "log_level":          { "value": "debug", "updated_by": "admin", "updated_at": 1754150400 },
     "oidc_client_secret": { "is_set": true,   "updated_by": "admin", "updated_at": 1754150400 }
   },
-  "allowed_keys": ["heartbeat_timeout", "log_level", "oidc_client_secret"]
+  "allowed_keys": ["heartbeat_timeout", "log_level", "oidc_client_secret"],
+  "read_only_keys": ["dex_score_policy"]
 }
 ```
 
 `allowed_keys` above is abridged for readability; the real response lists every key in the
-[allowed-keys table](#put-apiconfigkey). `config` reports effective values and `overrides` only the
+[allowed-keys table](#put-apiconfigkey). `read_only_keys` lists the allowed keys this route does not
+write (see the note under that table). `config` reports effective values and `overrides` only the
 keys with a stored override, so a key can appear in `config` without appearing in `overrides`.
 
 ---
@@ -4862,6 +4867,14 @@ Update a single runtime configuration value. The key must be one of the allowed 
 | `dex_blast_window_seconds` | integer | **persisted only - see note** | Blast-radius window |
 | `dex_blast_cooldown_seconds` | integer | **persisted only - see note** | Blast-radius cooldown |
 | `dex_cohort_export_key` | string | **persisted only - see note** | Cohort export tag key; `""` disables export |
+| `dex_score_policy` | string (JSON document) | **typically within 5 seconds** | The customer score policy (tier edges and names, deduction weights, per-application overrides). **Read-only here:** a `PUT` to this route is refused, see below. The policy route ships in a later change; until then the key cannot be written through the product and every response reports `source: "default"` |
+
+`GET /api/config` also returns `read_only_keys`: the allowed keys that this route lists but does not
+write. It currently holds `dex_score_policy`. `PUT /api/config/dex_score_policy` is refused with a `400` (A4 envelope, no audit row) naming
+`PUT /api/v1/dex/score-policy`: the policy is one document that is validated whole by its own route,
+and a generic single-value write could leave it half-edited. That route ships in a later change;
+until then the key cannot be written through the product, and every response reports `source:
+"default"`.
 
 ##### When a change takes effect
 
@@ -4892,6 +4905,11 @@ most keys:
   which runs at server startup and from the DEX -> Alerts tab save handlers - never from this
   endpoint. A `PUT` through this API is inert on the running server until one of those two happens.
   To change DEX alerting and have it apply at once, use the DEX -> Alerts tab.
+- **typically within 5 seconds** - `dex_score_policy`. Every server instance reads the stored
+  document through a short-lived cache and refreshes it at most every 5 seconds while it serves
+  requests, so a change is typically in use on each instance within 5 seconds with no restart; the
+  policy in use is up to 60 seconds old when the store is unreadable. It is read-only through this
+  API (see above).
 - **never** - `auto_approve_enabled` is accepted by the allow-list and written to the store, but no
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
@@ -4950,7 +4968,7 @@ another OIDC field, restart first so the process is not holding the old value.
 > **Two different error sources, two different shapes.** The shared authorization gate in front of
 > this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
 > authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
-> gated route. Most bodies **the handler itself** emits do not (the two A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
+> gated route. Most bodies **the handler itself** emits do not (the three A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
 > non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
@@ -4961,10 +4979,11 @@ another OIDC field, restart first so the process is not holding the old value.
 > earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
 > deliberate distinction, and has been unified). Note `503` and `403` are emitted by **both** sources, so status
 > alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
-> it, on every status. Two refusals added with the audit-first and same-site gates use the A4 envelope
-> (`correlation_id` present): `403` `cross-site request refused` and `503` `audit log unavailable; the
-> change was not made` (`retry_after_ms: 5000`, a `remediation` hint, header `Sec-Audit-Failed: true`). An unknown key is a
-> bare `400` and writes no audit row.
+> it, on every status. Three refusals use the A4 envelope (`correlation_id` present): `403`
+> `cross-site request refused`, `503` `audit log unavailable; the change was not made`
+> (`retry_after_ms: 5000`, a `remediation` hint, header `Sec-Audit-Failed: true`) and the `400` for
+> `dex_score_policy` (written only through its own route, which ships in a later change; no audit
+> row). An unknown key is a bare `400` and writes no audit row.
 
 **Error (503) - runtime config store unavailable.** A genuine DB/crypto write failure, distinguished
 from caller-input validation at the seam so it never returns a `400`-shaped body instead:
@@ -9444,9 +9463,11 @@ App-centric stability list — every application with a Windows crash/hang signa
 
 - **Permission:** `GuaranteedState:Read`.
 - **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
-- **Response:** `data` object `{window, population, population_basis, apps_total, apps_truncated, apps[]}`. `apps[]` holds the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order, not database collation); `apps_total` counts every application with a Windows crash or hang signal in the window and `apps_truncated` is `true` when the cut dropped any. Each `{subject, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (up to 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when that cut dropped any. A full response is about 1.2 MB at 100 applications with 20 versions each; MCP clients should request it only when the per-version rows are needed. `crashes`, `hangs` and `distinct_devices` are window-wide. `share_affected`, `rate_per_1000` and `score` are over one population, the Windows devices online now: `distinct_devices_online` is how many of the affected devices are online now (`null` when no fleet source is wired, because membership is then unknown), `share_affected` is that count over the population (95 percent Wilson interval), `rate_per_1000` is those devices' events per 1,000 online devices (exact interval), and the score's inputs are the same online devices' figures. A device that crashed and then went offline is therefore in the counts and in `distinct_devices`, not in the share or rate, and the **score is withheld as `offline_affected`** when it would otherwise be published and `distinct_devices` exceeds `distinct_devices_online`, because a score built from the online devices alone would read healthy for an application that takes its devices offline. Read `distinct_devices_online` against `distinct_devices` before trusting a low share: figures over "online now" vary with the time of day (laptops overnight, weekends) for the same window. Expect this often: on a fleet with laptops or off-hours devices most applications with several affected devices will show a withheld score at any given moment, so use the share and rate, read against `distinct_devices_online` / `distinct_devices`, until an offline-aware score is decided (#5894). The online devices' events are not published separately; the rate is derived from them. `share_affected` carries `reliable: false` under 20 online affected devices and `rate_per_1000` under 20 online events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
+- **Response:** `data` object `{window, population, population_basis, apps_total, apps_truncated, policy, apps[]}`. `apps[]` holds the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order, not database collation); `apps_total` counts every application with a Windows crash or hang signal in the window and `apps_truncated` is `true` when the cut dropped any. Each `{subject, profile, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (up to 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when that cut dropped any. A full response is about 1.2 MB at 100 applications with 20 versions each; MCP clients should request it only when the per-version rows are needed. `crashes`, `hangs` and `distinct_devices` are window-wide. `share_affected`, `rate_per_1000` and `score` are over one population, the Windows devices online now: `distinct_devices_online` is how many of the affected devices are online now (`null` when no fleet source is wired, because membership is then unknown), `share_affected` is that count over the population (95 percent Wilson interval), `rate_per_1000` is those devices' events per 1,000 online devices (exact interval), and the score's inputs are the same online devices' figures. A device that crashed and then went offline is therefore in the counts and in `distinct_devices`, not in the share or rate, and the **score is withheld as `offline_affected`** when it would otherwise be published and `distinct_devices` exceeds `distinct_devices_online`, because a score built from the online devices alone would read healthy for an application that takes its devices offline. Read `distinct_devices_online` against `distinct_devices` before trusting a low share: figures over "online now" vary with the time of day (laptops overnight, weekends) for the same window. Expect this often: on a fleet with laptops or off-hours devices most applications with several affected devices will show a withheld score at any given moment, so use the share and rate, read against `distinct_devices_online` / `distinct_devices`, until an offline-aware score is decided (#5894). The online devices' events are not published separately; the rate is derived from them. `share_affected` carries `reliable: false` under 20 online affected devices and `rate_per_1000` under 20 online events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
+- **Score policy:** `policy` names the score policy every figure in the response was scored under: `{source, revision, fault, tiers}`. `source` is `default` (nothing stored, or a stored policy was refused) or `custom`; `revision` identifies the stored policy document (`default` when none is stored); `tiers` holds `excellent`, `good`, `fair` and `poor`, each `{edge, name}`, where `edge` is the lowest score in that tier and `name` its display name (a label for people: key on `score.band`, whose tokens never change). Poor's edge is the fixed `0`, not a stored value. Each application's `profile` is `override` when a per-application override shaped its tiers or weights and `default` otherwise; its versions inherit it and carry no `profile` of their own, and `tiers` shows the global policy. A change to the stored policy typically reaches every server instance within 5 seconds: each instance refreshes it from the store at most every 5 seconds while it serves requests, through one store read at a time, and the policy in use is up to 60 seconds old when the store is unreadable. A request arriving mid-refresh is scored under the last good policy while that is under 60 seconds old, so it never waits on that read (with no usable policy, it answers the `503` below at once). An invalid stored policy is never half-applied: the shipped defaults score and `fault` says why (`source` is `default`). If the stored policy cannot be read, the last good one is used for up to 60 seconds, after which the read fails as below. The response `tiers` is a read-model projection (`tiers.<tier>.{edge,name}`), not the shape of the stored document (`tiers.edges`, `tiers.names`); weights and per-application override values are not echoed. The policy is read-only on this surface; its own route (`PUT /api/v1/dex/score-policy`) is coming and is not yet available, so every response currently reports `source: "default"`. The cohort floor and the statistics are not part of the policy.
+- **Score policy faults:** when a stored policy document is refused, `policy.fault` holds one of `unparseable at <path>: <message>` (the document is not the expected shape, for example `unparseable at tiers.edges.great: unknown key`), `unparseable at document: not valid JSON`, `oversized at document: more than 262144 bytes`, or `<token> at <path>` where `<token>` is one of `edge_out_of_range`, `edge_not_display_exact`, `edges_not_descending`, `edge_gap_below_minimum`, `name_invalid`, `weight_invalid`, `weight_sum_above_maximum`, `override_key_invalid`, `override_key_duplicate` or `too_many_overrides` (`<path>` names the offending part, for example `overrides[3].weights`, and an unknown key is shown with control characters replaced and capped at 256 bytes). These tokens are stable. Today a refused document can occur only after a direct database write to the `dex_score_policy` row, because nothing in the product writes it yet. The shipped defaults score in the meantime; remove the row (key `dex_score_policy` in the `runtime_config_store.runtime_config` table, a direct database change, since no route removes it) rather than editing it in place. A `503` whose message ends `(score_policy_unavailable)` means the runtime-config store could not be read for more than 60 seconds or, with no usable policy cached, that the first read failed or is still in flight (a restart during the outage, or a concurrent first read), in which case the `503` answers at once: check PostgreSQL health and `yuzu_server_runtime_config_read_degrade_total{reason}`. The token `score_policy_unavailable` is stable.
 - **Population and scope:** counts are Windows-scoped and `population` is the number of Windows devices online now (`population_basis: "windows_online"`; `null` = no fleet source wired (unknown); `0` = no Windows device online now). With an unknown or zero population there is no share and no rate, and the score is withheld as `no_population`. The share is a proportion over that one population: its numerator is drawn from the same online devices the population counts, so the affected set can never exceed it. No device floor applies: figures are published at any device count.
-- **Failure:** a failed store read, an invalid score policy or a read over its concurrency budget returns `503` with `retry_after_ms: 2000`, never an empty list. The read holds a database connection for several seconds on a large window, so at most four run at once per server; a fifth answers `503` immediately (counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`) and the caller retries.
+- **Failure:** a failed store read, a stored score policy that cannot be read within its 60-second staleness bound (the message ends `(score_policy_unavailable)`) or a read over its concurrency budget returns `503` with `retry_after_ms: 2000`, never an empty list. The builder also refuses a policy that fails validation (the message ends `(score_policy_invalid)`); that is defence in depth, because a stored policy that fails validation is replaced by the shipped defaults before it reaches the builder. The read holds a database connection for several seconds on a large window, so at most four run at once per server; a fifth answers `503` immediately (counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`) and the caller retries.
 - No per-agent identity (a distinct-device **count** per app, never an `agent_id`) — not audited.
 
 #### `GET /api/v1/dex/catalogue`
@@ -9617,12 +9638,14 @@ outcome's granularity.
 | `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC discovery, JWKS and (Linux/macOS) token requests (insecure, dev only); the Windows token request ignores it. The save itself does not contact the IdP; use `/test` |
 
 - **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success. `400` with a red message when `issuer` or `client_id` is missing, or `redirect_uri` is blank; nothing is saved in that case. Each `400`, and the `500` returned when the provider cannot be built, also carries an error toast (`HX-Trigger: {"showToast":{"message":"...","level":"error"}}`) because the dashboard does not swap a 4xx or 5xx body. Saves are serialized: two concurrent saves run one after the other, and a blank `client_secret` keeps the secret stored when that save runs.
+- **Trimming:** `issuer`, `client_id`, `redirect_uri` and `admin_group` are trimmed of surrounding whitespace before they are validated and stored (a trailing space in `admin_group` previously made the group match fail for every SSO administrator at the next sign-in).
 - **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts the provider to that value (the stored `oidc_admin_group` still applies after a restart; see [When a change takes effect](#when-a-change-takes-effect)). Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
 **`POST /api/settings/oidc/test`** — Test OIDC discovery and signing-key connectivity.
 
 - **Permission:** Admin only
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
+- **Behaviour today:** an empty `issuer` falls back to the stored issuer; the stored skip-TLS flag is OR-ed with the posted one (a posted `false` cannot turn off a stored `true`); the typed issuer is not trimmed here (unlike the save route); and the check fetches the discovery document and the signing keys.
 - **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` (one request after the other, each with its own total time bound, so one call can take up to about 20 s in the worst case at the default timeouts: a slow discovery document followed by a stalled JWKS fetch; a dead IdP fails at the discovery step) and reports how many signing keys it found. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. The typed issuer and the `jwks_uri` are subject to the server's OIDC egress policy: an address the policy refuses (link-local and cloud-metadata always; loopback, RFC 1918, carrier-grade NAT and unique-local unless the server was started with `--oidc-allow-private-networks`) is not connected to, and the red feedback reads `Discovery failed: request failed: address not permitted by the OIDC egress policy` (never the resolved address). The switch is a server start-up option; no form field of this route or of `POST /api/settings/oidc` can change it. This is a connectivity check, not a guarantee of what a sign-in will hit: it uses the form's `issuer` (the saved issuer when blank), never reads or clears the running provider's discovery state (the 30 s no-retry window and the in-flight mark), and skips TLS verification when the form's `skip_tls_verify` is `"true"` OR the server's current value is true (an absent field cannot turn verification on while that value is true).
 
 #### `GET /api/v1/settings/oidc`
@@ -9672,7 +9695,7 @@ Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration c
 | `content` | string | Yes | PEM-encoded content (must contain `-----BEGIN`) |
 
 - **Response:** Re-rendered TLS Settings fragment (HTMX). Returns toast notification on success.
-- **Effect:** Writes PEM content to the server cert directory. A `key` is created owner-only (0600) and replaced atomically by rename (a symlink at the destination is replaced, not followed); a certificate directory the server creates is 0700, and an existing directory's mode is left as it is. Config is updated immediately; HTTPS cert hot-reload will pick up changes within the polling interval.
+- **Effect:** Writes PEM content to the server cert directory. A `key` is created owner-only (0600) and replaced atomically by rename (a symlink at the destination is replaced, not followed); a certificate directory the server creates is 0700, and an existing directory's mode is left as it is. The agent (gRPC) certificate, key or CA path in the running configuration is updated. This does not change the dashboard HTTPS certificate (that comes from `--https-cert`/`--https-key`), and the running gRPC listeners are not reloaded; after a restart the file is used only if `--cert`/`--key`/`--ca-cert` name it.
 
 ---
 
@@ -9771,7 +9794,7 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
 
 ### Settings — Multi-Factor Authentication (MFA / TOTP)
 
-These endpoints drive the **Settings → Multi-Factor Authentication** card. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than JSON. All five require an admin session and target `#mfa-section` for swap-in. SOC 2 CC6.6 — see `docs/auth-mfa-design.md`.
+These endpoints drive the **Settings → Security and sign-in → Two-factor sign-in** card. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than JSON. All five require an admin session and target `#mfa-section` for swap-in. SOC 2 CC6.6 — see `docs/auth-mfa-design.md`.
 
 **`GET /fragments/settings/mfa`** — Render the MFA card for the logged-in admin.
 
@@ -9992,6 +10015,35 @@ These endpoints back the read-only **Access → Tokens and principals** page (`/
 - **Response (200):** HTML fragment. The list carries `data-check="1"` only when the caller also holds `AuditLog:Read` (the page script then runs the no-administrator check). A malformed `id` is the "select a principal" placeholder with no store read; an unknown id is a 200 "not found" panel.
 - **Revocation detail:** for a revoked principal the free-text detail of the `engine_principal.revoke` audit event is shown only to callers who hold `AuditLog:Read`; others see it marked withheld (also when the grant could not be confirmed). The newest 200 events are read; when more exist the panel says so.
 - **Audit:** success writes `engine_principal.list` or `engine_principal.get`, plus `engine_principal.role.listed` when the roles were read. A refused browser session writes no row; a refused token or engine caller does.
+
+### Access — Audit and reviews
+
+These endpoints back the read-only **Access → Audit and reviews** page (`/access/audit`). They return HTMX fragments, not the JSON envelope, and are the dashboard views of existing REST routes; they add no capability.
+
+**`GET /fragments/access/audit/log`**
+
+The audit-log panel. Same store and gate as `GET /api/v1/audit` (MCP `query_audit_log`), offering a subset of its filters (time range, exact principal, exact action; no `until`, target or `limit`) and rendering only that route's fields.
+
+- **Permission:** `AuditLog:Read` (admin-only while RBAC is disabled, #5771).
+- **Query:** `range` — `1h`, `24h` (default) or `7d`; `principal`, `action` — exact matches; `offset` — `0` to `10000`. `limit` is not read: the page is always 50 rows.
+- **Response (200):** HTML fragment: the table and pager, `No events match` when the store answered with zero rows, or a red "could not be read" box with no table when the store did not answer. A refused request (unknown `range`, `offset` outside `0..10000`, NUL byte in a filter) is also 200 with a fixed note and nothing read.
+- **Response (403):** The caller lacks `AuditLog:Read` (the gate's own response). The panel loads on its own, so a refused browser session writes no denial row; a refused token does.
+- **Audit:** none on a read, like the REST route.
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/audit/sample`**
+
+The dashboard view of `GET /api/v1/audit/auth-sample` with the window left open.
+
+- **Permission:** `AuditLog:Read`.
+- **Query:** `limit` — `1` to `1000` (default `100`); anything else is a 200 note, nothing read.
+- **Audit:** `audit.auth_sample.exported`, once per successful draw. A dropped row sets `Sec-Audit-Failed: true` and the panel says so.
+
+**`GET /fragments/access/audit/retention`**
+
+The dashboard view of `GET /api/v1/settings/data-retention` (audit retention only).
+
+- **Permission:** `ServerConfig:Read`.
 
 ### Commands
 

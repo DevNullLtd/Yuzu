@@ -1419,6 +1419,10 @@ if build_server
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
       'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
+      'unit/server/test_access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
+      'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
+      'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
+      'unit/server/test_access_audit_authz.cpp', # Audit and reviews page: [pg] persona matrix through the real gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -1609,6 +1613,10 @@ if build_server
       'unit/server/test_compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
       'unit/server/test_device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
       'unit/server/test_dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
+      # pure DEX score policy JSON: parse, canonical, revision, in-force resolution - no store, no I/O, no [pg]
+      'unit/server/test_dex_score_policy_json.cpp',
+      # bounded-refresh score policy provider over injected read/clock fns - no store, no sleeps, no [pg]
+      'unit/server/test_dex_score_policy_provider.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -1749,6 +1757,7 @@ if build_server
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_settings_security_ui.cpp', # Security and sign-in page: pure panel renderers + page pins + no-PG route cases
       'unit/server/test_groups_enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
       'unit/server/test_groups_page.cpp', # Groups and enrolment page: /groups gate, headers, template contract
       'unit/server/test_groups_js.cpp', # Groups and enrolment page: string pins on yuzu-groups.js
@@ -3580,6 +3589,16 @@ test('access users production wiring lexical gate',
   timeout: 30,
 )
 
+# Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
+# audit store read that returns nullopt for a closed store). Source-text only, so Python.
+# Suite 'docs' for the same reason as the Users page gate above.
+test('access audit production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_audit_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #5678: static lexical gate pinning that BOTH disconnect paths (direct Subscribe in
 # agent_service_impl.cpp, gateway DISCONNECTED in gateway_service_impl.cpp) mirror a departure into
 # durable presence only through mirror_departure_to_presence() with the real gate; the direct path
@@ -3603,6 +3622,18 @@ test('presence departure wiring lexical gate (#5678)',
 test('gateway-upstream guard registration lexical gate',
   _python3_test,
   args: [files('test_gateway_peer_registration_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #6016: static lexical gate pinning that only default_certs.cpp mints the server identity URI
+# (`yuzu://<install>/server`) the gateway management plane will admit by: no other file names
+# server_identity_uri() or the "/server" suffix literal, issue_leaf() has one production caller,
+# and sign_csr() has a closed, reviewed set of call sites. Carries its own in-memory mutation
+# self-test. No build required. Suite 'docs' for the same reason as the gateway-upstream gate above.
+test('server identity URI minting lexical gate (#6016)',
+  _python3_test,
+  args: [files('test_server_identity_uri_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -3757,6 +3788,21 @@ test('split interlock tripwire selftest',
   args: [files('test_split_interlock_tripwire_selftest.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Personal-data commit guard (scripts/ci/check-personal-data.py) and its
+# self-test. Both also run in .github/workflows/docs-lint.yml on every PR.
+test('personal data guard',
+  _python3_test,
+  args: [files('../scripts/ci/check-personal-data.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+test('personal data guard selftest',
+  _python3_test,
+  args: [files('test_check_personal_data_selftest.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # #1611 tripwire: the TSan suppression in unit/test_runner_main.cpp is honest
