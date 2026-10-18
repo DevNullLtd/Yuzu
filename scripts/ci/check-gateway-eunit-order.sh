@@ -73,7 +73,12 @@ export YUZU_REQUIRE_TLS_TESTS="${YUZU_REQUIRE_TLS_TESTS:-1}"
 rm -rf "$REBAR_BASE_DIR"
 
 cd "$gw" || exit 2
-rebar3 eunit --module="$modules"
+# One test process per module, as `--dir` gives: `rebar3 eunit --module=a,b`
+# runs every module in ONE shared process, so a link one module leaves
+# behind kills a later module and reads as an order dependency that is not
+# one (see eunit_shard.config.script). The shard config keeps list order.
+REBAR_CONFIG="$gw/eunit_shard.config.script" YUZU_GW_EUNIT_SHARD_MODULES="$modules" \
+    rebar3 eunit
 rc=$?
 
 if [ "$keep" -eq 0 ]; then
