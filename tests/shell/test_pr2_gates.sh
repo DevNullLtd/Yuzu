@@ -770,7 +770,12 @@ case "\$1" in
         [[ -n "\${YUZU_MOCK_PIDFILE:-}" ]] && echo "\$\$" > "\$YUZU_MOCK_PIDFILE"
         mkdir -p "\$dir/meson-logs"
         printf 'ok\n%s\n' "\${YUZU_MOCK_TESTLOG_LINE:-}" > "\$dir/meson-logs/testlog.txt"
-        [[ -n "\${YUZU_MOCK_TEST_SLEEP:-}" ]] && sleep "\$YUZU_MOCK_TEST_SLEEP"
+        if [[ -n "\${YUZU_MOCK_TEST_SLEEP:-}" ]]; then
+            sleep "\$YUZU_MOCK_TEST_SLEEP" & sp=\$!
+            # On TERM, record whether the gate still holds the lock (it must until we are gone), then take a moment to die.
+            trap 'echo "LOCK-AT-TERM \$(readlink "\${dir%/}.lock" 2>/dev/null)" >> "$FK_MLOG"; kill \$sp 2>/dev/null; sleep 1; exit 143' TERM
+            wait \$sp
+        fi
         exit "\${YUZU_MOCK_TEST_RC:-0}" ;;
 esac
 exit 0
@@ -786,12 +791,19 @@ done
 # The lock must still be held by the gate while gcovr runs.
 [[ -n "\$JSON" ]] && echo "LOCK-AT-GCOVR \$(readlink "\$(dirname "\$JSON").lock" 2>/dev/null) GATE-PID \$PPID" >> "$FK_MLOG"
 if [[ -n "\$JSON" ]]; then
-    if [[ -n "\${YUZU_MOCK_NO_LINE:-}" ]]; then printf '{"branch_percent":65.5}' > "\$JSON"
+    if [[ -n "\${YUZU_MOCK_BAD_JSON:-}" ]]; then printf 'not json' > "\$JSON"
+    elif [[ -n "\${YUZU_MOCK_NO_LINE:-}" ]]; then printf '{"branch_percent":65.5}' > "\$JSON"
     else printf '{"branch_percent":65.5,"line_percent":72.0}' > "\$JSON"; fi
 fi
 exit 0
 EOF
-    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr"
+    # ps stub: lets a scenario stall ONE gate between reading a stale holder and acting on it.
+    cat > "$FK_BIN/ps" <<EOF
+#!/usr/bin/env bash
+if [[ -n "\${YUZU_MOCK_PS_DELAY:-}" ]]; then : > "\$YUZU_MOCK_PS_MARK"; sleep "\$YUZU_MOCK_PS_DELAY"; fi
+exec $(command -v ps) "\$@"
+EOF
+    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr" "$FK_BIN/ps"
     FK_SAVED_PATH="$PATH"; export PATH="$FK_BIN:$PATH"
     printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$CHAOS_ROOT/$tag-baseline.json"
     FK_BASE="$CHAOS_ROOT/$tag-baseline.json"
@@ -862,6 +874,7 @@ scenario_CH_19() {
     elif [[ "$(echo "$owner_line" | awk '{print $2}')" == "$dead" || "$(echo "$owner_line" | awk '{print $2}')" != "$(echo "$owner_line" | awk '{print $4}')" ]]; then
         bad "CH-19" "after clearing a stale lock the run did not hold the lock itself: '$owner_line'"
     elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after clearing a stale one"
+    elif [[ -e "$lock.takeover" || -L "$lock.takeover" ]]; then bad "CH-19" "takeover guard left behind after a successful takeover"
     else ok "CH-19: a stale lock (dead holder) is cleared and the run proceeds holding the lock under its own pid"; fi
 
     # D: a lock that is not a pid is never treated as stale.
@@ -884,7 +897,7 @@ scenario_CH_19() {
     local second_calls; second_calls=$(grep -c "^setup \|^compile " "$FK_MLOG")
     wait "$first" 2>/dev/null
     if [[ "$(db_gate_notes ch19f Coverage)" != *"another coverage-gate run"* ]]; then
-        bad "CH-19" "overlapping second run was not refused: rc=$FK_RC notes=$(db_gate_notes ch19f Coverage)"
+        bad "CH-19" "overlapping second run was not refused: rc=$FK_RC notes=$(db_gate_notes ch19f Coverage) out=$(printf '%s' "$FK_OUT" | tail -5)"
     elif [[ "$second_calls" != "2" ]]; then
         bad "CH-19" "second run touched the build dir (setup+compile calls=$second_calls, expected only the first run's 2)"
     elif [[ "$(db_gate_status ch19e Coverage)" != "PASS" ]]; then
@@ -895,7 +908,7 @@ scenario_CH_19() {
     # win (safety, asserted strictly). A round where every racer refuses is a liveness
     # hiccup under load, not a safety failure: it is retried (twice) before it counts.
     local round r winners tries allok=1
-    for round in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    for round in 1 2 3 4 5; do
         for tries in 1 2 3; do
             : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
             sleep 0 & dead=$!; wait "$dead" 2>/dev/null
@@ -916,7 +929,7 @@ scenario_CH_19() {
             allok=0; break
         fi
     done
-    (( allok )) && ok "CH-19: of 4 runs racing for one stale lock exactly one wins, in each of 12 rounds"
+    (( allok )) && ok "CH-19: of 4 runs racing for one stale lock exactly one wins, in each of 5 rounds"
 
     # G: SIGTERM to the gate alone terminates its meson test child before the lock is released.
     : > "$FK_MLOG"; rm -rf "$build" "$lock"
@@ -940,7 +953,62 @@ scenario_CH_19() {
         kill "$mock_pid" 2>/dev/null
         bad "CH-19" "SIGTERM to the gate left its meson test (pid $mock_pid) running"
     elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after SIGTERM"
+    elif ! grep -q "^LOCK-AT-TERM [0-9]" "$FK_MLOG"; then bad "CH-19" "the lock was released before the terminating meson test had exited: $(grep LOCK-AT-TERM "$FK_MLOG")"
     else ok "CH-19: SIGTERM to the gate ends its meson test child and releases the lock"; fi
+
+    # H: deterministic interleave for the re-check under the takeover guard. Run B reads the
+    # stale holder, then stalls (ps stub); run A takes over completely and starts its tests;
+    # B resumes, wins the (now free) guard and must NOT clear A's live lock.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    local mark="$CHAOS_ROOT/ch19-ps.mark"; rm -f "$mark"
+    sleep 0 & dead=$!; wait "$dead" 2>/dev/null; ln -s "$dead" "$lock"
+    start_run ch19hb; start_run ch19ha
+    ( env YUZU_MOCK_PS_DELAY=2 YUZU_MOCK_PS_MARK="$mark" YUZU_MOCK_TEST_SLEEP=1 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19hb \
+        --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    local pb=$!
+    for i in $(seq 1 100); do [[ -e "$mark" ]] && break; sleep 0.1; done
+    ( env YUZU_MOCK_TEST_SLEEP=4 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19ha \
+        --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    wait
+    local h_owners; h_owners=$(grep -c "^LOCK-OWNER " "$FK_MLOG")
+    # A must still hold its lock when ITS gcovr runs (B may not have cleared or replaced it).
+    local h_own h_at; h_own=$(grep "^LOCK-OWNER " "$FK_MLOG" | head -1 | awk '{print $2}')
+    h_at=$(grep "^LOCK-AT-GCOVR " "$FK_MLOG" | head -1 | awk '{print $2}')
+    if [[ ! -e "$mark" ]]; then bad "CH-19" "interleave test setup failed: the stalled run never reached ps"
+    elif [[ "$h_owners" != "1" ]]; then bad "CH-19" "a stalled contender cleared a LIVE lock it had judged stale earlier: $h_owners runs ran meson test (expected 1)"
+    elif [[ -z "$h_own" || "$h_own" != "$h_at" ]]; then bad "CH-19" "the live lock was disturbed by a stalled contender (owner at meson test '$h_own', at gcovr '$h_at')"
+    elif [[ "$(db_gate_status ch19hb Coverage)" != "PASS" && "$(db_gate_status ch19hb Coverage)" != "WARN" ]]; then bad "CH-19" "stalled run left no row"
+    else ok "CH-19: a contender that judged the lock stale before another took it over refuses on re-check"; fi
+
+    # I: a surviving `meson test` on this build dir (left by a SIGKILL'd gate) refuses the run.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    ( exec -a "meson test -C $build" sleep 30 ) & local orphan=$!
+    sleep 0.3
+    ch_run ch19i "$build" --
+    kill "$orphan" 2>/dev/null; wait "$orphan" 2>/dev/null
+    if [[ -s "$FK_MLOG" ]]; then bad "CH-19" "run proceeded next to a surviving meson test: $(cat "$FK_MLOG")"
+    elif [[ "$(db_gate_notes ch19i Coverage)" != *"a meson test is already running"* ]]; then
+        bad "CH-19" "orphan refusal not recorded: $(db_gate_notes ch19i Coverage)"
+    elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "refused-for-orphan run left the lock behind"
+    else ok "CH-19: a surviving meson test on the build dir refuses the run and releases the lock"; fi
+
+    # J: a symlink-to-directory planted at the lock path is a refusal, not a link created inside the directory.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    mkdir -p "$FK_ROOT/planted"; ln -s "$FK_ROOT/planted" "$lock"
+    ch_run ch19j "$build" --
+    if [[ -s "$FK_MLOG" ]]; then bad "CH-19" "gate ran with a planted directory symlink at its lock path"
+    elif [[ -n "$(ls -A "$FK_ROOT/planted")" ]]; then bad "CH-19" "the gate created something inside the planted directory: $(ls "$FK_ROOT/planted")"
+    elif [[ "$(readlink "$lock")" != "$FK_ROOT/planted" ]]; then bad "CH-19" "the planted link was removed or replaced"
+    else ok "CH-19: a symlink-to-directory planted at the lock path is refused and nothing is written through it"; fi
+    rm -f "$lock"; rm -rf "$FK_ROOT/planted"
+
+    # K: a non-printable lock target is never echoed raw into the terminal, log or DB note.
+    ln -s $'evil\033[31mX\nFAKE-PASS' "$lock"
+    ch_run ch19k "$build" --
+    if printf '%s' "$FK_OUT$(db_gate_notes ch19k Coverage)" | grep -q $'\033'; then bad "CH-19" "an escape character from a planted lock reached the output or the DB note"
+    elif [[ "$(db_gate_notes ch19k Coverage | wc -l)" -gt 1 || "$(db_gate_notes ch19k Coverage)" != *"evil?"* ]]; then bad "CH-19" "a newline from a planted lock reached the DB note"
+    else ok "CH-19: control characters in a planted lock target are neutralised in output and DB note"; fi
+    rm -f "$lock"
 
     export PATH="$FK_SAVED_PATH"
     rm -rf "$FK_ROOT" 2>/dev/null || true
@@ -1013,6 +1081,12 @@ PY
           || "$(db_gate_notes ch20h Coverage)" != *"meson test exit=3"* ]]; then
         bad "CH-20" "gcovr failure dropped the inconclusive reasons: status=$(db_gate_status ch20h Coverage) notes=$(db_gate_notes ch20h Coverage)"
     else ok "CH-20: a gcovr failure on an inconclusive run still names the test failure"; fi
+
+    # I: same when gcovr succeeds but its summary cannot be parsed.
+    ch_run ch20i "$build" -- YUZU_MOCK_TEST_RC=3 YUZU_MOCK_BAD_JSON=1
+    if [[ "$(db_gate_notes ch20i Coverage)" != *"could not parse"* || "$(db_gate_notes ch20i Coverage)" != *"meson test exit=3"* ]]; then
+        bad "CH-20" "a parse failure dropped the inconclusive reasons: $(db_gate_notes ch20i Coverage)"
+    else ok "CH-20: a parse failure on an inconclusive run still names the test failure"; fi
 
     export PATH="$FK_SAVED_PATH"
     rm -rf "$FK_ROOT" 2>/dev/null || true

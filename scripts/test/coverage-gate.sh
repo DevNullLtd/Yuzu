@@ -44,6 +44,8 @@
 #   0  coverage measured and within tolerance (or --report-only), or under
 #      --report-only a refusal / inconclusive run (the WARN row is the record)
 #   1  coverage regressed beyond slack, or --capture-baselines was refused
+# 129/130/143  interrupted (SIGHUP / SIGINT / SIGTERM): meson was terminated and
+#      the lock released before exit
 #   2  environmental refusal (missing tool, bad configuration, another run holds
 #      the build dir), an inconclusive run, a build/gcovr/parse failure, or a
 #      gate/metric DB write that failed (WARN row; also turns an exit 0 into 2)
@@ -203,9 +205,13 @@ write_metric() {
 # an exit-0 whose DB write failed into exit 2.
 LOCK_HELD=0
 LOCK_PATH=""
+LOCK_GUARD=""
 TEST_PID=""
 on_exit() {
     local rc=$?
+    # Cleanup must finish: a second INT/TERM/HUP here would abort it, leak the lock
+    # and leave meson running.
+    trap '' INT TERM HUP
     # An orphaned `meson test` would keep writing counters after the lock is
     # gone and corrupt the next run. meson terminates its own test children on
     # SIGTERM, so forward it and wait.
@@ -214,8 +220,12 @@ on_exit() {
         wait "$TEST_PID" 2>/dev/null || true
         TEST_PID=""
     fi
-    if (( LOCK_HELD )) && [[ -n "$LOCK_PATH" ]]; then
+    if (( LOCK_HELD )) && [[ -n "$LOCK_PATH" ]] && [[ "$(readlink "$LOCK_PATH" 2>/dev/null)" == "$$" ]]; then
         rm -f "$LOCK_PATH" 2>/dev/null || true
+    fi
+    # A takeover guard this run created and was interrupted inside.
+    if [[ -n "$LOCK_GUARD" && "$(readlink "$LOCK_GUARD" 2>/dev/null)" == "$$" ]]; then
+        rm -f "$LOCK_GUARD" 2>/dev/null || true
     fi
     if (( DB_WRITE_FAILED )) && [[ $rc -eq 0 ]]; then
         exit 2
@@ -283,11 +293,17 @@ tool_check
 # short-lived symlink guard so two runs cannot both clear and re-take it. (Both
 # use `ln -s`, not `mkdir`: uutils coreutils' mkdir is not atomic under
 # contention. A guard left by a taker that died inside its few-microsecond
-# critical section refuses runs until `<build-dir>.lock.takeover` is removed.)
-# Residual: a gate killed with SIGKILL leaves its `meson test` running (the
-# next run's lock check sees a dead pid and proceeds); other signals are
-# forwarded to meson and waited for before the lock is released. PID reuse can
-# make a dead holder look alive; the run is then refused, naming the lock path.
+# critical section blocks takeover of a LATER stale lock until
+# `<build-dir>.lock.takeover` is removed; the EXIT handler removes a guard it
+# created.)
+# `ln -sn` (not plain `ln -s`) so a pre-planted symlink-to-directory at the lock
+# path is an "already exists" failure instead of a link created INSIDE that
+# directory. INT, TERM and HUP are forwarded to meson and waited for before the
+# lock is released (exit 130/143/129); a TERM sent to the gate alone while it is
+# inside `meson compile` or gcovr is acted on when that command ends. Residual:
+# SIGKILL (and SIGQUIT/SIGPIPE) leave meson test running; a pgrep check below
+# refuses a run while a `meson test` on this build dir is still alive. PID reuse
+# can make a dead holder look alive; the run is then refused, naming the lock.
 BUILD_DIR_ABS="${BUILD_DIR_ABS%/}"
 LOCK_PATH="${BUILD_DIR_ABS}.lock"
 LOCK_GUARD="${LOCK_PATH}.takeover"
@@ -300,19 +316,19 @@ pid_alive() {  # kill -0 fails with EPERM for another user's live process; ps -p
 
 acquire_build_lock() {
     local holder
-    ln -s "$$" "$LOCK_PATH" 2>/dev/null && return 0
+    ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null && return 0
     holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
     if [[ "$holder" =~ ^[0-9]+$ ]] && ! pid_alive "$holder"; then
         # Only one contender at a time may judge and clear a stale lock. The guard
         # is a symlink too (`ln -s` is atomic everywhere we measured; `mkdir` is
         # NOT under uutils coreutils 0.8.0, Ubuntu 26.04's default, where two
         # simultaneous mkdirs of one path can both succeed).
-        if ln -s "$$" "$LOCK_GUARD" 2>/dev/null; then
+        if ln -sn -- "$$" "$LOCK_GUARD" 2>/dev/null; then
             holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
             if [[ "$holder" =~ ^[0-9]+$ ]] && ! pid_alive "$holder"; then
                 echo "coverage-gate: clearing stale lock $LOCK_PATH (holder pid $holder is not running)" | tee -a "$GATE_LOG"
                 rm -f "$LOCK_PATH"
-                if ln -s "$$" "$LOCK_PATH" 2>/dev/null; then
+                if ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null; then
                     rm -f "$LOCK_GUARD"
                     return 0
                 fi
@@ -321,6 +337,7 @@ acquire_build_lock() {
             holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
         fi
     fi
+    holder="${holder//[^[:print:]]/?}"
     LOCK_HOLDER="${holder:-unreadable}"
     return 1
 }
@@ -328,6 +345,16 @@ if acquire_build_lock; then
     LOCK_HELD=1
 else
     NOTE="refused: another coverage-gate run (pid $LOCK_HOLDER) holds $LOCK_PATH; wait for it, or remove that file if no such run is active"
+    echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
+    write_gate WARN 0 "$NOTE"
+    exit "$REFUSE_EXIT"
+fi
+
+# A gate killed with SIGKILL (or a manual `meson test`) can leave a test run alive
+# on this build dir; running our own purge/tests next to it would corrupt both.
+ORPHAN_PIDS=$(pgrep -f "meson test -C ${BUILD_DIR}( |\$)" 2>/dev/null | tr '\n' ' ' || true)
+if [[ -n "${ORPHAN_PIDS// /}" ]]; then
+    NOTE="refused: a meson test is already running on $BUILD_DIR (pid ${ORPHAN_PIDS% }), probably left by a killed coverage-gate; wait for it or stop it"
     echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
     write_gate WARN 0 "$NOTE"
     exit "$REFUSE_EXIT"
@@ -454,9 +481,10 @@ fi
 echo "coverage-gate: meson test --timeout-multiplier $TIMEOUT_MULT" | tee -a "$GATE_LOG"
 # A background job we `wait` on, so a signal to this script reaches the EXIT
 # handler (which terminates meson) instead of being deferred until meson ends.
-meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
-    --timeout-multiplier "$TIMEOUT_MULT" \
-    >> "$GATE_LOG" 2>&1 &
+# Subshell + exec: a background job of a non-interactive shell starts with SIGINT
+# and SIGQUIT ignored, which would be inherited by every test.
+( trap - INT QUIT; exec meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
+    --timeout-multiplier "$TIMEOUT_MULT" ) >> "$GATE_LOG" 2>&1 &
 TEST_PID=$!
 wait "$TEST_PID" || TEST_RC=$?
 TEST_PID=""
