@@ -42,6 +42,7 @@
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
+#include "crypto_library_model.hpp" // get_crypto_libraries / list_crypto_library_devices (shared model)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
@@ -319,7 +320,8 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
 /// Builds the catalogue model's `Params` from the named MCP arguments (strings and integers
 /// only; any other JSON type is left out, and an integer is stringified for every key). Every
 /// caller refuses a wrongly typed argument first, through `strict_args_error` (the two
-/// catalogue twins) or `installed_software_args_error` (query_installed_software), so nothing
+/// catalogue twins), `installed_software_args_error` (query_installed_software) or
+/// `crypto_library::strict_{summary,devices}_args_error` (the two /crypto twins), so nothing
 /// is silently dropped or stringified here. MCP and REST parse through the one model.
 software_catalogue::Params catalogue_params(const nlohmann::json& args,
                                             std::initializer_list<const char*> keys) {
@@ -3887,6 +3889,105 @@ static const ToolDef kTools[] = {
      R"j("command_id":{"type":"string"},"source":{"type":"string"},"requested_at":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"})j"
      R"j(},"required":["requested","agents_reached","skipped_offline","skipped_version","command_id","source","requested_at"]})j"},
+    // ── /crypto slice 1 twins - MCP mirrors of GET /api/v1/crypto/libraries[/devices], shaped
+    // by the SAME pure model (crypto_library_model.hpp) and read through the SAME CryptoApi seam
+    // as the REST routes and the /crypto page. Appended at the VERY END of kTools[] per the
+    // standing governance note above. The `family` enum is the model's families() ids; a test
+    // pins the two together.
+    {"get_crypto_libraries",
+     "Fleet view of which cryptographic libraries are installed: one row per library family "
+     "(OpenSSL, GnuTLS, NSS, Mbed TLS, wolfSSL, libsodium, Bouncy Castle and others), each with "
+     "the number of DISTINCT devices carrying any package of the family and a per-(version, "
+     "ecosystem) breakdown with the matching package names. Use it to answer 'where is library X "
+     "installed and at which versions'; chain it with list_crypto_library_devices to name the "
+     "devices behind a family or one version bucket. Evidence is the daily-synced "
+     "installed-software inventory matched by package NAME against a curated table "
+     "(table_version says which mapping answered; names_source says where the package NAMES "
+     "came from - 'catalogue' (the hourly software catalogue, fresh: a name first reported "
+     "after names_as_of appears after the next refresh) or 'live' (read from the inventory at "
+     "call time because the catalogue is not built, is stale or was refreshed over zero "
+     "titles; names_as_of null); counts and versions for listed names are live either "
+     "way). It reports presence and versions only and "
+     "never judges a library or version: interpreting a version is the caller's job. Families "
+     "with no matching device are omitted, and an empty families list means 'no matching package "
+     "rows in the caller's visible inventory' - NOT proof the library is absent: statically "
+     "linked, vendored and OS-bundled copies are invisible here, and Windows installer builds of "
+     "OpenSSL are not matched. coverage gives the denominator: "
+     "devices_reporting_inventory (visible devices with an installed-software report) and "
+     "devices_with_crypto_library (distinct devices matching any family). versions_truncated / "
+     "result_truncated true mean version rows were capped, never that devices are missing from "
+     "the counts; when the 2,000-row store ceiling fires (result_truncated) every family is "
+     "flagged versions_truncated, because which families lost rows is not known. Each version "
+     "bucket lists at most 8 package names; package_names_truncated is true when it has more. "
+     "Requires Inventory:Read; a management-group-confined caller sees only its visible devices "
+     "(counts, coverage and versions are all computed over that scope). A service-scoped token "
+     "is refused (403) while RBAC enforcement is off, the default; with RBAC enforcement on it "
+     "is admitted within the ITServiceOwner ceiling and sees only the devices tagged with its IT "
+     "service. Input is strict: a non-object arguments value, an unknown family, an ecosystem "
+     "outside the published set, a wrong JSON type or an over-long string is rejected (the REST "
+     "twin clamps). A degraded inventory store, or crypto read capacity in "
+     "use, is a retryable error, never an "
+     "empty result. Package names are cut to 256 bytes (a cut name ends in an ellipsis) and the "
+     "whole payload is byte-budgeted: a cut version list sets versions_truncated and "
+     "result_truncated. ecosystem is matched EXACTLY (empty string = rows with no ecosystem; "
+     "omit for any). Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
+     R"j({"type":"object","properties":{)j"
+     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict to one library family id; omit for every family"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
+     R"j("names_source":{"type":"string","enum":["catalogue","live"],"description":"Where the package names came from: the fresh hourly catalogue, or a live read of the inventory (catalogue not built, stale or refreshed over zero titles)"},)j"
+     R"j("names_as_of":{"type":["integer","null"],"description":"Refresh time (epoch seconds) of the catalogue when names_source is catalogue; null when live. Counts and versions for listed names are live either way"},)j"
+     R"j("families":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display":{"type":"string"},"device_count":{"type":"integer"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"ecosystem":{"type":"string"},"device_count":{"type":"integer"},"package_names":{"type":"array","items":{"type":"string"}},"package_names_truncated":{"type":"boolean","description":"True when the bucket has more matching package names than the 8 listed"}},"required":["version","ecosystem","device_count","package_names","package_names_truncated"]}},"versions_truncated":{"type":"boolean","description":"True when this family's version list is cut (per-family cap of 50, the byte budget, or the 2,000-row store ceiling, which flags every family)"}},"required":["id","display","device_count","versions","versions_truncated"]}},)j"
+     R"j("coverage":{"type":"object","properties":{"devices_reporting_inventory":{"type":"integer"},"devices_with_crypto_library":{"type":"integer"}},"required":["devices_reporting_inventory","devices_with_crypto_library"]},)j"
+     R"j("result_truncated":{"type":"boolean"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["table_version","names_source","names_as_of","families","coverage","result_truncated"]})j"},
+
+    {"list_crypto_library_devices",
+     "List the devices (and the matching package rows) behind one cryptographic library family, "
+     "optionally narrowed to one exact version and ecosystem - the drill-down after "
+     "get_crypto_libraries. Each row carries agent_id, hostname (null when the registry does not "
+     "know the device), package_name, version, release, ecosystem and kind. A device with several "
+     "matching packages appears once per package. Ordered by agent_id, package name; page with "
+     "next_cursor (non-null when more rows exist) passed back as cursor: a cursor reused with a "
+     "different family/version/ecosystem, one issued under a different table_version, a "
+     "malformed one, or a page whose cursor was issued on live package names when the next page "
+     "finds the shared catalogue in use (names_source live to catalogue; this recurs if the "
+     "catalogue goes stale and recovers mid-walk), is rejected and the walk must restart "
+     "without a cursor. A newer catalogue or a switch to live continues; a name new in the "
+     "newer source is listed for devices after the cursor, and its rows on devices already "
+     "passed are missed until you restart. version and ecosystem are matched "
+     "EXACTLY; pass an empty string for the rows that carry none, omit either for every value. An empty devices list means 'no matching package rows "
+     "in the caller's visible inventory' - NOT proof the library is absent: statically linked, "
+     "vendored and OS-bundled copies are invisible here. Presence and versions only; nothing is "
+     "judged. Requires Inventory:Read; a management-group-confined caller sees only its visible "
+     "devices. A service-scoped token is refused (403) while RBAC enforcement is off, the "
+     "default; with RBAC enforcement on it is admitted within the ITServiceOwner ceiling and "
+     "sees only the devices tagged with its IT service. Input is "
+     "strict: a non-object arguments value, an unknown family, an ecosystem outside the "
+     "published set, a wrong JSON type, an over-long string or a limit outside 1..1000 is "
+     "rejected rather than clamped. A degraded "
+     "inventory store, or crypto read capacity in use, is a retryable error, never an empty result. Every page served is audited "
+     "as mcp.list_crypto_library_devices (continuation pages tagged page=continuation). Mirrors "
+     "GET /api/v1/crypto/libraries/devices.",
+     R"j({"type":"object","properties":{)j"
+     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
+     R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
+     R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version; refused if the previous page was read on live names and the catalogue is now in use; restart without a cursor"},)j"
+     R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
+     R"j(},"required":["family"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this page; a cursor is bound to it"},)j"
+     R"j("names_source":{"type":"string","enum":["catalogue","live"],"description":"Where the package names came from: the fresh hourly catalogue, or a live read of the inventory (catalogue not built, stale or refreshed over zero titles)"},)j"
+     R"j("names_as_of":{"type":["integer","null"],"description":"Refresh time (epoch seconds) of the catalogue when names_source is catalogue; null when live. Counts and versions for listed names are live either way"},)j"
+     R"j("family":{"type":"string"},"version":{"type":["string","null"]},"ecosystem":{"type":["string","null"],"description":"The exact-ecosystem filter echoed; null when absent"},)j"
+     R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"]},"package_name":{"type":"string"},"version":{"type":"string"},"release":{"type":"string"},"ecosystem":{"type":"string"},"kind":{"type":"string"}},"required":["agent_id","hostname","package_name","version","release","ecosystem","kind"]}},)j"
+     R"j("next_cursor":{"type":["string","null"]},"count":{"type":"integer"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["table_version","names_source","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -4091,6 +4192,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
     {"query_installed_software", {"Inventory", "Read", ServiceScopeClass::confined}},
+    // /crypto slice 1: gated on fleet_read_fn_ (Inventory:Read), whose composed
+    // meet(management-group, service-scope) VisibleSet is pushed into the SQL by the CryptoApi
+    // seam - a REAL confinement mechanism, so `confined`, same as query_installed_software.
+    {"get_crypto_libraries", {"Inventory", "Read", ServiceScopeClass::confined}},
+    {"list_crypto_library_devices", {"Inventory", "Read", ServiceScopeClass::confined}},
     // M.9: the catalogue twins read a FLEET-WIDE rollup that cannot be scoped to a service tag,
     // so they keep the default-deny class (C8 refuses a service-scoped token before the handler).
     {"query_software_catalogue", {"Inventory", "Read"}},
@@ -4893,6 +4999,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_inventory_tables", {ToolEffect::ReadOnly, true, "List inventory tables"}},
     {"get_agent_inventory", {ToolEffect::ReadOnly, true, "Get agent inventory"}},
     {"query_installed_software", {ToolEffect::ReadOnly, true, "Query installed software"}},
+    {"get_crypto_libraries", {ToolEffect::ReadOnly, true, "Get installed crypto libraries"}},
+    {"list_crypto_library_devices",
+     {ToolEffect::ReadOnly, true, "List devices carrying a crypto library"}},
     {"query_software_catalogue", {ToolEffect::ReadOnly, true, "Query the software catalogue"}},
     {"get_software_versions", {ToolEffect::ReadOnly, true, "Get a title's versions"}},
     {"list_dex_app_perf_devices",
@@ -9621,6 +9730,154 @@ McpServer::HandlerFn McpServer::build_handler(
                 reply(swc::catalogue_response_json(page.rows, page.totals, page.kpis, page.next_cursor,
                                                    omit_newest, 0),
                       audit_ok);
+                return;
+            }
+
+            // ── get_crypto_libraries / list_crypto_library_devices (/crypto slice 1 twins) ──
+            // Shaped by crypto_library_model.hpp and read through the CryptoApi seam: the same
+            // model and instance the /crypto page and the REST twins use. fleet_read_fn_ is the
+            // SOLE gate (Inventory:Read); its composed meet(management-group, service-scope)
+            // VisibleSet is pushed into the SQL by the seam, so a confined caller gets a real,
+            // filtered answer (a service-scoped token is refused 403 by the gate while RBAC
+            // enforcement is off, and confined to its IT service's devices when it is on).
+            // ONE dispatch branch per tool, never a shared `||` branch: the A5 retry-hint gate
+            // (scripts/ci/check-mcp-retry-hints.py) scans each tool's own `if (tool_name ==`
+            // block, so a shared branch is invisible to it.
+            if (tool_name == "get_crypto_libraries") {
+                namespace cl = crypto_library;
+                if (!fleet_read_fn_) {
+                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
+                                  "closed",
+                                  tool_name);
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                // Strict input (REST clamps, MCP refuses), judged before any parse or read.
+                if (const auto bad = cl::strict_summary_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Crypto library data unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto parsed =
+                    cl::parse_summary_params(catalogue_params(args, {"family", "ecosystem"}));
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string target = cl::audit_target(*parsed);
+                // The seam's caller-input refusal (a bad cursor) is answered through this
+                // helper so the `if (!read)` block below holds ONLY the retryable store-fault
+                // answer: the retry-hint gate then judges that branch on its own hint, and an
+                // exempt comment for the refusal cannot mask a missing retry_after_ms.
+                auto refuse_input = [&](const std::string& message) {
+                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                auto read = crypto_api_->library_summary(*parsed, gate.scope);
+                if (!read) {
+                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                        refuse_input(read.error().message);
+                        return;
+                    }
+                    mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
+                                                                   gate.scope.has_value()) +
+                                             " target=" + target);
+                    res.set_content(a4_error(kInternalError,
+                                             std::string(cl::degraded_message(read.error().cause)),
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                // Same key set as the REST/page rows; the MCP path mints no cid, and the
+                // tool name is the audit target so the filters ride in the detail.
+                const bool audit_ok = mcp_audit(
+                    "success", cl::audit_detail("", parsed->family.value_or("all"),
+                                                read->families.size(), read->names_from_catalogue,
+                                                false, gate.scope.has_value()) +
+                                   " target=" + target);
+                auto payload = cl::summary_json(*read);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_crypto_library_devices") {
+                namespace cl = crypto_library;
+                if (!fleet_read_fn_) {
+                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
+                                  "closed",
+                                  tool_name);
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                if (const auto bad = cl::strict_devices_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Crypto library data unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto parsed = cl::parse_devices_params(
+                    catalogue_params(args, {"family", "version", "ecosystem", "cursor", "limit"}));
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string target = cl::audit_target(*parsed);
+                const bool continuation = !parsed->cursor.empty();
+                // The seam's caller-input refusal (a bad cursor) is answered through this
+                // helper so the `if (!read)` block below holds ONLY the retryable store-fault
+                // answer: the retry-hint gate then judges that branch on its own hint, and an
+                // exempt comment for the refusal cannot mask a missing retry_after_ms.
+                auto refuse_input = [&](const std::string& message) {
+                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                auto read = crypto_api_->library_devices(*parsed, gate.scope);
+                if (!read) {
+                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                        refuse_input(read.error().message);
+                        return;
+                    }
+                    mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
+                                                                   gate.scope.has_value()) +
+                                             " target=" + target);
+                    res.set_content(a4_error(kInternalError,
+                                             std::string(cl::degraded_message(read.error().cause)),
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = mcp_audit(
+                    "success", cl::audit_detail("", parsed->family, read->devices.size(),
+                                                read->names_from_catalogue, continuation,
+                                                gate.scope.has_value()) +
+                                   " target=" + target);
+                auto payload = cl::devices_json(*read);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 

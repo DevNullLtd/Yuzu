@@ -224,8 +224,8 @@ namespace {
 namespace swc = software_catalogue;
 
 constexpr std::int64_t kStaleSecs = swc::kStaleWindowSecs; // 48 h: the Last synced stale pill
-// Two missed hourly refreshes: the 'stale —' prefix.
-constexpr std::int64_t kRollupStaleSecs = 7200;
+// Two missed hourly refreshes: the 'stale —' prefix (the store's freshness window).
+constexpr std::int64_t kRollupStaleSecs = kCatalogueFreshSeconds;
 constexpr const char* kEm = "\xE2\x80\x94";                // U+2014
 
 std::string dash() { return std::string("<span class=\"inv-grey\">") + kEm + "</span>"; }
@@ -412,6 +412,9 @@ std::string kpi_strip(const SoftwarePageFilters& f, const swc::KpiFigures& k, st
         h += std::string("<div class=\"inv-kpi later\" hidden title=\"") + l.title + "\"><div class=\"h\">" +
              l.h + "</div><div class=\"big\">" + kEm + "</div><div class=\"s2\">" + l.s2 + "</div></div>";
     h += "</div>";
+    // Display only: unlike the /crypto freshness gate (which also rejects a stamp from the
+    // future), this stale predicate has no future-skew bound - a wrong-clock stamp just shows as
+    // fresh here and gates nothing.
     const bool stale = m.refreshed_at > 0 && (now - m.refreshed_at) > kRollupStaleSecs;
     h += "<div class=\"inv-fresh\">Catalogue rollup " +
          std::string(stale ? "stale " + std::string(kEm) + " " : "") +
