@@ -24,17 +24,10 @@
  * every home, so a link anywhere in its path (an aliased spelling such as /var/root, where /var
  * is a link on macOS) answers ELOOP and is refused loudly, never walked past the mount guard.
  *
- * Reads are bounded. An Include directory and each account home are opened ONCE and every read
- * under them goes through THAT descriptor, one path component per openat() (dir-fd
- * confinement), never through a re-resolved path join. One PosixFs per execute(): it holds
- * those descriptors, so it is not thread-safe and not for sharing.
- *
- * Blocking: open and read carry no deadline of their own (posix_secure_read.hpp). The legs
- * decision logic skips every configured path under a network mount named by the mount table
- * BEFORE any call here: the config file, an Include file or directory (each also at its one
- * readlink hop via resolve_root), a home parent, a home and a key path. Stacked filesystems,
- * a bare `fuse` mount over a dead server, link chains and links among the entries of a listed
- * Include directory still block (#4875).
+ * An Include directory and each account home are opened ONCE and every read under them goes
+ * through THAT descriptor, one component per openat(). One PosixFs per execute(): it holds those
+ * descriptors, so it is not thread-safe. Open/read carry no deadline of their own; the legs skip
+ * network-mount paths first (posix_secure_read.hpp; README caveat 4; residual #4875).
  */
 #pragma once
 
@@ -258,12 +251,9 @@ inline PosixFs make_posix_fs(const Paths& p) {
         return any_listed ? 0 : ENOENT;
     };
     if (p.min_uid > 0) {
-        // A path lstat: nothing is opened and nothing is followed. false ONLY on a confirmed
-        // owner of the HOME below the floor; a failed stat answers true so open_home reports the
-        // errno (refused / failed) rather than the home vanishing, and so does a link, whose
-        // lstat owner (often root, for a relocated home) says nothing about the home it names:
-        // eligible at any floor, refused loudly at open. A single home (/root, /private/var/root)
-        // is never filtered: root's own home is owned by uid 0 by definition.
+        // lstat only. false ONLY on a confirmed owner below the floor; a failed stat or a link
+        // (its lstat owner says nothing about the home it names) stays eligible so open_home
+        // reports it. A single home (root's) is never filtered.
         fs.is_account_home = [singles = p.single_homes, min_uid = p.min_uid](const HomeEntry& h) {
             if (std::ranges::find(singles, h.path) != singles.end())
                 return true;
@@ -297,10 +287,8 @@ inline PosixFs make_posix_fs(const Paths& p) {
         return to_read_like(yuzu::shared::read_file_no_follow_at(fd, components.back().c_str(), kKeyFileCap));
     };
     fs.read_key_file_abs = [](const std::string& path) -> FileReadLike {
-        // The parent is opened from "/" one O_NOFOLLOW component at a time, exactly as the
-        // lister opens a home parent, so a link anywhere in the chain is refused (ELOOP), never
-        // walked; the leaf is then read no-follow through that descriptor. The handle is a local
-        // and outlives the read.
+        // Hop by hop from "/" with O_NOFOLLOW, so a link in any directory of the chain is
+        // refused (ELOOP), then the leaf is read no-follow through that descriptor.
         const std::filesystem::path p{path};
         const std::string leaf = p.filename().string();
         if (leaf.empty())

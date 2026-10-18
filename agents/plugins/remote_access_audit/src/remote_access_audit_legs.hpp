@@ -3,18 +3,11 @@
  * its three per-OS leg TUs (shares_legs.hpp / mgmt_posture_legs.hpp shape). Linux and macOS
  * are real legs over the SAME POSIX decision logic; Windows is a PLANNED placeholder.
  *
- * Holds (a) the per-OS entry-point declarations, (b) report_list, the SINGLE owner of the
- * `status|list|...` row (no leg and no parser writes one), (c) execute_list, the plugin's
- * whole execute() body (dispatch + ABI containment), and (d) the OS-free DECISION logic,
- * `list_posix`, over an injected `PosixFs` boundary so every refused-vs-absent,
- * budget and ordering rule is unit-tested with canned results and no disk, uid or process
- * dependence. The leg TUs keep only the OS shell.
- *
- * The cut line (config + service half vs keys half) is kept clean: audit_config and
- * audit_service_* use only the config/service members of PosixFs and the config parsers
- * header; audit_keys uses only the keys members and the keys parsers header. The one thing
- * both halves share is the run-start network mount snapshot (and `resolve_root`, its one
- * readlink hop): list_posix takes it ONCE, before any path is touched, and hands it to both.
+ * Holds the per-OS entry points, report_list (the SINGLE owner of the `status|list|...` row),
+ * execute_list (the plugin's whole execute() body: dispatch + ABI containment) and the OS-free
+ * decision logic, `list_posix`, over an injected `PosixFs` boundary so every refused-vs-absent,
+ * budget and ordering rule is unit-tested with canned results. The leg TUs keep only the OS
+ * shell. list_posix takes the run-start network mount snapshot ONCE, before any path is touched.
  *
  * Row contract (pipe rows, status row first):
  *   status|list|<supported|constrained|permission_denied|unsupported>|<tokens or ->
@@ -23,14 +16,8 @@
  *   service|<unit>|<state>|<mechanism>
  *   file|<account>|<authorized_keys|authorized_keys2|custom>|<read|absent|refused|failed>|<keys>|<malformed>|<oversized>
  *   key|<account>|<kind>|<type>|<SHA256:...>|<bits or ->|<flags or ->|<option names or ->
- * All three `source` rows and every `config` row are emitted on EVERY real-leg arm, so zero
- * `key` rows is never an ambiguous empty success. `account` is the HOME DIRECTORY BASENAME,
- * not the login name. These are CONFIGURED facts (sshd_config as written, key files as
- * found), not sshd's effective policy. The `homes` source row alone carries a fifth field: the
- * number of listed home-root entries the account-eligibility probe positively refused (macOS:
- * owned by a uid under 500), `-` where no probe exists (Linux) or the roots were not listed.
- *
- * Each entry point is a READ and returns 0: a degraded read is not a failed command.
+ * `account` is the HOME DIRECTORY BASENAME, not the login name. All rows are CONFIGURED facts,
+ * not sshd's effective policy. Each entry point is a READ and returns 0.
  */
 #pragma once
 
@@ -62,46 +49,30 @@ int run_macos(yuzu::CommandContext& ctx);
 
 enum class StatusState { supported, constrained, permission_denied, unsupported };
 
-inline std::string_view status_token(StatusState s) {
-    switch (s) {
-    case StatusState::supported:
-        return "supported";
-    case StatusState::constrained:
-        return "constrained";
-    case StatusState::permission_denied:
-        return "permission_denied";
-    case StatusState::unsupported:
-        return "unsupported";
-    }
-    return "unsupported";
-}
-
 /// Writes the status row FIRST, then the data rows, then the paired result status.
 /// `unsupported` (a leg that read nothing) pairs with UNAVAILABLE/UNKNOWN; every other
 /// state is a read that ran.
 inline void report_list(yuzu::CommandContext& ctx, const std::vector<std::string>& data_rows,
                         StatusState status, std::string_view reason) {
-    ctx.write_output("status|list|" + std::string{status_token(status)} + '|' +
+    struct Pairing {
+        std::string_view token;
+        YuzuResultStatus status;
+        YuzuResultCompleteness completeness;
+    };
+    // Indexed by StatusState.
+    static constexpr std::array<Pairing, 4> kPairing{{
+        {"supported", YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL},
+        {"constrained", YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL},
+        {"permission_denied", YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL},
+        {"unsupported", YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN},
+    }};
+    const Pairing& p = kPairing[static_cast<std::size_t>(status)];
+    ctx.write_output("status|list|" + std::string{p.token} + '|' +
                      (reason.empty() ? std::string{"-"} : yuzu::util::safe_output_field(reason)));
     for (const auto& r : data_rows)
         ctx.write_output(r);
-    switch (status) {
-    case StatusState::permission_denied:
-        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              std::string{reason});
-        break;
-    case StatusState::constrained:
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              std::string{reason});
-        break;
-    case StatusState::unsupported:
-        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
-                              std::string{reason});
-        break;
-    case StatusState::supported:
-        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
-        break;
-    }
+    ctx.set_result_status(p.status, p.completeness,
+                          status == StatusState::supported ? std::string{} : std::string{reason});
 }
 
 /// What a leg decided: the status, its reason token(s), and the data rows.
@@ -120,13 +91,10 @@ inline void report_list(yuzu::CommandContext& ctx, const Listing& p) {
 
 using LegFn = int (*)(yuzu::CommandContext&);
 
-/// The WHOLE body of the plugin's execute(): dispatch and the single ABI containment.
-/// Status-row contract: one status row per dispatch, with three exceptions. (1) An unknown
-/// action writes ONE non-status line (`unknown action: <name>`, invalid UTF-8 replaced and
-/// the rest escaped) and returns 1: no status row. (2) A leg that throws AFTER report_list
-/// already wrote its row gets the catch arm's `unsupported` row appended, so there are TWO
-/// and the LAST status row wins. (3) The recovery itself allocates, so it is guarded too: if
-/// it throws as well, the dispatch returns 1 rather than unwinding across the plugin ABI.
+/// The WHOLE body of the plugin's execute(): dispatch and the single ABI containment. One
+/// status row per dispatch, except: an unknown action writes one non-status line and returns 1;
+/// a leg that throws after report_list gets the catch arm's `unsupported` row appended (the LAST
+/// status row wins); if that recovery throws too, return 1 rather than unwind across the ABI.
 inline int execute_list(yuzu::CommandContext& ctx, std::string_view action, LegFn leg,
                         std::string_view leg_exception_token) {
     try {
@@ -162,15 +130,8 @@ struct FileReadLike {
 
 using ReadFn = std::function<FileReadLike(const std::string& path)>;
 
-inline bool refused(int err) { return err == EACCES || err == EPERM; }
-
 inline std::string errno_token(int err) {
     switch (err) {
-    case ENOENT:
-        return "enoent";
-    case EACCES:
-    case EPERM:
-        return "permission_denied";
     case EIO:
         return "eio";
     case ELOOP:
@@ -219,7 +180,7 @@ inline SrcOutcome classify_read(const FileReadLike& r, std::string_view os, std:
     case ReadErr::io:
         if (r.err == ENOENT)
             return {SourceState::absent, {}};
-        if (refused(r.err))
+        if (r.err == EACCES || r.err == EPERM)
             return {SourceState::refused, src_token(os, src, "permission_denied")};
         return {SourceState::failed, src_token(os, src, errno_token(r.err))};
     }
@@ -342,13 +303,11 @@ struct PosixFs {
     // --- keys half ---
     /// Mount points of network filesystems; nullopt = the mount table could not be read.
     std::function<std::optional<std::vector<std::string>>()> network_mount_prefixes;
-    /// Optional. Resolves any configured path that is itself a symlink (a home PARENT such as
-    /// Fedora Atomic's /home -> var/home, the sshd_config path, an Include file or directory)
-    /// by ONE readlink hop to the absolute, normalised path it names; a path that is not a
-    /// link, a single home, and any failure answer `root` unchanged. It reads the link only,
-    /// never the target, so the mount-table decision runs on the real path before anything is
-    /// opened. Link chains, and links among the entries of a listed Include directory, are NOT
-    /// resolved (a disclosed residual, README caveat 4). Unset = every path is taken as written.
+    /// Optional. Resolves a configured path that is itself a symlink (a home PARENT such as
+    /// /home -> var/home, the sshd_config path, an Include file or directory) by ONE readlink
+    /// hop to the absolute, normalised path it names; anything else answers `root` unchanged.
+    /// Chains, and links among a listed Include directory's entries, are NOT resolved
+    /// (README caveat 4). Unset = every path is taken as written.
     std::function<std::string(const std::string& root)> resolve_root;
     /// Lists the account homes under `roots` (already resolved): errno of the first failed
     /// root, ENOENT when every root is absent.
@@ -376,16 +335,13 @@ struct ConfigOutcome {
     std::size_t files_read = 0;
 };
 
-/// The firmlinked read-write volume's spelling on macOS: a mount the system creates under it is
-/// listed as `/System/Volumes/Data/<path>`, though the same object is reached as `/<path>`. A
-/// firmlink is not a symlink, so neither the prefix compare nor a no-follow open tells the two
-/// apart.
+/// macOS firmlinked volume: a mount listed as `/System/Volumes/Data/<path>` is the same object
+/// as `/<path>`, and a firmlink is not a symlink, so neither a prefix compare nor a no-follow
+/// open tells the spellings apart.
 inline constexpr std::string_view kDataVolume = "/System/Volumes/Data";
 
-/// Adds the other spelling of every mount prefix: the stripped form of a `/System/Volumes/Data/<p>`
-/// prefix, and the Data-volume form of every other absolute prefix (not "/"), so a home or key
-/// path is matched under either spelling. Pure: no stat, no realpath. Segment boundaries stay
-/// `detail::under_prefix`'s job.
+/// Adds the other spelling of every mount prefix (stripped / Data-volume form; not "/") so a
+/// home or key path matches under either. Pure: no stat, no realpath.
 inline void add_data_volume_aliases(std::vector<std::string>& prefixes) {
     std::vector<std::string> aliases;
     for (const std::string_view p : prefixes) {
@@ -819,11 +775,8 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
             std::optional<std::size_t> nk, nm, no;
             std::vector<std::string> krows;
             if (o.state == SourceState::read) {
-                // The file row is charged BEFORE its key rows, at its worst-case size (every count
-                // is at most the file cap). The parse then charges the key rows against what is
-                // left and stops at the first refusal, so a file that saturates the budget keeps
-                // its first N keys and its file row; charging the row after the parse dropped the
-                // row and every key already admitted.
+                // The file row is charged BEFORE its key rows (worst-case size), so a file that
+                // saturates the budget keeps its file row and its first N keys.
                 bool ignored = false;
                 const std::string worst_row = file_row(home.name, s.kind, o.state, kKeyFileCap,
                                                        kKeyFileCap, kKeyFileCap, ignored);

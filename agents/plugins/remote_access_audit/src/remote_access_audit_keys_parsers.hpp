@@ -4,28 +4,18 @@
 // authorized_keys half of the remote_access_audit plugin: which public keys let someone log
 // in to an account. Header-only and portable; no file I/O, no subprocess, no OS header.
 //
-//   parse_authorized_keys      one authorized_keys file -> `key|...` rows plus the
-//                              malformed/oversized line counts
-//   parse_key_options          the options prefix, by sshd's rules (auth-options.c)
-//   decode_key_blob            the COMPLETE bounded decode of one key or certificate blob
-//                              (sshkey.c), returning the PLAIN public blob to fingerprint
-//   fingerprint_sha256         `SHA256:` + unpadded base64 of the plain blob, byte-identical
-//                              to `ssh-keygen -lf` (a certificate fingerprints the key it
-//                              carries)
-//   expand_authorized_keys_file  one AuthorizedKeysFile token -> which file to open
+// parse_authorized_keys (file -> key rows), parse_key_options (auth-options.c rules),
+// decode_key_blob (complete bounded decode, sshkey.c; returns the PLAIN public blob),
+// fingerprint_sha256 (byte-identical to `ssh-keygen -lf`; a certificate fingerprints the key
+// it carries), expand_authorized_keys_file (one AuthorizedKeysFile token -> which file to open).
 //
-// FINGERPRINTS AND OPTION NAMES ONLY. A key comment, an option VALUE (command=, from=,
-// principals=, environment=, ...) and a key-file path are NEVER emitted: the comment is
-// skipped, option values are dequoted only to find where they end, and the only option
-// output is the lowercased NAME from a closed set plus has_command/has_from/has_principals.
+// FINGERPRINTS AND OPTION NAMES ONLY. A key comment, an option VALUE (command=, from=, ...)
+// and a key-file path are NEVER emitted; option values are dequoted only to find where they end.
+// The row is a SYNTACTIC inventory: option VALUES are not validated and an ECDSA point is
+// checked for length and 0x04 prefix, not curve membership (README caveat).
 //
-// The row is a SYNTACTIC inventory of what sshd's parser would accept. Option VALUES are not
-// validated (expiry-time, environment, tunnel, permitopen/permitlisten), and an ECDSA point is
-// checked for its length and 0x04 prefix, not for lying on the curve. A line sshd would reject
-// for such a value is therefore counted as a key here (README caveat).
-//
-// Every parser charges the caller's yuzu::shared::RowByteBudget BEFORE materialising a row
-// and stops at the first refusal, so allocation is bounded by the budget plus the input.
+// Every parser charges the caller's RowByteBudget BEFORE materialising a row and stops at the
+// first refusal, so allocation is bounded by the budget plus the input.
 
 #include "remote_access_audit_config_parsers.hpp"
 
@@ -231,7 +221,6 @@ inline std::optional<KeyFacts> decode_blob(std::string_view blob, bool allow_cer
 
     KeyFacts out;
     out.info = *ti;
-    out.info.cert = false;
     std::string fields;
     switch (ti->family) {
     case Family::ed25519:
@@ -291,7 +280,6 @@ inline std::optional<KeyFacts> decode_blob(std::string_view blob, bool allow_cer
 
     put_string(out.plain_blob, plain_type_name(out.info));
     out.plain_blob += fields;
-    out.info.cert = ti->cert;
     return out;
 }
 
@@ -504,16 +492,13 @@ inline std::optional<KeyOptions> parse_key_options(std::string_view s) {
 // authorized_keys lines
 // ---------------------------------------------------------------------------
 
-/// What reading one key off the front of `s[at..]` found. Mirrors sshkey_read: the type
-/// token runs to space/tab, the blob token to the next space/tab, and the decoded blob must
-/// be the same KEY TYPE as the token (rsa-sha2-256 and ssh-rsa are one type; an ECDSA token
-/// must name the blob's curve). A type this table does not know is accepted only as 1..64 bytes
-/// of [A-Za-z0-9._@+-] (detail::is_key_type_name), so the token is never an option clause.
+/// What reading one key off the front of `s[at..]` found. Mirrors sshkey_read: the decoded blob
+/// must be the same KEY TYPE as the token (rsa-sha2-256 and ssh-rsa are one type; an ECDSA token
+/// must name the blob's curve). Unknown types: see detail::is_key_type_name.
 struct ReadKey {
     KeyFacts facts;
     std::string type_token; ///< as written; a known name, or an unknown type (see unknown)
     bool unknown = false;   ///< not in the known-name set: fingerprinted over the raw blob
-    std::size_t end = 0;    ///< index just past the blob token
 };
 
 inline std::optional<ReadKey> try_read_key(std::string_view s, std::size_t at) {
@@ -539,7 +524,6 @@ inline std::optional<ReadKey> try_read_key(std::string_view s, std::size_t at) {
 
     ReadKey out;
     out.type_token = std::string(type_token);
-    out.end = bend;
     if (const auto ti = type_info(type_token)) {
         auto facts = decode_key_blob(*blob);
         if (!facts)
@@ -554,9 +538,7 @@ inline std::optional<ReadKey> try_read_key(std::string_view s, std::size_t at) {
     // A type this table does not know (ssh-dss, a newer algorithm): inventoried when the
     // blob leads with that same name, fingerprinted over the raw blob (which is what
     // ssh-keygen does for a plain key). A certificate of an unknown type cannot be unwrapped.
-    // The name must also fit detail::is_key_type_name (1..64 bytes of [A-Za-z0-9._@+-]): the
-    // token is written to the key row verbatim, so an option clause such as `command="..."`
-    // that a crafted blob repeats is refused here and left to the option parser.
+    // The name must also fit detail::is_key_type_name (it is written to the key row verbatim).
     detail::Reader r{*blob};
     const auto lead = r.str();
     if (!lead || *lead != type_token || !detail::is_key_type_name(type_token) ||
@@ -594,14 +576,12 @@ struct KeysParse {
                     field_oversized);
 }
 
-/// Parses one authorized_keys file's text into `out.rows` (one `key|...` row per accepted
-/// line, in file order, duplicates kept). Blank and `#` lines are ignored and uncounted. A
-/// line over kMaxKeyLine is counted oversized and not parsed; a line sshd would not accept is
-/// counted malformed and not emitted. Formats each row, charges its wire size plus overhead
-/// and retains it only when admitted; stops at the first refusal (`out.truncated`). A line is
-/// cut at its first NUL byte before it is parsed (`out.nul_truncated`): sshd reads each line
-/// with getline() and treats it as a C string, so a key before the NUL is a key it trusts and
-/// the file is still accepted.
+/// Parses one authorized_keys file's text into `out.rows` (one `key|...` row per accepted line,
+/// in file order, duplicates kept). Blank and `#` lines are uncounted; a line over kMaxKeyLine
+/// is counted oversized, one sshd would not accept is counted malformed. Each row is charged
+/// before it is retained; stops at the first refusal (`out.truncated`). A line is cut at its
+/// first NUL (`out.nul_truncated`): sshd treats it as a C string, so a key before the NUL is
+/// still trusted.
 inline void parse_authorized_keys(std::string_view text, std::string_view account, std::string_view kind,
                                   yuzu::shared::RowByteBudget& budget, KeysParse& out) {
     std::size_t at = 0;

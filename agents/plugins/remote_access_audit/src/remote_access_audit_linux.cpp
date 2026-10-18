@@ -1,11 +1,7 @@
 /**
- * remote_access_audit_linux.cpp -- Linux leg: sshd_config (Include followed), per-account
- * authorized_keys fingerprints and sshd's enablement via `systemctl is-enabled` (rung 2, a
- * bounded argv runner; chosen over the sd-bus GetUnitFileState API to avoid a system dependency).
- *
- * Only the path binding and the runner live here: the reads are
- * remote_access_audit_posix_fs.hpp and every decision (refused != absent, Include order,
- * network-mount skips, budgets) is `list_posix` in remote_access_audit_legs.hpp.
+ * remote_access_audit_linux.cpp -- Linux leg: the path binding and the `systemctl is-enabled`
+ * runner (rung 2, a bounded argv runner; no sd-bus dependency). Reads live in
+ * remote_access_audit_posix_fs.hpp, every decision in `list_posix` (remote_access_audit_legs.hpp).
  */
 #include "remote_access_audit_legs.hpp"
 

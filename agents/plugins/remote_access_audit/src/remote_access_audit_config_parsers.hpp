@@ -2,30 +2,17 @@
 
 // remote_access_audit_config_parsers.hpp -- pure parsers and row formatters for the
 // sshd_config half of the remote_access_audit plugin: what this host's sshd is CONFIGURED to
-// accept, and whether its service is enabled. Header-only and portable so the unit tests run
-// on every host; no file I/O, no subprocess, no OS header.
+// accept, and whether its service is enabled. Header-only and portable; no file I/O, no
+// subprocess, no OS header. The `status|list|...` row is NOT built here (the legs header owns it).
 //
-//   split_sshd_line / parse_sshd_config   the sshd_config grammar, as servconf.c reads it:
-//                                         first-occurrence-wins for scalar keywords in
-//                                         DIRECTIVE ORDER, Include followed at the directive
-//                                         position (the caller recurses inside the sink),
-//                                         Match blocks counted and never evaluated
-//   expand_include_pattern                the Include argument -> a single file or a
-//                                         leaf-wildcard directory listing (sshd prefixes a
-//                                         relative path with /etc/ssh/)
-//   parse_systemctl_is_enabled            `systemctl is-enabled <unit>` stdout, closed vocab
-//   parse_print_disabled_label            `launchctl print-disabled system`, one exact label
-//
-// This header also owns what the keys half (remote_access_audit_keys_parsers.hpp) shares: the
-// row/byte limits, SourceState, wire_field and source_row. The keys header includes THIS one,
-// never the reverse, so the config/service half is a self-contained cut.
+// Also owns what the keys half shares (row/byte limits, SourceState, wire_field, source_row);
+// the keys header includes THIS one, never the reverse.
 //
 // PRIVACY CONTRACT: the AuthorizedKeysFile tokens are kept in SshdConfigState for path
-// resolution only. The `authorizedkeysfile` row reports `default | none | custom:<n>` and
-// never a path. The `status|list|...` row is NOT built here; the legs header owns it.
+// resolution only; the `authorizedkeysfile` row reports `default | none | custom:<n>`, never a path.
 //
-// Semantics verified against OpenSSH master (servconf.c process_server_config_line_depth,
-// misc.c strdelim_internal and argv_split); the line numbers are in the README.
+// Semantics verified against OpenSSH master: servconf.c process_server_config_line_depth,
+// misc.c strdelim_internal/argv_split.
 
 #include <row_byte_budget.hpp>
 #include <wire_utf8.hpp>
@@ -111,11 +98,8 @@ inline std::string wire_field(std::string_view v, bool& oversized) {
     return yuzu::util::safe_output_field(s);
 }
 
-/// `prefix|f1|f2|...` with every field through wire_field. `prefix` is the literal row kind. The
-/// fields the row builders once appended raw (the config key, a file row's state token, the
-/// counts) are lowercase-ASCII literals or digits or `-`, with no NUL, pipe or backslash and far
-/// under kMaxFieldBytes, so wire_field is the identity on them. Callers may pass temporaries:
-/// they live to the end of the full expression that calls this.
+/// `prefix|f1|f2|...` with every field through wire_field (the identity on the lowercase-ASCII
+/// literals, digits and `-` that the key/state/count fields are). `prefix` is the literal row kind.
 [[nodiscard]] inline std::string pipe_row(std::string_view prefix,
                                           std::initializer_list<std::string_view> fields,
                                           bool& oversized) {
@@ -286,11 +270,10 @@ struct CountSlot {
     std::string origin; ///< file of the first occurrence
 };
 
-/// Keywords that name a login credential source, or an extra login requirement, this plugin does
-/// NOT read (the value allowlist above is closed). Only their PRESENCE at global scope is
-/// recorded -- never a value or a path -- so a host that uses one is not reported as fully
-/// `supported`. `inert` is the lowercase first argument that disables the keyword or is its
-/// default (sshd: `none`, `any`, `no`); the first occurrence decides, as for every sshd keyword.
+/// Keywords naming a login credential source or extra login requirement this plugin does NOT
+/// read. Only their PRESENCE at global scope is recorded (never a value), so such a host is not
+/// reported `supported`. `inert` is the lowercase first argument that disables the keyword or is
+/// its default; the first occurrence decides.
 struct OtherCredentialKey {
     std::string_view keyword;
     std::string_view inert;
@@ -542,13 +525,11 @@ struct ServiceFact {
     std::string cause; ///< failure cause (`no_output`, `unrecognised_output`); empty when the output was understood
 };
 
-/// The first line of the output, trimmed, must be exactly one state word. The EXIT CODE is not a
-/// failure signal for that: `disabled` and `masked-runtime` exit 1, `not-found` exits 4. `out` is
-/// stdout and stderr merged, because systemd 249/252 report a unit that does not exist ONLY on
-/// stderr (stdout empty, exit 1): `Failed to get unit file state for <unit>: No such file or
-/// directory`. That one exact line, with a non-zero exit, is `not-found`, the word systemd 259
-/// prints on stdout for the same unit; nothing else is ever read as an absent unit (a broader
-/// match would also take `Failed to connect to bus: No such file or directory`).
+/// The first line of the output, trimmed, must be exactly one state word; the exit code is not a
+/// failure signal (`disabled` exits 1, `not-found` 4). `out` is stdout+stderr merged because
+/// systemd 249/252 report a missing unit only on stderr: `Failed to get unit file state for
+/// <unit>: No such file or directory`. That exact line with a non-zero exit is `not-found`;
+/// nothing broader is (it would also take `Failed to connect to bus: No such file or directory`).
 inline ServiceFact parse_systemctl_is_enabled(std::string_view out, int exit_code, std::string_view unit) {
     const auto nl = out.find('\n');
     std::string_view first = nl == std::string_view::npos ? out : out.substr(0, nl);

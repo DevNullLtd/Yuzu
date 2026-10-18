@@ -41,24 +41,18 @@ class RemoteAccessAuditDefinitionColumns(unittest.TestCase):
 
     def test_description_states_fingerprints_only_and_configured_not_effective(self):
         text = _definition()["metadata"]["description"].lower()
-        self.assertIn("fingerprint", text)
-        self.assertIn("configured", text)
-        self.assertIn("not sshd's effective policy", text)
-        self.assertIn("comments", text)
-        self.assertIn("option values", text)
-        self.assertIn("key-file paths", text)
-        self.assertIn("off until enabled", text)
-        # what the audit does not cover is stated in the description, not only in the README
-        self.assertIn("does not read every way to log in", text)
-        self.assertIn("certificate authority", text)
-        self.assertIn("host-based authentication", text)
-        self.assertIn("access list", text)
-        self.assertIn("uid 500", text)
-        # the flagged set is the six closed-set keywords, AuthenticationMethods included, and the two
-        # undetectable gaps are stated as documented-only (no token), never as flagged
-        self.assertIn("authenticationmethods", text)
-        self.assertIn("one of these six", text)
-        self.assertIn("raise no token and are documented only", text)
+        for phrase in (
+            "fingerprint", "configured", "not sshd's effective policy", "comments", "option values",
+            "key-file paths", "off until enabled",
+            # what the audit does not cover is stated in the description, not only in the README
+            "does not read every way to log in", "certificate authority", "host-based authentication",
+            "access list", "uid 500",
+            # the flagged set is the six closed-set keywords, AuthenticationMethods included, and the
+            # two undetectable gaps are documented-only (no token), never flagged
+            "authenticationmethods", "one of these six", "raise no token and are documented only",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
 
     def test_header_separates_flagged_sources_from_undetectable_gaps(self):
         header = DEFINITION.read_text(encoding="utf-8").split("\n---\n", 1)[0]

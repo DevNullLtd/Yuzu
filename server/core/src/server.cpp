@@ -5257,11 +5257,8 @@ public:
             }
         }
 
-        // remote_access_audit (per-account SSH authorized_keys
-        // fingerprints plus sshd_config and service state) ships default-off,
-        // same Forensics-class posture as privacy_permissions. An operator
-        // must explicitly enable it via PUT
-        // /api/v1/plugin-config/remote_access_audit/kill-switch.
+        // remote_access_audit ships default-off (Forensics class, like privacy_permissions);
+        // enable via PUT /api/v1/plugin-config/remote_access_audit/kill-switch.
         if (plugin_config_store_ && !startup_failed_) {
             if (!plugin_config_store_->seed_kill_switch_default_off(
                     "remote_access_audit",

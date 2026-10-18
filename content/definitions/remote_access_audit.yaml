@@ -86,16 +86,6 @@ spec:
     properties: {}
 
   result:
-    # Rows are discriminated by field 0 (row_kind); "-" is an absent value. A status row always
-    # comes first, then the three source rows, then every config row, then the service rows,
-    # then a file row per authorized_keys file followed by one key row per accepted key line.
-    #
-    #   status|list|<supported|constrained|permission_denied|unsupported>|<reason tokens or ->
-    #   source|<sshd_config|homes|service>|<read|absent|refused|failed>|<count or ->[|<skipped homes or ->]
-    #   config|<key>|<value or ->|<origin: sshd_config|include:<file name> or ->
-    #   service|<unit>|<state>|<systemctl_is_enabled|launchctl_print_disabled>
-    #   file|<account>|<authorized_keys|authorized_keys2|custom>|<read|absent|refused|failed>|<keys>|<malformed>|<oversized>
-    #   key|<account>|<kind>|<key type>|<SHA256:fingerprint>|<bits or ->|<flags or ->|<option names or ->
     columns:
       - name: row_kind
         type: string

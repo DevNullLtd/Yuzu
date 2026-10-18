@@ -44,13 +44,9 @@
  *
  * LEAF POLICY: the *_no_follow functions are the default and the only safe
  * choice wherever the audited subject can write the path (a link there would
- * make a privileged reader open what the subject cannot). Leaf::follow
- * (open_dir / read_file / read_file_at) exists for trees writable by root
- * only, e.g. /etc/ssh, where a link is root's own configuration (NixOS and
- * stock macOS ship such links) and the daemon being modelled follows it too.
- * Follow mode still refuses a non-regular target by fstat on the descriptor it
- * reads (no TOCTOU), caps the size, and keeps the single-component and
- * plain-leaf-path guards.
+ * make a privileged reader open what the subject cannot). Leaf::follow is
+ * for root-only trees such as /etc/ssh. Follow mode still refuses a
+ * non-regular target by fstat on the descriptor it reads.
  *
  * Blocking: open and read carry no deadline of their own, so a path on a dead
  * hard network mount can pin the calling worker (#4875 tracks the host-level

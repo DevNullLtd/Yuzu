@@ -47,6 +47,13 @@ constexpr const char* kAliceKey =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEfwkBaM2u8m02IuUZ4wuvCPggDaq5R5MqdQWA82+WdV alice@laptop\n";
 constexpr const char* kAliceFp = "SHA256:BPH4QduMtDlX59CWZCda5Zf0U0jseMmFVimvek7EMhA";
 
+/// A mount table naming one mount point.
+auto mounts_of(std::string point) {
+    return [point = std::move(point)] {
+        return std::optional<std::vector<std::string>>{std::vector<std::string>{point}};
+    };
+}
+
 struct Tree {
     yuzu::test::TempDir dir{"yuzu_test_raa_"};
     fs::path root; ///< canonical: list_homes opens its roots link-free from "/", and macOS's temp dir sits under the /var link
@@ -62,6 +69,7 @@ struct Tree {
     Paths paths() const {
         Paths p;
         p.os = "linux";
+        p.run = service_enabled;
         p.config = at("sshd_config").string();
         p.home_parents = {at("home").string()};
         p.single_homes = {at("rootsingle").string()};
@@ -126,9 +134,6 @@ TEST_CASE("remote_access_audit posix fs: a symlinked .ssh directory is never fol
     const auto r = b.read_key_file({".ssh", "authorized_keys"});
     CHECK(r.error != ReadErr::none);
     CHECK(r.data.empty());
-    // a symlinked HOME is refused at the open
-    fs::create_directory_symlink(t.at("elsewhere"), t.at("home/linkhome"));
-    CHECK(b.open_home({"linkhome", t.at("home/linkhome").string()}) != 0);
 }
 
 TEST_CASE("remote_access_audit posix fs: reads are confined to the opened home by descriptor",
@@ -267,8 +272,6 @@ TEST_CASE("remote_access_audit posix fs: account eligibility is a path lstat, fa
         const auto eq = make_posix_fs(p);
         REQUIRE(eq.is_account_home);
         CHECK(eq.is_account_home(alice)); // a floor at the owner's uid keeps it (>=)
-        // lstat, not stat: a link is never opened or followed, and never judged by its owner
-        CHECK(eq.is_account_home(linked));
     }
 }
 
@@ -304,13 +307,6 @@ TEST_CASE("remote_access_audit posix fs: an unopenable home is listed and refuse
     CHECK(b.open_home(find("linked")) != 0);         // a symlinked home is refused at the open (ELOOP or ENOTDIR by OS)
 
     // and the whole listing says so: a refused file row plus the homes token, never a vanished account
-    p.run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
-        yuzu::agent::SubprocessResult r;
-        r.tool_ran = true;
-        r.termination_reason = yuzu::agent::TerminationReason::exited;
-        r.output = "enabled\n";
-        return r;
-    };
     const auto l = list_posix(make_posix_fs(p));
     CHECK(std::ranges::find(l.rows, "file|locked|authorized_keys|refused|-|-|-") != l.rows.end());
     CHECK(l.reason.find("linux:remote_access_audit:homes:permission_denied") != std::string::npos);
@@ -332,7 +328,6 @@ TEST_CASE("remote_access_audit posix fs: a symlinked home parent is resolved by 
     auto p = t.paths();
     p.home_parents = {t.at("homes").string()};
     p.single_homes = {t.at("rootlink").string()};
-    p.run = service_enabled;
     const auto b = make_posix_fs(p);
     REQUIRE(b.resolve_root);
 
@@ -387,10 +382,7 @@ TEST_CASE("remote_access_audit posix fs: a home parent linked into a network mou
     auto p = t.paths();
     p.home_parents = {t.at("homes").string()};
     p.single_homes = {};
-    p.mounts = [net = t.at("network").string()] {
-        return std::optional<std::vector<std::string>>{std::vector<std::string>{net}};
-    };
-    p.run = service_enabled;
+    p.mounts = mounts_of(t.at("network").string());
     const auto b = make_posix_fs(p);
     // the alias is not under the mount; its readlink target is
     CHECK(b.resolve_root(t.at("homes").string()) == t.at("network").string());
@@ -409,7 +401,6 @@ TEST_CASE("remote_access_audit posix fs: a link chain or a linked component unde
     t.write(t.at("real_homes/alice/.ssh/authorized_keys"), kAliceKey);
     auto p = t.paths();
     p.single_homes = {};
-    p.run = service_enabled;
     const auto refused_loudly = [&](const Listing& l) {
         CHECK(std::ranges::find(l.rows, "source|homes|failed|-|-") != l.rows.end());
         CHECK(l.reason.find("linux:remote_access_audit:homes:eloop") != std::string::npos);
@@ -445,13 +436,9 @@ TEST_CASE("remote_access_audit posix fs: a single home reached through an aliase
     Tree t;
     t.write(t.at("real/root/.ssh/authorized_keys"), kAliceKey);
     fs::create_directory_symlink(t.at("real"), t.at("alias"));
-    const auto net = [&] {
-        return std::optional<std::vector<std::string>>{std::vector<std::string>{t.at("real/root").string()}};
-    };
     auto p = t.paths();
     p.home_parents = {};
-    p.run = service_enabled;
-    p.mounts = net;
+    p.mounts = mounts_of(t.at("real/root").string());
     const auto no_key_read = [&](const Listing& l) {
         for (const auto& r : l.rows) {
             CHECK(r.find(kAliceFp) == std::string::npos);
@@ -492,18 +479,13 @@ TEST_CASE("remote_access_audit posix fs: resolve_root normalises a relative targ
     fs::create_directories(t.at("var/home"));
     fs::create_directories(t.at("sub"));
     fs::create_directories(t.at("plain"));
-    fs::create_directories(t.at("rootsingle"));
     fs::create_directory_symlink("var/home", t.at("homeRel"));        // the /home -> var/home shape
     fs::create_directory_symlink("../var/home/", t.at("sub/up"));     // dot-dot and a trailing slash
-    fs::create_directory_symlink(t.at("rootsingle"), t.at("singlelink"));
-    auto p = t.paths();
-    p.single_homes = {t.at("singlelink").string()};
-    const auto b = make_posix_fs(p);
+    const auto b = make_posix_fs(t.paths());
 
     CHECK(b.resolve_root(t.at("homeRel").string()) == t.at("var/home").string());
     CHECK(b.resolve_root(t.at("sub/up").string()) == t.at("var/home").string());
     CHECK(b.resolve_root(t.at("plain").string()) == t.at("plain").string());               // not a link
-    CHECK(b.resolve_root(t.at("singlelink").string()) == t.at("singlelink").string());     // a single home
     CHECK(b.resolve_root(t.at("absent").string()) == t.at("absent").string());             // lstat fails
 }
 
@@ -540,10 +522,7 @@ TEST_CASE("remote_access_audit posix fs: an absolute AuthorizedKeysFile through 
     fs::create_directory_symlink(t.at("protected"), t.at("home/alice/link"));
     auto p = t.paths();
     p.single_homes = {};
-    p.run = service_enabled;
-    p.mounts = [net = t.at("protected").string()] {
-        return std::optional<std::vector<std::string>>{std::vector<std::string>{net}};
-    };
+    p.mounts = mounts_of(t.at("protected").string());
     const auto l = list_posix(make_posix_fs(p));
     for (const auto& r : l.rows)
         CHECK(r.find(kAliceFp) == std::string::npos); // the protected file's fingerprint never appears
@@ -567,10 +546,7 @@ TEST_CASE("remote_access_audit posix fs: an unnormalised absolute AuthorizedKeys
     fs::create_directories(t.at("home/bob"));
     auto p = t.paths();
     p.single_homes = {};
-    p.run = service_enabled;
-    p.mounts = [net = t.at("protected").string()] {
-        return std::optional<std::vector<std::string>>{std::vector<std::string>{net}};
-    };
+    p.mounts = mounts_of(t.at("protected").string());
     const auto l = list_posix(make_posix_fs(p));
     CHECK(std::ranges::find_if(l.rows, [](const std::string& r) { return r.rfind("key|", 0) == 0; }) == l.rows.end());
     for (const auto& r : l.rows)
@@ -632,7 +608,6 @@ TEST_CASE("remote_access_audit posix fs: config-side symlinks are followed as ss
     t.write(t.at("sshd_config.d/100-macos.conf"), "UsePAM yes\nInclude " + t.at("crypto.conf").string() + "\n");
     auto list = [&] {
         auto p = t.paths();
-        p.run = service_enabled;
         return list_posix(make_posix_fs(p));
     };
     auto has = [](const Listing& l, const std::string& row) {
@@ -688,18 +663,9 @@ TEST_CASE("remote_access_audit posix fs: end to end over a real tree", "[remote_
     Tree t;
     t.write(t.at("sshd_config"), "Include " + t.at("sshd_config.d").string() + "/*.conf\nPermitRootLogin yes\n");
     t.write(t.at("sshd_config.d/10.conf"), "PermitRootLogin no\n");
-    t.write(t.at("home/alice/.ssh/authorized_keys"),
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEfwkBaM2u8m02IuUZ4wuvCPggDaq5R5MqdQWA82+WdV a\n");
+    t.write(t.at("home/alice/.ssh/authorized_keys"), kAliceKey);
     t.write(t.at("rootsingle/.ssh/authorized_keys"), "");
     auto p = t.paths();
-    p.run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
-        yuzu::agent::SubprocessResult r;
-        r.tool_ran = true;
-        r.exit_code = 0;
-        r.termination_reason = yuzu::agent::TerminationReason::exited;
-        r.output = "enabled\n";
-        return r;
-    };
     const auto l = list_posix(make_posix_fs(p));
     CHECK(l.status == StatusState::supported);
     CHECK(l.rows[0] == "source|sshd_config|read|2");

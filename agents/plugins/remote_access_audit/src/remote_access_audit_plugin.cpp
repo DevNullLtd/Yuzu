@@ -1,22 +1,13 @@
 /**
- * remote_access_audit_plugin.cpp -- the SSH inbound-access audit of this host, for Yuzu.
+ * remote_access_audit_plugin.cpp -- the SSH inbound-access audit of this host.
  *
- * Action:
- *   "list" -- who can log in over SSH, as CONFIGURED:
- *               Linux   sshd_config (Include followed), per-account authorized_keys
- *                       fingerprints and `systemctl is-enabled` for the sshd units;
- *               macOS   the same files plus `launchctl print-disabled system`;
- *               Windows PLANNED (not read yet).
+ * "list" -- who can log in over SSH, as CONFIGURED: sshd_config (Include followed), per-account
+ * authorized_keys fingerprints and the sshd service state (Linux `systemctl is-enabled`, macOS
+ * `launchctl print-disabled system`). Windows is PLANNED. READ-ONLY, facts only: fingerprints
+ * and option NAMES, never a comment, option value or key-file path.
  *
- * READ-ONLY and FACTS ONLY. Key fingerprints and option NAMES, never a key comment, an option
- * value or a key-file path. sshd_config as written, not sshd's effective policy (Match is not
- * evaluated, defaults are not applied). A refused or failed read is reported as
- * permission_denied/constrained with a token, never as an empty result.
- *
- * This TU is portable except for its single dispatch #if, which selects the platform's leg
- * function and exception token (`kLeg`, `kLegExceptionToken`) and ends in an #error. All
- * three descriptor legs are declared unconditionally so the capability-matrix generator
- * sees a stable shape on every host.
+ * Portable except the single dispatch #if selecting the leg (`kLeg`, `kLegExceptionToken`);
+ * all three descriptor legs are declared unconditionally for the capability-matrix generator.
  */
 
 #include <yuzu/plugin.hpp>

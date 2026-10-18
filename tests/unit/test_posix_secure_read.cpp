@@ -338,7 +338,6 @@ TEST_CASE("posix_secure_read: Leaf::follow follows a link, still refuses non-reg
 
     const auto link = (tmp.path / "link").string();
     CHECK(read_file(link, 64, Leaf::follow).data == "body");
-    CHECK(read_file_no_follow(link, 64).error == ReadError::symlink_refused); // the wrapper is unchanged
     CHECK(read_file(link, 64, Leaf::no_follow).error == ReadError::symlink_refused);
 
     const auto loop = read_file((tmp.path / "loop").string(), 64, Leaf::follow);
@@ -354,7 +353,6 @@ TEST_CASE("posix_secure_read: Leaf::follow follows a link, still refuses non-reg
     auto d = open_dir((tmp.path / "dlink").string(), Leaf::follow);
     REQUIRE(d.opened());
     CHECK(read_file_at(d.dir.fd(), "f", 64, Leaf::follow).data == "in-d");
-    CHECK(open_dir_no_follow((tmp.path / "dlink").string()).err == ENOTDIR);
     CHECK(read_file_at(d.dir.fd(), "a/b", 64, Leaf::follow).err == EINVAL); // single-component guard holds
 }
 

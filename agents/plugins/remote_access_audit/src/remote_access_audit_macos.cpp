@@ -1,11 +1,8 @@
 /**
- * remote_access_audit_macos.cpp -- macOS leg: sshd_config (Include followed), per-account
- * authorized_keys fingerprints and the sshd launchd override state via
- * `launchctl print-disabled system` (rung 2, a bounded argv runner; it works unprivileged).
- *
- * Only the path binding, the mount-table read and the runner live here; every decision is
- * `list_posix` in remote_access_audit_legs.hpp. The mount table comes from
- * getmntinfo_r_np(MNT_NOWAIT), the kernel's cache, which never calls into a wedged server.
+ * remote_access_audit_macos.cpp -- macOS leg: the path binding, the mount-table read and the
+ * `launchctl print-disabled system` runner (rung 2; works unprivileged). Every decision is
+ * `list_posix`. The mount table is getmntinfo_r_np(MNT_NOWAIT), the kernel's cache, which
+ * never calls into a wedged server.
  */
 #include "remote_access_audit_legs.hpp"
 

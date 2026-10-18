@@ -1,21 +1,15 @@
 /**
- * base64.hpp -- dependency-free, strict RFC 4648 base64 (standard alphabet).
+ * base64.hpp -- dependency-free, portable, strict RFC 4648 base64 (standard alphabet).
  *
- * Portable on every OS: no OS headers, no yuzu/ includes, no crypto library. Pinned against
- * the RFC 4648 section 10 vectors in tests/unit/test_base64.cpp.
- *
- * base64_decode is STRICT, as OpenSSH's sshbuf_b64tod is: the alphabet only, length a multiple
- * of four, padding only as the final one or two characters, and no whitespace or newline
- * tolerance. Any deviation answers nullopt, never a best-effort partial decode -- the caller
- * is parsing attacker-writable files and must be able to tell "malformed" from "empty".
- * Non-canonical trailing bits in a padded final quantum ("Zh==" for "f") are rejected too, as
- * OpenSSH's b64_pton does ("subliminal channel"): `ssh-keygen -l` refuses such a key line.
- *
- * base64_encode(bytes, pad=false) is the unpadded form `ssh-keygen -l` prints after `SHA256:`.
+ * base64_decode is STRICT, as OpenSSH's sshbuf_b64tod is: alphabet only, length a multiple of
+ * four, padding only as the final one or two characters, no whitespace tolerance, and
+ * non-canonical trailing bits ("Zh==" for "f") rejected (b64_pton's "subliminal channel").
+ * Any deviation answers nullopt, never a partial decode: the caller parses attacker-writable
+ * files and must tell "malformed" from "empty". base64_encode(bytes, false) is the unpadded
+ * form `ssh-keygen -l` prints after `SHA256:`.
  */
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <optional>
 #include <string>

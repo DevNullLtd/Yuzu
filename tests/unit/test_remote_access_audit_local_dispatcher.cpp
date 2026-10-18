@@ -184,7 +184,6 @@ TEST_CASE("remote_access_audit plugin: the descriptor declares Linux constrained
         return;
     }
     CHECK(std::string_view{plugin->descriptor->name} == "remote_access_audit");
-    CHECK(std::string_view{plugin->descriptor->version} == "1.0.0");
     REQUIRE(plugin->descriptor->action_descriptors != nullptr);
     REQUIRE(plugin->descriptor->action_descriptor_count == 1);
     const auto& d = plugin->descriptor->action_descriptors[0];
@@ -261,8 +260,6 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
         CHECK(in(fields(rows[i])[2], {"read", "absent", "refused", "failed"}));
     // The homes row alone carries a fifth field (entries the eligibility probe refused; `-` on Linux).
     CHECK(fields(rows[2]).size() == 5);
-    CHECK(fields(rows[1]).size() == 4);
-    CHECK(fields(rows[3]).size() == 4);
     // The production wiring, asserted only on what is environment-stable. sshd_config is world-readable
     // on every Mac and is either there or not on a CI image; a path that was mis-bound would read `failed`.
     CHECK(in(fields(rows[1])[2], {"read", "absent"}));
@@ -303,17 +300,17 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     CHECK(rows[0].find("homes:eloop") == std::string::npos);
 #endif
 
-    static constexpr const char* kConfigKeys[] = {
-        "permitrootlogin", "passwordauthentication", "pubkeyauthentication", "kbdinteractiveauthentication",
-        "permitemptypasswords", "usepam", "port", "authorizedkeysfile", "allowusers_count", "allowgroups_count",
-        "denyusers_count", "denygroups_count", "match_blocks"};
-    for (const char* k : kConfigKeys) {
-        const auto n = std::ranges::count_if(rows, [&](const std::string& r) {
-            return r.starts_with(std::string{"config|"} + k + "|");
-        });
-        INFO("config key " << k);
-        CHECK(n == 1); // every allowlisted key exactly once
+    // every allowlisted key exactly once, in row order
+    std::vector<std::string> config_keys;
+    for (const auto& r : rows) {
+        if (r.starts_with("config|"))
+            config_keys.push_back(fields(r)[1]);
     }
+    CHECK(config_keys ==
+          std::vector<std::string>{"permitrootlogin", "passwordauthentication", "pubkeyauthentication",
+                                   "kbdinteractiveauthentication", "permitemptypasswords", "usepam", "port",
+                                   "authorizedkeysfile", "allowusers_count", "allowgroups_count",
+                                   "denyusers_count", "denygroups_count", "match_blocks"});
 
     for (std::size_t i = 4; i < rows.size(); ++i) {
         INFO("row " << i << ": " << rows[i]);

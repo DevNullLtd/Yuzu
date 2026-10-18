@@ -11,12 +11,9 @@
 /// (`agents/plugins/remote_access_audit/src/remote_access_audit_plugin.cpp`). Classified by
 /// reading the implementation.
 ///
-/// `list` is ReadOnly/None -- the plugin never writes a file, edits sshd_config, adds or
-/// removes an authorized key, or starts or stops a service. It reads /etc/ssh/sshd_config
-/// (Include followed) and each account's authorized_keys with bounded no-follow reads, and
-/// runs exactly one fixed read-only argv per sshd unit (`systemctl is-enabled`) or one
-/// `launchctl print-disabled system`. It emits key FINGERPRINTS and option NAMES only: never a
-/// key comment, an option value (command=, from=, principals=) or a key-file path.
+/// `list` is ReadOnly/None -- the plugin never writes a file or changes a key or service. It
+/// reads sshd_config and each account's authorized_keys with bounded no-follow reads, runs one
+/// fixed read-only argv per sshd unit, and emits key FINGERPRINTS and option NAMES only.
 ///
 /// Grouped under the SAME `Forensics` securable execution_artifacts and privacy_permissions
 /// use (`rbac_store.cpp`'s seeded `types[]` entry; the string below MUST equal that seed
@@ -25,10 +22,9 @@
 /// `dispatch_destructive_gate.hpp`'s `kForensicsSecurable`/`requires_explicit_targets`
 /// single-target + audited enforcement for free.
 ///
-/// `authz::RiskTier::High`: per-account SSH key fingerprints on a SINGLE named machine are
-/// identity material -- they name which keys can log in as which account, the evidence an
-/// operator triages a compromise with and a rogue operator identity could misuse to map a
-/// target's access. Ships default-off behind the plugin-config kill switch.
+/// `authz::RiskTier::High`: per-account SSH key fingerprints on a SINGLE named machine name
+/// which keys can log in as which account -- identity material. Ships default-off behind the
+/// plugin-config kill switch.
 namespace yuzu::server::capdecls {
 
 namespace detail {
