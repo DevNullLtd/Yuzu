@@ -1065,7 +1065,13 @@ int64_t db_now_epoch(pg::PgPool& pool) {
 }
 } // namespace
 
-TEST_CASE("ApprovalManager: reviewed_at and consumed_at are database time",
+// NAME HONESTY (G8-QE-1): this test compares the stamps with database-clock bounds read in
+// the same process on the same host, where the process clock and the database clock agree, so
+// it proves the stamps are written and plausible -- it CANNOT observe which clock produced
+// them. The clock SOURCE is pinned by the source tripwire further down ("review and consume
+// stamps and every expiry cutoff are authored in-SQL").
+TEST_CASE("ApprovalManager: reviewed_at and consumed_at are written and fall inside the "
+          "call's window (clock SOURCE is pinned by the source tripwire)",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
@@ -1129,8 +1135,10 @@ TEST_CASE("ApprovalManager: an approved ticket reviewed in the future is not con
     CHECK(swept->status == "expired");
 }
 
-TEST_CASE("ApprovalManager: submit() sweep cutoff comes from the database clock -- live "
-          "tickets of every age inside the TTL survive it",
+// NAME HONESTY (G8-QE-1): 6-day-old rows survive an app-clock cutoff too, so this proves live
+// tickets inside the TTL survive the sweep, not that the cutoff is database time (pinned by
+// the source tripwire below).
+TEST_CASE("ApprovalManager: submit() sweep leaves live tickets of every age inside the TTL",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
@@ -1158,27 +1166,140 @@ TEST_CASE("ApprovalManager: submit() sweep cutoff comes from the database clock 
     CHECK(mgr.consume_ticket(*approved, "operator1", {}).has_value());
 }
 
-TEST_CASE("ApprovalManager: no review stamp or expiry cutoff comes from the process clock "
-          "(UP-3/UP-4 tripwire)",
-          "[approval_manager][approval]") {
+namespace {
+// approval_manager.cpp with `//` comments removed (string-literal aware), so a comment that
+// merely names an identifier is not counted as a code site.
+std::string approval_manager_code_without_comments() {
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
-    // The skew defect cannot be simulated in-process (the database clock is not injectable),
-    // so pin its cause instead: reviewed_at, consumed_at and every cutoff are authored
-    // in-SQL. The ONE process-clock read left is submitted_at's submit_stamp_epoch(), kept
-    // because ScheduleRunner compares it with ScheduleEngine's process-clock stamps; a
-    // second clock read means a new stamp or cutoff slipped back onto the process clock.
     std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "approval_manager.cpp");
     REQUIRE(in.is_open());
-    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    std::size_t clock_reads = 0;
-    for (auto pos = src.find("system_clock::now"); pos != std::string::npos;
-         pos = src.find("system_clock::now", pos + 1))
-        ++clock_reads;
-    CHECK(clock_reads == 1);
-    CHECK(src.find("std::time(") == std::string::npos);
-    CHECK(src.find("time(nullptr)") == std::string::npos);
+    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    std::string out;
+    bool in_str = false;
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        const char c = src[i];
+        if (in_str) {
+            out += c;
+            if (c == '\\' && i + 1 < src.size())
+                out += src[++i];
+            else if (c == '"')
+                in_str = false;
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+            out += c;
+        } else if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            while (i < src.size() && src[i] != '\n')
+                ++i;
+            out += '\n';
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+std::size_t count_occurrences(const std::string& hay, std::string_view needle) {
+    std::size_t n = 0;
+    for (auto pos = hay.find(needle); pos != std::string::npos; pos = hay.find(needle, pos + 1))
+        ++n;
+    return n;
+}
+
+// The statement that starts at `anchor`, through its terminating ';' ("" if the anchor is
+// absent, which the callers REQUIRE against so a refactor that renames it fails loudly).
+std::string statement_from(const std::string& code, std::string_view anchor) {
+    const auto pos = code.find(anchor);
+    if (pos == std::string::npos)
+        return {};
+    const auto semi = code.find(';', pos);
+    return code.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos + 1);
+}
+} // namespace
+
+// G8-QE-1 (UP-3/UP-4 closure evidence). The skew defect cannot be simulated in-process (the
+// database clock is not injectable, and the behavioural tests above run both clocks on one
+// host), so this pins the CAUSE at the source: the review/consume stamps and every expiry
+// cutoff are authored in-SQL from kDbNowEpochSql, and the process clock is read at exactly
+// one documented place (submit()'s submitted_at). Reusing submit_stamp_epoch() for
+// reviewed_at, or adding a second process-clock read, fails here.
+TEST_CASE("ApprovalManager: review and consume stamps and every expiry cutoff are authored "
+          "in-SQL from the database clock; the process clock is read at ONE site "
+          "(UP-3/UP-4 source tripwire)",
+          "[approval_manager][approval]") {
+    const std::string code = approval_manager_code_without_comments();
+
+    // (a) The process clock: ONE system_clock read (inside submit_stamp_epoch's body) and
+    // ONE submit_stamp_epoch call site (submit()'s submitted_at), plus the definition.
+    CHECK(count_occurrences(code, "system_clock::now") == 1);
+    CHECK(count_occurrences(code, "submit_stamp_epoch(") == 2); // definition + the one call
+    CHECK(code.find("std::time(") == std::string::npos);
+    CHECK(code.find("time(nullptr)") == std::string::npos);
+    const auto submitted_at = statement_from(code, "const std::string submitted_at");
+    REQUIRE_FALSE(submitted_at.empty());
+    CHECK(submitted_at.find("submit_stamp_epoch(") != std::string::npos);
+
+    // (b) The database clock: each stamp / cutoff statement names kDbNowEpochSql (directly or
+    // via the shared liveness predicate) and none of them can reach the process clock.
+    const auto review = statement_from(code, "const std::string review_sql");
+    const auto consume = statement_from(code, "const std::string consume_sql");
+    const auto db_now = statement_from(code, "const std::string db_now");
+    const auto sweep_pending = statement_from(code, "const std::string sweep_pending_sql");
+    const auto sweep_approved = statement_from(code, "const std::string sweep_approved_sql");
+    const auto live_now = statement_from(code, "const std::string now =");
+    const auto live_stmt = statement_from(code, "const std::string live_sql");
+    for (const auto* stmt :
+         {&review, &consume, &db_now, &sweep_pending, &sweep_approved, &live_now, &live_stmt})
+        REQUIRE_FALSE(stmt->empty());
+
+    CHECK(review.find("kDbNowEpochSql") != std::string::npos);   // reviewed_at
+    CHECK(consume.find("kDbNowEpochSql") != std::string::npos);  // consumed_at
+    CHECK(consume.find("ticket_live_sql()") != std::string::npos);
+    CHECK(db_now.find("kDbNowEpochSql") != std::string::npos);   // the pending-sweep cutoff
+    CHECK(sweep_pending.find("db_now") != std::string::npos);
+    CHECK(live_now.find("kDbNowEpochSql") != std::string::npos); // the liveness predicate
+    CHECK(live_stmt.find("ticket_live_sql()") != std::string::npos);
+    CHECK(sweep_approved.find("live_sql") != std::string::npos); // approved sweep cutoff
+    for (const auto* stmt : {&review, &consume, &db_now, &sweep_pending, &sweep_approved, &live_now,
+                             &live_stmt}) {
+        CHECK(stmt->find("submit_stamp_epoch") == std::string::npos);
+        CHECK(stmt->find("system_clock") == std::string::npos);
+    }
+}
+
+// G8-QE-7. submitted_at is DELIBERATELY stamped from the process clock (not database time):
+// ScheduleRunner's occurrence anchor (ticket_is_current) compares it with ScheduleEngine's
+// process-clock last_executed_at/created_at, and moving only one side to database time would
+// make that comparison cross-clock (a spent ticket looking newer than its occurrence, one
+// approval firing more than once). The residual -- a schedule re-fire under process/database
+// skew -- is tracked in #6096. If you are changing this, you are changing that trade-off:
+// move ScheduleEngine's stamps in the same change and update this test consciously.
+TEST_CASE("ApprovalManager: submitted_at is deliberately process-clock stamped (#6096 residual)",
+          "[pg][approval_manager][approval]") {
+    const std::string code = approval_manager_code_without_comments();
+    const auto stamp = statement_from(code, "const std::string submitted_at");
+    REQUIRE_FALSE(stamp.empty());
+    CHECK(stamp.find("submit_stamp_epoch(") != std::string::npos);
+    CHECK(stamp.find("kDbNowEpochSql") == std::string::npos);
+
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+    auto epoch = [] {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    };
+    const int64_t before = epoch();
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    const int64_t after = epoch();
+    REQUIRE(id.has_value());
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->submitted_at >= before);
+    CHECK(row->submitted_at <= after);
 }
 
 TEST_CASE("ApprovalManager::ticket_is_live: the shared liveness predicate",
