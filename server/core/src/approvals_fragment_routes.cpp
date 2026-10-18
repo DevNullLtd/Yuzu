@@ -1,6 +1,7 @@
 #include "approvals_fragment_routes.hpp"
 
 #include "approval_manager.hpp"
+#include "approver_assurance.hpp"
 #include "approvals_page_render.hpp"
 #include "http_route_sink.hpp"
 #include "instruction_store.hpp"
@@ -63,6 +64,13 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
             // but empty = every status. Validated BEFORE the store is read, so a typo
             // answers "unknown filter" and never reads as an empty queue.
             const bool view_page = req.get_param_value("view") == "page";
+            // Buttons are rendered only for a session the decide routes would accept on
+            // class (#6061): an interactive human, non-engine session. A bearer / engine /
+            // non-human viewer would only get a refusal, so the control is not offered.
+            // This mirrors the route's check (the one shared predicate); the route stays
+            // the authority.
+            const bool approver_class_ok =
+                approval::check_approver_class(*session) == approval::ApproverRefusal::kNone;
             std::string status = req.has_param("status") ? req.get_param_value("status")
                                                          : (view_page ? "pending" : "");
             const auto& allowed = ApprovalManager::allowed_status();
@@ -101,7 +109,7 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                         return a.status == "pending" &&
                                (session->username.empty() || a.submitted_by != session->username);
                     });
-                view.can_decide = decidable_row && deps.probe_perm_fn &&
+                view.can_decide = approver_class_ok && decidable_row && deps.probe_perm_fn &&
                                   deps.probe_perm_fn(req, "Approval", "Approve");
                 view.rows.reserve(listed->approvals.size());
                 for (const auto& a : listed->approvals) {
@@ -156,7 +164,7 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             html += "<span class=\"hint\">"
                                     "You submitted this — another reviewer must "
                                     "approve</span>";
-                        } else {
+                        } else if (approver_class_ok) {
                             html += "<button class=\"btn btn-primary btn-sm\" "
                                     "hx-post=\"/api/approvals/" +
                                     a.id +
