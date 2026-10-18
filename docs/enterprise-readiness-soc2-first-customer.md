@@ -404,7 +404,15 @@ may be used for extra occurrences until it ages out (at most 7 days), or be igno
 again. Further small residuals (database-clock steps expiring approved tickets, a stale `approved`
 status on lists until the next sweep, no approval or schedule alert rules) are tracked in #6097 and
 #6098. Operator-facing detail: `docs/user-manual/instructions.md`, "Who can
-approve".
+approve". The MCP half is a recorded exception to the both-surfaces rule: ADR-1005's
+exception-ledger entry of 2026-10-18 (`docs/adr/1005-headless-platform-use-case-engines.md`,
+revisit 2027-01-18, a re-confirmation date rather than a deadline). Rows an auditor can sample for
+CC6.3: `approval.approve` / `approval.reject` carry an `attempted` row before the decision and an
+outcome row (`success`, or `denied` with the store's reason) after it, plus `denied` rows whose
+`detail` starts with `approver_assurance:` for a bearer or engine credential that reached the
+decision surface, and `mcp.approve_request` / `mcp.reject_request` refusals
+(`docs/user-manual/audit-log.md`; the reconciliation query for a lost outcome row is in
+`docs/ops-runbooks/audit-store-clock-guard.md`).
 
 ---
 

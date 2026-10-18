@@ -51,7 +51,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
 - **Expiry is enforced at consume.** An approved request not used within 7 days of its review is refused
   when it is consumed, using database time, even if no new request has been submitted since. The `status` shown on
   the Approvals page and returned by the list routes (`GET /api/approvals`, `GET /api/v1/approvals`, MCP
-  `list_pending_approvals`) is only rewritten to `expired` by the next approval submission, so an aged approved ticket
+  `list_pending_approvals`) is only rewritten to `expired` by the next accepted approval submission, so an aged approved ticket
   keeps showing `approved` until then even though consume and `ScheduleRunner` already refuse it (tracked in #6098).
 
 **Who this affects.** Any automation that approved or rejected over MCP or with an API token. It will now
@@ -101,7 +101,7 @@ list the SAML and `amr`-less OIDC operators who have signed in, query the login 
 retention window applies):
 
 ```sql
-SELECT principal, action, max(timestamp) AS last_login
+SELECT principal, action, to_timestamp(max(timestamp)) AS last_login
 FROM audit_store.audit_events
 WHERE action = 'auth.saml_login'
    OR (action = 'auth.oidc_login' AND detail LIKE '%amr_mfa_asserted=false%')
@@ -109,22 +109,43 @@ GROUP BY principal, action
 ORDER BY last_login DESC;
 ```
 
-That lists who signed in by those routes, not who holds `Approval:Approve`; compare it with the role assignments
-by hand. This guide gives no way to list local accounts that have no enrolled MFA factor, so check each approver's
-account individually.
+`timestamp` is epoch seconds, hence `to_timestamp`. That lists who signed in by those routes, not who holds
+`Approval:Approve`; compare it with the role assignments by hand. For an OIDC row the `detail` column carries the
+display name and e-mail (personal data), which helps match a principal to a person. To list the local accounts
+that have no enrolled MFA factor (read-only; SSO identities are rows with another `identity_source`), query the
+`auth` schema:
+
+```sql
+SELECT username, role, last_login_at
+FROM auth.users
+WHERE is_active
+  AND identity_source = 'local'
+  AND mfa_enrolled_at IS NULL
+ORDER BY username;
+```
+
+`role` is the account's legacy role column, not its RBAC grants, so compare the result with who holds
+`Approval:Approve`. An account listed here passes the step-up without a second factor.
 
 **After upgrading, verify approvals on a test request.**
 
-1. As a human approver on a signed-in browser session, approve a pending test request on the Approvals page. Expect
-   the step-up prompt if the proof is older than `--mfa-step-up-window-secs`, then success. The audit store
+1. Create a pending test request. Execute any instruction whose definition has `approval_mode: role-gated` or
+   `always` as one account (`POST /api/instructions/{id}/execute`, or from the dashboard); the `202` response carries
+   the `approval_id` when the caller needs approval, and the request appears on the Approvals page. **You need two distinct accounts:** the
+   submitter cannot approve their own request (that attempt answers `400` and leaves an `attempted` and a `denied`
+   row), so approve it as a different human account that holds `Approval:Approve`.
+2. As that human approver on a signed-in browser session, approve the pending test request on the Approvals page.
+   Expect the step-up prompt if the proof is older than `--mfa-step-up-window-secs`, then success. The audit store
    should show an `approval.approve` row with `result=attempted` followed by one with `result=success`, and the
-   `success` row should carry `principal_class = 'human'`.
-2. With an API token that holds `Approval:Approve`, send `POST /api/approvals/{id}/approve` for a pending request.
+   `success` row should carry `principal_class = 'human'`. If you script this step with a session cookie, send an
+   `Origin` header naming the server (for example `-H "Origin: https://yuzu.example.com"`), or the `POST` is
+   refused with `403` before anything is recorded other than a `csrf.denied` row.
+3. With an API token that holds `Approval:Approve`, send `POST /api/approvals/{id}/approve` for a pending request (create a second test request if step 2 already decided the first).
    Expect `403` with message `approver_assurance_required:non_interactive_session`, and one `approval.approve`
    row with `result=denied` and `detail=approver_assurance:non_interactive_session`. The same attempt through MCP
    `approve_request` returns `-32003` with the same message. (A token without `Approval:Approve` gets the plain
    permission `403` first, so it does not prove the new check.)
-3. Repeat step 1 with one account of each kind you run: a SAML user (expect `403` "MFA step-up is not available
+4. Repeat step 2 with one account of each kind you run: a SAML user (expect `403` "MFA step-up is not available
    for SAML sessions in this release"), an OIDC user your identity provider does not send an MFA `amr` for (what
    you see depends on `--mfa-enforcement`, as above), and a local account with no enrolled factor (it succeeds
    without a prompt for a second factor, which is the documented limit tracked in #6079).
