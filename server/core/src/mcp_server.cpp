@@ -2762,8 +2762,9 @@ static const ToolDef kTools[] = {
      "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
      "A human reviewer decides via the dashboard Approvals page or POST "
      "/api/approvals/{id}/approve from an interactive session that passes the existing "
-     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required, an "
-     "OIDC session without an amr proof pass it; --mfa-step-up-window-secs=0 disables it; "
+     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required "
+     "(or admin-only, for an admin role), an OIDC session without an amr proof pass it; "
+     "--mfa-step-up-window-secs=0 disables it; "
      "SAML sessions are refused, #4935; an enrolled-factor requirement is tracked in #6079).",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to approve"},)j"
@@ -2785,8 +2786,9 @@ static const ToolDef kTools[] = {
      "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
      "A human reviewer decides via the dashboard Approvals page or POST "
      "/api/approvals/{id}/reject from an interactive session that passes the existing "
-     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required, an "
-     "OIDC session without an amr proof pass it; --mfa-step-up-window-secs=0 disables it; "
+     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required "
+     "(or admin-only, for an admin role), an OIDC session without an amr proof pass it; "
+     "--mfa-step-up-window-secs=0 disables it; "
      "SAML sessions are refused, #4935; an enrolled-factor requirement is tracked in #6079).",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to reject"},)j"

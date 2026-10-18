@@ -1912,6 +1912,33 @@ TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST,
     CHECK(blob.find("reject_request") != std::string::npos);
 }
 
+// R3-CA-2: the approve_request/reject_request descriptions state the OIDC no-amr pass-through
+// the way mfa_step_up.cpp implements it (`mfa_enforcement_protects(mode, role)`): it ends under
+// --mfa-enforcement=required AND under admin-only for an admin role. The machine-readable
+// refusal token stays exact.
+TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the OIDC pass-through "
+          "precisely (R3-CA-2)",
+          "[mcp][2g][approval]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int seen = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (name != "approve_request" && name != "reject_request")
+            continue;
+        ++seen;
+        const auto desc = t["description"].get<std::string>();
+        INFO(name);
+        CHECK(desc.find("approver_assurance_required:<reason>") != std::string::npos);
+        CHECK(desc.find("--mfa-enforcement=required") != std::string::npos);
+        CHECK(desc.find("admin-only, for an admin role") != std::string::npos);
+    }
+    CHECK(seen == 2);
+}
+
 TEST_CASE("MCP 2g: instructions blob references every tool family (staleness tether A)",
           "[mcp][2g]") {
     McpTestServer ts;
