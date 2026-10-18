@@ -103,7 +103,7 @@ TEST_CASE("tokens write render: default flags draw no control at all (the read-o
     CHECK_THAT(html, !ContainsSubstring("data-tk=\"token-"));
     CHECK_THAT(html, !ContainsSubstring("class=\"acts\""));
     CHECK_THAT(html, !ContainsSubstring("Actions"));
-    CHECK_THAT(html, ContainsSubstring("Creating tokens needs the Administrator account role."));
+    CHECK_THAT(html, ContainsSubstring("Creating tokens needs an Administrator browser session."));
 }
 
 TEST_CASE("tokens write render: the header shows New API token only when create is allowed, else says what is missing",
@@ -211,6 +211,8 @@ TEST_CASE("tokens write render: a hostile token id gets no control and reaches n
         CHECK_THAT(html, !ContainsSubstring("hx-delete"));
         CHECK_THAT(html, !ContainsSubstring("hx-post"));
         CHECK_THAT(html, !ContainsSubstring("href="));
+        // The row itself is still drawn: refusing the controls does not hide the data.
+        CHECK_THAT(html, ContainsSubstring("alice</td>"));
     }
     CHECK(safe_token_id("a1b2c3"));
     CHECK(safe_token_id("Ab.c_d-e"));
@@ -239,7 +241,7 @@ TEST_CASE("principals write render: New principal only with the capability, else
     v.rows = {principal("bot")};
     v.roles = std::vector<PrincipalRole>{};
     CHECK_THAT(render_principals_list(v), !ContainsSubstring("principal-new"));
-    CHECK_THAT(render_principals_list(v), ContainsSubstring("Creating principals needs the Administrator account role."));
+    CHECK_THAT(render_principals_list(v), ContainsSubstring("Creating principals needs an Administrator browser session."));
     v.rbac_enforced = true;
     CHECK_THAT(render_principals_list(v), ContainsSubstring("Creating principals needs the Security:Write permission."));
     v.can_write = true;
@@ -361,4 +363,35 @@ TEST_CASE("principals write render: a hostile principal id draws no action and n
     CHECK(principal_slug("engine:bot") == "bot");
     CHECK(principal_slug("engine:../x").empty());
     CHECK(principal_slug("bot").empty());
+}
+
+TEST_CASE("tokens write render: Rotate carries the old token's expiry so the dialog offers only overlaps that fit",
+          "[access-tokens][render][writes]") {
+    const auto t = tok("aaa");
+    const auto html = render_tokens_list(view({t}), flags(kAll));
+    CHECK_THAT(html, ContainsSubstring("data-tk=\"token-rotate\" data-token-id=\"aaa\" data-name=\"ci\" data-expires-at=\"" +
+                                      std::to_string(t.expires_at) + "\""));
+    auto never = tok("bbb");
+    never.expires_at = 0;
+    CHECK_THAT(render_tokens_list(view({never}), flags(kAll)), ContainsSubstring("data-expires-at=\"0\""));
+}
+
+TEST_CASE("principals write render: a dot-only slug draws no role control (its URL segment would be resolved away)",
+          "[access-tokens][render][writes][urlsafety]") {
+    for (const char* id : {"engine:.", "engine:.."}) {
+        INFO(id);
+        PrincipalDetail d = detail({});
+        d.row.principal_id = id;
+        d.custom_roles = std::vector<std::string>{"Auditor"};
+        d.roles = std::vector<PrincipalRole>{{"engine", id, "Auditor"}};
+        const auto html = render_principal_detail(d, id);
+        CHECK_THAT(html, !ContainsSubstring("data-tk=\"role-"));
+        CHECK_THAT(html, !ContainsSubstring("data-slug="));
+        // The role itself is still listed, and the principal's own actions are unaffected.
+        CHECK_THAT(html, ContainsSubstring("Auditor"));
+        CHECK_THAT(html, ContainsSubstring("data-tk=\"principal-revoke\""));
+    }
+    CHECK(principal_slug("engine:.").empty());
+    CHECK(principal_slug("engine:..").empty());
+    CHECK(principal_slug("engine:a.b") == "a.b");
 }

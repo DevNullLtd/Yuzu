@@ -408,7 +408,7 @@ TEST_CASE("tokens page authz: a plain user with RBAC off may rotate their own to
     CHECK(has(res->body, "data-tk=\"token-rotate\""));
     CHECK_FALSE(has(res->body, "token-new"));
     CHECK_FALSE(has(res->body, "token-revoke"));
-    CHECK(has(res->body, "Creating tokens needs the Administrator account role."));
+    CHECK(has(res->body, "Creating tokens needs an Administrator browser session."));
     CHECK(r.denied_rows() == 0);
 }
 

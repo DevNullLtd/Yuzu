@@ -128,7 +128,7 @@ std::string primary_btn(const char* tk, const char* label) {
 std::string need_note(bool rbac_enforced, const char* what, const char* perm) {
     return std::string("<p class=\"hint\">") + what + " needs " +
            (rbac_enforced ? std::string("the ") + perm + " permission."
-                          : std::string("the Administrator account role.")) +
+                          : std::string("an Administrator browser session.")) +
            "</p>";
 }
 
@@ -165,7 +165,11 @@ std::string token_actions(const ApiToken& t, const std::vector<ApiToken>& all, c
                        "Confirm rotation");
         } else if (t.rotation_group.empty()) {
             if (t.expires_at == 0 || t.expires_at - f.now > kRotateMinRemainingSecs)
-                out += act("token-rotate", {{"data-token-id", t.token_id}, {"data-name", t.name}}, "Rotate");
+                out += act("token-rotate",
+                           {{"data-token-id", t.token_id},
+                            {"data-name", t.name},
+                            {"data-expires-at", std::to_string(t.expires_at)}},
+                           "Rotate");
             else
                 out += act("token-rotate", {{"data-token-id", t.token_id}}, "Rotate", false,
                            "A token within 24 hours of expiry cannot be rotated. Create a new one.");
@@ -276,7 +280,11 @@ std::vector<std::string> custom_role_names(const std::vector<RbacRole>& roles) {
 std::string principal_slug(std::string_view principal_id) {
     if (!valid_principal_id(principal_id))
         return {};
-    return std::string(principal_id.substr(7));  // after "engine:"
+    const auto slug = principal_id.substr(7);  // after "engine:"
+    // "." and ".." are valid ids but not URL path segments: no role URL can be built for them.
+    if (slug.find_first_not_of('.') == std::string_view::npos)
+        return {};
+    return std::string(slug);
 }
 
 bool valid_principal_id(std::string_view id) {
@@ -469,8 +477,8 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
     out += "</section>";
 
     // Roles: Unavailable is never "No roles".
-    const bool can_edit_roles = d.can_write && valid_principal_id(p.principal_id);
     const std::string slug = principal_slug(p.principal_id);
+    const bool can_edit_roles = d.can_write && !slug.empty();
     out += "<section class=\"panel\"><div class=\"hd\"><h2>Roles</h2>";
     const auto* custom = std::get_if<std::vector<std::string>>(&d.custom_roles);
     const char* no_assign = nullptr;  // why Assign is disabled, when it is

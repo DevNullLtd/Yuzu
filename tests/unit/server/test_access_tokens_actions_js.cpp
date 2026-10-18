@@ -113,7 +113,8 @@ TEST_CASE("actions glue: every id reaches a path only after a charset check and 
     // The charsets mirror the routes' own.
     CHECK_THAT(js(), ContainsSubstring("var TOKEN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;"));
     CHECK_THAT(js(), ContainsSubstring("var PRINCIPAL = /^engine:[a-z0-9._-]{1,128}$/;"));
-    CHECK_THAT(js(), ContainsSubstring("var SLUG = /^[a-z0-9._-]{1,128}$/;"));
+    // A dot-only slug is refused: no role URL can be built for "." or "..".
+    CHECK_THAT(js(), ContainsSubstring("var SLUG = /^(?!\\.+$)[a-z0-9._-]{1,128}$/;"));
     CHECK_THAT(js(), ContainsSubstring("function seg(v) { return encodeURIComponent(v); }"));
     // Every line that builds a request path may add only literals, seg(...) and the literal tail.
     std::size_t path_lines = 0;
@@ -145,9 +146,13 @@ TEST_CASE("actions glue: every mutation is a dialog form with a submit hook, so 
     CHECK_THAT(js(), !ContainsSubstring("D.confirm("));
     CHECK(count_of(js(), "D.request(") == 1);
     CHECK_THAT(js(), ContainsSubstring("return r.message || 'The request failed (HTTP ' + r.status + ').';"));
-    // A 5xx on a credential write may have changed state: the detail is reloaded, never retried.
-    CHECK_THAT(js(), ContainsSubstring("function refreshOnFail(id) { return function (r) { if (r.status >= 500) reloadDetail(id); }; }"));
-    CHECK(count_of(js(), "onFail: refreshOnFail(d.principalId)") == 3);
+    // A reply that leaves the outcome open (no answer, 404, 409, 5xx) refreshes what the action
+    // changes, once, never a retry. Every mutation names its refresh: 12 actions.
+    CHECK_THAT(js(), ContainsSubstring(
+        "function outcomeOpen(status) { return status === 0 || status === 404 || status === 409 || status >= 500; }"));
+    CHECK_THAT(js(), ContainsSubstring("if (o.refresh && outcomeOpen(r.status)) o.refresh();"));
+    CHECK(count_of(js(), "refresh: ") == 12);
+    CHECK_THAT(js(), !ContainsSubstring("onFail"));
     // A dropped audit row on a successful change is surfaced, persistently.
     CHECK_THAT(js(), ContainsSubstring("if (r.auditFailed) auditBanner();"));
 }
@@ -155,16 +160,23 @@ TEST_CASE("actions glue: every mutation is a dialog form with a submit hook, so 
 TEST_CASE("actions glue: copy and limits match the matrix", "[access-tokens][js][writes]") {
     // Settings' confirm sentences, verbatim.
     CHECK_THAT(js(), ContainsSubstring("Applications using this token will lose access."));
-    CHECK_THAT(js(), ContainsSubstring("This is TERMINAL - never un-revocable; recovery mints a successor."));
+    CHECK_THAT(js(), ContainsSubstring("This cannot be undone: a revoked principal stays revoked"));
     // MCP tokens: one hour short of 90 days; default overlap 7 days; ttl days 1..90.
     CHECK_THAT(js(), ContainsSubstring("var MCP_MAX_HOURS = 2159;"));
-    CHECK_THAT(js(), ContainsSubstring("value: String(7 * DAY)"));
+    // Overlap choices that fit the old token's remaining life; the default is the longest up to 7 days.
+    CHECK_THAT(js(), ContainsSubstring("d === 1 || d * DAY + OVERLAP_MARGIN <= leftSecs"));
+    CHECK_THAT(js(), ContainsSubstring("filter(function (d) { return d <= 7; }).pop()"));
+    CHECK_THAT(js(), ContainsSubstring("Number(d.expiresAt) - serverNow()"));
     CHECK_THAT(js(), ContainsSubstring("wholeNumber(v.days, 1, 90)"));
     // The recovery sentence names the 2-minute window and the way out after it.
     CHECK_THAT(js(), ContainsSubstring("Rotate again within 2 minutes to get the same secret."));
     CHECK_THAT(js(), ContainsSubstring("After that, revoke the new"));
     // expires_at comes from the server clock plus page-measured elapsed time.
     CHECK_THAT(js(), ContainsSubstring("serverNow() + h * 3600"));
+    // The server/page clock offset is taken from the wall clock, which keeps running across a
+    // laptop sleep (a monotonic timer can stop).
+    CHECK_THAT(js(), ContainsSubstring("Math.floor(Date.now() / 1000 + (nowBase - nowAt))"));
+    CHECK_THAT(js(), !ContainsSubstring("performance.now"));
     // A byte size may be large: whole numbers up to 15 digits stay exact in a JS Number.
     CHECK_THAT(js(), ContainsSubstring("/^\\d{1,15}$/.test(t)"));
     CHECK_THAT(js(), ContainsSubstring("Number(root.dataset.now)"));

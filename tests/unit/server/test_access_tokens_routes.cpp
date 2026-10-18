@@ -663,7 +663,7 @@ TEST_CASE("tokens routes: RBAC off - controls follow the account role and no pro
         CHECK_THAT(res->body, !ContainsSubstring("token-new"));
         CHECK_THAT(res->body, !ContainsSubstring("token-revoke"));
         CHECK_THAT(res->body, ContainsSubstring("data-tk=\"token-rotate\""));
-        CHECK_THAT(res->body, ContainsSubstring("Creating tokens needs the Administrator account role."));
+        CHECK_THAT(res->body, ContainsSubstring("Creating tokens needs an Administrator browser session."));
         CHECK(h.perm_calls.size() == 1);
     }
 }

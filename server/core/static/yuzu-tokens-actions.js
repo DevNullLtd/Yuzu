@@ -31,8 +31,10 @@
   var MCP_MAX_HOURS = 2159;
   var MAX_HOURS = 876000;
   var TOKEN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+  // A dot-only slug ("." or "..") is a valid id but not a URL path segment: encodeURIComponent
+  // leaves it alone and the browser would resolve it away, so no role URL is ever built for it.
   var PRINCIPAL = /^engine:[a-z0-9._-]{1,128}$/;
-  var SLUG = /^[a-z0-9._-]{1,128}$/;
+  var SLUG = /^(?!\.+$)[a-z0-9._-]{1,128}$/;
   var AUDIT_FAILED = 'The change was made, but its audit record could not be saved.';
 
   var secretShown = false;
@@ -45,15 +47,17 @@
 
   // ---- server clock -----------------------------------------------------------------------
   // expires_at is computed from the fragment's server time plus time elapsed on this page, so a
-  // skewed workstation clock cannot mint a wrong lifetime. The server validates it anyway.
+  // skewed workstation clock cannot mint a wrong lifetime. The offset between the server's clock
+  // and this one is taken once, when the list loads; the wall clock keeps running while a laptop
+  // sleeps, which a monotonic timer does not. The server validates the value anyway.
   document.body.addEventListener('htmx:afterSwap', function (e) {
     var t = e.detail && e.detail.target;
     if (!t || t.id !== 'tokens-body') return;
     var root = byId('tokens-root');
     nowBase = root ? Number(root.dataset.now) || 0 : 0;
-    nowAt = performance.now();
+    nowAt = Date.now() / 1000;
   });
-  function serverNow() { return nowBase ? Math.floor(nowBase + (performance.now() - nowAt) / 1000) : 0; }
+  function serverNow() { return nowBase ? Math.floor(Date.now() / 1000 + (nowBase - nowAt)) : 0; }
 
   // ---- reloads ----------------------------------------------------------------------------
   function load(url, targetId) { htmx.ajax('GET', url, { target: '#' + targetId }); }
@@ -184,10 +188,17 @@
     return n >= lo && n <= hi ? n : NaN;
   }
 
-  function overlapField() {
+  // The server rejects an overlap longer than the old token's remaining life, so only choices
+  // that fit are offered (one day is always kept: the row's own 24 h rule guarantees it fits) and
+  // the default is the largest of them up to 7 days. `leftSecs` is Infinity for a token that
+  // never expires.
+  var OVERLAP_MARGIN = 60;
+  function overlapField(leftSecs) {
+    var days = [1, 3, 7, 14, 30].filter(function (d) { return d === 1 || d * DAY + OVERLAP_MARGIN <= leftSecs; });
+    var def = days.filter(function (d) { return d <= 7; }).pop();
     return {
-      name: 'overlap', label: 'Keep the old one valid for', type: 'select', value: String(7 * DAY),
-      options: [1, 3, 7, 14, 30].map(function (d) {
+      name: 'overlap', label: 'Keep the old one valid for', type: 'select', value: String(def * DAY),
+      options: days.map(function (d) {
         return { value: String(d * DAY), label: d + (d === 1 ? ' day' : ' days') };
       })
     };
@@ -250,7 +261,7 @@
       body: ['Create a replacement for "' + (d.name || d.tokenId) + '"? Both tokens stay valid until the overlap ends. ' +
              'Move your automation to the new secret, then use Confirm rotation to retire the old one.',
              'Rotating again within 2 minutes returns the same secret.'],
-      fields: [overlapField()],
+      fields: [overlapField(d.expiresAt && serverNow() ? Number(d.expiresAt) - serverNow() : Infinity)],
       submitLabel: 'Rotate',
       method: 'POST', path: path, refresh: reloadTokens,
       json: function (v) { return { overlap_secs: parseInt(v.overlap, 10) }; }
@@ -353,7 +364,7 @@
     mutate({
       title: 'Rotate credential',
       body: 'Rotate the credential for "' + d.principalId + '"? Both credentials stay valid for the overlap window.',
-      fields: [overlapField()],
+      fields: [overlapField(Infinity)],  // engine credentials carry no remaining-life rule here
       submitLabel: 'Rotate',
       method: 'POST', path: path, refresh: detailRefresh(d.principalId),
       json: function (v) { return { overlap_secs: parseInt(v.overlap, 10) }; }
@@ -407,7 +418,7 @@
     mutate({
       title: 'Revoke principal', danger: true, submitLabel: 'Revoke',
       body: 'Revoke engine principal "' + d.principalId +
-            '"? This is TERMINAL - never un-revocable; recovery mints a successor.',
+            '"? This cannot be undone: a revoked principal stays revoked, and recovery means creating a successor.',
       fields: [{ name: 'successor', label: 'Successor principal id (optional)', type: 'text', maxlength: 160 }],
       validate: function (v) {
         var s = v.successor.trim();
