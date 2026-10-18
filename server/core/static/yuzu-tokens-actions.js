@@ -237,7 +237,7 @@
         if (h > 0 && !serverNow()) return 'The token list has not loaded yet. Reload the page.';
         return null;
       },
-      method: 'POST', path: API + 'tokens', refresh: reloadTokens,
+      method: 'POST', refresh: reloadTokens, path: API + 'tokens',
       json: function (v) {
         var h = String(v.hours).trim() === '' ? 0 : parseInt(v.hours, 10);
         var body = { name: v.name.trim(), expires_at: h > 0 ? serverNow() + h * 3600 : 0 };
@@ -321,7 +321,7 @@
       ],
       submitLabel: 'Create',
       validate: function (v) { return SLUG.test(v.slug.trim()) ? null : 'The slug may use a-z, 0-9, dot, underscore and hyphen, up to 128 characters.'; },
-      method: 'POST', path: API + 'engine-principals', refresh: reloadPrincipals,
+      method: 'POST', refresh: reloadPrincipals, path: API + 'engine-principals',
       json: function (v) {
         return { slug: v.slug.trim(), display_name: v.display_name.trim(), owner_username: v.owner_username.trim(),
                  justification: v.justification.trim(), classification: v.classification };
