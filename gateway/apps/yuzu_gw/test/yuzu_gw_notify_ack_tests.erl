@@ -93,12 +93,16 @@ planned_stop_test_() ->
 %% A restarted agent owner (OWNER-RESTART) waits on notify_settled/4 before it
 %% presents its predecessor's session to the server again. The retry set must
 %% not let a refused notice of that session follow the re-registration.
-%% Backoff 100 ms, so a refused notice waits in its timer when the settle is
-%% asked and becomes due while the (slow) re-registration is at the server.
+%% The backoff is 60 s, so a refused notice never becomes due on its own during
+%% a case: each case ends the backoff itself, when it chooses, by delivering the
+%% message the backoff timer would (due_message/2, deliver/1), including the
+%% stale one of a resend already cancelled, during the (slow) re-registration.
+%% These cases used a 100 ms backoff and relied on reading the waiting entry
+%% before it fell due, which a loaded host did not always do.
 owner_restart_settle_test_() ->
     {foreach,
-     fun() -> setup(#{notify_unacked_retry_base_ms => 100,
-                      notify_unacked_retry_max_ms => 100}) end,
+     fun() -> setup(#{notify_unacked_retry_base_ms => 60000,
+                      notify_unacked_retry_max_ms => 60000}) end,
      fun cleanup/1,
      [t("a settle cancels a waiting refused DISCONNECTED: none reaches the server after "
         "the re-registration",
@@ -350,22 +354,29 @@ a_planned_stop_sends_refused_disconnected_not_connected() ->
 %% successor's settle is answered, it re-registers (slow at the server) and
 %% casts CONNECTED. No DISCONNECTED may reach the server after the
 %% re-registration started: it would remove the session just presented again.
+%% The cancelled resend's backoff ends during the re-registration (its timer
+%% message was already on its way when the settle cancelled it).
 a_settle_cancels_a_waiting_disconnected_retry() ->
     [{Id, Sess}] = register_agents(<<"settle-wait">>, 1),
     Refusals = counter(1),
-    answer_owner(fun(#{event := 'DISCONNECTED'}) ->
-                         case take(Refusals) of true -> unacked; false -> ok end;
-                    (#{event := 'CONNECTED'}) -> ok
-                 end),
+    Answer = fun(#{event := 'DISCONNECTED'}) ->
+                     case take(Refusals) of true -> unacked; false -> ok end;
+                (#{event := 'CONNECTED'}) -> ok
+             end,
+    answer_owner(Answer),
     ok = notify(Id, Sess, disconnected),
     ?assertEqual(ok, wait_until(fun() -> length(notices(Id)) =:= 1 andalso settled() end)),
     ?assertMatch(#{status := {waiting, _}}, unacked_entry(Id, Sess)),
+    Due = due_message(Id, Sess),
     ok = await_settled(Id, Sess),
     ?assertEqual(none, unacked_entry(Id, Sess)),
+    Delivered = counter(0),
+    answer_owner(Answer, fun() -> ok = deliver(Due), bump(Delivered) end),
     {ok, _} = yuzu_gw_upstream:reregister_session(register_req(Id), Sess, #{}),
+    ?assertEqual(1, atomics:get(Delivered, 1)),
     ok = notify(Id, Sess, connected),
     ?assertEqual(ok, wait_until(fun() -> lists:keymember(connected, 2, notices(Id)) end)),
-    timer:sleep(5 * 100),
+    ?assertEqual(ok, wait_until(fun settled/0)),
     ?assertEqual([{disconnected, unacked}, {reregister, ok}, {connected, ok}],
                  [{E, A} || {_, E, A} <- notices(Id)]),
     ?assertEqual(1, event_count([yuzu, gw, upstream, notify_unacked_ended],
@@ -389,6 +400,8 @@ a_settle_waits_for_an_inflight_resend() ->
                     (#{event := 'CONNECTED'}) -> ok
                  end),
     ok = notify(Id, Sess, disconnected),
+    ?assertEqual(ok, wait_until(fun() -> length(notices(Id)) =:= 1 andalso settled() end)),
+    ok = deliver(due_message(Id, Sess)),
     W = blocked(Id),
     Alias = alias([reply]),
     ok = yuzu_gw_upstream:notify_settled(Id, Sess, <<"home">>, Alias),
@@ -403,7 +416,7 @@ a_settle_waits_for_an_inflight_resend() ->
     {ok, _} = yuzu_gw_upstream:reregister_session(register_req(Id), Sess, #{}),
     ok = notify(Id, Sess, connected),
     ?assertEqual(ok, wait_until(fun() -> lists:keymember(connected, 2, notices(Id)) end)),
-    timer:sleep(5 * 100),
+    ?assertEqual(ok, wait_until(fun settled/0)),
     ?assertEqual([{disconnected, unacked}, {disconnected, unacked}, {reregister, ok},
                   {connected, ok}],
                  [{E, A} || {_, E, A} <- notices(Id)]),
@@ -417,47 +430,68 @@ a_settle_waits_for_an_inflight_resend() ->
 a_predecessor_connected_retry_never_follows_the_successor() ->
     [{Id, Sess}] = register_agents(<<"settle-conn">>, 1),
     Refusals = counter(1),
-    answer_owner(fun(#{event := 'CONNECTED'}) ->
-                         case take(Refusals) of true -> unacked; false -> ok end;
-                    (#{event := 'DISCONNECTED'}) -> ok
-                 end),
+    Answer = fun(#{event := 'CONNECTED'}) ->
+                     case take(Refusals) of true -> unacked; false -> ok end;
+                (#{event := 'DISCONNECTED'}) -> ok
+             end,
+    answer_owner(Answer),
     ok = notify(Id, Sess, connected),
     ?assertEqual(ok, wait_until(fun() -> length(notices(Id)) =:= 1 andalso settled() end)),
     ?assertMatch(#{status := {waiting, _}}, unacked_entry(Id, Sess)),
+    %% The refused CONNECTED's backoff ends during the re-registration, after
+    %% the DISCONNECTED superseded it.
+    Due = due_message(Id, Sess),
     ok = notify(Id, Sess, disconnected),
     ok = await_settled(Id, Sess),
+    Delivered = counter(0),
+    answer_owner(Answer, fun() -> ok = deliver(Due), bump(Delivered) end),
     {ok, _} = yuzu_gw_upstream:reregister_session(register_req(Id), Sess, #{}),
+    ?assertEqual(1, atomics:get(Delivered, 1)),
     ok = notify(Id, Sess, connected),
     ?assertEqual(ok, wait_until(fun() -> length(notices(Id)) =:= 4 end)),
-    timer:sleep(5 * 100),
+    ?assertEqual(ok, wait_until(fun settled/0)),
     ?assertEqual([{connected, unacked}, {disconnected, ok}, {reregister, ok}, {connected, ok}],
                  [{E, A} || {_, E, A} <- notices(Id)]),
     ?assertEqual(0, map_size(up_field(notify_unacked))).
 
 a_repeatedly_refused_connected_is_slowed() ->
     [{Id, Sess}] = register_agents(<<"slow">>, 1),
-    answer(fun(_) -> unacked end),
+    %% When the server received each send, in order.
+    Sent = ets:new(slow_sent, [public, ordered_set]),
+    answer(fun(_) ->
+                   true = ets:insert(Sent, {erlang:unique_integer([monotonic]),
+                                            erlang:monotonic_time(millisecond)}),
+                   unacked
+           end),
     Entry = entry_poller(Id, Sess),
     ok = notify(Id, Sess, connected),
-    %% Before the threshold the backoff is unchanged: never above the max.
-    Before = Entry(refusals(?SLOW_AFTER - 1)),
+    %% Before the threshold the backoff is unchanged: never above the max, and
+    %% the key is not counted slow. Both read from the one state the entry was
+    %% found in: the next refusal can come within ?MAX_MS, so a second read of
+    %% the slow count could already see the threshold'th.
+    {Before, BeforeSlow} = entry_and_field(Id, Sess, refusals(?SLOW_AFTER - 1),
+                                           notify_unacked_slow),
     ?assert(maps:get(delay, Before) =< ?MAX_MS),
-    ?assertEqual(0, up_field(notify_unacked_slow)),
+    ?assertEqual(0, BeforeSlow),
     %% The threshold'th refusal: the next resend is 0.8 to 1 x the slow max.
     Slow = Entry(refusals(?SLOW_AFTER)),
     ?assert(maps:get(delay, Slow) >= ?SLOW_FLOOR_MS),
     ?assert(maps:get(delay, Slow) =< ?SLOW_MAX_MS),
     ?assertEqual(1, up_field(notify_unacked_slow)),
     ?assertEqual(ok, wait_until(fun() -> last_slow_gauge() =:= 1 end)),
-    %% Nothing is sent before the slow floor...
-    timer:sleep(?SLOW_FLOOR_MS - 300),
-    ?assertEqual(?SLOW_AFTER, length(notices(Id))),
-    %% ...then it is, is refused again, and stays slow.
+    %% The next send comes, is refused again, and stays slow...
     Next = Entry(refusals(?SLOW_AFTER + 1)),
     ?assert(maps:get(delay, Next) >= ?SLOW_FLOOR_MS),
     ?assertEqual(?SLOW_AFTER + 1, length(notices(Id))),
     ?assertEqual(1, up_field(notify_unacked_slow)),
-    ?assertEqual(1, max_slow_gauge()).
+    ?assertEqual(1, max_slow_gauge()),
+    %% ...and nothing was sent before the slow floor: the server received it at
+    %% least ?SLOW_FLOOR_MS after the threshold'th refusal. (Measured from the
+    %% server's side, not from when this test got to look: a loaded host can
+    %% take a few hundred milliseconds to run the steps above.)
+    [{_, T10}, {_, T11}] = lists:sublist(ets:tab2list(Sent), ?SLOW_AFTER, 2),
+    ?assert(T11 - T10 >= ?SLOW_FLOOR_MS),
+    true = ets:delete(Sent).
 
 an_acknowledgement_ends_the_slow_phase() ->
     [{Id, Sess}] = register_agents(<<"slow-ack">>, 1),
@@ -659,8 +693,12 @@ notify_answer(Answer, _Meta, Path, Req, _Def, _Opts) ->
 
 %% answer/1, and a ProxyRegister is recorded too ({Seq, AgentId, reregister,
 %% ok}) when it arrives, then answered after 300 ms (a slow re-registration:
-%% a resend that becomes due meanwhile would be sent during it).
+%% a resend that becomes due meanwhile would be sent during it). OnRegister()
+%% runs once the ProxyRegister is recorded, before the answer.
 answer_owner(Answer) ->
+    answer_owner(Answer, fun() -> ok end).
+
+answer_owner(Answer, OnRegister) ->
     meck:expect(yuzu_grpc_client, unary,
                 fun(Meta, Path, Req, Def, Opts) ->
                         case lists:last(binary:split(Path, <<"/">>, [global])) of
@@ -668,6 +706,7 @@ answer_owner(Answer) ->
                                 AgentId = maps:get(agent_id, maps:get(info, Req, #{}), undefined),
                                 catch ets:insert(?CALLS, {erlang:unique_integer([monotonic]),
                                                           AgentId, reregister, ok}),
+                                _ = OnRegister(),
                                 timer:sleep(300),
                                 {ok, #{accepted => true}, #{}};
                             _ ->
@@ -686,6 +725,21 @@ await_settled(Id, Sess) ->
     receive {Alias, notify_settled} -> ok
     after ?WAIT_MS -> unalias(Alias), {error, never_settled}
     end.
+
+%% The message that ends the backoff of the key's waiting resend: what its
+%% timer (erlang:start_timer/3 in yuzu_gw_upstream) delivers when it fires.
+%% Taken while the entry waits, it can be delivered after the entry is gone,
+%% as a timer message already on its way when the entry was cancelled.
+due_message(Id, Sess) ->
+    Key = {Id, Sess, <<"home">>},
+    #{status := {waiting, TRef}} = unacked_entry(Id, Sess),
+    {timeout, TRef, {notify_unacked_due, Key}}.
+
+%% Deliver a message to the upstream process and return once it has handled it.
+deliver(Msg) ->
+    yuzu_gw_upstream ! Msg,
+    _ = sys:get_state(yuzu_gw_upstream),
+    ok.
 
 %% The retry-set entry of the key notify/3 uses, or `none'.
 unacked_entry(Id, Sess) ->
@@ -708,6 +762,23 @@ poll_entry(Idx, Key, Pred, Left) ->
     end.
 
 refusals(N) -> fun(E) -> maps:get(refusals, E, undefined) =:= N end.
+
+%% The first entry of the key Pred holds for, polled as entry_poller/2 does,
+%% with the value of the upstream state field Field in the same state.
+entry_and_field(Id, Sess, Pred, Field) ->
+    Idx = field_index(notify_unacked),
+    FIdx = field_index(Field),
+    Key = {Id, Sess, <<"home">>},
+    poll_entry_and_field(Idx, FIdx, Key, Pred, ?WAIT_MS).
+
+poll_entry_and_field(Idx, FIdx, Key, Pred, Left) ->
+    St = sys:get_state(yuzu_gw_upstream),
+    Entry = maps:get(Key, element(Idx, St), none),
+    case is_map(Entry) andalso Pred(Entry) of
+        true -> {Entry, element(FIdx, St)};
+        false when Left =< 0 -> error({no_matching_entry, Key, Entry});
+        false -> timer:sleep(5), poll_entry_and_field(Idx, FIdx, Key, Pred, Left - 5)
+    end.
 
 register_req(Id) ->
     #{info => #{agent_id => Id, hostname => <<"host">>, plugins => [#{name => <<"svc">>}]},
