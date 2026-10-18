@@ -217,6 +217,22 @@
 %%%     a registry that is not running does not stop it). It has no time limit:
 %%%     a live session the server does not record is the failure this exists
 %%%     for, and the alert names it.
+%%%   - Slow phase (a stopgap until the answer carries a refusal reason, #6059):
+%%%     a refusal the server will repeat for as long as the session lives
+%%%     (stale_connected_session, cluster_affinity_violation) looks the same as
+%%%     a transient one. So once a CONNECTED has been refused
+%%%     notify_unacked_slow_after (10) times in a row, each next resend comes
+%%%     0.8 to 1 x notify_unacked_slow_max_ms (600000) later: a fixed interval
+%%%     jittered down by up to 20%, not decorrelated jitter: its floor stays the
+%%%     base (1 s), so even with a 600 s cap a third of its draws fall below the
+%%%     cap, anywhere down to 1 s, and it needs several more refusals to climb
+%%%     from the ~34 s it was at. At the defaults 5,000 slowed keys cost about 9
+%%%     resends a second instead of 150. The count lives in the entry: an
+%%%     acknowledgement, a newer event for the key or the end of the session
+%%%     removes the entry, and with it the count. A DISCONNECTED is never
+%%%     slowed: its window bounds it already, and a slow delay would push its
+%%%     last resend past the window. Counted in
+%%%     yuzu_gw_upstream_notify_unacked_slow_keys (entries in the slow phase).
 %%%   - A DISCONNECTED is resent for at most notify_unacked_disconnected_window_ms
 %%%     (120000) after its first refusal, then counted lost (unacknowledged).
 %%%     The only `false' a DISCONNECTED gets is unknown_session: harmless when
@@ -354,6 +370,13 @@
 %%%                                          100..3600000, raised to the base)
 %%%   notify_unacked_disconnected_window_ms - how long a refused DISCONNECTED is
 %%%                                          resent (default 120000, valid 0..3600000)
+%%%   notify_unacked_slow_after           - consecutive refusals of a CONNECTED
+%%%                                          after which it is resent at the slow
+%%%                                          interval (default 10, valid 1..10000)
+%%%   notify_unacked_slow_max_ms          - the slow interval: each slowed resend
+%%%                                          comes 0.8 to 1 x this later (default
+%%%                                          600000, valid 100..3600000, raised to
+%%%                                          notify_unacked_retry_max_ms)
 %%   cluster_id                         — this gateway's trust-zone/region id,
 %%                                          stamped on every StreamStatusNotification
 %%                                          (default <<"default">>; ADR-2002 §7)
@@ -521,6 +544,20 @@
 %% changes nothing. 0 (never resent) to 1 h.
 -define(DEFAULT_UNACKED_DISC_WINDOW_MS, 120000).
 -define(MAX_UNACKED_DISC_WINDOW_MS, 3600000).
+%% The slow phase (stopgap until the refusal carries a reason, #6059): after
+%% this many consecutive refusals a CONNECTED is resent every 0.8 to 1 x the
+%% slow max. 10 refusals take about 2 minutes at the default backoff (median
+%% 100 s, 33 s to 260 s for 80% of keys, simulated): longer than a degraded route
+%% store usually lasts, at the cost that one unreadable for longer leaves its
+%% sessions waiting up to the slow max after it recovers. 1 to 10000 refusals
+%% (10000 is several days of resends at the normal backoff: in effect never).
+%% The slow max is 100 ms to 1 h like the max, and raised to the max when below
+%% it.
+-define(DEFAULT_UNACKED_SLOW_AFTER, 10).
+-define(MAX_UNACKED_SLOW_AFTER, 10000).
+-define(DEFAULT_UNACKED_SLOW_MAX_MS, 600000).
+-define(MIN_UNACKED_SLOW_MAX_MS, 100).
+-define(MAX_UNACKED_SLOW_MAX_MS, 3600000).
 %% The most resends in flight at once: half the notify lane, so fresh notices
 %% always have the other half (and are drained first on every pass).
 -define(MAX_UNACKED_INFLIGHT, (?MAX_NOTIFY_INFLIGHT div 2)).
@@ -614,10 +651,13 @@
 %%                                given back to the pending store, which sends it.
 %%   delay   the last backoff delay (ms), the next one is derived from it.
 %%   first   when the server first refused this event (monotonic ms).
+%%   refusals how many times in a row the server refused this event; a
+%%           CONNECTED at notify_unacked_slow_after or more is in the slow phase.
 -type unacked() :: #{event  := yuzu_gw_notify_queue:event(),
                      class  := connected | disconnected,
                      delay  := pos_integer(),
                      first  := integer(),
+                     refusals := pos_integer(),
                      status := {waiting, reference()} | ready | inflight | held}.
 
 %% {AgentId, SessionId, stored RegisterRequest | walk}. A verdict entry carries
@@ -748,7 +788,14 @@
     notify_unacked_reported = 0 :: non_neg_integer(),
     unacked_base_ms = ?DEFAULT_UNACKED_BASE_MS :: pos_integer(),
     unacked_max_ms = ?DEFAULT_UNACKED_MAX_MS :: pos_integer(),
-    unacked_disc_window_ms = ?DEFAULT_UNACKED_DISC_WINDOW_MS :: non_neg_integer()
+    unacked_disc_window_ms = ?DEFAULT_UNACKED_DISC_WINDOW_MS :: non_neg_integer(),
+    %% The slow phase (#6059 stopgap): its two settings, the entries in it
+    %% (kept by slow_in/2 and slow_out/2 as entries enter and leave the retry
+    %% set) and the last count reported.
+    unacked_slow_after = ?DEFAULT_UNACKED_SLOW_AFTER :: pos_integer(),
+    unacked_slow_max_ms = ?DEFAULT_UNACKED_SLOW_MAX_MS :: pos_integer(),
+    notify_unacked_slow = 0 :: non_neg_integer(),
+    notify_unacked_slow_reported = 0 :: non_neg_integer()
 }).
 
 %%%===================================================================
@@ -1211,14 +1258,20 @@ init_state(ClusterId) ->
     UnackedWindow = yuzu_gw_env:env_int(notify_unacked_disconnected_window_ms,
                                         ?DEFAULT_UNACKED_DISC_WINDOW_MS, 0,
                                         ?MAX_UNACKED_DISC_WINDOW_MS),
+    SlowAfter = yuzu_gw_env:env_int(notify_unacked_slow_after, ?DEFAULT_UNACKED_SLOW_AFTER,
+                                    1, ?MAX_UNACKED_SLOW_AFTER),
+    SlowMax = max(UnackedMax,
+                  yuzu_gw_env:env_int(notify_unacked_slow_max_ms, ?DEFAULT_UNACKED_SLOW_MAX_MS,
+                                      ?MIN_UNACKED_SLOW_MAX_MS, ?MAX_UNACKED_SLOW_MAX_MS)),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
                 "replay_start_jitter=~bms, replay_session_guard=~bms, replay_queue_max=~b, "
                 "notify_pending_max=~b, notify_probe_timeout=~bms, cluster_id=~ts, "
-                "unacknowledged notice resend=~b..~bms, disconnected window=~bms)",
+                "unacknowledged notice resend=~b..~bms, disconnected window=~bms, "
+                "slowed after ~b refusals to ~bms)",
                 [Threshold, BaseTimeout, ReplayJitter, SessionGuard, QueueMax,
                  NotifyPendingMax, ProbeTimeout, ClusterId, UnackedBase, UnackedMax,
-                 UnackedWindow]),
+                 UnackedWindow, SlowAfter, SlowMax]),
 
     %% A restarted instance counts only its own workers, so the gauges start
     %% from zero here (workers of an earlier instance are unlinked and uncounted).
@@ -1254,11 +1307,13 @@ init_state(ClusterId) ->
         cluster_id      = ClusterId,
         unacked_base_ms = UnackedBase,
         unacked_max_ms  = UnackedMax,
-        unacked_disc_window_ms = UnackedWindow
+        unacked_disc_window_ms = UnackedWindow,
+        unacked_slow_after = SlowAfter,
+        unacked_slow_max_ms = SlowMax
     },
     publish_breaker(State#state.cb_state, State#state.cb_gen),
     emit_notify_held(State),
-    emit_unacked_keys(0),
+    emit_unacked_keys(0, 0),
     erlang:send_after(?NOTIFY_HWM_TICK_MS, self(), notify_hwm_tick),
     {ok, State}.
 
@@ -1979,7 +2034,9 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% A state from before OWNER-RESTART and NOTIFY-ACK (#5695) lacks the fields
 %% they appended to the record, in this order: settle_waiters, then the retry
-%% set (notify_unacked .. unacked_disc_window_ms). Each missing one is appended
+%% set (notify_unacked .. unacked_disc_window_ms), then its slow phase
+%% (unacked_slow_after .. notify_unacked_slow_reported; an entry of an older
+%% state without `refusals' counts as refused once). Each missing one is appended
 %% at its default (the retry settings at the built-in defaults, not the app
 %% env: init/1 reads that on the next start). Any other shape is returned as it
 %% is. This only keeps the upgraded process from crashing on a field it cannot
@@ -1988,7 +2045,8 @@ add_trailing_fields(State) when is_tuple(State), element(1, State) =:= state ->
     Defaults = [#{},                                %% settle_waiters
                 #{}, queue:new(), #{}, #{}, 0,      %% notify_unacked .. _reported
                 ?DEFAULT_UNACKED_BASE_MS, ?DEFAULT_UNACKED_MAX_MS,
-                ?DEFAULT_UNACKED_DISC_WINDOW_MS],
+                ?DEFAULT_UNACKED_DISC_WINDOW_MS,
+                ?DEFAULT_UNACKED_SLOW_AFTER, ?DEFAULT_UNACKED_SLOW_MAX_MS, 0, 0],
     Missing = record_info(size, state) - tuple_size(State),
     case Missing > 0 andalso Missing =< length(Defaults) of
         true  -> list_to_tuple(tuple_to_list(State) ++
@@ -2584,13 +2642,14 @@ cancel_unacked(Key, #state{notify_unacked = U, notify_unacked_cancelled = C} = S
     case maps:take(Key, U) of
         error ->
             State;
-        {#{status := inflight}, U1} ->
+        {#{status := inflight} = Entry, U1} ->
             emit_unacked_ended(superseded),
-            State#state{notify_unacked = U1, notify_unacked_cancelled = C#{Key => true}};
-        {#{status := Status}, U1} ->
+            slow_out(Entry, State#state{notify_unacked = U1,
+                                        notify_unacked_cancelled = C#{Key => true}});
+        {#{status := Status} = Entry, U1} ->
             cancel_unacked_timer(Status),
             emit_unacked_ended(superseded),
-            State#state{notify_unacked = U1}
+            slow_out(Entry, State#state{notify_unacked = U1})
     end.
 
 cancel_unacked_timer({waiting, TRef}) ->
@@ -2604,9 +2663,9 @@ cancel_unacked_timer(_Status) ->
 -spec drop_held_unacked(yuzu_gw_notify_queue:key(), #state{}) -> #state{}.
 drop_held_unacked(Key, #state{notify_unacked = U} = State) ->
     case maps:find(Key, U) of
-        {ok, #{status := held}} ->
+        {ok, #{status := held} = Entry} ->
             emit_unacked_ended(lost),
-            State#state{notify_unacked = maps:remove(Key, U)};
+            slow_out(Entry, State#state{notify_unacked = maps:remove(Key, U)});
         _ ->
             State
     end.
@@ -2635,7 +2694,8 @@ take_unacked_attempt(Key, #state{notify_unacked = U, notify_unacked_cancelled = 
         error ->
             case maps:find(Key, U) of
                 {ok, #{status := inflight} = Entry} ->
-                    {{retry, Entry}, State#state{notify_unacked = maps:remove(Key, U)}};
+                    {{retry, Entry},
+                     slow_out(Entry, State#state{notify_unacked = maps:remove(Key, U)})};
                 _ ->
                     {none, State}
             end
@@ -2649,7 +2709,7 @@ retry_ended(_NoneOrCancelled, _Outcome) -> ok.
 %% A failed resend was given back to the pending store: its entry is kept (as
 %% `held'), so the backoff goes on from where it was if it is refused again.
 hold_unacked({retry, Entry}, Key, #state{notify_unacked = U} = State) ->
-    State#state{notify_unacked = U#{Key => Entry#{status := held}}};
+    slow_in(Entry, State#state{notify_unacked = U#{Key => Entry#{status := held}}});
 hold_unacked(_NoneOrCancelled, _Key, State) ->
     State.
 
@@ -2686,12 +2746,15 @@ settle_unacked1(Retry, _Key, Class, {AgentId, _}, #state{mode = flushing} = Stat
 settle_unacked1(Retry, Key, Class, {AgentId, _} = Event,
                 #state{notify_pending = Pending, notify_unacked = U,
                        notify_pending_max = Cap, unacked_base_ms = Base, unacked_max_ms = Max,
-                       unacked_disc_window_ms = Window} = State) ->
+                       unacked_disc_window_ms = Window, unacked_slow_after = SlowAfter,
+                       unacked_slow_max_ms = SlowMax} = State) ->
     Now = erlang:monotonic_time(millisecond),
-    {First, Prev} = case Retry of
-                        {retry, #{first := F, delay := D}} -> {F, D};
-                        none -> {Now, undefined}
-                    end,
+    {First, Prev, Refusals} = case Retry of
+                                  {retry, #{first := F, delay := D} = E} ->
+                                      {F, D, maps:get(refusals, E, 1) + 1};
+                                  none ->
+                                      {Now, undefined, 1}
+                              end,
     Over = Class =:= disconnected andalso Now - First >= Window,
     Full = Retry =:= none andalso map_size(U) >= Cap,
     case yuzu_gw_notify_queue:is_held(Key, Pending) of
@@ -2713,15 +2776,53 @@ settle_unacked1(Retry, Key, Class, {AgentId, _} = Event,
             retry_ended(Retry, lost),
             State;
         false ->
-            Delay = next_unacked_delay(Prev, Base, Max),
+            Entry0 = #{event => Event, class => Class, first => First, refusals => Refusals},
+            Delay = case is_slow(Entry0, SlowAfter) of
+                        true  -> slow_unacked_delay(SlowMax);
+                        false -> next_unacked_delay(Prev, Base, Max)
+                    end,
             TRef = erlang:start_timer(Delay, self(), {notify_unacked_due, Key}),
             yuzu_gw_safe_call:warn_limited(notify_unacknowledged,
                                            "Server did not record the ~s stream status notice for "
                                            "~s (acknowledged=false); sending it again in ~b ms",
                                            [Class, yuzu_gw_env:log_text(AgentId), Delay]),
-            State#state{notify_unacked = U#{Key => #{event => Event, class => Class,
-                                                     delay => Delay, first => First,
-                                                     status => {waiting, TRef}}}}
+            Entry = Entry0#{delay => Delay, status => {waiting, TRef}},
+            slow_in(Entry, State#state{notify_unacked = U#{Key => Entry}})
+    end.
+
+%% @doc The slow phase's delay (#6059 stopgap): uniform in 0.8 x SlowMax ..
+%% SlowMax. A fixed interval jittered by up to 20% (down, so SlowMax stays the
+%% longest delay) rather than decorrelated jitter: that one's floor stays the
+%% base, so a third of its draws at the cap fall below it, anywhere down to the
+%% base. The band holds every slowed key to at most one resend per 0.8 x
+%% SlowMax, and still spreads keys that were slowed together over a fifth of
+%% the interval.
+-spec slow_unacked_delay(pos_integer()) -> pos_integer().
+slow_unacked_delay(SlowMax) ->
+    Lo = max(1, SlowMax - SlowMax div 5),
+    Lo + rand:uniform(SlowMax - Lo + 1) - 1.
+
+%% @doc Whether an entry is in the slow phase: a CONNECTED refused SlowAfter
+%% times in a row or more. A DISCONNECTED never is (its window bounds it).
+-spec is_slow(map(), pos_integer()) -> boolean().
+is_slow(#{class := connected} = Entry, SlowAfter) ->
+    maps:get(refusals, Entry, 1) >= SlowAfter;
+is_slow(_Entry, _SlowAfter) ->
+    false.
+
+%% The count of entries in the slow phase follows every entry put into the
+%% retry set (slow_in/2) and every entry taken out of it (slow_out/2); an entry
+%% whose status changes in place keeps its count.
+slow_in(Entry, #state{unacked_slow_after = SlowAfter, notify_unacked_slow = N} = State) ->
+    case is_slow(Entry, SlowAfter) of
+        true  -> State#state{notify_unacked_slow = N + 1};
+        false -> State
+    end.
+
+slow_out(Entry, #state{unacked_slow_after = SlowAfter, notify_unacked_slow = N} = State) ->
+    case is_slow(Entry, SlowAfter) of
+        true  -> State#state{notify_unacked_slow = max(0, N - 1)};
+        false -> State
     end.
 
 %% @doc The next backoff delay: decorrelated jitter, min(Max, uniform(Base,
@@ -2766,7 +2867,7 @@ unacked_due({AgentId, SessionId, _Home} = Key, #{class := Class} = Entry,
                         notify_unacked_ready = Q2};
         false ->
             emit_unacked_ended(session_gone),
-            State#state{notify_unacked = maps:remove(Key, U)}
+            slow_out(Entry, State#state{notify_unacked = maps:remove(Key, U)})
     end.
 
 is_ready_unacked(Key, U) ->
@@ -2816,12 +2917,12 @@ flush_unacked(#state{notify_unacked = U} = State) ->
 flush_unacked_entry(_Key, #{status := Status}, State) when Status =:= inflight;
                                                            Status =:= held ->
     State;
-flush_unacked_entry(Key, #{status := Status, class := connected},
+flush_unacked_entry(Key, #{status := Status, class := connected} = Entry,
                     #state{notify_unacked = U} = State) ->
     cancel_unacked_timer(Status),
     emit_notify_lost(connected, shutdown, 1),
     emit_unacked_ended(lost),
-    State#state{notify_unacked = maps:remove(Key, U)};
+    slow_out(Entry, State#state{notify_unacked = maps:remove(Key, U)});
 flush_unacked_entry(Key, #{status := Status, class := disconnected, event := Event} = Entry,
                     #state{notify_unacked = U, notify_pending = Pending} = State) ->
     cancel_unacked_timer(Status),
@@ -2831,7 +2932,8 @@ flush_unacked_entry(Key, #{status := Status, class := disconnected, event := Eve
                                   notify_pending = Pending1});
         {superseded, Pending1} ->
             emit_unacked_ended(superseded),
-            State#state{notify_unacked = maps:remove(Key, U), notify_pending = Pending1}
+            slow_out(Entry, State#state{notify_unacked = maps:remove(Key, U),
+                                        notify_pending = Pending1})
     end.
 
 %% @doc The retry set is dropped with the process or the end of a flush. What
@@ -2851,8 +2953,9 @@ drop_unacked(#state{notify_unacked = U}) ->
                       end
               end, 0, U).
 
-emit_unacked_keys(N) ->
-    telemetry:execute([yuzu, gw, upstream, notify_unacked], #{keys => N}, #{}).
+emit_unacked_keys(N, Slow) ->
+    telemetry:execute([yuzu, gw, upstream, notify_unacked], #{keys => N, slow_keys => Slow},
+                      #{}).
 
 emit_unacked_ended(Outcome) ->
     telemetry:execute([yuzu, gw, upstream, notify_unacked_ended], #{count => 1},
@@ -2919,7 +3022,8 @@ end_flush(#state{flush_from = From, flush_timer = Timer, flush_sent = Sent,
                 notify_pids = Resolved,
                 notify_pending = yuzu_gw_notify_queue:new(yuzu_gw_notify_queue:cap(Pending)),
                 notify_unacked = #{}, notify_unacked_ready = queue:new(),
-                notify_unacked_pids = #{}, notify_unacked_cancelled = #{}}.
+                notify_unacked_pids = #{}, notify_unacked_cancelled = #{},
+                notify_unacked_slow = 0}.
 
 %% Held events by class, read once at the end of a flush or in terminate/2.
 held_by_class(Pending) ->
@@ -2981,8 +3085,9 @@ notify_counts(#state{notify_pending = Pending, notify_pids = Pids}) ->
 %% either number. Before is notify_counts/1 taken at the top of the handler.
 -spec report_notify_counts({non_neg_integer(), non_neg_integer()}, #state{}) -> #state{}.
 report_notify_counts(Before, #state{notify_pids = Pids, guardian_pids = GPids,
-                                    notify_unacked = U,
-                                    notify_unacked_reported = Reported} = State) ->
+                                    notify_unacked = U, notify_unacked_slow = Slow,
+                                    notify_unacked_reported = Reported,
+                                    notify_unacked_slow_reported = SlowReported} = State) ->
     %% The lane figures the pressure sampler reads (lane_snapshot/0) follow the
     %% worker sets, which only the handlers that end here change.
     cell_put(?CELL_NOTIFY, map_size(Pids)),
@@ -2991,11 +3096,14 @@ report_notify_counts(Before, #state{notify_pids = Pids, guardian_pids = GPids,
         Before                  -> ok;
         {Pending, Inflight}     -> emit_notify_queue(Pending, Inflight)
     end,
-    %% NOTIFY-ACK: the keys awaiting a resend, reported when it changed.
+    %% NOTIFY-ACK: the keys awaiting a resend and those of them in the slow
+    %% phase, reported when either changed.
     case map_size(U) of
-        Reported -> State;
-        Keys     -> emit_unacked_keys(Keys),
-                    State#state{notify_unacked_reported = Keys}
+        Reported when Slow =:= SlowReported ->
+            State;
+        Keys ->
+            emit_unacked_keys(Keys, Slow),
+            State#state{notify_unacked_reported = Keys, notify_unacked_slow_reported = Slow}
     end.
 
 emit_notify_queue(Pending, Inflight) ->
