@@ -61,7 +61,9 @@
     return t;
   }
 
-  // ---- devices online (the shell's own count: connected to this server, unauthenticated read) ----
+  // ---- devices online (informational only: this server's own count, which on a multi-server
+  // deployment is not the fleet. It never enables or disables a button; the server's reply is the
+  // authority.) ----
 
   function readOnline() {
     var out = $('dev-online');
@@ -71,11 +73,8 @@
       var n = d && d.agents ? d.agents.online : null;
       if (!Number.isInteger(n)) throw new Error('unreadable');
       if (out) out.textContent = n + ' (connected to this server)';
-      setButtons(n === 0, n === 0 ? 'No device is connected.' : '');
     }).catch(function () {
-      // An unreadable count must not block the action: the server answers with its own reason.
       if (out) out.textContent = 'Unknown';
-      setButtons(false, '');
     });
   }
 
@@ -86,7 +85,7 @@
   }
 
   function finish(res) {
-    busy = false;
+    free();
     if (res.ok) {
       var line = sentLine(res.data || {}, new Date());
       if (res.auditFailed) say(line + ' The action was sent but its audit record could not be written.', 'dev-err');
@@ -96,6 +95,8 @@
     }
     return readOnline();
   }
+
+  function free() { busy = false; setButtons(false, ''); }
 
   function run(id) {
     var spec = TABLE[id];
@@ -112,14 +113,14 @@
       submit: function () {
         return request(spec).then(function (res) {
           if (res.ok) { finish(res); return null; }
-          // Failed: the dialog shows the server's own text and stays open; the buttons free up.
-          busy = false;
+          // Failed: the dialog shows the server's own text and stays open; the buttons free up and
+          // any earlier result line is cleared so a Cancel does not leave a stale "Sent".
+          free();
+          say('');
           return S.failText(res);
         });
       }
-    }).then(function (v) {
-      if (v === null) { busy = false; return readOnline(); }
-    }, function () { busy = false; return readOnline(); });
+    }).then(function () { free(); return readOnline(); }, function () { free(); return readOnline(); });
   }
 
   document.addEventListener('click', function (e) {
