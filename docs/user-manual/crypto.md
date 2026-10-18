@@ -322,7 +322,7 @@ message and the counter, and check `yuzu_server_audit_emit_failed_total`:
 | The inventory read failed or ran past its 5 s bound | `crypto library read degraded` | `store degraded` | `reason` is `store_not_open`, `pool_acquire_timeout` or `query_error` |
 | The concurrent-read bound was full | `crypto read capacity in use; retry` | `capacity in use` | `reason="admission_full"` |
 | The same `crypto library read degraded` while `YuzuInventoryCatalogRollupStale` or `YuzuInventoryCatalogRollupFailing` is firing | `crypto library read degraded` | `store degraded` | `reason="query_error"` (the 5 s statement timeout) |
-| The access gate could not complete its check (RBAC, management-group or tag store) | REST: the gate's own `503` envelope; MCP: a JSON-RPC error, not an HTTP `503`; on the page the banner "The access check could not be completed: one of its stores (permissions, management groups or tags) could not be read" | none here; the gate writes its own `auth.fleet_read_required` `denied` row, whose detail names the store that failed (for example `fleet read blocked: management-group store unavailable`) | not moved; `yuzu_server_rbac_read_degrade_total` moves only when an RBAC read itself fails, not for an unavailable RBAC store or a management-group or tag store failure |
+| The access gate could not complete its check (RBAC, management-group or tag store) | REST and MCP: the gate's own `503` A4 envelope (on MCP too, not a JSON-RPC error); on the page the banner "The access check could not be completed: one of its stores (permissions, management groups or tags) could not be read" | none here; the gate writes its own `auth.fleet_read_required` `denied` row, whose detail names the store that failed (for example `fleet read blocked: management-group store unavailable`) | not moved; `yuzu_server_rbac_read_degrade_total` moves only when an RBAC read itself fails, not for an unavailable RBAC store or a management-group or tag store failure |
 
 The last row most likely means the live name scan exceeded its 5 s bound: there are too many
 distinct package names for a live read, and retrying will not help (a Postgres overload also
@@ -339,8 +339,8 @@ reads are already running on this server; retry shortly" and a store fault reads
 store could not be read" (a degraded access gate reads "The access check could not be completed:
 one of its stores (permissions, management groups or tags) could not be read" instead); REST uses
 the same `503` message per cause and MCP the same message text in a retryable JSON-RPC error. An
-access-gate failure is the exception: REST carries the gate's own `503` envelope and MCP a JSON-RPC
-error, never an HTTP `503`.
+access-gate failure is the exception: both REST and MCP carry the gate's own `503` A4 envelope,
+not a JSON-RPC error.
 
 Every such response also attempts a `failure` row for the `crypto.libraries.*` verb in the audit
 log. Under connection-pool exhaustion that row can be lost; a failed audit store write increments
