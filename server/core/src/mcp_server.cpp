@@ -2,6 +2,7 @@
 
 #include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
+#include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
@@ -2754,8 +2755,13 @@ static const ToolDef kTools[] = {
      "the legacy dashboard route POST /api/approvals/{id}/approve, but NOT a wire-format "
      "mirror of it: that HTMX-facing route returns {\"status\":\"approved\"} for a toast, "
      "while this tool returns {approved, approval_id} below - do not assume the two are "
-     "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
-     "reviewer cannot be the submitter.",
+     "interchangeable response shapes). ALWAYS REFUSED over MCP (#6061): deciding an "
+     "approval is a human-session act, and every MCP session is bearer-authenticated, so "
+     "this returns a permission-denied error whose message is "
+     "approver_assurance_required:<reason> (reason: non_interactive_session, "
+     "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
+     "A human reviewer decides via the dashboard Approvals page or POST "
+     "/api/approvals/{id}/approve from an interactive session with a fresh MFA step-up.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -2769,8 +2775,13 @@ static const ToolDef kTools[] = {
      "the legacy dashboard route POST /api/approvals/{id}/reject, but NOT a wire-format "
      "mirror of it: that HTMX-facing route returns {\"status\":\"rejected\"} for a toast, "
      "while this tool returns {rejected, approval_id} below - do not assume the two are "
-     "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
-     "reviewer cannot be the submitter.",
+     "interchangeable response shapes). ALWAYS REFUSED over MCP (#6061): deciding an "
+     "approval is a human-session act, and every MCP session is bearer-authenticated, so "
+     "this returns a permission-denied error whose message is "
+     "approver_assurance_required:<reason> (reason: non_interactive_session, "
+     "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
+     "A human reviewer decides via the dashboard Approvals page or POST "
+     "/api/approvals/{id}/reject from an interactive session with a fresh MFA step-up.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -4312,7 +4323,8 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // Write tools (#289). NOTE (governance S3/UP-3, revised for PR #1796 review
     // C2): the op here drives the C8 TIER gate (tier_allows / requires_approval),
     // NOT per-handler RBAC — each handler separately calls perm_fn with its
-    // REST-verified op (approve/reject → Approval:Approve, quarantine →
+    // REST-verified op (approve/reject → Approval:Approve — now ALSO this mapping,
+    // #3151 — quarantine →
     // Security:Execute). INVARIANT: this mapping and mcp_policy.hpp's
     // requires_approval() move TOGETHER. quarantine_device maps to
     // Security:Execute — the SAME (securable, op) its handler and the REST
@@ -4325,8 +4337,8 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // quarantine via REST with NO approval. If you change a tool's mapping OR a
     // requires_approval() rule, re-check the OTHER side and every REST route that
     // shares the (securable, op) pair.
-    {"approve_request", {"Approval", "Write"}},
-    {"reject_request", {"Approval", "Write"}},
+    {"approve_request", {"Approval", "Approve"}},
+    {"reject_request", {"Approval", "Approve"}},
     {"quarantine_device", {"Security", "Execute", ServiceScopeClass::confined}},
     // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
     {"list_issued_certs", {"Security", "Read"}},
@@ -8375,18 +8387,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
-                        res.set_content(
-                            a4_error(kPermissionDenied,
-                                     "approval already used (one-time ticket)",
-                                     "submit a new request without approval_id to obtain a fresh "
-                                     "approval ticket"),
-                            "application/json");
-                        return;
-                    }
-                    mcp_audit("approved", "consumed approval_id=" + supplied_id);
-                    // #2444 item 3: from here on, any mcp_audit("failure", ...) the
-                    // tool handler below emits for THIS request is a burned ticket —
-                    // set AFTER the "approved" row above so that row itself (result
                         // kExpired (#6061): the ticket outlived its 7-day lifetime
                         // and was refused by DATABASE time at consume. Not in the
                         // anti-oracle set above: the origin + submitter binding
@@ -8403,6 +8403,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
+                        res.set_content(
+                            a4_error(kPermissionDenied,
+                                     "approval already used (one-time ticket)",
+                                     "submit a new request without approval_id to obtain a fresh "
+                                     "approval ticket"),
+                            "application/json");
+                        return;
+                    }
+                    mcp_audit("approved", "consumed approval_id=" + supplied_id);
+                    // #2444 item 3: from here on, any mcp_audit("failure", ...) the
+                    // tool handler below emits for THIS request is a burned ticket —
+                    // set AFTER the "approved" row above so that row itself (result
                     // "approved", not "failure") never counts.
                     approval_ticket_just_consumed = true;
                     // Ticket consumed → fall through to the tool handler below.
@@ -19419,45 +19431,47 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            // ── approve_request / reject_request (#289) ───────────────────
-            // Tier handled by C8 (Approval:Write → supervised only). Real RBAC
-            // op is Approval:Approve (matches REST /api/approvals/{id}/{approve,
-            // reject}). Reviewer≠submitter + pending-only are enforced atomically
-            // in ApprovalManager::set_review_status.
+            // ── approve_request / reject_request (#289, #6061) ────────────
+            // Tier handled by C8 (Approval:Approve → supervised only; #3151 —
+            // this used to be mapped Approval:Write while the handler checked
+            // Approval:Approve). Real RBAC op is Approval:Approve (matches REST
+            // /api/approvals/{id}/{approve,reject}).
+            //
+            // APPROVER ASSURANCE (#6061, the intended ADR-1005 exception):
+            // deciding an approval is a HUMAN-SESSION act. Every MCP session is
+            // bearer-authenticated (api_token / mcp_token / engine_token) and
+            // never carries an interactive login or a fresh MFA proof, so the
+            // handlers stay registered and discoverable but REFUSE with a typed
+            // error rather than letting a bearer (or an agentic worker holding
+            // one) close the four-eyes loop on its own request. The refusal is
+            // unconditional on this transport, NOT a call to the session-class
+            // predicate alone: a session reaching /mcp/v1/ is non-interactive by
+            // construction whatever its `auth_source` field says, so the
+            // predicate only chooses the reason token (engine / non-human are
+            // reported as such; everything else is non_interactive_session).
+            // Decide via the dashboard Approvals page or POST
+            // /api/approvals/{id}/{approve,reject} from an interactive session.
+            // Reviewer≠submitter + pending-only remain enforced atomically in
+            // ApprovalManager::set_review_status for the surfaces that can reach it.
             if (tool_name == "approve_request" || tool_name == "reject_request") {
                 if (!perm_fn(req, res, "Approval", "Approve"))
                     return;
-                if (!approval_manager) {
-                    res.set_content(
-                        error_response(id, kInternalError, "Approval manager unavailable"),
-                        "application/json");
-                    return;
-                }
-                auto target_id = param_str(args, "approval_id");
-                auto comment = param_str(args, "comment");
-                if (target_id.empty()) {
-                    res.set_content(error_response(id, kInvalidParams, "approval_id is required"),
-                                    "application/json");
-                    return;
-                }
-                const bool is_approve = (tool_name == "approve_request");
-                auto review_res = is_approve
-                                      ? approval_manager->approve(target_id, session->username, comment)
-                                      : approval_manager->reject(target_id, session->username, comment);
-                if (!review_res) {
-                    mcp_audit("failure", target_id);
-                    res.set_content(error_response(id, kInvalidParams, review_res.error()),
-                                    "application/json");
-                    return;
-                }
-                bool audit_ok = mcp_audit("success", target_id);
-                JObj payload;
-                payload.add(is_approve ? "approved" : "rejected", true)
-                    .add("approval_id", target_id);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
-                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
-                                "application/json");
+                namespace approval = yuzu::server::approval;
+                auto refusal = approval::check_approver_class(*session);
+                if (refusal == approval::ApproverRefusal::kNone)
+                    refusal = approval::ApproverRefusal::kNonInteractiveSession;
+                const bool audit_ok = mcp_audit(
+                    "denied", "approval_id=" + audit_token(param_str(args, "approval_id")) +
+                                  " approver_assurance:" +
+                                  std::string(approval::approver_refusal_reason(refusal)));
+                res.set_content(
+                    a4_error(kPermissionDenied, approval::approver_refusal_message(refusal),
+                             "approving or rejecting requires an interactive human session with "
+                             "a fresh MFA step-up; MCP, API-token and engine credentials cannot "
+                             "decide an approval. Ask a human reviewer to use the dashboard "
+                             "Approvals page.",
+                             /*retry_after_ms=*/-1, /*cid_override=*/{}, audit_ok),
+                    "application/json");
                 return;
             }
 

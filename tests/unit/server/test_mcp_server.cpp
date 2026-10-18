@@ -27830,34 +27830,44 @@ TEST_CASE("MCP 2405: concurrent validate() on one compiled schema is race-free",
     CHECK(rejects == 8 * 200);
 }
 
-TEST_CASE("MCP approve_request approves a pending request as a second principal",
-          "[pg][mcp][integration][approval]") {
-        yuzu::test::ApprovalManagerPg appr_bundle;
-    yuzu::server::ApprovalManager& appr = *appr_bundle;
-    auto submitted =
-        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
-    REQUIRE(submitted);
-
-    McpTestServer ts;
-    ts.approval_manager_for_test = &appr;
-    ts.start("supervised"); // Approval:Write is supervised-only
-
-    std::string call = R"({"jsonrpc":"2.0","method":"tools/call","id":230,"params":{"name":"approve_request","arguments":{"approval_id":")" +
-                       *submitted + R"(","comment":"lgtm"}}})";
+// ── approve_request / reject_request: human-session acts (#6061) ─────────────
+// Every MCP session is bearer-authenticated, so the tools stay registered but
+// refuse with a typed A4 error (the intended ADR-1005 exception). The ticket
+// must be left untouched. These replace the former "MCP approve_request
+// approves a pending request as a second principal" / "MCP reject_request
+// rejects a pending request" cases, which pinned the bearer-can-approve behaviour
+// this change removes.
+namespace {
+void check_mcp_approval_refused(McpTestServer& ts, const std::string& tool, int rpc_id,
+                                const std::string& approval_id, const std::string& reason,
+                                yuzu::server::ApprovalManager& appr) {
+    std::string call = R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(rpc_id) +
+                       R"(,"params":{"name":")" + tool + R"(","arguments":{"approval_id":")" +
+                       approval_id + R"(","comment":"lgtm"}}})";
     auto res = ts.call(call);
-    auto payload = write_tool_payload(res);
-    CHECK(payload["approved"] == true);
-    // Store reflects the approval (reviewer is the MCP principal "test-user").
-    auto row = appr.get(*submitted);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"] == "approver_assurance_required:" + reason);
+    CHECK(body["error"]["data"].contains("remediation"));
+    CHECK(!body.contains("result"));
+    // The refused attempt is audited as a denial, with the stable reason in the detail.
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp." + tool + "|denied") !=
+          ts.audit_log.end());
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("approver_assurance:" + reason) != std::string::npos);
+    auto row = appr.get(approval_id);
     REQUIRE(row);
-    CHECK(row->status == "approved");
-    CHECK(row->reviewed_by == "test-user");
-    // #2712: structuredContent mirrors content[0].text exactly.
-    CHECK(write_tool_structured(res) == payload);
+    CHECK(row->status == "pending");
+    CHECK(row->reviewed_by.empty());
 }
+} // namespace
 
-TEST_CASE("MCP reject_request rejects a pending request", "[pg][mcp][integration][approval]") {
-        yuzu::test::ApprovalManagerPg appr_bundle;
+TEST_CASE("MCP approve_request is refused with a typed error (human-session act), ticket stays "
+          "pending",
+          "[pg][mcp][integration][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     auto submitted =
         appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
@@ -27867,16 +27877,59 @@ TEST_CASE("MCP reject_request rejects a pending request", "[pg][mcp][integration
     ts.approval_manager_for_test = &appr;
     ts.start("supervised");
 
-    std::string call = R"({"jsonrpc":"2.0","method":"tools/call","id":231,"params":{"name":"reject_request","arguments":{"approval_id":")" +
-                       *submitted + R"("}}})";
-    auto res = ts.call(call);
-    auto payload = write_tool_payload(res);
-    CHECK(payload["rejected"] == true);
-    auto row = appr.get(*submitted);
-    REQUIRE(row);
-    CHECK(row->status == "rejected");
-    // #2712: structuredContent mirrors content[0].text exactly.
-    CHECK(write_tool_structured(res) == payload);
+    // A different principal with the RBAC grant still cannot decide over MCP.
+    check_mcp_approval_refused(ts, "approve_request", 230, *submitted, "non_interactive_session",
+                               appr);
+}
+
+TEST_CASE("MCP reject_request is refused with a typed error (human-session act), ticket stays "
+          "pending",
+          "[pg][mcp][integration][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
+    REQUIRE(submitted);
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    check_mcp_approval_refused(ts, "reject_request", 231, *submitted, "non_interactive_session",
+                               appr);
+}
+
+TEST_CASE("MCP approve_request / reject_request name an engine principal as such",
+          "[pg][mcp][integration][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
+    REQUIRE(submitted);
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.mock_principal_kind = "engine";
+    ts.mock_auth_source = "engine_token";
+    ts.start("supervised");
+
+    check_mcp_approval_refused(ts, "approve_request", 232, *submitted, "engine_principal", appr);
+    check_mcp_approval_refused(ts, "reject_request", 233, *submitted, "engine_principal", appr);
+}
+
+TEST_CASE("MCP approve_request: the RBAC gate still runs first (no assurance oracle for an "
+          "unauthorised caller)",
+          "[mcp][approval]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& type, const std::string& op) {
+        return !(type == "Approval" && op == "Approve");
+    };
+    ts.start("supervised");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":234,"params":{"name":"approve_request","arguments":{"approval_id":"x"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("approver_assurance_required") == std::string::npos);
 }
 
 TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolation",
@@ -28607,7 +28660,7 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
 // by principal X, then approve_request called by the SAME principal X, comes
 // back as a JSON-RPC error carrying the store's rejection.
 
-TEST_CASE("MCP approve_request rejects the ticket's own submitter as reviewer",
+TEST_CASE("MCP approve_request refuses the ticket's own submitter (human-session gate fires before the store)",
           "[pg][mcp][integration][approval]") {
     yuzu::test::TagStorePg tag_bundle;
     yuzu::server::TagStore& tags = *tag_bundle;
@@ -28627,18 +28680,20 @@ TEST_CASE("MCP approve_request rejects the ticket's own submitter as reviewer",
         nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
     REQUIRE(!approval_id.empty());
 
-    // Same principal tries to approve their own request → store rejection
-    // surfaced through the MCP error envelope.
+    // Same principal tries to approve their own request. Since #6061 the
+    // human-session refusal fires BEFORE the store is reached, so the self-approval
+    // never gets as far as the store's reviewer != submitter check (which remains
+    // enforced, and is pinned at the store and REST layers); what matters here is
+    // that the bearer cannot approve its own ticket by ANY path.
     std::string self_approve =
         R"({"jsonrpc":"2.0","method":"tools/call","id":271,"params":{"name":"approve_request","arguments":{"approval_id":")" +
         approval_id + R"("}}})";
     auto res = ts.call(self_approve);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
-    CHECK(body["error"]["message"].get<std::string>().find(
-              "reviewer cannot be the same as the submitter") != std::string::npos);
+    CHECK(body["error"]["message"] == "approver_assurance_required:non_interactive_session");
 
-    // The ticket is still pending — a second principal can review it.
+    // The ticket is still pending — a human reviewer can still decide it.
     auto row = appr.get(approval_id);
     REQUIRE(row);
     CHECK(row->status == "pending");
