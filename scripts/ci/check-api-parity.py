@@ -346,7 +346,7 @@ BASELINE_UNTWINNED = 227
 # issue. Bidirectional like BASELINE_UNTWINNED: lower it in the same change that removes rows.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 176
+BASELINE_GENERIC_PLANNED = 174
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error.
 REVISIT_MIN = datetime.date(2026, 1, 1)
