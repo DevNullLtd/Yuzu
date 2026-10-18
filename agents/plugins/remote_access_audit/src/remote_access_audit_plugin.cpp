@@ -29,7 +29,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "constrained: the agent runs unprivileged, so other users' homes (usually 0700) are "
          "refused, not empty, and the listing is constrained; configured access as written, not "
          "sshd's effective policy (Match is not evaluated); CA trust, key and principals "
-         "commands and hostbased auth are not read; key comments, option values and key-file "
+         "commands, a principals file, hostbased auth and AuthenticationMethods are not read; "
+         "key comments, option values and key-file "
          "paths are never emitted; only homes under /home and /root are walked; a symlinked key "
          "file or .ssh is refused; network mounts are skipped"},
         /* .macos_leg   = */
@@ -38,8 +39,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "does) and each account's authorized_keys (no-follow; pure parsers, SHA-256 "
          "fingerprints); one bounded launchctl print-disabled system argv",
          "configured access as written, not sshd's effective policy; the launchd override is "
-         "not 'running'; CA trust, key and principals commands and hostbased auth are not read; "
-         "key comments, option values and key-file paths are never emitted; only homes under "
+         "not 'running'; CA trust, key and principals commands, a principals file, hostbased auth "
+         "and AuthenticationMethods are not read; the Remote Login access list (pam_sacl) is "
+         "not read; key comments, option values and key-file paths are never emitted; only homes under "
          "/Users owned by uid 500 or above, and /var/root, are walked; a symlinked key file or "
          ".ssh is refused; network mounts are skipped"},
         /* .windows_leg = */

@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-17 · euid 501 (account redacted to jsmith) · leg-hash 58c6c41593ed
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-18 · euid 501 (account redacted to jsmith) · leg-hash 58c6c41593ed
 == action=list
 status|list|constrained|macos:remote_access_audit:homes:permission_denied
 source|sshd_config|read|3
@@ -8,6 +8,7 @@ config|permitrootlogin|-|-
 config|passwordauthentication|-|-
 config|pubkeyauthentication|-|-
 config|kbdinteractiveauthentication|-|-
+config|gssapiauthentication|-|-
 config|permitemptypasswords|-|-
 config|usepam|yes|include:100-macos.conf
 config|port|-|-

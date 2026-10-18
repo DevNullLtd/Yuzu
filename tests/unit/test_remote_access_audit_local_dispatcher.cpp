@@ -260,7 +260,7 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     CHECK(rows[0] == "status|list|unsupported|windows:planned");
     CHECK(result.result_provenance == "windows:planned");
 #else
-    REQUIRE(rows.size() >= 1 + 3 + 13);
+    REQUIRE(rows.size() >= 1 + 3 + 14);
     CHECK(rows[1].starts_with("source|sshd_config|"));
     CHECK(rows[2].starts_with("source|homes|"));
     CHECK(rows[3].starts_with("source|service|"));
@@ -269,8 +269,14 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     // The homes row alone carries a fifth field (entries the eligibility probe refused; `-` on Linux).
     CHECK(fields(rows[2]).size() == 5);
     // The production wiring, asserted only on what is environment-stable. sshd_config is world-readable
-    // on every Mac and is either there or not on a CI image; a path that was mis-bound would read `failed`.
+    // on every Mac (0644) and is either there or not on a CI image; a path that was mis-bound would read
+    // `failed`. On Linux a RHEL-family 0600 root file reads `refused` to an unprivileged run, which is a
+    // correct answer, so it is accepted there.
+#if defined(__APPLE__)
     CHECK(in(fields(rows[1])[2], {"read", "absent"}));
+#else
+    CHECK(in(fields(rows[1])[2], {"read", "absent", "refused"}));
+#endif
 #if defined(__APPLE__)
     // launchctl print-disabled answers an unprivileged caller, so the service source IS read and the one
     // row names the label and the mechanism. MUTATION: a wrong tool path or arguments drops this row.
@@ -285,20 +291,20 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     CHECK(fields(rows[2])[4] != "-");
 #else
     // systemctl may not exist on a CI image (a failed service source, no service rows) or exist but answer
-    // for no unit (a container without a bus: failed, the three units reported with an unknown state);
-    // when it ran, every row is for one of the three units and names the mechanism.
+    // for no unit (a container without a bus: failed, the four units reported with an unknown state);
+    // when it ran, every row is for one of the four units and names the mechanism.
     CHECK(fields(rows[2])[4] == "-"); // Linux has no eligibility probe, so nothing is detectably skipped
     CHECK(in(fields(rows[3])[2], {"read", "failed"}));
     const auto n_svc = std::ranges::count_if(rows, [](const std::string& r) { return r.starts_with("service|"); });
     if (fields(rows[3])[2] == "read")
-        CHECK(n_svc == 3);
+        CHECK(n_svc == 4);
     else
-        CHECK((n_svc == 0 || n_svc == 3));
+        CHECK((n_svc == 0 || n_svc == 4));
     for (const auto& r : rows) {
         if (!r.starts_with("service|"))
             continue;
         const auto sf = fields(r);
-        CHECK(in(sf[1], {"ssh.service", "sshd.service", "ssh.socket"}));
+        CHECK(in(sf[1], {"ssh.service", "sshd.service", "ssh.socket", "sshd.socket"}));
         CHECK(sf[3] == "systemctl_is_enabled");
     }
 #endif
@@ -320,7 +326,7 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     CHECK(config_keys ==
           std::vector<std::string>{"permitrootlogin", "passwordauthentication",
                                    "pubkeyauthentication", "kbdinteractiveauthentication",
-                                   "permitemptypasswords", "usepam", "port", "authorizedkeysfile",
+                                   "gssapiauthentication", "permitemptypasswords", "usepam", "port", "authorizedkeysfile",
                                    "allowusers_count", "allowgroups_count", "denyusers_count",
                                    "denygroups_count", "match_blocks"});
 

@@ -28,7 +28,7 @@ int run_linux(yuzu::CommandContext& ctx) {
             argv.push_back(tool);
             argv.insert(argv.end(), args.begin(), args.end());
         }
-        // sink: remote_access_audit/run_linux#1 -- systemctl is-enabled <unit> (rung 2 argv; rung 1's sd-bus gate + mandatory argv fallback buys three saved spawns and no fidelity, comparison in the manifest)
+        // sink: remote_access_audit/run_linux#1 -- systemctl is-enabled <unit> (rung 2 argv; rung 1's sd-bus gate + mandatory argv fallback buys four saved spawns and no fidelity, comparison in the manifest)
         return yuzu::agent::run_bounded_subprocess(argv, opts);
     };
     report_list(ctx, list_posix(make_posix_fs(p)));

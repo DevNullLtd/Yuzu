@@ -12,8 +12,8 @@
 /// reading the implementation.
 ///
 /// `list` is ReadOnly/None -- the plugin never writes a file or changes a key or service. It
-/// reads sshd_config and each account's authorized_keys with bounded no-follow reads, runs one
-/// fixed read-only argv per sshd unit, and emits key FINGERPRINTS and option NAMES only.
+/// reads sshd_config (links followed as sshd follows them) and each account's authorized_keys
+/// (no-follow), both bounded, runs one fixed read-only argv per sshd unit, and emits key FINGERPRINTS and option NAMES only.
 ///
 /// Grouped under the SAME `Forensics` securable execution_artifacts and privacy_permissions
 /// use (`rbac_store.cpp`'s seeded `types[]` entry; the string below MUST equal that seed
@@ -22,7 +22,7 @@
 /// `dispatch_destructive_gate.hpp`'s `kForensicsSecurable`/`requires_explicit_targets`
 /// single-target + audited enforcement for free.
 ///
-/// `authz::RiskTier::High`: per-account SSH key fingerprints on a SINGLE named machine name
+/// `authz::RiskTier::High`: per-account SSH key fingerprints on a SINGLE named machine say
 /// which keys can log in as which account -- identity material. Ships default-off behind the
 /// plugin-config kill switch.
 namespace yuzu::server::capdecls {

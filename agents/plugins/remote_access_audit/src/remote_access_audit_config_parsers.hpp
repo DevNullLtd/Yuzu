@@ -47,8 +47,8 @@ inline constexpr std::size_t kRowOverhead = 64;
 inline constexpr std::size_t kMaxIncludeDepth = 4;
 inline constexpr std::size_t kMaxIncludeFiles = 32;
 inline constexpr std::size_t kMaxPorts = 256; ///< sshd's own MAX_PORTS
-/// AuthorizedKeysFile tokens kept; the rest are dropped with a token. The order of the
-/// MAX_AUTHKEYS_FILES (100) older OpenSSH enforced: each token is resolved once per account home.
+/// AuthorizedKeysFile tokens kept; the rest are dropped with a token. Each kept token is
+/// resolved once per account home.
 inline constexpr std::size_t kMaxAuthorizedKeysFileTokens = 100;
 
 inline std::string_view state_token(SourceState s) {
@@ -255,10 +255,11 @@ inline std::optional<SshdLine> split_sshd_line(std::string_view raw, bool& inval
 
 /// The first-occurrence-wins scalar keywords, in row order. `kbdinteractiveauthentication`
 /// also answers to its deprecated alias `challengeresponseauthentication`, sharing the slot as
-/// sshd does.
-inline constexpr std::array<std::string_view, 6> kScalarKeys = {
+/// sshd does. `gssapiauthentication` is a key-less login method like the password ones, reported
+/// as written rather than raised as an unread credential source.
+inline constexpr std::array<std::string_view, 7> kScalarKeys = {
     "permitrootlogin",       "passwordauthentication", "pubkeyauthentication",
-    "kbdinteractiveauthentication", "permitemptypasswords", "usepam"};
+    "kbdinteractiveauthentication", "gssapiauthentication", "permitemptypasswords", "usepam"};
 
 struct ScalarSlot {
     bool set = false;
@@ -485,7 +486,7 @@ inline IncludeSpec expand_include_pattern(std::string_view arg) {
     return "custom:" + std::to_string(st.akf_count);
 }
 
-/// The 13 config rows, ALWAYS all of them. `config_read == false` (sshd_config absent or
+/// The 14 config rows, ALWAYS all of them. `config_read == false` (sshd_config absent or
 /// unreadable) -> every value `-`: the file said nothing, and defaults are not applied.
 [[nodiscard]] inline std::vector<std::string> config_rows(const SshdConfigState& st, bool config_read,
                                                           bool& oversized) {

@@ -119,7 +119,8 @@ TEST_CASE("remote_access_audit config: the Debian 13 stock sshd_config parses to
     CHECK_FALSE(run.seen[0].in_match);
     bool ov = false;
     const auto rows = config_rows(run.st, true, ov);
-    CHECK(rows.size() == 13);
+    CHECK(rows.size() == 14);
+    CHECK(row_for(rows, "gssapiauthentication") == "config|gssapiauthentication|-|-");
     CHECK(row_for(rows, "usepam") == "config|usepam|yes|sshd_config");
     CHECK(row_for(rows, "permitrootlogin") == "config|permitrootlogin|-|-");
 }
@@ -292,7 +293,7 @@ TEST_CASE("remote_access_audit config: a missing sshd_config reports every value
     const auto run = parse("PermitRootLogin yes\n");
     bool ov = false;
     const auto rows = config_rows(run.st, /*config_read=*/false, ov);
-    REQUIRE(rows.size() == 13);
+    REQUIRE(rows.size() == 14);
     CHECK(row_for(rows, "permitrootlogin") == "config|permitrootlogin|-|-");
     CHECK(row_for(rows, "match_blocks") == "config|match_blocks|-|-");
 }

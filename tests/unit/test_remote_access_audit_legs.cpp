@@ -219,14 +219,16 @@ TEST_CASE("remote_access_audit legs: a clean read is supported, with every fixed
     f.key_files["/home/bob/.ssh/authorized_keys"] = ok("");
     const auto l = list_posix(f.build());
     CHECK(l.status == StatusState::supported);
-    REQUIRE(l.rows.size() >= 3 + 13 + 3);
+    REQUIRE(l.rows.size() >= 3 + 14 + 4);
     CHECK(l.rows[0] == "source|sshd_config|read|1");
     CHECK(l.rows[1] == "source|homes|read|2|-");
-    CHECK(l.rows[2] == "source|service|read|3");
-    CHECK(kind_rows(l, "config").size() == 13);
+    CHECK(l.rows[2] == "source|service|read|4");
+    CHECK(kind_rows(l, "config").size() == 14);
     CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|no|sshd_config");
-    CHECK(kind_rows(l, "service").size() == 3);
+    CHECK(kind_rows(l, "service").size() == 4);
     CHECK(row_with(l.rows, "service|ssh.socket|") == "service|ssh.socket|enabled|systemctl_is_enabled");
+    // MUTATION: dropping the 4th literal leaves a socket-activated Fedora/RHEL host reading as SSH off
+    CHECK(row_with(l.rows, "service|sshd.socket|") == "service|sshd.socket|enabled|systemctl_is_enabled");
     CHECK(row_with(l.rows, "file|alice|authorized_keys|") == "file|alice|authorized_keys|read|1|0|0");
     CHECK(row_with(l.rows, "file|bob|authorized_keys|") == "file|bob|authorized_keys|read|0|0|0");
     CHECK(row_with(l.rows, "file|alice|authorized_keys2|") == "file|alice|authorized_keys2|absent|-|-|-");
@@ -584,6 +586,35 @@ TEST_CASE("remote_access_audit legs: the config half honours the same run-start 
     CHECK(l.rows[0] == "source|sshd_config|read|1");
     CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|-|-");
 
+    // the Include DIRECTORY is a link (one readlink hop) over a per-file mount: the entry is judged under
+    // BOTH spellings, so the mounted one is never opened and its sibling still is.
+    // MUTATION: dropping the resolved-spelling comparison opens share1.conf.
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/mnt/shares/share1.conf"};
+    f.resolve = [](const std::string& p) { return p == "/etc/ssh/conf.d" ? std::string{"/mnt/shares"} : p; };
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /etc/ssh/conf.d/*.conf\n");
+    f.listings["/etc/ssh/conf.d|*.conf"] = {"share1.conf", "ok.conf"};
+    f.dir_files["/etc/ssh/conf.d/share1.conf"] = ok("PermitRootLogin yes\n");
+    f.dir_files["/etc/ssh/conf.d/ok.conf"] = ok("PasswordAuthentication no\n");
+    l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "share1"));
+    CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|-|-");
+    CHECK(row_with(l.rows, "config|passwordauthentication|") == "config|passwordauthentication|no|include:ok.conf");
+
+    // a dot-spelled Include directory and a mounted entry that sorts BEFORE its sibling.
+    // MUTATION: dropping lexical_normal opens m.conf; `continue` -> `break` drops z.conf.
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/etc/ssh/conf.d/m.conf"};
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /etc/ssh/./conf.d/*.conf\n");
+    f.listings["/etc/ssh/./conf.d|*.conf"] = {"m.conf", "z.conf"};
+    f.dir_files["/etc/ssh/./conf.d/m.conf"] = ok("PermitRootLogin yes\n");
+    f.dir_files["/etc/ssh/./conf.d/z.conf"] = ok("PasswordAuthentication no\n");
+    l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "m.conf"));
+    CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    CHECK(row_with(l.rows, "config|passwordauthentication|") == "config|passwordauthentication|no|include:z.conf");
+
     // the config path is itself a link whose single readlink hop lands under a mount
     f = healthy();
     f.prefixes = std::vector<std::string>{"/net"};
@@ -728,6 +759,7 @@ TEST_CASE("remote_access_audit legs: service state arms", "[remote_access_audit]
     CHECK(row_with(l.rows, "service|ssh.service|") == "service|ssh.service|not-found|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|sshd.service|") == "service|sshd.service|disabled|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|ssh.socket|") == "service|ssh.socket|static|systemctl_is_enabled");
+    CHECK(row_with(l.rows, "service|sshd.socket|") == "service|sshd.socket|static|systemctl_is_enabled");
 
     f = healthy();
     f.runner = [](const std::vector<std::string>&) { return died(yuzu::agent::TerminationReason::deadline); };
@@ -854,8 +886,8 @@ TEST_CASE("remote_access_audit legs: the row budget is dispatch-wide and the fix
     CHECK(has_token(l, "linux:remote_access_audit:keys:row_cap"));
     CHECK(l.rows.size() <= kMaxRows);
     CHECK(kind_rows(l, "source").size() == 3);
-    CHECK(kind_rows(l, "config").size() == 13);
-    CHECK(kind_rows(l, "service").size() == 3);
+    CHECK(kind_rows(l, "config").size() == 14);
+    CHECK(kind_rows(l, "service").size() == 4);
 
     // the byte budget binds first for long account names (4 KiB each, cut on the wire)
     f = healthy();
@@ -911,12 +943,13 @@ TEST_CASE("remote_access_audit legs: a unit systemd 249/252 reports on stderr is
     auto l = list_posix(f.build());
     CHECK(l.status == StatusState::supported);
     CHECK(l.reason.empty());
-    CHECK(l.rows[2] == "source|service|read|3");
+    CHECK(l.rows[2] == "source|service|read|4");
     CHECK(row_with(l.rows, "service|ssh.service|") == "service|ssh.service|not-found|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|sshd.service|") == "service|sshd.service|not-found|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|ssh.socket|") == "service|ssh.socket|not-found|systemctl_is_enabled");
+    CHECK(row_with(l.rows, "service|sshd.socket|") == "service|sshd.socket|not-found|systemctl_is_enabled");
     // the runner is asked for stderr: without it the line above is never seen
-    REQUIRE(f.merge_flags.size() == 3);
+    REQUIRE(f.merge_flags.size() == 4);
     CHECK(std::ranges::all_of(f.merge_flags, [](bool m) { return m; }));
 
     // REAL CAPTURE (same containers) AFTER `apt-get install openssh-server`: ssh.service enabled (exit 0),
@@ -934,6 +967,7 @@ TEST_CASE("remote_access_audit legs: a unit systemd 249/252 reports on stderr is
     CHECK(row_with(l.rows, "service|ssh.service|") == "service|ssh.service|enabled|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|sshd.service|") == "service|sshd.service|alias|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|ssh.socket|") == "service|ssh.socket|disabled|systemctl_is_enabled");
+    CHECK(row_with(l.rows, "service|sshd.socket|") == "service|sshd.socket|disabled|systemctl_is_enabled");
 
     // narrow: another stderr line that merely contains the words, or the right line on exit 0, is still a failure
     f = healthy();
@@ -983,7 +1017,8 @@ TEST_CASE("remote_access_audit legs: a credential source the plugin does not rea
     CHECK(has_token(list_posix(f.build()), "macos:remote_access_audit:sshd_config:other_credential_sources"));
 
     // controls: the disabling values, a Match-scoped directive and an unread config raise nothing
-    for (const char* text : {"AuthorizedKeysCommand none\nHostbasedAuthentication no\nAuthenticationMethods any\n",
+    for (const char* text : {"AuthorizedKeysCommand none\nHostbasedAuthentication no\nAuthenticationMethods any\n"
+                             "TrustedUserCAKeys none\nAuthorizedPrincipalsFile none\nAuthorizedPrincipalsCommand none\n",
                              "Match User bob\n  TrustedUserCAKeys /etc/ssh/ca.pub\n"}) {
         f = healthy();
         f.config_files["/etc/ssh/sshd_config"] = ok(text);
@@ -993,6 +1028,18 @@ TEST_CASE("remote_access_audit legs: a credential source the plugin does not rea
     f = healthy();
     f.config_files.clear(); // sshd_config absent: nothing was read, so nothing is claimed
     CHECK_FALSE(has_token(list_posix(f.build()), tok));
+}
+
+// MUTATION: dropping `gssapiauthentication` from kScalarKeys leaves a global `GSSAPIAuthentication yes`
+// with no row and no token. It is a login METHOD like password auth: reported as written, supported, no token.
+TEST_CASE("remote_access_audit legs: GSSAPIAuthentication is reported as written, not flagged",
+          "[remote_access_audit][legs]") {
+    auto f = healthy();
+    f.config_files["/etc/ssh/sshd_config"] = ok("GSSAPIAuthentication yes\n");
+    const auto l = list_posix(f.build());
+    CHECK(l.status == StatusState::supported);
+    CHECK(l.reason.empty());
+    CHECK(row_with(l.rows, "config|gssapiauthentication|") == "config|gssapiauthentication|yes|sshd_config");
 }
 
 // MUTATION: matching a closed-set keyword by prefix (`starts_with` in place of the exact lookup in
@@ -1132,7 +1179,7 @@ TEST_CASE("remote_access_audit legs: AuthorizedKeysFile tokens beyond the cap ar
 // already admitted when one subject-authored file saturates the dispatch budget (2,100 lines -> zero rows).
 TEST_CASE("remote_access_audit legs: a file that saturates the row budget keeps its first keys and its file row",
           "[remote_access_audit][legs]") {
-    const std::size_t fixed = kSourceRows + 13 + 3; // source + config + service rows
+    const std::size_t fixed = kSourceRows + 14 + 4; // source + config + service rows
     for (const std::size_t n : {std::size_t{1900}, std::size_t{2020}, std::size_t{2100}}) {
         INFO("lines in alice's file: " << n);
         auto f = healthy();
@@ -1188,6 +1235,7 @@ TEST_CASE("remote_access_audit legs: the documented limits are pinned", "[remote
     static_assert(kMaxKeyLine == 16 * 1024);
     static_assert(kMaxIncludeDepth == 4);
     static_assert(kMaxIncludeFiles == 32);
+    static_assert(kMaxAuthorizedKeysFileTokens == 100);
     static_assert(kMaxHomes == 512);
     static_assert(kMaxKeyFileAttempts == 1024);
     static_assert(kKeyFileCap == 1024 * 1024);

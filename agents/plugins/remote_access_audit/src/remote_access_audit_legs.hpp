@@ -401,8 +401,8 @@ inline std::string lexical_normal(std::string_view path) {
 
 /// True when a CONFIGURED path (the config file, an Include file or directory) is on a network
 /// mount, judged without touching the mount: the lexically normalised path, then the single
-/// readlink hop `resolve_root` answers when the path is itself a link. Nothing is opened,
-/// stat'ed or realpath'ed.
+/// readlink hop `resolve_root` answers when the path is itself a link. The path is lstat'ed and,
+/// when a link, readlinked; its target is never opened or realpath'ed.
 inline bool configured_path_on_network(const PosixFs& fs, const std::vector<std::string>& prefixes,
                                        const std::string& path) {
     const std::string norm = lexical_normal(path);
@@ -454,8 +454,9 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
         return;
     }
     // The readers carry no deadline, so an Include file (or a listed directory) on a network
-    // mount is never opened; the directory and each listed entry are checked by name; an entry that
-    // is a link into a mount is not resolved (README caveat 4).
+    // mount is never opened; the directory and each listed entry are checked by name under both the
+    // configured and the one-hop resolved spelling of the directory; an entry that is itself a
+    // link into a mount is not resolved (README caveat 4).
     if (configured_path_on_network(c.fs, c.prefixes,
                                    spec.kind == IncludeSpec::Kind::single ? spec.path : spec.dir)) {
         c.t.acc.add_failure(src_token(os, "include", "network_mount_skipped"));
@@ -493,14 +494,16 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
         } else {
             if (too_many)
                 c.t.acc.add_failure(src_token(os, "include", "too_many"));
+            const std::string dir_norm = lexical_normal(spec.dir);
+            const std::string dir_resolved = c.fs.resolve_root ? c.fs.resolve_root(dir_norm) : dir_norm;
             for (const auto& n : names) {
                 if (c.files_read >= kMaxIncludeFiles) {
                     c.t.acc.add_failure(src_token(os, "include", "too_many"));
                     break;
                 }
-                // Lexical by name only: an entry that is itself a link into a mount is not
-                // resolved.
-                if (under_prefix(lexical_normal(spec.dir + "/" + n), c.prefixes)) {
+                // Lexical by name, under both spellings of the directory; no per-entry readlink.
+                if (under_prefix(lexical_normal(spec.dir + "/" + n), c.prefixes) ||
+                    (dir_resolved != dir_norm && under_prefix(dir_resolved + "/" + n, c.prefixes))) {
                     c.t.acc.add_failure(src_token(os, "include", "network_mount_skipped"));
                     continue;
                 }
@@ -593,7 +596,8 @@ inline std::optional<std::string> service_failure(const yuzu::agent::SubprocessR
 /// into the captured output: systemd 249/252 name a missing unit only there
 /// (parse_systemctl_is_enabled).
 inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
-    static constexpr std::array<std::string_view, 3> kUnits = {"ssh.service", "sshd.service", "ssh.socket"};
+    static constexpr std::array<std::string_view, 4> kUnits = {"ssh.service", "sshd.service", "ssh.socket",
+                                                               "sshd.socket"};
     ServiceOutcome out;
     bool any_answered = false;
     for (const auto unit : kUnits) {
@@ -763,7 +767,7 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
         // Order: network prefix -> eligibility -> lazy open_home. A home on a network mount is
         // never stat'ed or opened (it is reported failed below); on any other home the
         // eligibility probe runs before anything opens it, and a home that is positively not an
-        // account is neither counted nor reported.
+        // account has no row and is counted in the homes row's skipped field.
         const bool on_network = detail::under_prefix(home.path, prefixes);
         if (!on_network && fs.is_account_home && !fs.is_account_home(home)) {
             ++*out.skipped_homes;

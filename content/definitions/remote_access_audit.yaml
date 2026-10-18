@@ -1,7 +1,7 @@
 ## Remote Access Audit Definitions
 ## Who can log in to this host over SSH, as CONFIGURED: the sshd_config values that matter for
-## inbound access, a SHA-256 fingerprint of every public key in each account's authorized_keys,
-## and whether the sshd service is enabled. Nothing is changed or fetched.
+## inbound access, a SHA-256 fingerprint of every public key in the authorized_keys of the homes
+## it walks, and whether the sshd service is enabled. Nothing is changed or fetched.
 ## Plugin: remote_access_audit | Actions: list
 ##
 ## Gated behind the SAME Forensics securable execution_artifacts and privacy_permissions use
@@ -19,7 +19,8 @@
 ##            followed as sshd does; 0644 on Debian-family packages, 0600 root on the RHEL
 ##            family, where the unprivileged agent gets sshd_config:permission_denied) and the
 ##            authorized_keys of each home directly under /home plus /root (never through a
-##            symlink); `systemctl is-enabled` for ssh.service, sshd.service and ssh.socket.
+##            symlink); `systemctl is-enabled` for ssh.service, sshd.service, ssh.socket and
+##            sshd.socket.
 ##            A home the agent cannot open is refused, not empty.
 ##   macOS:   the same files, for each home under /Users owned by uid 500 or above plus
 ##            /var/root (the source row counts the entries skipped); `launchctl print-disabled
@@ -62,7 +63,9 @@ metadata:
     quote is flagged: sshd -t is the validity check). It reports a
     SHA-256 fingerprint for every public key in the authorized_keys of the homes it walks (a
     certificate reports the fingerprint of the key it carries) with the option names it uses,
-    and whether the sshd service is enabled. It does not read every way to log in: a
+    and whether the sshd service is enabled. A login that needs no key (password,
+    keyboard-interactive, GSSAPI) is governed by the config rows and reported as written. It
+    does not read every way to log in: a
     certificate authority, keys or principals supplied by a command, a principals file,
     host-based authentication and AuthenticationMethods are not read (when sshd_config sets
     one of these six the status is constrained, with a presence-only token). Two more gaps
@@ -104,7 +107,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_1
         type: string
-        description: 'status: the literal "list". source: sshd_config, homes or service. config: the setting (permitrootlogin, passwordauthentication, pubkeyauthentication, kbdinteractiveauthentication, permitemptypasswords, usepam, port, authorizedkeysfile, allowusers_count, allowgroups_count, denyusers_count, denygroups_count, match_blocks). service: the unit (ssh.service, sshd.service, ssh.socket, or com.openssh.sshd on macOS). file and key: the account, which is the HOME DIRECTORY NAME, not necessarily the login name.'
+        description: 'status: the literal "list". source: sshd_config, homes or service. config: the setting (permitrootlogin, passwordauthentication, pubkeyauthentication, kbdinteractiveauthentication, gssapiauthentication, permitemptypasswords, usepam, port, authorizedkeysfile, allowusers_count, allowgroups_count, denyusers_count, denygroups_count, match_blocks). service: the unit (ssh.service, sshd.service, ssh.socket, sshd.socket, or com.openssh.sshd on macOS). file and key: the account, which is the HOME DIRECTORY NAME, not necessarily the login name.'
         example: alice
         platforms: [windows, linux, darwin]
       - name: field_2
@@ -115,11 +118,11 @@ spec:
       - name: field_3
         type: string
         description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:remote_access_audit:homes:permission_denied or windows:planned. source: files read (sshd_config plus includes), accounts walked, or units queried, "-" unless read. config: where the value came from (sshd_config or include:<file name>), "-" when unset. service: the mechanism. file: read, absent, refused or failed. key: the key type as written (ssh-ed25519, ssh-rsa, ecdsa-sha2-nistp256, a -cert-v01 certificate type, ...).'
-        example: SHA256:BPH4QduMtDlX59CWZCda5Zf0U0jseMmFVimvek7EMhA
+        example: ssh-ed25519
         platforms: [windows, linux, darwin]
       - name: field_4
         type: string
-        description: 'source (homes row only): the number of home-root entries not treated as accounts (macOS: owned by a uid under 500, such as /Users/Shared), "-" on Linux where nothing is detectably skipped, or when the roots were not listed. file: the number of key lines listed (accepted and within the row budget; keys:row_cap in the status reason means the listing stopped before the last accepted line of the file), "-" unless read. key: the fingerprint, SHA256: plus unpadded base64, identical to ssh-keygen -lf (a certificate reports the key it carries).'
+        description: 'source (homes row only): the number of home-root entries not treated as accounts (macOS: owned by a uid under 500, such as /Users/Shared), "-" on Linux where nothing is detectably skipped, or when the roots were not listed (counted over the homes examined: a lower bound when keys:row_cap or keys:file_cap is set). file: the number of key lines listed (accepted and within the row budget; keys:row_cap in the status reason means the listing stopped before the last accepted line of the file), "-" unless read. key: the fingerprint, SHA256: plus unpadded base64, identical to ssh-keygen -lf (a certificate reports the key it carries).'
         example: '2'
         platforms: [linux, darwin]
       - name: field_5
