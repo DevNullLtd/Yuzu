@@ -1064,7 +1064,7 @@ gateway_env(UpPort, AgentPort, Agent6Port, MgmtPort, Dual) ->
                       acceptors => 32,
                       http2 => #{idle_timeout => 180000, max_concurrent_streams => 32},
                       limits => #{max_connections => 60000, max_message_bytes => 4194304,
-                                  max_connection_memory_bytes => 16777216,
+                                  max_connection_memory_bytes => 33554432,
                                   request_timeout_ms => 30000}}
             end,
     Mgmt = #{name => mgmt,

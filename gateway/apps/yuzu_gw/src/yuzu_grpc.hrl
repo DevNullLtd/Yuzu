@@ -40,13 +40,16 @@
 %% The per-connection memory ceiling the stream handler sets on the Cowboy
 %% connection process (process_flag(max_heap_size), counting shared binaries, so
 %% the refc buffers of its streams' in-flight requests are included). Default
-%% when limits.max_connection_memory_bytes is unset: four times the max message
-%% size, so a connection may carry a few concurrent full-size messages (a 3 MiB
-%% inventory blob and the copies a binary append makes) but not the dozens a
-%% flood of half-finished streams would (`infinity' disables it).
--define(YUZU_GRPC_MAX_CONN_MEMORY_FACTOR, 4).
+%% when limits.max_connection_memory_bytes is unset: eight times the max message
+%% size (32 MiB with the 4 MiB default; `infinity' disables it). Sized from what
+%% the ceiling was measured to see: one message of max_message_bytes costs the
+%% connection three times its size at its peak (its chunks, the joined message
+%% and the decoded request) plus under a MiB of garbage, so two such messages
+%% completing at once fit with room to spare (6x), and a flood of half-finished
+%% streams, each holding its own size, is killed at about the eighth.
+-define(YUZU_GRPC_MAX_CONN_MEMORY_FACTOR, 8).
 %% The derived default never goes below this: with a small max_message_bytes,
-%% four times it could fall under a connection process's own baseline memory and
+%% eight times it could fall under a connection process's own baseline memory and
 %% kill every connection at once. An EXPLICIT max_connection_memory_bytes must
 %% also be at least this (or `infinity'); the listener refuses a smaller one.
 -define(YUZU_GRPC_MIN_CONN_MEMORY_BYTES, 1048576).

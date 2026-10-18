@@ -21,7 +21,13 @@
 %%%      cannot excuse a missing channel);
 %%%   4. when the file configures `grpc_listeners', they pass
 %%%      yuzu_gw_app:check_grpc_listeners/0 once set as the application env (with
-%%%      `allow_no_listeners' unset, for the same reason).
+%%%      `allow_no_listeners' unset, for the same reason);
+%%%   5. a listener serving the agent service that writes out
+%%%      max_connection_memory_bytes writes the derived default (eight times its
+%%%      max_message_bytes, yuzu_grpc.hrl): the files show the defaults so they
+%%%      are visible, and a stale value there (the earlier 16 MiB, under which
+%%%      one full-size agent message killed its own connection) would override
+%%%      the corrected default on every gateway booted from the file.
 %%%
 %%% The application env keys this touches are saved and restored around the run.
 %%%
@@ -38,6 +44,7 @@
 %% The repository root, for other modules that read shipped files.
 -export([repo_root/0]).
 -include_lib("eunit/include/eunit.hrl").
+-include("../src/yuzu_grpc.hrl").
 
 %% Every shipped Erlang config, relative to the repository root. test.config is
 %% the suites' config rather than a release's; it is held to items 1-3 as well,
@@ -64,7 +71,9 @@ config_files_test_() ->
                       {"upstream_client is visible and names default_channel",
                        fun() -> check_upstream_client(Root, File) end},
                       {"grpc_listeners pass the boot guard",
-                       fun() -> check_listeners(Root, File) end}]}
+                       fun() -> check_listeners(Root, File) end},
+                      {"an agent listener's memory ceiling is the derived default",
+                       fun() -> check_agent_ceiling(Root, File) end}]}
               || File <- config_files()]};
         {error, Why} ->
             case os:getenv("YUZU_REQUIRE_CONFIG_FILES_TEST") of
@@ -119,6 +128,20 @@ check_listeners(Root, File) ->
             with_env([{grpc_listeners, Listeners}, {allow_no_listeners, unset}],
                      fun() -> ?assertEqual(ok, yuzu_gw_app:check_grpc_listeners()) end)
     end.
+
+check_agent_ceiling(Root, File) ->
+    Cfg = consult(filename:join(Root, File)),
+    Env = proplists:get_value(yuzu_gw, Cfg, []),
+    Listeners = proplists:get_value(grpc_listeners, Env, []),
+    [begin
+         Max = maps:get(max_message_bytes, Limits, ?YUZU_GRPC_MAX_MESSAGE_BYTES),
+         ?assertEqual({Name, ?YUZU_GRPC_MAX_CONN_MEMORY_FACTOR * Max}, {Name, Ceiling})
+     end
+     || #{services := Services, limits := #{max_connection_memory_bytes := Ceiling} = Limits} = L
+            <- Listeners,
+        Name <- [maps:get(name, L, unnamed)],
+        maps:is_key('yuzu.agent.v1.AgentService', Services)],
+    ok.
 
 %%--------------------------------------------------------------------
 %% Helpers

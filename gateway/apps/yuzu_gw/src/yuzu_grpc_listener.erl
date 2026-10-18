@@ -50,8 +50,9 @@
 %%%                  max_connection_memory_bytes caps a single connection's memory
 %%%                  (a max_heap_size on the Cowboy connection process counting the
 %%%                  refc buffers its streams hold); a connection that buffers more
-%%%                  half-finished requests than this is killed. Default: four times
-%%%                  max_message_bytes (`infinity' disables it), except on a listener
+%%%                  half-finished requests than this is killed. Default: eight times
+%%%                  max_message_bytes (`infinity' disables it; see the derivation
+%%%                  in yuzu_grpc.hrl), except on a listener
 %%%                  that routes the ManagementService and does not serve the agent
 %%%                  service, where the default is none: its one peer is the pinned
 %%%                  server, and the ceiling killed the server's connection when a
@@ -450,12 +451,15 @@ protocol_opts(Entry, Routes) ->
 %% before any stream of it is served), which holds ONE connection and sends a
 %% whole fan-out over it. On that connection the ceiling killed the server's
 %% connection, every call in flight on it, when the agents of a fan-out answered
-%% together with large responses: the derived 16 MiB equals Cowboy's own
-%% output-buffer alarm (max_connection_buffer_size, 16000000 bytes), so the VM
-%% killed the connection before that alarm could slow the senders, and each
-%% stream holds one more response than the alarm counts. Without the ceiling the
-%% alarm paces the senders; what one connection can then hold is about 16 MB
-%% plus one response per stream in flight (max_concurrent_streams of them). A
+%% together with large responses: the derived ceiling was then 16 MiB, equal to
+%% Cowboy's own output-buffer alarm (max_connection_buffer_size, 16000000
+%% bytes), so the VM killed the connection before that alarm could slow the
+%% senders, and each stream holds one more response than the alarm counts. The
+%% agent listener's default is now higher (yuzu_grpc.hrl) but the exemption
+%% stands: without the ceiling the alarm paces the senders, and what one
+%% connection can then hold is about 16 MB plus one response per stream in
+%% flight (max_concurrent_streams of them, 4096 on the shipped management
+%% listener), which no fixed ceiling sized for an agent covers. A
 %% combined agent+management listener serves anonymous agents and keeps the
 %% ceiling (it is a lab rig: the boot guard refuses it off loopback unless
 %% allow_insecure_mgmt acknowledges one).

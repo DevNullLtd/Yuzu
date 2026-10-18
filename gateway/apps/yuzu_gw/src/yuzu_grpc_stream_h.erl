@@ -35,16 +35,21 @@
 %%%
 %%%   - the connection process is given a max_heap_size ceiling on the first
 %%%     stream it serves (init runs here, in that process). The ceiling counts
-%%%     shared binaries, so the refc buffers every stream's in-flight request
-%%%     holds in #st.buf count against it, and a connection that buffers more
-%%%     than limits.max_connection_memory_bytes of half-finished requests is
-%%%     killed by the VM (yuzu_gw_conn_watch counts the kill). Without it a peer
-%%%     could open max_concurrent_streams streams and hold a full message short
-%%%     of its last byte on each, for the life of the connection. The listener
-%%%     leaves it off on a management-only listener unless configured
-%%%     (yuzu_grpc_listener:stream_limits/1): the ceiling also counts the
-%%%     responses waiting to be written, and killed the pinned server's one
-%%%     connection when a fan-out's responses arrived together;
+%%%     shared binaries, so the request bytes every stream holds in its reader
+%%%     (#st.reader) count against it, and a connection that buffers more than
+%%%     limits.max_connection_memory_bytes of half-finished requests is killed
+%%%     by the VM (yuzu_gw_conn_watch counts the kill). Without it a peer could
+%%%     open max_concurrent_streams streams and hold a full message short of its
+%%%     last byte on each, for the life of the connection. The VM checks it when
+%%%     the process collects garbage and counts the dead binaries too, so the
+%%%     reader copies each chunk once and joins once (yuzu_grpc_frame:read/3)
+%%%     and the process collects after every MiB of requests (maybe_collect/2):
+%%%     a well-behaved client sending messages of max_message_bytes must never
+%%%     reach the ceiling. The listener leaves it off on a management-only
+%%%     listener unless configured (yuzu_grpc_listener:stream_limits/1): the
+%%%     ceiling also counts the responses waiting to be written, and killed the
+%%%     pinned server's one connection when a fan-out's responses arrived
+%%%     together;
 %%%   - a unary or server-streaming stream that stays in `awaiting_request'
 %%%     (buffering its one request, no handler yet) past limits.request_timeout_ms
 %%%     is aborted with DEADLINE_EXCEEDED and its buffer dropped. It is armed
@@ -68,6 +73,10 @@
 
 %% Cowboy kills a handler that ignores the shutdown signal after this long.
 -define(SHUTDOWN_MS, 5000).
+%% The connection process collects its garbage once this many request bytes
+%% have passed through it since the last collection (or max_message_bytes, if
+%% that is smaller): see maybe_collect/2.
+-define(COLLECT_AFTER_BYTES, 1048576).
 %% A call with a grpc-timeout is ended this much before the client's deadline:
 %% a tenth of the timeout, at most one second (deadline_ms/1).
 -define(DEADLINE_MARGIN_MAX_MS, 1000).
@@ -76,13 +85,16 @@
 %% close of this connection was already counted.
 -define(LISTENER_KEY, '$yuzu_grpc_listener').
 -define(CLOSED_KEY, '$yuzu_grpc_close_counted').
+%% Connection-process dictionary key: request bytes since the last collection.
+-define(UNCOLLECTED_KEY, '$yuzu_grpc_uncollected').
 
 -record(st, {
     phase = awaiting_request :: awaiting_request | running | running_single | ended,
     route :: yuzu_grpc_route:route() | undefined,
     stream :: yuzu_grpc_stream:stream() | undefined,
     max_message :: pos_integer(),
-    buf = <<>> :: binary(),
+    %% The request bytes of a message not yet complete (yuzu_grpc_frame:read/3).
+    reader = yuzu_grpc_frame:reader() :: yuzu_grpc_frame:reader(),
     handler :: pid() | undefined,
     ref :: reference() | undefined,
     headers_sent = false :: boolean(),
@@ -111,7 +123,8 @@ init(StreamId, Req, Opts) ->
     {cowboy_stream:commands(), #st{}}.
 data(_StreamId, IsFin, Data, St) ->
     try
-        on_data(IsFin, Data, St)
+        uncollected(byte_size(Data)),
+        maybe_collect(on_data(IsFin, Data, St), St#st.max_message)
     catch
         Class:_ -> failed(St, Class)
     end.
@@ -197,8 +210,8 @@ connection_closed(Reason) ->
 
 %% The max_heap_size ceiling on the connection process. `include_shared_binaries'
 %% makes it count the refc binaries the streams' in-flight requests hold (the
-%% request buffer is one), which is where a flood of half-finished streams keeps
-%% its bytes: the connection process's own heap stays tiny. `kill' ends the
+%% chunks in each stream's reader), which is where a flood of half-finished
+%% streams keeps its bytes: the connection process's own heap stays tiny. `kill' ends the
 %% connection (every stream on it) when the ceiling is passed; `error_logger'
 %% emits the report yuzu_gw_conn_watch counts. `infinity' disables it.
 cap_connection_memory(MaxMessage, Limits) ->
@@ -221,7 +234,7 @@ cap_connection_memory(MaxMessage, Limits) ->
 max_connection_memory_bytes(MaxMessage, Limits) ->
     case maps:get(max_connection_memory_bytes, Limits, undefined) of
         undefined ->
-            %% Floor the derived default: four times a small max_message_bytes
+            %% Floor the derived default: a multiple of a small max_message_bytes
             %% could be below a connection's baseline memory and kill it at once.
             max(?YUZU_GRPC_MIN_CONN_MEMORY_BYTES,
                 ?YUZU_GRPC_MAX_CONN_MEMORY_FACTOR * MaxMessage);
@@ -377,41 +390,44 @@ spawn_runner(#{kind := Kind, module := Module, function := Function}, Stream, Ex
 %% Request DATA
 %%--------------------------------------------------------------------
 
-on_data(IsFin, Data, #st{phase = awaiting_request, buf = Buf0, max_message = Max} = St) ->
+on_data(IsFin, Data, #st{phase = awaiting_request, reader = Reader, max_message = Max} = St) ->
     Size = byte_size(Data),
-    case yuzu_grpc_frame:decode(<<Buf0/binary, Data/binary>>, Max) of
+    case yuzu_grpc_frame:read(Data, Max, Reader) of
         {ok, Message, Rest} ->
             case decode_request(St, Message) of
                 {ok, Request} ->
                     %% The request is complete: the handler runs now, so the
                     %% receive deadline has done its job.
                     cancel_timer(St#st.recv_timer),
+                    uncollected(2 * byte_size(Message)),
                     Pid = spawn_runner(St#st.route, St#st.stream, #{request => Request}),
                     dropped(byte_size(Rest), St, extra_request_data),
                     {[{spawn, Pid, ?SHUTDOWN_MS} | credit(Size)],
-                     St#st{phase = running_single, handler = Pid, buf = <<>>,
-                           recv_timer = undefined}};
+                     St#st{phase = running_single, handler = Pid,
+                           reader = yuzu_grpc_frame:reader(), recv_timer = undefined}};
                 error ->
                     abort(St, ?GRPC_STATUS_INTERNAL, <<"invalid request message">>)
             end;
         {more, _} when IsFin =:= fin ->
             abort(St, ?GRPC_STATUS_INTERNAL, <<"incomplete request message">>);
-        {more, Buf} ->
-            {credit(Size), St#st{buf = Buf}};
+        {more, Reader1} ->
+            {credit(Size), St#st{reader = Reader1}};
         {error, {Status, Message}} ->
             abort(St, Status, Message)
     end;
-on_data(IsFin, Data, #st{phase = running, buf = Buf0, max_message = Max,
+on_data(IsFin, Data, #st{phase = running, reader = Reader0, max_message = Max,
                          handler = Handler, ref = Ref} = St) ->
-    case deliver(<<Buf0/binary, Data/binary>>, Max, St) of
-        {ok, Buf} when IsFin =:= fin, Buf =/= <<>> ->
-            abort(St, ?GRPC_STATUS_INTERNAL, <<"incomplete request message">>);
-        {ok, Buf} ->
-            case IsFin of
-                fin -> Handler ! {Ref, eos};
-                nofin -> ok
-            end,
-            {credit(byte_size(Data)), St#st{buf = Buf}};
+    case deliver(Data, Max, Reader0, St) of
+        {ok, Reader} ->
+            case {IsFin, yuzu_grpc_frame:reader_bytes(Reader)} of
+                {fin, 0} ->
+                    Handler ! {Ref, eos},
+                    {credit(byte_size(Data)), St#st{reader = Reader}};
+                {fin, _} ->
+                    abort(St, ?GRPC_STATUS_INTERNAL, <<"incomplete request message">>);
+                {nofin, _} ->
+                    {credit(byte_size(Data)), St#st{reader = Reader}}
+            end;
         {error, Status, Message} ->
             abort(St, Status, Message)
     end;
@@ -428,23 +444,74 @@ on_data(_IsFin, Data, #st{phase = ended} = St) ->
 credit(0) -> [];
 credit(Size) -> [{flow, Size}].
 
-%% Hand every complete message of the buffer to the handler; what is left is an
-%% incomplete frame.
-deliver(Buf, Max, #st{handler = Handler, ref = Ref} = St) ->
-    case yuzu_grpc_frame:decode(Buf, Max) of
+%% Hand every complete message of Data to the handler; the reader returned holds
+%% the start of the next one.
+deliver(Data, Max, Reader, #st{handler = Handler, ref = Ref} = St) ->
+    case yuzu_grpc_frame:read(Data, Max, Reader) of
         {ok, Message, Rest} ->
             case decode_request(St, Message) of
                 {ok, Request} ->
+                    uncollected(2 * byte_size(Message)),
                     Handler ! {Ref, Request},
-                    deliver(Rest, Max, St);
+                    deliver(Rest, Max, yuzu_grpc_frame:reader(), St);
                 error ->
                     {error, ?GRPC_STATUS_INTERNAL, <<"invalid request message">>}
             end;
-        {more, Rest} ->
-            {ok, Rest};
+        {more, Reader1} ->
+            {ok, Reader1};
         {error, {Status, Message}} ->
             {error, Status, Message}
     end.
+
+%% Request bytes that became (or will become) garbage of the connection process:
+%% every DATA frame (the socket buffer it came in), and twice a complete message
+%% (the joined message and the decoded request, both garbage once the request is
+%% handed to its handler).
+uncollected(Bytes) ->
+    put(?UNCOLLECTED_KEY, Bytes + case get(?UNCOLLECTED_KEY) of
+                                      undefined -> 0;
+                                      N -> N
+                                  end).
+
+%% Have the connection process collect its garbage once enough request bytes
+%% went through it. The memory ceiling (cap_connection_memory/2) is checked when
+%% the process collects, and it counts every binary the process references AT
+%% THAT MOMENT, the dead ones included: left to itself the VM collects a process
+%% with large binaries only when their total passes a threshold it sizes from
+%% the live total (up to about twice it), so the garbage of one full-size
+%% message was still counted while the next one arrived, and one well-behaved
+%% client was killed (#5695). Collecting after every max_message_bytes (at most
+%% every MiB) keeps what the ceiling sees close to the bytes actually buffered:
+%% a complete message costs three times its size at its peak (the chunks, the
+%% joined message, the decoded request) and the garbage on top of that is under
+%% a MiB.
+%%
+%% The collection cannot run here: Cowboy's state, on the stack of this call,
+%% still holds this stream's previous state and with it the chunks just joined.
+%% So it is a message to the stream itself, handled once this call has
+%% returned (on_info(grpc_collect, ...)). It goes only to a stream that stays
+%% open; a stream reset between the send and its handling drops it (Cowboy logs
+%% it as a message for an ended stream, rate-limited by yuzu_grpc_cowboy_log),
+%% and the next DATA frame sends another. A connection's collection costs the
+%% size of its own heap, a few kilowords: the request bytes are off it.
+maybe_collect({Commands, #st{phase = Phase,
+                             stream = #yuzu_grpc_stream{conn = Conn, stream_id = Id}}} = Result,
+              MaxMessage) when Phase =/= ended ->
+    case get(?UNCOLLECTED_KEY) of
+        N when is_integer(N), N >= min(?COLLECT_AFTER_BYTES, MaxMessage) ->
+            case lists:member(stop, Commands) of
+                true ->
+                    Result;
+                false ->
+                    put(?UNCOLLECTED_KEY, 0),
+                    Conn ! {{Conn, Id}, grpc_collect},
+                    Result
+            end;
+        _ ->
+            Result
+    end;
+maybe_collect(Result, _MaxMessage) ->
+    Result.
 
 decode_request(#st{route = #{pb := Pb, input := Input}}, Message) ->
     try
@@ -494,9 +561,14 @@ on_info(grpc_deadline, #st{phase = Phase} = St) when Phase =/= ended ->
 on_info(grpc_recv_deadline, #st{phase = awaiting_request} = St) ->
     telemetry:execute([yuzu, gw, grpc, recv_timeout], #{count => 1},
                       #{method => path_of(St#st.route)}),
-    abort(St#st{recv_timer = undefined, buf = <<>>}, ?GRPC_STATUS_DEADLINE_EXCEEDED,
+    abort(St#st{recv_timer = undefined, reader = yuzu_grpc_frame:reader()},
+          ?GRPC_STATUS_DEADLINE_EXCEEDED,
           <<"request deadline exceeded">>);
 on_info(grpc_recv_deadline, St) ->
+    {[], St};
+%% See maybe_collect/2. The stream's own state holds no request bytes now.
+on_info(grpc_collect, St) ->
+    _ = erlang:garbage_collect(),
     {[], St};
 on_info({'EXIT', Pid, Reason}, #st{handler = Pid} = St) ->
     exited(Reason, St);

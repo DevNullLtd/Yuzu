@@ -11,14 +11,20 @@
 -module(yuzu_grpc_frame).
 
 -export([encode/1, decode/2]).
+-export([reader/0, read/3, reader_bytes/1]).
 -export([parse_timeout/1]).
 -export([encode_message/1, decode_message/1, normalize_message/1]).
 -export([status_to_binary/1, normalize_status/1, trailers/2]).
 
--export_type([status/0, error/0]).
+-export_type([status/0, error/0, reader/0]).
 
 -type status() :: 0..16.
 -type error() :: {status(), binary()}.
+%% An incremental frame reader (read/3): the start of a header (fewer than five
+%% bytes), or the body of a frame whose header was read, as the number of bytes
+%% still missing and the chunks received so far, most recent first.
+-opaque reader() :: {header, binary()}
+                  | {body, pos_integer(), [binary()]}.
 
 %% The longest grpc-message the layer sends, before percent-encoding. A handler
 %% that formats a large term into its message must not blow the peer's header
@@ -55,6 +61,89 @@ decode(<<0, Len:32, Body/binary>>, _Max) when byte_size(Body) >= Len ->
     {ok, Message, Rest};
 decode(Buffer, _Max) ->
     {more, Buffer}.
+
+%% @doc A reader with nothing buffered. read/3 feeds it.
+-spec reader() -> reader().
+reader() ->
+    {header, <<>>}.
+
+%% @doc decode/2 for a message that arrives in many chunks, without copying it
+%% over and over. decode/2 needs the buffer as ONE binary, so a caller that
+%% appends each chunk to the last buffer copies the whole buffer at every chunk
+%% (matching a binary makes it read-only, so the next append cannot grow it in
+%% place): a 4 MiB message in 16 KiB DATA frames is about 512 MiB of copies, all
+%% of it garbage the receiving process holds until it next collects. Counted by
+%% the per-connection memory ceiling (a max_heap_size that includes shared
+%% binaries, see yuzu_grpc_stream_h), that garbage killed a connection sending
+%% ONE message of max_message_bytes.
+%%
+%% Each chunk is copied once as it arrives and the copies are joined once, when
+%% the last byte is in. The copy is deliberate: a chunk is a part of the
+%% receiving connection's socket buffer, which can be several times larger (it
+%% holds the frames of other streams, and the HTTP/2 layer re-copies a frame
+%% split between two reads), and keeping the part would keep the whole buffer.
+%% With the copy, what a reader holds is the bytes it was given, so the memory a
+%% half-finished message costs is its own size whatever the read pattern was. A
+%% message that came in one chunk is not copied at all (decode/2's case).
+%%
+%% Data is the next chunk. `{ok, Message, Rest}': the first complete message and
+%% what follows it in Data (feed Rest to a fresh reader()); `{more, Reader}':
+%% keep Reader for the next chunk; `{error, _}' as decode/2, a frame over Max
+%% refused as soon as its header is in, before any of its body is kept.
+-spec read(binary(), pos_integer(), reader()) ->
+    {ok, binary(), binary()} | {more, reader()} | {error, error()}.
+read(Data, Max, {header, <<>>}) ->
+    header(Data, Max);
+read(Data, Max, {header, Head}) ->
+    Need = 5 - byte_size(Head),
+    case Data of
+        <<More:Need/binary, Body/binary>> ->
+            <<0, Len:32>> = <<Head/binary, More/binary>>,
+            body_of(Len, Body, Max);
+        _ ->
+            {more, {header, <<Head/binary, Data/binary>>}}
+    end;
+read(Data, _Max, {body, Missing, Chunks}) ->
+    body(Data, Missing, Chunks).
+
+%% @doc The bytes of an unfinished message a reader has taken, its 5-byte header
+%% included: zero only between messages (a header alone, with no body byte yet,
+%% is still an unfinished message).
+-spec reader_bytes(reader()) -> non_neg_integer().
+reader_bytes({header, Head}) ->
+    byte_size(Head);
+reader_bytes({body, _Missing, Chunks}) ->
+    5 + iolist_size(Chunks).
+
+header(<<1, _/binary>>, _Max) ->
+    {error, {12, <<"compressed messages are not supported">>}};
+header(<<Flag, _/binary>>, _Max) when Flag =/= 0 ->
+    {error, {13, <<"invalid message flag">>}};
+header(<<0, Len:32, Body/binary>>, Max) ->
+    body_of(Len, Body, Max);
+header(Short, _Max) ->
+    %% Under five bytes: copied (a few bytes) so the reader does not keep the
+    %% chunk they came in alive.
+    {more, {header, binary:copy(Short)}}.
+
+body_of(Len, _Body, Max) when Len > Max ->
+    {error, {8, <<"message too large">>}};
+body_of(Len, Body, _Max) ->
+    body(Body, Len, []).
+
+body(Data, Missing, Chunks) when byte_size(Data) < Missing ->
+    {more, {body, Missing - byte_size(Data), add_chunk(Data, Chunks)}};
+body(Data, Missing, Chunks) ->
+    <<Last:Missing/binary, Rest/binary>> = Data,
+    {ok, join(Last, Chunks), Rest}.
+
+%% Copied: see read/3.
+add_chunk(<<>>, Chunks) -> Chunks;
+add_chunk(Data, Chunks) -> [binary:copy(Data) | Chunks].
+
+%% A message that came in one chunk is a part of it, not a copy.
+join(Last, []) -> Last;
+join(Last, Chunks) -> iolist_to_binary(lists:reverse(Chunks, [Last])).
 
 %%--------------------------------------------------------------------
 %% grpc-timeout

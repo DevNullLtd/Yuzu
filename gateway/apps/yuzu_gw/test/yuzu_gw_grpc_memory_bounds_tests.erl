@@ -4,22 +4,26 @@
 %%% gun HTTP/2 client (the attacker's view: it opens streams and sends a length
 %%% prefix with the body short of its last byte, so a request never completes):
 %%%
-%%%   - max_connection_memory_bytes: a connection that buffers more than the
-%%%     ceiling of half-finished requests is killed by the VM, its kill is
-%%%     counted, and a second connection doing ordinary work (including a 3 MiB
-%%%     request, the size of an installed-software inventory blob) is untouched;
+%%%   - max_connection_memory_bytes: a well-behaved client sending messages up
+%%%     to the FULL max_message_bytes, back to back, is never killed by the
+%%%     production-default ceiling (also with every scheduler kept busy, since
+%%%     what the ceiling sees depends on when the connection process collects
+%%%     its garbage); a connection that buffers more than the ceiling of
+%%%     half-finished requests is killed by the VM, its kill is counted, and a
+%%%     second connection doing ordinary work is untouched;
 %%%   - request_timeout_ms: a unary stream that buffers its request past the
 %%%     deadline is aborted DEADLINE_EXCEEDED and its buffer dropped, while a
 %%%     bidirectional stream (an agent's Subscribe) that delivered its first
 %%%     message is never cut by it.
 %%%
-%%% These bounds are time- and memory-driven by nature, so the cases use a small
-%%% ceiling and a short deadline and wait on the event (the connection going
-%%% down, the stream's trailers), not on a fixed sleep.
+%%% These bounds are time- and memory-driven by nature, so the cases wait on the
+%%% event (the connection going down, the stream's trailers), not on a fixed
+%%% sleep.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_grpc_memory_bounds_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include("../src/yuzu_grpc.hrl").
 
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(HEARTBEAT, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).
@@ -29,42 +33,116 @@
 %% Bound 1: per-connection memory ceiling
 %%--------------------------------------------------------------------
 
+%% The production message limit; every case below runs under the ceiling the
+%% stream handler derives from it (no explicit max_connection_memory_bytes), the
+%% default every shipped config uses.
+-define(MAX_MSG, 4 * 1024 * 1024).
+%% Full-size requests sent back to back on one connection.
+-define(FULL_SIZE_REPEATS, 20).
+
+full_size_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     [{timeout, 120, fun full_size_requests_survive_the_default_ceiling/0},
+      {timeout, 120, fun full_size_requests_survive_busy_schedulers/0}]}.
+
+%% A legit client sends messages of exactly max_message_bytes, one after the
+%% other on one connection: the ceiling must never kill it. The ceiling counts
+%% the binaries the connection process still references when it collects its
+%% garbage, so what matters is the worst moment of every request, not the
+%% average; 20 in a row cross many collections.
+full_size_requests_survive_the_default_ceiling() ->
+    full_size_requests(bounds_full, ?FULL_SIZE_REPEATS).
+
+%% The same with every scheduler kept busy by a spinning process, so the
+%% connection process is descheduled at arbitrary points (the CI condition the
+%% default ceiling once failed under). Fewer repeats: each is slower.
+full_size_requests_survive_busy_schedulers() ->
+    Spinners = [spawn(fun spin/0) || _ <- lists:seq(1, erlang:system_info(schedulers_online))],
+    try
+        full_size_requests(bounds_busy, ?FULL_SIZE_REPEATS div 2)
+    after
+        [exit(P, kill) || P <- Spinners]
+    end.
+
+full_size_requests(ChanName, Repeats) ->
+    {Port, L} = start(#{max_message_bytes => ?MAX_MSG, request_timeout_ms => infinity}),
+    Kill0 = counter(yuzu_gw_grpc_connection_killed_total, [<<"max_heap_size">>]),
+    Chan = yuzu_gw_test_listener:client_channel(ChanName, #{port => Port}),
+    try
+        ?assertMatch({ok, _, _}, unary(Chan, #{session_id => <<"ok">>})),
+        [Conn] = ranch:procs({yuzu_grpc, bounds}, connections),
+        %% The ceiling in force is the derived default, whatever it is set to.
+        {max_heap_size, #{size := Words}} = erlang:process_info(Conn, max_heap_size),
+        ?assertEqual(?YUZU_GRPC_MAX_CONN_MEMORY_FACTOR * ?MAX_MSG,
+                     Words * erlang:system_info(wordsize)),
+        Msg = full_size_message(?MAX_MSG),
+        ?assertEqual(?MAX_MSG, byte_size(encode_hb(Msg))),
+        Results = [unary(Chan, Msg, 30000) || _ <- lists:seq(1, Repeats)],
+        ?assertEqual(lists:duplicate(Repeats, ok), [ok_of(R) || R <- Results]),
+        ?assert(is_process_alive(Conn)),
+        ?assertEqual(Kill0, counter(yuzu_gw_grpc_connection_killed_total,
+                                    [<<"max_heap_size">>]))
+    after
+        yuzu_gw_test_listener:stop_channel(Chan),
+        yuzu_gw_test_listener:stop(L)
+    end.
+
+ok_of({ok, _, _}) -> ok;
+ok_of(Other) -> Other.
+
+spin() -> spin(0).
+spin(N) -> spin(N + 1).
+
+%% A HeartbeatRequest whose encoding is exactly Size bytes: the largest message
+%% the listener accepts.
+full_size_message(Size) ->
+    Empty = byte_size(encode_hb(blob_message(<<>>))),
+    fit_message(Size, Size - Empty - 8).
+
+fit_message(Size, BlobBytes) ->
+    Msg = blob_message(binary:copy(<<"x">>, BlobBytes)),
+    case byte_size(encode_hb(Msg)) of
+        Size -> Msg;
+        S when S < Size -> fit_message(Size, BlobBytes + 1);
+        _ -> fit_message(Size, BlobBytes - 1)
+    end.
+
+blob_message(Blob) ->
+    #{session_id => <<"ok">>, status_tags => #{<<"blob">> => Blob}}.
+
+encode_hb(Msg) ->
+    agent_pb:encode_msg(Msg, 'yuzu.agent.v1.HeartbeatRequest').
+
 max_conn_memory_test_() ->
     {setup, fun setup/0, fun cleanup/1,
      {timeout, 60, fun max_conn_memory_kills_the_flooder/0}}.
 
 max_conn_memory_kills_the_flooder() ->
-    %% The production-default sizing: a 4 MiB message limit and a 16 MiB
-    %% per-connection ceiling (4x), so a legit 3 MiB request (and the copies a
-    %% binary append makes of it) fits but a flood of half-finished streams does
-    %% not. The receive deadline is off so the KILL, not the deadline, ends it.
-    {Port, L} = start(#{max_message_bytes => 4 * 1024 * 1024,
-                        max_connection_memory_bytes => 16 * 1024 * 1024,
-                        request_timeout_ms => infinity}),
+    %% The production-default sizing: a 4 MiB message limit and the ceiling
+    %% derived from it. The receive deadline is off so the KILL, not the
+    %% deadline, ends the flood.
+    {Port, L} = start(#{max_message_bytes => ?MAX_MSG, request_timeout_ms => infinity}),
     Kill0 = counter(yuzu_gw_grpc_connection_killed_total, [<<"max_heap_size">>]),
     LegitChan = yuzu_gw_test_listener:client_channel(bounds_legit, #{port => Port}),
     try
-        %% A legit connection: an ordinary call, then a 3 MiB inventory-style one.
+        %% A legit connection: an ordinary call, then a full-size one.
         ?assertMatch({ok, _, _}, unary(LegitChan, #{session_id => <<"ok">>})),
-        Blob = binary:copy(<<"x">>, 3 * 1024 * 1024),
-        ?assertMatch({ok, _, _},
-                     unary(LegitChan, #{session_id => <<"ok">>,
-                                        status_tags => #{<<"blob">> => Blob}}, 15000)),
+        ?assertMatch({ok, _, _}, unary(LegitChan, full_size_message(?MAX_MSG), 30000)),
 
         %% The flooder: 32 streams, each a 4 MiB length prefix with all but the
-        %% last byte, no grpc-timeout. Their buffers cross the 16 MiB ceiling.
+        %% last byte, no grpc-timeout. Their buffers cross the ceiling.
         {ok, C} = gun:open("127.0.0.1", Port, #{protocols => [http2], retry => 0}),
         {ok, http2} = gun:await_up(C, 5000),
         CMon = erlang:monitor(process, C),
-        Body = binary:copy(<<"A">>, 4 * 1024 * 1024 - 1),
+        Body = binary:copy(<<"A">>, ?MAX_MSG - 1),
         [begin
              S = gun:post(C, ?HEARTBEAT, grpc_headers()),
-             gun:data(C, S, nofin, [<<0, (4 * 1024 * 1024):32>>, Body])
+             gun:data(C, S, nofin, [<<0, (?MAX_MSG):32>>, Body])
          end || _ <- lists:seq(1, 32)],
 
         %% The connection is killed: gun sees it go down.
         receive {'DOWN', CMon, process, C, _} -> ok
-        after 15000 -> erlang:error(flooder_connection_not_killed) end,
+        after 30000 -> erlang:error(flooder_connection_not_killed) end,
 
         ok = wait_counter_above(yuzu_gw_grpc_connection_killed_total,
                                 [<<"max_heap_size">>], Kill0, 100),
@@ -88,9 +166,7 @@ request_timeout_test_() ->
      {timeout, 30, fun request_timeout_aborts_a_stalled_unary/0}}.
 
 request_timeout_aborts_a_stalled_unary() ->
-    {Port, L} = start(#{max_message_bytes => 4 * 1024 * 1024,
-                        max_connection_memory_bytes => 16 * 1024 * 1024,
-                        request_timeout_ms => 400}),
+    {Port, L} = start(#{max_message_bytes => ?MAX_MSG, request_timeout_ms => 400}),
     T0 = counter(yuzu_gw_grpc_recv_timeout_total, []),
     {ok, C} = gun:open("127.0.0.1", Port, #{protocols => [http2], retry => 0}),
     {ok, http2} = gun:await_up(C, 5000),

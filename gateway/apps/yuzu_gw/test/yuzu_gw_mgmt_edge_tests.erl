@@ -58,10 +58,10 @@ cleanup(_) ->
 %% test releases all of them at once; each then sends one 1 MiB response. The
 %% 32 MiB arrive in the connection process together, faster than the client's
 %% flow-control window lets Cowboy write them out, so they sit in its buffers.
-%% Under the agent listener's ceiling (16 MiB with the shipped 4 MiB message
-%% limit) the VM kills the connection and every call on it fails; the
-%% management listener has no ceiling by default, Cowboy's own output-buffer
-%% alarm paces the senders, and every call completes on the same connection.
+%% Under the agent listener's ceiling as it then was (16 MiB) the VM killed the
+%% connection and every call on it failed; the management listener has no ceiling by
+%% default, Cowboy's own output-buffer alarm paces the senders, and every call
+%% completes on the same connection.
 mgmt_burst_of_large_responses_test_() ->
     {setup, fun setup/0, fun cleanup/1,
      {timeout, 60, fun mgmt_burst_of_large_responses/0}}.
@@ -95,8 +95,8 @@ mgmt_burst_of_large_responses() ->
 %% keeps the agent listener's bound.
 connection_ceiling_by_listener_kind_test_() ->
     {setup, fun setup/0, fun cleanup/1,
-     [{"agent listener, derived default: 4 x max_message_bytes",
-       ?_assertEqual(16 * 1024 * 1024,
+     [{"agent listener, derived default: 8 x max_message_bytes",
+       ?_assertEqual(32 * 1024 * 1024,
                      ceiling(agent_entry(#{limits => #{max_message_bytes => 4194304}}),
                              agent))},
       {"agent listener, explicit value",
@@ -114,7 +114,7 @@ connection_ceiling_by_listener_kind_test_() ->
                                                                32 * 1024 * 1024}}),
                              mgmt))},
       {"combined agent+management listener: bounded like the agent listener",
-       ?_assertEqual(16 * 1024 * 1024,
+       ?_assertEqual(32 * 1024 * 1024,
                      ceiling(agent_entry(#{service_protos => [agent_pb, management_pb],
                                            services => #{?AGENT_SVC => yuzu_grpc_stub_svc,
                                                          ?MGMT_SVC => yuzu_gw_edge_stub_svc},

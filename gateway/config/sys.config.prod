@@ -225,15 +225,20 @@
               %%   max_connection_memory_bytes: a per-connection memory ceiling
               %%     (a max_heap_size on the connection process counting its
               %%     streams' refc buffers). A connection that buffers more than
-              %%     this of half-finished requests is killed. Default = four
-              %%     times max_message_bytes = 16 MiB; `infinity' disables it.
+              %%     this of half-finished requests is killed. Default = eight
+              %%     times max_message_bytes = 32 MiB; `infinity' disables it.
+              %%     One message of max_message_bytes costs a connection three
+              %%     times its size at its peak, so 32 MiB lets two arrive at
+              %%     once and kills a flood at about the eighth half-sent
+              %%     stream. Below about four times max_message_bytes an agent
+              %%     sending one full-size message can be killed.
               %%   request_timeout_ms: a unary/server-streaming stream that
               %%     buffers its one request this long without completing it is
               %%     aborted DEADLINE_EXCEEDED and its buffer dropped. Default
               %%     30000; `infinity' disables it. It never cuts a long-lived
               %%     Subscribe (bidirectional), which runs before any message.
               limits => #{max_connections => 60000, max_message_bytes => 4194304,
-                          max_connection_memory_bytes => 16777216,
+                          max_connection_memory_bytes => 33554432,
                           request_timeout_ms => 30000}
               %% Behind a load balancer or router? Say so and name the proxies you
               %% trust; with no `origin` the agent's address is the TCP peer, and a

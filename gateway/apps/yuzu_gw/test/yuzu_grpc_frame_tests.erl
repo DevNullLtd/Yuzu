@@ -66,6 +66,87 @@ oversize_is_resource_exhausted_test() ->
     ?assertEqual({ok, Msg, <<>>}, yuzu_grpc_frame:decode(yuzu_grpc_frame:encode(Msg), ?MAX)).
 
 %%--------------------------------------------------------------------
+%% The incremental reader (read/3)
+%%--------------------------------------------------------------------
+
+%% Feed Chunks to a fresh reader; the messages read and the reader left.
+read_all(Chunks) ->
+    read_all(Chunks, yuzu_grpc_frame:reader(), []).
+
+read_all([], Reader, Acc) ->
+    {lists:reverse(Acc), Reader};
+read_all([Chunk | Chunks], Reader, Acc) ->
+    case yuzu_grpc_frame:read(Chunk, ?MAX, Reader) of
+        {ok, Msg, Rest} -> read_all([Rest | Chunks], yuzu_grpc_frame:reader(), [Msg | Acc]);
+        {more, Reader1} -> read_all(Chunks, Reader1, Acc);
+        {error, _} = Error -> Error
+    end.
+
+%% Cut Bin into pieces of Size bytes (the last may be shorter).
+pieces(Bin, Size) when byte_size(Bin) =< Size -> [Bin];
+pieces(Bin, Size) ->
+    <<Piece:Size/binary, Rest/binary>> = Bin,
+    [Piece | pieces(Rest, Size)].
+
+reader_whole_message_in_one_chunk_test() ->
+    Msg = crypto:strong_rand_bytes(300),
+    ?assertEqual({ok, Msg, <<>>},
+                 yuzu_grpc_frame:read(yuzu_grpc_frame:encode(Msg), ?MAX, yuzu_grpc_frame:reader())).
+
+reader_empty_message_test() ->
+    ?assertEqual({ok, <<>>, <<"x">>},
+                 yuzu_grpc_frame:read(<<0, 0:32, "x">>, ?MAX, yuzu_grpc_frame:reader())).
+
+%% Every way of cutting two back-to-back frames into equal pieces, from one
+%% byte at a time (the header split at every offset) to the whole buffer, reads
+%% the same two messages and leaves nothing behind.
+reader_any_chunking_reads_the_same_messages_test() ->
+    A = crypto:strong_rand_bytes(700),
+    B = crypto:strong_rand_bytes(5),
+    Buf = <<(yuzu_grpc_frame:encode(A))/binary, (yuzu_grpc_frame:encode(B))/binary>>,
+    [begin
+         {Msgs, Reader} = read_all(pieces(Buf, Size)),
+         ?assertEqual({Size, [A, B]}, {Size, Msgs}),
+         ?assertEqual(0, yuzu_grpc_frame:reader_bytes(Reader))
+     end || Size <- lists:seq(1, byte_size(Buf))].
+
+reader_bytes_counts_what_it_holds_test() ->
+    Frame = yuzu_grpc_frame:encode(binary:copy(<<"x">>, 100)),
+    <<Head:3/binary, Rest/binary>> = Frame,
+    {more, R1} = yuzu_grpc_frame:read(Head, ?MAX, yuzu_grpc_frame:reader()),
+    ?assertEqual(3, yuzu_grpc_frame:reader_bytes(R1)),
+    <<More:42/binary, _/binary>> = Rest,
+    {more, R2} = yuzu_grpc_frame:read(More, ?MAX, R1),
+    %% the 5 header bytes and 40 body bytes of an unfinished message
+    ?assertEqual(45, yuzu_grpc_frame:reader_bytes(R2)),
+    %% a header alone is an unfinished message too (END_STREAM there is an error)
+    {more, R3} = yuzu_grpc_frame:read(<<0, 7:32>>, ?MAX, yuzu_grpc_frame:reader()),
+    ?assertEqual(5, yuzu_grpc_frame:reader_bytes(R3)).
+
+%% A held chunk is a copy: it does not keep the (larger) binary it was cut from.
+reader_does_not_keep_the_buffer_a_chunk_came_in_test() ->
+    Big = binary:copy(<<"z">>, 64 * 1024),
+    Frame = yuzu_grpc_frame:encode(binary:copy(<<"x">>, 900)),
+    <<Part:100/binary, _/binary>> = Frame,
+    <<_:16/binary, Chunk:100/binary, _/binary>> = <<"0123456789abcdef", Part/binary, Big/binary>>,
+    {more, Reader} = yuzu_grpc_frame:read(Chunk, ?MAX, yuzu_grpc_frame:reader()),
+    {body, _, [Held]} = Reader,
+    ?assertEqual(byte_size(Held), binary:referenced_byte_size(Held)).
+
+reader_refuses_on_the_header_test() ->
+    New = yuzu_grpc_frame:reader(),
+    ?assertMatch({error, {12, _}}, yuzu_grpc_frame:read(<<1>>, ?MAX, New)),
+    ?assertMatch({error, {13, _}}, yuzu_grpc_frame:read(<<2, 0:32>>, ?MAX, New)),
+    ?assertMatch({error, {8, _}}, yuzu_grpc_frame:read(<<0, (?MAX + 1):32>>, ?MAX, New)),
+    %% an oversize length split across two chunks is refused once it is whole
+    {more, R} = yuzu_grpc_frame:read(<<0, 0>>, ?MAX, New),
+    ?assertMatch({error, {8, _}}, yuzu_grpc_frame:read(<<16#FF, 16#FF, 16#FF>>, ?MAX, R)),
+    %% exactly the limit is fine
+    Msg = binary:copy(<<"x">>, ?MAX),
+    {Msgs, _} = read_all(pieces(yuzu_grpc_frame:encode(Msg), 100)),
+    ?assertEqual([Msg], Msgs).
+
+%%--------------------------------------------------------------------
 %% grpc-timeout
 %%--------------------------------------------------------------------
 
