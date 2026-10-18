@@ -2190,7 +2190,13 @@ these**: each command it forwards to this gateway in that window fails
 terminally as `gateway_unauthenticated`, is counted in the server's
 `yuzu_server_gateway_forward_total{status="unauthenticated"}` and shows as a
 failed command. Commands sent after the refresh go through, and nothing needs to
-be done about the gateway. If a failed command matters, run it again. To make
+be done about the gateway. If a failed command matters, run it again. The gateway's
+own `YuzuGatewayMgmtPinMismatch` is suppressed through the rotation (below), but the
+**server's** `YuzuGatewayForwardUnauthenticated` (`increase(yuzu_server_gateway_forward_total{status="unauthenticated"}[1h]) > 0`)
+counts those failed commands and fires for up to an hour after a rotation that had a
+command in flight. A routine rotation can therefore still raise that warning; it
+needs no action beyond re-running the failed commands, and #5988 (the server retries
+once after UNAUTHENTICATED) removes the cause. To make
 the window empty, pre-stage the new key as a second pin (`{spki_sha256, Hex}` of
 the new certificate) before the server rotates, and remove it after. Each change
 to `mgmt_peer_pins` applies only at a gateway restart, which disconnects every
@@ -2204,7 +2210,7 @@ someone has something to do:
 | Alert | Fires when | What to do |
 |---|---|---|
 | `YuzuGatewayMgmtAuthRejected` (warning) | a management peer was refused for any reason **other than** `pin_mismatch`, in the last hour | `missing_server_auth_eku`, `bad_peer_cert`: a holder of an install-CA certificate that is not the server reached `:50063`, or the server's leaf lacks the serverAuth usage; investigate the source, fix the server certificate. `no_pins_resolved`, `no_pins_configured`, `bad_pin_config`: the pins admit nobody and every forwarded command fails; restore the pinned file or correct `mgmt_peer_pins`. `internal_error`: collect the log, report it. A rotation never produces these. |
-| `YuzuGatewayMgmtPinMismatch` (critical) | `pin_mismatch` rejections that no pin rotation on this gateway explains: rejections are read one minute late and ignored for 4 minutes after `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` moves | Commands to this gateway's agents are failing. If the server's certificate changed, update the pinned file (picked up within one interval). If it did not change, someone is presenting another serverAuth certificate (for example the gateway's own key) to the command plane: treat it as a security incident. |
+| `YuzuGatewayMgmtPinMismatch` (critical) | `pin_mismatch` rejections that no pin rotation on this gateway explains: rejections are read one minute late and ignored for 4 minutes after `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` moves (the server's `YuzuGatewayForwardUnauthenticated` is not suppressed, see above) | Commands to this gateway's agents are failing. If the server's certificate changed, update the pinned file (picked up within one interval). If it did not change, someone is presenting another serverAuth certificate (for example the gateway's own key) to the command plane: treat it as a security incident. |
 | `YuzuGatewayMgmtPinUnresolved` (warning, 2 m) | a configured pin has never resolved, or a pin file's latest read failed (`yuzu_gw_cert_file_readable{role="mgmt_peer_pin"} == 0`) | Correct the fingerprint, or put the server's current certificate back in the pinned file (owner, mode, contents). The fix is picked up within one interval. The key last read stays pinned meanwhile: deleting or damaging the file does not revoke it (see above). |
 | `YuzuGatewayCertificateFileUnreadable` (warning, 10 m) | a listener or upstream certificate file cannot be read or parsed | Restore it before the gateway restarts or redials: until then it keeps the certificate it loaded, but anything that reads the file again fails. |
 | `YuzuGatewayCertificateExpiringSoon` (warning, 1 h) | a configured certificate expires in 7 to 30 days | Schedule the renewal. |

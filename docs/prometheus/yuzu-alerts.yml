@@ -182,7 +182,11 @@ groups:
       # reads the new pin file, and the streams opened in that window are
       # refused. The server does not retry them, so the commands forwarded in
       # that window fail as gateway_unauthenticated; the next commands go
-      # through and nobody has to act, so this must not page.
+      # through and nobody has to act, so this must not page. This suppression
+      # is this rule's only: the server's YuzuGatewayForwardUnauthenticated
+      # (below, unchanged) still counts those failed commands and can fire for
+      # up to an hour after a rotation that had a command in flight; #5988 (a
+      # server retry after UNAUTHENTICATED) removes that cause.
       # How the rule tells the two apart: the watcher sets
       # yuzu_gw_mgmt_pin_rotated_timestamp_seconds when it publishes a changed
       # key (0 until then, so a gateway that never saw a rotation is never
@@ -228,7 +232,9 @@ groups:
             own key) is presenting it to the command plane: treat it as a
             security incident. A routine rotation does not fire this: its
             rejections are suppressed for 4 minutes after
-            yuzu_gw_mgmt_pin_rotated_timestamp_seconds moves.
+            yuzu_gw_mgmt_pin_rotated_timestamp_seconds moves (the server's
+            YuzuGatewayForwardUnauthenticated can still fire for a command
+            forwarded in that window).
 
       # A configured pin that does not resolve or a pin file that cannot be
       # read. Two shapes, one action (fix the pin): the counter moves on every
