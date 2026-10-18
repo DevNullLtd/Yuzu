@@ -469,7 +469,7 @@ The smoke uses existing authenticated, explicitly targeted command routes; it do
 
 **SRE verdict:** no additional operational finding beyond QA1; overall validation remains BLOCKING pending closure. Final package must be rebuilt after fixes and exact final bytes checked. No fresh installation, production TLS, notarization, Intel/oldest-OS runtime, live recovery, or long-duration ES reliability certification is claimed.
 
-Artifact-specific limitation received after initial report: the current shared `/Users/nathan/Yuzu/vcpkg_installed/arm64-osx` dependency prefix emits `libxml2.a` archive-member minos26 warnings while linking a minos13.3 target. No fresh complete static-archive audit establishes the older floor for these bytes. Prior historical clean-dependency evidence cannot certify this artifact. Treat current output as current-host development only until a separate clean 13.3 dependency build/audit and oldest-OS execution qualify it; do not modify the user's shared dependency prefix as part of this review.
+Artifact-specific limitation received after initial report: the current shared `/Users/<user>/Yuzu/vcpkg_installed/arm64-osx` dependency prefix emits `libxml2.a` archive-member minos26 warnings while linking a minos13.3 target. No fresh complete static-archive audit establishes the older floor for these bytes. Prior historical clean-dependency evidence cannot certify this artifact. Treat current output as current-host development only until a separate clean 13.3 dependency build/audit and oldest-OS execution qualify it; do not modify the user's shared dependency prefix as part of this review.
 
 ---
 

@@ -388,7 +388,7 @@ ip|utun4|fe80::200:5eff:fe00:5387|64|203.0.113.1
 ip|utun5|fe80::200:5eff:fe00:5388|64|203.0.113.1
 ip|utun6|fe80::200:5eff:fe00:5389|64|203.0.113.1
 ip|utun6|198.51.100.77|32|203.0.113.1
-ip|utun6|fd7a:115c:a1e0::e032:b14f|48|203.0.113.1
+ip|utun6|fd7a:115c:a1e0::77|48|203.0.113.1
 [result_status] UNDECLARED / UNKNOWN
 
 == action=dns_servers

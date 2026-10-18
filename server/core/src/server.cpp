@@ -243,6 +243,7 @@
 #include "device_lens_routes.hpp"
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
 #include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
+#include "dex_score_policy_provider.hpp" // read-through score policy over runtime_config_store_
 #include "dex_perf_api_local.hpp" // ADR-0031 WS-A4 (sixth family): make_local_dex_perf_api
 #include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
 #include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
@@ -665,6 +666,11 @@ public:
         }
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
+                          "gauge");
+        metrics_.describe("yuzu_server_identity_uri_present",
+                          "1 when the default-server certificate carries the server identity "
+                          "URI SAN, 0 when it does not (a skipped or failed upgrade). Absent "
+                          "when the server is not using built-in default certificates.",
                           "gauge");
         metrics_.describe("yuzu_server_cert_expiry_timestamp_seconds",
                           "Unix timestamp (seconds) at which a server certificate expires, by "
@@ -7976,6 +7982,11 @@ public:
             cfg_.using_default_agent_certs = true;
         }
         metrics_.gauge("yuzu_server_default_certs_active").set(1);
+        // #6016: whether the served default-server leaf carries the identity URI.
+        // Set only here (default certs active), so it is absent — not a fabricated 0 —
+        // for operator-supplied certificates.
+        metrics_.gauge("yuzu_server_identity_uri_present")
+            .set(default_server_leaf_has_identity(default_cert_set_) ? 1 : 0);
         // B-4 (#1238): the default CA + leaves are 10-year with NO auto-renewal,
         // so their eventual expiry is otherwise a silent outage. Publish the
         // absolute notAfter as a timestamp gauge so the yuzu-tls alert rules
@@ -8002,6 +8013,48 @@ public:
                                                "ca_fingerprint=" +
                                                default_cert_set_.ca_fingerprint_sha256,
                                      .result = "warning"});
+        }
+        // #6016: the in-place server-leaf re-issue records a new `ca_issued` row and
+        // revokes the superseded serial at boot, with no operator request — leave a
+        // system-principal audit row naming both serials (the row above is gated on
+        // freshly_generated, which an upgrade leaves false).
+        if (default_cert_set_.server_identity_upgraded && audit_store_ && audit_store_->is_open()) {
+            const bool revoked = default_cert_set_.superseded_revoke_confirmed;
+            const bool logged = audit_store_->log(
+                {.timestamp = std::time(nullptr),
+                 .principal = "system",
+                 .principal_role = "system",
+                 .action = "server.default_certs_server_identity_upgraded",
+                 .target_type = "server",
+                 .target_id = "default-certs",
+                 .detail = "Re-issued default-server.pem with the server identity "
+                           "URI SAN (same root, same key); superseded_serial=" +
+                           default_cert_set_.superseded_server_serial +
+                           " new_serial=" + default_cert_set_.new_server_serial +
+                           " superseded_revoked=" + (revoked ? "true" : "false") +
+                           (default_cert_set_.replacement_withdrawn ? " replacement_withdrawn=true"
+                                                                    : "") +
+                           (default_cert_set_.replacement_withdraw_failed
+                                ? " replacement_withdraw_failed=true"
+                                : "") +
+                           " ca_fingerprint=" + default_cert_set_.ca_fingerprint_sha256,
+                 // "warning" when the superseded serial's revoke was not confirmed: the
+                 // old row may still be active in the CA inventory and needs an operator.
+                 .result = revoked ? "success" : "warning"});
+            // The next boot sees an intact set and never re-emits this row, so a lost
+            // write must at least be loud in the operator log.
+            if (!logged)
+                spdlog::error(
+                    "audit: FAILED to record server.default_certs_server_identity_upgraded "
+                    "(superseded_serial={} new_serial={})",
+                    default_cert_set_.superseded_server_serial,
+                    default_cert_set_.new_server_serial);
+        } else if (default_cert_set_.server_identity_upgraded) {
+            spdlog::error("audit: the audit store is not open, so "
+                          "server.default_certs_server_identity_upgraded was NOT recorded "
+                          "(superseded_serial={} new_serial={})",
+                          default_cert_set_.superseded_server_serial,
+                          default_cert_set_.new_server_serial);
         }
         const std::time_t exp =
             std::chrono::system_clock::to_time_t(default_cert_set_.ca_expires_at);
@@ -11522,10 +11575,12 @@ private:
         // Install-scoped URI SAN (defence in depth + forensic identity). The CA
         // fingerprint (colon-stripped → a valid URI authority) is the per-install
         // id; fall back to the ca_store root fingerprint on an operator-supplied set.
-        std::string install = default_cert_set_.ca_fingerprint_sha256.empty()
-                                  ? root->fingerprint_sha256
-                                  : default_cert_set_.ca_fingerprint_sha256;
-        std::erase(install, ':');
+        // One definition of the install id (shared with the server's own identity
+        // URI, #6016) so the agent and server URI families cannot drift.
+        const std::string install =
+            install_id_from_fingerprint(default_cert_set_.ca_fingerprint_sha256.empty()
+                                            ? root->fingerprint_sha256
+                                            : default_cert_set_.ca_fingerprint_sha256);
         if (!install.empty())
             lp.san.uris.push_back("yuzu://" + install + "/agent/" + uri_encode_segment(agent_id));
 
@@ -18313,8 +18368,25 @@ private:
         // guard used: store present → wired; store absent → nullptr → 503
         // (byte-identical). Mirrors verify_api's "null → 503" contract.
         std::shared_ptr<yuzu::server::DexApi> dex_api;
-        if (guaranteed_state_store_)
-            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn);
+        if (guaranteed_state_store_) {
+            // The customer score policy is one stored document read through a
+            // bounded-refresh provider, so every instance converges within
+            // kDexPolicyRefreshMs. With no runtime config store the Apps read scores
+            // under the shipped defaults (the empty function).
+            yuzu::server::DexScorePolicyFn dex_policy_fn;
+            if (runtime_config_store_ && runtime_config_store_->is_open()) {
+                dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
+                    dex_score_policy_store_reader(*runtime_config_store_),
+                    []() -> std::int64_t {
+                        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+                    });
+                dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
+            }
+            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
+                                         std::move(dex_policy_fn));
+        }
         // ADR-0031 WS-A4 (seventh family): the schedule-read API seam — ONE
         // instance backing GET /fragments/schedules (WorkflowRoutes),
         // GET /api/v1/schedules (also WorkflowRoutes), and MCP
@@ -22437,6 +22509,14 @@ private:
     // both destruct before it (declared above every member here).
     std::unique_ptr<pg::SecretCodec> runtime_config_secret_codec_;
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
+    /// Score policy read-through (dex_score_policy_provider.hpp). Its read function
+    /// borrows runtime_config_store_ by reference, and the DexApi closures held by
+    /// rest_api_v1_ and mcp_server_ (declared above the store) keep a copy of this
+    /// pointer, so the provider can outlive the store as an object. The borrow is safe
+    /// because it is never CALLED after the store is gone: web_server_->stop() signals
+    /// the web thread and web_thread_ is joined in stop() (or the process exits), and
+    /// the store is reset only after that, so no call can happen in between.
+    std::shared_ptr<DexScorePolicyProvider> dex_score_policy_provider_;
     std::unique_ptr<CustomPropertiesStore> custom_properties_store_;
     std::unique_ptr<WorkflowEngine> workflow_engine_;
     std::unique_ptr<ProductPackStore> product_pack_store_;

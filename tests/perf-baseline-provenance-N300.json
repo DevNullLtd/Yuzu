@@ -71,5 +71,5 @@
     }
   },
   "n_samples": 300,
-  "source_jsonl": "/mnt/c/Users/natha/Yuzu/tests/perf-baseline-provenance-N300.jsonl"
+  "source_jsonl": "/mnt/c/Users/<user>/Yuzu/tests/perf-baseline-provenance-N300.jsonl"
 }
