@@ -241,7 +241,7 @@ private:
     /// Optional `otpauth_uri` / `secret_b32` / `recovery_codes` are populated
     /// by the POST handlers for the one-time reveal after enroll / verify /
     /// regenerate. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
-    std::string render_mfa_fragment(const std::string& username,
+    std::string render_mfa_fragment(const auth::Session& session,
                                     const std::string& new_otpauth_uri = {},
                                     const std::string& new_secret_b32 = {},
                                     const std::vector<std::string>& new_recovery_codes = {},
@@ -263,7 +263,10 @@ private:
     std::string render_dex_alerts_fragment();
     std::string render_mcp_fragment();
     std::string render_nvd_fragment();
-    std::string render_directory_fragment();
+    /// The OIDC SSO form. `message` renders INSIDE #oidc-feedback (an out-of-band
+    /// swap into it is destroyed by the main swap, so a save error was never seen).
+    std::string render_directory_fragment(const std::string& message = {},
+                                          bool message_is_error = true);
     /// Plugin code-signing settings — operator-managed trust bundle and
     /// require-signature toggle. The PEM bundle lives in
     /// auth::default_cert_dir() / "plugin-trust-bundle.pem"; the require
