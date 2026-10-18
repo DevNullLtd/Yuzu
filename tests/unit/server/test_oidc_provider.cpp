@@ -2250,6 +2250,18 @@ TEST_CASE("OIDC JWKS (#1901 UP-12): a token with no kid is tried against at most
     CHECK(seventeenth.error().find("signature verification failed") != std::string::npos);
     CHECK(cap17.text().find("matched none of the first 16 of the 17 usable keys") !=
           std::string::npos);
+    // 17 usable keys but the FIRST one signs: the token verifies and nothing is said about the
+    // untried keys (the warning only fires when no tried key verified the token).
+    {
+        auto p = lease_test_provider();
+        REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*p, "real", payload).empty());
+        for (int i = 0; i < 16; ++i)
+            REQUIRE(p->add_test_jwks_key("decoy-" + std::to_string(i), decoy.n, decoy.e));
+        yuzu::test::LogCapture first_signs;
+        CHECK(p->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload)).has_value());
+        first_signs.stop();
+        CHECK(first_signs.text().find("were not tried") == std::string::npos);
+    }
     // A token that names the key still finds it wherever it sits in the set.
     CHECK(build(16)
               ->verify_jwt_signature(yuzu::server::test::rs256_sign("real", payload))
@@ -2322,7 +2334,9 @@ TEST_CASE("OIDC JWKS (#6058): an RSA exponent below 3, even or over 32 bits is r
         {"e1", "AQ", "RSA exponent is 1"},            // 1
         {"e2", "Ag", "RSA exponent is even"},         // 2
         {"e4", "BA", "RSA exponent is even"},         // 4
+        {"e0", "AA", "RSA exponent is even"},            // 0
         {"e33", "AQAAAAE", "RSA exponent over 32 bits"}, // 2^32 + 1: odd, 33 bits
+        {"e32", "_____w", nullptr},                      // 2^32 - 1: odd, exactly 32 bits, imports
         {"e3", "Aw", nullptr},                        // 3 is legal and rare
         {"e65537", "AQAB", nullptr},                  // what every IdP publishes
     };
@@ -2357,17 +2371,20 @@ TEST_CASE("OIDC JWKS (#6058): an RSA exponent below 3, even or over 32 bits is r
 TEST_CASE("OIDC JWKS (#1901 UP-7): the floor counts significant bits - leading zero bytes in n do "
           "not change the verdict",
           "[oidc][oidc_jwks][security]") {
-    const auto pad = [](const PubJwk& k) {
+    const auto pad = [](const PubJwk& k, std::size_t zero_bytes) {
         auto bytes = OidcProvider::base64url_decode(k.n);
-        std::vector<uint8_t> padded{0, 0, 0, 0};
+        std::vector<uint8_t> padded(zero_bytes, uint8_t{0});
         padded.insert(padded.end(), bytes.begin(), bytes.end());
         return OidcProvider::base64url_encode(padded);
     };
     const auto weak = fresh_rsa_pub(1024);
     const auto strong = fresh_rsa_pub(2048);
     auto provider = lease_test_provider();
-    CHECK_FALSE(provider->add_test_jwks_key("weak-padded", pad(weak), weak.e)); // 1024 + 32 zero bits
-    CHECK(provider->add_test_jwks_key("strong-padded", pad(strong), strong.e));
+    CHECK_FALSE(provider->add_test_jwks_key("weak-padded", pad(weak, 4), weak.e));
+    // 1024 significant bits plus 128 zero bytes is 256 bytes (2048 bits) on the wire: a floor that
+    // counted decoded bytes would accept it, one that counts significant bits refuses it.
+    CHECK_FALSE(provider->add_test_jwks_key("weak-padded-256B", pad(weak, 128), weak.e));
+    CHECK(provider->add_test_jwks_key("strong-padded", pad(strong, 4), strong.e));
 }
 
 TEST_CASE("OIDC JWKS: a use=enc key is skipped silently and its signing sibling still verifies",
@@ -2378,8 +2395,11 @@ TEST_CASE("OIDC JWKS: a use=enc key is skipped silently and its signing sibling 
     std::string log_text;
     {
         yuzu::test::LogCapture cap;
+        // The e=1 key is the log control: a refused signing key DOES warn, so the absence of a line
+        // for the enc key below is meaningful.
         keys = OidcProvider::parse_jwks(R"({"keys":[)" + rsa_jwk("enc-key", other.n, other.e, "enc") +
-                                        "," + rsa_jwk("sig-key", shared.n_b64, shared.e_b64) + "]}");
+                                        "," + rsa_jwk("sig-key", shared.n_b64, shared.e_b64) + "," +
+                                        rsa_jwk("bad-e", other.n, "AQ") + "]}");
         cap.stop();
         log_text = cap.text();
     }
@@ -2387,6 +2407,7 @@ TEST_CASE("OIDC JWKS: a use=enc key is skipped silently and its signing sibling 
     REQUIRE((*keys)->size() == 1);
     CHECK((*keys)->front().kid == "sig-key");
     CHECK(log_text.find("enc-key") == std::string::npos); // skipped without a warning
+    CHECK(log_text.find("failed to parse JWK kid=bad-e (RSA exponent is 1)") != std::string::npos);
 }
 
 TEST_CASE("OIDC JWKS: a duplicated kid resolves to the first key published - a token the second "
@@ -2394,6 +2415,14 @@ TEST_CASE("OIDC JWKS: a duplicated kid resolves to the first key published - a t
           "[oidc][oidc_jwks][jwt]") {
     const std::string payload = R"({"sub":"x"})";
     const auto decoy = fresh_rsa_pub(2048);
+    {
+        // Control: with the real key alone under "dup" the same token verifies, so the refusal
+        // below is the first-wins rule and not a broken fixture.
+        auto alone = lease_test_provider();
+        REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*alone, "dup", payload).empty());
+        CHECK(alone->verify_jwt_signature(yuzu::server::test::rs256_sign("dup", payload))
+                  .has_value());
+    }
     auto provider = lease_test_provider();
     REQUIRE(provider->add_test_jwks_key("dup", decoy.n, decoy.e)); // first with this kid
     REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*provider, "dup", payload).empty());
@@ -2411,9 +2440,15 @@ TEST_CASE("OIDC JWKS: a token with no kid and a malformed signature is refused b
     const auto good = yuzu::server::test::rs256_sign("", payload);
     REQUIRE(provider->verify_jwt_signature(good).has_value()); // the control
     const auto head = good.substr(0, good.rfind('.') + 1);
-    const std::string zeros =
+    // "!!!" decodes to nothing (every character is skipped), so it would repeat the empty case:
+    // use wrong-length and out-of-range signatures that reach OpenSSL's own error paths.
+    const std::string zeros255 =
         OidcProvider::base64url_encode(std::vector<uint8_t>(255, uint8_t{0}));
-    for (const std::string& bad_sig : {std::string{}, std::string("!!!"), zeros}) {
+    const std::string zeros256 =
+        OidcProvider::base64url_encode(std::vector<uint8_t>(256, uint8_t{0}));
+    const std::string ones256 =
+        OidcProvider::base64url_encode(std::vector<uint8_t>(256, uint8_t{0xFF}));
+    for (const std::string& bad_sig : {std::string{}, zeros255, zeros256, ones256}) {
         CAPTURE(bad_sig);
         ERR_clear_error();
         const auto r = provider->verify_jwt_signature(head + bad_sig);

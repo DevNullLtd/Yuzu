@@ -272,7 +272,7 @@ store is degraded (previously an empty `200`) and `404` for an unknown role
 ## ⚠️ Breaking: OIDC refuses RSA signing keys under 2048 bits or with a degenerate exponent (#1901, #6058)
 
 OIDC sign-in no longer accepts an RSA signing key whose modulus is under 2048 bits, or whose public
-exponent is below 3, even, or wider than 32 bits (every IdP in practice publishes 65537). Such a key is
+exponent is below 3, even, or wider than 32 bits (65537 is the near-universal choice). Such a key is
 skipped when the IdP's key set is parsed, with the warning
 `OidcProvider: failed to parse JWK kid=<kid> (RSA modulus under 2048 bits)` (or `(RSA exponent is 1)`,
 `(RSA exponent is even)`, `(RSA exponent over 32 bits)`), and its siblings are kept.
@@ -280,9 +280,9 @@ skipped when the IdP's key set is parsed, with the warning
 - **Who is affected.** An IdP that signs ID tokens with such a key, for example a legacy, in-house or test
   IdP. That includes an IdP that also publishes a larger key it does not sign with. A token that names the
   skipped key's `kid` is refused with `no matching JWKS key found`; a token with no `kid` that the skipped
-  key signed is refused with `JWT signature verification failed - token may be forged`; if every key the IdP
+  key signed is refused as `token may be forged`; if every key the IdP
   serves is skipped, nobody can sign in. Settings Test Connection reports only the keys that remain, so it
-  can be green while sign-ins fail: a count lower than the number of RSA keys the IdP publishes means keys
+  can be green while sign-ins fail: a count lower than the number of RSA signing keys the IdP publishes means keys
   were skipped.
 - **Check before upgrading.** Fetch the IdP's `jwks_uri` and confirm that each RSA key it signs with has a
   modulus (`n`, base64url-decoded) of at least 2048 bits and an exponent (`e`) of 65537 or another odd value

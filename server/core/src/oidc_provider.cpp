@@ -1566,7 +1566,8 @@ constexpr int kMaxRsaExponentBits = 32;
 constexpr std::size_t kMaxNoKidCandidates = 16;
 
 // Parse a single JWK (RSA public key) into an EVP_PKEY. On a refusal that is not a plain parse
-// failure, `*refusal` (when given) names why, for the caller's log line.
+// failure, `*refusal` (when given) names why, for the caller's log line; it is set to nullptr
+// otherwise.
 static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk,
                                              const char** refusal = nullptr) {
     auto kty = jwk.value("kty", "");
@@ -1760,10 +1761,14 @@ static std::expected<bool, std::string> verify_rsa_digest(EVP_PKEY* pkey, const 
     EvpMdCtxPtr ctx(EVP_MD_CTX_new());
     if (!ctx)
         return std::unexpected("EVP_MD_CTX_new failed");
-    if (EVP_DigestVerifyInit(ctx.get(), nullptr, md, nullptr, pkey) != 1)
+    if (EVP_DigestVerifyInit(ctx.get(), nullptr, md, nullptr, pkey) != 1) {
+        ERR_clear_error();
         return std::unexpected("EVP_DigestVerifyInit failed");
-    if (EVP_DigestVerifyUpdate(ctx.get(), input.data(), input.size()) != 1)
+    }
+    if (EVP_DigestVerifyUpdate(ctx.get(), input.data(), input.size()) != 1) {
+        ERR_clear_error();
         return std::unexpected("EVP_DigestVerifyUpdate failed");
+    }
     const bool valid = EVP_DigestVerifyFinal(ctx.get(),
                                              reinterpret_cast<const unsigned char*>(signature.data()),
                                              signature.size()) == 1;
@@ -1853,11 +1858,11 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
         // `keys`; the earlier 'failed to parse JWK' line says which and why.
         if (kid.empty())
             spdlog::warn("OidcProvider: the token has no kid and the fetched key set has no usable "
-                         "key (a key under the 2048-bit RSA floor is skipped at parse; see the "
+                         "key (an RSA key under 2048 bits or with an unusable exponent is skipped at parse; see the "
                          "'failed to parse JWK' line)");
         else
             spdlog::warn("OidcProvider: the token names kid={}, which the fetched key set does not "
-                         "hold (a key under the 2048-bit RSA floor is skipped at parse; see the "
+                         "hold (an RSA key under 2048 bits or with an unusable exponent is skipped at parse; see the "
                          "'failed to parse JWK' line)",
                          ::yuzu::log_key_token(kid));
         return std::unexpected("no matching JWKS key found for kid=" + ::yuzu::log_key_token(kid));
