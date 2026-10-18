@@ -1,13 +1,14 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-17 · euid 0 · leg-hash 58c6c41593ed
+captured: linux Ubuntu 26.04.1 LTS x86_64 · container · 2026-10-18 · euid 0 · leg-hash 58c6c41593ed
 == action=list
 status|list|constrained|linux:remote_access_audit:keys:malformed,linux:remote_access_audit:keys:oversized_line,linux:remote_access_audit:keys:symlink_refused
 source|sshd_config|read|3
-source|homes|read|4|-
-source|service|read|3
+source|homes|read|5|-
+source|service|read|4
 config|permitrootlogin|prohibit-password|include:10-test.conf
 config|passwordauthentication|no|include:10-test.conf
 config|pubkeyauthentication|-|-
 config|kbdinteractiveauthentication|no|sshd_config
+config|gssapiauthentication|-|-
 config|permitemptypasswords|-|-
 config|usepam|yes|sshd_config
 config|port|-|-
@@ -17,9 +18,10 @@ config|allowgroups_count|0|-
 config|denyusers_count|0|-
 config|denygroups_count|0|-
 config|match_blocks|0|-
-service|ssh.service|enabled|systemctl_is_enabled
+service|ssh.service|disabled|systemctl_is_enabled
 service|sshd.service|alias|systemctl_is_enabled
-service|ssh.socket|disabled|systemctl_is_enabled
+service|ssh.socket|enabled|systemctl_is_enabled
+service|sshd.socket|not-found|systemctl_is_enabled
 file|alice|authorized_keys|read|6|1|1
 key|alice|authorized_keys|ssh-ed25519|SHA256:BPH4QduMtDlX59CWZCda5Zf0U0jseMmFVimvek7EMhA|256|-|-
 key|alice|authorized_keys|ssh-rsa|SHA256:frqA0Mkaf9cJzWtmjOJemTbg/vQTRmE5s3WzAScnda0|4096|-|-
@@ -47,5 +49,9 @@ key|root|authorized_keys|ssh-ed25519|SHA256:sFi+I5VZR9SGQu5UyQcG/NMUAorE9RmeTLoC
 file|root|authorized_keys2|absent|-|-|-
 file|root|custom|read|1|0|0
 key|root|custom|ssh-ed25519|SHA256:Uc/dY5jcWGbEIlLnEJfWtdNNKWrXJ1m2unP44ggBYfY|256|-|-
+file|ubuntu|authorized_keys|absent|-|-|-
+file|ubuntu|authorized_keys2|absent|-|-|-
+file|ubuntu|custom|read|1|0|0
+key|ubuntu|custom|ssh-ed25519|SHA256:Uc/dY5jcWGbEIlLnEJfWtdNNKWrXJ1m2unP44ggBYfY|256|-|-
 [result_status] CONSTRAINED / PARTIAL / linux:remote_access_audit:keys:malformed,linux:remote_access_audit:keys:oversized_line,linux:remote_access_audit:keys:symlink_refused
 

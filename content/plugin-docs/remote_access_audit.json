@@ -278,23 +278,23 @@
             "provenance": "linux:remote_access_audit:keys:malformed,linux:remote_access_audit:keys:oversized_line,linux:remote_access_audit:keys:symlink_refused",
             "status": "CONSTRAINED"
           },
-          "row_count": 47,
+          "row_count": 53,
           "rows": [
             "status|list|constrained|linux:remote_access_audit:keys:malformed,linux:remote_access_audit:keys:oversized_line,linux:remote_access_audit:keys:symlink_refused",
             "source|sshd_config|read|3",
-            "source|homes|read|4|-",
-            "source|service|read|3",
+            "source|homes|read|5|-",
+            "source|service|read|4",
             "config|permitrootlogin|prohibit-password|include:10-test.conf"
           ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-10-17",
+        "date": "2026-10-18",
         "host_class": "container",
         "leg_hash": "58c6c41593ed",
         "os": "linux",
-        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "os_version": "Ubuntu 26.04.1 LTS x86_64",
         "privilege": "euid 0"
       }
     },

@@ -127,23 +127,23 @@ config|port|-|-
 [result_status] CONSTRAINED / PARTIAL / macos:remote_access_audit:homes:permission_denied
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-17 · euid 0 · leg-hash 58c6c41593ed
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · container · 2026-10-18 · euid 0 · leg-hash 58c6c41593ed
 
 ```
 == action=list
 status|list|constrained|linux:remote_access_audit:keys:malformed,linux:remote_access_audit:keys:oversized_line,linux:remote_access_audit:keys:symlink_refused
 source|sshd_config|read|3
-source|homes|read|4|-
-source|service|read|3
+source|homes|read|5|-
+source|service|read|4
 config|permitrootlogin|prohibit-password|include:10-test.conf
 config|passwordauthentication|no|include:10-test.conf
 config|pubkeyauthentication|-|-
 config|kbdinteractiveauthentication|no|sshd_config
+config|gssapiauthentication|-|-
 config|permitemptypasswords|-|-
 config|usepam|yes|sshd_config
 config|port|-|-
-config|authorizedkeysfile|custom:3|sshd_config
-… 12 of 47 rows shown
+… 12 of 53 rows shown
 [result_status] CONSTRAINED / PARTIAL / linux:remote_access_audit:keys:malformed,linux:remote_access_audit:keys:oversized_line,linux:remote_access_audit:keys:symlink_refused
 ```
 <!-- END GENERATED -->
