@@ -59,6 +59,9 @@ struct CryptoSummary {
     std::vector<CryptoFamilyRow> families; ///< zero-device families omitted
     CryptoCoverage coverage;
     bool result_truncated{false}; ///< the store row cap dropped version rows
+    /// Refresh time (epoch seconds) of the hourly catalogue rollup that supplied the package
+    /// NAMES; counts and versions for listed names are live.
+    std::int64_t names_as_of{0};
 };
 
 struct CryptoDeviceRow {
@@ -74,6 +77,8 @@ struct CryptoDeviceRow {
 struct CryptoDevicesPage {
     std::string family;
     std::optional<std::string> version;
+    std::optional<std::string> ecosystem; ///< the exact-ecosystem filter echoed (nullopt = any)
+    std::int64_t names_as_of{0};          ///< as CryptoSummary::names_as_of
     std::vector<CryptoDeviceRow> devices;
     std::string next_cursor; ///< "" = last page
 };

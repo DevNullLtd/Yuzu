@@ -7,6 +7,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -24,6 +28,45 @@ std::string cls(std::string_view n) {
     const auto f = cl::classify(n);
     return f ? std::string(*f) : std::string("-");
 }
+// Repo-relative file lookup: $MESON_SOURCE_ROOT, then CWD, then a bounded walk-up from CWD (the
+// same order test_dex_obs_table.cpp uses).
+std::filesystem::path find_repo_file(const std::string& relative) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> candidates;
+    if (auto* root = std::getenv("MESON_SOURCE_ROOT"))
+        candidates.emplace_back(fs::path{root} / relative);
+    candidates.emplace_back(fs::path{relative});
+    std::error_code ec;
+    fs::path dir = fs::current_path(ec);
+    for (int i = 0; !ec && i < 8 && !dir.empty(); ++i) {
+        candidates.emplace_back(dir / relative);
+        fs::path parent = dir.parent_path();
+        if (parent == dir)
+            break;
+        dir = parent;
+    }
+    for (const auto& c : candidates) {
+        std::error_code e2;
+        if (fs::exists(c, e2) && !e2)
+            return fs::absolute(c, e2);
+    }
+    return {};
+}
+
+// Every `backticked` token in a table cell.
+std::set<std::string> backticked(const std::string& cell) {
+    std::set<std::string> out;
+    std::size_t i = 0;
+    while ((i = cell.find('`', i)) != std::string::npos) {
+        const auto j = cell.find('`', i + 1);
+        if (j == std::string::npos)
+            break;
+        out.insert(cell.substr(i + 1, j - i - 1));
+        i = j + 1;
+    }
+    return out;
+}
+
 cl::Params P(std::initializer_list<std::pair<const std::string, std::string>> l) {
     return cl::Params(l.begin(), l.end());
 }
@@ -96,6 +139,13 @@ TEST_CASE("crypto classifier: bare libssl/libcrypto prefixes are gone (v2)", "[c
     CHECK(cls("mozilla-nss-tools") == "nss");
     CHECK(cls("libhogweed6") == "nettle");
     CHECK(cls("libbcpkix-java") == "bouncycastle");
+    // Unicode look-alikes never fold onto ASCII (one ASCII-only fold rule, same as the SQL).
+    CHECK(cls("l\xC4\xB0" "bssl3") == "-");                 // lİbssl3
+    CHECK(cls("lib\xC5\xBF" "sl3") == "-");                 // libſsl3
+    CHECK(cls("\xEF\xBD\x8C\xEF\xBD\x89\xEF\xBD\x82\xEF\xBD\x93\xEF\xBD\x93"
+              "\xEF\xBD\x8C\xEF\xBC\x93") == "-");       // fullwidth libssl3
+    CHECK(cls("nss-so\xE2\x84\xAA" "tn") == "-");           // Kelvin sign for the k of nss-softokn
+    CHECK(cls("nss-softokn") == "nss");
     // Exact rules stay exact.
     CHECK(cls("libssl-dev-extra") == "-");
     CHECK(cls("nss-tools-extra") == "-");
@@ -363,6 +413,7 @@ TEST_CASE("crypto JSON: summary and devices shapes", "[crypto]") {
     const json d = cl::devices_json(p);
     CHECK(d["family"] == "openssl");
     CHECK(d["version"].is_null());
+    CHECK(d["ecosystem"].is_null()); // absent filter echoes null
     CHECK(d["next_cursor"].is_null());
     CHECK(d["count"] == 2);
     CHECK(d["devices"][0]["hostname"].is_null());
@@ -373,6 +424,10 @@ TEST_CASE("crypto JSON: summary and devices shapes", "[crypto]") {
     p.next_cursor = "k1:x";
     const json d2 = cl::devices_json(p);
     CHECK(d2["version"] == "");
+    p.ecosystem = "";
+    CHECK(cl::devices_json(p)["ecosystem"] == ""); // present-empty is echoed as the empty string
+    p.ecosystem = "deb";
+    CHECK(cl::devices_json(p)["ecosystem"] == "deb");
     CHECK(d2["next_cursor"] == "k1:x");
 
     // never throws on a stray invalid byte
@@ -411,15 +466,17 @@ TEST_CASE("crypto audit detail: one key set, cid optional", "[crypto]") {
     CHECK(cl::audit_detail_degraded("") == "tv=2 store degraded");
 }
 
-TEST_CASE("crypto summary: a hostile 20,000-bucket report stays inside the byte budget and says so",
+TEST_CASE("crypto summary: a hostile many-bucket report stays inside the byte budget and says so",
           "[crypto]") {
-    // 12 families x 20,000 version rows x 8 names x 1 KiB: the worst a hostile agent set could send.
+    // 12 families x 200 version rows x 8 names x 1 KiB (~20 MB in): far over both the 50-bucket
+    // per-family cap and, after it, the byte budget. Larger inputs add nothing - the per-family
+    // cap already bounds what reaches the budget - and cost peak RSS.
     CryptoSummary s;
     for (const auto& fam : cl::families()) {
         CryptoFamilyRow f;
         f.id = std::string(fam.id);
         f.device_count = 5;
-        for (int i = 0; i < 20000; ++i) {
+        for (int i = 0; i < 200; ++i) {
             CryptoVersionRow v;
             v.version = "0." + std::to_string(i);
             v.ecosystem = "deb";
@@ -436,6 +493,7 @@ TEST_CASE("crypto summary: a hostile 20,000-bucket report stays inside the byte 
     CHECK(body.size() < cl::kSummaryByteBudget);
     CHECK(s.result_truncated);
     REQUIRE(s.families.size() == 12);
+    CHECK(s.families.front().versions.size() <= cl::kMaxVersionsPerFamily);
     for (const auto& f : s.families) {
         CHECK(f.versions_truncated);
         CHECK_FALSE(f.versions.empty()); // every family keeps its first bucket
@@ -490,4 +548,85 @@ TEST_CASE("crypto JSON: the devices page carries table_version", "[crypto]") {
     CryptoDevicesPage p;
     p.family = "openssl";
     CHECK(cl::devices_json(p)["table_version"] == cl::kCryptoTableVersion);
+}
+
+TEST_CASE("crypto table: the families table in crypto.md lists exactly rules()", "[crypto][docs]") {
+    const auto path = find_repo_file("docs/user-manual/crypto.md");
+    if (path.empty())
+        FAIL("docs/user-manual/crypto.md not found - the table pin has nothing to read");
+    std::ifstream f(path);
+    REQUIRE(f.good());
+
+    struct Cells {
+        std::set<std::string> exact, prefix;
+        std::string display;
+    };
+    std::map<std::string, Cells> doc;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.starts_with("| `"))
+            continue;
+        // | `id` | Display | exact | prefixes |
+        std::vector<std::string> cells;
+        std::size_t pos = 1;
+        while (true) {
+            const auto bar = line.find('|', pos);
+            if (bar == std::string::npos)
+                break;
+            cells.push_back(line.substr(pos, bar - pos));
+            pos = bar + 1;
+        }
+        if (cells.size() != 4)
+            continue;
+        const auto id = backticked(cells[0]);
+        if (id.size() != 1 || !cl::find_family(*id.begin()))
+            continue; // an endpoint / verb table row, not the family table
+        doc[*id.begin()] = {backticked(cells[2]), backticked(cells[3]), cells[1]};
+    }
+
+    std::map<std::string, Cells> code;
+    for (const auto& r : cl::rules())
+        (r.kind == cl::MatchKind::kExact ? code[std::string(r.family_id)].exact
+                                         : code[std::string(r.family_id)].prefix)
+            .insert(std::string(r.value));
+    REQUIRE(doc.size() == cl::families().size());
+    for (const auto& fam : cl::families()) {
+        const std::string id{fam.id};
+        INFO("family " << id);
+        REQUIRE(doc.contains(id));
+        CHECK(doc[id].exact == code[id].exact);
+        CHECK(doc[id].prefix == code[id].prefix);
+        CHECK(doc[id].display.find(std::string(fam.display)) != std::string::npos);
+    }
+}
+
+TEST_CASE("crypto SQL patterns: every rule has a 3-character lowercase lead the pattern starts with",
+          "[crypto]") {
+    // A rule literal shorter than kLeadChars is a compile error (static_assert in the model);
+    // this pins the runtime half: the lead is the literal's first kLeadChars characters.
+    const auto pats = cl::sql_patterns();
+    REQUIRE(pats.leads.size() == pats.patterns.size());
+    REQUIRE(pats.leads.size() == cl::rules().size());
+    for (std::size_t i = 0; i < cl::rules().size(); ++i) {
+        const auto& r = cl::rules()[i];
+        INFO(r.value);
+        CHECK(r.value.size() >= cl::kLeadChars);
+        CHECK(pats.leads[i].size() == cl::kLeadChars);
+        CHECK(pats.leads[i] == std::string(r.value.substr(0, cl::kLeadChars)));
+        CHECK(std::ranges::none_of(pats.leads[i], [](char c) { return c >= 'A' && c <= 'Z'; }));
+    }
+    // A per-family request carries the family's leads only.
+    const auto one = cl::sql_patterns("libressl");
+    REQUIRE(one.leads.size() == one.patterns.size());
+    for (const auto& l : one.leads)
+        CHECK(l == "lib");
+}
+
+TEST_CASE("crypto JSON: names_as_of rides on the summary and the devices page", "[crypto]") {
+    CryptoSummary s;
+    s.names_as_of = 1760000000;
+    CHECK(cl::summary_json(s)["names_as_of"] == 1760000000);
+    CryptoDevicesPage p;
+    p.names_as_of = 1760000001;
+    CHECK(cl::devices_json(p)["names_as_of"] == 1760000001);
 }

@@ -265,6 +265,9 @@ inline constexpr int kNamePatternPageMax = 1000;
 struct NamePatternQuery {
     std::vector<std::string> patterns;
     std::vector<std::string> labels;
+    /// Parallel to `patterns`: the first 3 characters of each pattern's literal, lowercase
+    /// ASCII (every pattern's literal must be at least 3 characters). Step 1 pre-filters on it.
+    std::vector<std::string> leads;
     std::optional<std::string> ecosystem; ///< exact ecosystem filter
     /// Scope push-down (ADR-0033): nullopt = unfiltered; PRESENT-EMPTY = deny-all -> empty
     /// value with no SQL; non-empty -> `agent_id = ANY(...)` in SQL BEFORE the grouping.
@@ -293,6 +296,10 @@ struct NamePatternRollup {
     /// statement (one snapshot) as `total_devices`.
     std::int64_t reporting_agents{0};
     bool truncated{false};         ///< more than kNamePatternRollupRowCap version rows matched
+    /// `catalog_rollup_meta.refreshed_at` (epoch seconds) read in the SAME statement; the NAMES
+    /// searched come from that hourly catalogue. 0 = the catalogue has never been built: the
+    /// rows are empty and the caller must treat the read as unavailable, never as "none found".
+    std::int64_t names_as_of{0};
 };
 
 /// One page of the devices behind one pattern set. `patterns` are the LIKE patterns of ONE
@@ -301,6 +308,7 @@ struct NamePatternRollup {
 /// strictly after that position; `limit` is clamped to [1, kNamePatternPageMax].
 struct NamePatternDevicesQuery {
     std::vector<std::string> patterns;
+    std::vector<std::string> leads; ///< parallel to `patterns`, as NamePatternQuery::leads
     std::optional<std::string> version;
     std::optional<std::string> ecosystem;
     std::optional<std::vector<std::string>> agent_ids; ///< as NamePatternQuery::agent_ids
@@ -311,6 +319,8 @@ struct NamePatternDevicesQuery {
 struct NamePatternDevicesPage {
     std::vector<SoftwareFleetRow> rows; ///< at most `limit`; the entry carries name/version/release/ecosystem/kind
     bool has_more{false};               ///< a row exists beyond `rows` (read limit+1)
+    /// As NamePatternRollup::names_as_of (0 = catalogue never built; rows empty).
+    std::int64_t names_as_of{0};
 };
 
 class SoftwareInventoryStore {
@@ -336,6 +346,12 @@ public:
     /// null registry (the default, e.g. in unit tests) disables emission; every
     /// emit site is null-guarded.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// Count one /crypto read refused by the API's admission bound BEFORE any store call:
+    /// `yuzu_inventory_read_degrade_total{reason="admission_full", source="installed_software"}`.
+    /// A shed is not a store fault, so it takes its own closed reason value and bumps nothing
+    /// else (no episode sampler, no log line). Null-guarded like every emit site.
+    void note_read_shed() const noexcept;
 
     /// Canonical content hash over a machine-scope software list (sorted +
     /// deduplicated; fields unit-separated 0x1F, entries record-separated 0x1E;
@@ -411,20 +427,19 @@ public:
     [[nodiscard]] std::optional<NamePatternRollup>
     software_name_pattern_rollup(const NamePatternQuery& q);
 
-    /// The step-1 SQL (`$1` = a text[] of LIKE patterns; yields `name`) both name-pattern reads
-    /// share. Exposed so a test can EXPLAIN it and pin that it uses installed_software_name_idx.
+    /// The step-1 SQL (`$1` = a text[] of LIKE patterns, `$2` = the parallel text[] of 3-character
+    /// leads; yields `name`) both name-pattern reads share. Exposed so a test can EXPLAIN it and pin that it uses installed_software_name_idx.
     [[nodiscard]] static std::string name_pattern_matched_names_sql();
+
+    /// Test seam: the one-dimensional text[] literal parser behind the rollup's per-bucket
+    /// package names ({a,"b c",NULL}; quoted elements honour \" and \\; an unquoted NULL is
+    /// skipped; malformed input yields what parsed so far, never throws).
+    [[nodiscard]] static std::vector<std::string> parse_name_array_for_test(std::string_view text);
 
     /// One keyset page of the devices behind a pattern set (see `NamePatternDevicesQuery`).
     /// Same AUTHORITATIVE / bounded / scope contract as `software_name_pattern_rollup`.
     [[nodiscard]] std::optional<NamePatternDevicesPage>
     software_name_pattern_devices(const NamePatternDevicesQuery& q);
-
-    /// Count of agents that have an `installed_software` inventory report (the "N devices
-    /// reporting" denominator), restricted to `agent_ids` when set (nullopt = whole fleet,
-    /// present-empty -> 0 with no SQL). `std::nullopt` on degrade, never a zero.
-    [[nodiscard]] std::optional<std::int64_t>
-    count_reporting_agents(const std::optional<std::vector<std::string>>& agent_ids);
 
     /// Fleet software catalogue — one row per title under the active filters, most-installed
     /// first (the `/inventory` Software list). Reads the PRECOMPUTED `catalog_rollup` (one

@@ -2146,12 +2146,18 @@ public:
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(store_not_open/pool_acquire_timeout/query_error, plus "
+                          "admission_full for installed_software: a /crypto read refused by "
+                          "its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
                           "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
+        // /crypto admission refusals (reason=admission_full): pre-seeded so the series is
+        // present on a healthy server (the three store-side reasons are emitted on demand).
+        metrics_.counter("yuzu_inventory_read_degrade_total",
+                         {{"reason", "admission_full"}, {"source", "installed_software"}});
         // Management-group CONFINEMENT store observability (ADR-0042). The
         // read-degrade counter is the fail-closed signal: a non-zero rate means
         // RbacStore's authorize_list_read / check_scoped_permission is denying

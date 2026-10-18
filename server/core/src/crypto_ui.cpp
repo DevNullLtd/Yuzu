@@ -11,8 +11,10 @@
 #include "web_utils.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <string>
 #include <vector>
@@ -116,6 +118,18 @@ std::string tile(const std::string& title, const std::string& big, const std::st
            "</div><div class=\"s2\">" + s2 + "</div></div>";
 }
 
+// "Package names as of 2026-10-18 02:00 UTC": the refresh time of the hourly catalogue that
+// supplied the package NAMES (counts and versions for a listed name are live).
+std::string names_as_of_note(std::int64_t as_of) {
+    if (as_of <= 0)
+        return {};
+    const auto t = std::chrono::sys_seconds{std::chrono::seconds{as_of}};
+    return "<div class=\"cry-caveat\">Package names as of " +
+           esc(std::format("{:%Y-%m-%d %H:%M} UTC", t)) +
+           ". A package name first reported after this time appears after the next hourly "
+           "refresh; counts and versions for listed names are live.</div>";
+}
+
 std::string caveat_box() {
     return "<div class=\"cry-caveat\">" + esc(std::string(kEvidenceCaveat)) + "</div>";
 }
@@ -141,7 +155,8 @@ std::string family_rows(const CryptoSummary& s) {
                      "</span>";
         }
         if (f.versions.empty())
-            chips = dash();
+            chips = f.versions_truncated ? "<span class=\"cry-grey\">versions not shown</span>"
+                                         : dash();
         else if (f.versions_truncated || f.versions.size() > shown)
             chips += "<span class=\"cry-grey\">+more</span>";
         h += "<tr class=\"click\" title=\"Click for the devices carrying this family\" hx-get=\"" +
@@ -200,7 +215,7 @@ std::string render_libraries(const CryptoSummary& s) {
               "of " + std::to_string(crypto_library::families().size()) + " in the table") +
          "</div>";
     if (s.result_truncated)
-        h += "<div class=\"cry-caveat\">The version list was capped by the store row limit, so "
+        h += "<div class=\"cry-caveat\">The version list was capped (row or size limit), so "
              "some version rows are not shown. Family device counts are unaffected.</div>";
     if (s.families.empty()) {
         h += "<div class=\"cry-panel cry-empty\">No matching package rows in your visible "
@@ -212,7 +227,7 @@ std::string render_libraries(const CryptoSummary& s) {
              "<th>Top versions</th></tr></thead><tbody>" +
              family_rows(s) + "</tbody></table></div>";
     }
-    h += caveat_box() + "</div>";
+    h += caveat_box() + names_as_of_note(s.names_as_of) + "</div>";
     return h;
 }
 

@@ -3885,7 +3885,10 @@ static const ToolDef kTools[] = {
      "installed and at which versions'; chain it with list_crypto_library_devices to name the "
      "devices behind a family or one version bucket. Evidence is the daily-synced "
      "installed-software inventory matched by package NAME against a curated table "
-     "(table_version says which mapping answered). It reports presence and versions only and "
+     "(table_version says which mapping answered; names_as_of is when the hourly catalogue that "
+     "supplies the package NAMES was refreshed - a name first reported after it appears after "
+     "the next refresh, while counts and versions for listed names are live; before the first "
+     "refresh the call is a retryable error). It reports presence and versions only and "
      "never judges a library or version: interpreting a version is the caller's job. Families "
      "with no matching device are omitted, and an empty families list means 'no matching package "
      "rows in the caller's visible inventory' - NOT proof the library is absent: statically "
@@ -3896,7 +3899,8 @@ static const ToolDef kTools[] = {
      "the counts. Requires Inventory:Read; a management-group-confined or service-scoped caller "
      "sees only its visible devices (counts, coverage and versions are all computed over that "
      "scope). Input is strict: an unknown family, a wrong JSON type or an over-long string is "
-     "rejected (the REST twin clamps). A degraded inventory store is a retryable error, never an "
+     "rejected (the REST twin clamps). A degraded inventory store, or crypto read capacity in "
+     "use, is a retryable error, never an "
      "empty result. Package names are cut to 256 bytes (a cut name ends in an ellipsis) and the "
      "whole payload is byte-budgeted: a cut version list sets versions_truncated and "
      "result_truncated. ecosystem is matched EXACTLY (empty string = rows with no ecosystem; "
@@ -3907,11 +3911,12 @@ static const ToolDef kTools[] = {
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
+     R"j("names_as_of":{"type":"integer","description":"Refresh time (epoch seconds) of the hourly catalogue that supplied the package names; counts and versions for listed names are live"},)j"
      R"j("families":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display":{"type":"string"},"device_count":{"type":"integer"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"ecosystem":{"type":"string"},"device_count":{"type":"integer"},"package_names":{"type":"array","items":{"type":"string"}}},"required":["version","ecosystem","device_count","package_names"]}},"versions_truncated":{"type":"boolean"}},"required":["id","display","device_count","versions","versions_truncated"]}},)j"
      R"j("coverage":{"type":"object","properties":{"devices_reporting_inventory":{"type":"integer"},"devices_with_crypto_library":{"type":"integer"}},"required":["devices_reporting_inventory","devices_with_crypto_library"]},)j"
      R"j("result_truncated":{"type":"boolean"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["table_version","families","coverage","result_truncated"]})j"},
+     R"j(},"required":["table_version","names_as_of","families","coverage","result_truncated"]})j"},
 
     {"list_crypto_library_devices",
      "List the devices (and the matching package rows) behind one cryptographic library family, "
@@ -3928,23 +3933,24 @@ static const ToolDef kTools[] = {
      "judged. Requires Inventory:Read; a management-group-confined or service-scoped caller sees "
      "only its visible devices. Input is strict: an unknown family, a wrong JSON type, an "
      "over-long string or a limit outside 1..1000 is rejected rather than clamped. A degraded "
-     "inventory store is a retryable error, never an empty result. Every page served is audited "
+     "inventory store, or crypto read capacity in use, is a retryable error, never an empty result. Every page served is audited "
      "as mcp.list_crypto_library_devices (continuation pages tagged page=continuation). Mirrors "
      "GET /api/v1/crypto/libraries/devices.",
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
      R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
      R"j("ecosystem":{"type":"string","maxLength":1024,"description":"Exact package ecosystem filter; empty string selects rows that carry no ecosystem; omit for any"},)j"
-     R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter"},)j"
+     R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version"},)j"
      R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
      R"j(},"required":["family"]})j",
      R"j({"type":"object","properties":{)j"
      R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this page; a cursor is bound to it"},)j"
-     R"j("family":{"type":"string"},"version":{"type":["string","null"]},)j"
+     R"j("names_as_of":{"type":"integer","description":"Refresh time (epoch seconds) of the hourly catalogue that supplied the package names; counts and versions for listed names are live"},)j"
+     R"j("family":{"type":"string"},"version":{"type":["string","null"]},"ecosystem":{"type":["string","null"],"description":"The exact-ecosystem filter echoed; null when absent"},)j"
      R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"]},"package_name":{"type":"string"},"version":{"type":"string"},"release":{"type":"string"},"ecosystem":{"type":"string"},"kind":{"type":"string"}},"required":["agent_id","hostname","package_name","version","release","ecosystem","kind"]}},)j"
      R"j("next_cursor":{"type":["string","null"]},"count":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["table_version","family","version","devices","next_cursor","count"]})j"},
+     R"j(},"required":["table_version","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);

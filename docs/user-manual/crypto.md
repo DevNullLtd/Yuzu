@@ -53,7 +53,7 @@ Three tiles across the top:
 
 | Tile | Meaning |
 |---|---|
-| Devices reporting inventory | Devices in your visible scope that have an installed-software report. This is the denominator: a device that has never reported cannot be shown to carry or not carry a library. |
+| Devices reporting inventory | Devices in your visible scope that have an installed-software report. This is the denominator: a device that has never reported cannot be shown to carry or not carry a library. The denominator is floored at the numerator, so it is never smaller than the devices-with-a-library figure. |
 | Devices with a crypto library | Distinct devices in scope with at least one package matching any family. A device carrying `libssl3` and `libgnutls30` counts once here. |
 | Families matched | Number of curated families with at least one matching device, shown against the size of the table ("of 12 in the table"). |
 
@@ -75,9 +75,11 @@ The response is bounded, and every cut is flagged, never silent:
   `versions_truncated` in the API. The device count is unaffected by that cap.
 - Each package name is cut to 256 bytes (on a character boundary, ending in `…`), and a bucket
   shows at most 8 package names.
-- The whole summary has a 256 KiB byte budget. When one agent (or many) reports so many versions
+- The whole summary has a byte budget of about 256 KiB, plus at most one first bucket per family
+  (worst case about 300 KB). When one agent (or many) reports so many versions
   that the budget would be exceeded, further buckets of the most crowded families are dropped
-  (every family keeps at least its most-installed bucket), those families are flagged
+  (every family keeps at least its most-installed bucket, which is why the budget can be exceeded
+  by those twelve buckets), those families are flagged
   `versions_truncated` and the summary sets `result_truncated`. Buckets are kept most-installed
   first, so a flood of one-device versions cannot push the common versions out.
 - If the store's row ceiling (2,000 version rows per read) is reached, the page says so and the
@@ -211,8 +213,8 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 
 | Tool | Mirrors | Notes |
 |---|---|---|
-| `get_crypto_libraries` | `GET /api/v1/crypto/libraries` | Args `family` (one of the twelve family ids) and `ecosystem` (at most 1,024 characters; `""` selects rows with no ecosystem, omit for any), both optional. |
-| `list_crypto_library_devices` | `GET /api/v1/crypto/libraries/devices` | Args `family` (required), `version` (at most 1,024 characters), `ecosystem` (at most 1,024), `cursor` (at most 2048 characters), `limit` (1 to 1000). |
+| `get_crypto_libraries` | `GET /api/v1/crypto/libraries` | Args `family` (one of the twelve family ids) and `ecosystem` (at most 1,024 bytes; `""` selects rows with no ecosystem, omit for any), both optional. |
+| `list_crypto_library_devices` | `GET /api/v1/crypto/libraries/devices` | Args `family` (required), `version` (at most 1,024 bytes), `ecosystem` (at most 1,024), `cursor` (at most 2048 bytes), `limit` (1 to 1000). |
 
 Both tools are read-only. The intended chain is `get_crypto_libraries`, then
 `list_crypto_library_devices` for the family or version bucket of interest. They take **strict
@@ -252,7 +254,9 @@ is not duplicated here.
 Reads are authoritative. When the inventory store cannot be read, the answer is an error and never
 an empty list, because an empty list would read as "no library installed".
 
-- **REST:** `503` with the A4 error envelope and `retry_after_ms: 5000`. Bad parameters (an
+- **REST:** `503` with the A4 error envelope and `retry_after_ms: 5000`, also when the server's
+  bound on concurrent `/crypto` reads is full (see "Capacity" below) and before the software
+  catalogue has been built for the first time (see "How fresh the package names are"). Bad parameters (an
   unknown family, a parameter repeated with differing values, a `limit` that is not a plain
   decimal integer (including an out-of-range or signed form such as `+5`), a cursor issued for a
   different filter set or `table_version`, over-long or non-UTF-8 values) are `400`.
@@ -264,9 +268,20 @@ an empty list, because an empty list would read as "no library installed".
   notice box for a refused permission or a bad parameter. On a **Load more** page the banner or
   notice is a single table row, so the list above it stays intact.
 
-**Diagnosing a degrade.** A banner or `503` here means the inventory read failed. The counter
-`yuzu_inventory_read_degrade_total{source="installed_software"}` rises with each failed read, and
-every failure also writes a `failure` row for the `crypto.libraries.*` verb in the audit log.
+**Capacity.** The server lets at most two `/crypto` store reads run at once (summary and drill
+share the bound), because a summary read can hold a database connection for as long as the
+statement timeout and the connection pool is shared with authorization, audit and ingest. A read
+that arrives while both slots are in use is refused at once, without touching the database: REST
+`503` with `retry_after_ms`, a retryable MCP error, and the "temporarily unavailable" banner or
+row on the page. It is a shed, not a fault; retry after the hint.
+
+**Diagnosing a degrade.** A banner or `503` here means the inventory read failed or the read
+capacity was in use. The counter `yuzu_inventory_read_degrade_total{source="installed_software"}`
+rises with each failed read (`reason` is `store_not_open`, `pool_acquire_timeout` or `query_error`)
+and with each capacity refusal (`reason="admission_full"`), and every such response also writes a
+`failure` row for the `crypto.libraries.*` verb in the audit log. A banner or `503` that comes
+from the authorization store instead moves `yuzu_server_rbac_read_degrade_total`, not the
+inventory counter, and writes no `crypto.libraries.*` failure row (the gate writes its own).
 
 ## Pilot expectations
 
@@ -277,6 +292,24 @@ registered in the registry. "One family found" therefore reads as "one family fo
 package evidence", not as "this is the only library in use". A statically linked or vendored
 copy is the usual reason a known library does not appear. Component-level inventory that closes
 that gap is planned (roadmap Issue 18.7, ADR-0028).
+
+If an access-audit row cannot be written, the page still shows the data and the operator cannot
+see that (REST and MCP report it in the response); watch `yuzu_server_audit_emit_failed_total` on
+the server.
+
+**How fresh the package names are.** The list of package NAMES that the table is matched against
+comes from the hourly software-catalogue refresh, and every response (and the page) says when that
+refresh ran (`names_as_of`, epoch seconds in the API; "Package names as of ..." on the page). A
+package name first reported after that time appears after the next hourly refresh. Counts and
+versions for names that are already listed are live: a device that reports an already-listed name
+is counted at once. Before the first catalogue refresh after a server start with no catalogue, the
+read answers `503` with `retry_after_ms` ("software catalogue not built yet; retry") rather than
+an empty list.
+
+**Scale.** The cost of the name-matching step follows the number of DISTINCT package names in the
+fleet, not the number of devices: measured on the reference host it takes 17 to 430 ms from 30,000
+to 1.03 million distinct names (3 million to 15 million installed-package rows). A fleet well under
+that, which is every normal fleet, is unaffected.
 
 ## Roadmap
 

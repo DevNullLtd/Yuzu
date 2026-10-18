@@ -345,6 +345,20 @@ TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bo
           std::string::npos);
     CHECK(devices["responses"]["400"]["description"].get<std::string>().find("table_version") !=
           std::string::npos);
+    // The filter params are EXACT when present (even empty): none says "no filter" for empty.
+    for (const json* op : {&summary, &devices}) {
+        const auto eco = param(*op, "ecosystem")["description"].get<std::string>();
+        CHECK(eco.find("no filter") == std::string::npos);
+        CHECK(eco.find("present") != std::string::npos);
+    }
+    CHECK(param(devices, "version")["description"].get<std::string>().find("present") !=
+          std::string::npos);
+    // The drill echoes the ecosystem filter the way it echoes version; 503 names the admission bound.
+    CHECK(devices["responses"]["200"]["description"].get<std::string>().find("ecosystem|null") !=
+          std::string::npos);
+    for (const json* op : {&summary, &devices})
+        CHECK((*op)["responses"]["503"]["description"].get<std::string>().find("capacity in use") !=
+              std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the retry semantics",

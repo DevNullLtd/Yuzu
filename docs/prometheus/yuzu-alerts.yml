@@ -3691,7 +3691,11 @@ groups:
         # failure, to avoid false LB evictions), so this is otherwise
         # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
         # moves but nothing inventory-specific does (#1675).
-        # reason = store_not_open | pool_acquire_timeout | query_error.
+        # reason = store_not_open | pool_acquire_timeout | query_error, plus
+        # admission_full (source=installed_software only): a /crypto read refused by
+        # its per-process in-flight bound BEFORE any store call. Sustained for 5m
+        # that is saturation of the bound (a poll storm or slow summary reads), which
+        # is worth the same warning; a brief burst does not satisfy `for: 5m`.
         expr: |
           sum(rate(yuzu_inventory_read_degrade_total[5m])) by (reason, source) > 0
         for: 5m
@@ -3705,7 +3709,9 @@ groups:
             read for the labelled authoritative inventory source returned a
             degrade (no data) rather than a result. pool_acquire_timeout/query_error correlate
             with yuzu_pg_* saturation or outage; store_not_open means the store
-            failed to open at boot. A fleet vulnerability query ("which devices run
+            failed to open at boot; admission_full means /crypto reads are being
+            refused because its in-flight bound (two reads) stayed full - check for
+            a poll storm or slow summary reads, not for a database fault. A fleet vulnerability query ("which devices run
             <CVE>") reads as degraded, NOT "installed nowhere" — do not trust a
             zero-result inventory answer while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"

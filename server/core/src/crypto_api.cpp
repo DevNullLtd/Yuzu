@@ -1,6 +1,7 @@
 #include "crypto_api_local.hpp"
 
 #include "crypto_library_model.hpp"
+#include "crypto_read_gate.hpp"
 #include "device_api.hpp"
 #include "software_inventory_store.hpp"
 
@@ -24,26 +25,47 @@ std::optional<std::vector<std::string>> to_agent_ids(const authz::VisibleSet& sc
 
 CryptoReadError degraded() { return {CryptoReadError::Kind::kDegraded, "inventory read degraded"}; }
 
+// The hourly catalogue rollup that supplies the package names has never been built.
+CryptoReadError catalogue_not_built() {
+    return {CryptoReadError::Kind::kDegraded, "software catalogue not built yet; retry"};
+}
+
+// The admission refusal: same kind as a store degrade, so every transport answers it exactly
+// like one (REST/MCP 503 + retry_after_ms, fragment "temporarily unavailable") - no store call.
+CryptoReadError capacity_in_use() {
+    return {CryptoReadError::Kind::kDegraded, "crypto read capacity in use; retry"};
+}
+
 class LocalCryptoApi final : public CryptoApi {
 public:
-    LocalCryptoApi(SoftwareInventoryStore& store, const DeviceApi* devices)
-        : store_(store), devices_(devices) {}
+    LocalCryptoApi(SoftwareInventoryStore& store, const DeviceApi* devices, int max_reads)
+        : store_(store), devices_(devices), gate_(max_reads) {}
 
     std::expected<CryptoSummary, CryptoReadError>
     library_summary(const CryptoSummaryQuery& q, const authz::VisibleSet& scope) const override {
         if (q.family && !cl::find_family(*q.family))
             return std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "unknown family"});
+        const auto lease = gate_.try_acquire();
+        if (!lease) {
+            store_.note_read_shed();
+            return std::unexpected(capacity_in_use());
+        }
         auto pats = cl::sql_patterns(q.family ? std::optional<std::string_view>(*q.family)
                                               : std::nullopt);
         NamePatternQuery sq;
         sq.patterns = std::move(pats.patterns);
         sq.labels = std::move(pats.labels);
+        sq.leads = std::move(pats.leads);
         sq.ecosystem = q.ecosystem;
         sq.agent_ids = to_agent_ids(scope);
 
         const auto rollup = store_.software_name_pattern_rollup(sq);
         if (!rollup)
             return std::unexpected(degraded());
+        // The package NAMES come from the hourly catalogue; before its first build the read is
+        // unavailable, never "none found". No fallback to scanning installed rows.
+        if (rollup->names_as_of <= 0)
+            return std::unexpected(catalogue_not_built());
 
         CryptoSummary out;
         // "Reporting" = a device with an installed_software inventory_state row, counted in the
@@ -54,6 +76,7 @@ public:
             std::max(rollup->reporting_agents, rollup->total_devices);
         out.coverage.devices_with_crypto_library = rollup->total_devices;
         out.result_truncated = rollup->truncated;
+        out.names_as_of = rollup->names_as_of;
         std::unordered_map<std::string, std::size_t> index;
         for (const auto& lc : rollup->label_counts) {
             index.emplace(lc.label, out.families.size());
@@ -85,8 +108,17 @@ public:
     library_devices(const CryptoDevicesQuery& q, const authz::VisibleSet& scope) const override {
         if (!cl::find_family(q.family))
             return std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "unknown family"});
+        const auto lease = gate_.try_acquire();
+        if (!lease) {
+            store_.note_read_shed();
+            return std::unexpected(capacity_in_use());
+        }
         NamePatternDevicesQuery sq;
-        sq.patterns = cl::sql_patterns(q.family).patterns;
+        {
+            auto pats = cl::sql_patterns(q.family);
+            sq.patterns = std::move(pats.patterns);
+            sq.leads = std::move(pats.leads);
+        }
         sq.version = q.version;
         sq.ecosystem = q.ecosystem;
         sq.agent_ids = to_agent_ids(scope);
@@ -104,6 +136,8 @@ public:
         const auto page = store_.software_name_pattern_devices(sq);
         if (!page)
             return std::unexpected(degraded());
+        if (page->names_as_of <= 0)
+            return std::unexpected(catalogue_not_built());
 
         std::unordered_map<std::string, std::string> hostnames;
         if (devices_ && !page->rows.empty())
@@ -113,6 +147,8 @@ public:
         CryptoDevicesPage out;
         out.family = q.family;
         out.version = q.version;
+        out.ecosystem = q.ecosystem;
+        out.names_as_of = page->names_as_of;
         for (const auto& r : page->rows) {
             if (cl::classify(r.entry.name) != std::string_view(q.family))
                 continue;
@@ -140,13 +176,17 @@ public:
 private:
     SoftwareInventoryStore& store_;
     const DeviceApi* devices_;
+    // Per-process bound on in-flight store reads, shared by both methods. The lease is held to
+    // the end of each method (RAII), so every return path - and any throw - releases it.
+    mutable CryptoReadGate gate_;
 };
 
 } // namespace
 
 std::shared_ptr<CryptoApi> make_local_crypto_api(SoftwareInventoryStore& store,
-                                                 const DeviceApi* device_api) {
-    return std::make_shared<LocalCryptoApi>(store, device_api);
+                                                 const DeviceApi* device_api,
+                                                 int max_concurrent_reads) {
+    return std::make_shared<LocalCryptoApi>(store, device_api, max_concurrent_reads);
 }
 
 } // namespace yuzu::server

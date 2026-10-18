@@ -864,7 +864,7 @@ ingest is failing. Four further series sharpen the picture:
   hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
   a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci` /
+  `pool_acquire_timeout` / `query_error`, plus `admission_full` for `source="installed_software"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure

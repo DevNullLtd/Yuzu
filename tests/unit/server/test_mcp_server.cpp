@@ -23314,7 +23314,34 @@ TEST_CASE("MCP crypto twins: success shapes carry the model's JSON and are audit
     CHECK(mcp_audits(ts, "mcp.get_crypto_libraries|success") == 1);
     CHECK(mcp_audits(ts, "mcp.list_crypto_library_devices|success") == 1);
     CHECK(mcp_audit_details(ts, "mcp.list_crypto_library_devices|success") ==
-          std::vector<std::string>{"tv=2 family=openssl rows=1 page=continuation target=family=openssl;version="});
+          std::vector<std::string>{
+              "tv=" + std::to_string(yuzu::server::crypto_library::kCryptoTableVersion) +
+              " family=openssl rows=1 page=continuation target=family=openssl;version="});
+    CHECK(dc.contains("ecosystem"));
+    CHECK(dc["ecosystem"].is_null()); // no ecosystem filter was sent: echoed as null
+
+    // The structured output matches its advertised outputSchema: every `required` key is
+    // present and no top-level key is undeclared (a schema/model drift fails here, not at a client).
+    auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":2})");
+    const auto tools = nlohmann::json::parse(listed->body)["result"]["tools"];
+    int checked = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        const nlohmann::json* out = nullptr;
+        if (name == "get_crypto_libraries")
+            out = &sc;
+        else if (name == "list_crypto_library_devices")
+            out = &dc;
+        else
+            continue;
+        ++checked;
+        const auto& schema = t["outputSchema"];
+        for (const auto& req : schema["required"])
+            CHECK(out->contains(req.get<std::string>()));
+        for (const auto& [key, val] : out->items())
+            CHECK(schema["properties"].contains(key));
+    }
+    CHECK(checked == 2);
 }
 
 TEST_CASE("MCP crypto twins: a present empty ecosystem is the exact empty ecosystem; absent is any",

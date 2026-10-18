@@ -65,6 +65,7 @@ CryptoSummary sample_summary() {
     f.versions.push_back({"", "rpm", 2, {"openssl-libs"}});
     s.families.push_back(f);
     s.coverage = {12, 7};
+    s.names_as_of = 1760000000; // 2025-10-09 08:53 UTC
     return s;
 }
 
@@ -365,6 +366,7 @@ TEST_CASE("crypto routes: the library fragment renders the figures, the drill li
     CHECK_THAT(res->body, ContainsSubstring("(unknown)")); // the empty-version bucket is labelled
     CHECK_THAT(res->body, ContainsSubstring("Package-level evidence only"));
     CHECK_THAT(res->body, ContainsSubstring("Certificates, SSH host keys and protocol settings"));
+    CHECK_THAT(res->body, ContainsSubstring("Package names as of 2025-10-09 08:53 UTC"));
     CHECK_THAT(res->body, !ContainsSubstring("hx-on"));
     // Interpretation words never appear in the markup.
     for (const char* word : {"vulnerable", "weak", "outdated", "insecure", "quantum"})
@@ -593,4 +595,18 @@ TEST_CASE("crypto routes: the page names the per-OS evidence sources and the tab
                ContainsSubstring("of " + std::to_string(crypto_library::families().size()) + " in the table"));
     CHECK_THAT(res->body, ContainsSubstring("planned and not yet available"));
     CHECK_THAT(res->body, !ContainsSubstring("later releases"));
+}
+
+TEST_CASE("crypto routes: a family whose versions were all cut says so instead of a dash",
+          "[crypto][routes][ui]") {
+    Harness h;
+    auto s = sample_summary();
+    s.families[0].versions.clear();
+    s.families[0].versions_truncated = true;
+    s.result_truncated = true;
+    h.api->summary_result = s;
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/libraries");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("versions not shown"));
+    CHECK_THAT(res->body, ContainsSubstring("capped (row or size limit)"));
 }

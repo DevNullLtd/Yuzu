@@ -51,13 +51,18 @@ inline constexpr std::size_t kCursorMaxBytes = 2048;
 inline constexpr std::size_t kMaxVersionsPerFamily = 50;
 /// Each emitted package name is cut to this many bytes (UTF-8 safe; a cut name ends in U+2026).
 inline constexpr std::size_t kNameMaxBytes = 256;
-/// Byte budget of the whole serialised summary: version buckets beyond it are dropped (the
+/// Byte budget of the whole serialised summary (about 256 KiB, plus at most one first bucket
+/// per family that is always kept: worst case about 300 KB): version buckets beyond it are dropped (the
 /// family sets `versions_truncated`, the summary `result_truncated`). One agent reporting
 /// thousands of versions/long names cannot grow the response (REST, MCP and the fragment all
 /// shape through finish_summary) or silently evict - the cut is always flagged.
 inline constexpr std::size_t kSummaryByteBudget = 256 * 1024;
 
 // ── The curated table ────────────────────────────────────────────────────────
+
+/// Length of the literal lead the store matches before the LIKE; every rule is at least this long
+/// (static_assert in the .cpp).
+inline constexpr std::size_t kLeadChars = 3;
 
 struct Family {
     std::string_view id;
@@ -86,9 +91,12 @@ struct MatchRule {
 
 /// Parallel arrays for the store (`patterns[i]` labels as `labels[i]`), every rule of every
 /// family, or only the named family's.
+/// `leads[i]` is the first kLeadChars characters of rule i's literal (lowercase ASCII): the
+/// store pre-filters candidate names by it before the LIKE.
 struct SqlPatterns {
     std::vector<std::string> patterns;
     std::vector<std::string> labels;
+    std::vector<std::string> leads;
 };
 [[nodiscard]] SqlPatterns sql_patterns(std::optional<std::string_view> family = std::nullopt);
 
@@ -161,7 +169,8 @@ struct CursorPos {
 /// Normalise a summary the local API filled in: drop zero-device families, fill display names,
 /// order versions (device_count desc, version, ecosystem) and cap them at kMaxVersionsPerFamily,
 /// cut every package name to kNameMaxBytes, order families (device_count desc, id), then fit the
-/// serialised size into kSummaryByteBudget (every family keeps its first bucket). Whenever a
+/// serialised size into kSummaryByteBudget (every family keeps its first bucket, so the budget
+/// is exceeded by at most those 12 buckets). Whenever a
 /// family's version list is cut - by the per-family cap, by the budget, or emptied by the
 /// store's row cap - `versions_truncated` is set; a budget cut also sets `result_truncated`.
 void finish_summary(CryptoSummary& s);

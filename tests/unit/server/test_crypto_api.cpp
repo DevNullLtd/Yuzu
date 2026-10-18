@@ -17,9 +17,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <yuzu/metrics.hpp>
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <memory>
 #include <optional>
 #include <unordered_set>
@@ -53,10 +57,15 @@ SoftwareEntry ent(std::string name, std::string version, std::string eco = "deb"
     return e;
 }
 
-void seed(SoftwareInventoryStore& s, const std::string& agent, std::vector<SoftwareEntry> rows) {
+// The reads take package NAMES from the hourly catalogue rollup, so seeding refreshes it by
+// default (a test about the un-refreshed state passes refresh=false).
+void seed(SoftwareInventoryStore& s, const std::string& agent, std::vector<SoftwareEntry> rows,
+          bool refresh = true) {
     const auto h = SoftwareInventoryStore::canonical_hash(rows);
     REQUIRE(s.apply_installed_software(agent, h, std::move(rows), 1000) ==
             InventoryIngestOutcome::kStored);
+    if (refresh)
+        REQUIRE(s.refresh_catalog_rollup());
 }
 
 class FakeDevices : public DeviceApi {
@@ -73,13 +82,13 @@ public:
 struct Fx {
     PgPool pool;
     SoftwareInventoryStore store;
-    explicit Fx(const std::string& dsn)
+    explicit Fx(const std::string& dsn, bool refresh = true)
         : pool(PgPool::Options{.conninfo = dsn, .size = 4}), store(pool) {
         REQUIRE(store.is_open());
-        seed(store, "a1", {ent("libssl3", "3.0.13"), ent("openssl", "3.0.13")});
-        seed(store, "a2", {ent("libssl3", "3.0.13")});
-        seed(store, "a3", {ent("libssl3", "1.1.1", "rpm"), ent("libgnutls30", "3.7.9")});
-        seed(store, "a4", {ent("curl", "8.0")});
+        seed(store, "a1", {ent("libssl3", "3.0.13"), ent("openssl", "3.0.13")}, refresh);
+        seed(store, "a2", {ent("libssl3", "3.0.13")}, refresh);
+        seed(store, "a3", {ent("libssl3", "1.1.1", "rpm"), ent("libgnutls30", "3.7.9")}, refresh);
+        seed(store, "a4", {ent("curl", "8.0")}, refresh);
     }
 };
 
@@ -425,4 +434,274 @@ TEST_CASE("CryptoRoutes over the real store: a scoped gate yields only in-scope 
     for (const auto& row : dj["devices"])
         CHECK(row["agent_id"] == "a1");
     CHECK(dj["table_version"] == cl::kCryptoTableVersion);
+}
+
+// ── Admission bound (A2): at most N store reads in flight, the rest refused at once ──────────
+
+TEST_CASE("CryptoReadGate: the bound is exact, refusal is non-blocking, release is RAII",
+          "[crypto]") {
+    CryptoReadGate gate{2};
+    auto a = gate.try_acquire();
+    auto b = gate.try_acquire();
+    REQUIRE(a);
+    REQUIRE(b);
+    CHECK(gate.in_flight() == 2);
+    {
+        auto c = gate.try_acquire();
+        CHECK_FALSE(c); // third refused, nothing counted
+        CHECK(gate.in_flight() == 2);
+    }
+    a = CryptoReadGate::Lease{}; // release one
+    CHECK(gate.in_flight() == 1);
+    auto d = gate.try_acquire();
+    CHECK(d);
+    CHECK(gate.in_flight() == 2);
+
+    // Release on an exception path.
+    CryptoReadGate g2{1};
+    try {
+        auto l = g2.try_acquire();
+        REQUIRE(l);
+        throw std::runtime_error("store threw");
+    } catch (const std::runtime_error&) {
+    }
+    CHECK(g2.in_flight() == 0);
+    CHECK(g2.try_acquire());
+
+    // A zero bound refuses everything.
+    CryptoReadGate g0{0};
+    CHECK_FALSE(g0.try_acquire());
+}
+
+TEST_CASE("CryptoApi: reads over the bound are refused as kDegraded with no store call and counted",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    yuzu::MetricsRegistry metrics;
+    fx.store.set_metrics(&metrics);
+    auto api = make_local_crypto_api(fx.store, nullptr, /*max_concurrent_reads=*/0);
+
+    auto s = api->library_summary({}, std::nullopt);
+    REQUIRE_FALSE(s.has_value());
+    CHECK(s.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(s.error().message == "crypto read capacity in use; retry");
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    auto d = api->library_devices(q, std::nullopt);
+    REQUIRE_FALSE(d.has_value());
+    CHECK(d.error().kind == CryptoReadError::Kind::kDegraded);
+
+    CHECK(metrics
+              .counter("yuzu_inventory_read_degrade_total",
+                       {{"reason", "admission_full"}, {"source", "installed_software"}})
+              .value() == 2.0);
+    // No store call happened: none of the store's own degrade reasons moved.
+    for (const char* r : {"store_not_open", "pool_acquire_timeout", "query_error"})
+        CHECK(metrics
+                  .counter("yuzu_inventory_read_degrade_total",
+                           {{"reason", r}, {"source", "installed_software"}})
+                  .value() == 0.0);
+}
+
+TEST_CASE("CryptoApi: with two reads genuinely in flight the third is refused at once, and a new "
+          "read succeeds after release",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    auto api = make_local_crypto_api(fx.store, nullptr); // default bound = kMaxConcurrentCryptoReads
+    static_assert(kMaxConcurrentCryptoReads == 2);
+
+    // Block the store's reads on a table lock held by this test; release it on demand.
+    auto locker = fx.pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(locker);
+    const std::vector<std::string> none;
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE software_inventory_store.installed_software IN ACCESS "
+                            "EXCLUSIVE MODE",
+                            none)
+                .status() == PGRES_COMMAND_OK);
+
+    std::atomic<int> started{0};
+    std::atomic<int> ok{0};
+    auto reader = [&] {
+        ++started;
+        if (api->library_summary({}, std::nullopt).has_value())
+            ++ok;
+    };
+    std::thread t1{reader};
+    std::thread t2{reader};
+    while (started.load() < 2)
+        std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds{400}); // both are now inside the store
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto third = api->library_summary({}, std::nullopt);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    REQUIRE_FALSE(third.has_value());
+    CHECK(third.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(third.error().message == "crypto read capacity in use; retry");
+    CHECK(took < std::chrono::milliseconds{300}); // refused, not queued behind the lock
+
+    pg::exec_params(locker.get(), "ROLLBACK", none); // release the table
+    t1.join();
+    t2.join();
+    CHECK(ok.load() == 2);
+    auto after = api->library_summary({}, std::nullopt);
+    CHECK(after.has_value()); // the leases were released
+}
+
+TEST_CASE("CryptoRoutes: a read over the admission bound is a REST 503 with retry_after_ms",
+          "[pg][crypto][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    std::shared_ptr<CryptoApi> api = make_local_crypto_api(fx.store, nullptr, 0);
+
+    CryptoRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    CryptoRoutes::Deps d;
+    d.auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "u";
+        s.role = auth::Role::user;
+        return s;
+    };
+    d.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                         const std::string&) -> authz::FleetReadGate { return {true, std::nullopt}; };
+    d.api = api;
+    std::vector<std::string> details;
+    d.audit_fn = [&](const httplib::Request&, const std::string&, const std::string& result,
+                     const std::string&, const std::string&, const std::string& detail) {
+        details.push_back(result + "|" + detail);
+        return true;
+    };
+    routes.register_routes(sink, std::move(d));
+
+    for (const char* path : {"/api/v1/crypto/libraries", "/api/v1/crypto/libraries/devices?family=openssl"}) {
+        auto r = sink.dispatch("GET", path);
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        const auto body = nlohmann::json::parse(r->body);
+        INFO(r->body);
+        CHECK(body["error"]["retry_after_ms"].is_number());
+    }
+    // The refusal follows the degraded-read audit path.
+    REQUIRE(details.size() == 2);
+    for (const auto& dtl : details)
+        CHECK(dtl.find("store degraded") != std::string::npos);
+}
+
+// ── Catalogue-sourced package names (step 1) ─────────────────────────────────────────────────
+
+TEST_CASE("CryptoApi: before the first catalogue build both reads are kDegraded, and REST is a "
+          "503 with retry_after_ms",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn(), /*refresh=*/false}; // rows exist, the catalogue was never built
+    auto api = make_local_crypto_api(fx.store, nullptr);
+
+    const auto s = api->library_summary({}, std::nullopt);
+    REQUIRE_FALSE(s.has_value());
+    CHECK(s.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(s.error().message == "software catalogue not built yet; retry");
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    const auto d = api->library_devices(q, std::nullopt);
+    REQUIRE_FALSE(d.has_value());
+    CHECK(d.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(d.error().message == "software catalogue not built yet; retry");
+    // A deny-all scope is not a way around it: the stamp is still consulted.
+    CHECK_FALSE(api->library_summary({}, set_of({})).has_value());
+
+    CryptoRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    CryptoRoutes::Deps deps;
+    deps.auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session sess;
+        sess.username = "u";
+        sess.role = auth::Role::user;
+        return sess;
+    };
+    deps.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                            const std::string&) -> authz::FleetReadGate { return {true, std::nullopt}; };
+    deps.api = api;
+    deps.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) { return true; };
+    routes.register_routes(sink, std::move(deps));
+    for (const char* path :
+         {"/api/v1/crypto/libraries", "/api/v1/crypto/libraries/devices?family=openssl"}) {
+        auto r = sink.dispatch("GET", path);
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(nlohmann::json::parse(r->body)["error"]["retry_after_ms"].is_number());
+    }
+
+    // Once the catalogue is built the same reads answer.
+    REQUIRE(fx.store.refresh_catalog_rollup());
+    CHECK(api->library_summary({}, std::nullopt).has_value());
+    CHECK(api->library_devices(q, std::nullopt).has_value());
+}
+
+TEST_CASE("CryptoApi: a name first reported after a refresh waits for the next one; counts for a "
+          "listed name are live",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    auto openssl_count = [&] {
+        const auto s = api->library_summary({}, std::nullopt);
+        REQUIRE(s.has_value());
+        for (const auto& f : s->families)
+            if (f.id == "openssl")
+                return f.device_count;
+        return std::int64_t{0};
+    };
+    CHECK(openssl_count() == 3); // a1, a2, a3
+
+    // n2 carries an ALREADY-LISTED name (libssl3), n1 a brand-new one (libssl4); no refresh.
+    seed(fx.store, "n2", {ent("libssl3", "3.0.13")}, /*refresh=*/false);
+    seed(fx.store, "n1", {ent("libssl4", "4.0.0")}, /*refresh=*/false);
+    CHECK(openssl_count() == 4); // n2 is live, n1's new name is not listed yet
+
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    q.limit = 1000;
+    auto has_agent = [&](const char* id) {
+        const auto page = api->library_devices(q, std::nullopt);
+        REQUIRE(page.has_value());
+        return std::ranges::any_of(page->devices,
+                                   [&](const CryptoDeviceRow& r) { return r.agent_id == id; });
+    };
+    CHECK(has_agent("n2"));
+    CHECK_FALSE(has_agent("n1"));
+
+    REQUIRE(fx.store.refresh_catalog_rollup());
+    CHECK(openssl_count() == 5);
+    CHECK(has_agent("n1"));
+}
+
+TEST_CASE("CryptoApi: names_as_of is the catalogue's refreshed_at on the summary and the drill",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    const auto meta = fx.store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    REQUIRE(meta->refreshed_at > 0);
+    const auto s = api->library_summary({}, std::nullopt);
+    REQUIRE(s.has_value());
+    CHECK(s->names_as_of == meta->refreshed_at);
+    CHECK(cl::summary_json(*s)["names_as_of"] == meta->refreshed_at);
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    const auto d = api->library_devices(q, std::nullopt);
+    REQUIRE(d.has_value());
+    CHECK(d->names_as_of == meta->refreshed_at);
+    CHECK(cl::devices_json(*d)["names_as_of"] == meta->refreshed_at);
+    // An empty page (a family nobody carries) still reports it, from the same statement.
+    q.family = "botan";
+    const auto e = api->library_devices(q, std::nullopt);
+    REQUIRE(e.has_value());
+    CHECK(e->devices.empty());
+    CHECK(e->names_as_of == meta->refreshed_at);
 }

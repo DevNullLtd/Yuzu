@@ -246,6 +246,17 @@ std::optional<std::string> family_arg_error(const nlohmann::json& args) {
 
 } // namespace
 
+// Every rule's literal must be at least kLeadChars long: the store's step 1 pre-filters names by
+// the first kLeadChars characters of each rule, so a shorter rule would silently never match.
+constexpr bool all_rules_long_enough() {
+    for (const auto& r : kRules)
+        if (r.value.size() < kLeadChars)
+            return false;
+    return true;
+}
+static_assert(all_rules_long_enough(),
+              "every crypto match rule must be at least kLeadChars (3) characters long");
+
 std::span<const Family> families() { return kFamilies; }
 std::span<const MatchRule> rules() { return kRules; }
 
@@ -281,6 +292,7 @@ SqlPatterns sql_patterns(std::optional<std::string_view> family) {
         if (family && r.family_id != *family)
             continue;
         out.patterns.push_back(like_pattern(r));
+        out.leads.emplace_back(r.value.substr(0, kLeadChars));
         out.labels.emplace_back(r.family_id);
     }
     return out;
@@ -505,10 +517,11 @@ void finish_summary(CryptoSummary& s) {
         return a.id < b.id;
     });
 
-    // Fit the serialised size into the byte budget. Every family keeps its first bucket (the
-    // "reserved" floor, counted up front so the total can never exceed the budget); further
-    // buckets are admitted in order until the allowance runs out, then the rest of that family
-    // and every later family's extras are dropped - flagged, never silent.
+    // Fit the serialised size into the byte budget (about 256 KiB). Every family keeps its
+    // first bucket (the floor, counted up front and never dropped, so a worst case of hostile
+    // long values in 12 first buckets lands near 300 KB, not at the budget); further buckets
+    // are admitted in order until the allowance runs out, then the rest of that family and
+    // every later family's extras are dropped - flagged, never silent.
     constexpr std::size_t kEnvelope = 512;       // table_version, coverage, flags, braces
     constexpr std::size_t kFamilyOverhead = 192; // the family object's own keys
     std::size_t used = kEnvelope;
@@ -554,6 +567,7 @@ nlohmann::json summary_json(const CryptoSummary& s) {
                             {"versions_truncated", f.versions_truncated}});
     }
     return json{{"table_version", kCryptoTableVersion},
+                {"names_as_of", s.names_as_of},
                 {"families", std::move(fams)},
                 {"coverage",
                  {{"devices_reporting_inventory", s.coverage.devices_reporting_inventory},
@@ -573,8 +587,10 @@ nlohmann::json devices_json(const CryptoDevicesPage& p) {
                             {"ecosystem", d.ecosystem},
                             {"kind", d.kind}});
     return json{{"table_version", kCryptoTableVersion},
+                {"names_as_of", p.names_as_of},
                 {"family", p.family},
                 {"version", p.version ? json(*p.version) : json(nullptr)},
+                {"ecosystem", p.ecosystem ? json(*p.ecosystem) : json(nullptr)},
                 {"devices", std::move(rows)},
                 {"next_cursor", p.next_cursor.empty() ? json(nullptr) : json(p.next_cursor)},
                 {"count", p.devices.size()}};
