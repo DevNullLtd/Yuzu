@@ -38,8 +38,11 @@ async function main() {
   await page.goto(`${BASE}/login`, { waitUntil: 'networkidle2', timeout: 15000 });
   await page.type('input[name="username"]', 'admin');
   await page.type('input[name="password"]', 'YuzuUatAdmin1!');
-  await page.click('button[type="submit"]');
-  await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
+  // Arm the navigation wait before the click: a fast redirect would otherwise be missed.
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
+    page.click('button[type="submit"]'),
+  ]);
 
   await page.goto(`${BASE}/access/tokens`, { waitUntil: 'networkidle2', timeout: 15000 });
   // The lists load by htmx on page load; the controls are part of those fragments.

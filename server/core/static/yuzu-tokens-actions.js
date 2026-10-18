@@ -48,7 +48,7 @@
   // ---- server clock -----------------------------------------------------------------------
   // expires_at is computed from the fragment's server time plus time elapsed on this page, so a
   // skewed workstation clock cannot mint a wrong lifetime. The offset between the server's clock
-  // and this one is taken once, when the list loads; the wall clock keeps running while a laptop
+  // and this one is taken when the token list or a principal detail loads; the wall clock keeps running while a laptop
   // sleeps, which a monotonic timer does not. The server validates the value anyway.
   document.body.addEventListener('htmx:afterSwap', function (e) {
     var t = e.detail && e.detail.target;
