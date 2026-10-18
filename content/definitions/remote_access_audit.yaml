@@ -28,10 +28,13 @@
 ##
 ## NOT read, and flagged rather than hidden: a certificate authority (TrustedUserCAKeys), keys
 ## or principals supplied by a command (AuthorizedKeysCommand, AuthorizedPrincipalsCommand), a
-## principals file, host-based authentication, AuthenticationMethods, macOS Remote Login's
-## access list, and accounts whose home is outside the roots above. When sshd_config sets one
-## of the first group at global scope the status is constrained with
-## <os>:remote_access_audit:sshd_config:other_credential_sources (presence only).
+## principals file (AuthorizedPrincipalsFile), host-based authentication and
+## AuthenticationMethods. When sshd_config sets one of these six at global scope the status is
+## constrained with <os>:remote_access_audit:sshd_config:other_credential_sources (presence
+## only).
+##
+## NOT read, and NOT detectable: macOS Remote Login's access list and accounts whose home is
+## outside the roots above. These are documented, not flagged; no token marks them.
 ##
 ## Fingerprints and option NAMES only: a key comment, an option value (command=, from=,
 ## principals=) and a key-file path are never emitted. The AuthorizedKeysFile config row says
@@ -52,11 +55,12 @@ metadata:
     certificate reports the fingerprint of the key it carries) with the option names it uses,
     and whether the sshd service is enabled. It does not read every way to log in: a
     certificate authority, keys or principals supplied by a command, a principals file,
-    host-based authentication and macOS Remote Login's access list are not read (when
-    sshd_config sets one of the first four the status is constrained, with a presence-only
-    token), and only homes under /home and /root (Linux) or under /Users owned by uid 500 or
-    above and /var/root (macOS) are walked, so an account with its home elsewhere is not
-    listed. Key comments, option values, principals and key-file paths are never emitted; the
+    host-based authentication and AuthenticationMethods are not read (when sshd_config sets
+    one of these six the status is constrained, with a presence-only token). Two more gaps
+    raise no token and are documented only: macOS Remote Login's access list is not read,
+    and only homes under /home and /root (Linux) or under /Users owned by uid 500 or above
+    and /var/root (macOS) are walked, so an account with its home elsewhere is not listed.
+    Key comments, option values, principals and key-file paths are never emitted; the
     account is the home directory's name. A home or file the agent cannot read is reported as
     refused with a reason token (on Linux an unprivileged agent usually cannot open other
     users' homes, so constrained is the common outcome), never as an empty result. A key row
@@ -116,7 +120,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_4
         type: string
-        description: 'source (homes row only): the number of home-root entries not treated as accounts (macOS: owned by a uid under 500, such as /Users/Shared), "-" on Linux where nothing is detectably skipped, or when the roots were not listed. file: the number of key lines accepted, "-" unless read. key: the fingerprint, SHA256: plus unpadded base64, identical to ssh-keygen -lf (a certificate reports the key it carries).'
+        description: 'source (homes row only): the number of home-root entries not treated as accounts (macOS: owned by a uid under 500, such as /Users/Shared), "-" on Linux where nothing is detectably skipped, or when the roots were not listed. file: the number of key lines listed (accepted and within the row budget; keys:row_cap in the status reason means the listing stopped before the last accepted line of the file), "-" unless read. key: the fingerprint, SHA256: plus unpadded base64, identical to ssh-keygen -lf (a certificate reports the key it carries).'
         example: '2'
         platforms: [linux, darwin]
       - name: field_5

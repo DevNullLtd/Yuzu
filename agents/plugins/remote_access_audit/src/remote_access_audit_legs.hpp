@@ -48,7 +48,6 @@
 #include <cerrno>
 #include <chrono>
 #include <functional>
-#include <iterator>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -397,8 +396,7 @@ inline void add_data_volume_aliases(std::vector<std::string>& prefixes) {
         else if (p.size() > 1 && p.front() == '/')
             aliases.push_back(std::string{kDataVolume} + std::string{p});
     }
-    prefixes.insert(prefixes.end(), std::make_move_iterator(aliases.begin()),
-                    std::make_move_iterator(aliases.end()));
+    prefixes.insert(prefixes.end(), aliases.begin(), aliases.end());
 }
 
 namespace detail {
@@ -447,10 +445,9 @@ inline std::string lexical_normal(std::string_view path) {
 /// stat'ed or realpath'ed.
 inline bool configured_path_on_network(const PosixFs& fs, const std::vector<std::string>& prefixes,
                                        const std::string& path) {
-    if (prefixes.empty())
-        return false;
     const std::string norm = lexical_normal(path);
-    return under_prefix(norm, prefixes) || (fs.resolve_root && under_prefix(fs.resolve_root(norm), prefixes));
+    return under_prefix(norm, prefixes) ||
+           (fs.resolve_root && under_prefix(fs.resolve_root(norm), prefixes));
 }
 
 struct IncludeCtx {
@@ -459,7 +456,7 @@ struct IncludeCtx {
     SshdConfigState& st;
     const std::vector<std::string>& prefixes; ///< the run-start network mount snapshot
     std::size_t files_read = 0;
-    std::size_t directives = 0; ///< Include directives seen, followed or not
+    std::size_t directives = 0; ///< Include patterns (arguments) seen, followed or not
 };
 
 inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t depth);
@@ -473,7 +470,7 @@ inline void parse_with_includes(IncludeCtx& c, std::string_view text, std::strin
 /// One Include argument, processed AT the directive's position by the sink that called us.
 inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t depth) {
     const auto& os = c.fs.os;
-    // Every directive counts, not only the ones that read a file: a glob that matches nothing
+    // Every pattern counts, not only the ones that read a file: a glob that matches nothing
     // lists its directory again each time, and only a successful read raises files_read.
     if (++c.directives > kMaxIncludeFiles) {
         c.t.acc.add_failure(src_token(os, "include", "too_many"));
@@ -664,7 +661,8 @@ inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
 inline ServiceOutcome audit_service_macos(const PosixFs& fs, Tally& t) {
     ServiceOutcome out;
     out.units = 1;
-    const auto r = fs.run({"print-disabled", "system"}, detail::service_options(4096, 256 * 1024, /*merge_stderr=*/false));
+    const auto r = fs.run({"print-disabled", "system"},
+                          detail::service_options(4096, 256 * 1024, /*merge_stderr=*/false));
     bool unavailable = false;
     if (const auto bad = detail::service_failure(r, fs.os, "launchctl_unavailable", unavailable)) {
         t.acc.add_failure(*bad);
@@ -737,7 +735,7 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
 
     if (cfg.akf_in_match)
         t.acc.add_failure(token("match_scoped_authorizedkeysfile"));
-    if (cfg.akf_capped)
+    if (cfg.akf_count > kMaxAuthorizedKeysFileTokens)
         t.acc.add_failure(token("path_token_cap"));
 
     std::vector<std::string> entries;
@@ -827,9 +825,9 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
                 // its first N keys and its file row; charging the row after the parse dropped the
                 // row and every key already admitted.
                 bool ignored = false;
-                const std::size_t file_row_cost =
-                    file_row(home.name, s.kind, o.state, kKeyFileCap, kKeyFileCap, kKeyFileCap, ignored).size() +
-                    kRowOverhead;
+                const std::string worst_row = file_row(home.name, s.kind, o.state, kKeyFileCap,
+                                                       kKeyFileCap, kKeyFileCap, ignored);
+                const std::size_t file_row_cost = worst_row.size() + kRowOverhead;
                 if (!t.budget.charge(file_row_cost)) {
                     t.truncated = true;
                     return;
@@ -853,11 +851,13 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
                 krows = std::move(kp.rows);
             }
             if (o.state == SourceState::read) {
-                out.rows.push_back(file_row(home.name, s.kind, o.state, nk, nm, no, t.field_oversized)); // charged above
+                out.rows.push_back(file_row(home.name, s.kind, o.state, nk, nm, no,
+                                            t.field_oversized)); // charged above
                 for (auto& k : krows)
                     out.rows.push_back(std::move(k)); // charged inside the parse
             } else {
-                t.emit(out.rows, file_row(home.name, s.kind, o.state, nk, nm, no, t.field_oversized));
+                t.emit(out.rows,
+                       file_row(home.name, s.kind, o.state, nk, nm, no, t.field_oversized));
             }
         };
         const auto record_failed = [&](const KeyFileSpec& s, SourceState st, std::string tok) {
@@ -865,8 +865,8 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
                 t.note(SrcOutcome{SourceState::refused, std::move(tok)});
             else
                 t.acc.add_failure(tok);
-            t.emit(out.rows, file_row(home.name, s.kind, st, std::nullopt, std::nullopt, std::nullopt,
-                                      t.field_oversized));
+            t.emit(out.rows, file_row(home.name, s.kind, st, std::nullopt, std::nullopt,
+                                      std::nullopt, t.field_oversized));
         };
 
         // A home on a network mount is not touched at all.
@@ -928,9 +928,12 @@ inline Listing list_posix(const PosixFs& fs) {
     // config half and the keys half both decide against it (the table itself is a bounded
     // no-follow read of /proc/self/mountinfo or the kernel's getmntinfo cache, never a mount).
     std::vector<std::string> prefixes;
-    if (auto p = fs.network_mount_prefixes())
+    if (auto p = fs.network_mount_prefixes()) {
         prefixes = std::move(*p);
-    else
+        // a mount the system creates is listed under /System/Volumes/Data (macOS firmlink)
+        if (fs.os == "macos")
+            add_data_volume_aliases(prefixes);
+    } else
         t.acc.add_failure(src_token(fs.os, "keys", "mounts_unreadable"));
 
     const ConfigOutcome co = audit_config(fs, t, cfg, prefixes);

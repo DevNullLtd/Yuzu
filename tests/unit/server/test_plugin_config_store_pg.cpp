@@ -581,6 +581,13 @@ TEST_CASE("Wave 11: ServerImpl's boot sequence actually calls "
 
     CHECK(block.find("startup_failed_ = true;") != std::string::npos);
     CHECK(block.find("Refusing to start") != std::string::npos);
+
+    // The seed reason is public (it is stored and shown to an operator): the exact text, split
+    // across two source literals, and no roadmap-wave wording.
+    CHECK(block.find("\"default-off: forensics class; enable per PUT \"") != std::string::npos);
+    CHECK(block.find("\"/api/v1/plugin-config/remote_access_audit/kill-switch\"") !=
+          std::string::npos);
+    CHECK(block.find("Wave 11") == std::string::npos);
 }
 
 TEST_CASE("set_kill_switch rejects an invalid reason as InvalidInput",

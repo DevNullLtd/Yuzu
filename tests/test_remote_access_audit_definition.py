@@ -54,6 +54,25 @@ class RemoteAccessAuditDefinitionColumns(unittest.TestCase):
         self.assertIn("host-based authentication", text)
         self.assertIn("access list", text)
         self.assertIn("uid 500", text)
+        # the flagged set is the six closed-set keywords, AuthenticationMethods included, and the two
+        # undetectable gaps are stated as documented-only (no token), never as flagged
+        self.assertIn("authenticationmethods", text)
+        self.assertIn("one of these six", text)
+        self.assertIn("raise no token and are documented only", text)
+
+    def test_header_separates_flagged_sources_from_undetectable_gaps(self):
+        header = DEFINITION.read_text(encoding="utf-8").split("\n---\n", 1)[0]
+        flat = " ".join(line.lstrip("# ").strip() for line in header.splitlines())
+        self.assertIn("When sshd_config sets one of these six", flat)
+        self.assertIn("AuthenticationMethods", flat)
+        self.assertIn("NOT read, and NOT detectable", flat)
+        self.assertIn("documented, not flagged", flat)
+
+    def test_columns_state_the_listed_count_and_the_row_cap_signal(self):
+        cols = {c["name"]: c["description"] for c in _definition()["spec"]["result"]["columns"]}
+        self.assertIn("number of key lines listed", cols["field_4"])
+        self.assertIn("keys:row_cap", cols["field_4"])
+        self.assertNotIn("lines accepted", cols["field_4"])
 
 
 class RemoteAccessAuditDefinitionContract(unittest.TestCase):

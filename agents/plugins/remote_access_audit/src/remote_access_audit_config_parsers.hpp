@@ -312,7 +312,6 @@ struct SshdConfigState {
     std::vector<std::string> akf; ///< tokens, kept for path resolution only
     std::string akf_origin;
     std::size_t akf_count = 0;  ///< tokens written, before the kMaxAuthorizedKeysFileTokens cut
-    bool akf_capped = false;    ///< the cut dropped tokens
     bool akf_in_match = false;  ///< an AuthorizedKeysFile appeared inside a Match block
     unsigned cred_seen = 0;     ///< bit per kOtherCredentialKeys entry whose first occurrence was read
     bool other_credential_sources = false; ///< a kOtherCredentialKeys keyword is live at global scope
@@ -378,7 +377,6 @@ inline void parse_sshd_config(std::string_view text, std::string_view origin, Ss
                 continue; // sshd rejects an empty argument or a "none" that is not alone
             st.akf_set = true;
             st.akf_count = args.size();
-            st.akf_capped = args.size() > kMaxAuthorizedKeysFileTokens;
             st.akf.assign(args.begin(), args.begin() + static_cast<std::ptrdiff_t>(
                                                            (std::min)(args.size(), kMaxAuthorizedKeysFileTokens)));
             st.akf_origin = std::string(origin);
@@ -387,12 +385,15 @@ inline void parse_sshd_config(std::string_view text, std::string_view origin, Ss
         if (in_match)
             continue;
 
-        if (const auto cred = std::ranges::find(kOtherCredentialKeys, kw, &OtherCredentialKey::keyword);
+        if (const auto cred =
+                std::ranges::find(kOtherCredentialKeys, kw, &OtherCredentialKey::keyword);
             cred != kOtherCredentialKeys.end()) {
-            const unsigned bit = 1u << static_cast<unsigned>(std::distance(kOtherCredentialKeys.begin(), cred));
+            const unsigned bit =
+                1u << static_cast<unsigned>(std::distance(kOtherCredentialKeys.begin(), cred));
             if ((st.cred_seen & bit) == 0 && !args.empty() && !args[0].empty()) {
                 st.cred_seen |= bit;
-                st.other_credential_sources = st.other_credential_sources || detail::lower(args[0]) != cred->inert;
+                st.other_credential_sources =
+                    st.other_credential_sources || detail::lower(args[0]) != cred->inert;
             }
             continue;
         }

@@ -79,6 +79,8 @@ struct Fake {
     mutable int open_home_calls = 0;
     mutable int key_reads = 0;
     mutable int probe_calls = 0;
+    mutable int mount_calls = 0;           // network_mount_prefixes acquisitions
+    mutable std::size_t touched_at_mount = 0; // path touches when the table was last asked for
     mutable std::vector<std::string> resolved; // roots resolve_root was asked about (readlink only; not in `touched`)
     mutable std::vector<bool> merge_flags;     // SubprocessOptions::merge_stderr of every fs.run call
 
@@ -114,7 +116,11 @@ struct Fake {
             merge_flags.push_back(o.merge_stderr);
             return runner ? runner(args) : died(yuzu::agent::TerminationReason::spawn_error);
         };
-        fs.network_mount_prefixes = [this]() { return prefixes; };
+        fs.network_mount_prefixes = [this]() {
+            ++mount_calls;
+            touched_at_mount = touched.size();
+            return prefixes;
+        };
         fs.list_homes = [this](const std::vector<std::string>& r, std::vector<HomeEntry>& out, bool& too_many) {
             for (const auto& x : r)
                 touched.push_back(x);
@@ -162,6 +168,10 @@ struct Fake {
 
     bool touched_under(std::string_view prefix) const {
         return std::ranges::any_of(touched, [&](const std::string& t) { return t.rfind(prefix, 0) == 0; });
+    }
+    /// The one run-start mount snapshot: acquired exactly once, before any path was touched.
+    bool mount_snapshot_first() const {
+        return mount_calls == 1 && touched_at_mount == 0 && !touched.empty();
     }
 };
 
@@ -406,6 +416,7 @@ TEST_CASE("remote_access_audit legs: a non-account home is skipped by the eligib
     f.open_err["/home/locked"] = EACCES;                                      // an account the agent cannot open
     f.key_files["/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
     const auto l = list_posix(f.build());
+    CHECK(f.mount_snapshot_first());
 
     // shared: probed once and nothing else (no open, no read), no file rows, not counted as an account
     CHECK(std::ranges::count(f.touched, "/home/shared") == 1);
@@ -519,7 +530,8 @@ TEST_CASE("remote_access_audit legs: a network mount is never touched", "[remote
     f.homes = {HomeEntry{"alice", "/net/home/alice"}};
     f.key_files["/net/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
     l = list_posix(f.build());
-    CHECK(std::ranges::count(f.resolved, "/home") == 1); // the config half asks about its own paths too
+    // the config half asks about its own path first, then the keys half about the home root
+    CHECK(f.resolved == std::vector<std::string>{"/etc/ssh/sshd_config", "/home"});
     CHECK(has_token(l, "linux:remote_access_audit:keys:network_mount_skipped"));
     CHECK(row_with(l.rows, "key|alice|").empty());
     CHECK(f.open_home_calls == 0);
@@ -546,6 +558,7 @@ TEST_CASE("remote_access_audit legs: a network mount is never touched", "[remote
     f.homes = {home("alice")};
     f.key_files["/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
     l = list_posix(f.build());
+    CHECK(f.mount_snapshot_first()); // an unreadable table is still ONE acquisition, taken first
     CHECK(has_token(l, "linux:remote_access_audit:keys:mounts_unreadable"));
     CHECK(row_with(l.rows, "key|alice|") != "");
     CHECK(l.status == StatusState::constrained);
@@ -682,19 +695,17 @@ TEST_CASE("remote_access_audit legs: a mount recorded under the macOS Data volum
         };
         return f;
     };
-    const auto with_aliases = [](std::vector<std::string> v) {
-        add_data_volume_aliases(v);
-        return std::optional<std::vector<std::string>>{std::move(v)};
-    };
-
+    // The fake hands list_posix the table as the kernel lists it (RAW): the macOS alias expansion
+    // is list_posix's own step, so deleting it from the production path turns this test red.
     // The mount is named /System/Volumes/Data/Users/alice, the home is walked as /Users/alice.
     auto f = macos_fake();
-    f.prefixes = with_aliases({"/System/Volumes/Data/Users/alice"});
+    f.prefixes = std::vector<std::string>{"/System/Volumes/Data/Users/alice"};
     f.homes = {HomeEntry{"alice", "/Users/alice"}, HomeEntry{"bob", "/Users/bob"}};
     f.account_probe = [](const HomeEntry&) { return true; };
     f.key_files["/Users/alice/.ssh/authorized_keys"] = ok(kAliceKey);
     f.key_files["/Users/bob/.ssh/authorized_keys"] = ok(kAliceKey);
     auto l = list_posix(f.build());
+    CHECK(f.mount_snapshot_first());
     CHECK(f.probe_calls == 1);                     // bob only: alice is never asked about
     CHECK(f.open_home_calls == 1);                 // bob only
     CHECK_FALSE(f.touched_under("/Users/alice"));  // not probed, opened or read
@@ -704,20 +715,21 @@ TEST_CASE("remote_access_audit legs: a mount recorded under the macOS Data volum
     CHECK(row_with(l.rows, "key|bob|") != "");     // the local home is still audited
     CHECK(l.status == StatusState::constrained);
 
-    // negative control: the table as recorded, without the alias, is what let the home open
-    f = macos_fake();
+    // negative control: the same RAW table on the Linux leg (no alias expansion) lets the home open
+    f = healthy();
+    f.roots = {"/Users"};
     f.prefixes = std::vector<std::string>{"/System/Volumes/Data/Users/alice"};
     f.homes = {HomeEntry{"alice", "/Users/alice"}};
     f.key_files["/Users/alice/.ssh/authorized_keys"] = ok(kAliceKey);
     l = list_posix(f.build());
     CHECK(f.open_home_calls == 1);
-    CHECK_FALSE(has_token(l, "macos:remote_access_audit:keys:network_mount_skipped"));
+    CHECK_FALSE(has_token(l, "linux:remote_access_audit:keys:network_mount_skipped"));
 
     // the other direction: a mount recorded as /Users/alice covers an absolute AuthorizedKeysFile
     // entry spelled through the Data volume, and the entry's reader is never called
     f = macos_fake();
     f.config_files["/etc/ssh/sshd_config"] = ok("AuthorizedKeysFile /System/Volumes/Data/Users/alice/.ssh/k\n");
-    f.prefixes = with_aliases({"/Users/alice"});
+    f.prefixes = std::vector<std::string>{"/Users/alice"};
     f.homes = {HomeEntry{"bob", "/Users/bob"}};
     f.abs_files["/System/Volumes/Data/Users/alice/.ssh/k"] = ok(kAliceKey);
     l = list_posix(f.build());
@@ -731,7 +743,7 @@ TEST_CASE("remote_access_audit legs: a mount recorded under the macOS Data volum
     f = macos_fake();
     f.config_files["/etc/ssh/sshd_config"] = ok("Include /System/Volumes/Data/net/ssh.conf\n");
     f.config_files["/System/Volumes/Data/net/ssh.conf"] = ok("PermitRootLogin yes\n");
-    f.prefixes = with_aliases({"/net"});
+    f.prefixes = std::vector<std::string>{"/net"};
     l = list_posix(f.build());
     CHECK_FALSE(f.touched_under("/System/Volumes/Data/net"));
     CHECK(has_token(l, "macos:remote_access_audit:include:network_mount_skipped"));
@@ -1008,7 +1020,6 @@ TEST_CASE("remote_access_audit legs: a credential source the plugin does not rea
         f.homes = {home("alice")};
         f.key_files["/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
         const auto l = list_posix(f.build());
-        CHECK(l.status != StatusState::supported);
         CHECK(l.status == StatusState::constrained);
         CHECK(has_token(l, tok));
         CHECK(row_with(l.rows, "key|alice|") != ""); // the keys it does read are still reported
@@ -1036,6 +1047,33 @@ TEST_CASE("remote_access_audit legs: a credential source the plugin does not rea
     f = healthy();
     f.config_files.clear(); // sshd_config absent: nothing was read, so nothing is claimed
     CHECK_FALSE(has_token(list_posix(f.build()), tok));
+}
+
+// MUTATION: matching a closed-set keyword by prefix (`starts_with` in place of the exact lookup in
+// parse_sshd_config) turns every look-alike below into a false `other_credential_sources`. Each
+// look-alike carries a non-inert value, so only the keyword match can keep it quiet. The names are
+// real sshd keywords where one exists (AuthorizedKeysCommandUser, AuthorizedPrincipalsCommandUser,
+// HostbasedAcceptedAlgorithms); the other three are CONSTRUCTED look-alikes.
+TEST_CASE("remote_access_audit legs: a keyword that resembles a credential keyword raises nothing",
+          "[remote_access_audit][legs]") {
+    const std::string tok = "linux:remote_access_audit:sshd_config:other_credential_sources";
+    for (const char* line :
+         {"TrustedUserCAKeysFile /etc/ssh/zq-ca-9731.pub", "AuthorizedKeysCommandUser zq-9731",
+          "AuthorizedPrincipalsFileX /etc/ssh/zq-principals-9731",
+          "AuthorizedPrincipalsCommandUser zq-9731", "AuthenticationMethodsExtra publickey",
+          "HostbasedAcceptedAlgorithms ssh-ed25519"}) {
+        INFO(line);
+        auto f = healthy();
+        f.config_files["/etc/ssh/sshd_config"] =
+            ok(std::string("PermitRootLogin no\n") + line + "\n");
+        f.homes = {home("alice")};
+        f.key_files["/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
+        const auto l = list_posix(f.build());
+        CHECK(l.status == StatusState::supported);
+        CHECK_FALSE(has_token(l, tok));
+        CHECK(l.reason.find("other_credential_sources") == std::string::npos);
+        CHECK(row_with(l.rows, "key|alice|") != "");
+    }
 }
 
 // MUTATION: removing the skipped-home count (or the probe wiring) puts `-`/0 on the wire for a Mac whose
@@ -1113,6 +1151,30 @@ TEST_CASE("remote_access_audit legs: every Include directive counts against the 
     const auto ok_l = list_posix(f.build());
     CHECK_FALSE(has_token(ok_l, "linux:remote_access_audit:include:too_many"));
     CHECK(ok_l.status == StatusState::supported);
+}
+
+// The cap counts ARGUMENTS (one IncludeDirective per pattern), not `Include` lines: one line with
+// 32 patterns is at the cap and one with 33 is over it, in the same single directive.
+TEST_CASE("remote_access_audit legs: one Include line counts every pattern against the cap",
+          "[remote_access_audit][legs]") {
+    const auto one_line = [](std::size_t patterns) {
+        auto f = healthy();
+        std::string cfg = "Include";
+        for (std::size_t i = 0; i < patterns; ++i)
+            cfg += " /etc/ssh/d/*.nomatch";
+        f.config_files["/etc/ssh/sshd_config"] = ok(cfg + "\n");
+        f.listings["/etc/ssh/d|*.nomatch"] = {};
+        return std::pair{list_posix(f.build()), std::ranges::count(f.touched, "/etc/ssh/d")};
+    };
+    const auto [at_cap, at_cap_lists] = one_line(kMaxIncludeFiles);
+    CHECK_FALSE(has_token(at_cap, "linux:remote_access_audit:include:too_many"));
+    CHECK(at_cap_lists == static_cast<long>(kMaxIncludeFiles));
+    CHECK(at_cap.status == StatusState::supported);
+
+    const auto [over_cap, over_cap_lists] = one_line(kMaxIncludeFiles + 1);
+    CHECK(has_token(over_cap, "linux:remote_access_audit:include:too_many"));
+    CHECK(over_cap_lists == static_cast<long>(kMaxIncludeFiles)); // the 33rd is never listed
+    CHECK(over_cap.status == StatusState::constrained);
 }
 
 TEST_CASE("remote_access_audit legs: AuthorizedKeysFile tokens beyond the cap are dropped with a token",

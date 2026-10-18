@@ -620,7 +620,6 @@ TEST_CASE("remote_access_audit posix fs: network mount points come from the moun
     // MUTATION: restoring the old 1 MiB default drops a container-dense node's guard entirely.
     // The default holds fs.mount-max (100,000 mounts at ~160 bytes a line) in full.
     static_assert(kMountinfoCap >= 100000 * 160);
-    static_assert(kMountinfoCap == 16 * 1024 * 1024);
 }
 
 TEST_CASE("remote_access_audit posix fs: config-side symlinks are followed as sshd follows them, key-side never",

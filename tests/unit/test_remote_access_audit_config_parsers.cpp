@@ -243,13 +243,12 @@ TEST_CASE("remote_access_audit config: AuthorizedKeysFile tokens are capped, the
         at_cap += " .ssh/k" + std::to_string(i);
     auto run = parse(at_cap + "\n");
     CHECK(run.st.akf.size() == kMaxAuthorizedKeysFileTokens);
-    CHECK_FALSE(run.st.akf_capped);
+    CHECK(run.st.akf_count == kMaxAuthorizedKeysFileTokens);
 
     // one over the cap: the first kMaxAuthorizedKeysFileTokens are kept, the rest dropped and flagged
     run = parse(at_cap + " .ssh/extra\n");
     CHECK(run.st.akf.size() == kMaxAuthorizedKeysFileTokens);
     CHECK(run.st.akf.back() == ".ssh/k99");
-    CHECK(run.st.akf_capped);
     CHECK(run.st.akf_count == kMaxAuthorizedKeysFileTokens + 1);
     bool ov = false;
     CHECK(row_for(config_rows(run.st, true, ov), "authorizedkeysfile") == "config|authorizedkeysfile|custom:101|sshd_config");
@@ -260,7 +259,7 @@ TEST_CASE("remote_access_audit config: AuthorizedKeysFile tokens are capped, the
         huge += " a";
     run = parse(huge + "\n");
     CHECK(run.st.akf.size() == kMaxAuthorizedKeysFileTokens);
-    CHECK(run.st.akf_capped);
+    CHECK(run.st.akf_count == 100000);
 }
 
 // MUTATION: dropping a keyword from kOtherCredentialKeys, or reading its value instead of its first
