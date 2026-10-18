@@ -1671,7 +1671,7 @@ TEST_CASE("access-reviews: a cookie write with a text/plain or form body is refu
     CHECK(ok->status == 201);
 }
 
-TEST_CASE("access-reviews: same-origin and token calls still open, attest and close",
+TEST_CASE("access-reviews: same-origin and token calls still open; attest and close",
           "[pg][access_review][rest][security][csrf]") {
     AccessReviewHarness h;
     seed_one_grant(h);
