@@ -1625,7 +1625,7 @@ def baseline_inventory():
     return 0
 
 
-def _selftest():
+def _selftest_body():
     """Unit-tests the extraction/parsing/canonicalization logic itself against
     synthetic fixtures, per this repo's established precedent for CI tooling
     scripts of this shape (flake-retry.py, check-plugin-spawn-lexical.sh,
@@ -1882,7 +1882,7 @@ def _selftest():
         kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n/*\n#if 0\n*/\n};\n', encoding="utf-8")
         check(_PP_LINE.match("/**/ " * 3000 + "x") is None and _PP_LINE.match("/*" * 3000 + "x") is None,
               "directive pattern: a long run of comments with no directive must not match (and must not backtrack)")
-        check(_PP_LINE.match(" * b */ #if 0") and _PP_LINE.match("/* a */ /* b */ #if 0") and not _PP_LINE.match("/* a */ x #if 0"),
+        check(_PP_LINE.match("*/ %:if 0") and _PP_LINE.match(" * b */ #if 0") and _PP_LINE.match("/* a */ /* b */ #if 0") and not _PP_LINE.match("/* a */ x #if 0"),
               "directive pattern: text before the closing '*/' of a multi-line comment may precede a directive; code after it may not")
         kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n/* a\n b */ #if 0\n    {"b", "d"},\n#endif\n};\n', encoding="utf-8")
         try:
@@ -2114,7 +2114,7 @@ def _selftest():
     check(revisit_lapse_warning(lapse_rows, due_day - datetime.timedelta(days=REVISIT_WARN_DAYS + 5)) is None,
           "lapse: nothing due beyond the horizon -> no warning")
     w = revisit_lapse_warning(lapse_rows, due_day + 2 * one_day)
-    check(w is not None and w.startswith("5 exception row(s)") and "2 already past" in w
+    check(w is not None and f"on or before {due_day + (2 + REVISIT_WARN_DAYS) * one_day}" in w and w.startswith("5 exception row(s)") and "2 already past" in w
           and "#520" in w and "get.fragments-l0" in w and w.endswith("or retire it") and ", ..." in w,
           f"lapse: one aggregated warning with counts, issues and the first ids, got {w}")
     for n_due, dots in ((3, False), (4, True)):
@@ -2159,8 +2159,14 @@ def _selftest():
         check(body_s.startswith("an earlier step\n") and "exception revisit dates" in body_s
               and "or retire it" in body_s and body_s.count("###") == 1,
               f"step summary: the lapse notice is appended once, after what is already there, got {body_s!r}")
-        rc_s, out_s = _drive(base_rows, today=day_a - 100 * one_day)
-        check(not summ.read_text(encoding="utf-8").count("###") > 1, "step summary: nothing is appended when no revisit date is near")
+        os.environ["GITHUB_STEP_SUMMARY"] = str(summ)
+        try:
+            rc_s, out_s = _drive(base_rows, today=day_a - 100 * one_day)
+        finally:
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        check(rc_s == 0 and summ.read_text(encoding="utf-8").count("###") == 1,
+              "step summary: nothing is appended when no revisit date is near")
+        check(os.environ.get("GITHUB_STEP_SUMMARY") is None, "step summary: the selftest leaves the variable as it found it")
     rc_l, out_l = _drive(base_rows, today=day_a - 100 * one_day)
     check(rc_l == 0 and "or retire it" not in out_l, f"lapse: no warning far from the date, got {out_l[:200]}")
 
@@ -2259,6 +2265,17 @@ def _selftest():
         return 1
     print("check-api-parity selftest: OK")
     return 0
+
+
+def _selftest():
+    """Runs the selftest with GITHUB_STEP_SUMMARY removed, so its synthetic revisit
+    notices never land in the real run summary when CI sets the variable."""
+    saved = os.environ.pop("GITHUB_STEP_SUMMARY", None)
+    try:
+        return _selftest_body()
+    finally:
+        if saved is not None:
+            os.environ["GITHUB_STEP_SUMMARY"] = saved
 
 
 def main(argv=None):
