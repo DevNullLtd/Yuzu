@@ -1624,6 +1624,36 @@ TEST_CASE("ca_routes: the revocation pill follows the revoked set and the list's
     CHECK(lapsed->body.find(">Current</span>") == std::string::npos);
 }
 
+TEST_CASE("ca_routes: a lapsed list reads Expired even when it is also behind the revoked set",
+          "[ca_routes][pki][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    REQUIRE(h.store->revoke("DEAD", "test"));
+    h.wire();
+    CrlVersionRecord crl;
+    crl.version = 1;
+    crl.der = {0x30, 0x03, 0x01, 0x02, 0x03};
+    crl.this_update = 1000;
+    crl.next_update = 2000; // long past
+    crl.published_at = 1000;
+    crl.revoked_count = 0; // behind the revoked set as well
+    REQUIRE(h.store->record_crl_for_test(crl));
+    auto page = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(page);
+    CHECK(page->body.find("Expired list") != std::string::npos);
+    CHECK(page->body.find("Out of date") == std::string::npos);
+
+    // Same for a row with no recorded count (the "not confirmed" arm).
+    crl.version = 2;
+    crl.revoked_count.reset();
+    REQUIRE(h.store->record_crl_for_test(crl));
+    auto page2 = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(page2);
+    CHECK(page2->body.find("Expired list") != std::string::npos);
+    CHECK(page2->body.find("Not confirmed current") == std::string::npos);
+}
+
 TEST_CASE("ca_routes: a pre-count CRL row reports a null revoked count, not 0",
           "[ca_routes][pki][pg]") {
     Harness h;
