@@ -46,7 +46,7 @@ TEST_CASE("reviews glue: every write is an existing REST v1 route and reads the 
     }
 }
 
-TEST_CASE("reviews glue: every control the renderer draws has a handler, and the decision is not hard-coded",
+TEST_CASE("reviews glue: every control the renderer draws has a handler; and the decision is not hard-coded",
           "[access-reviews][js]") {
     const std::string& js = yuzu::server::kYuzuAuditJs;
     CampaignView v;
@@ -93,7 +93,7 @@ TEST_CASE("reviews page: the panels carry the renderer's sentences and nothing l
     CHECK_THAT(t, !ContainsSubstring("hx-get=\"/fragments/access/reviews/grants\" hx-trigger"));
 }
 
-TEST_CASE("reviews page: htmx history is off before htmx loads, because campaign rows push a URL",
+TEST_CASE("reviews page: htmx history is off before htmx loads; because campaign rows push a URL",
           "[access-reviews][js]") {
     // A campaign row carries hx-push-url, which makes htmx snapshot the whole page (audit rows,
     // campaigns, grants) into localStorage unless history is disabled. The meta is read once, at

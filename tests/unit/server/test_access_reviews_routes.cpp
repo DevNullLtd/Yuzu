@@ -332,7 +332,7 @@ TEST_CASE("reviews routes: campaign id validation reads nothing and audits nothi
     CHECK(h.last_get_id == std::string(64, 'a'));
 }
 
-TEST_CASE("reviews routes: not_found is a distinct note, any other fault is unavailable",
+TEST_CASE("reviews routes: not_found is a distinct note; any other fault is unavailable",
           "[access-reviews][routes]") {
     Harness h;
     h.wire();

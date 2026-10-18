@@ -85,7 +85,7 @@ std::string campaign_html(const CampaignView& v, bool can) {
 
 } // namespace
 
-TEST_CASE("reviews render: campaign list shows state, opener and a Close only for an attester",
+TEST_CASE("reviews render: campaign list shows state; opener and a Close only for an attester",
           "[access-reviews][render]") {
     const std::vector<AccessReviewCampaignRow> rows = {camp("a41c0e92d7b3f518", "Q4 admin access"),
                                                        camp("7be2c95a10d4e863", "Q3 admin access", "closed")};
@@ -105,7 +105,7 @@ TEST_CASE("reviews render: campaign list shows state, opener and a Close only fo
     CHECK_THAT(out, !ContainsSubstring("data-act=\"ar-close\""));
 }
 
-TEST_CASE("reviews render: empty, unavailable and populated lists are three different outputs",
+TEST_CASE("reviews render: empty; unavailable and populated lists are three different outputs",
           "[access-reviews][render]") {
     const auto empty = render_campaigns(std::vector<AccessReviewCampaignRow>{}, false);
     CHECK_THAT(empty, ContainsSubstring("No review campaigns yet"));
@@ -120,7 +120,7 @@ TEST_CASE("reviews render: empty, unavailable and populated lists are three diff
     CHECK_THAT(un, !ContainsSubstring("No review campaigns yet"));
 }
 
-TEST_CASE("reviews render: controls need an attester AND an open campaign, and carry their decision",
+TEST_CASE("reviews render: controls need an attester AND an open campaign; and carry their decision",
           "[access-reviews][render]") {
     for (const bool can : {false, true})
         for (const char* status : {"open", "closed"}) {
@@ -223,7 +223,7 @@ TEST_CASE("reviews render: the summary card is an out-of-band swap with honest c
     CHECK_THAT(out, !ContainsSubstring("<span>Closed</span>"));
 }
 
-TEST_CASE("reviews render: not found, unavailable and unselected are distinct and never leak",
+TEST_CASE("reviews render: not found; unavailable and unselected are distinct and never leak",
           "[access-reviews][render]") {
     const auto nf = render_campaign(access::NotFound{}, true);
     CHECK_THAT(nf, ContainsSubstring("No campaign with that id"));
@@ -342,7 +342,7 @@ TEST_CASE("reviews render: reviewer; justification; closer and every live-grant 
     inert(render_grants(stamp), "rbac_enforcement (grants)");
 }
 
-TEST_CASE("reviews render: a hostile campaign id is percent-encoded in every URL, never raw",
+TEST_CASE("reviews render: a hostile campaign id is percent-encoded in every URL; never raw",
           "[access-reviews][render]") {
     for (const auto& [id, enc] : std::vector<std::pair<std::string, std::string>>{
              {"./x?", ".%2Fx%3F"}, {"../y", "..%2Fy"}, {"a#b", "a%23b"}, {"a b/c", "a%20b%2Fc"},
@@ -385,7 +385,7 @@ TEST_CASE("reviews render: nothing here can revoke and nothing mutates through h
         }
 }
 
-TEST_CASE("reviews render: current grants keep orphans, flag them and state the enforcement stamp",
+TEST_CASE("reviews render: current grants keep orphans; flag them and state the enforcement stamp",
           "[access-reviews][render]") {
     GrantsView g;
     g.rbac_enforcement = "degraded";
@@ -421,7 +421,7 @@ TEST_CASE("reviews render: current grants keep orphans, flag them and state the 
     CHECK_THAT(out, ContainsSubstring("n/a"));
 }
 
-TEST_CASE("reviews render: current grants cap, empty and unavailable", "[access-reviews][render]") {
+TEST_CASE("reviews render: current grants cap; empty and unavailable", "[access-reviews][render]") {
     GrantsView g;
     g.rbac_enforcement = "enabled";
     AccessReviewRow r;

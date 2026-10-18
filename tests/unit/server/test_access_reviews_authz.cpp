@@ -211,7 +211,7 @@ TEST_CASE("reviews authz: AuditLog:Read does not satisfy the reviews fragments (
     CHECK(r.denied_rows() == 2);
 }
 
-TEST_CASE("reviews authz: RBAC on, a Reviewer is admitted and the real Attest probe offers controls",
+TEST_CASE("reviews authz: RBAC on; a Reviewer is admitted and the real Attest probe offers controls",
           "[pg][access-reviews][authz]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, reviews_page_tpl);
     Rig r{db_.dsn()};
