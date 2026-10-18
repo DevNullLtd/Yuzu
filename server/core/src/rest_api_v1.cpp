@@ -8840,6 +8840,36 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(arr.str()), "application/json");
         });
 
+    // Browser-write gate for the three cookie-callable access-review mutations (open, attest,
+    // close). The Audit and reviews page and the Settings panel call them with a session cookie,
+    // an ambient credential a cross-site page can ride, so a cookie session must name this site in
+    // Origin/Referer (403, `csrf.denied` row) and a JSON body must say so (415). A token caller
+    // is not riding a cookie and is exempt from the same-site rule. Runs after the permission
+    // gate, the session lookup and the engine refusal, before the body is read. Returns true when
+    // the response is already written.
+    auto ar_refuse_browser_write =
+        [audit_fn, trusted = csrf_trusted_origins_](
+            const httplib::Request& req, httplib::Response& res, const auth::Session& session,
+            const char* endpoint, const char* action, bool json_body) -> bool {
+        if (browser_write_is_cross_site(session.auth_source, req.get_header_value("Host"),
+                                        req.get_header_value("Origin"),
+                                        req.get_header_value("Referer"), trusted)) {
+            (void)audit_fn(req, "csrf.denied", "denied", "Endpoint", endpoint,
+                           "cross-site or header-less browser write refused");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+            return true;
+        }
+        if (json_body && media_type_of(req.get_header_value("Content-Type")) != "application/json") {
+            (void)audit_fn(req, action, "denied", "AccessReview", "", "content_type_not_json");
+            res.status = 415;
+            res.set_content(detail::a4_error(res, "Content-Type must be application/json"),
+                            "application/json");
+            return true;
+        }
+        return false;
+    };
+
     // POST /api/v1/access-reviews {title} — freeze the CURRENT grant
     // population into a new review campaign (R3, access_review_store.hpp):
     // every grant that exists right now gets one reviewable row; a grant
@@ -8847,7 +8877,8 @@ void RestApiV1::register_routes(
     sink.Post(
         "/api/v1/access-reviews",
         [perm_fn, auth_fn, audit_fn, access_review_store, auth_db, rbac_store, eps, token_store,
-         directory_sync, metrics_registry](const httplib::Request& req, httplib::Response& res) {
+         directory_sync, metrics_registry,
+         ar_refuse_browser_write](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -8861,6 +8892,9 @@ void RestApiV1::register_routes(
                 return;
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.campaign_opened",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session, "/api/v1/access-reviews",
+                                        "access_review.campaign_opened", true))
                 return;
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9031,8 +9065,8 @@ void RestApiV1::register_routes(
     // reviewer decision against a frozen grant.
     sink.Post(
         R"(/api/v1/access-reviews/([^/]+)/attestations)",
-        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry](
-            const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry,
+         ar_refuse_browser_write](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -9047,6 +9081,10 @@ void RestApiV1::register_routes(
             auto campaign_id = req.matches[1].str();
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.attested",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session,
+                                        "/api/v1/access-reviews/{id}/attestations",
+                                        "access_review.attested", true))
                 return;
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9132,8 +9170,8 @@ void RestApiV1::register_routes(
     // something this route silently forces to completion.
     sink.Post(
         R"(/api/v1/access-reviews/([^/]+)/close)",
-        [perm_fn, auth_fn, audit_fn, access_review_store](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [perm_fn, auth_fn, audit_fn, access_review_store, ar_refuse_browser_write](
+            const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -9148,6 +9186,9 @@ void RestApiV1::register_routes(
             auto campaign_id = req.matches[1].str();
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.closed",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session, "/api/v1/access-reviews/{id}/close",
+                                        "access_review.closed", false))
                 return;
 
             auto close_res = access_review_store->close_campaign(campaign_id, session->username);

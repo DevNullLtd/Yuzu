@@ -58,6 +58,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "test_auth_db_pg_helper.hpp"
@@ -224,6 +225,10 @@ struct AccessReviewHarness {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
         acc_rev_reset();
+        // The cookie session below is a browser session, and a browser write must name this site
+        // (the access-review mutations refuse a cross-site or header-less cookie write). Every
+        // call carries the same-origin headers a browser sends; the csrf cases override them.
+        sink.default_headers = {{"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}};
         // RbacStore coexists in the SAME shared database as EnginePrincipalStore
         // /AccessReviewStore (own `rbac_store` schema) — acc_rev_reset() above
         // TRUNCATEs its user-data tables too, so each harness still gets fully
@@ -1514,4 +1519,220 @@ TEST_CASE("access-reviews: the 4 new metrics are wired with the documented names
     // The re-attest (same grant) does not double-count the attested label.
     CHECK(h.metrics.counter("yuzu_access_review_attestations_total", {{"decision", "attested"}})
              .value() == 1);
+}
+
+// ── Browser-write gate: the three cookie-callable mutations ─────────────────────────────────
+// POST /access-reviews, /{id}/attestations and /{id}/close are called by the Audit and reviews
+// page and the Settings panel with a session cookie. A cookie is an ambient credential, so a
+// cookie write must name this site in Origin/Referer (403 + a `csrf.denied` row) and a JSON body
+// must be application/json (415). A token caller is not riding a cookie and keeps working.
+
+namespace {
+
+const std::unordered_map<std::string, std::string> kSiblingOrigin{
+    {"Host", "yuzu.example"}, {"Origin", "https://evil.yuzu.example"}};
+const std::unordered_map<std::string, std::string> kNoOrigin{{"Host", "yuzu.example"}};
+const std::unordered_map<std::string, std::string> kSameOrigin{
+    {"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}};
+const std::unordered_map<std::string, std::string> kSameSiteReferer{
+    {"Host", "yuzu.example"}, {"Referer", "https://yuzu.example/access/audit"}};
+
+std::string attest_body(const std::string& user, const std::string& role,
+                        const std::string& decision = "attested") {
+    return nlohmann::json{{"principal_type", "user"},
+                          {"principal_id", user},
+                          {"role_name", role},
+                          {"decision", decision}}
+        .dump();
+}
+
+bool has_audit(const AccessReviewHarness& h, const std::string& action, const std::string& result,
+               const std::string& target_id, const std::string& detail) {
+    for (const auto& r : h.audit_log)
+        if (r.action == action && r.result == result && r.target_id == target_id &&
+            r.detail == detail)
+            return true;
+    return false;
+}
+
+// One real grant, so a campaign freezes one pending row the attestation can target.
+void seed_one_grant(AccessReviewHarness& h) {
+    REQUIRE(h.rbac->create_role({.name = "CsrfRole", .description = "d"}).has_value());
+    REQUIRE(h.auth_db->upsert_user("csrfuser", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "csrfuser", "CsrfRole"}).has_value());
+}
+
+int pending_in(const AccessReviewHarness& h, const std::string& cid) {
+    auto v = h.access_review_store->get_campaign(cid);
+    REQUIRE(v.has_value());
+    int n = 0;
+    for (const auto& a : v->attestations)
+        if (a.decision == "pending")
+            ++n;
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("access-reviews: a cookie write from another origin or with no Origin is refused 403 "
+          "and changes nothing on all three mutations",
+          "[pg][access_review][rest][security][csrf]") {
+    AccessReviewHarness h;
+    seed_one_grant(h);
+    const auto cid = h.open_campaign_rest("csrf target");
+    const int pending0 = pending_in(h, cid);
+    REQUIRE(pending0 >= 1);
+    const auto campaigns_before = h.access_review_store->list_campaigns();
+    REQUIRE(campaigns_before.has_value());
+
+    for (const auto* headers : {&kSiblingOrigin, &kNoOrigin}) {
+        h.audit_log.clear();
+
+        auto open = h.sink.dispatch("POST", "/api/v1/access-reviews", R"({"title":"forged"})",
+                                    "application/json", *headers);
+        REQUIRE(open);
+        CHECK(open->status == 403);
+        CHECK(open->body.find("cross-site request refused") != std::string::npos);
+        CHECK(has_audit(h, "csrf.denied", "denied", "/api/v1/access-reviews",
+                        "cross-site or header-less browser write refused"));
+
+        auto attest = h.sink.dispatch("POST", "/api/v1/access-reviews/" + cid + "/attestations",
+                                      attest_body("csrfuser", "CsrfRole"), "application/json",
+                                      *headers);
+        REQUIRE(attest);
+        CHECK(attest->status == 403);
+        CHECK(attest->body.find("cross-site request refused") != std::string::npos);
+        CHECK(has_audit(h, "csrf.denied", "denied", "/api/v1/access-reviews/{id}/attestations",
+                        "cross-site or header-less browser write refused"));
+
+        auto close = h.sink.dispatch("POST", "/api/v1/access-reviews/" + cid + "/close", "",
+                                     "application/json", *headers);
+        REQUIRE(close);
+        CHECK(close->status == 403);
+        CHECK(close->body.find("cross-site request refused") != std::string::npos);
+        CHECK(has_audit(h, "csrf.denied", "denied", "/api/v1/access-reviews/{id}/close",
+                        "cross-site or header-less browser write refused"));
+
+        // No success row of any kind, and the stores are untouched.
+        for (const auto& r : h.audit_log)
+            CHECK(r.result == "denied");
+    }
+    const auto campaigns_after = h.access_review_store->list_campaigns();
+    REQUIRE(campaigns_after.has_value());
+    CHECK(campaigns_after->size() == campaigns_before->size());
+    CHECK(pending_in(h, cid) == pending0);
+    auto view = h.access_review_store->get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->campaign.status == "open");
+}
+
+TEST_CASE("access-reviews: a cookie write with a text/plain or form body is refused 415; "
+          "a cross-site one stays 403",
+          "[pg][access_review][rest][security][csrf]") {
+    AccessReviewHarness h;
+    seed_one_grant(h);
+    const auto cid = h.open_campaign_rest("content type target");
+    const int pending0 = pending_in(h, cid);
+    REQUIRE(pending0 >= 1);
+
+    for (const char* ct : {"text/plain", "application/x-www-form-urlencoded", ""}) {
+        INFO("content type: '" << ct << "'");
+        h.audit_log.clear();
+        auto open = h.sink.dispatch("POST", "/api/v1/access-reviews", R"({"title":"plain"})", ct,
+                                    kSameOrigin);
+        REQUIRE(open);
+        CHECK(open->status == 415);
+        CHECK(has_audit(h, "access_review.campaign_opened", "denied", "", "content_type_not_json"));
+
+        auto attest = h.sink.dispatch("POST", "/api/v1/access-reviews/" + cid + "/attestations",
+                                      attest_body("csrfuser", "CsrfRole"), ct, kSameOrigin);
+        REQUIRE(attest);
+        CHECK(attest->status == 415);
+        CHECK(has_audit(h, "access_review.attested", "denied", "", "content_type_not_json"));
+
+        // The cross-site check comes first: a forged text/plain write is a 403, not a 415.
+        auto forged = h.sink.dispatch("POST", "/api/v1/access-reviews/" + cid + "/attestations",
+                                      attest_body("csrfuser", "CsrfRole"), ct, kSiblingOrigin);
+        REQUIRE(forged);
+        CHECK(forged->status == 403);
+    }
+    CHECK(pending_in(h, cid) == pending0);
+    const auto campaigns = h.access_review_store->list_campaigns();
+    REQUIRE(campaigns.has_value());
+    CHECK(campaigns->size() == 1);
+
+    // Parameters and case on the media type are fine.
+    auto ok = h.sink.dispatch("POST", "/api/v1/access-reviews", R"({"title":"charset"})",
+                              "Application/JSON; charset=utf-8", kSameOrigin);
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+}
+
+TEST_CASE("access-reviews: same-origin and token calls still open, attest and close",
+          "[pg][access_review][rest][security][csrf]") {
+    AccessReviewHarness h;
+    seed_one_grant(h);
+
+    SECTION("a browser cookie session naming this site by Origin") {
+        h.sink.default_headers = kSameOrigin;
+        const auto cid = h.open_campaign_rest("same origin");
+        const int pending0 = pending_in(h, cid);
+        auto attest = h.sink.Post("/api/v1/access-reviews/" + cid + "/attestations",
+                                  attest_body("csrfuser", "CsrfRole"));
+        REQUIRE(attest);
+        CHECK(attest->status == 200);
+        CHECK(pending_in(h, cid) == pending0 - 1);
+        auto close = h.sink.Post("/api/v1/access-reviews/" + cid + "/close", "");
+        REQUIRE(close);
+        CHECK(close->status == 200);
+        for (const auto& r : h.audit_log)
+            CHECK(r.action != "csrf.denied");
+    }
+
+    SECTION("a browser cookie session naming this site by Referer only") {
+        h.sink.default_headers = kSameSiteReferer;
+        const auto cid = h.open_campaign_rest("same site referer");
+        auto close = h.sink.Post("/api/v1/access-reviews/" + cid + "/close", "");
+        REQUIRE(close);
+        CHECK(close->status == 200);
+    }
+
+    SECTION("an API-token caller sends no Origin and is not gated") {
+        h.session_auth_source = "api_token";
+        h.sink.default_headers.clear();
+        const auto cid = h.open_campaign_rest("token caller");
+        auto attest = h.sink.Post("/api/v1/access-reviews/" + cid + "/attestations",
+                                  attest_body("csrfuser", "CsrfRole"));
+        REQUIRE(attest);
+        CHECK(attest->status == 200);
+        auto close = h.sink.Post("/api/v1/access-reviews/" + cid + "/close", "");
+        REQUIRE(close);
+        CHECK(close->status == 200);
+        for (const auto& r : h.audit_log)
+            CHECK(r.action != "csrf.denied");
+    }
+
+    SECTION("a token caller is still held to a JSON body") {
+        h.session_auth_source = "api_token";
+        h.sink.default_headers.clear();
+        auto open = h.sink.Post("/api/v1/access-reviews", R"({"title":"x"})", "text/plain");
+        REQUIRE(open);
+        CHECK(open->status == 415);
+    }
+}
+
+TEST_CASE("access-reviews: the browser-write gate runs after the permission gate",
+          "[pg][access_review][rest][security][csrf]") {
+    AccessReviewHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return !(t == "AccessReview" && op == "Attest");
+    };
+    // A caller without AccessReview:Attest is told so (the gate's own 403), not "cross-site".
+    auto res = h.sink.dispatch("POST", "/api/v1/access-reviews", R"({"title":"x"})",
+                               "application/json", kSiblingOrigin);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("cross-site") == std::string::npos);
+    CHECK_FALSE(has_audit(h, "csrf.denied", "denied", "/api/v1/access-reviews",
+                          "cross-site or header-less browser write refused"));
 }
