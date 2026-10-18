@@ -596,6 +596,44 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 Hard invariants live in §"Hard invariants" of `docs/auth-mfa-design.md` —
 do not regress them when shipping PR 2 / PR 3.
 
+### Approver assurance (maker-checker, #6061)
+
+Reviewing an approval ticket is a human-review act, so approve and reject carry more than the
+`Approval:Approve` permission. `POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
+the dashboard Approvals page (which posts to the same routes) and the MCP tools `approve_request` /
+`reject_request` require all of:
+
+- an **interactive cookie session** (local or OIDC); API-token and MCP bearer sessions are refused
+  with a typed `403` (A4 envelope);
+- a **fresh MFA step-up** through the same `require_mfa_step_up` gate as the other step-up endpoints
+  (so the same pass-through for an account the gate cannot ask for a factor applies: a local account
+  that never enrolled, or an OIDC session without an `amr` proof under a mode that does not protect
+  its role);
+- a **human principal**, never an engine principal;
+- a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`).
+
+Consequences, each deliberate:
+
+- **MCP can never approve.** Every MCP session is bearer-authenticated, so the two MCP tools always
+  return the typed refusal. This is a recorded ADR-1005 exception ("human review is a human-session
+  act"). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
+  tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
+  #3151).
+- **SAML approvers are blocked while step-up is on.** SAML sessions can never pass step-up (#4935),
+  so a SAML-authenticated user cannot approve. This is the SAML consequence of "MFA enforcement with
+  SAML" below, not a separate rule.
+- **`--mfa-step-up-window-secs=0` lowers the assurance to "interactive session" only.** The step-up
+  gate is off for approvals as for every other step-up endpoint. Operators who rely on approvals as a
+  control should not set it; if they do, alert on `approval.approve` audit rows.
+- **Fail closed.** An unresolvable session (the "degraded session read", #4128) answers `503` and the
+  ticket stays pending; it is no longer recorded with the reviewer `unknown`. The approval attempt
+  is audited before the decision is applied, and an audit-write failure answers `503` with nothing
+  changed (#5823; approve and reject only, cancel is unchanged).
+- **Expiry at consume.** An approved ticket older than the 7-day window (measured from review) is
+  refused at consume using database time, even if no later submit has swept expiry.
+
+Operator-facing description: `docs/user-manual/instructions.md`, "Who can approve".
+
 ## JIT admin elevation (SOC 2 CC6.3/CC6.6)
 
 `/auth-and-authz` skill gap matrix P1 #9. Reduce **standing** privilege: a
@@ -1544,9 +1582,9 @@ applies to these two flags).
 ### MFA enforcement with SAML
 
 **MFA step-up is not supported for SAML sessions in this release.** A SAML
-session hitting any of the 24 step-up-gated endpoints (token mint/revoke,
-session revoke, Guardian rule write, software deploy, user delete/role change)
-receives a `403` with `"MFA step-up is not available for SAML sessions in this
+session hitting any step-up-gated endpoint (token mint/revoke,
+session revoke, Guardian rule write, software deploy, user delete/role change,
+approval approve/reject) receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"` — regardless of `--mfa-enforcement` mode. The gate (`require_mfa_step_up`
 in `mfa_step_up.cpp`) exits with an honest denial before reaching the local
 `mfa_status` lookup, which would fail anyway (SAML users have no local `users`
@@ -1559,6 +1597,9 @@ row). This means:
   via group→role mapping (see Group→role mapping above) — both are denied.
 - `--mfa-enforcement=optional` — same: the SAML-specific exit fires before
   enforcement mode is consulted.
+
+A SAML user therefore cannot approve or reject approval tickets while step-up is on
+(see "Approver assurance" above).
 
 **Recommendation:** Use `--mfa-enforcement=optional` or `--mfa-enforcement=admin-only`
 when SAML is in use, and configure your IdP to enforce MFA at login time. Avoid

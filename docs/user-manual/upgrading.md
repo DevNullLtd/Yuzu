@@ -2,6 +2,36 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: approving or rejecting a request now needs an interactive session and MFA step-up; MCP cannot approve (#6061)
+
+**What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
+the dashboard Approvals page, and the MCP tools `approve_request` / `reject_request`) now require all of:
+an interactive cookie session (local or OIDC), a fresh MFA step-up, a human principal and not an engine
+principal. The existing rule that the reviewer cannot be the submitter is unchanged.
+
+- **API-token and MCP-token sessions are refused** with a typed `403` (A4 error envelope).
+- **MCP can no longer approve or reject.** Every MCP session is bearer-authenticated, so
+  `approve_request` and `reject_request` always return a typed refusal. This is a recorded ADR-1005
+  exception ("human review is a human-session act"). The tools stay registered, and listing pending
+  approvals through MCP is unchanged. Their tier/permission mapping is `Approval:Approve` (it was
+  mapped as `Approval:Write`, #3151).
+- **SAML users cannot approve while MFA step-up is on.** SAML sessions can never pass step-up (#4935).
+- **A degraded session read fails closed.** The route answers `503` and the request stays pending; it no
+  longer records the reviewer `unknown` (#4128).
+- **The attempt is audited first.** If the audit row cannot be written, approve and reject return `503`
+  and change nothing (#5823). Cancel is unchanged.
+- **Expiry is enforced at consume.** An approved request not used within 7 days of its review is refused
+  when it is consumed, using database time, even if no new request has been submitted since.
+
+**Who this affects.** Any automation that approved or rejected over MCP or with an API token. It will now
+fail. A supervised-tier agentic worker still requests approval and recalls with the `approval_id`, but a
+person must approve in the dashboard or over REST on a signed-in session. SAML-only approvers must sign
+in with a local account or OIDC. Scripts that approve with a session cookie must complete the step-up
+(`POST /login/mfa/stepup`) when they receive `401` with `meta.mfa_step_up_required`.
+
+**If you set `--mfa-step-up-window-secs=0`,** approval loses its MFA requirement and is protected by the
+interactive-session rule only. Alert on `approval.approve` audit rows if you run that way.
+
 ## Behaviour change: the macOS agent package installs transactionally and can refuse
 
 This applies to every macOS `.pkg`, including the release package.

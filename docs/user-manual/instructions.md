@@ -601,7 +601,60 @@ When a user (or MCP tool) executes an instruction that requires approval:
 
 The submitter cannot approve their own request. A different user with the appropriate role must review it.
 
+### Who can approve
+
+Approving or rejecting a request is an act of human review, so the server asks for more than the
+`Approval:Approve` permission. The same rules apply to the dashboard Approvals page, which posts to
+the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject`:
+
+- **An interactive browser session.** The reviewer must be signed in through the sign-in page with a
+  local account or OIDC single sign-on, and the request must carry that session cookie. An API token or an MCP
+  token is refused with `403` and an A4 error envelope, however much it is permitted to do
+  elsewhere.
+- **A fresh MFA step-up.** Approve and reject are step-up endpoints, like token creation and role
+  changes. If the session's MFA proof is older than `--mfa-step-up-window-secs` (default 300), the
+  request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
+  inline, and a script posts the code to `/login/mfa/stepup` and retries (see
+  [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). As on every
+  step-up endpoint, the gate cannot demand a factor an account does not have: a local account that
+  never enrolled in MFA, or an SSO account whose identity provider did not assert MFA, passes it
+  while `--mfa-enforcement=optional`. To make a fresh factor mandatory for every approver, run with
+  `--mfa-enforcement=required`.
+- **A human principal.** An engine principal is never admitted.
+- **Not the submitter.** Unchanged: the reviewer cannot be the person who submitted the request
+  (HTTP 400, audited as denied).
+- **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who
+  signed in through SAML is refused with `403` while step-up is on. Approvers who use SAML cannot
+  approve until they sign in with a local account or OIDC, or step-up is disabled (next point).
+- **If you disable step-up, assurance drops.** `--mfa-step-up-window-secs=0` turns the step-up gate
+  off for approve and reject along with every other step-up endpoint. Approval then requires only an
+  interactive session with the permission. Do not run that way if approvals are a control you rely
+  on; if you must, alert on `approval.approve` audit rows so a human reviews each one.
+
+**MCP clients cannot approve.** Every MCP session is bearer-authenticated, so the MCP tools
+`approve_request` and `reject_request` always return a typed refusal. This is a recorded
+ADR-1005 exception: human review is a human-session act. The tools stay registered, and listing
+pending approvals through MCP (`list_pending_approvals`, `get_pending_approval_count`) is
+unchanged. A supervised-tier agentic worker still gets its ticket from the first call and still
+recalls the tool with the `approval_id`; a person approves the ticket in the dashboard or over REST
+with a signed-in session.
+
+**Failure behaviour.**
+
+- If the server cannot resolve the caller's session while recording the decision, the request fails
+  closed with `503` and the request stays pending. It is no longer recorded with the reviewer
+  `unknown`.
+- The approval attempt is written to the audit log before the decision is applied. If that audit row
+  cannot be written, the request returns `503` and nothing changes (#5823). Cancelling a request is
+  unchanged.
+- An approved request that has not been used within 7 days of its review is refused when it is
+  consumed, even if no new request has been submitted since to sweep expired tickets. The check
+  uses database time. The submitter must request approval again.
+
 ### Approval API
+
+Approve and reject need a signed-in session cookie (see [Who can approve](#who-can-approve)); a bearer
+token is refused. The examples assume a session that has completed MFA step-up.
 
 ```bash
 # Check pending approval count

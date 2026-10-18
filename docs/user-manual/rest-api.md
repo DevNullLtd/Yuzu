@@ -10736,9 +10736,11 @@ HTML fragment behind the Instructions Approvals tab and the Approvals page (`/ap
 
 Approve a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
 
+**Who may call it.** Requires `Approval:Approve` and an interactive cookie session (local or OIDC) with a fresh MFA step-up: a stale proof returns `401` with `meta.mfa_step_up_required: true` and `meta.challenge_url`, exactly as on the other step-up endpoints (`docs/user-manual/authentication.md`, "Step-up on high-risk surfaces"). An API-token or MCP-token session is refused with `403` and an A4 error envelope, and an engine principal is never admitted; a SAML session is refused with `403` because MFA step-up is not available to it (#4935). `--mfa-step-up-window-secs=0` disables the step-up requirement, leaving only the interactive-session rule. The reviewer cannot be the submitter (`400`, audited as denied). Fail-closed behaviour: if the caller's session cannot be resolved the route returns `503` and the request stays pending; the approval attempt is audited before the decision is applied, and if that audit row cannot be written the route returns `503` and changes nothing (#5823). An approved ticket not consumed within 7 days of its review is refused at consume. Full rules: `docs/user-manual/instructions.md`, "Who can approve".
+
 #### `POST /api/approvals/{id}/reject`
 
-Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
+Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded. Same caller requirements and fail-closed behaviour as `POST /api/approvals/{id}/approve` above.
 
 ---
 
