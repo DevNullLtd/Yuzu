@@ -120,7 +120,8 @@ TEST_CASE("reviews glue: a read fragment whose audit row failed is flagged in it
           "[access-reviews][js]") {
     const std::string& js = yuzu::server::kYuzuAuditJs;
     for (const char* token : {"'htmx:afterRequest'", "getResponseHeader('Sec-Audit-Failed')",
-                              "'/fragments/access/reviews/'", "'ar-audit-failed'",
+                              "'/fragments/access/reviews/'", "note.id = 'ar-audit-failed'",
+                              "getElementById('ar-audit-failed')",
                               "note.setAttribute('role', 'alert')"}) {
         INFO(token);
         CHECK_THAT(js, ContainsSubstring(token));
