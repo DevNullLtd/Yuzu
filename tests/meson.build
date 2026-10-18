@@ -1623,6 +1623,7 @@ if build_server
       'unit/server/test_guardian_generation_cache.cpp', # #5513: TTL-cached policy-generation read
       'unit/server/test_guardian_rule_bundle.cpp', # #5513: per-generation rule-bundle memo
       'unit/server/test_guardian_reconcile_flow.cpp', # #5513: the heartbeat reconcile control flow (GuardianReconcileFlow::run)
+      'unit/server/test_guardian_rule_scope_preflight.cpp', # #5610: the fan-out resolves every rule scope before sending and aborts on a transient failure
       'unit/server/test_agent_registry_scope_for_agent.cpp', # #5513: single-agent scope evaluator
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',

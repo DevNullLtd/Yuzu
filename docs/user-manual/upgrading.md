@@ -269,7 +269,7 @@ that sign in with `POST /login` need no change. Bookmarks to `/login` keep worki
 - `result="degraded"` and `guaranteed_state.reconcile` audit rows beginning `heartbeat reconcile ABORTED` during a tag or property store outage. These rows are new for a scope-read failure. They do not raise `YuzuGuardianReadDegraded`; the tag-store and custom-properties read-degrade alerts (`YuzuTagStoreReadDegraded`, `YuzuCustomPropertiesReadDegraded`, both warning severity) are the alerts that fire for it.
 - Agents with an armed rule keep it during such an outage; an agent that has nothing armed yet receives no rules, scope-free rules included, until the store recovers.
 
-**Rolling upgrades with more than one server.** A replica still on the previous release keeps the old behaviour (no budget, and a narrowed push on a degraded tag or property read) until it is upgraded. The REST and dashboard policy-bump fan-out still narrows on a degraded tag or property read; that path is unchanged in this release and it is tracked in #5610.
+**Rolling upgrades with more than one server.** A replica still on the previous release keeps the old behaviour (no budget, and a narrowed push on a degraded tag or property read) until it is upgraded. The REST and dashboard policy-bump fan-out now also aborts with `503` on a degraded tag or property read (#5610); a replica still on the previous release narrows it.
 
 No agent or protocol change, and no config or data migration, is required.
 

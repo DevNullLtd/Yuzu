@@ -132,6 +132,7 @@
 #include "guaranteed_state_store.hpp"
 #include "baseline_store.hpp"
 #include "guardian_push_builder.hpp"
+#include "guardian_rule_scope_preflight.hpp"
 #include "guardian_reconcile_flow.hpp" // #5513 the heartbeat reconcile control flow (unit tested)
 #include "guardian_generation_cache.hpp" // #5513 short-TTL generation read
 #include "guardian_reconcile_gate.hpp" // #5513 claim map + admission budget
@@ -20713,39 +20714,51 @@ private:
                     // atom with no store wired still ABORTS (Unresolvable)
                     // instead of silently evaluating the atom false (which a
                     // NOT combinator inverted to a fleet-wide arm);
-                    // value_or({}) collapses the abort to zero targets — arm
-                    // nothing, the safe direction on the push path. Unlike
-                    // evaluate_scope, this can never abort for a presence
-                    // reason, so a presence-store blip cannot periodically
-                    // disarm this push.
-                    targets = registry_.evaluate_scope_local(*parsed_scope, tag_store_.get(),
-                                                             custom_properties_store_.get())
-                                  .value_or(std::vector<std::string>{});
+                    // An Unresolvable expression (a permanent property of the scope
+                    // text) resolves to zero targets: arm nothing. A degraded store
+                    // read does NOT: it aborts the push (-2), because nothing is sent
+                    // and the caller keeps the bump due, instead of a push that
+                    // quietly addresses nobody (#5610). Unlike evaluate_scope, this
+                    // can never abort for a presence reason, so a presence-store blip
+                    // cannot periodically disarm this push.
+                    auto resolved = registry_.evaluate_scope_local(
+                        *parsed_scope, tag_store_.get(), custom_properties_store_.get());
+                    if (resolved) {
+                        targets = std::move(*resolved);
+                    } else if (resolved.error().kind != ScopeEvalError::Kind::Unresolvable) {
+                        spdlog::warn("Guardian push: target scope read degraded ({}) - "
+                                     "aborting push (scope={})",
+                                     ::yuzu::log_key_token(resolved.error().detail),
+                                     ::yuzu::log_key_token(scope));
+                        return -2;
+                    }
                 }
 
-                // Per-rule scope membership, evaluated once per distinct scope_expr
-                // and cached, so the fan-out is O(agents + distinct_scopes) rather
-                // than O(agents × rules).
-                std::unordered_map<std::string, std::unordered_set<std::string>> scope_cache;
+                // Per-rule scope membership, resolved ONCE per distinct scope_expr BEFORE
+                // anything is sent, so the fan-out is O(agents + distinct_scopes) rather
+                // than O(agents x rules) and a degraded tag or property read aborts the
+                // whole push (-2) instead of omitting the scoped rule from every agent's
+                // full_sync and acknowledging the new generation (#5610). An unparseable
+                // or Unresolvable expression is out of scope for everyone, as before.
+                std::optional<guardian::RuleScopeMembers> rule_scopes;
+                if (!targets.empty()) {
+                    auto resolved_scopes = guardian::preflight_rule_scopes(
+                        rules, [&](const yuzu::scope::Expression& expr) {
+                            return registry_.evaluate_scope_local(
+                                expr, tag_store_.get(), custom_properties_store_.get());
+                        });
+                    if (!resolved_scopes) {
+                        spdlog::warn("Guardian push: rule scope read degraded ({}) - aborting "
+                                     "push, nothing sent (scope={})",
+                                     ::yuzu::log_key_token(resolved_scopes.error().error.detail),
+                                     ::yuzu::log_key_token(scope));
+                        return -2;
+                    }
+                    rule_scopes = std::move(*resolved_scopes);
+                }
                 auto agent_in_scope = [&](const std::string& aid,
                                           const std::string& expr) -> bool {
-                    auto it = scope_cache.find(expr);
-                    if (it == scope_cache.end()) {
-                        std::unordered_set<std::string> ids;
-                        if (auto parsed = yuzu::scope::parse(expr)) {
-                            // Same evaluate_scope_local semantics as above
-                            // (#4981 PR-1 B4): a from_result_set: atom aborts;
-                            // value_or({}) => this agent is treated as
-                            // out-of-scope (arm nothing) — never a presence
-                            // abort, since this push is LOCAL-ONLY.
-                            auto v = registry_.evaluate_scope_local(*parsed, tag_store_.get(),
-                                                                    custom_properties_store_.get())
-                                        .value_or(std::vector<std::string>{});
-                            ids.insert(v.begin(), v.end());
-                        }
-                        it = scope_cache.emplace(expr, std::move(ids)).first;
-                    }
-                    return it->second.contains(aid);
+                    return rule_scopes && rule_scopes->contains(expr, aid);
                 };
 
                 // Build and send a per-agent FILTERED push (M4 / #1209): each agent
