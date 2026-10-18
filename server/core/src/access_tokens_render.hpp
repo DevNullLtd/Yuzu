@@ -145,8 +145,9 @@ struct PrincipalDetail {
     bool rbac_enforced{false};
     /// Names of the roles an engine principal may hold (non-system roles only). Empty = none
     /// exist: Assign is drawn disabled with the reason. Unavailable = the role list could not
-    /// be read: Assign is disabled and the panel says so, never "no custom roles".
-    std::variant<std::vector<std::string>, Unavailable> custom_roles;
+    /// be read: Assign is disabled and the panel says so, never "no custom roles". Withheld =
+    /// the caller lacks UserManagement:Read (the REST role listing's gate): no name is drawn.
+    std::variant<std::vector<std::string>, Unavailable, Withheld> custom_roles;
 };
 
 [[nodiscard]] std::string render_principal_detail(

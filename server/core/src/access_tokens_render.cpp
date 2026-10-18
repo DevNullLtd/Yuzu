@@ -482,7 +482,9 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
     out += "<section class=\"panel\"><div class=\"hd\"><h2>Roles</h2>";
     const auto* custom = std::get_if<std::vector<std::string>>(&d.custom_roles);
     const char* no_assign = nullptr;  // why Assign is disabled, when it is
-    if (!custom)
+    if (std::holds_alternative<Withheld>(d.custom_roles))
+        no_assign = "Assigning a role needs the UserManagement:Read permission to list the custom roles.";
+    else if (!custom)
         no_assign = "The role list could not be read.";
     else if (custom->empty())
         no_assign = "No custom roles exist. Engine principals can only hold custom roles; built-in roles are refused.";

@@ -208,8 +208,12 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                  d.can_write = !d.rbac_enforced || allowed(deps, req, "Security", "Write");
                  // Only an active principal the caller may change draws Assign. An unreadable
                  // role list is Unavailable (Assign disabled, the panel says so), never "none".
+                 // The catalog is read behind UserManagement:Read, as GET /api/v1/rbac/roles
+                 // is: a Security:Write holder without it learns no role names here (Withheld).
                  if (d.can_write && d.row.lifecycle_state == "active") {
-                     if (auto cr = deps.custom_roles_fn(); cr) {
+                     if (!may_read(deps, req, "UserManagement")) {
+                         d.custom_roles = Withheld{};
+                     } else if (auto cr = deps.custom_roles_fn(); cr) {
                          d.custom_roles = std::move(*cr);
                      } else {
                          spdlog::warn("/fragments/access/principals/detail custom roles: {}", cr.error());

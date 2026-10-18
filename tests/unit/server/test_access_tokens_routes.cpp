@@ -767,6 +767,35 @@ TEST_CASE("principals routes: Assign offers custom roles only; an unreadable rol
     CHECK_THAT(res->body, !ContainsSubstring("exploded"));
 }
 
+TEST_CASE("principals routes: a Security:Write holder without UserManagement:Read sees no role names",
+          "[access-tokens][routes][writes]") {
+    Harness h;
+    h.rbac = true;
+    h.custom_roles = std::vector<std::string>{"Auditor-secret"};
+    h.perm_deny.insert("UserManagement:Read");
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, !ContainsSubstring("Auditor-secret"));
+    CHECK_THAT(res->body, !ContainsSubstring("role-options"));
+    CHECK_THAT(res->body, ContainsSubstring("disabled title=\"Assigning a role needs the UserManagement:Read permission"));
+    CHECK_THAT(res->body, !ContainsSubstring("The role list could not be read"));
+    // The catalog is not even read for that caller.
+    Harness reads;
+    reads.rbac = true;
+    reads.perm_deny.insert("UserManagement:Read");
+    int calls = 0;
+    auto d = reads.deps();
+    d.custom_roles_fn = [&calls]() -> std::expected<std::vector<std::string>, std::string> {
+        ++calls;
+        return std::vector<std::string>{"x"};
+    };
+    access_tokens::register_access_tokens_routes(reads.sink, d);
+    REQUIRE(reads.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot"));
+    CHECK(calls == 0);
+}
+
 TEST_CASE("tokens routes: the write glue is served uncached as JavaScript", "[access-tokens][routes][writes]") {
     Harness h;
     h.wire();
