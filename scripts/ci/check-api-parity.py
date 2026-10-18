@@ -2139,6 +2139,7 @@ def _selftest():
           and "::error::" not in out_l, f"lapse: run_check warns once and still passes, got {rc_l}: {out_l[:300]}")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dsum:
         summ = Path(dsum) / "summary.md"
+        summ.write_text("an earlier step\n", encoding="utf-8")
         for env_val, want in ((str(summ), True), (str(Path(dsum) / "no_such_dir" / "x.md"), False), (None, False)):
             saved = os.environ.get("GITHUB_STEP_SUMMARY")
             if env_val is None:
@@ -2155,8 +2156,9 @@ def _selftest():
             check(rc_s == 0 and "::error::" not in out_s,
                   f"step summary: an unwritable or unset summary path never changes the result, got {rc_s}: {out_s[:200]}")
         body_s = summ.read_text(encoding="utf-8") if summ.exists() else ""
-        check("exception revisit dates" in body_s and "or retire it" in body_s and body_s.count("###") == 1,
-              f"step summary: the lapse notice is appended once when the path is writable, got {body_s!r}")
+        check(body_s.startswith("an earlier step\n") and "exception revisit dates" in body_s
+              and "or retire it" in body_s and body_s.count("###") == 1,
+              f"step summary: the lapse notice is appended once, after what is already there, got {body_s!r}")
         rc_s, out_s = _drive(base_rows, today=day_a - 100 * one_day)
         check(not summ.read_text(encoding="utf-8").count("###") > 1, "step summary: nothing is appended when no revisit date is near")
     rc_l, out_l = _drive(base_rows, today=day_a - 100 * one_day)
