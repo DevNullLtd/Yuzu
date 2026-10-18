@@ -258,7 +258,7 @@ yuzu_tokens_actions_js_embed = custom_target(
   input: 'static/yuzu-tokens-actions.js',
   output: 'yuzu_tokens_actions_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
