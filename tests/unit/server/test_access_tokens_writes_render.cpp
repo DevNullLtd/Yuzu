@@ -181,16 +181,19 @@ TEST_CASE("tokens write render: the 120 s recovery window offers Rotate on a pre
         return std::vector<ApiToken>{pred, succ};
     };
     // Inside the window: the predecessor row carries Rotate (the way to get the secret again).
+    // The window and the 24 h floor are the store's own values (the page keeps no copy).
+    constexpr std::int64_t kGrace = ApiTokenStore::rotation_grace_secs();
+    static_assert(kGrace == 120 && ApiTokenStore::overlap_floor_secs() == 24 * 3600);
     auto in = render_tokens_list(view(make(60)), flags(kAll));
     CHECK(count(in, "data-tk=\"token-rotate\"") == 1);
     CHECK_THAT(in, ContainsSubstring("data-token-id=\"pred\" data-name=\"ci\">Rotate"));
     // The successor always offers Confirm.
     CHECK(count(in, "data-tk=\"token-confirm\"") == 1);
     // Outside the window the predecessor shows only its status.
-    auto out = render_tokens_list(view(make(121)), flags(kAll));
+    auto out = render_tokens_list(view(make(kGrace + 1)), flags(kAll));
     CHECK(count(out, "data-tk=\"token-rotate\"") == 0);
-    // Exactly at 120 s is outside (the server answers 409 from then on).
-    CHECK(count(render_tokens_list(view(make(120)), flags(kAll)), "data-tk=\"token-rotate\"") == 0);
+    // Exactly at the window is still inside (the server answers 409 only when older than it).
+    CHECK(count(render_tokens_list(view(make(kGrace)), flags(kAll)), "data-tk=\"token-rotate\"") == 1);
     // Confirm names the predecessor, not the successor.
     CHECK_THAT(in, ContainsSubstring("data-predecessor=\"ci\""));
 }

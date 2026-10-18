@@ -141,9 +141,10 @@ std::string principals_toolbar(const PrincipalsView& v) {
 }
 
 // Rotation grace window: a second rotate by the same operator inside it returns the same
-// successor secret (ApiTokenStore::kRotationGraceSecs). The server stays authoritative.
-constexpr std::int64_t kRotationGraceSecs = 120;
-constexpr std::int64_t kRotateMinRemainingSecs = 24 * 3600;
+// successor secret. A token with less life left than the overlap floor cannot be rotated. Both
+// are read from the store, so they cannot drift. The server stays authoritative.
+constexpr std::int64_t kRotationGraceSecs = ApiTokenStore::rotation_grace_secs();
+constexpr std::int64_t kRotateMinRemainingSecs = ApiTokenStore::overlap_floor_secs();
 
 std::string token_actions(const ApiToken& t, const std::vector<ApiToken>& all, const PageFlags& f) {
     // A row whose id could not safely sit in a request path gets no controls at all.
@@ -172,7 +173,7 @@ std::string token_actions(const ApiToken& t, const std::vector<ApiToken>& all, c
             // The predecessor of a pair: offer Rotate only while the successor is inside the
             // grace window, which is the one way to get its secret again (never earlier or later).
             for (const auto& succ : all)
-                if (succ.supersedes_token_id == t.token_id && f.now - succ.created_at < kRotationGraceSecs) {
+                if (succ.supersedes_token_id == t.token_id && f.now - succ.created_at <= kRotationGraceSecs) {
                     out += act("token-rotate", {{"data-token-id", t.token_id}, {"data-name", t.name}}, "Rotate");
                     break;
                 }
@@ -209,7 +210,7 @@ std::string principal_actions(const PrincipalDetail& d) {
                        "Confirm credential", false, nullptr, true);
             // Lost the response to the rotate? Within the grace window the same call returns the
             // same secret; after it the only way out is to revoke the successor and rotate again.
-            if (creds->size() == 2 && d.now - succ->created_at < kRotationGraceSecs)
+            if (creds->size() == 2 && d.now - succ->created_at <= kRotationGraceSecs)
                 out += solid("principal-rotate", "Rotate credential");
         } else if (creds->size() == 1) {
             out += solid("principal-rotate", "Rotate credential");
