@@ -25,6 +25,9 @@
 # what the connected server reports; it cannot detect an ssh -L tunnel or a port forward
 # to a different stack, and it is not an authorisation control. The password on the
 # command line is visible in ps; http:// with --allow-remote sends it in cleartext.
+# Permissions: Execution:Execute to dispatch, Response:Read to poll the results and
+# Infrastructure:Read for the agent lookup. The manifest is an attempt log, not outcome
+# evidence; see the runner's --help for the recovery recipe after a stop.
 #
 # Usage:
 #   bash scripts/test/instructions-tests.sh \
@@ -35,9 +38,10 @@
 # Returns:
 #   0    every runnable instruction passed (or returned expected pending_approval)
 #   1    one or more failed / errored, the run stopped early, or a destructive/forensic
-#        run executed nothing (every row skipped or pending approval)
+#        run executed nothing (every such row skipped or pending approval)
 #   2    argument, infrastructure or pre-flight error (login, content-dir empty,
-#        destructive/forensic targeting, --params-override, --run-id); nothing dispatched
+#        destructive/forensic targeting, --params-override, --run-id, an unwritable
+#        --output); nothing dispatched
 #   130  interrupted (Ctrl-C or SIGTERM)
 
 set -uo pipefail
@@ -58,7 +62,7 @@ ALLOW_REMOTE=0
 MATCH=""
 ONLY_ID=""
 PARALLELISM="4"
-POLL_TIMEOUT="30"
+POLL_TIMEOUT=""
 PARAMS_OVERRIDE=""
 OUTPUT=""
 VERBOSE=0
@@ -98,9 +102,11 @@ Optional:
   --only-id ID             run exactly one definition (debugging)
   --parallelism N          concurrent dispatches (default: 4; forced to 1 when
                            destructive or forensic is selected)
-  --poll-timeout SECONDS   per-instruction response poll cap (default: 30; 120 for
-                           destructive/forensic rows unless given; a targeted row
-                           still running at the deadline fails and stops the run)
+  --poll-timeout SECONDS   per-instruction response poll cap (when not given the
+                           runner uses 30 s, and exactly 120 s for destructive/
+                           forensic rows; a targeted row that ends without a
+                           verdict - no rows, still running, polls failing -
+                           fails and stops the run)
   --params-override FILE   JSON mapping {definition_id: {param: value}} (strings
                            or integers) — overrides for the schema-synthesised
                            defaults; for destructive/forensic it is required and
@@ -160,10 +166,10 @@ ARGS=(
     --password "$PASSWORD"
     --risks "${RISKS[@]}"
     --parallelism "$PARALLELISM"
-    --poll-timeout "$POLL_TIMEOUT"
     --gate-name "$GATE_NAME"
 )
 [[ -n "$RUN_ID" ]]          && ARGS+=(--run-id "$RUN_ID")
+[[ -n "$POLL_TIMEOUT" ]]    && ARGS+=(--poll-timeout "$POLL_TIMEOUT")
 [[ -n "$TARGET_AGENT_ID" ]] && ARGS+=(--target-agent-id "$TARGET_AGENT_ID")
 [[ -n "$CONFIRM_TARGET" ]]  && ARGS+=(--confirm-target "$CONFIRM_TARGET")
 [[ -n "$MANIFEST" ]]        && ARGS+=(--manifest "$MANIFEST")

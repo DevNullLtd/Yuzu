@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-instructions_runner.py — schema-driven REST exerciser for the
+instructions_runner.py - schema-driven REST exerciser for the
 InstructionDefinitions shipped under content/definitions/.
 
 Companion to scripts/test/instructions-tests.sh (the bash entry that the
@@ -9,7 +9,7 @@ scripts/test/synthetic-uat-tests.sh:
   - form-login at POST /login (session cookie)
   - dispatch via POST /api/instructions/:id/execute (workflow_routes.cpp:1290)
   - poll results via GET /api/responses/:command_id (used by synthetic
-    UAT test 6 — same correlation pattern)
+    UAT test 6 - same correlation pattern)
 
 Per-instruction outcome (recorded to the test-runs DB as both timing
 and gate_notes):
@@ -22,7 +22,7 @@ and gate_notes):
                     answer errored (a destructive/forensic row also fails on
                     any errored answer, any error_detail, or a row still running
                     at the poll deadline)
-  pending_approval  HTTP 202 with status=pending_approval — expected for
+  pending_approval  HTTP 202 with status=pending_approval - expected for
                     approval=always/auto/role-gated; not a failure, but nothing
                     ran and not a semantic check either
   skip              definition risk-tag excluded by the --risks filter
@@ -30,7 +30,7 @@ and gate_notes):
                     destructive/forensic definition the targeted run may not
                     dispatch (no override entry, required parameter missing,
                     server.* row, not eligible on the target's OS)
-  error             internal runner error (network, JSON parse, etc.) —
+  error             internal runner error (network, JSON parse, etc.) -
                     distinct from `fail` so flake-watching can separate
                     "instruction broken" from "test infra broken"
 
@@ -59,18 +59,25 @@ run that selects either class with --risks is a targeted run and needs all of:
 Anything missing is a configuration error: exit 2, nothing dispatched. These instructions change
 or read a real device, so a targeted run is serial, appends each dispatch to a manifest before
 sending it, and polls each targeted row until every response row is terminal or the poll deadline
-passes (--poll-timeout, at least 120 s for these classes unless given explicitly). It passes a row
-only if every response row is SUCCESS with no error_detail; a row still running at the deadline
-fails the run and stops further dispatch, so a following action never overlaps it. Ctrl-C and
-SIGTERM stop dispatching (exit 130); a dispatch already sent is reported as in_flight_unknown, and
-a transport failure after a POST was sent as dispatch_unknown (the run stops). Three consecutive
-401/403 answers to execute, or to a targeted poll (503 too), stop the run.
+passes (--poll-timeout; exactly 120 s for these classes unless it is given). A RUNNING row exists
+only for flushed output, so a quiet long-running action shows no rows at all until it finishes. A
+row passes only if every response row is SUCCESS with no error_detail. A row that ends without a
+verdict from terminal rows (no rows, rows still running, or polls failing for any reason) fails and
+stops further dispatch, so a following action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED
+row is a known outcome and does not stop the run. Ctrl-C and SIGTERM stop dispatching (exit 130); a
+dispatch already sent is reported as in_flight_unknown. A dispatch_unknown row (a transport failure
+after the POST was sent, a non-object 200 body, an HTTP 500/502/504 or an unexplained 503, or any
+failure after an accepted POST) also stops the run. Three consecutive 401/403 answers to execute, or
+401/403/503 to a targeted poll, stop it too. A 202 pending_approval (approval mode always,
+role-gated for a non-admin caller, or an unrecognised mode; never auto) executed nothing. Dispatch
+needs Execution:Execute, polling Response:Read and the agent lookup Infrastructure:Read.
 
-Exit codes: 0 all passed; 1 a failure or error, an early stop, or a targeted run in which nothing
-was executed (every row skipped or pending approval); 2 configuration/login/pre-flight error with
-nothing dispatched; 130 interrupted. The manifest is an attempt log, not outcome evidence: its
-first line is run-start, then one line per dispatch holding the exact params sent (treat it as
-sensitive; it is created 0600 and only at creation).
+Exit codes: 0 all passed; 1 a failure or error, an early stop, or a targeted run in which no
+destructive/forensic row was executed (every one skipped or pending approval); 2 configuration,
+login or pre-flight error (including an unwritable --output) with nothing dispatched; 130
+interrupted. The manifest is an attempt log, not outcome evidence: its first line is run-start, then
+one line per dispatch holding the exact params sent (treat it as sensitive; it is created 0600 on
+POSIX, at creation only).
 
 --confirm-target is a wrong-target typo guard against what the connected server reports. It cannot
 detect an ssh -L tunnel or a port forward to a different stack, and it is not an authorisation or
@@ -171,10 +178,10 @@ class Outcome:
         self.note = esc(self.note)  # a name or message from the server or an agent (CWE-117)
 
     def short(self) -> str:
-        bits = [f"{self.id} [{self.risk}]", self.status.upper(), f"{self.duration_ms}ms"]
+        bits = [f"{esc(self.id)} [{self.risk}]", self.status.upper(), f"{self.duration_ms}ms"]
         if self.note:
             bits.append(self.note)
-        return " — ".join(bits)
+        return " - ".join(bits)
 
 
 # ── inventory loaders ──────────────────────────────────────────────────────
@@ -505,7 +512,20 @@ class YuzuClient:
             with self.opener.open(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as e:
-            return {"error": str(e), "code": e.code}
+            try:
+                try:
+                    body = json.loads(e.read() or b"{}")
+                except Exception:
+                    body = {}
+            finally:
+                e.close()
+            msg = error_message(body)
+            out: dict[str, Any] = {"error": f"HTTP {e.code}" + (f" {msg}" if msg else ""),
+                                   "code": e.code}
+            perm = a4_permission(body)
+            if perm:
+                out["permission"] = perm
+            return out
         except Exception as e:  # URLError, TimeoutError, JSONDecodeError, OSError ...
             return {"error": f"{type(e).__name__}: {e}"}
 
@@ -563,7 +583,8 @@ INTERIM_STATUSES = ("running", "pending", "queued", "in_progress", "started", "d
 class RunControl:
     """State shared by the workers and run(): the stop flag, which dispatches were begun."""
 
-    def __init__(self) -> None:
+    def __init__(self, poll_explicit: bool = False) -> None:
+        self.poll_explicit = poll_explicit   # --poll-timeout was given; notes only then name it
         self.stop = threading.Event()
         self.sent: set[str] = set()   # definition ids whose execute POST was begun
         self.abort_reason = ""
@@ -630,6 +651,40 @@ def error_message(payload: Any) -> str:
 TARGETED_UNSUPPORTED = {
     "testing.chargen.start": "streams until stopped; run it by hand with testing.chargen.stop",
 }
+
+
+def a4_permission(body: Any) -> str:
+    """The "<securable>:<operation>" an A4 denial names, "" when it names none."""
+    err = body.get("error") if isinstance(body, dict) else None
+    perm = (err.get("permission") if isinstance(err, dict) else None) or \
+           (body.get("permission") if isinstance(body, dict) else None)
+    return perm if isinstance(perm, str) else ""
+
+
+# Server evidence for the rule below (workflow_routes.cpp, the instruction execute handler): every
+# refusal it makes before it sends is a 400/403/404 or a 503 carrying one of these reasons (or the
+# "no agents reached" 503 when `sent == 0`), and nothing had been dispatched. A 500 ("dispatch
+# failed", thrown after sends began), a 502/504 from a proxy in front of it, or a 503 without such a
+# reason can come after the action started, so its outcome is unknown.
+PRE_DISPATCH_503_REASONS = ("containment_unreadable", "route_unreadable", "os_gate_unreadable",
+                            "quarantined", "plugin_not_found", "kill_switched_os")
+
+
+def _post_outcome_unknown(code: int, payload: Any) -> bool:
+    """Whether a targeted execute answer leaves it unknown if the action started."""
+    if code in (500, 502, 504):
+        return True
+    if code != 503:
+        return False
+    err = payload.get("error") if isinstance(payload, dict) else None
+    tokens = []
+    if isinstance(err, dict):
+        tokens += [err.get("reason"), err.get("code")]
+    if isinstance(payload, dict):
+        tokens.append(payload.get("reason"))
+    if any(tok in PRE_DISPATCH_503_REASONS for tok in tokens if isinstance(tok, str)):
+        return False
+    return "no agents reached" not in error_message(payload).lower()
 
 
 def targeted_skip_reason(defn: Definition, param_overrides: dict[str, dict[str, Any]],
@@ -723,13 +778,15 @@ def _may_have_been_sent(e: BaseException) -> bool:
     return isinstance(e, (OSError, http.client.HTTPException, ValueError))
 
 
-def _dispatch_unknown(defn: Definition, control: RunControl, duration_ms: int, detail: str) -> Outcome:
+def _dispatch_unknown(defn: Definition, control: RunControl, duration_ms: int, detail: str,
+                      manifest: Manifest | None = None) -> Outcome:
     control.request_stop("a targeted dispatch may have reached the server but its outcome is "
                          "unknown (dispatch_unknown); stopping",
                          "stopped: previous dispatch outcome unknown")
+    where = f" {esc(manifest.path)}" if getattr(manifest, "path", None) else ""
     return Outcome(defn.id, defn.risk, "error", duration_ms, dispatch_unknown=True,
-                   note="dispatch_unknown: the request may have reached the server and the action "
-                        "may have run (see the manifest); do not re-run blindly [" + detail + "]")
+                   note=f"dispatch_unknown: the request may have reached the server and the action "
+                        f"may have run (see the manifest{where}); do not re-run blindly [{detail}]")
 
 
 def exercise(client: YuzuClient, defn: Definition,
@@ -742,6 +799,73 @@ def exercise(client: YuzuClient, defn: Definition,
                     manifest, accepted, control or RunControl(), targeted_poll_timeout_s)
     out.dispatched = accepted[0]
     return out
+
+
+def _poll_targeted(client: YuzuClient, defn: Definition, control: RunControl, poll_timeout_s: int,
+                   code: int, payload: dict, ms: Any) -> Outcome:
+    """Poll an accepted destructive/forensic dispatch to a verdict, or stop the run.
+
+    A RUNNING row exists only for flushed output (the server never stores bare keepalive frames),
+    so a quiet long-running action shows NO rows at all until its terminal frame arrives. A row
+    that ends the poll without a verdict from terminal rows - no rows, rows still RUNNING, or polls
+    failing - leaves the action possibly still executing, so it stops further dispatch. A terminal
+    FAILURE/TIMEOUT/REJECTED row is a known outcome and does not stop the run.
+    """
+    command_id = payload.get("command_id")
+    execution_id = str(payload.get("execution_id", ""))
+    if not isinstance(command_id, str) or not command_id:
+        raise ValueError("the 200 body has no usable command_id")
+    hint = " (--poll-timeout)" if control.poll_explicit else ""
+    deadline = time.monotonic() + poll_timeout_s
+    last_rows: list = []   # the rows of the last poll that returned any
+    poll_error = ""        # the last poll's error, "" when it answered
+    poll_perm = ""
+    while time.monotonic() < deadline:
+        if control.stop.is_set():
+            return Outcome(defn.id, defn.risk, "error", ms(), http_code=code,
+                           command_id=command_id, execution_id=execution_id,
+                           note="in_flight_unknown: dispatch was sent, result not collected")
+        polled = client.get_responses(command_id)
+        rows: list = []
+        if isinstance(polled, dict) and "responses" in polled:
+            rows = polled["responses"]
+            if not isinstance(rows, list):
+                raise TypeError(f"responses is {type(rows).__name__}, not a list")
+        failed = isinstance(polled, dict) and "error" in polled and not rows
+        poll_error = str(polled["error"]) if failed else ""
+        poll_perm = str(polled.get("permission", "")) if failed else ""
+        if rows:
+            last_rows = rows
+        http_code = polled.get("code") if failed else None
+        # refused (401/403/503) counts toward the stop; any other failure is neutral
+        refused = (http_code in (401, 403, 503)) if http_code else (None if failed else False)
+        if control.note_poll(refused):
+            break
+        if rows and not any(row_in_flight(r) for r in rows):
+            break
+        time.sleep(POLL_INTERVAL_S)
+
+    problems, running = grade_targeted(last_rows)
+    notes = [problems] if problems else []
+    why_stopped = ""
+    if poll_error:
+        notes.append(f"poll failed: {clip(poll_error)}"
+                     + (f" (needs {esc(poll_perm)})" if poll_perm else "")
+                     + "; could not read the response, the action may or may not have run")
+        why_stopped = "stopped: previous row's responses could not be read"
+    if running:
+        notes.append(f"still running after {poll_timeout_s}s{hint}; the action may still be "
+                     "executing on the target")
+        why_stopped = "stopped: previous row still running"
+    if not last_rows and not poll_error:
+        notes.append(f"no response rows within {poll_timeout_s}s{hint}; the action may or may not "
+                     "have run (a quiet long-running action shows no rows until it finishes)")
+        why_stopped = "stopped: previous row returned no response rows"
+    if why_stopped:  # never start a next action on top of one that may not have finished
+        control.request_stop(f"a targeted row ended without a verdict ({why_stopped[9:]})", why_stopped)
+    return Outcome(defn.id, defn.risk, "fail" if notes else "pass", ms(), http_code=code,
+                   command_id=command_id, execution_id=execution_id,
+                   response_count=len(last_rows), note="; ".join(notes))
 
 
 def _exercise(client: YuzuClient, defn: Definition,
@@ -800,14 +924,15 @@ def _exercise(client: YuzuClient, defn: Definition,
             code, payload = client.execute_instruction(defn.id, params)
     except Exception as e:
         if targeted and _may_have_been_sent(e):
-            return _dispatch_unknown(defn, control, ms(), f"{type(e).__name__}: {e}")
+            return _dispatch_unknown(defn, control, ms(), f"{type(e).__name__}: {e}", manifest)
         return Outcome(defn.id, defn.risk, "error", ms(), note=f"dispatch: {type(e).__name__}: {e}")
     if targeted:
         control.note_status(code)
 
     if code in (200, 202) and not isinstance(payload, dict):
         if targeted and code == 200:  # the server said OK: the action may have started
-            return _dispatch_unknown(defn, control, ms(), "HTTP 200 body is not a JSON object")
+            return _dispatch_unknown(defn, control, ms(), "HTTP 200 body is not a JSON object",
+                                     manifest)
         return Outcome(defn.id, defn.risk, "error", ms(), http_code=code,
                        note=f"dispatch: HTTP {code} body is not a JSON object")
 
@@ -817,6 +942,10 @@ def _exercise(client: YuzuClient, defn: Definition,
                        execution_id=payload.get("approval_id", ""),
                        note=f"approval={defn.approval_mode}")
 
+    if targeted and _post_outcome_unknown(code, payload):
+        return _dispatch_unknown(defn, control, ms(), f"HTTP {code} {error_message(payload)}".strip(),
+                                 manifest)
+
     if code != 200:
         msg = error_message(payload)
         return Outcome(defn.id, defn.risk, "fail", ms(),
@@ -824,6 +953,13 @@ def _exercise(client: YuzuClient, defn: Definition,
                        note=f"HTTP {code} {msg}".strip())
 
     accepted[0] = True  # the server accepted the dispatch: the action has been started
+    if targeted:
+        # Anything that goes wrong from here on leaves an accepted action whose outcome is unknown.
+        try:
+            return _poll_targeted(client, defn, control, poll_timeout_s, code, payload, ms)
+        except Exception as e:
+            return _dispatch_unknown(defn, control, ms(),
+                                     f"after the accepted POST: {type(e).__name__}: {e}", manifest)
     command_id = payload.get("command_id", "")
     execution_id = payload.get("execution_id", "")
     if not command_id:
@@ -836,8 +972,6 @@ def _exercise(client: YuzuClient, defn: Definition,
     last_payload: dict = {}
     responses: list = []
     response_count = 0
-    last_rows: list = []   # the rows of the last poll that returned any (targeted grading)
-    poll_error = ""        # the last poll's error, "" when it answered
     while time.monotonic() < deadline:
         if control.stop.is_set():
             return Outcome(defn.id, defn.risk, "error", ms(), http_code=code,
@@ -846,44 +980,11 @@ def _exercise(client: YuzuClient, defn: Definition,
         last_payload = client.get_responses(command_id)
         responses = last_payload.get("responses", []) if isinstance(last_payload, dict) else []
         response_count = len(responses)
-        if targeted:
-            failed = isinstance(last_payload, dict) and "error" in last_payload and not responses
-            poll_error = str(last_payload["error"]) if failed else ""
-            if responses:
-                last_rows = responses
-            http_code = last_payload.get("code") if failed else None
-            # refused (401/403/503) counts toward the stop; a transport failure is neutral
-            refused = (http_code in (401, 403, 503)) if http_code else (None if failed else False)
-            if control.note_poll(refused):
-                break
-        # A destructive/forensic row waits for every row to leave RUNNING (the agent sends
-        # periodic RUNNING frames and finalises the row in place); the rest take the first answer.
-        if response_count > 0 and not (targeted and any(row_in_flight(r) for r in responses)):
+        if response_count > 0:  # the first answer (a targeted row waits for a verdict instead)
             break
         time.sleep(POLL_INTERVAL_S)
 
     duration_ms = ms()
-
-    if targeted:
-        problems, running = grade_targeted(last_rows)
-        notes = [problems] if problems else []
-        if poll_error:
-            notes.append(f"poll failed: {clip(poll_error)}; could not read the response, the "
-                         "action may or may not have run")
-        if running:
-            notes.append(f"still running after {poll_timeout_s}s (--poll-timeout); the action may "
-                         "still be executing on the target")
-            # Never start a next action on top of one that has not finished.
-            control.request_stop("a targeted row was still running at the poll deadline; "
-                                 "dispatch stopped",
-                                 "stopped: previous row still running")
-        if not last_rows and not poll_error:
-            notes.append(f"no response rows within {poll_timeout_s}s (--poll-timeout); the action "
-                         "may or may not have run")
-        return Outcome(defn.id, defn.risk, "fail" if notes else "pass",
-                       duration_ms, http_code=code, command_id=command_id,
-                       execution_id=execution_id, response_count=len(last_rows),
-                       note="; ".join(notes))
 
     if response_count == 0:
         last_err = last_payload.get("error") if isinstance(last_payload, dict) else None
@@ -970,6 +1071,9 @@ def targeting_error(args: argparse.Namespace) -> str:
     if not args.target_agent_id or not args.confirm_target:
         return (f"--risks {'/'.join(classes)} needs --target-agent-id ID (the id of one connected "
                 "agent) and --confirm-target HOSTNAME")
+    if args.poll_timeout < 1:
+        return (f"--risks {'/'.join(classes)} needs --poll-timeout of at least 1 second (a row "
+                "with no time to be polled would never get a verdict)")
     if not args.run_id:
         return (f"--risks {'/'.join(classes)} needs --run-id (it names the manifest and "
                 "the User-Agent that attribute every request)")
@@ -1035,12 +1139,10 @@ def preflight(client: YuzuClient, args: argparse.Namespace) -> tuple[dict | None
             body = json.loads(e.read() or b"{}")
         except Exception:
             body = {}
-        err = body.get("error") if isinstance(body, dict) else None
-        perm = (err.get("permission") if isinstance(err, dict) else None) or \
-               (body.get("permission") if isinstance(body, dict) else None)
+        perm = a4_permission(body)
         msg = error_message(body)
         return None, (f"GET /api/agents answered HTTP {e.code}" + (f": {msg}" if msg else "")
-                      + (f" (needs {esc(perm)})" if isinstance(perm, str) else "")
+                      + (f" (needs {esc(perm)})" if perm else "")
                       + "; the route needs Infrastructure:Read")
     except Exception as e:
         return None, f"cannot read the agent list (GET /api/agents): {type(e).__name__}: {esc(e)}"
@@ -1068,6 +1170,8 @@ def write_output(path: str, payload: dict) -> None:
 def check_output_writable(path: str) -> str:
     """"" if --output can be written, else why not; a file this created is removed again."""
     p = Path(path)
+    if os.path.islink(path):
+        return f"--output {esc(path)}: refusing to write through a symlink"
     existed = p.exists()
     try:
         with p.open("a", encoding="utf-8"):
@@ -1168,7 +1272,7 @@ def run(args: argparse.Namespace) -> int:
         for d in targeted_defs:
             reason = targeted_skip_reason(d, param_overrides, target_os)
             if reason and d.id in param_overrides:
-                print(f"instructions_runner: warning: override for {d.id} skipped: {reason}",
+                print(f"instructions_runner: warning: override for {esc(d.id)} skipped: {reason}",
                       file=sys.stderr)
         if not usable:
             print(f"instructions_runner: no {'/'.join(classes)} definition is eligible on the "
@@ -1182,7 +1286,7 @@ def run(args: argparse.Namespace) -> int:
                            hostname=str(agent.get("hostname")), os=target_os,
                            agent_version=str(agent.get("agent_version", "?")), classes=classes)
         except OSError as e:
-            print(f"instructions_runner: cannot open the manifest {manifest_path}: {esc(e)}",
+            print(f"instructions_runner: cannot open the manifest {esc(manifest_path)}: {esc(e)}",
                   file=sys.stderr)
             return 2
         # Same-path writers (filesystem.*, registry.*) race at parallelism > 1.
@@ -1193,19 +1297,20 @@ def run(args: argparse.Namespace) -> int:
         print(f"instructions_runner: TARGETED RUN target={esc(args.target_agent_id)} "
               f"host={esc(agent.get('hostname'))} os={esc(target_os)} "
               f"version={esc(agent.get('agent_version', '?'))} "
-              f"dashboard={redact_url(args.dashboard)} classes={','.join(classes)} "
+              f"dashboard={esc(redact_url(args.dashboard))} classes={','.join(classes)} "
               f"covered={len(usable)} skipped={len(targeted_defs) - len(usable)} "
-              f"manifest={manifest_path}")
+              f"manifest={esc(manifest_path)}")
         if selected_risks & set(DEFAULT_RISKS):
             print("instructions_runner: mixed run: safe/mutating definitions are still sent to "
                   "EVERY agent")
 
     targeted_poll = args.poll_timeout if getattr(args, "poll_timeout_explicit", True) \
-        else max(args.poll_timeout, TARGETED_POLL_TIMEOUT_S)
+        else TARGETED_POLL_TIMEOUT_S
     outcomes: list[Outcome] = []
     started_at = time.monotonic()
     aborted = ""
-    control = RunControl()
+    interrupted = False
+    control = RunControl(poll_explicit=getattr(args, "poll_timeout_explicit", True))
     future_map: dict[concurrent.futures.Future, Definition] = {}
 
     def collect(fut: concurrent.futures.Future) -> None:
@@ -1237,7 +1342,8 @@ def run(args: argparse.Namespace) -> int:
             for fut in done:
                 collect(fut)
     except BaseException as e:  # KeyboardInterrupt included: stop further dispatch, keep the record
-        aborted = type(e).__name__
+        interrupted = isinstance(e, KeyboardInterrupt)
+        aborted = (_INTERRUPT.get("signal") or "SIGINT") if interrupted else type(e).__name__
         control.request_stop()
         pool.shutdown(wait=False, cancel_futures=True)
         print(f"instructions_runner: aborted ({aborted}); dispatch stopped", file=sys.stderr)
@@ -1258,6 +1364,13 @@ def run(args: argparse.Namespace) -> int:
         if manifest is not None:
             manifest.close()
 
+    # Rows cancelled or never started after an abort are reported, so the tally reconciles.
+    have = {o.id for o in outcomes}
+    for d in runnable:
+        if d.id not in have:
+            outcomes.append(Outcome(d.id, d.risk, "skip", 0,
+                                    note=f"not started: {aborted or control.abort_reason or 'run ended'}"))
+
     total_ms = int((time.monotonic() - started_at) * 1000)
 
     # Tally
@@ -1268,12 +1381,14 @@ def run(args: argparse.Namespace) -> int:
     counts["skip"] += len(skipped)
     # dispatched = the server accepted the POST (HTTP 200: the action was started), or it was
     # sent and the run ended before its result came back; a 202 pending_approval is not.
-    dispatched = sum(1 for o in outcomes if o.dispatched)
-    # dispatch_unknown: a targeted POST failed after it may have been sent. It is counted on its
-    # own and, conservatively, in the targeted-dispatched metric.
+    dispatched = sum(1 for o in outcomes if o.dispatched and not o.dispatch_unknown)
+    # dispatch_unknown: a targeted POST failed after it may have been sent (or an accepted one
+    # could not be followed). It is counted on its own and, conservatively, in the targeted metric.
     unknown = sum(1 for o in outcomes if o.dispatch_unknown)
-    targeted_dispatched = unknown + sum(1 for o in outcomes
-                                        if o.dispatched and o.risk in TARGETED_RISKS)
+    tgt = [o for o in outcomes if o.risk in TARGETED_RISKS]
+    tgt_dispatched = sum(1 for o in tgt if o.dispatched and not o.dispatch_unknown)
+    tgt_unknown = sum(1 for o in tgt if o.dispatch_unknown)
+    targeted_dispatched = tgt_dispatched + tgt_unknown
     run_skips = sum(1 for o in outcomes if o.status == "skip")
 
     summary = (f"instructions_runner: {counts['pass']} pass / "
@@ -1288,14 +1403,21 @@ def run(args: argparse.Namespace) -> int:
         print(f"instructions_runner: {dispatched} dispatched, {unknown} dispatch_unknown, "
               f"{counts['pending_approval']} pending_approval (not executed), {run_skips} skipped, "
               f"{counts['fail'] + counts['error']} failed (of {len(runnable)} selected)")
-        nothing_executed = not dispatched and not unknown
+        # Only the destructive/forensic outcomes count: a safe row that ran does not make a
+        # targeted run that executed nothing a success.
+        nothing_executed = not targeted_dispatched
         if nothing_executed:
-            print(f"instructions_runner: nothing was executed ({counts['pending_approval']} "
-                  f"pending_approval, {run_skips} skipped)", file=sys.stderr)
+            print(f"instructions_runner: nothing was executed "
+                  f"({sum(1 for o in tgt if o.status == 'pending_approval')} pending_approval, "
+                  f"{sum(1 for o in tgt if o.status == 'skip')} skipped)", file=sys.stderr)
     else:
         nothing_executed = False
-    if control.abort_reason:
-        print(f"instructions_runner: {control.abort_reason}", file=sys.stderr)
+    if control.abort_reason or aborted:
+        print(f"instructions_runner: stopped: {control.abort_reason or aborted}"
+              + (f"; manifest: {esc(manifest_path)}" if manifest_path else "")
+              + "; the manifest records attempts, not outcomes: check the target before retrying; "
+                "to resume pass --only-id/--match for the remaining ids only after verifying",
+              file=sys.stderr)
 
     if args.output:
         write_output(args.output, {
@@ -1309,7 +1431,9 @@ def run(args: argparse.Namespace) -> int:
             "skipped": counts["skip"],
             "dispatched": dispatched,
             "manifest": manifest_path,
-            "aborted": aborted or control.abort_reason,
+            "aborted": aborted,
+            "stop_reason": control.abort_reason,
+            "dispatch_unknown": unknown,
             "outcomes": [asdict(o) for o in outcomes],
         })
 
@@ -1334,7 +1458,7 @@ def run(args: argparse.Namespace) -> int:
     #   2   - infrastructure or configuration failure (login, content-dir empty, opt-in targeting,
     #         --params-override, --run-id, target pre-flight); nothing was dispatched
     #   130 - interrupted (Ctrl-C or SIGTERM)
-    if aborted == "KeyboardInterrupt":
+    if interrupted:
         return 130
     if (aborted or control.abort_reason or counts["fail"] > 0 or counts["error"] > 0
             or nothing_executed):
@@ -1344,9 +1468,9 @@ def run(args: argparse.Namespace) -> int:
 
 EPILOG = """\
 Exit codes: 0 every dispatched instruction passed (or is pending approval); 1 one or more failed or
-errored, the run stopped early, or a targeted run executed nothing (every row skipped or pending
-approval); 2 a configuration, login or pre-flight error, with nothing dispatched; 130 interrupted
-(Ctrl-C or SIGTERM).
+errored, the run stopped early, or a targeted run executed nothing (every destructive/forensic row
+skipped or pending approval); 2 a configuration, login, pre-flight or --output error, with nothing
+dispatched; 130 interrupted (Ctrl-C or SIGTERM). A failed write of --output at the end only warns.
 
 Destructive and forensic runs (--risks destructive forensic)
   Example, against a dedicated disposable stack on loopback:
@@ -1363,17 +1487,29 @@ Destructive and forensic runs (--risks destructive forensic)
   other definition is skipped, not dispatched. Each dispatch is appended to a manifest
   (--manifest PATH, default instructions-runner-<run-id>.manifest.jsonl) before it is sent. The
   runner polls each targeted row until every response row is terminal or the poll deadline passes
-  (--poll-timeout, 120 s for these classes unless given); a row passes only when every response row
-  is SUCCESS with no error_detail, and a row still running at the deadline fails the run and stops
-  further dispatch. Ctrl-C and SIGTERM stop further dispatch; a dispatch already sent is reported
-  in_flight_unknown, and a transport failure after a POST was sent is dispatch_unknown (the run
-  stops; do not re-run blindly). Three consecutive 401/403 answers to execute, or to a targeted
-  poll (503 too), stop the run.
+  (--poll-timeout; exactly 120 s for these classes unless it is given). A RUNNING row exists only
+  for flushed output, so a quiet long-running action shows no rows until it finishes. A row passes
+  only when every response row is SUCCESS with no error_detail. A row that ends without a verdict
+  from terminal rows (no rows, rows still running, or polls failing for any reason) fails the row
+  and stops further dispatch; a terminal FAILURE/TIMEOUT/REJECTED row does not stop the run.
+  Ctrl-C and SIGTERM stop further dispatch; a dispatch already sent is reported in_flight_unknown.
+  dispatch_unknown (a transport failure after a POST was sent, a non-object 200 body, any failure
+  after an accepted POST, or an HTTP 500/502/504 or unexplained 503) also stops the run: do not
+  re-run blindly. Three consecutive 401/403 answers to execute, or 401/403/503 to a targeted poll,
+  stop the run. A 202 pending_approval (approval mode always, role-gated for a non-admin caller, or
+  an unrecognised mode; never auto) executed nothing. Permissions: Execution:Execute to dispatch,
+  Response:Read to poll, Infrastructure:Read for the agent lookup.
 
   The manifest is an attempt log, not outcome evidence: the first line is run-start, then one line
-  per dispatch with the exact params sent (treat it as sensitive; it is created 0600, at creation
-  only; .gitignore covers only the default name). Forensic rows read behavioural data from the
-  target, and the responses are stored in the server's response store.
+  per dispatch with the exact params sent (treat it as sensitive; it is created 0600 on POSIX only,
+  at creation only; .gitignore covers only the default name). Forensic rows read behavioural data
+  from the target, and the responses are stored in the server's response store.
+
+  Recovery after a stop: the manifest lines are attempts. --output holds command_id for every row
+  whose POST was accepted, and the in_flight_unknown and dispatch_unknown rows; a definition in
+  neither was never sent, and a dispatch_unknown row has no command_id to look up. Check the target
+  by hand (and the dashboard's executions) before retrying; to resume, pass --only-id or --match for
+  the remaining ids only after verifying.
 
   --confirm-target is a wrong-target typo guard against what the connected server reports. It cannot
   detect an ssh -L tunnel or a port forward to a different stack, and it is not an authorisation or
@@ -1393,7 +1529,8 @@ with "_" are ignored; an empty {} is valid only for a definition with no require
     "device.tags.clear": {},
     "device.filesystem.append": {"path": "/tmp/yuzu_uat_scratch.txt", "content": "x"}
   }
-  (device.filesystem.append: the path must already exist on the target.)
+  (device.filesystem.append: the path must already exist on the target. The path above is for a
+  Unix target; on a Windows target use a path such as C:\\Windows\\Temp\\yuzu_uat_scratch.txt.)
 
 Side effects (NOT exhaustive: every destructive/forensic row in the risk table applies; the runner
 undoes none of them):
@@ -1415,7 +1552,7 @@ undoes none of them):
   crossplatform.power.set_power_plan   changes the active power plan
   testing.chargen.start          streams until stopped, so a targeted run skips it (even with an
                                  override): the runner cannot target the mutating
-                                 testing.chargen.stop; start and stop it by hand from the
+                                 testing.chargen.stop; start and stop it by hand through the
                                  dashboard or REST with agent_ids
   server.* rows (for example server.policy.invalidate_all) are skipped, never sent.
 """
@@ -1480,12 +1617,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return ns
 
 
+_INTERRUPT: dict[str, str] = {}   # which signal raised the KeyboardInterrupt, for the record
+
+
 def _raise_interrupt(signum: int, frame: Any) -> None:
+    _INTERRUPT["signal"] = "SIGTERM" if signum == getattr(signal, "SIGTERM", None) else str(signum)
     raise KeyboardInterrupt
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    _INTERRUPT.clear()
+    try:  # operator-visible on a pipe: the banner and each failed row must not sit in a buffer
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError, OSError):
+        pass
     previous = None
     try:  # SIGTERM takes the same abort path as Ctrl-C (summary, --output, exit 130)
         previous = signal.signal(signal.SIGTERM, _raise_interrupt)
