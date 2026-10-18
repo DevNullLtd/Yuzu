@@ -107,7 +107,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash f31d206bb2ee
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM (tailnet address replaced with a placeholder) · leg-hash f31d206bb2ee
 
 ```
 == action=netstat_list

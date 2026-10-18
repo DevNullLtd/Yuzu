@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -1033,3 +1034,580 @@ TEST_CASE("default_certs: a bogus --cert-group falls back to tight perms (no boo
 }
 
 #endif // !_WIN32
+
+// ── #6016: the server-only identity URI SAN ────────────────────────────────────
+
+namespace {
+
+// Rewrite `set.server_cert` as a pre-#6016 leaf: same key, same root, same DNS/IP
+// SANs and subject, but WITHOUT the identity URI — what an existing install holds
+// when it upgrades. Signs with the real on-disk CA key, exactly as the bootstrap
+// itself does.
+void downgrade_server_leaf_to_pre_6016(const std::filesystem::path& dir,
+                                       const DefaultCertSet& set) {
+    FileKeyProvider kp(dir);
+    auto ca_key = kp.load_key(kp.path_for("default-ca").string());
+    auto srv_key = kp.load_key(kp.path_for("default-server").string());
+    REQUIRE(ca_key);
+    REQUIRE(srv_key);
+    auto old = pki::parse_certificate(read_file(set.server_cert));
+    REQUIRE(old);
+    pki::LeafParams lp;
+    lp.subject = old->subject;
+    lp.san.dns = old->san.dns;
+    lp.san.ips = old->san.ips; // deliberately no URIs
+    // Dated a day EARLIER than the bootstrap's leaf (a real install is days or years old by the
+    // time it upgrades): lets the upgrade's `min(old.notBefore, now - backdate)` be told apart
+    // from a plain `now - backdate`, which X.509's one-second resolution would otherwise hide.
+    lp.validity = {old->not_before - std::chrono::hours(24), old->not_after};
+    lp.usage = pki::LeafUsage{.server_auth = true, .client_auth = true};
+    // Keep the serial the bootstrap recorded in ca_store, so the fixture matches
+    // what a real pre-#6016 install holds (on-disk serial == inventory row).
+    lp.serial_hex = old->serial_hex;
+    auto csr = pki::make_csr(*srv_key, pki::CsrParams{lp.subject, lp.san});
+    REQUIRE(csr);
+    auto issued = pki::sign_csr(*csr, read_file(set.ca_cert), *ca_key, lp);
+    REQUIRE(issued);
+    {
+        std::ofstream out(set.server_cert, std::ios::binary | std::ios::trunc);
+        out << issued->cert_pem;
+    }
+    auto check = pki::parse_certificate(read_file(set.server_cert));
+    REQUIRE(check);
+    REQUIRE(check->san.uris.empty()); // sanity: the fixture really is pre-#6016
+}
+
+// Records a server-purpose row in `store` for a certificate over either the on-disk server
+// key (`same_key`) or a freshly generated, unrelated key, then revokes it with an
+// operator-typed "key compromise". Returns the certificate PEM.
+std::string record_revoked_server_sibling(const std::filesystem::path& dir,
+                                          const DefaultCertSet& set, CaStore& store,
+                                          bool same_key) {
+    FileKeyProvider kp(dir);
+    auto ca_key = kp.load_key(kp.path_for("default-ca").string());
+    auto srv_key = kp.load_key(kp.path_for("default-server").string());
+    REQUIRE(ca_key);
+    REQUIRE(srv_key);
+    std::optional<std::string> other_key;
+    if (!same_key) {
+        other_key = pki::generate_private_key(pki::KeyAlgo::EcP256);
+        REQUIRE(other_key);
+    }
+    auto old = pki::parse_certificate(read_file(set.server_cert));
+    REQUIRE(old);
+    pki::LeafParams lp;
+    lp.subject = old->subject;
+    lp.san = old->san;
+    lp.validity = {old->not_before, old->not_after};
+    lp.usage = pki::LeafUsage{.server_auth = true, .client_auth = true};
+    auto csr = pki::make_csr(same_key ? *srv_key : *other_key, pki::CsrParams{lp.subject, lp.san});
+    REQUIRE(csr);
+    auto sibling = pki::sign_csr(*csr, read_file(set.ca_cert), *ca_key, lp);
+    REQUIRE(sibling);
+    IssuedCertRecord rec;
+    rec.serial_hex = sibling->serial_hex;
+    rec.subject = lp.subject.common_name;
+    rec.purpose = "server";
+    rec.not_after = 4102444800; // 2100-01-01
+    rec.cert_pem = sibling->cert_pem;
+    rec.issued_by = "test";
+    REQUIRE(store.record_issued(rec).has_value());
+    REQUIRE(store.revoke(sibling->serial_hex, "key compromise").value_or(false));
+    return sibling->cert_pem;
+}
+
+} // namespace
+
+TEST_CASE("default_certs: identity URI helpers share one colon-stripped install id (#6016)",
+          "[default_certs][pki]") {
+    CHECK(install_id_from_fingerprint("AB:CD:EF:01") == "ABCDEF01");
+    CHECK(install_id_from_fingerprint("ABCDEF01") == "ABCDEF01");
+    CHECK(install_id_from_fingerprint("").empty());
+    CHECK(server_identity_uri("AB:CD:EF:01") == "yuzu://ABCDEF01/server");
+    CHECK(server_identity_uri("").empty());
+    CHECK(server_identity_uri(":::")
+              .empty()); // strips to nothing -> no identity, never "yuzu:///server"
+}
+
+TEST_CASE("default_certs: ONLY the server leaf carries the server identity URI (#6016)",
+          "[default_certs][security]") {
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, set));
+
+    const std::string want = server_identity_uri(set.ca_fingerprint_sha256);
+    REQUIRE_FALSE(want.empty());
+    REQUIRE(want.rfind("yuzu://", 0) == 0);
+    REQUIRE(want.find(':', 7) == std::string::npos); // install id is colon-free
+
+    auto server = pki::parse_certificate(read_file(set.server_cert));
+    auto https = pki::parse_certificate(read_file(set.https_cert));
+    auto gateway = pki::parse_certificate(read_file(set.gateway_cert));
+    REQUIRE(server);
+    REQUIRE(https);
+    REQUIRE(gateway);
+    CHECK(server->san.uris == std::vector<std::string>{want}); // exactly the one URI
+    CHECK(https->san.uris.empty());
+    CHECK(gateway->san.uris
+              .empty()); // a gateway holding a CA-signed leaf must NOT look like the server
+    // The DNS/IP SANs are unchanged by the URI: still one shared base set.
+    CHECK(server->san.dns == gateway->san.dns);
+    CHECK(server->san.ips == gateway->san.ips);
+}
+
+TEST_CASE("default_certs: an existing pre-#6016 set gains the identity URI in place — same key and "
+          "same root - other leaves untouched (#6016)",
+          "[default_certs][security]") {
+    TempDir dir;
+    const std::vector<std::string> extras{"dns:extra.example.test", "ip:10.9.8.7"};
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, first, extras));
+    downgrade_server_leaf_to_pre_6016(dir.path, first);
+
+    const std::string server_key_before = read_file(first.server_key);
+    const std::string https_before = read_file(first.https_cert);
+    const std::string gateway_before = read_file(first.gateway_cert);
+    const std::string gateway_key_before = read_file(first.gateway_key);
+    const std::string ca_before = read_file(first.ca_cert);
+    const std::string marker_before = read_file(dir.path / "default-marker.json");
+    const auto old_cert = pki::parse_certificate(read_file(first.server_cert));
+    REQUIRE(old_cert);
+
+    CHECK_FALSE(default_server_leaf_has_identity(first)); // the downgraded fixture
+    DefaultCertSet second;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, second, extras));
+    CHECK(default_server_leaf_has_identity(second)); // drives yuzu_server_identity_uri_present
+
+    // An upgrade, NOT a regeneration: same CA, nothing else re-keyed.
+    CHECK_FALSE(second.freshly_generated);
+    // ...but flagged as an upgrade, naming both serials, so server.cpp can audit it.
+    CHECK(second.server_identity_upgraded);
+    CHECK(second.superseded_server_serial == old_cert->serial_hex);
+    CHECK(second.new_server_serial ==
+          pki::parse_certificate(read_file(second.server_cert)).value().serial_hex);
+    CHECK(second.new_server_serial != second.superseded_server_serial);
+    CHECK(second.ca_fingerprint_sha256 == first.ca_fingerprint_sha256);
+    CHECK(read_file(second.ca_cert) == ca_before);
+    CHECK(read_file(second.server_key) ==
+          server_key_before); // SAME key => same SPKI => pins stay valid
+    CHECK(read_file(second.https_cert) == https_before);
+    CHECK(read_file(second.gateway_cert) == gateway_before);
+    CHECK(read_file(second.gateway_key) == gateway_key_before);
+    CHECK(read_file(dir.path / "default-marker.json") == marker_before); // no marker-version bump
+
+    auto server = pki::parse_certificate(read_file(second.server_cert));
+    REQUIRE(server);
+    CHECK(server->san.uris ==
+          std::vector<std::string>{server_identity_uri(second.ca_fingerprint_sha256)});
+    CHECK(pki::verify_chain(read_file(second.server_cert), read_file(second.ca_cert)));
+    CHECK(pki::cert_matches_key(read_file(second.server_cert), read_file(second.server_key)));
+    CHECK(pki::fingerprint_sha256(read_file(second.ca_cert)).value_or("") ==
+          second.ca_fingerprint_sha256);
+
+    // Operator --cert-san / hostname SANs minted into the old leaf survive.
+    auto old_names = pki::parse_certificate(read_file(first.https_cert));
+    REQUIRE(old_names);
+    CHECK(server->san.dns == old_names->san.dns);
+    CHECK(server->san.ips == old_names->san.ips);
+    CHECK(std::ranges::find(server->san.dns, "extra.example.test") != server->san.dns.end());
+    CHECK(std::ranges::find(server->san.ips, "10.9.8.7") != server->san.ips.end());
+
+    // Same validity envelope as a freshly minted leaf: backdated start, ends with the CA.
+    const auto ca_details = pki::parse_certificate(read_file(second.ca_cert));
+    REQUIRE(ca_details);
+    CHECK(server->not_after == ca_details->not_after);
+    CHECK(server->not_before <= std::chrono::system_clock::now());
+    // Never later than the leaf it replaces, so a fleet with modest clock skew that
+    // accepted the original does not see the swap as "not yet valid".
+    CHECK(server->not_before == old_cert->not_before);
+
+    // A third boot is the ordinary idempotent fast path: nothing to upgrade.
+    const std::string server_after = read_file(second.server_cert);
+    DefaultCertSet third;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, third));
+    CHECK_FALSE(third.freshly_generated);
+    CHECK_FALSE(third.server_identity_upgraded);
+    CHECK(read_file(third.server_cert) == server_after);
+}
+
+TEST_CASE("default_certs: an upgrade that cannot sign keeps the existing working leaf (#6016)",
+          "[default_certs][security]") {
+    TempDir dir;
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, first));
+    downgrade_server_leaf_to_pre_6016(dir.path, first);
+    const std::string server_before = read_file(first.server_cert);
+
+    // The CA key is not part of the "set is present" check, so a missing key is a
+    // realistic upgrade state (e.g. the CA key lives behind a KeyProvider).
+    FileKeyProvider kp(dir.path);
+    std::error_code ec;
+    REQUIRE(std::filesystem::remove(kp.path_for("default-ca"), ec));
+
+    DefaultCertSet second;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, second)); // non-fatal
+    CHECK_FALSE(second.freshly_generated);
+    CHECK_FALSE(second.server_identity_upgraded);
+    CHECK_FALSE(default_server_leaf_has_identity(second)); // the gauge helper reads 0 here
+    CHECK(read_file(second.server_cert) == server_before); // untouched, still chains and pairs
+    CHECK(pki::verify_chain(read_file(second.server_cert), read_file(second.ca_cert)));
+}
+
+TEST_CASE(
+    "default_certs: the identity upgrade under a populated ca_store keeps the root and records "
+    "the new leaf and revokes the superseded one (#6016)",
+    "[default_certs][ca_store][security][pg]") {
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, first));
+    downgrade_server_leaf_to_pre_6016(dir.path, first);
+    const auto old_serial = pki::parse_certificate(read_file(first.server_cert))->serial_hex;
+    const std::string server_key_before = read_file(first.server_key);
+
+    DefaultCertSet second;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, second));
+    CHECK_FALSE(second.freshly_generated);
+    CHECK(second.ca_fingerprint_sha256 == first.ca_fingerprint_sha256);
+    CHECK(read_file(second.server_key) == server_key_before);
+    CHECK(second.server_identity_upgraded);
+    CHECK(second.superseded_server_serial == old_serial);
+    CHECK(second.superseded_revoke_confirmed);
+    // Nothing left behind by the staged publish, and the published cert keeps the
+    // world-readable mode a public certificate has always had.
+    CHECK_FALSE(std::filesystem::exists(second.server_cert.string() + ".staged-6016"));
+#ifndef _WIN32
+    CHECK((std::filesystem::status(second.server_cert).permissions() &
+           std::filesystem::perms::others_read) != std::filesystem::perms::none);
+#endif
+
+    // The root B-2 exists to protect is untouched.
+    auto root = store.get_root();
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
+    CHECK((*root)->fingerprint_sha256 == first.ca_fingerprint_sha256);
+
+    const auto new_cert = pki::parse_certificate(read_file(second.server_cert));
+    REQUIRE(new_cert);
+    REQUIRE_FALSE(new_cert->san.uris.empty());
+    CHECK(new_cert->serial_hex != old_serial);
+    CHECK(store.is_revoked(old_serial));                 // superseded, not purged
+    CHECK_FALSE(store.is_revoked(new_cert->serial_hex)); // the live leaf is active
+
+    // https + gateway rows were never purged: 3 original + 1 new server row.
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    CHECK(issued->size() == 4);
+    // Select the live row by content, not by raw serial: the store canonicalises
+    // serials (strips leading zeros), so BN_bn2hex's `0A01...` would not compare
+    // equal for ~1 in 16 random 128-bit serials.
+    const std::string want_uri_san = "URI:" + server_identity_uri(second.ca_fingerprint_sha256);
+    const auto live_server = std::ranges::find_if(*issued, [&](const IssuedCertRecord& r) {
+        return r.purpose == "server" && r.san.find(want_uri_san) != std::string::npos;
+    });
+    REQUIRE(live_server != issued->end());
+    CHECK(live_server->purpose == "server");
+    CHECK(live_server->san.find("URI:" + server_identity_uri(second.ca_fingerprint_sha256)) !=
+          std::string::npos);
+}
+
+TEST_CASE(
+    "default_certs: a revoked server leaf is never re-certified by the identity upgrade (#6016)",
+    "[default_certs][ca_store][security][pg]") {
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, first));
+    downgrade_server_leaf_to_pre_6016(dir.path, first);
+    const auto old_serial = pki::parse_certificate(read_file(first.server_cert))->serial_hex;
+    const std::string server_before = read_file(first.server_cert);
+
+    // The operator revoked the server leaf (e.g. its key leaked) but has not re-keyed
+    // yet. Re-certifying the same key under a fresh serial would silently undo that.
+    auto revoked = store.revoke(old_serial, "key compromise");
+    REQUIRE(revoked.has_value());
+    REQUIRE(*revoked);
+
+    DefaultCertSet second;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, second)); // non-fatal
+    CHECK_FALSE(second.server_identity_upgraded);
+    CHECK(read_file(second.server_cert) == server_before);
+
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    CHECK(issued->size() == 3); // nothing new was recorded
+}
+
+TEST_CASE("default_certs: a leaf already revoked as superseded is still upgraded (restored backup) "
+          "(#6016)",
+          "[default_certs][ca_store][security][pg]") {
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, first));
+    downgrade_server_leaf_to_pre_6016(dir.path, first);
+    const auto old_serial = pki::parse_certificate(read_file(first.server_cert))->serial_hex;
+
+    // A pre-upgrade cert-dir backup restored (or a sibling replica's copy) into a
+    // database that already revoked this serial as "superseded": its key was never
+    // withdrawn, so the upgrade must proceed rather than skip forever.
+    auto revoked = store.revoke_system(old_serial, kRevokeReasonSuperseded);
+    REQUIRE(revoked.has_value());
+    REQUIRE(*revoked);
+
+    DefaultCertSet second;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, second));
+    CHECK(second.server_identity_upgraded);
+    CHECK(second.superseded_revoke_confirmed); // already revoked as superseded: nothing to redo
+    CHECK(default_server_leaf_has_identity(second));
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    CHECK(issued->size() == 4);
+}
+
+TEST_CASE("default_certs: an operator-typed superseded reason is not the system marker (#6016)",
+          "[default_certs][ca_store][security][pg]") {
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, first));
+    downgrade_server_leaf_to_pre_6016(dir.path, first);
+    const auto old_serial = pki::parse_certificate(read_file(first.server_cert))->serial_hex;
+    const std::string server_before = read_file(first.server_cert);
+
+    // An operator revokes a leaked key and, naturally, types exactly "superseded". The
+    // store must keep that distinguishable from the system marker: this is the ONLY input
+    // where the qualifier changes the outcome (any other spelling already differs from the
+    // marker the upgrade compares against).
+    auto revoked = store.revoke(old_serial, "superseded");
+    REQUIRE(revoked.has_value());
+    REQUIRE(*revoked);
+    auto row = store.get_issued(old_serial);
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->revocation_reason == "operator-supplied: superseded");
+
+    DefaultCertSet second;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, second)); // non-fatal skip
+    CHECK_FALSE(second.server_identity_upgraded);
+    CHECK(read_file(second.server_cert) == server_before);
+}
+
+TEST_CASE("default_certs: a same-key sibling revoked for compromise blocks the upgrade (#6016)",
+          "[default_certs][ca_store][security][pg]") {
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, first));
+    downgrade_server_leaf_to_pre_6016(dir.path, first);
+    const auto old_serial = pki::parse_certificate(read_file(first.server_cert))->serial_hex;
+    const std::string server_before = read_file(first.server_cert);
+
+    // The on-disk leaf is revoked only as superseded (a restored backup), but a successor
+    // certificate over the SAME key was later revoked for compromise.
+    REQUIRE(store.revoke_system(old_serial, kRevokeReasonSuperseded).value_or(false));
+    const std::string sibling_pem =
+        record_revoked_server_sibling(dir.path, first, store, /*same_key=*/true);
+    // The fixture's premise, asserted: the sibling really carries the on-disk leaf's key.
+    REQUIRE(pki::issuer_key_id(sibling_pem).has_value());
+    REQUIRE(pki::issuer_key_id(sibling_pem) == pki::issuer_key_id(server_before));
+
+    DefaultCertSet second;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, second)); // non-fatal skip
+    CHECK_FALSE(second.server_identity_upgraded);
+    CHECK(read_file(second.server_cert) == server_before);
+}
+
+TEST_CASE("default_certs: a revoke that matches nothing is never a confirmed supersession (#6016)",
+          "[default_certs][ca_store][security][pg]") {
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, first));
+    const auto old_serial = pki::parse_certificate(read_file(first.server_cert))->serial_hex;
+
+    // The replacement the upgrade just published: a second ACTIVE row over the same key.
+    FileKeyProvider kp(dir.path);
+    auto ca_key = kp.load_key(kp.path_for("default-ca").string());
+    auto srv_key = kp.load_key(kp.path_for("default-server").string());
+    REQUIRE(ca_key);
+    REQUIRE(srv_key);
+    auto old = pki::parse_certificate(read_file(first.server_cert));
+    REQUIRE(old);
+    pki::LeafParams lp;
+    lp.subject = old->subject;
+    lp.san = old->san;
+    lp.validity = {old->not_before, old->not_after};
+    lp.usage = pki::LeafUsage{.server_auth = true, .client_auth = true};
+    auto csr = pki::make_csr(*srv_key, pki::CsrParams{lp.subject, lp.san});
+    REQUIRE(csr);
+    auto fresh = pki::sign_csr(*csr, read_file(first.ca_cert), *ca_key, lp);
+    REQUIRE(fresh);
+    IssuedCertRecord rec;
+    rec.serial_hex = fresh->serial_hex;
+    rec.subject = lp.subject.common_name;
+    rec.purpose = "server";
+    rec.not_after = 4102444800; // 2100-01-01
+    rec.cert_pem = fresh->cert_pem;
+    rec.issued_by = "test";
+    REQUIRE(store.record_issued(rec).has_value());
+    const auto new_serial = fresh->serial_hex;
+
+    const auto status_of = [&](const std::string& serial) {
+        auto row = store.get_issued(serial);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        return std::pair{(*row)->status, (*row)->revocation_reason};
+    };
+
+    SECTION("an ordinary supersession is confirmed and leaves the replacement active") {
+        auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
+        CHECK(out.revoke_confirmed);
+        CHECK_FALSE(out.replacement_withdrawn);
+        CHECK(status_of(old_serial).first == CertStatus::Revoked);
+        CHECK(status_of(old_serial).second == kRevokeReasonSuperseded);
+        CHECK(status_of(new_serial).first == CertStatus::Active);
+    }
+
+    SECTION("an operator compromise revoke that lands first withdraws the replacement too") {
+        // The race: the operator revokes the old serial AFTER the upgrade's guard reads and
+        // BEFORE its own revoke. revoke_system then matches nothing (Ok(false)).
+        REQUIRE(store.revoke(old_serial, "key compromise").value_or(false));
+        auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
+        CHECK_FALSE(out.revoke_confirmed);
+        CHECK(out.replacement_withdrawn);
+        CHECK_FALSE(out.replacement_withdraw_failed);
+        CHECK(status_of(new_serial).first == CertStatus::Revoked);
+        CHECK(status_of(new_serial).second == "key compromise");
+        CHECK(status_of(old_serial).second == "key compromise"); // never rewritten
+    }
+
+    SECTION("an operator-typed superseded is not the marker and also withdraws the replacement") {
+        REQUIRE(store.revoke(old_serial, "superseded").value_or(false));
+        auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
+        CHECK_FALSE(out.revoke_confirmed);
+        CHECK(out.replacement_withdrawn);
+        CHECK(status_of(new_serial).first == CertStatus::Revoked);
+    }
+
+    SECTION("a sibling's identical upgrade got there first: confirmed, replacement untouched") {
+        REQUIRE(store.revoke_system(old_serial, kRevokeReasonSuperseded).value_or(false));
+        auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
+        CHECK(out.revoke_confirmed);
+        CHECK_FALSE(out.replacement_withdrawn);
+        CHECK(status_of(new_serial).first == CertStatus::Active);
+    }
+
+    SECTION("an old row carrying the system unpublished marker is not a withdrawal") {
+        REQUIRE(store.revoke_system(old_serial, kRevokeReasonUnpublished).value_or(false));
+        auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
+        CHECK_FALSE(out.revoke_confirmed);
+        CHECK_FALSE(out.replacement_withdrawn);
+        CHECK_FALSE(out.replacement_withdraw_failed);
+        CHECK(status_of(new_serial).first == CertStatus::Active);
+    }
+
+    SECTION("an unknown old serial is unconfirmed but withdraws nothing") {
+        auto out = settle_superseded_server_leaf(store, "0A0B0C0D0E0F", new_serial);
+        CHECK_FALSE(out.revoke_confirmed);
+        CHECK_FALSE(out.replacement_withdrawn);
+        CHECK(status_of(new_serial).first == CertStatus::Active);
+    }
+}
+
+TEST_CASE("default_certs: an unwritable staging path aborts the identity upgrade before any "
+          "inventory change and a later boot recovers (#6016)",
+          "[default_certs][ca_store][security][pg]") {
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, first));
+    downgrade_server_leaf_to_pre_6016(dir.path, first);
+    const std::string server_before = read_file(first.server_cert);
+    const auto old_serial = pki::parse_certificate(server_before)->serial_hex;
+
+    // A non-empty directory on the staging path makes the publish fail on every OS.
+    const std::filesystem::path blocker{first.server_cert.string() + ".staged-6016"};
+    std::error_code ec;
+    REQUIRE(std::filesystem::create_directory(blocker, ec));
+    { std::ofstream(blocker / "keep") << "x"; }
+
+    DefaultCertSet second;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, second)); // non-fatal
+    CHECK_FALSE(second.server_identity_upgraded);
+    CHECK_FALSE(default_server_leaf_has_identity(second));
+    CHECK(read_file(second.server_cert) == server_before);
+    CHECK_FALSE(store.is_revoked(old_serial));
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    CHECK(issued->size() == 3); // staged FIRST: nothing recorded, nothing revoked
+    for (const auto& e : std::filesystem::directory_iterator(dir.path))
+        CHECK(e.path().filename().string().find(".tmp.") == std::string::npos); // no leaked temp
+
+    // Positive twin: once the obstruction is gone the very next boot upgrades, proving the
+    // skip above was the staging failure and not some other cause.
+    std::filesystem::remove_all(blocker, ec);
+    DefaultCertSet third;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, third));
+    CHECK(third.server_identity_upgraded);
+    CHECK(store.is_revoked(old_serial));
+    auto after = store.list_issued();
+    REQUIRE(after.has_value());
+    CHECK(after->size() == 4);
+}
+
+TEST_CASE(
+    "default_certs: a revoked certificate over a DIFFERENT key does not block the upgrade (#6016)",
+    "[default_certs][ca_store][security][pg]") {
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, first));
+    downgrade_server_leaf_to_pre_6016(dir.path, first);
+    const std::string server_before = read_file(first.server_cert);
+
+    // Negative twin of the same-key test: the identical fixture with the sibling over an
+    // UNRELATED key must not block, proving the skip there comes from the key equality and
+    // not from "any revoked server row".
+    const std::string sibling_pem =
+        record_revoked_server_sibling(dir.path, first, store, /*same_key=*/false);
+    REQUIRE(pki::issuer_key_id(sibling_pem).has_value());
+    REQUIRE(pki::issuer_key_id(sibling_pem) != pki::issuer_key_id(server_before));
+
+    DefaultCertSet second;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, second));
+    CHECK(second.server_identity_upgraded);
+    CHECK(default_server_leaf_has_identity(second));
+}

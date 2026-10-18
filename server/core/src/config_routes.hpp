@@ -24,12 +24,16 @@
 /// is why `Deps::cfg` is `Config*`, not `const Config*`.
 ///
 /// Routes (2) — gate in parens:
-///   GET /api/config             (perm_fn Infrastructure:Read)
-///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN the
-///                                 store-open 503, THEN auth_fn for the audit-attributed
-///                                 username and the same-site check, THEN
-///                                 body parsing and integer-key validation, THEN the
-///                                 unknown-key 400, THEN the audit-first attempted row)
+///   GET /api/config             (perm_fn Infrastructure:Read; lists
+///                                 `read_only_keys`, the allowed keys this route
+///                                 does not write: dex_score_policy)
+///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN auth_fn for the
+///                                 audit-attributed username and the same-site check,
+///                                 THEN the dex_score_policy 400 (that key is written
+///                                 only through its own route, a later change), THEN the
+///                                 store-open 503, THEN body parsing and integer-key
+///                                 validation, THEN the unknown-key 400, THEN the
+///                                 audit-first attempted row)
 ///
 /// AUDIT: GET is never audited. PUT is audit-first (ADR-0033 section 9): `attempted` row, 503 and
 /// no change if it cannot be stored, then `success`/`failure`. A secret key's `detail` never

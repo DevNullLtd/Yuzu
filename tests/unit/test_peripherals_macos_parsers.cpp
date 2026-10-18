@@ -107,22 +107,23 @@ TEST_CASE("usb_speed_name: an out-of-range value stays visible as text, not eras
 }
 
 // ── uid_to_hex16 ─────────────────────────────────────────────────────────
-// REAL CAPTURE this Mac 2026-09-08: ioreg_iothunderboltswitch.plist's three
-// IOThunderboltSwitchType5 nodes' `UID` integers.
+// Modelled on ioreg_iothunderboltswitch.plist's three IOThunderboltSwitchType5
+// nodes' `UID` integers (fully synthetic IDs; only the 0x05AC Apple
+// vendor prefix is kept).
 
-TEST_CASE("uid_to_hex16: REAL CAPTURE this Mac 2026-09-08 first switch UID",
+TEST_CASE("uid_to_hex16: synthetic first switch UID",
           "[peripherals][macos]") {
-    CHECK(uid_to_hex16(408803588609184944ull) == "05ac5cb2a9f494b0");
+    CHECK(uid_to_hex16(0x05AC000000000001ull) == "05ac000000000001");
 }
 
-TEST_CASE("uid_to_hex16: REAL CAPTURE this Mac 2026-09-08 second switch UID",
+TEST_CASE("uid_to_hex16: synthetic second switch UID",
           "[peripherals][macos]") {
-    CHECK(uid_to_hex16(408803588609184945ull) == "05ac5cb2a9f494b1");
+    CHECK(uid_to_hex16(0x05AC000000000002ull) == "05ac000000000002");
 }
 
-TEST_CASE("uid_to_hex16: REAL CAPTURE this Mac 2026-09-08 third switch UID",
+TEST_CASE("uid_to_hex16: synthetic third switch UID",
           "[peripherals][macos]") {
-    CHECK(uid_to_hex16(408803588609184947ull) == "05ac5cb2a9f494b3");
+    CHECK(uid_to_hex16(0x05AC000000000003ull) == "05ac000000000003");
 }
 
 TEST_CASE("uid_to_hex16: zero pads to full width", "[peripherals][macos]") {

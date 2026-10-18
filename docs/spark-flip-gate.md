@@ -2080,7 +2080,7 @@ tracked separately below)
   of these two tests had raced non-deterministically against the mechanism's own worker
   thread, per quality-engineer's Gate 3 finding, independently confirmed 11/11 times on
   this same hardware before the wedge-idiom rewrite). Worktree left at
-  `C:/Users/daver/yuzu-3848-zombie` for reuse.
+  `C:/Users/<user>/yuzu-3848-zombie` for reuse.
 
   **Correction (2026-09-05): the INFEASIBLE claim below is false - retracted.** It was written
   from a one-off scratch build's 1266 `LNK2038` link failures and concluded MSVC ASan could not
@@ -2100,7 +2100,7 @@ tracked separately below)
   checking off globally, not just for the vendored deps - that gap is `#2016`'s separate,
   correctly-deferred, from-source-instrumented-triplet project, and is irrelevant to `#2839`'s
   UAF-class defect. Root cause of the scratch build's failure confirmed directly (its worktree
-  was still on disk at `C:/Users/daver/yuzu-2839-asan-check`, `build-windows-asan-addr`): its
+  was still on disk at `C:/Users/<user>/yuzu-2839-asan-check`, `build-windows-asan-addr`): its
   meson configure log shows `b_sanitize=address` set but **no** `cpp_args` entry at all - the
   `-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION` workaround was simply never
   passed - and its compile log's 1268 `LNK2038` lines (close to, though not identical to, the
@@ -3423,7 +3423,7 @@ estimate).
 
 Same port-pair shape as the existing dev-pair setup (`8090`/`8100`), just two more instances.
 Each rig gets its own build dir, own local Postgres DB, own `kv_store.db`/journal path. Both
-are well clear of the hands-off homeserver at `100.74.176.116:8080`/`:50051`
+are well clear of the hands-off homeserver at `<homeserver>:8080`/`:50051`
 (Tailscale-bound - **never touch**; `start-UAT.sh`-style scripts default to those ports and
 have killed it before).
 
