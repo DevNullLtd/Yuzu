@@ -57,6 +57,7 @@
 #include <thread>
 #include <unordered_set>
 #include <string>
+#include <utility>
 #include <vector>
 
 // #5906 [live] case: httplib's acceptor crashes under TSan with no report (#438).
@@ -462,7 +463,7 @@ TEST_CASE("health_routes: GET /readyz with a null draining pointer degrades "
     CHECK(json::parse(r->body)["status"] != "draining");
 }
 
-// ── ADR-3006 PM1.1b: the enablement store on /readyz and /healthz ──────────────
+// ── ADR-3006: the enablement store on /readyz and /healthz ──────────────
 
 namespace {
 // A store that is NOT open (an unparseable DSN gives an invalid pool), so the cases below need
@@ -530,20 +531,46 @@ TEST_CASE("health_routes: GET /readyz carries exactly one `enablement` object wi
         CHECK(e["report_ahead"] == false);
     }
     SECTION("all three at once are all visible, and none changes the verdict") {
-        EnablementStore::RegressionState st;
-        st.regressed = true;
-        st.reason = "store_behind";
-        st.anchor_unwitnessed = true;
-        st.report_ahead_endpoints = 3;
-        closed.store.set_regression_state_for_test(st);
-        const auto raw = fetch();
-        CHECK(count_of(raw, "\"enablement\"") == 1);
-        const auto body = json::parse(raw);
-        CHECK(body["enablement"]["regression_pending"] == true);
-        CHECK(body["enablement"]["anchor_unwitnessed_at_boot"] == true);
-        CHECK(body["enablement"]["report_ahead"] == true);
-        // The object is informational: the verdict still comes from `failed_stores`.
-        CHECK(body["status"] == "not ready");
+        // The verdict is derived solely from `failed_stores`, so the gate's INPUT is what
+        // is pinned: with the store closed the body is "not ready" in every case, and a
+        // regression, an unwitnessed anchor or report-ahead endpoints must add NO entry to
+        // `failed_stores` (a new gating row for any of them would). Residual: a mutant that
+        // folded a regression into the existing `enablement_store` row is only
+        // distinguishable with an OPEN store, i.e. on the Postgres surface.
+        const auto quiet = json::parse(fetch());
+        const auto baseline = quiet["failed_stores"];
+        const auto baseline_status = quiet["status"];
+        REQUIRE(baseline.is_array());
+        CHECK(baseline_status == "not ready");
+
+        EnablementStore::RegressionState regressed;
+        regressed.regressed = true;
+        regressed.reason = "store_behind";
+        EnablementStore::RegressionState unwitnessed;
+        unwitnessed.anchor_unwitnessed = true;
+        EnablementStore::RegressionState ahead;
+        ahead.report_ahead_endpoints = 3;
+        EnablementStore::RegressionState all = regressed;
+        all.anchor_unwitnessed = true;
+        all.report_ahead_endpoints = 3;
+
+        for (const auto& [label, st] :
+             std::vector<std::pair<const char*, EnablementStore::RegressionState>>{
+                 {"regressed alone", regressed},
+                 {"unwitnessed alone", unwitnessed},
+                 {"report-ahead alone", ahead},
+                 {"all three", all}}) {
+            INFO(label);
+            closed.store.set_regression_state_for_test(st);
+            const auto raw = fetch();
+            CHECK(count_of(raw, "\"enablement\"") == 1);
+            const auto body = json::parse(raw);
+            CHECK(body["failed_stores"] == baseline);
+            CHECK(body["status"] == baseline_status);
+            CHECK(body["enablement"]["regression_pending"] == st.regressed);
+            CHECK(body["enablement"]["anchor_unwitnessed_at_boot"] == st.anchor_unwitnessed);
+            CHECK(body["enablement"]["report_ahead"] == (st.report_ahead_endpoints > 0));
+        }
     }
 }
 
@@ -1172,7 +1199,7 @@ TEST_CASE("health_routes: plaintext /health never resolves a session - even with
         std::set<std::string> keys;
         for (const auto& [k, v] : body.items())
             keys.insert(k);
-        // enablement_regressed (ADR-3006 PM1.1b) is one boolean, the same fact the plaintext
+        // enablement_regressed (ADR-3006) is one boolean, the same fact the plaintext
         // /readyz `enablement` object already carries; it was added to this allowlist
         // deliberately, not drifted in.
         CHECK(keys == std::set<std::string>{"status", "uptime_seconds", "agents", "stores",

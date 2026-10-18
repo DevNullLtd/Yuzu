@@ -380,7 +380,7 @@ struct Deps {
     AccessReviewStore* access_review_store{nullptr};
     SoftwareLicensingStore* software_licensing_store{nullptr};
     PluginConfigStore* plugin_config_store{nullptr};
-    EnablementStore* enablement_store{nullptr}; // ADR-3006 PM1.1b (also a /healthz row)
+    EnablementStore* enablement_store{nullptr}; // ADR-3006 (also a /healthz row)
     AppUsageStore* app_usage_store{nullptr}; // Wave 7 PR7.2 (gov Gate 3 sre HIGH finding)
     ProductRegistryStore* product_registry_store{nullptr};
     ProductPackStore* product_pack_store{nullptr};

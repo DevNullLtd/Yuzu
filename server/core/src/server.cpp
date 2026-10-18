@@ -72,7 +72,7 @@
 #include "http_route_sink.hpp"
 #include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
-#include "enablement_store.hpp"        // ADR-3006 PM1.1b: durable enablement store + continuity anchor
+#include "enablement_store.hpp"        // ADR-3006: durable enablement store + continuity anchor
 #include "upload_grant_store.hpp"
 #include "file_retrieval_routes.hpp"
 #include <yuzu/server/scim_json.hpp> // D7 (#2407 hardening): scim::error() for the pre-routing body-cap 4xx
@@ -5180,7 +5180,7 @@ public:
                 }
             }
         }
-        // ADR-3006 PM1.1b — the durable enablement store: rules, per-endpoint desired and
+        // ADR-3006 — the durable enablement store: rules, per-endpoint desired and
         // reported state, and the continuity anchor. It borrows
         // the plugin_config_store schema (PluginConfigStore ran its v3 migration just
         // above), so it is built only once that store is open. Fail-CLOSED like every
@@ -5201,39 +5201,15 @@ public:
                 // does not exist.
                 spdlog::error("[PG] Refusing to start: enablement overlay hash failed");
                 startup_failed_ = true;
+            } else if (auto booted = EnablementStore::boot(
+                           *pg_pool_, std::move(*overlay), *overlay_digest,
+                           enablement::durable_attribute_kinds(detail::scope_kind_catalog()),
+                           cfg_.db_dir() / "enablement-anchor", &metrics_);
+                       !booted) {
+                spdlog::error("[PG] Refusing to start: {}", booted.error());
+                startup_failed_ = true;
             } else {
-                enablement_store_ = std::make_unique<EnablementStore>(
-                    *pg_pool_, std::move(*overlay),
-                    enablement::durable_attribute_kinds(detail::scope_kind_catalog()));
-                if (!enablement_store_->is_open()) {
-                    spdlog::error("[PG] Refusing to start: enablement store open failed");
-                    startup_failed_ = true;
-                } else {
-                    enablement_store_->set_metrics(&metrics_);
-                    // A release that adds/removes a unit OR a requirement edge makes every
-                    // endpoint row stale (rules_version bump in the same statement).
-                    if (auto synced = enablement_store_->sync_overlay_hash(*overlay_digest);
-                        !synced) {
-                        spdlog::error("[PG] Refusing to start: enablement overlay hash could "
-                                      "not be recorded");
-                        startup_failed_ = true;
-                    } else if (*synced) {
-                        spdlog::info("EnablementStore: the unit overlay changed in this release; "
-                                     "every endpoint will be re-resolved");
-                    }
-                    // The continuity anchor beside the server data. A present anchor that
-                    // disagrees with the store declares it regressed (issuing desired
-                    // state freezes); a missing one is only reported.
-                    if (!startup_failed_) {
-                        if (auto cont = enablement_store_->check_continuity_at_boot(
-                                cfg_.db_dir() / "enablement-anchor");
-                            !cont) {
-                            spdlog::error("[PG] Refusing to start: enablement continuity check "
-                                          "could not read the store");
-                            startup_failed_ = true;
-                        }
-                    }
-                }
+                enablement_store_ = std::move(*booted);
             }
         }
 
@@ -22371,7 +22347,7 @@ private:
     // here purely to group the whole p14 surface together.
     std::unique_ptr<pg::SecretCodec> plugin_config_secret_codec_;
     std::unique_ptr<PluginConfigStore> plugin_config_store_;
-    /// ADR-3006 PM1.1b: the durable enablement store (rules, per-endpoint state,
+    /// ADR-3006: the durable enablement store (rules, per-endpoint state,
     /// continuity anchor) over the plugin_config_store schema. Declared after
     /// plugin_config_store_ (which owns its migration); borrows pg_pool_.
     std::unique_ptr<EnablementStore> enablement_store_;

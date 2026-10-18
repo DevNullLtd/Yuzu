@@ -80,7 +80,7 @@ const std::vector<pg::PgMigration>& migrations() {
         // v2 (#5294): per-OS kill-switch rows. scope_key stays the unique
         // identity (`<plugin>[.<action>][@<os>]`); existing rows read as os=''.
         {2, "ALTER TABLE kill_switches ADD COLUMN os TEXT NOT NULL DEFAULT '';"},
-        // v3 (ADR-3006 PM1.1b): the enablement tables. Purely additive; the SQL
+        // v3 (ADR-3006): the enablement tables. Purely additive; the SQL
         // that reads and writes them lives in EnablementStore (enablement_store.cpp),
         // which holds the contracts (counter reservation, the epoch fence, the
         // registration-order guard, the continuity anchor). enablement_meta is ONE

@@ -1,18 +1,28 @@
-// test_enablement_store_pg.cpp — EnablementStore behaviour on Postgres (ADR-3006
-// PM1.1b). PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset (a SKIP reports Ok,
+// test_enablement_store_pg.cpp — EnablementStore behaviour on Postgres (ADR-3006).
+// PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset (a SKIP reports Ok,
 // so these prove nothing without the DSN), fails when it is set but broken.
 //
 // Each case clones a pre-migrated template (plugin_config_store v1..v3 + the
 // leader_elector schema the epoch fence reads) and holds a LIVE elector, so the
-// epoch the store's fence accepts is a real one. The falsifier cases drive the
-// races deterministically with a second raw connection holding a row lock; none
-// sleeps or polls on a clock.
+// epoch the store's fence accepts is a real one. The race cases hold a row lock on a
+// second raw connection and observe the blocked backend (wait_for_lock_waiter,
+// test_principal_lock_gate.hpp) before releasing it, so the interleaving they claim
+// is the one that ran; no case sleeps on a clock.
+//
+// The server's boot composition is EnablementStore::boot, tested below for each of its
+// refusals (the store does not open, the overlay hash cannot be recorded, the continuity
+// check cannot read the store) and for the two outcomes that must NOT refuse (a healthy
+// boot, and a declared regression). Two inputs to it are process-wide facts the caller
+// establishes first, so a test cannot inject them: the overlay build and its digest.
+// The one-line mapping of a boot() refusal to startup_failed_ in server.cpp has no unit
+// seam short of constructing a ServerImpl.
 
 #include "agent_registry.hpp" // detail::scope_kind_catalog
 #include "capability_decls/all_fragments.hpp"
 #include "enablement_store.hpp"
 #include "key_provider.hpp"
 #include "leader_elector.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -20,6 +30,7 @@
 #include "plugin_config_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_principal_lock_gate.hpp" // Workers, wait_for_lock_waiter, kLockWait*
 
 #include <yuzu/metrics.hpp>
 
@@ -32,8 +43,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <latch>
 #include <memory>
 #include <optional>
@@ -102,6 +115,66 @@ std::string query1(const std::string& dsn, const std::string& sql) {
 
 std::int64_t query_i64(const std::string& dsn, const std::string& sql) {
     return std::stoll(query1(dsn, sql));
+}
+
+/// The SQLSTATE of a statement that is expected to FAIL; empty when it succeeded.
+std::string sqlstate_of(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    if (r.ok())
+        return {};
+    const char* state = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
+    return state != nullptr ? state : "?";
+}
+
+/// Clear a regression declaration by hand. The store deliberately has no API for it:
+/// accepting a regressed state starts a new ordering of states (ADR-3006 D14), which is
+/// not this store's to define. The caller refreshes the instance under test afterwards.
+void clear_regression(const std::string& dsn) {
+    exec_sql(dsn, "UPDATE plugin_config_store.enablement_meta SET regressed_at = NULL, "
+                  "regressed_reason = ''");
+}
+
+std::size_t count_of(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto pos = hay.find(needle); pos != std::string::npos; pos = hay.find(needle, pos + 1))
+        ++n;
+    return n;
+}
+
+std::string read_file(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+/// True once some backend of THIS database is blocked on a RELATION lock (a table lock).
+/// The shared wait_for_lock_waiter covers advisory and row-lock (transactionid) waits only,
+/// so the snapshot case, which parks the loader on a table lock, polls for this one itself.
+/// Like that helper this is an event-style poll (there is no event to wait on in another
+/// backend); the deadline only bounds a failing test.
+bool wait_for_relation_waiter(PgPool& pool) {
+    const auto end = std::chrono::steady_clock::now() + yuzu::test::kLockWaitDeadline;
+    while (std::chrono::steady_clock::now() < end) {
+        if (auto probe = pool.try_acquire_for(std::chrono::milliseconds(100))) {
+            PgResult r = pg::exec_params(
+                probe.get(),
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                "AND wait_event_type = 'Lock' AND wait_event = 'relation'",
+                std::vector<std::string>{});
+            if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1 &&
+                std::atoi(PQgetvalue(r.get(), 0, 0)) > 0)
+                return true;
+        }
+        std::this_thread::sleep_for(yuzu::test::kLockWaitPoll);
+    }
+    return false;
+}
+
+/// Release a raw connection's open transaction. Safe to call when none is open (the
+/// server answers with a notice), so it can run from a Workers pre-join callback.
+void end_txn(PgConn& conn, const char* verb) {
+    PgResult r{PQexec(conn.get(), verb)};
 }
 
 // Captures spdlog output for one case (restored in the destructor).
@@ -253,6 +326,17 @@ TEST_CASE("EnablementStore: schema v3 applies over an existing v2 plugin_config_
     CHECK(query1(db.dsn(), "SELECT to_regclass('plugin_config_store.enablement_meta') IS NULL") == "t");
     CHECK(query1(db.dsn(), "SELECT version FROM public.schema_meta WHERE store='plugin_config_store'") == "2");
 
+    // Representative v2 data - a config, a sealed secret and a per-OS kill switch - that the
+    // additive v3 migration must leave exactly as it found it.
+    exec_sql(db.dsn(), "INSERT INTO plugin_config_store.configs (plugin, key, value, updated_by) "
+                       "VALUES ('p1', 'k1', 'a value', 'alice')");
+    exec_sql(db.dsn(), "INSERT INTO plugin_config_store.secrets (scope_key, plugin, key, "
+                       "sealed_value, updated_by) VALUES ('p1.s1', 'p1', 's1', "
+                       "'\\xdeadbeef00ff'::bytea, 'alice')");
+    exec_sql(db.dsn(), "INSERT INTO plugin_config_store.kill_switches (scope_key, plugin, action, "
+                       "enabled, reason, set_by, os) VALUES ('p1.act@linux', 'p1', 'act', FALSE, "
+                       "'because', 'alice', 'linux')");
+
     yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     pg::SecretCodec codec(provider);
@@ -260,6 +344,15 @@ TEST_CASE("EnablementStore: schema v3 applies over an existing v2 plugin_config_
     {
         EnablementStore before{pool, make_overlay(), kinds()};
         CHECK_FALSE(before.is_open()); // the v3 schema is not there yet
+    }
+    {
+        // The boot composition refuses at the first step, before it touches the anchor.
+        yuzu::test::TempDir anchor_dir{"yuzu_test_enablement_anchor_"};
+        const auto anchor = anchor_dir.path / "enablement-anchor";
+        auto refused = EnablementStore::boot(pool, make_overlay(), kH1, kinds(), anchor, nullptr);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find("open failed") != std::string::npos);
+        CHECK_FALSE(fs::exists(anchor));
     }
     PluginConfigStore pcs{pool, codec};
     REQUIRE(pcs.is_open());
@@ -274,8 +367,30 @@ TEST_CASE("EnablementStore: schema v3 applies over an existing v2 plugin_config_
     CHECK(meta->counter == 0);
     CHECK(meta->rules_version == 1);
     CHECK_FALSE(meta->regressed);
-    // The existing tables are untouched.
-    CHECK(query1(db.dsn(), "SELECT count(*) FROM plugin_config_store.kill_switches") == "0");
+
+    // The existing tables are untouched: one row each, every value read back as written.
+    CHECK(query1(db.dsn(), "SELECT count(*) FROM plugin_config_store.configs") == "1");
+    CHECK(query1(db.dsn(), "SELECT plugin || '|' || key || '|' || value || '|' || updated_by "
+                           "FROM plugin_config_store.configs") == "p1|k1|a value|alice");
+    CHECK(query1(db.dsn(), "SELECT count(*) FROM plugin_config_store.secrets") == "1");
+    CHECK(query1(db.dsn(), "SELECT scope_key || '|' || encode(sealed_value, 'hex') || '|' || "
+                           "updated_by FROM plugin_config_store.secrets") ==
+          "p1.s1|deadbeef00ff|alice");
+    CHECK(query1(db.dsn(), "SELECT count(*) FROM plugin_config_store.kill_switches") == "1");
+    CHECK(query1(db.dsn(), "SELECT scope_key || '|' || action || '|' || enabled::text || '|' || "
+                           "reason || '|' || set_by || '|' || os "
+                           "FROM plugin_config_store.kill_switches") ==
+          "p1.act@linux|act|false|because|alice|linux");
+
+    // enablement_meta is a singleton: another id fails the CHECK (23514), a second id=1 row
+    // fails the primary key (23505), and the one row is still the only row.
+    CHECK(sqlstate_of(db.dsn(), "INSERT INTO plugin_config_store.enablement_meta (id, store_id) "
+                                "VALUES (2, 'second')") == "23514");
+    CHECK(sqlstate_of(db.dsn(), "INSERT INTO plugin_config_store.enablement_meta (id, store_id) "
+                                "VALUES (1, 'duplicate')") == "23505");
+    CHECK(query1(db.dsn(), "SELECT count(*) FROM plugin_config_store.enablement_meta") == "1");
+    CHECK(query1(db.dsn(), "SELECT store_id FROM plugin_config_store.enablement_meta") ==
+          meta->store_id);
 }
 
 // -- Rules --------------------------------------------------------------------
@@ -388,11 +503,16 @@ TEST_CASE("EnablementStore: the loader keeps surviving units and never skips a b
     CHECK(loaded->unresolved_units == std::vector<std::string>{"gone.unit"});
     CHECK(f.metrics.gauge("yuzu_server_enablement_unresolved_units").value() == 1);
 
-    // One warn line per bad rule, naming the id and the label - never the pattern text.
-    for (const char* id : {"badsel", "badpat", "badunit"})
-        CHECK(log.says(std::string("rule ") + id + " refused at load: refused"));
+    // Exactly one warn line per bad rule, naming the id and the label - never the pattern
+    // text - and one for the unresolved names.
+    const std::string text = log.text();
+    for (const char* id : {"badsel", "badpat", "badunit"}) {
+        INFO(id);
+        CHECK(count_of(text, std::string("rule ") + id + " refused at load: refused") == 1);
+    }
     CHECK_FALSE(log.says("MATCHES"));
-    CHECK(log.says("gone.unit"));
+    CHECK(count_of(text, "unknown to this release") == 1);
+    CHECK(count_of(text, "gone.unit") == 1);
 
     // Resolving the mixed rule keeps wol.wake off despite the stale name.
     std::vector<en::Rule> one;
@@ -427,31 +547,69 @@ TEST_CASE("EnablementStore: a rule id carrying control bytes is quarantined and 
     CHECK(log.says("rule _bad_ refused at load: caps"));
 }
 
+TEST_CASE("EnablementStore: the loader refuses more than the cap of active rules and never truncates",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    LogCapture log;
+    seed_rules(f.dsn(), static_cast<int>(en::kMaxRules) + 1);
+    auto over = f.store->load_rules();
+    REQUIRE_FALSE(over.has_value());
+    CHECK(over.error() == EnablementStore::Error::Unavailable);
+    CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "query_error"}}) == 1);
+    CHECK(log.says("load refused"));
+
+    // One rule fewer is exactly the cap: every rule loads, none is quarantined.
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_rules SET active = FALSE "
+                      "WHERE id = 'seed0001'");
+    auto at_cap = f.store->load_rules();
+    REQUIRE(at_cap.has_value());
+    CHECK(at_cap->rules.size() == en::kMaxRules);
+    CHECK(at_cap->quarantined.empty());
+    CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "query_error"}}) == 1);
+}
+
 TEST_CASE("EnablementStore: load_rules returns a version and rows from ONE snapshot",
           "[pg][store][enablement]") {
     EnablementPg f;
-    // Each put adds exactly one rule and bumps the version once, in one transaction, so
-    // a consistent snapshot always satisfies rules == rules_version - 1.
-    auto writer = f.make_store();
-    std::atomic<bool> done{false};
-    std::atomic<int> write_failures{0};
-    std::thread t([&] {
-        for (int i = 0; i < 40; ++i)
-            if (!writer->put_rule(row("w" + std::to_string(1000 + i), {"wol.wake"})))
-                ++write_failures;
-        done = true;
-    });
-    int checked = 0;
-    while (!done.load() || checked == 0) {
-        auto loaded = f.store->load_rules();
-        REQUIRE(loaded.has_value());
-        CHECK(static_cast<std::int64_t>(loaded->rules.size()) == loaded->rules_version - 1);
-        ++checked;
-    }
-    t.join();
-    CHECK(write_failures.load() == 0);
-    auto last = f.store->load_rules();
-    CHECK(last->rules.size() == 40);
+    REQUIRE(f.store->put_rule(row("r1", {"wol.wake"})));
+    const auto version_before = f.store->get_meta()->rules_version;
+    REQUIRE(f.store->list_rules(true)->size() == 1);
+
+    // A holds ACCESS EXCLUSIVE on the rules table. The loader's version read, which fixes
+    // its REPEATABLE READ snapshot, does not touch that table and runs; its rules SELECT
+    // then parks on the relation lock until A commits.
+    PgConn a{PQconnectdb(f.dsn().c_str())};
+    REQUIRE(PQstatus(a.get()) == CONNECTION_OK);
+    REQUIRE(PgResult{PQexec(a.get(), "BEGIN")}.ok());
+    REQUIRE(PgResult{PQexec(a.get(), "LOCK TABLE plugin_config_store.enablement_rules IN ACCESS "
+                                     "EXCLUSIVE MODE")}
+                .ok());
+    std::expected<EnablementStore::LoadedRules, EnablementStore::Error> parked;
+    yuzu::test::Workers workers([&] { end_txn(a, "ROLLBACK"); });
+    workers.add([&] { parked = f.store->load_rules(); });
+    REQUIRE(wait_for_relation_waiter(f.pool()));
+
+    // The author adds a rule and bumps the version in ONE transaction while the loader waits.
+    REQUIRE(PgResult{PQexec(a.get(), "INSERT INTO plugin_config_store.enablement_rules (id, units, "
+                                     "selector, provenance) VALUES ('late', ARRAY['wol.wake'], "
+                                     "'__all__', 'operator')")}
+                .ok());
+    REQUIRE(PgResult{PQexec(a.get(), "UPDATE plugin_config_store.enablement_meta SET rules_version "
+                                     "= rules_version + 1 WHERE id = 1")}
+                .ok());
+    REQUIRE(PgResult{PQexec(a.get(), "COMMIT")}.ok());
+    workers.join_all();
+
+    // The loader's snapshot predates that commit, so it holds the OLD version and the OLD
+    // rows together. A READ COMMITTED loader would return the old version with the new rule.
+    REQUIRE(parked.has_value());
+    CHECK(parked->rules_version == version_before);
+    CHECK(parked->rules.size() == 1);
+    // A load after the commit sees the new pair.
+    auto fresh = f.store->load_rules();
+    REQUIRE(fresh.has_value());
+    CHECK(fresh->rules_version == version_before + 1);
+    CHECK(fresh->rules.size() == 2);
 }
 
 // -- Endpoints -----------------------------------------------------------------------
@@ -603,11 +761,14 @@ TEST_CASE("EnablementStore: a report equal to the previous desired state never c
                              "', pending_since = now() WHERE agent_id = 'ep001'")
                                 .c_str())}
                 .ok());
-    // B reports the PREVIOUS state while A is uncommitted (or just after - the result is the same).
+    // B reports the PREVIOUS state and parks on A's row lock; the wait is observed, so the
+    // report really is evaluated against the row A is about to change.
     std::expected<EnablementStore::ReportOutcome, EnablementStore::Error> b_result;
-    std::thread b([&] { b_result = f.store->record_report("ep001", epoch, c1, kH1); });
+    yuzu::test::Workers workers([&] { end_txn(a, "ROLLBACK"); });
+    workers.add([&] { b_result = f.store->record_report("ep001", epoch, c1, kH1); });
+    REQUIRE(yuzu::test::wait_for_lock_waiter(f.pool()));
     REQUIRE(PgResult{PQexec(a.get(), "COMMIT")}.ok());
-    b.join();
+    workers.join_all();
     REQUIRE(b_result.has_value());
     // The CASE was evaluated against the committed state 2: pending is NOT cleared.
     CHECK(f.store->get_endpoint("ep001")->pending);
@@ -748,11 +909,13 @@ TEST_CASE("EnablementStore: a declaration and a batch serialise on the meta row 
                                  " RETURNING counter")
                                     .c_str())}
                     .status() == PGRES_TUPLES_OK);
-        // B's declaration blocks on the meta row A holds.
+        // B's declaration blocks on the meta row A holds (the wait is observed).
         std::expected<void, EnablementStore::Error> declared;
-        std::thread b([&] { declared = f.store->set_regressed("race"); });
+        yuzu::test::Workers workers([&] { end_txn(a, "ROLLBACK"); });
+        workers.add([&] { declared = f.store->set_regressed("race"); });
+        REQUIRE(yuzu::test::wait_for_lock_waiter(f.pool()));
         REQUIRE(PgResult{PQexec(a.get(), "ROLLBACK")}.ok());
-        b.join();
+        workers.join_all();
         REQUIRE(declared.has_value());
         auto next = f.store->set_desired_batch(f.batch({{"ep001", 1, {}, kH1}}, {}, 1));
         REQUIRE_FALSE(next.has_value());
@@ -768,11 +931,13 @@ TEST_CASE("EnablementStore: a declaration and a batch serialise on the meta row 
                                 "regressed_reason = 'race' WHERE id = 1")}
                     .ok());
         std::expected<EnablementStore::BatchResult, EnablementStore::Error> batch;
-        std::thread a([&] {
+        yuzu::test::Workers workers([&] { end_txn(b, "ROLLBACK"); });
+        workers.add([&] {
             batch = f.store->set_desired_batch(f.batch({{"ep001", 1, {}, kH1}}, {}, 1));
         });
+        REQUIRE(yuzu::test::wait_for_lock_waiter(f.pool()));
         REQUIRE(PgResult{PQexec(b.get(), "COMMIT")}.ok());
-        a.join();
+        workers.join_all();
         REQUIRE_FALSE(batch.has_value());
         CHECK(batch.error() == EnablementStore::Error::Regressed);
         CHECK(f.store->get_endpoint("ep001")->desired_hash.empty());
@@ -834,8 +999,15 @@ TEST_CASE("EnablementStore: the continuity anchor - unwitnessed, regressed, idem
         CHECK(en::parse_anchor(now)->counter == meta0->counter + 10);
     }
 
-    // Another store's id, an unparseable file and an over-long one are all regressions.
-    REQUIRE(f.store->resolve_regression());
+    // Another store's id, an unparseable file and an over-long one are all regressions. The
+    // store has no way to clear a declaration (resolution starts a new ordering and is not
+    // its to define), so each round is reset by hand.
+    const auto reset_by_hand = [&] {
+        clear_regression(f.dsn());
+        f.store->refresh_regression();
+        REQUIRE_FALSE(f.store->regression().regressed);
+    };
+    reset_by_hand();
     for (const auto& [content, reason] : std::vector<std::pair<std::string, std::string>>{
              {en::render_anchor({"00000000-0000-0000-0000-000000000000", 1, 0}), "store_id_mismatch"},
              {"not an anchor", "anchor_unparseable"},
@@ -848,7 +1020,7 @@ TEST_CASE("EnablementStore: the continuity anchor - unwitnessed, regressed, idem
         auto probe = f.make_store();
         CHECK(*probe->check_continuity_at_boot(f.anchor()) == en::Continuity::Regressed);
         CHECK(probe->regression().reason == reason);
-        REQUIRE(f.store->resolve_regression());
+        reset_by_hand();
     }
 }
 
@@ -873,8 +1045,11 @@ TEST_CASE("EnablementStore: write_anchor reads the meta row, and the file, autho
     CHECK(f.counter("yuzu_server_enablement_anchor_write_refused_total", {{"reason", "regressed"}}) == 1);
     CHECK(read_file() == untouched);
 
-    // Resolve, then put the FILE ahead while the instance runs: refused, declared, not lowered.
-    REQUIRE(other->resolve_regression());
+    // Clear it by hand, then put the FILE ahead while the instance runs: refused, declared,
+    // not lowered.
+    clear_regression(f.dsn());
+    other->refresh_regression();
+    REQUIRE_FALSE(other->regression().regressed);
     const auto meta = f.store->get_meta();
     {
         std::ofstream out(f.anchor(), std::ios::binary | std::ios::trunc);
@@ -886,7 +1061,7 @@ TEST_CASE("EnablementStore: write_anchor reads the meta row, and the file, autho
     CHECK(query1(f.dsn(), "SELECT regressed_reason FROM plugin_config_store.enablement_meta") == "store_behind");
 }
 
-TEST_CASE("EnablementStore: the anchor is written atomically, ignores stale temp files, matches the store",
+TEST_CASE("EnablementStore: a successful anchor write replaces the file and leaves no temp of its own",
           "[pg][store][enablement]") {
     EnablementPg f;
     f.seed(2);
@@ -914,22 +1089,101 @@ TEST_CASE("EnablementStore: the anchor is written atomically, ignores stale temp
     CHECK(temps == 1);
 }
 
-TEST_CASE("EnablementStore: a second replica answers pending-with-age from the row",
+TEST_CASE("EnablementStore: an anchor write that cannot land is Failed and counted and leaves nothing behind",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    fs::create_directories(f.dir.path);
+    // A regular file where the anchor's parent directory should be: the path reads as
+    // missing (ENOTDIR), so the write is attempted, and creating the temp file under a
+    // non-directory fails on every platform, as root or not.
+    const fs::path blocker = f.dir.path / "not_a_directory";
+    {
+        std::ofstream out(blocker, std::ios::binary);
+        out << "keep me";
+    }
+    CHECK(f.store->write_anchor(blocker / "enablement-anchor") == EnablementStore::AnchorWrite::Failed);
+    CHECK(f.counter("yuzu_server_enablement_anchor_write_failed_total") == 1);
+    CHECK(read_file(blocker) == "keep me");
+    for (const auto& e : fs::directory_iterator(f.dir.path))
+        CHECK(e.path().filename().string().find(".tmp.") == std::string::npos);
+
+    // The failure is not sticky: the next write to a usable path lands.
+    CHECK(f.store->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Written);
+    CHECK(en::parse_anchor(read_file(f.anchor())).has_value());
+    CHECK(f.counter("yuzu_server_enablement_anchor_write_failed_total") == 1);
+    // Not reproducible without a fault-injection hook in production code, and so stated
+    // rather than tested: an EXISTING anchor surviving a failure between the temp write and
+    // the rename, and a crash between fsync and rename. Both rest on the write order
+    // (fsync the temp, then an atomic replace) described in the header banner.
+}
+
+
+TEST_CASE("EnablementStore: a second replica answers pending-with-age from the persisted row",
           "[pg][store][enablement]") {
     EnablementPg f;
     f.seed(1);
     exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 2");
     REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 2)));
+    // Age the pending state in SQL, not on a clock: the age a second replica reports must come
+    // from the persisted column, so a constant-zero implementation cannot satisfy this.
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_endpoints SET pending_since = "
+                      "now() - interval '2 hours' WHERE agent_id = 'ep001'");
     PgPool pool_b{{.conninfo = f.dsn(), .size = 2}};
     auto b = f.make_store(&pool_b);
     auto e = b->get_endpoint("ep001");
     REQUIRE(e.has_value());
     CHECK(e->pending);
     REQUIRE(e->pending_age_seconds.has_value());
-    CHECK(*e->pending_age_seconds >= 0);
+    CHECK(*e->pending_age_seconds >= 7100);
+    CHECK(*e->pending_age_seconds <= 7300);
     CHECK(e->desired_hash == kH1);
     CHECK(e->desired_units == std::vector<std::string>{"wol.wake"});
     CHECK(e->desired_counter == 1);
+
+    // The exact acknowledgement clears the pending state and its age.
+    REQUIRE(b->record_report("ep001", e->desired_epoch, e->desired_counter, kH1));
+    auto acked = f.store->get_endpoint("ep001");
+    REQUIRE(acked.has_value());
+    CHECK_FALSE(acked->pending);
+    CHECK_FALSE(acked->pending_age_seconds.has_value());
+}
+
+TEST_CASE("EnablementStore: has_held_state is a durable latch that empty reports and "
+          "re-registration and a new store never clear",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(2);
+    REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 1)));
+    const auto issued = f.store->get_endpoint("ep001");
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->desired_counter > 0);
+    // Being issued a state is not holding one: nothing has been reported yet.
+    CHECK_FALSE(issued->has_held_state);
+
+    // A report of a positive counter latches it, for that endpoint only.
+    REQUIRE(f.store->record_report("ep001", issued->desired_epoch, issued->desired_counter, kH1));
+    CHECK(f.store->get_endpoint("ep001")->has_held_state);
+    CHECK_FALSE(f.store->get_endpoint("ep002")->has_held_state);
+
+    // An empty report differs from the last one, so it IS written - and the latch holds.
+    auto empty = f.store->record_report("ep001", issued->desired_epoch, 0, "");
+    REQUIRE(empty.has_value());
+    CHECK(*empty == EnablementStore::ReportOutcome::Written);
+    CHECK(f.store->get_endpoint("ep001")->reported_counter == 0);
+    CHECK(f.store->get_endpoint("ep001")->has_held_state);
+
+    // So does a re-registration (which does run: input_gen moves) ...
+    f.store->upsert_on_registration("ep001", EnablementPg::ident("h1"), f.reg(2));
+    CHECK(f.store->get_endpoint("ep001")->input_gen == 2);
+    CHECK(f.store->get_endpoint("ep001")->has_held_state);
+
+    // ... and a store instance that never saw any of it reads the same durable answer.
+    PgPool pool_b{{.conninfo = f.dsn(), .size = 2}};
+    auto b = f.make_store(&pool_b);
+    CHECK(b->get_endpoint("ep001")->has_held_state);
+    CHECK_FALSE(b->get_endpoint("ep002")->has_held_state);
+    CHECK(query1(f.dsn(), "SELECT has_held_state FROM plugin_config_store.enablement_endpoints "
+                          "WHERE agent_id = 'ep001'") == "t");
 }
 
 TEST_CASE("EnablementStore: a release that changes the unit overlay makes every row stale",
@@ -960,4 +1214,112 @@ TEST_CASE("EnablementStore: a read that cannot be served is a typed Unavailable,
     CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "query_error"}}) == 1);
     REQUIRE(PgResult{PQexec(locker.get(), "ROLLBACK")}.ok());
     CHECK(store->list_rules(true).has_value());
+}
+
+// -- Boot ----------------------------------------------------------------------------
+//
+// EnablementStore::boot is the server's whole composition of the store, so each refusal the
+// server turns into startup_failed_ is a branch here.
+
+TEST_CASE("EnablementStore: a healthy boot opens the store and records the overlay and witnesses the anchor",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    auto booted = EnablementStore::boot(f.pool(), make_overlay(), kH1, kinds(), f.anchor(), &f.metrics);
+    REQUIRE(booted.has_value());
+    REQUIRE(*booted);
+    CHECK((*booted)->is_open());
+    CHECK_FALSE((*booted)->regression().regressed);
+    // First boot on this host: no anchor yet, so it is unwitnessed - and then written.
+    CHECK((*booted)->regression().anchor_unwitnessed);
+    const auto meta = f.store->get_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->overlay_hash == kH1);
+    const auto parsed = en::parse_anchor(read_file(f.anchor()));
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->store_id == meta->store_id);
+
+    // A second boot with the same digest and the anchor now on disk is quiet: same
+    // rules_version (no re-resolution), not unwitnessed.
+    const auto version = meta->rules_version;
+    auto again = EnablementStore::boot(f.pool(), make_overlay(), kH1, kinds(), f.anchor(), nullptr);
+    REQUIRE(again.has_value());
+    CHECK_FALSE((*again)->regression().anchor_unwitnessed);
+    CHECK(f.store->get_meta()->rules_version == version);
+}
+
+TEST_CASE("EnablementStore: boot refuses when the overlay hash cannot be recorded and writes no anchor",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    PgPool short_pool{{.conninfo = f.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    // A holds the meta row; the construction smoke read (a plain SELECT) is not blocked, the
+    // overlay-hash UPDATE is, and gives up at the pool's lock timeout.
+    PgConn a{PQconnectdb(f.dsn().c_str())};
+    REQUIRE(PQstatus(a.get()) == CONNECTION_OK);
+    REQUIRE(PgResult{PQexec(a.get(), "BEGIN")}.ok());
+    REQUIRE(PgResult{PQexec(a.get(), "SELECT 1 FROM plugin_config_store.enablement_meta WHERE id = 1 "
+                                     "FOR UPDATE")}
+                .status() == PGRES_TUPLES_OK);
+    auto refused = EnablementStore::boot(short_pool, make_overlay(), kH1, kinds(), f.anchor(), nullptr);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("overlay hash") != std::string::npos);
+    CHECK_FALSE(fs::exists(f.anchor()));
+    CHECK(query1(f.dsn(), "SELECT overlay_hash = '' FROM plugin_config_store.enablement_meta") == "t");
+
+    // Control: the same call succeeds once the row is free.
+    REQUIRE(PgResult{PQexec(a.get(), "ROLLBACK")}.ok());
+    auto booted = EnablementStore::boot(short_pool, make_overlay(), kH1, kinds(), f.anchor(), nullptr);
+    REQUIRE(booted.has_value());
+    CHECK(fs::exists(f.anchor()));
+}
+
+TEST_CASE("EnablementStore: boot refuses when a disagreeing anchor cannot be declared against the store",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    // The digest is already recorded, so the overlay-hash UPDATE matches no row and does not
+    // wait; the anchor is ahead of the store, so the continuity check must DECLARE a
+    // regression - and that write is the one the held row lock refuses.
+    REQUIRE(f.store->sync_overlay_hash(kH1).value());
+    const auto meta = f.store->get_meta();
+    REQUIRE(meta.has_value());
+    fs::create_directories(f.dir.path);
+    {
+        std::ofstream out(f.anchor(), std::ios::binary | std::ios::trunc);
+        out << en::render_anchor({meta->store_id, meta->epoch, meta->counter + 10});
+    }
+    REQUIRE(fs::exists(f.anchor())); // an unwritable fixture would read as a MISSING anchor
+    PgPool short_pool{{.conninfo = f.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    PgConn a{PQconnectdb(f.dsn().c_str())};
+    REQUIRE(PQstatus(a.get()) == CONNECTION_OK);
+    REQUIRE(PgResult{PQexec(a.get(), "BEGIN")}.ok());
+    REQUIRE(PgResult{PQexec(a.get(), "SELECT 1 FROM plugin_config_store.enablement_meta WHERE id = 1 "
+                                     "FOR UPDATE")}
+                .status() == PGRES_TUPLES_OK);
+    auto refused = EnablementStore::boot(short_pool, make_overlay(), kH1, kinds(), f.anchor(), nullptr);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("continuity") != std::string::npos);
+    REQUIRE(PgResult{PQexec(a.get(), "ROLLBACK")}.ok());
+    CHECK(query1(f.dsn(), "SELECT regressed_at IS NULL FROM plugin_config_store.enablement_meta") == "t");
+}
+
+TEST_CASE("EnablementStore: a declared regression does not stop the server booting",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    const auto meta = f.store->get_meta();
+    REQUIRE(meta.has_value());
+    fs::create_directories(f.dir.path);
+    {
+        // The anchor is ahead of the store: a dump restored behind it.
+        std::ofstream out(f.anchor(), std::ios::binary | std::ios::trunc);
+        out << en::render_anchor({meta->store_id, meta->epoch, meta->counter + 10});
+    }
+    REQUIRE(fs::exists(f.anchor())); // an unwritable fixture would read as a MISSING anchor
+    auto booted = EnablementStore::boot(f.pool(), make_overlay(), kH1, kinds(), f.anchor(), &f.metrics);
+    // A regression is a fact the store declares and /readyz reports, not a startup refusal.
+    REQUIRE(booted.has_value());
+    CHECK((*booted)->regression().regressed);
+    CHECK((*booted)->regression().reason == "store_behind");
+    CHECK(f.metrics.gauge("yuzu_server_enablement_regressed").value() == 1);
+    CHECK(query1(f.dsn(), "SELECT regressed_at IS NOT NULL FROM plugin_config_store.enablement_meta") == "t");
+    // The anchor was not lowered to hide it.
+    CHECK(en::parse_anchor(read_file(f.anchor()))->counter == meta->counter + 10);
 }

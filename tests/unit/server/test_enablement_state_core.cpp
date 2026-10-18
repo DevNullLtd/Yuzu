@@ -1,6 +1,6 @@
 /**
  * test_enablement_state_core.cpp — truth tables of the pure half of the durable
- * enablement store (enablement_state_core.hpp, sha256_hex.hpp, ADR-3006 PM1.1b):
+ * enablement store (enablement_state_core.hpp, sha256_hex.hpp, ADR-3006):
  * wire spellings, hashes, boundary caps, the continuity anchor and the loader.
  *
  * Pure: no database, no file, no clock, no process.

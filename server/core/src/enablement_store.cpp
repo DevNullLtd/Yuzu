@@ -304,6 +304,32 @@ EnablementStore::EnablementStore(pg::PgPool& pool, en::UnitOverlay overlay,
     open_ = true;
 }
 
+std::expected<std::unique_ptr<EnablementStore>, std::string>
+EnablementStore::boot(pg::PgPool& pool, en::UnitOverlay overlay, std::string_view overlay_digest,
+                      std::vector<std::string_view> kinds, const fs::path& anchor_path,
+                      yuzu::MetricsRegistry* metrics) {
+    const auto refuse = [](const char* why) {
+        return std::unexpected<std::string>(std::string(why));
+    };
+    auto store = std::make_unique<EnablementStore>(pool, std::move(overlay), std::move(kinds));
+    if (!store->is_open())
+        return refuse("enablement store open failed");
+    store->set_metrics(metrics);
+    // A release that adds/removes a unit OR a requirement edge makes every endpoint row
+    // stale (rules_version bump in the same statement).
+    const auto synced = store->sync_overlay_hash(overlay_digest);
+    if (!synced)
+        return refuse("enablement overlay hash could not be recorded");
+    if (*synced)
+        spdlog::info("EnablementStore: the unit overlay changed in this release; every endpoint "
+                     "will be re-resolved");
+    // A present anchor that disagrees with the store declares it regressed (issuing desired
+    // state freezes); a missing one is only reported. Either way the server still boots.
+    if (!store->check_continuity_at_boot(anchor_path))
+        return refuse("enablement continuity check could not read the store");
+    return store;
+}
+
 void EnablementStore::set_metrics(yuzu::MetricsRegistry* m) {
     metrics_ = m;
     if (!m)
@@ -929,31 +955,22 @@ void EnablementStore::apply_regression_cache(bool regressed, std::string reason,
         metrics_->gauge("yuzu_server_enablement_regressed").set(regressed ? 1.0 : 0.0);
 }
 
-std::expected<void, EnablementStore::Error>
-EnablementStore::update_meta_regression(std::string_view set_clause,
-                                        const std::vector<std::string>& params) {
+// Idempotent: only the first declaration records its time and reason.
+std::expected<void, EnablementStore::Error> EnablementStore::set_regressed(std::string_view reason) {
     auto lease = write_lease();
     if (!lease)
         return std::unexpected(Error::Unavailable);
     pg::PgResult r = pg::exec_params(
-        lease.get(), (std::string("UPDATE ") + kMeta + " SET " + std::string(set_clause)).c_str(),
-        params);
+        lease.get(),
+        (std::string("UPDATE ") + kMeta +
+         " SET regressed_at = now(), regressed_reason = $1 WHERE id = 1 AND regressed_at IS NULL")
+            .c_str(),
+        std::vector<std::string>{::yuzu::log_token(reason.substr(0, 64))});
     if (r.status() != PGRES_COMMAND_OK)
         return std::unexpected(Error::WriteFailed);
     lease.reset();
     refresh_regression();
     return {};
-}
-
-// Idempotent: only the first declaration records its time and reason.
-std::expected<void, EnablementStore::Error> EnablementStore::set_regressed(std::string_view reason) {
-    return update_meta_regression(
-        "regressed_at = now(), regressed_reason = $1 WHERE id = 1 AND regressed_at IS NULL",
-        {::yuzu::log_token(reason.substr(0, 64))});
-}
-
-std::expected<void, EnablementStore::Error> EnablementStore::resolve_regression() {
-    return update_meta_regression("regressed_at = NULL, regressed_reason = '' WHERE id = 1", {});
 }
 
 void EnablementStore::refresh_regression() {

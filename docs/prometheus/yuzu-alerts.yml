@@ -5041,7 +5041,7 @@ groups:
             yuzu_exec_correlation_write_degrade_total.
 
   - name: yuzu-enablement
-    # ADR-3006 PM1.1b — the durable plugin-enablement store (EnablementStore). Every closed-label
+    # ADR-3006 — the durable plugin-enablement store (EnablementStore). Every closed-label
     # series and every gauge is zero-seeded at boot, so increase() > 0 is
     # meaningful and absent() stays a real signal. All series are server-side.
     #

@@ -2,7 +2,7 @@
 
 /**
  * enablement_state_core.hpp — the PURE half of the durable enablement store
- * (ADR-3006, PM1.1b). No I/O, no clock, no globals: every decision the SQL shell
+ * (ADR-3006). No I/O, no clock, no globals: every decision the SQL shell
  * (enablement_store.cpp) makes about bytes goes through a free function here, so the unit suites cover it
  * without Postgres.
  *

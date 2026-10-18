@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file enablement_store.hpp
-/// The durable enablement store (ADR-3006 PM1.1b): rules, per-endpoint desired
+/// The durable enablement store (ADR-3006): rules, per-endpoint desired
 /// and reported state, and the continuity anchor. A sibling accessor over the
 /// `plugin_config_store` schema — PluginConfigStore owns the v3 migration, this
 /// class reads and writes the three tables it adds (enablement_rules,
@@ -75,7 +75,7 @@
 ///  - MISSING is only unwitnessed: counted, latched on /readyz for the boot, then
 ///    written from the store's current highest. ReportAhead (an agent reporting an
 ///    (epoch, counter) above the store's) is the second witness, counted here and
-///    declared by PM2.1.
+///    declared by the delivery row.
 ///  - The anchor is NEVER lowered: write_anchor reads enablement_meta authoritatively
 ///    and the file itself on every write; a store behind THIS host's file (a dump
 ///    restored under a running server) is declared, not overwritten, and nothing is
@@ -96,6 +96,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -218,6 +219,19 @@ public:
     EnablementStore(const EnablementStore&) = delete;
     EnablementStore& operator=(const EnablementStore&) = delete;
 
+    /// The server's boot composition, in one place so it is testable below ServerImpl:
+    /// construct (a store that did not open is an error), wire metrics, record this
+    /// release's overlay digest (a failure is an error; a changed digest is logged and
+    /// makes every row stale) and classify the continuity anchor at `anchor_path`
+    /// (an unreadable store is an error). The string is the refusal reason, for the
+    /// caller's startup log. A Regressed VERDICT is NOT an error: the store is declared
+    /// regressed (issuing freezes, /readyz reports it) and the server still boots. The
+    /// overlay build and digest are process-wide facts the caller establishes first.
+    [[nodiscard]] static std::expected<std::unique_ptr<EnablementStore>, std::string>
+    boot(pg::PgPool& pool, enablement::UnitOverlay overlay, std::string_view overlay_digest,
+         std::vector<std::string_view> kinds, const std::filesystem::path& anchor_path,
+         yuzu::MetricsRegistry* metrics);
+
     [[nodiscard]] bool is_open() const noexcept { return open_; }
     /// The unit overlay this release shipped (the resolver resolves against it).
     [[nodiscard]] const enablement::UnitOverlay& overlay() const noexcept { return overlay_; }
@@ -252,7 +266,7 @@ public:
     [[nodiscard]] std::expected<EndpointRow, Error> get_endpoint(std::string_view agent_id) const;
     /// One conditional UPDATE (see the banner). Ahead means the reported (epoch,
     /// counter) exceeds the store's highest; it is counted and flagged, never
-    /// declared here (PM2.1 owns the threshold).
+    /// declared here (the delivery row owns the threshold).
     [[nodiscard]] std::expected<ReportOutcome, Error>
     record_report(std::string_view agent_id, std::int64_t epoch, std::int64_t counter,
                   std::string_view hash);
@@ -277,10 +291,12 @@ public:
     /// while regressed or when the file is ahead of / foreign to the store.
     AnchorWrite write_anchor(const std::filesystem::path& anchor_path);
 
-    /// Declare / clear a regression (PM2.1 and tests; no route calls them here).
-    /// Both UPDATE the meta row, so they serialise with set_desired_batch.
+    /// Declare a regression (the delivery row and tests; no route calls it here). It
+    /// UPDATEs the meta row, so it serialises with set_desired_batch. There is
+    /// deliberately no way to clear one: accepting a regressed state starts a new
+    /// ordering of states (ADR-3006 D14), which is the operator preview flow's to
+    /// define, not a flag flip. Tests clear it with a raw UPDATE.
     [[nodiscard]] std::expected<void, Error> set_regressed(std::string_view reason);
-    [[nodiscard]] std::expected<void, Error> resolve_regression();
     /// Re-read regressed_at / reason and the report-ahead endpoint count into the
     /// cache that serves /readyz. The cache is never the authority for a write.
     void refresh_regression();
@@ -299,9 +315,6 @@ private:
     /// The same for a write; empty on the same two causes, not counted (the caller
     /// returns Unavailable, and write_degrade_total is for best-effort writes).
     [[nodiscard]] pg::PgPool::Lease write_lease() const;
-    /// set_regressed / resolve_regression: one UPDATE of the meta row, then a cache refresh.
-    [[nodiscard]] std::expected<void, Error>
-    update_meta_regression(std::string_view set_clause, const std::vector<std::string>& params);
     void apply_regression_cache(bool regressed, std::string reason, std::int64_t since_ms);
 
     pg::PgPool& pool_;

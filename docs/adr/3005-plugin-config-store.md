@@ -230,7 +230,7 @@ is already on.
   plugin kill switch rows (#5294)").
 - **Scope.** This is the mechanism only; no plugin is wired to a per-OS seed here.
 
-### Update (2026-10-17, ADR-3006 PM1.1b) — enablement tables (schema v3)
+### Update (2026-10-17, ADR-3006) — enablement tables (schema v3)
 
 Schema v3 adds the durable half of the enablement model to the same schema. It is purely
 additive (v1 and v2 are untouched) and the rows are read and written by `EnablementStore`
@@ -280,7 +280,9 @@ release (ADR-3006 D10/D14).
 - **The continuity anchor.** `<data_dir>/enablement-anchor` (three lines: store id, epoch, counter)
   is this host's witness of the highest `(epoch, counter)` it has seen. A PRESENT anchor that names
   another store, is ahead of the store, or cannot be read declares the store regressed
-  (`regressed_at` is set, issuing freezes, `/readyz` reports it). A MISSING anchor is only
+  (`regressed_at` is set, issuing freezes, `/readyz` reports it; this store has no way to clear
+  it, because accepting a regressed state starts a new ordering of states, ADR-3006 D14, which
+  the operator flow that follows owns). A MISSING anchor is only
   unwitnessed: counted, latched on `/readyz` for that boot and then written, so every later restore
   on the host is witnessed. An agent reporting above the store's highest (`ReportAhead`) is the
   second witness: counted and surfaced here, declared by the delivery row. The anchor is NEVER
@@ -299,9 +301,10 @@ release (ADR-3006 D10/D14).
   rules reference that this release does not know are computed at load with `resolve()`'s own
   predicate, gauged (`yuzu_server_enablement_unresolved_units`) and alerted.
 - **Not here.** The resolver job that issues desired state, the registration observer and the
-  durable plugin inventory, tag and property invalidation, delivery and the regression declaration from agent reports (PM2.1), REST and MCP
-  authoring and audit (PM3.1), the dispatch cutover that consumes the inventory (PM3.2), purging
-  retired rows (nothing is ever deleted automatically) and cross-replica registration ordering.
+  durable plugin inventory, tag and property invalidation, delivery and the regression declaration
+  from agent reports, REST and MCP authoring and audit, the dispatch cutover that consumes the
+  inventory, purging retired rows (nothing is ever deleted automatically) and cross-replica
+  registration ordering.
 
 ### REST authorization — existing operations only
 

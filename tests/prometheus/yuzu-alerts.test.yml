@@ -3812,3 +3812,59 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
         eval_time: 29m
         exp_samples: []
+
+  # ── YuzuEnablementRegressed / YuzuEnablementRulesRejected (ADR-3006) ──────
+  #
+  # The enablement store's two alerts that carry a threshold or a duration. A
+  # regression freezes desired-state issuing, so the critical rule must (a) fire
+  # once the gauge has been held past for: 5m, (b) stay quiet on a blip shorter
+  # than that, and (c) resolve when the declaration is cleared. A rule loader that
+  # refuses a persisted rule must page on a RISE of the counter and stay quiet on a
+  # flat one, which is the zero-seeded healthy shape.
+
+  # CASE: a held regression fires, a short blip does not, and a cleared one resolves.
+  # s1 is regressed from minute 3 to 23 (fires once held 5m, i.e. from minute 8);
+  # s2 is regressed for three minutes only (3..5) and never reaches for: 5m.
+  - interval: 1m
+    name: enablement regressed - held past for fires, a short blip stays quiet, a cleared gauge resolves
+    input_series:
+      - series: 'yuzu_server_enablement_regressed{job="yuzu",instance="s1"}'
+        values: "0x2 1x20 0x10"
+      - series: 'yuzu_server_enablement_regressed{job="yuzu",instance="s2"}'
+        values: "0x2 1x2 0x30"
+    promql_expr_test:
+      # Held for two minutes: still pending, not firing.
+      - expr: 'ALERTS{alertname="YuzuEnablementRegressed", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      # Held past for: 5m: s1 fires; s2 (cleared at minute 6) does not.
+      - expr: 'ALERTS{alertname="YuzuEnablementRegressed", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementRegressed", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+      # Cleared at minute 24: resolved.
+      - expr: 'ALERTS{alertname="YuzuEnablementRegressed"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE: a refused rule fires on the rise of the counter and resolves when the rise
+  # leaves the one-hour window; a flat, zero-seeded counter stays quiet.
+  # s1 refuses three rules at minute 11 and then stays flat; s2 never moves.
+  - interval: 1m
+    name: enablement rules rejected - a rising counter fires and a flat zero-seeded one stays quiet
+    input_series:
+      - series: 'yuzu_server_enablement_rules_rejected_total{job="yuzu",instance="s1",reason="refused"}'
+        values: "0x10 3x80"
+      - series: 'yuzu_server_enablement_rules_rejected_total{job="yuzu",instance="s2",reason="refused"}'
+        values: "0x90"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      # The rise has left the 1h window: resolved, and s2 never fired.
+      - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected"}'
+        eval_time: 80m
+        exp_samples: []

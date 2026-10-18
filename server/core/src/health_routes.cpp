@@ -354,7 +354,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // WS-3 3.3 (arch-F1/sre-F1): born-on-PG command outbox on the live
         // scheduled-dispatch path — mirrors its /readyz row.
         bool command_outbox_ok = deps.command_outbox_store && deps.command_outbox_store->is_open();
-        // ADR-3006 PM1.1b: the enablement tables live in the plugin-config schema, and
+        // ADR-3006: the enablement tables live in the plugin-config schema, and
         // both stores are latched at boot like the rows above. The plugin-config store
         // was /readyz-only until now (the same readyz-vs-healthz drift class), so its
         // row joins here with the new one.
@@ -840,7 +840,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // yuzu::protective). Same readyz-vs-healthz drift class
             // the rows above document; boot state only (latched, #3061).
             {"plugin_config_store", deps.plugin_config_store && deps.plugin_config_store->is_open()},
-            // ADR-3006 PM1.1b — the enablement tables ride the plugin-config schema; boot
+            // ADR-3006 — the enablement tables ride the plugin-config schema; boot
             // state only (latched), like the row above.
             {"enablement_store", deps.enablement_store && deps.enablement_store->is_open()},
         };
