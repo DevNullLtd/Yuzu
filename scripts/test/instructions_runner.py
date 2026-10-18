@@ -92,8 +92,11 @@ line per attempt (the exact params sent: treat it as sensitive; it is created 06
 creation only; .gitignore covers only the default name) and an accepted line when the server answers
 it. --output is written through an owner-only descriptor that refuses a symlink (POSIX only); a
 targeted run creates it exclusively and refuses an existing one (rename it first: it holds the
-command_id record of an earlier run). A SIGKILL leaves only the manifest. --output holds command_id
-for accepted rows; rows rebuilt at an abort may have none (use the manifest accepted line). A closed
+command_id record of an earlier run); an untargeted run truncates and rewrites an existing --output
+in place, but only if it is a regular single-link file. A SIGKILL, a double signal in the same
+instant, or SIGHUP (an ssh drop) can leave only the manifest. --output holds command_id for accepted
+rows; rows rebuilt at an abort, and answers that land after the manifest was closed, carry no
+command_id in --output or the manifest: check the target by definition id and timestamp. A closed
 stdout may still end the process with exit 120 at interpreter flush: --output and the metrics are
 written first and it fails closed, never a false 0. The stderr list of not-started ids is capped at
 30; the rest are in --output and the manifest. Forensic rows read behavioural data from the target,
@@ -122,6 +125,7 @@ import platform
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -1278,17 +1282,35 @@ def preflight(client: YuzuClient, args: argparse.Namespace) -> tuple[dict | None
 
 
 def write_output(path: str, payload: dict, exclusive: bool = False) -> None:
-    """Write the summary through a descriptor opened owner-only that refuses a symlink where the
-    platform can say so (the same pattern as the manifest); a failure only warns. A targeted run
-    creates the file exclusively (O_EXCL): a file planted since the pre-flight is never written."""
+    """Write the summary through a descriptor opened owner-only; a failure only warns.
+
+    The open never follows a symlink where the platform can say so (O_NOFOLLOW) and never blocks on
+    a FIFO planted since the pre-flight (O_NONBLOCK: ENXIO at once). A targeted run creates the
+    file exclusively (O_EXCL), so a file planted since the pre-flight is never written. An
+    untargeted run opens WITHOUT O_TRUNC, checks the descriptor (a regular file with a single
+    link, so a hard link to someone else's file is refused) and only then truncates it in place.
+    """
+    fd = -1
     try:
         flags = (os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-                 | (os.O_EXCL if exclusive else os.O_TRUNC))
-        with os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8") as fh:
+                 | getattr(os, "O_NONBLOCK", 0) | (os.O_EXCL if exclusive else 0))
+        fd = os.open(path, flags, 0o600)
+        if not exclusive:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise OSError("refusing to write: not a regular file with a single link")
+            os.ftruncate(fd, 0)
+        if hasattr(os, "set_blocking"):
+            os.set_blocking(fd, True)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1   # the file object owns it now
             fh.write(json.dumps(payload, indent=2))
     except OSError as e:  # never lose the exit code over the summary file
         say(f"instructions_runner: warning: could not write --output {esc(path)}: {esc(e)}",
             file=sys.stderr)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def check_output_writable(path: str, refuse_existing: bool = False) -> str:
@@ -1530,7 +1552,8 @@ def run(args: argparse.Namespace) -> int:
             for fut in done:
                 collect(fut)
     except BaseException as e:  # KeyboardInterrupt included: stop further dispatch, keep the record
-        _GUARD.enter()   # first thing: a second signal must not interrupt the abort handler
+        control.request_stop()   # first: the worker stops even if a second signal lands next
+        _GUARD.enter()           # then: a second signal must not interrupt the abort handler
         abort_hold = True
         interrupted = isinstance(e, KeyboardInterrupt)
         aborted = (_INTERRUPT.get("signal") or "SIGINT") if interrupted else type(e).__name__
@@ -1735,25 +1758,28 @@ Destructive and forensic runs (--risks destructive forensic)
   creation only; .gitignore covers only the default name) and an accepted line when the server
   answers it. --output is written through an owner-only descriptor that refuses a symlink (POSIX
   only); a targeted run creates it exclusively and refuses an existing one (rename it first: it
-  holds the command_id record of an earlier run). A SIGKILL leaves only the manifest. --output holds
-  command_id for accepted rows; rows rebuilt at an abort may have none (use the manifest accepted
-  line). A closed stdout may still end the process with exit 120 at interpreter flush: --output and
-  the metrics are written first and it fails closed, never a false 0. The stderr list of not-started
-  ids is capped at 30; the rest are in --output and the manifest. Forensic rows read behavioural
-  data from the target, and the responses are stored in the server's response store.
+  holds the command_id record of an earlier run); an untargeted run truncates and rewrites an
+  existing --output in place, but only if it is a regular single-link file. A SIGKILL, a double
+  signal in the same instant, or SIGHUP (an ssh drop) can leave only the manifest. --output holds
+  command_id for accepted rows; rows rebuilt at an abort, and answers that land after the manifest
+  was closed, carry no command_id in --output or the manifest: check the target by definition id and
+  timestamp. A closed stdout may still end the process with exit 120 at interpreter flush: --output
+  and the metrics are written first and it fails closed, never a false 0. The stderr list of
+  not-started ids is capped at 30; the rest are in --output and the manifest. Forensic rows read
+  behavioural data from the target, and the responses are stored in the server's response store.
 
   Recovery after a stop. In the manifest a dispatch line is an attempt and an accepted line means
   only that the server answered it (http status and, when given, command_id, execution_id or
   approval_id): 200 means the server started it; an accepted line with a 5xx status may have run;
   202 and 4xx were not executed (an open approval ticket may remain). A dispatch line with no
-  accepted line may or may not have run (a SIGKILL leaves only the manifest and no --output).
-  --output holds command_id for every accepted row, plus the in_flight_unknown and dispatch_unknown
-  rows (a dispatch_unknown row may have no command_id: a POST that failed in flight has none). A
-  definition with no dispatch line was never sent. Check the target by hand (and the dashboard's
-  executions) before retrying. To resume, rename the old --output first (a targeted run refuses an
-  existing one), then pass --match with an anchored regex for the remaining ids only after
-  verifying, e.g. --match '^(device\\.tags\\.clear|device\\.filesystem\\.append)$' (--only-id takes
-  exactly one id).
+  accepted line may or may not have run (a SIGKILL, a double signal in the same instant, or SIGHUP
+  can leave only the manifest and no --output). --output holds command_id for every accepted row,
+  plus the in_flight_unknown and dispatch_unknown rows (a dispatch_unknown row may have no
+  command_id: a POST that failed in flight has none). A definition with no dispatch line was never
+  sent. Check the target by hand (and the dashboard's executions) before retrying. To resume, rename
+  the old --output first (a targeted run refuses an existing one), then pass --match with an
+  anchored regex for the remaining ids only after verifying, e.g. --match
+  '^(device\\.tags\\.clear|device\\.filesystem\\.append)$' (--only-id takes exactly one id).
 
   --confirm-target is a wrong-target typo guard against what the connected server reports. It cannot
   detect an ssh -L tunnel or a port forward to a different stack, and it is not an authorisation or
@@ -1866,9 +1892,13 @@ _INTERRUPT: dict[str, str] = {}   # which signal raised the KeyboardInterrupt, f
 
 
 def _raise_interrupt(signum: int, frame: Any) -> None:
-    if _INTERRUPT.get("ignore"):
+    """The one handler for SIGINT and SIGTERM: the first signal raises KeyboardInterrupt in the
+    main thread; every later one is ignored, so a second KeyboardInterrupt can never land inside
+    the abort handler or a lock wait and cost the --output record."""
+    if _INTERRUPT.get("ignore") or _INTERRUPT.get("fired"):
         return
-    _INTERRUPT["signal"] = "SIGTERM" if signum == getattr(signal, "SIGTERM", None) else str(signum)
+    _INTERRUPT["fired"] = "1"
+    _INTERRUPT["signal"] = "SIGTERM" if signum == getattr(signal, "SIGTERM", None) else "SIGINT"
     raise KeyboardInterrupt
 
 
@@ -1879,19 +1909,25 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError, OSError):
         pass
-    previous = None
-    try:  # SIGTERM takes the same abort path as Ctrl-C (summary, --output, exit 130)
-        previous = signal.signal(signal.SIGTERM, _raise_interrupt)
-    except (ValueError, OSError, AttributeError):  # not the main thread, or no such signal
-        pass
+    previous: dict[int, Any] = {}
+    for name in ("SIGINT", "SIGTERM"):   # both take the same abort path (summary, --output, 130)
+        sig = getattr(signal, name, None)
+        try:
+            if sig is not None:
+                previous[sig] = signal.signal(sig, _raise_interrupt)
+        except (ValueError, OSError):  # not the main thread
+            pass
     try:
         return run(args)
     except KeyboardInterrupt:
         say("instructions_runner: interrupted", file=sys.stderr)
         return 130
     finally:
-        if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+        for sig, handler in previous.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError, TypeError):
+                pass
 
 
 if __name__ == "__main__":

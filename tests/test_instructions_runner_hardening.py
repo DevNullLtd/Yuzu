@@ -212,6 +212,10 @@ class RunnerCase(unittest.TestCase):
             p = mock.patch.object(ir, name, lambda *a, _s=sink, **k: _s.append(a))
             p.start()
             self.addCleanup(p.stop)
+        if threading.current_thread() is threading.main_thread():
+            self.addCleanup(signal.signal, signal.SIGINT, signal.getsignal(signal.SIGINT))
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        ir._INTERRUPT.clear()
         quiet = contextlib.redirect_stdout(io.StringIO())   # exercise() prints "dispatching ..."
         quiet.__enter__()
         self.addCleanup(quiet.__exit__, None, None, None)
@@ -896,6 +900,8 @@ class PollAndTransport(RunnerCase):
                     OSError(errno.EHOSTUNREACH, "no route"), OSError(errno.ENETUNREACH, "unreachable"),
                     OSError(errno.EADDRNOTAVAIL, "no addr"),
                     ir.urllib.error.URLError(OSError(errno.EHOSTUNREACH, "no route")),
+                    ir.urllib.error.URLError(ConnectionResetError(104, "reset by peer")),
+                    ir.urllib.error.URLError(BrokenPipeError()),
                     ConnectionRefusedError(111, "refused"), socket.gaierror(-2, "nodename")):
             with self.subTest(exc=repr(exc)):
                 out, control = self.sends(exc)
@@ -1238,7 +1244,10 @@ class VerdictlessRowsStopTheRun(RunnerCase):
                      (400, {"error": {"code": 400, "message": "bad"}}),
                      (403, {"error": {"code": 403, "message": "no"}}),
                      (404, {"error": {"code": 404, "message": "nope"}}),
-                     (429, {"error": {"code": 429, "message": "slow down"}})]
+                     (429, {"error": {"code": 429, "message": "slow down"}}),
+                     (409, {"error": {"code": 409, "message": "conflict"}}),
+                     (422, {"error": {"code": 422, "message": "unprocessable"}}),
+                     (499, {"error": {"code": 499, "message": "client closed"}})]
         for code, body in refusals:
             with self.subTest(code=code, body=body["error"].get("reason", body["error"]["message"])):
                 self.fake.posts.clear()
@@ -1612,6 +1621,115 @@ class UnrecognisedRows(RunnerCase):
         self.assertEqual(len(self.fake.posts), 3)
 
 
+class OutputTargetPlanting(RunnerCase):
+    """Things planted at an untargeted --output after the pre-flight."""
+
+    def run_untargeted(self, output):
+        with mock.patch.object(ir, "check_output_writable", return_value=""):
+            return self.run_runner([definition("t.safe", "safe")], risks=("safe",), targeted=False,
+                                   extra=["--output", str(output)])
+
+    @unittest.skipUnless(hasattr(os, "link"), "needs hard links")
+    def test_a_hard_link_to_another_file_is_not_truncated(self):
+        victim = self.tmp / "victim.txt"
+        victim.write_text("precious " * 50)
+        planted = self.tmp / "linked.json"
+        os.link(victim, planted)
+        r = self.run_untargeted(planted)
+        self.assertEqual(victim.read_text(), "precious " * 50)
+        self.assertIn("warning: could not write --output", r.err)
+        self.assertIn("single link", r.err)
+        self.assertEqual(r.rc, 0, r.err)
+
+    def test_a_regular_single_link_file_is_truncated_and_rewritten(self):
+        existing = self.tmp / "regular.json"
+        existing.write_text("y" * 20000)
+        r = self.run_untargeted(existing)
+        self.assertEqual(r.rc, 0, r.err)
+        self.assertEqual(json.loads(existing.read_text())["summary"]["pass"], 1)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"), "needs mkfifo")
+    def test_a_fifo_planted_after_the_preflight_does_not_block(self):
+        fifo = self.tmp / "planted.fifo"
+        os.mkfifo(fifo)
+        # If the open blocked, this opens the read end after 3 s so the test fails instead of hanging.
+        unblock = threading.Timer(3, lambda: os.close(os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)))
+        unblock.start()
+        self.addCleanup(unblock.cancel)
+        t0 = time.monotonic()
+        r = self.run_untargeted(fifo)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertIn("warning: could not write --output", r.err)
+        self.assertEqual(r.rc, 0, r.err)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW") and hasattr(os, "symlink"), "needs O_NOFOLLOW")
+    def test_a_symlink_planted_after_the_preflight_is_not_followed_untargeted(self):
+        victim = self.tmp / "victim.txt"
+        victim.write_text("keep")
+        link = self.tmp / "out_link.json"
+        os.symlink(victim, link)
+        r = self.run_untargeted(link)
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertIn("warning: could not write --output", r.err)
+
+
+@unittest.skipIf(sys.platform == "win32", "os.kill(SIGINT/SIGTERM) semantics")
+@unittest.skipUnless(threading.current_thread() is threading.main_thread(), "signals need the main thread")
+class DoubleSignal(RunnerCase):
+    DEFS = [definition("t.d0", "destructive")]
+    OV = {"t.d0": {}}
+    TRIALS = 10
+
+    def trial(self, first, second):
+        self.fake.posts.clear()
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.15)
+
+        def send():
+            deadline = time.monotonic() + 5
+            while not self.fake.posts and time.monotonic() < deadline:
+                time.sleep(0.001)
+            os.kill(os.getpid(), first)
+            os.kill(os.getpid(), second)    # no gap at all
+
+        sender = threading.Thread(target=send)
+        sender.start()
+        r = self.run_runner(self.DEFS, overrides=self.OV)
+        sender.join()
+        return r
+
+    def test_two_signals_back_to_back_still_exit_130_with_the_output_written(self):
+        for first, second in ((signal.SIGINT, signal.SIGTERM), (signal.SIGTERM, signal.SIGINT)):
+            for i in range(self.TRIALS):
+                with self.subTest(first=first.name, trial=i):
+                    r = self.trial(first, second)
+                    self.assertEqual(r.rc, 130, r.err)
+                    self.assertIsNotNone(r.summary, "--output must be written")
+                    # CPython runs pending handlers lowest signal number first, so either may win
+                    self.assertIn(r.summary["aborted"], ("SIGINT", "SIGTERM"))
+        self.settle()
+
+    def test_the_sigint_handler_is_back_after_an_aborted_run(self):
+        sentinel = lambda signum, frame: None   # noqa: E731
+        signal.signal(signal.SIGINT, sentinel)
+        with self.interrupt_after_posts(1):
+            self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.3)
+            self.run_runner(self.DEFS, overrides=self.OV)
+        self.assertIs(signal.getsignal(signal.SIGINT), sentinel)
+        self.assertEqual(ir._GUARD._depth, 0)
+        self.settle()
+
+
+class RemainingIdsCap(RunnerCase):
+    def test_more_than_30_not_started_ids_show_30_and_a_count(self):
+        defs = [definition(f"t.d{i:02d}", "destructive") for i in range(33)]
+        self.fake.polls = lambda cid, n: []
+        r = self.run_runner(defs, overrides={d["id"]: {} for d in defs}, extra=["--poll-timeout", "1"])
+        line = next(ln for ln in r.err.splitlines() if "not started:" in ln)
+        ids = line.split("not started: ", 1)[1].split(" (+")[0].split(", ")
+        self.assertEqual((len(ids), ids[0], ids[-1]), (30, "t.d01", "t.d30"))
+        self.assertIn("(+2 more)", line)
+
+
 class OutputHardening(RunnerCase):
     DEFS = [definition("t.d0", "destructive")]
     OV = {"t.d0": {}}
@@ -1721,8 +1839,11 @@ class OutputHardening(RunnerCase):
             r = self.run_runner(self.DEFS, overrides=self.OV)
         self.assertEqual(r.rc, 0, r.err)
         self.assertIs(seen["write"], signal.SIG_IGN)
-        self.assertTrue(seen["metric"] and all(h is sentinel for h in seen["metric"]))
-        self.assertTrue(seen["say"] and all(h is sentinel for h in seen["say"][-3:]))
+        # the handler in effect for the metrics and the summary is main()'s routing handler, not
+        # the guard's SIG_IGN; the caller's handler is back once main() returns
+        self.assertTrue(seen["metric"] and all(h is ir._raise_interrupt for h in seen["metric"]))
+        self.assertTrue(seen["say"] and all(h is ir._raise_interrupt for h in seen["say"][-3:]))
+        self.assertIs(signal.getsignal(signal.SIGINT), sentinel)
 
     def test_output_may_not_be_the_manifest_under_another_spelling(self):
         (self.tmp / "sub").mkdir()
@@ -1763,6 +1884,7 @@ class OutputHardening(RunnerCase):
             time.sleep(0.05)
             ir._raise_interrupt(signal.SIGTERM, None)  # and so is a SIGTERM
         self.assertEqual(signal.getsignal(signal.SIGINT), before)
+        ir._INTERRUPT.clear()
         with self.assertRaises(KeyboardInterrupt):
             ir._raise_interrupt(signal.SIGTERM, None)
 
