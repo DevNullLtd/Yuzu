@@ -708,7 +708,7 @@ from starving Guardian, and Guardian's own enforcement evidence, of that shared,
   the default lens, not an automatic copy). **`capture_output` is RAW plugin stdout/stderr — it is
   NOT covered by the "never a SID/username/user path" guarantee above by construction.** A
   `script_exec`-class Reaction can easily emit a diagnostic line containing a user path
-  (`/home/alice/...`) on stderr with no malicious authoring required, which the bullet above's
+  (`/home/jsmith/...`) on stderr with no malicious authoring required, which the bullet above's
   blanket D10(a) rule otherwise contradicts. This must be closed one of two ways, decided at R6
   (executor + outcome mapping) and stated in that slice's own PR text, not left implicit: either a
   **default-deny, per-action typed output projection** is applied before persistence (an action opts

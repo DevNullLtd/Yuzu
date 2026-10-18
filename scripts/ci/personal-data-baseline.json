@@ -268,11 +268,6 @@
   },
   {
    "detector": "home-path",
-   "max_hits": 3,
-   "path": "tests/unit/test_privacy_permissions_parsers.cpp"
-  },
-  {
-   "detector": "home-path",
    "max_hits": 1,
    "path": "tests/unit/test_privacy_permissions_win_internals.cpp"
   },
@@ -300,11 +295,6 @@
    "detector": "tailnet-ip",
    "max_hits": 1,
    "path": "tests/unit/test_tar_store.cpp"
-  },
-  {
-   "detector": "home-path",
-   "max_hits": 1,
-   "path": "tests/unit/test_user_profile_model.cpp"
   },
   {
    "detector": "home-path",
