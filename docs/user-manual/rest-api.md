@@ -6917,14 +6917,16 @@ Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` con
 
 #### Developer and API page
 
-Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a read-only front for the discovery routes above. It adds no REST route and no MCP tool: its four panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row for a dashboard session (a token caller keeps its denial row).
+Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a front for the discovery routes above, plus a load generator control. It adds no REST route and no MCP tool: its four read panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row for a dashboard session (a token caller keeps its denial row).
 
 - **API:** the OpenAPI document link and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes.
 - **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown.
 - **Permissions:** each `Securable:Operation` pair with the roles that allow it. The role grid needs `UserManagement:Read`, as on `/discover/permissions`; without it the page says so instead of listing nothing.
 - **Plugins:** the build-embedded manifests with per-OS support. The list of plugins connected devices currently report is a separate, on-request list: no connected device is not the same as no plugins.
 
-The load generator and process data fetch controls are not part of this page.
+- **Load generator:** *Start* and *Stop* send `{"plugin":"chargen","action":"chargen_start"}` or `"chargen_stop"` to the existing `POST /api/command` and nothing else (no parameters, no target list), so a run always means every device the caller can see, at the plugin's default of about 10 lines a second per device. *Start* asks first and states that scope and that every open Dashboard receives the rows; *Stop* sends at once. The same gates apply as to any `POST /api/command`: `Execution:Execute`, and `chargen_start` also needs an administrator or an approval, whose refusal text is shown as the server wrote it. The result line counts the devices the request reached and any withheld; "sent" does not mean running or stopped. "Devices online" is the count connected to this server.
+
+The process data fetch control is not part of this page.
 
 ### Inventory
 
