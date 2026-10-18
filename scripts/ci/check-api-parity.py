@@ -335,7 +335,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # way, so 216 -> 227, with no change in capability; a 12th (settings developer plugins) is
 # satisfied by the `resource:yuzu://plugin-docs` MCP resource twin and stays `twinned`.
 #
-# 225 (origin/dev) -> 226 (this change, Users and roles page): GET /fragments/access/enforcement has only the REST twin
+# 225 (origin/dev) -> 226 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
 # GET /api/v1/me, which omits the unconfirmed (degraded) bit, and no MCP twin
 # (`twinned-rest-only`); the missing REST/MCP read is tracked in #6033.
 BASELINE_UNTWINNED = 226

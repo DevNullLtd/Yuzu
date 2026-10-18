@@ -4911,7 +4911,7 @@ void SettingsRoutes::register_routes(
                              "'{}' — refusing to delete (a store blip must not read as \"no "
                              "linked identities to revoke\")",
                              username);
-                audit_fn_(req, "user.delete", "failure", "User", username,
+                (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "failure", "User", username,
                          "identity_link_resolution_failed");
                 res.status = 500;
                 res.set_header(
@@ -4928,7 +4928,7 @@ void SettingsRoutes::register_routes(
                              "refusing to delete '{}' without being able to revoke its "
                              "credentials",
                              username);
-                audit_fn_(req, "user.delete", "failure", "User", username,
+                (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "failure", "User", username,
                          "api_token_store_unavailable");
                 res.status = 503;
                 res.set_header(
@@ -4955,7 +4955,7 @@ void SettingsRoutes::register_routes(
                              "persist for one or more principals linked to '{}' — refusing to "
                              "report a clean delete (ADR-2001 §3 fail-closed)",
                              username);
-                audit_fn_(req, "user.delete", "partial", "User", username, revoke_detail);
+                (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "partial", "User", username, revoke_detail);
                 res.status = 500;
                 res.set_header(
                     "HX-Trigger",
@@ -4986,7 +4986,7 @@ void SettingsRoutes::register_routes(
             spdlog::error("DELETE /api/settings/users: no ApiTokenStore wired — refusing to "
                          "delete '{}' without being able to revoke its credentials (ADR-2001)",
                          username);
-            audit_fn_(req, "user.delete", "failure", "User", username,
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "failure", "User", username,
                      "api_token_store_unavailable");
             res.status = 503;
             res.set_header(
@@ -5020,7 +5020,7 @@ void SettingsRoutes::register_routes(
                          username);
             // `partial`, not `denied`: the credentials WERE revoked (a change was made) and
             // the account stays active, so the audit result must not read as "nothing happened".
-            audit_fn_(req, "user.delete", "partial", "User", username,
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "partial", "User", username,
                       "last_administrator_blocked credentials_revoked_before_refusal=true "
                       "account_remains_active=true " +
                           revoke_detail);
@@ -5033,7 +5033,7 @@ void SettingsRoutes::register_routes(
             // The row may or may not be deactivated (a lost COMMIT ack, or a fail-closed arm):
             // say only that the delete may not have completed; repeating the DELETE re-runs the
             // guarded write and the session wipe.
-            audit_fn_(req, "user.delete", "failure", "User", username,
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "failure", "User", username,
                       "store_failure credentials_revoked_before_failure=true " + revoke_detail);
             respond_lifecycle_store_unavailable(
                 res, "User store unavailable; the delete may not have completed. Linked "
@@ -5045,7 +5045,7 @@ void SettingsRoutes::register_routes(
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
             }
-            audit_fn_(req, "user.delete", "partial", "User", username,
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "partial", "User", username,
                       "account_deactivated session_wipe_failed=true " + revoke_detail);
             respond_lifecycle_store_unavailable(
                 res, "User deactivated, but session cleanup failed. Repeat the delete to finish");
@@ -5263,7 +5263,7 @@ void SettingsRoutes::register_routes(
         case auth::UpdateRoleOutcome::UpdatedSessionWipeFailed:
             // The role IS changed (committed) but a session at the old role may survive. No
             // retry hint: a repeat answers 200 "Role unchanged" and never redoes the wipe.
-            audit_fn_(req, "user.role_change", "partial", "User", target_username,
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.role_change", "partial", "User", target_username,
                       "role_changed session_wipe_failed=true old_role=" +
                           auth::role_to_string(old_role) +
                           " new_role=" + auth::role_to_string(new_role));
@@ -5273,7 +5273,7 @@ void SettingsRoutes::register_routes(
             return;
         case auth::UpdateRoleOutcome::StoreFailure:
             spdlog::error("Failed to update role for '{}'", target_username);
-            audit_fn_(req, "user.role_change", "failure", "User", target_username,
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.role_change", "failure", "User", target_username,
                       "store_failure");
             // The owner outcome does not distinguish "nothing committed" from "committed but the
             // commit acknowledgement was lost", and the failure path's durable session wipe may
