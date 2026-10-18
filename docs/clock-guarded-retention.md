@@ -579,6 +579,19 @@ predicate (`ticket_live_sql()` in `approval_manager.cpp`, constants `kApprovalTi
 disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-ticket sweep, and
 `ticket_is_live()`, which `ScheduleRunner` calls before it fires an approved schedule ticket.
 
+- **Anti-fork rule.** `ticket_is_live()` answers liveness ONLY. It carries none of the #2442 origin and
+  submitter binding, and `consume_ticket` stays the sole redemption chokepoint: `ScheduleRunner` never
+  consumes a ticket, it retires one by advancing the schedule. A caller that needs to redeem a ticket
+  calls `consume_ticket`, never `ticket_is_live` followed by its own write.
+- **`ScheduleRunner` and a failing store (known, pre-existing, tracked in #2878).** The comment at the
+  liveness check says a store failure HOLDS the occurrence. That is true only once the first read has
+  succeeded: if `ticket_is_live()` itself cannot read, `fire_with_approval` holds (no advance) and logs
+  a WARN. But the `query()` call that finds the approved ticket in the first place swallows a store
+  error into an empty list, so with the store still failing the runner falls through to raising a fresh
+  approval request; that submit fails too, `fire_with_approval` returns true ("occurrence skipped"),
+  the schedule ADVANCES and the approved occurrence is dropped (a `once` schedule is lost), leaving only a failure audit row and
+  `yuzu_schedule_fire_failures_total`. Do not read "holds the occurrence" as a guarantee for an outage
+  that starts before the ticket lookup.
 - **It is a liveness check and a state transition, not a bulk delete.** The consume is a per-row CAS
   that refuses and leaves the row untouched. The sweep is `UPDATE ... SET status = 'expired'`, never a
   `DELETE`; ADR-0065's "Expiry-sweep clock-guard adjudication" (and its 2026-10-18 amendment) records
