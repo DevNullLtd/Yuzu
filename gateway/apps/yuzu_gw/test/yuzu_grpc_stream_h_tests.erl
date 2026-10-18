@@ -939,20 +939,53 @@ no_raise_test_() ->
 
 %% Run Fun(Routes) as the "connection process": exits trapped (the handlers are
 %% linked to it), the probe service reporting to it, handlers cleaned up after.
+%%
+%% The test process is the one eunit process that runs EVERY case of this
+%% module, so nothing a case links to it may be able to signal it once the case
+%% is over. stop_handlers/2 unlinks each handler before killing it and waits for
+%% it to be gone, all while exits are still trapped. Killing a still-linked
+%% handler and then restoring the trap (as this once did) loses a race whenever
+%% the handler sits on another scheduler's run queue: its `killed' exit signal
+%% lands after the trap is off and kills the test process, and eunit cancels
+%% the rest of the module under "Failed: 0" (*unexpected termination of test
+%% process* ::killed).
 in_conn(Fun) ->
     {ok, _} = application:ensure_all_started(telemetry),
     OldTrap = process_flag(trap_exit, true),
     yuzu_grpc_probe_svc:set_test_pid(self()),
     put(probe_pids, []),
     {ok, Routes} = yuzu_grpc_route:build([agent_pb], #{?SVC => yuzu_grpc_probe_svc}),
+    Linked = links(),
     try
         Fun(Routes)
     after
-        [exit(P, kill) || P <- get(probe_pids)],
+        stop_handlers(Linked, get(probe_pids)),
         yuzu_grpc_probe_svc:clear_test_pid(),
         flush(),
         process_flag(trap_exit, OldTrap)
     end.
+
+%% Stop every process the case linked to the test process (each handler the
+%% stream handler spawned, with spawn_link) and every handler the probe service
+%% reported, and return only once all of them are dead and none is still
+%% linked. unlink/1 comes first: once it has returned, that link can never
+%% deliver an exit signal to the test process, whenever the handler dies.
+stop_handlers(Linked, Reported) ->
+    Pids = lists:usort((links() -- Linked) ++ Reported),
+    Monitors = [begin
+                    Ref = erlang:monitor(process, P),
+                    true = unlink(P),
+                    exit(P, kill),
+                    {P, Ref}
+                end || P <- Pids],
+    [receive
+         {'DOWN', Ref, process, P, _} -> ok
+     after 5000 ->
+         error({handler_alive_after_kill, P})
+     end || {P, Ref} <- Monitors],
+    %% No process this case linked may outlive it.
+    ?assertEqual([], links() -- Linked),
+    ok.
 
 %% The processes linked to the test process: every handler the stream handler
 %% spawns is linked to its "connection", and spawn_link returns only once the
