@@ -52,9 +52,11 @@
 %%% the OS clock is being slewed. Two nodes of one host therefore disagree by
 %%% tens of microseconds while the OS clock is steady and by milliseconds while
 %%% it is being slewed (#5695 Gate 8: an event caused by a kill read 6 ms BEFORE
-%%% the suite's kill marker). Every ProxyRegister arrival and every
-%%% recorded notice takes the next number of one counter; mark/0 returns the
-%%% counter, and registers/1 and notices/1 return what was recorded after it.
+%%% the suite's kill marker). Every ProxyRegister and every NotifyStreamStatus
+%%% takes the next number of one counter as it ARRIVES (before any configured
+%%% latency, so a call that arrived before a marker and is answered after it is
+%%% not counted after it; #5695 Gate 8 round 6); mark/0 returns the counter, and
+%%% registers/1 and notices/1 return what arrived after it.
 %%% Anything caused by an action the suite takes after mark/0 returned has a
 %%% larger number.
 %%%
@@ -139,7 +141,7 @@ refuse_connected_for(Ms) ->
     Until.
 
 %% @doc Where this node's record is now: the sequence number of the last
-%% ProxyRegister arrival or notice recorded, and this node's clock (for
+%% ProxyRegister or NotifyStreamStatus arrival, and this node's clock (for
 %% durations measured against times recorded here). Every record made after
 %% this returns has a larger sequence number (see the module doc).
 -spec mark() -> #{seq := non_neg_integer(), ms := integer()}.
@@ -192,8 +194,8 @@ registers(Since) ->
 notices() ->
     [{Id, Sess, Ev, T} || {_Seq, Id, Sess, Ev, T} <- ets:tab2list(?NOTICES)].
 
-%% @doc The notices recorded after mark/0 returned Since, in the order they
-%% were recorded: {Seq, AgentId, SessionId, Event, RecvMs}.
+%% @doc The notices recorded (acknowledged) that ARRIVED after mark/0 returned
+%% Since, in arrival order: {Seq, AgentId, SessionId, Event, RecvMs}.
 -spec notices(non_neg_integer()) ->
           [{pos_integer(), binary(), binary(), connected | disconnected, integer()}].
 notices(Since) ->
@@ -380,6 +382,9 @@ inflight_guard(A, Kind) ->
 
 notify_stream_status(Ctx, Req) ->
     A = persistent_term:get({?MODULE, atomics}),
+    %% The arrival's place in this node's record (notices/1 selects by it); a
+    %% refused notice leaves it unused.
+    RecvSeq = atomics:add_get(A, ?A_SEQ, 1),
     sleep(cfg(notify_latency_ms)),
     AgentId = maps:get(agent_id, Req, <<>>),
     Session = maps:get(session_id, Req, <<>>),
@@ -397,7 +402,7 @@ notify_stream_status(Ctx, Req) ->
         false ->
             atomics:add(A, case Event of connected -> ?A_CONNECTED;
                                          disconnected -> ?A_DISCONNECTED end, 1),
-            ets:insert(?NOTICES, {atomics:add_get(A, ?A_SEQ, 1), AgentId, Session, Event, Now}),
+            ets:insert(?NOTICES, {RecvSeq, AgentId, Session, Event, Now}),
             ets:insert(?SESSIONS, {Session, AgentId, Event}),
             {ok, #{acknowledged => true}, Ctx}
     end.

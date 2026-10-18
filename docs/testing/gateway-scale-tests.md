@@ -132,9 +132,12 @@ clock is steady and by milliseconds while it is being slewed (an `owner_kill`
 `DISCONNECTED` once read 6 ms before the suite's kill marker, and the case
 reported 34 of them missing from a run that had every one). Before a case acts,
 the suite asks the fake server and the load generator for a marker (a sequence
-number each, `mark/0`); "since the kill" or "since the wave" means "recorded
-there with a larger number". A duration is a difference of two times taken on
-the same node.
+number each, `mark/0`); "since the kill" or "since the wave" means "started
+there with a larger number". A number is taken when the thing STARTS, never
+when it ends: a load-generator `Register` when it is sent, a failed connection
+when it was opened (so a connection opened before a marker and failing after it
+is not counted after it), and a fake-server call when it arrives. A duration is
+a difference of two times taken on the same node.
 
 ## Invariants and the gate
 

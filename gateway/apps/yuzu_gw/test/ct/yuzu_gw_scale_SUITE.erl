@@ -547,13 +547,13 @@ owner_kill(Config) ->
 
 %% For the killed sessions: how many have a DISCONNECTED recorded at the server
 %% after the marker M, and how many have a CONNECTED recorded after that
-%% DISCONNECTED (recovered). Both orders are the server's record order (its
+%% DISCONNECTED (recovered). Both orders are the server's arrival order (its
 %% sequence numbers), not times: each session's setup CONNECTED is recorded
 %% before the marker and must not count, and the kill's DISCONNECTED must.
 owner_kill_progress(Config, Sessions, M) ->
     Notices = [Nt || {_, _, S, _, _} = Nt <- up_call(Config, notices, [up_seq(M)]),
                      maps:is_key(S, Sessions)],
-    %% In record order: from_list keeps each session's last DISCONNECTED.
+    %% In arrival order: from_list keeps each session's last DISCONNECTED.
     Disc = maps:from_list([{S, Seq} || {Seq, _, S, disconnected, _} <- Notices]),
     Conn = [{S, T} || {Seq, _, S, connected, T} <- Notices,
                       case Disc of #{S := DSeq} -> Seq > DSeq; _ -> false end],

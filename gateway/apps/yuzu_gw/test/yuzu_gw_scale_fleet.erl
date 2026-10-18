@@ -36,8 +36,9 @@
 %%% system time is the OS clock through its own time correction, and two nodes
 %%% of one host disagree by up to milliseconds (#5695 Gate 8). Which attempts
 %%% started after a marker is decided by sequence number instead: every attempt
-%%% takes the next number of one counter as it starts, mark/0 returns the
-%%% counter, and attempts/1 returns the attempts started after it.
+%%% takes the next number of one counter as it starts (a Register when it is
+%%% sent; a failed connection when it was opened, not when it failed), mark/0
+%%% returns the counter, and attempts/1 returns the attempts started after it.
 %%%
 %%% Not a test module: no *_test function, no eunit.hrl.
 %%% @end
@@ -148,7 +149,7 @@ status() ->
               end, Init, ?AGENTS).
 
 %% @doc Where this node's record is now: the sequence number of the last
-%% Register attempt started, and this node's clock (for durations measured
+%% attempt started (a Register sent or a connection opened), and this node's clock (for durations measured
 %% against attempt times). Every attempt that starts after this returns has a
 %% larger sequence number.
 -spec mark() -> #{seq := non_neg_integer(), ms := integer()}.
@@ -271,11 +272,18 @@ register_request(Id) ->
                                    <<"role">> => <<"workstation">>}},
       enrollment_token => <<"scale-test-enrollment-token-0123456789abcdef">>}.
 
+%% A connection that fails is an attempt that started when the connection was
+%% opened: its {time, seq} is taken before gun:open/3, so a connection opened
+%% before a marker and failing after it is not counted as started after the
+%% marker (#5695 Gate 8 round 6). A connection that comes up leaves that seq
+%% unused (a gap in the sequence, harmless: attempts/1 compares, never
+%% counts); its Register takes its own at the send.
 connect(#a{idx = Idx} = A) ->
     set_state(A, connecting),
     Targets = cfg(targets),
     {Ip, Port} = lists:nth(1 + (Idx rem length(Targets)), Targets),
     Inet = case tuple_size(Ip) of 8 -> [inet6]; _ -> [] end,
+    ConnectStart = attempt_start(),
     {ok, Conn} = gun:open(Ip, Port, #{protocols => [http2], retry => 0,
                                       connect_timeout => 10000,
                                       tcp_opts => [{linger, {true, 0}}, {nodelay, true} | Inet],
@@ -287,7 +295,7 @@ connect(#a{idx = Idx} = A) ->
         {error, Reason} ->
             close(Conn, MRef),
             A1 = A#a{attempt = A#a.attempt + 1, conn = undefined, mref = undefined},
-            record_attempt(A1, attempt_start(), {connect_failed, short(Reason)}),
+            record_attempt(A1, ConnectStart, {connect_failed, short(Reason)}),
             backoff(A1)
     end.
 
