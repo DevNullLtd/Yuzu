@@ -15,13 +15,16 @@
 %%%   notify_latency_ms   {Min, Max}  the same for NotifyStreamStatus
 %%%   register_fail       none | {Status, Message}  answer every ProxyRegister
 %%%                                   with that gRPC status instead
-%%%   notify_refuse_connected_until  0 | OS ms  answer every CONNECTED
+%%%   notify_refuse_connected_until  0 | ms  answer every CONNECTED
 %%%                                   NotifyStreamStatus received before that time
-%%%                                   with acknowledged=false (not recorded: it is
-%%%                                   counted in refused_connected_notices only,
-%%%                                   not in notices/0 or the session table), as
-%%%                                   a server that cannot record sessions does
-%%%                                   (default 0, never)
+%%%                                   (THIS node's erlang:system_time; set it with
+%%%                                   refuse_connected_for/1, never from another
+%%%                                   node's clock) with acknowledged=false (not
+%%%                                   recorded: it is counted in
+%%%                                   refused_connected_notices only, not in
+%%%                                   notices/0 or the session table), as a server
+%%%                                   that cannot record sessions does (default 0,
+%%%                                   never)
 %%%
 %%% close_connections/1 closes the connections the gateway holds to this server
 %%% while the server keeps running with its state (sessions, notices): `abort'
@@ -30,16 +33,30 @@
 %%% calls already started finish, then the socket closes).
 %%%
 %%% What it records, for the suite to read (stats/0, registers/0, notices/0):
-%%%   - every ProxyRegister: agent id, receive and answer time (ms, OS clock:
-%%%     every node of the suite runs on one host), whether it was a replay (the
-%%%     gateway sends the agent's existing session id as x-yuzu-session-id
-%%%     metadata on a replay only) and the session it answered;
+%%%   - every ProxyRegister: agent id, receive and answer time (ms, this node's
+%%%     erlang:system_time), whether it was a replay (the gateway sends the
+%%%     agent's existing session id as x-yuzu-session-id metadata on a replay
+%%%     only) and the session it answered;
 %%%   - the peak number of ProxyRegister calls in flight at once, overall and
 %%%     for replays only (the gateway runs them one at a time today);
 %%%   - every NotifyStreamStatus (agent, session, event, time);
 %%%   - BatchHeartbeat totals; the answer names the sessions this server does
 %%%     not know (the verdict the gateway replays from, #1197), as the real
 %%%     server does.
+%%%
+%%% "After the marker" is decided HERE, by sequence number, never by comparing
+%%% a time recorded here with a time taken on another node. Each node's
+%%% erlang:system_time follows the OS clock through that node's own time
+%%% correction, which re-reads the OS clock on its own schedule (every ~24 s
+%%% measured on macOS); in between it drifts from the OS clock by however fast
+%%% the OS clock is being slewed. Two nodes of one host therefore disagree by
+%%% tens of microseconds while the OS clock is steady and by milliseconds while
+%%% it is being slewed (#5695 Gate 8: an event caused by a kill read 6 ms BEFORE
+%%% the suite's kill marker). Every ProxyRegister arrival and every
+%%% recorded notice takes the next number of one counter; mark/0 returns the
+%%% counter, and registers/1 and notices/1 return what was recorded after it.
+%%% Anything caused by an action the suite takes after mark/0 returned has a
+%%% larger number.
 %%%
 %%% Not a test module: no *_test function, no eunit.hrl.
 %%% @end
@@ -48,7 +65,8 @@
 -behaviour(gen_server).
 
 %% Control API (called in the upstream peer through peer:call).
--export([start/1, port/0, set_config/1, stats/0, registers/0, notices/0, sessions/0,
+-export([start/1, port/0, set_config/1, refuse_connected_for/1, stats/0, mark/0,
+         registers/0, registers/1, notices/0, notices/1, sessions/0,
          trace_stream_ends/0, stream_ends/0, close_connections/1]).
 %% GatewayUpstream handlers (yuzu_grpc_runner unary convention).
 -export([proxy_register/2, batch_heartbeat/2, proxy_inventory/2,
@@ -111,6 +129,23 @@ set_config(Cfg) ->
     ets:insert(?CFG, maps:to_list(Cfg)),
     ok.
 
+%% @doc Refuse every CONNECTED (acknowledged=false) for the next Ms ms of THIS
+%% node's clock. Returns the time the refusal ends (this node's
+%% erlang:system_time, ms): compare it only with times recorded here.
+-spec refuse_connected_for(non_neg_integer()) -> integer().
+refuse_connected_for(Ms) ->
+    Until = now_ms() + Ms,
+    set_config(#{notify_refuse_connected_until => Until}),
+    Until.
+
+%% @doc Where this node's record is now: the sequence number of the last
+%% ProxyRegister arrival or notice recorded, and this node's clock (for
+%% durations measured against times recorded here). Every record made after
+%% this returns has a larger sequence number (see the module doc).
+-spec mark() -> #{seq := non_neg_integer(), ms := integer()}.
+mark() ->
+    #{seq => atomics:get(persistent_term:get({?MODULE, atomics}), ?A_SEQ), ms => now_ms()}.
+
 %% @doc Counters and peaks.
 -spec stats() -> map().
 stats() ->
@@ -143,10 +178,27 @@ stats() ->
 registers() ->
     [{Id, Kind, Recv, Done, Sess, Att} || {_Seq, Id, Kind, Recv, Done, Sess, Att} <- ets:tab2list(?REGS)].
 
+%% @doc The ProxyRegister calls answered OK that ARRIVED after mark/0 returned
+%% Since, in arrival order: {RecvSeq, AgentId, Kind, RecvMs, DoneMs, SessionId,
+%% Attempt}.
+-spec registers(non_neg_integer()) ->
+          [{pos_integer(), binary(), fresh | replay, integer(), integer(), binary(), integer()}].
+registers(Since) ->
+    lists:keysort(1, ets:select(?REGS, [{{'$1', '_', '_', '_', '_', '_', '_'},
+                                         [{'>', '$1', Since}], ['$_']}])).
+
 %% @doc Every NotifyStreamStatus: {AgentId, SessionId, Event, RecvMs}.
 -spec notices() -> [{binary(), binary(), connected | disconnected, integer()}].
 notices() ->
     [{Id, Sess, Ev, T} || {_Seq, Id, Sess, Ev, T} <- ets:tab2list(?NOTICES)].
+
+%% @doc The notices recorded after mark/0 returned Since, in the order they
+%% were recorded: {Seq, AgentId, SessionId, Event, RecvMs}.
+-spec notices(non_neg_integer()) ->
+          [{pos_integer(), binary(), binary(), connected | disconnected, integer()}].
+notices(Since) ->
+    lists:keysort(1, ets:select(?NOTICES, [{{'$1', '_', '_', '_', '_'},
+                                            [{'>', '$1', Since}], ['$_']}])).
 
 %% @doc The sessions this server knows: {SessionId, AgentId, LastEvent}.
 %% LastEvent = registered (ProxyRegister only) | connected | disconnected.
@@ -263,6 +315,8 @@ handle_info(_Msg, S) -> {noreply, S}.
 proxy_register(Ctx, Req) ->
     Recv = now_ms(),
     A = persistent_term:get({?MODULE, atomics}),
+    %% The arrival's place in this node's record (registers/1 selects by it).
+    RecvSeq = atomics:add_get(A, ?A_SEQ, 1),
     Headers = yuzu_grpc:headers(Ctx),
     Info = maps:get(info, Req, #{}),
     AgentId = maps:get(agent_id, Info, <<>>),
@@ -297,8 +351,7 @@ proxy_register(Ctx, Req) ->
                               P -> P
                           end,
                 ets:insert(?SESSIONS, {Session, AgentId, registered}),
-                ets:insert(?REGS, {atomics:add_get(A, ?A_SEQ, 1), AgentId, Kind, Recv, now_ms(),
-                                   Session, Attempt}),
+                ets:insert(?REGS, {RecvSeq, AgentId, Kind, Recv, now_ms(), Session, Attempt}),
                 {ok, #{session_id => Session, accepted => true,
                        enrollment_status => <<"enrolled">>}, Ctx}
         end

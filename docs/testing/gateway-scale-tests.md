@@ -92,10 +92,12 @@ console, every one in the case's HTML log. The main numbers:
   agents not registered within the budget, latency percentiles;
 - the server's view: the peak number of `ProxyRegister` calls in flight at once;
   the calls that created a session the agent never got because its attempt
-  failed ("wasted"), and of those the ones that arrived after the agent had
-  already given up ("stale") (each agent puts its attempt number in one extra
-  scopable tag, which the gateway forwards unchanged, so each call is matched to
-  its attempt); `CONNECTED` and `DISCONNECTED` counts; live sessions the server
+  failed ("wasted"), and of those the ones that provably arrived after the
+  agent had already given up ("stale": the server had already received a call
+  for a later attempt of the same agent, a lower bound) (each agent puts its
+  attempt number in one extra scopable tag, which the gateway forwards
+  unchanged, so each call is matched to its attempt); `CONNECTED` and
+  `DISCONNECTED` counts; live sessions the server
   has no `CONNECTED` for; and sessions it still thinks are connected that no
   agent holds; and the `ProxyRegister` handlers that were stopped before they
   answered (`register_rpcs_cut`, with the exit reasons: the listener stops a
@@ -122,6 +124,17 @@ perf suite and records the headline numbers as `perf_scale_*` metrics.
 
 The numbers come from four nodes on one host, so they are noisy; they are
 reported, never compared with a fixed limit.
+
+No result compares a time taken on one node with a time taken on another. Each
+node's `erlang:system_time` follows the OS clock through that node's own time
+correction, so the four nodes disagree by tens of microseconds while the OS
+clock is steady and by milliseconds while it is being slewed (an `owner_kill`
+`DISCONNECTED` once read 6 ms before the suite's kill marker, and the case
+reported 34 of them missing from a run that had every one). Before a case acts,
+the suite asks the fake server and the load generator for a marker (a sequence
+number each, `mark/0`); "since the kill" or "since the wave" means "recorded
+there with a larger number". A duration is a difference of two times taken on
+the same node.
 
 ## Invariants and the gate
 

@@ -30,8 +30,14 @@
 %%% max_concurrent_streams 4096; gun refuses a stream over the peer's limit
 %%% where gRPC C++ queues it, so the client queues).
 %%%
-%%% All times are erlang:system_time(millisecond): the suite's nodes share one
-%%% host and one OS clock, so times from the fake server and from here compare.
+%%% All times are this node's erlang:system_time(millisecond). They are for
+%%% durations measured HERE (an attempt's latency, time since this node's
+%%% mark/0) and never compare with a time taken on another node: each node's
+%%% system time is the OS clock through its own time correction, and two nodes
+%%% of one host disagree by up to milliseconds (#5695 Gate 8). Which attempts
+%%% started after a marker is decided by sequence number instead: every attempt
+%%% takes the next number of one counter as it starts, mark/0 returns the
+%%% counter, and attempts/1 returns the attempts started after it.
 %%%
 %%% Not a test module: no *_test function, no eunit.hrl.
 %%% @end
@@ -40,8 +46,8 @@
 -behaviour(gen_server).
 
 %% Control API (called in the load-generator node through peer:call).
--export([start/1, stop_all/0, spawn_agents/1, set_config/1, status/0, attempts/0,
-         truth/0, disconnect/1, fanout/1, counters/0, ended/1]).
+-export([start/1, stop_all/0, spawn_agents/1, set_config/1, status/0, mark/0, attempts/0,
+         attempts/1, truth/0, disconnect/1, fanout/1, counters/0, ended/1]).
 %% Agent process entry
 -export([agent_init/2]).
 %% gen_server
@@ -141,10 +147,24 @@ status() ->
                            disconnects := D + Disc}
               end, Init, ?AGENTS).
 
+%% @doc Where this node's record is now: the sequence number of the last
+%% Register attempt started, and this node's clock (for durations measured
+%% against attempt times). Every attempt that starts after this returns has a
+%% larger sequence number.
+-spec mark() -> #{seq := non_neg_integer(), ms := integer()}.
+mark() ->
+    #{seq => atomics:get(persistent_term:get({?MODULE, seq}), 1), ms => now_ms()}.
+
 %% @doc Every Register attempt: {Id, N, StartMs, EndMs, Outcome}.
 -spec attempts() -> [tuple()].
 attempts() ->
-    ets:tab2list(?ATTEMPTS).
+    [{Id, N, S, E, O} || {Id, N, S, E, O, _Seq} <- ets:tab2list(?ATTEMPTS)].
+
+%% @doc The Register attempts that STARTED after mark/0 returned Since (and have
+%% ended): {Id, N, StartMs, EndMs, Outcome}.
+-spec attempts(non_neg_integer()) -> [tuple()].
+attempts(Since) ->
+    [{Id, N, S, E, O} || {Id, N, S, E, O, Seq} <- ets:tab2list(?ATTEMPTS), Seq > Since].
 
 %% @doc The agents that hold a session now: [{Id, Session, RegisteredAtMs}].
 -spec truth() -> [{binary(), binary(), integer()}].
@@ -179,6 +199,8 @@ init(Cfg) ->
     ets:new(?ATTEMPTS, [named_table, public, duplicate_bag, {write_concurrency, true}]),
     ets:new(?COUNTERS, [named_table, public, set, {write_concurrency, true}]),
     ets:new(?ENDED, [named_table, public, duplicate_bag, {write_concurrency, true}]),
+    %% The attempt sequence (mark/0, attempts/1); a fresh one per start/1.
+    persistent_term:put({?MODULE, seq}, atomics:new(1, [{signed, false}])),
     ets:insert(?COUNTERS, [{K, 0} || K <- [commands_received, responses_sent, heartbeats_sent,
                                            heartbeats_not_found, heartbeats_failed,
                                            connections_lost, subscribe_ended]]),
@@ -265,7 +287,7 @@ connect(#a{idx = Idx} = A) ->
         {error, Reason} ->
             close(Conn, MRef),
             A1 = A#a{attempt = A#a.attempt + 1, conn = undefined, mref = undefined},
-            record_attempt(A1, now_ms(), {connect_failed, short(Reason)}),
+            record_attempt(A1, attempt_start(), {connect_failed, short(Reason)}),
             backoff(A1)
     end.
 
@@ -274,9 +296,9 @@ register(#a{conn = Conn, mref = MRef, req = Req} = A0) ->
     set_state(A, registering),
     Timeout = cfg(register_timeout_ms),
     Request = encode_attempt(Req, A#a.attempt),
-    Start = now_ms(),
+    {StartMs, _} = Start = attempt_start(),
     Ref = gun:post(Conn, ?REGISTER, grpc_headers(Timeout), Request),
-    case await_unary(Conn, MRef, Ref, Start + Timeout + 1000) of
+    case await_unary(Conn, MRef, Ref, StartMs + Timeout + 1000) of
         {ok, <<"0">>, Body} ->
             case decode_one(Body, 'yuzu.agent.v1.RegisterResponse') of
                 #{session_id := Session} when Session =/= <<>> ->
@@ -444,9 +466,13 @@ cancel_heartbeat(#a{hb_timer = T}) -> erlang:cancel_timer(T), ok.
 set_state(#a{id = Id}, State) ->
     ets:update_element(?AGENTS, Id, {?F_STATE, State}).
 
-record_attempt(#a{id = Id, attempt = N}, Start, Outcome) ->
+%% An attempt starts: its time and its place in the attempt sequence.
+attempt_start() ->
+    {now_ms(), atomics:add_get(persistent_term:get({?MODULE, seq}), 1, 1)}.
+
+record_attempt(#a{id = Id, attempt = N}, {Start, Seq}, Outcome) ->
     End = now_ms(),
-    ets:insert(?ATTEMPTS, {Id, N, Start, End, Outcome}),
+    ets:insert(?ATTEMPTS, {Id, N, Start, End, Outcome, Seq}),
     case ets:lookup(?AGENTS, Id) of
         [{_, _, _, _, Attempts, undefined, _, _, _, _}] ->
             ets:update_element(?AGENTS, Id, [{?F_ATTEMPTS, Attempts + 1},

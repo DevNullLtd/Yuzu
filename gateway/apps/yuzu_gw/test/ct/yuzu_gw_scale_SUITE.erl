@@ -50,6 +50,17 @@
 %%%                  (90000: the gateway's 60 s longest resend backoff plus
 %%%                  30 s) after the switch, and the breaker must not open
 %%%
+%%% "Since the kill", "after the marker": decided on the node that recorded the
+%%% events, never by comparing timestamps taken on different nodes. Each node's
+%%% erlang:system_time is the OS clock through that node's own time correction,
+%%% and the four nodes of one host disagree by up to milliseconds (#5695 Gate 8:
+%%% an owner_kill DISCONNECTED read 6 ms before the kill marker, so 34 of them
+%%% were "missing" from a run that had every one). mark/1 asks each recording
+%%% node where its record is (yuzu_gw_scale_upstream:mark/0,
+%%% yuzu_gw_scale_fleet:mark/0: a sequence number), before the scenario acts;
+%%% "after the marker" is "recorded with a larger number there". A time taken on
+%%% one node is subtracted only from a time taken on the same node.
+%%%
 %%% Each scenario MEASURES and REPORTS (never fails on a timing): registration
 %%% counts and latency percentiles, replay time, notices lost, gateway memory
 %%% per connection, the mailbox high-water mark of each named singleton, and
@@ -219,22 +230,22 @@ ramp(Config) ->
     N = ?config(n, Config),
     Rate = env_int("YUZU_GW_SCALE_RAMP_RATE", 100),
     set_upstream(Config, #{register_latency_ms => latency()}),
-    T0 = mark(Config),
+    M = mark(Config),
     ok = load_call(Config, spawn_agents, [#{from => 1, count => N, mode => {ramp, Rate}}]),
-    Reg = await_registered(Config, N, T0),
+    Reg = await_registered(Config, N, ct_ms(M)),
     Settle = settle(Config),
-    R = registration_report(Config, T0, Reg),
+    R = registration_report(Config, M, Reg),
     finish(ramp, Config, R#{rate_per_s => Rate, settle => Settle}).
 
 %% @doc N agents connect and register at once (a thundering herd).
 storm(Config) ->
     N = ?config(n, Config),
     set_upstream(Config, #{register_latency_ms => latency()}),
-    T0 = mark(Config),
+    M = mark(Config),
     ok = load_call(Config, spawn_agents, [#{from => 1, count => N, mode => storm}]),
-    Reg = await_registered(Config, N, T0),
+    Reg = await_registered(Config, N, ct_ms(M)),
     Settle = settle(Config),
-    R = registration_report(Config, T0, Reg),
+    R = registration_report(Config, M, Reg),
     finish(storm, Config, R#{settle => Settle}).
 
 %% @doc The server is killed while N agents are registered and a fresh one is
@@ -248,7 +259,7 @@ server_crash(Config) ->
     Outage = env_int("YUZU_GW_SCALE_OUTAGE_MS", 5000),
     FlapN = max(1, N * env_int("YUZU_GW_SCALE_FLAP_PCT", 10) div 100),
     {Flapped, Kept} = lists:split(FlapN, lists:sort(PreTruth)),
-    T0 = mark(Config),
+    T0 = ct_ms(mark(Config)),
     ok = ?PEER:kill(?config(up, Config)),
     timer:sleep(500),
     ok = load_call(Config, disconnect, [[Id || {Id, _, _} <- Flapped]]),
@@ -260,7 +271,9 @@ server_crash(Config) ->
                                             register_latency_ms => latency()}]),
     maybe_trace_upstream(Up2),
     Config2 = lists:keystore(up, 1, Config, {up, Up2}),
-    T1 = erlang:system_time(millisecond),
+    %% The restarted server's own clock for the replay time (its records are
+    %% all new: nothing to select by number there).
+    M1 = marker(Config2),
     KeptSessions = [{Id, S} || {Id, S, _} <- Kept],
     FlapOld = [S || {_, S, _} <- Flapped],
     %% Two waits, each ended early by a stall (no progress for a while), so a
@@ -285,14 +298,14 @@ server_crash(Config) ->
         crash_progress(Config2, KeptSessions, FlapOld, N),
     Up = up_call(Config2, stats, []),
     Conv = convergence(Config2),
-    R0 = registration_report(Config2, T1, #{}, attempting),
+    R0 = registration_report(Config2, M1, #{}, attempting),
     R = R0#{setup => Pre,
             outage_ms => Outage,
             flapped => FlapN,
             replay => #{expected => length(KeptSessions), replayed => Replayed,
                         complete => Replayed =:= length(KeptSessions),
                         time_to_full_replay_ms => case Replayed =:= length(KeptSessions) of
-                                                      true -> LastReplay - T1;
+                                                      true -> LastReplay - up_ms(M1);
                                                       false -> null
                                                   end,
                         replay_and_agents_back => ReplayedAll,
@@ -323,8 +336,11 @@ gateway_crash(Config) ->
                           n => N, agent_port => maps:get(agent_port, Gw),
                           agent6_port => maps:get(agent6_port, Gw),
                           mgmt_port => maps:get(mgmt_port, Gw)}),
-    TUp = erlang:system_time(millisecond),
     Config2 = lists:keystore(gw, 1, Config, {gw, Gw2}),
+    %% The new gateway is up: an attempt the load generator starts after this
+    %% marker is an attempt to the new gateway.
+    MUp = marker(Config2),
+    TUp = ct_ms(MUp),
     Back = fun() ->
                    Now = [Id || {Id, S, _} <- truth(Config2), maps:get(Id, Old, S) =/= S],
                    case length(Now) of N -> {true, N}; K -> {false, K} end
@@ -332,14 +348,13 @@ gateway_crash(Config) ->
     {Reached, Count} = wait_until(Back, budget(N) * 3, 500),
     TBack = erlang:system_time(millisecond),
     Settle = settle(Config2),
-    Attempts = load_call(Config2, attempts, []),
-    After = [A || {_, _, Start, _, _} = A <- Attempts, Start >= TUp],
+    After = load_call(Config2, attempts, [load_seq(MUp)]),
     Failures = [A || {_, _, _, _, Outcome} = A <- After, Outcome =/= ok],
     OldSessions = maps:values(Old),
     Notices = up_call(Config2, notices, []),
     OldDisc = length([1 || {_, S, disconnected, _} <- Notices,
                            lists:member(S, OldSessions)]),
-    R0 = registration_report(Config2, TUp, #{}, attempting),
+    R0 = registration_report(Config2, MUp, #{}, attempting),
     R = R0#{setup => Pre,
             pre_kill_probe => PreProbe,
             gateway_restart_ms => TUp - T0,
@@ -433,7 +448,7 @@ upstream_conn_loss(Config) ->
     Opens0 = breaker_transitions(Config),
     #{replay_rpcs := Replays0} = up_call(Config, stats, []),
     Dups0 = duplicate_connected(up_call(Config, notices, [])),
-    T0 = mark(Config),
+    M = mark(Config),
     ok = load_call(Config, spawn_agents, [#{from => N + 1, count => Wave, mode => storm}]),
     %% Close with ProxyRegister calls on the wire: each would count against the
     %% breaker if the connection loss were not one event.
@@ -443,13 +458,13 @@ upstream_conn_loss(Config) ->
                            {I >= 8, I}
                    end, 30000, 2),
     Closed = up_call(Config, close_connections, [abort]),
-    TClose = erlang:system_time(millisecond),
-    Reg = await_registered(Config, N + Wave, T0),
+    #{seq := ClosedAt} = up_call(Config, mark, []),
+    Reg = await_registered(Config, N + Wave, ct_ms(M)),
     Settle = settle(Config),
     Opens = maps:map(fun(K, V) -> V - maps:get(K, Opens0) end, breaker_transitions(Config)),
     #{replay_rpcs := Replays1} = up_call(Config, stats, []),
     Notices = up_call(Config, notices, []),
-    R0 = registration_report(Config, T0, Reg, Wave),
+    R0 = registration_report(Config, M, Reg, Wave),
     R = R0#{setup => Pre,
             wave => Wave,
             register_inflight_at_close => InFlightSeen,
@@ -459,7 +474,7 @@ upstream_conn_loss(Config) ->
             replay_rpcs_after_close => Replays1 - Replays0,
             duplicate_connected_after_close => duplicate_connected(Notices) - Dups0,
             connected_notices_after_close =>
-                length([1 || {_, _, connected, T} <- Notices, T >= TClose]),
+                length([1 || {_, _, _, connected, _} <- up_call(Config, notices, [ClosedAt])]),
             settle => Settle},
     finish(upstream_conn_loss, Config, R).
 
@@ -479,11 +494,11 @@ owner_kill(Config) ->
     #{disconnects := Disc0} = load_call(Config, status, []),
     SupBefore = gw_call(Config, erlang, whereis, [yuzu_gw_agent_sup]),
     Restarts0 = owner_restarts(Config),
-    T0 = mark(Config),
+    M = mark(Config),
     Killed = gw_call(Config, ?PROBE, kill_owners, [Victims]),
     Sessions = maps:from_list([{S, Id} || {Id, S} <- Killed]),
     Progress = fun() ->
-                       P = owner_kill_progress(Config, Sessions, T0),
+                       P = owner_kill_progress(Config, Sessions, M),
                        {maps:get(recovered, P) =:= map_size(Sessions)
                         andalso maps:get(disconnected, P) =:= map_size(Sessions), P}
                end,
@@ -491,7 +506,7 @@ owner_kill(Config) ->
     TBack = erlang:system_time(millisecond),
     Settle = settle(Config),
     #{disconnected := Disc, recovered := Rec, last_connected_ms := LastConn} =
-        owner_kill_progress(Config, Sessions, T0),
+        owner_kill_progress(Config, Sessions, M),
     After = maps:from_list([{Id, S} || {Id, S, _} <- truth(Config)]),
     SameSession = length([1 || {Id, S} <- Killed, maps:get(Id, After, none) =:= S]),
     Gw = ?config(gw, Config),
@@ -504,18 +519,20 @@ owner_kill(Config) ->
     SupAfter = gw_call(Config, erlang, whereis, [yuzu_gw_agent_sup]),
     Restarts = maps:map(fun(K, V) -> V - maps:get(K, Restarts0) end, owner_restarts(Config)),
     Counters = load_call(Config, counters, []),
-    Unrecovered = owner_kill_unrecovered(Config, Killed, Sessions, After, T0),
+    Unrecovered = owner_kill_unrecovered(Config, Killed, Sessions, After, M),
     R = #{setup => Pre,
           killed => length(Killed),
           disconnected_received => Disc,
           disconnected_lost => length(Killed) - Disc,
           recovered => Rec,
           all_recovered => AllBack,
+          %% The server's clock on both sides: its last recovering CONNECTED
+          %% minus its clock at the marker.
           time_to_all_recovered_ms => case AllBack of
-                                          true -> LastConn - T0;
+                                          true -> LastConn - up_ms(M);
                                           false -> null
                                       end,
-          waited_ms => TBack - T0,
+          waited_ms => TBack - ct_ms(M),
           same_session_after => SameSession,
           agent_disconnects_during => Disc1 - Disc0,
           agent_sup_restarted => SupBefore =/= SupAfter,
@@ -528,27 +545,33 @@ owner_kill(Config) ->
           gateway => gateway_report(Config)},
     finish(owner_kill, Config, R).
 
-%% For the killed sessions: how many have a DISCONNECTED at the server since
-%% T0, and how many have a CONNECTED after that DISCONNECTED (recovered).
-owner_kill_progress(Config, Sessions, T0) ->
-    Notices = [N || {_, S, _, T} = N <- up_call(Config, notices, []), T >= T0,
-                    maps:is_key(S, Sessions)],
-    Disc = maps:from_list([{S, T} || {_, S, disconnected, T} <- lists:keysort(4, Notices)]),
-    Conn = [{S, T} || {_, S, connected, T} <- Notices,
-                      case Disc of #{S := TD} -> T >= TD; _ -> false end],
+%% For the killed sessions: how many have a DISCONNECTED recorded at the server
+%% after the marker M, and how many have a CONNECTED recorded after that
+%% DISCONNECTED (recovered). Both orders are the server's record order (its
+%% sequence numbers), not times: each session's setup CONNECTED is recorded
+%% before the marker and must not count, and the kill's DISCONNECTED must.
+owner_kill_progress(Config, Sessions, M) ->
+    Notices = [Nt || {_, _, S, _, _} = Nt <- up_call(Config, notices, [up_seq(M)]),
+                     maps:is_key(S, Sessions)],
+    %% In record order: from_list keeps each session's last DISCONNECTED.
+    Disc = maps:from_list([{S, Seq} || {Seq, _, S, disconnected, _} <- Notices]),
+    Conn = [{S, T} || {Seq, _, S, connected, T} <- Notices,
+                      case Disc of #{S := DSeq} -> Seq > DSeq; _ -> false end],
     Recovered = maps:from_list(Conn),
     #{disconnected => map_size(Disc), recovered => map_size(Recovered),
       recovered_set => sets:from_list(maps:keys(Recovered), [{version, 2}]),
-      last_connected_ms => lists:max([T0 | maps:values(Recovered)])}.
+      last_connected_ms => lists:max([up_ms(M) | maps:values(Recovered)])}.
 
 %% The gateway's own count of restarted owners by outcome (0 for a gateway that
 %% predates the counter, so the scenario reports on it too).
 %% For each killed agent that is not recovered at the server or did not keep its
 %% session, everything each side saw, in ms since the kill: the fake server's
 %% registrations and notices for the agent, the agent's session ends (why), and
-%% the restarted owner's outcome. At most 20.
-owner_kill_unrecovered(Config, Killed, Sessions, After, T0) ->
-    #{recovered_set := Rec} = owner_kill_progress(Config, Sessions, T0),
+%% the restarted owner's outcome. At most 20. Each side's times are relative to
+%% that side's own clock at the marker (a diagnostic: the times of different
+%% sides are not compared with each other).
+owner_kill_unrecovered(Config, Killed, Sessions, After, M) ->
+    #{recovered_set := Rec} = owner_kill_progress(Config, Sessions, M),
     Bad = [{Id, S} || {Id, S} <- Killed,
                       not sets:is_element(S, Rec) orelse maps:get(Id, After, none) =/= S],
     Ids = [Id || {Id, _} <- lists:sublist(Bad, 20)],
@@ -556,16 +579,17 @@ owner_kill_unrecovered(Config, Killed, Sessions, After, T0) ->
     Notices = up_call(Config, notices, []),
     Ended = load_call(Config, ended, [Ids]),
     Owners = gw_call(Config, ?PROBE, owner_events, [Ids]),
-    Rel = fun(T) -> T - T0 end,
+    #{up := #{ms := UpT0}, load := #{ms := LoadT0}, gw := GwT0} = M,
     [#{agent => Id, session => S,
        session_after => maps:get(Id, After, null),
        server => lists:keysort(2,
-                   [{register, Rel(Recv), Kind, Sess} || {A, Kind, Recv, _Done, Sess, _} <- Registers,
-                                                         A =:= Id, Recv >= T0 - 1000]
-                   ++ [{Ev, Rel(T), Sess} || {A, Sess, Ev, T} <- Notices, A =:= Id,
-                                             T >= T0 - 1000]),
-       agent_ended => [{Why, Rel(T)} || {A, Why, T} <- Ended, A =:= Id, T >= T0 - 1000],
-       owner => [{O, Rel(T), W} || {A, T, O, W} <- Owners, A =:= Id]}
+                   [{register, Recv - UpT0, Kind, Sess}
+                    || {A, Kind, Recv, _Done, Sess, _} <- Registers,
+                       A =:= Id, Recv >= UpT0 - 1000]
+                   ++ [{Ev, T - UpT0, Sess} || {A, Sess, Ev, T} <- Notices, A =:= Id,
+                                               T >= UpT0 - 1000]),
+       agent_ended => [{Why, T - LoadT0} || {A, Why, T} <- Ended, A =:= Id, T >= LoadT0 - 1000],
+       owner => [{O, T - GwT0, W} || {A, T, O, W} <- Owners, A =:= Id]}
      || {Id, S} <- lists:sublist(Bad, 20)].
 
 owner_restarts(Config) ->
@@ -589,25 +613,31 @@ unacknowledged(Config) ->
     Refuse = env_int("YUZU_GW_SCALE_UNACK_MS", 10000),
     Bound = env_int("YUZU_GW_SCALE_UNACK_BOUND_MS", 90000),
     Opens0 = breaker_transitions(Config),
-    T0 = mark(Config),
-    Switch = T0 + Refuse,
-    set_upstream(Config, #{register_latency_ms => latency(),
-                           notify_refuse_connected_until => Switch}),
+    M = mark(Config),
+    set_upstream(Config, #{register_latency_ms => latency()}),
+    %% The server's clock decides when it switches (Switch is its time); this
+    %% node waits from the moment the call returned, by which the server's
+    %% Refuse ms had already begun, so the wait covers Bound after the switch.
+    Switch = up_call(Config, refuse_connected_for, [Refuse]),
+    SwitchSet = erlang:monotonic_time(millisecond),
     ok = load_call(Config, spawn_agents, [#{from => 1, count => N, mode => storm}]),
-    Reg = await_registered(Config, N, T0),
+    Reg = await_registered(Config, N, ct_ms(M)),
     RefusedBySwitch = maps:get(refused_connected_notices, up_call(Config, stats, [])),
     %% Every live session recorded, waited for up to the bound after the switch.
     {AllRecorded, Missing} =
         wait_until(fun() ->
-                           #{missing_connected := M} = convergence(Config),
-                           {M =:= 0, M}
-                   end, max(0, Switch + Bound - erlang:system_time(millisecond)), 1000),
+                           #{missing_connected := Mi} = convergence(Config),
+                           {Mi =:= 0, Mi}
+                   end,
+                   max(0, Refuse + Bound - (erlang:monotonic_time(millisecond) - SwitchSet)),
+                   1000),
     Settle = settle(Config),
     Live = [S || {_, S, _} <- truth(Config)],
     FirstRecorded = lists:foldl(fun({_, S, connected, T}, Acc) ->
                                         maps:update_with(S, fun(Prev) -> min(Prev, T) end, T, Acc);
                                    (_, Acc) -> Acc
                                 end, #{}, up_call(Config, notices, [])),
+    %% The server's record times against the server's switch time.
     Times = [maps:get(S, FirstRecorded) || S <- Live, maps:is_key(S, FirstRecorded)],
     LastAfterSwitch = case length(Times) =:= length(Live) andalso Times =/= [] of
                           true -> lists:max(Times) - Switch;
@@ -615,7 +645,7 @@ unacknowledged(Config) ->
                       end,
     Opens = maps:map(fun(K, V) -> V - maps:get(K, Opens0) end, breaker_transitions(Config)),
     #{refused_connected_notices := Refused} = up_call(Config, stats, []),
-    R0 = registration_report(Config, T0, Reg),
+    R0 = registration_report(Config, M, Reg),
     R = R0#{refuse_ms => Refuse,
             bound_ms => Bound,
             refused_connected_by_switch => RefusedBySwitch,
@@ -770,15 +800,20 @@ inv(Name, Ok, What) ->
 %%% Measurement
 %%%===================================================================
 
-%% Register outcomes and latency since T0, the server's view, the gateway's.
-registration_report(Config, T0, Reg) ->
-    registration_report(Config, T0, Reg, ?config(n, Config)).
+%% Register outcomes and latency since the marker M (mark/1, marker/1), the
+%% server's view, the gateway's.
+registration_report(Config, M, Reg) ->
+    registration_report(Config, M, Reg, ?config(n, Config)).
 
-%% Expected: how many agents should have registered since T0 (all N for ramp
+%% Expected: how many agents should have registered since M (all N for ramp
 %% and storm; for a phase where only some agents register, the ones that tried).
-registration_report(Config, T0, Reg, Expected0) ->
+%% The attempts are the ones the load generator STARTED after its marker, the
+%% budget is counted on its clock from its marker, and the server's calls are
+%% the ones that ARRIVED after its marker: no time crosses a node.
+registration_report(Config, M, Reg, Expected0) ->
     N = ?config(n, Config),
-    Attempts = [A || {_, _, Start, _, _} = A <- load_call(Config, attempts, []), Start >= T0],
+    #{load := #{seq := LoadSeq, ms := LoadT0}, up := #{seq := UpSeq}} = M,
+    Attempts = load_call(Config, attempts, [LoadSeq]),
     ByAgent = group_attempts(Attempts),
     Firsts = [hd(L) || L <- maps:values(ByAgent)],
     FirstOk = [E - S || {_, _, S, E, ok} <- Firsts],
@@ -788,11 +823,11 @@ registration_report(Config, T0, Reg, Expected0) ->
     RegisteredBy = [lists:min([E || {_, _, _, E, ok} <- L] ++ [infinity])
                     || L <- maps:values(ByAgent)],
     Expected = case Expected0 of attempting -> maps:size(ByAgent); E -> E end,
-    LateOrNever = length([1 || T <- RegisteredBy, T =:= infinity orelse T > T0 + Budget])
+    LateOrNever = length([1 || T <- RegisteredBy, T =:= infinity orelse T > LoadT0 + Budget])
                   + max(0, Expected - maps:size(ByAgent)),
     Status = load_call(Config, status, []),
     Up = up_call(Config, stats, []),
-    Waste = upstream_waste(up_call(Config, registers, []), Attempts, T0),
+    Waste = upstream_waste(up_call(Config, registers, [UpSeq]), Attempts),
     Reg#{register => #{agents => N,
                        attempts => length(Attempts),
                        first_attempt_ok => length(FirstOk),
@@ -810,30 +845,43 @@ registration_report(Config, T0, Reg, Expected0) ->
          convergence => convergence(Config),
          gateway => gateway_report(Config)}.
 
-%% The server's fresh ProxyRegister calls since T0, matched to the agent attempt
-%% each belongs to (the attempt number rides in the request, see
-%% yuzu_gw_scale_fleet:encode_attempt/2):
+%% The server's fresh ProxyRegister calls that arrived after its marker
+%% (Registers: yuzu_gw_scale_upstream:registers/1, in arrival order), matched to
+%% the agent attempt each belongs to (the attempt number rides in the request,
+%% see yuzu_gw_scale_fleet:encode_attempt/2):
 %%   wasted  the server created a session the agent never got: the attempt did
 %%           not succeed;
-%%   stale   of those, the call reached the server after the attempt had
-%%           already ended: work started for a caller that had given up. (Every
-%%           node reads the same OS clock, so no slack is needed; a call that
-%%           started just before the agent gave up is wasted but not stale.)
-upstream_waste(Registers, Attempts, T0) ->
-    ByKey = maps:from_list([{{Id, N}, {End, Outcome}} || {Id, N, _S, End, Outcome} <- Attempts]),
-    Fresh = [{Id, Recv, Att} || {Id, fresh, Recv, _Done, _S, Att} <- Registers, Recv >= T0],
-    Wasted = [{Recv, End} || {Id, Recv, Att} <- Fresh,
-                             {End, Outcome} <- [maps:get({Id, Att}, ByKey, {undefined, none})],
-                             Outcome =/= ok],
+%%   stale   of those, the ones that PROVABLY reached the server after the
+%%           attempt had already ended: work started for a caller that had
+%%           given up. Provably: the server had already received a call for a
+%%           LATER attempt of the same agent, and the agent starts attempt K+1
+%%           only after attempt K ended. That is the server's own arrival order,
+%%           not a comparison of the server's clock with the load generator's
+%%           (they disagree by milliseconds); a stale call with no later
+%%           attempt arriving before it is not counted, so this is a lower
+%%           bound. Reported, not checked.
+upstream_waste(Registers, Attempts) ->
+    ByKey = maps:from_list([{{Id, N}, Outcome} || {Id, N, _S, _End, Outcome} <- Attempts]),
+    Fresh = [{Seq, Id, Att} || {Seq, Id, fresh, _Recv, _Done, _S, Att} <- Registers],
+    Wasted = [W || {_Seq, Id, Att} = W <- Fresh, maps:get({Id, Att}, ByKey, none) =/= ok],
+    Arrivals = lists:foldl(fun({Seq, Id, Att}, Acc) ->
+                                   maps:update_with(Id, fun(L) -> [{Att, Seq} | L] end,
+                                                    [{Att, Seq}], Acc)
+                           end, #{}, Fresh),
+    Stale = [W || {Seq, Id, Att} = W <- Wasted,
+                  lists:any(fun({Att2, Seq2}) -> Att2 > Att andalso Seq2 < Seq end,
+                            maps:get(Id, Arrivals))],
     #{fresh_register_rpcs => length(Fresh),
       wasted_register_rpcs => length(Wasted),
-      stale_register_rpcs => length([1 || {Recv, End} <- Wasted, is_integer(End), Recv > End])}.
+      stale_register_rpcs => length(Stale)}.
 
 group_attempts(Attempts) ->
     G = lists:foldl(fun({Id, _, _, _, _} = A, Acc) ->
                             maps:update_with(Id, fun(L) -> [A | L] end, [A], Acc)
                     end, #{}, Attempts),
-    maps:map(fun(_, L) -> lists:keysort(3, L) end, G).
+    %% By attempt number (the agent numbers its attempts in order), not by
+    %% start time.
+    maps:map(fun(_, L) -> lists:keysort(2, L) end, G).
 
 %% Does the server's view match the agents'? A live session with no CONNECTED
 %% notice at the server is missing; a session the server last saw CONNECTED
@@ -1184,10 +1232,32 @@ mode(Config) ->
         M -> M
     end.
 
+%% Reset the gateway's peaks and take a marker (marker/1) before a scenario's
+%% measured phase.
 mark(Config) ->
     probe_call(Config, reset_hwm, []),
     probe_call(Config, sched_mark, []),
-    erlang:system_time(millisecond).
+    marker(Config).
+
+%% Where each node's record and clock is now, asked of each node in turn, every
+%% answer received before the scenario's next action:
+%%   up    the fake server: #{seq, ms} (yuzu_gw_scale_upstream:mark/0);
+%%   load  the load generator: #{seq, ms} (yuzu_gw_scale_fleet:mark/0);
+%%   gw    the gateway's clock (ms; its owner events carry its times);
+%%   ct    this node's clock (ms), last, for durations measured here.
+%% An event a node records after its answer, and so every event the next action
+%% causes, has a larger seq there. A node's ms is compared only with times that
+%% node recorded.
+marker(Config) ->
+    Up = up_call(Config, mark, []),
+    Load = load_call(Config, mark, []),
+    Gw = gw_call(Config, erlang, system_time, [millisecond]),
+    #{up => Up, load => Load, gw => Gw, ct => erlang:system_time(millisecond)}.
+
+ct_ms(#{ct := T}) -> T.
+up_seq(#{up := #{seq := S}}) -> S.
+up_ms(#{up := #{ms := T}}) -> T.
+load_seq(#{load := #{seq := S}}) -> S.
 
 set_upstream(Config, Cfg) -> up_call(Config, set_config, [Cfg]).
 
