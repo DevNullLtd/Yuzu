@@ -297,8 +297,9 @@ rows this is expected until the catalogue rollup is made incremental. Fix the ca
 (the alerts say how) or the flood of distinct names; `/crypto` recovers on its own once the
 catalogue is fresh again. The two rollup alerts use each replica's own refresh-success time against the
 Prometheus clock, while `/crypto` compares the shared catalogue stamp with the database clock, so a
-database clock step of more than five minutes (either direction) can send `/crypto` to live reads
-with neither alert firing; compare `names_as_of` with the database `now()`.
+database clock step back of more than five minutes, or forward far enough to push the stamp past
+two hours, can send `/crypto` to live reads with neither alert firing; compare `names_as_of` with
+the database `now()`.
 On the dashboard page and its **Load more** row the capacity shed reads "Temporarily busy: two
 reads are already running on this server; retry shortly" and a store fault reads "The inventory
 store could not be read"; REST and MCP use the same `503` message per cause.
@@ -318,9 +319,10 @@ package evidence", not as "this is the only library in use". A statically linked
 copy is the usual reason a known library does not appear. Component-level inventory that closes
 that gap is planned (roadmap Issue 18.7, ADR-0028).
 
-Fleets above about 6,000 endpoints (about 2.7M installed-package rows): the hourly catalogue does
-not build, so `/crypto` reads names live on every call (about 2 s per summary) and, with many
-replicas on one database, can time out. See Scale.
+Fleets above about 2.7M installed-package rows (roughly 6,000 endpoints at about 450 packages
+each, about 1,800 at 1,500): the hourly catalogue does not build, so
+`/crypto` reads names live on every call (about 2 s per summary at 15M rows / 30,000 distinct
+names) and, with many replicas on one database, can time out. See Scale.
 
 If an access-audit row cannot be written, the page still shows the data and the operator cannot
 see that (REST and MCP report it in the response); watch `yuzu_server_audit_emit_failed_total` on
@@ -346,12 +348,14 @@ refresh, so rows of a name the walk has already listed could be skipped. That co
 answers invalid-params). Every other change continues: a switch from the catalogue to live names
 lists every name, and a newer catalogue lists every name that had rows at its refresh. The refusal
 normally happens once, but it happens again each time the catalogue goes stale (the refresh failing
-for more than two hours, or a database clock step) and then recovers during the same walk. Two
-residuals on a continuing walk: a name with no rows anywhere at a refresh that reappears before the
-next refresh is missed for the rest of the walk, exactly as on a fresh walk on that catalogue (the
-catalogue lag above); and because rows are ordered agent first, a name new in the newer source IS
-listed for devices after the cursor, while its rows on devices already passed are missed. Restart
-the walk to see them. A deny-all answer (an empty scope) reads nothing, so
+for more than two hours, or a database clock step) and then recovers during the same walk. A walk
+is not a snapshot: rows are ordered agent first, and a row that appears during the walk, for any
+name, on a device the walk has already passed (or earlier in order on the cursor's own device) is
+not returned. Two further cases follow from the names source: a name with no rows anywhere at a
+refresh that reappears before the next refresh is missed until a later refresh lists it again,
+exactly as on a fresh walk on that catalogue (the catalogue lag above); and a name new in the newer
+source IS listed for devices after the cursor, while its rows on devices already passed are missed.
+Restart the walk to see them. A deny-all answer (an empty scope) reads nothing, so
 it reports `names_source` `live` and `names_as_of` `null` (and its page still carries the
 names-source note); a walk whose scope empties mid-walk continues and ends on an empty page. An old
 catalogue is the signal to look at the rollup alerts `YuzuInventoryCatalogRollupStale` (a catalogue

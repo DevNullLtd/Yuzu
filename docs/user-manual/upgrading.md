@@ -149,9 +149,10 @@ customer-distribution lane. Before switching lanes, read the
   30,000 names, and on a fleet above about 140,000 to 180,000 distinct package names with a stale
   catalogue it can pass its 5 s bound and answer `503`; see
   [Crypto](crypto.md#how-fresh-the-package-names-are).
-- **Large fleets.** Fleets above about 6,000 endpoints (about 2.7M installed-package rows): the
-  hourly catalogue does not build, so `/crypto` reads names live on every call (about 2 s per
-  summary) and, with many replicas on one database, can time out. See
+- **Large fleets.** Fleets above about 2.7M installed-package rows (roughly 6,000 endpoints at
+  about 450 packages each, about 1,800 at 1,500): the hourly catalogue does not build, so
+  `/crypto` reads names live on every call (about 2 s per summary at 15M rows / 30,000 distinct
+  names) and, with many replicas on one database, can time out. See
   [Scale](crypto.md#how-fresh-the-package-names-are).
 
 **Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`

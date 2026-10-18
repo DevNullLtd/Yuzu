@@ -160,10 +160,11 @@ public:
         // again each time the catalogue goes stale (refresh failing past two hours, or a
         // database clock step) and then recovers during the same walk. A newer catalogue lists
         // every name that had rows at ITS refresh; a name with no rows anywhere at that refresh
-        // that reappears before the next one is missed for the rest of the walk, as on a fresh
-        // walk on that catalogue (the documented catalogue lag). Rows are ordered agent first,
-        // so on a continue a name new in the newer source IS listed for devices after the
-        // cursor; only its rows on devices already passed are missed. Restart to see them.
+        // that reappears before the next one is missed until a later refresh lists it, as on a
+        // fresh walk on that catalogue (the documented catalogue lag). Rows are ordered agent
+        // first and a walk is not a snapshot: on a continue a name new in the newer source IS
+        // listed for devices after the cursor, and any row appearing on a device already passed
+        // is missed. Restart to see them.
         if (cursor_pos && cursor_pos->names_as_of == 0 && page->names_as_of > 0)
             return std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid,
                                                    std::string(cl::names_source_changed_message())});
