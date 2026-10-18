@@ -59,10 +59,22 @@ constexpr const char* kReasonQueryError = "query_error";
 constexpr const char* kMeta = "plugin_config_store.enablement_meta";
 constexpr const char* kRules = "plugin_config_store.enablement_rules";
 constexpr const char* kEndpoints = "plugin_config_store.enablement_endpoints";
-// The rule SELECT list, spelled once: rule_row() reads these columns by position.
+// The SELECT lists, spelled once: each reader decodes its columns by position, and the
+// construction smoke read projects the same lists, so what the runtime selects and what
+// open_ proves present cannot drift apart.
 constexpr const char* kRuleCols =
     "id, array_to_json(units)::text, selector, provenance, actor, audit_ref, active, "
     "(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint";
+constexpr const char* kMetaCols =
+    "store_id, epoch, counter, rules_version, overlay_hash, job_cursor, "
+    "regressed_at IS NOT NULL, regressed_reason";
+constexpr const char* kEndpointCols =
+    "agent_id, hostname, os, arch, agent_version, reg_boot_id, reg_seq, input_gen, "
+    "resolved_version, array_to_json(desired_units)::text, desired_hash, desired_epoch, "
+    "desired_counter, reported_epoch, reported_counter, reported_hash, report_ahead, "
+    "pending_since IS NOT NULL, "
+    "COALESCE(EXTRACT(EPOCH FROM (now() - pending_since))::bigint, -1), "
+    "has_held_state, retired_at IS NOT NULL";
 
 constexpr std::size_t kMaxAgentIdBytes = 256;
 
@@ -293,12 +305,22 @@ EnablementStore::EnablementStore(pg::PgPool& pool, en::UnitOverlay overlay,
                       pool_.last_error());
         return;
     }
-    pg::PgResult res = pg::exec_params(
-        lease.get(), (std::string("SELECT 1 FROM ") + kMeta + " WHERE id = 1").c_str(),
-        std::vector<std::string>{});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
-        spdlog::error("EnablementStore: enablement_meta is missing (plugin_config_store schema "
-                      "v3 not applied) — enablement store disabled");
+    // Fail closed unless every column the runtime selects is present (postgres-store-playbook
+    // "post-migration projection smoke read"): the singleton read proves enablement_meta is
+    // seeded; the two LIMIT 0 projections touch no rows. last_report_at is the one column
+    // record_report uses without selecting it.
+    const auto projects = [&](const std::string& cols, const char* table, const char* tail,
+                              int rows) {
+        pg::PgResult r = pg::exec_params(
+            lease.get(), (std::string("SELECT ") + cols + " FROM " + table + tail).c_str(),
+            std::vector<std::string>{});
+        return r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == rows;
+    };
+    if (!projects(kMetaCols, kMeta, " WHERE id = 1", 1) ||
+        !projects(kRuleCols, kRules, " LIMIT 0", 0) ||
+        !projects(std::string(kEndpointCols) + ", last_report_at", kEndpoints, " LIMIT 0", 0)) {
+        spdlog::error("EnablementStore: the enablement schema is missing or incomplete "
+                      "(plugin_config_store schema v3 not applied) — enablement store disabled");
         return;
     }
     open_ = true;
@@ -308,25 +330,22 @@ std::expected<std::unique_ptr<EnablementStore>, std::string>
 EnablementStore::boot(pg::PgPool& pool, en::UnitOverlay overlay, std::string_view overlay_digest,
                       std::vector<std::string_view> kinds, const fs::path& anchor_path,
                       yuzu::MetricsRegistry* metrics) {
-    const auto refuse = [](const char* why) {
-        return std::unexpected<std::string>(std::string(why));
-    };
     auto store = std::make_unique<EnablementStore>(pool, std::move(overlay), std::move(kinds));
     if (!store->is_open())
-        return refuse("enablement store open failed");
+        return std::unexpected("enablement store open failed");
     store->set_metrics(metrics);
     // A release that adds/removes a unit OR a requirement edge makes every endpoint row
     // stale (rules_version bump in the same statement).
     const auto synced = store->sync_overlay_hash(overlay_digest);
     if (!synced)
-        return refuse("enablement overlay hash could not be recorded");
+        return std::unexpected("enablement overlay hash could not be recorded");
     if (*synced)
         spdlog::info("EnablementStore: the unit overlay changed in this release; every endpoint "
                      "will be re-resolved");
     // A present anchor that disagrees with the store declares it regressed (issuing desired
     // state freezes); a missing one is only reported. Either way the server still boots.
     if (!store->check_continuity_at_boot(anchor_path))
-        return refuse("enablement continuity check could not read the store");
+        return std::unexpected("enablement continuity check could not read the store");
     return store;
 }
 
@@ -683,13 +702,7 @@ EnablementStore::get_endpoint(std::string_view agent_id) const {
         return std::unexpected(Error::Unavailable);
     pg::PgResult r = pg::exec_params(
         lease.get(),
-        (std::string("SELECT agent_id, hostname, os, arch, agent_version, reg_boot_id, reg_seq, "
-                     "input_gen, resolved_version, array_to_json(desired_units)::text, "
-                     "desired_hash, desired_epoch, desired_counter, reported_epoch, "
-                     "reported_counter, reported_hash, report_ahead, pending_since IS NOT NULL, "
-                     "COALESCE(EXTRACT(EPOCH FROM (now() - pending_since))::bigint, -1), "
-                     "has_held_state, retired_at IS NOT NULL FROM ") +
-         kEndpoints + " WHERE agent_id = $1")
+        (std::string("SELECT ") + kEndpointCols + " FROM " + kEndpoints + " WHERE agent_id = $1")
             .c_str(),
         std::vector<std::string>{std::string(agent_id)});
     if (r.status() != PGRES_TUPLES_OK) {
@@ -739,9 +752,12 @@ EnablementStore::record_report(std::string_view agent_id, std::int64_t epoch, st
          " e SET reported_epoch = $2::bigint, reported_counter = $3::bigint, "
          "reported_hash = $4::text, last_report_at = now(), "
          "has_held_state = e.has_held_state OR $3::bigint > 0, "
-         "pending_since = CASE WHEN e.desired_epoch = $2::bigint AND "
-         "e.desired_counter = $3::bigint AND e.desired_hash = $4::text "
-         "THEN NULL ELSE e.pending_since END, "
+         "pending_since = CASE "
+         "WHEN e.desired_epoch = $2::bigint AND e.desired_counter = $3::bigint AND "
+         "e.desired_hash = $4::text THEN NULL "
+         "WHEN ($2::bigint, $3::bigint) < (e.desired_epoch, e.desired_counter) "
+         "THEN COALESCE(e.pending_since, now()) "
+         "ELSE e.pending_since END, "
          "report_ahead = (($2::bigint, $3::bigint) > "
          "(SELECT m.epoch, m.counter FROM " +
          kMeta +
@@ -794,6 +810,11 @@ EnablementStore::set_desired_batch(const BatchWrite& batch) {
     std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
         return batch.changed[a].agent_id < batch.changed[b].agent_id;
     });
+    // `changed` agent_ids must be unique: a duplicate would reserve a counter it never writes.
+    if (std::adjacent_find(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+            return batch.changed[a].agent_id == batch.changed[b].agent_id;
+        }) != order.end())
+        return std::unexpected(Error::InvalidInput);
 
     BatchResult result;
     bool ran = false;
@@ -903,10 +924,7 @@ std::expected<EnablementStore::MetaRow, EnablementStore::Error> EnablementStore:
         return std::unexpected(Error::Unavailable);
     pg::PgResult r = pg::exec_params(
         lease.get(),
-        (std::string("SELECT store_id, epoch, counter, rules_version, overlay_hash, job_cursor, "
-                     "regressed_at IS NOT NULL, regressed_reason FROM ") +
-         kMeta + " WHERE id = 1")
-            .c_str(),
+        (std::string("SELECT ") + kMetaCols + " FROM " + kMeta + " WHERE id = 1").c_str(),
         std::vector<std::string>{});
     if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1) {
         count_read_degrade(kReasonQueryError);

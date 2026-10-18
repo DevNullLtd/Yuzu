@@ -56,10 +56,15 @@
 /// A batch is bounded: acquire <= 5 s and three statements at <= 5 s each.
 ///
 /// record_report is ONE conditional UPDATE (no read-then-write): the CASE that
-/// clears pending_since and the WHERE that suppresses a duplicate are evaluated
-/// against the row's current version under its row lock, so a report equal to the
-/// PREVIOUS desired state can never clear pending_since for a state issued in
-/// between, and concurrent reports serialise on the row.
+/// clears or reopens pending_since and the WHERE that suppresses a duplicate are
+/// evaluated against the row's current version under its row lock, so a report equal
+/// to the PREVIOUS desired state can never clear pending_since for a state issued in
+/// between, and concurrent reports serialise on the row. An exact acknowledgement
+/// clears pending_since; a report BEHIND the row's issued (epoch, counter) (an
+/// endpoint restored from an older snapshot) reopens it, keeping the original age if
+/// still pending, so pending-with-age holds whenever the agent is behind (ADR-3006
+/// Verification 22). A never-issued row has nothing to be behind, and a report ahead
+/// leaves pending_since as it is (the report_ahead witness covers it).
 ///
 /// LOADER DUTIES (enablement_resolver.hpp, make_persisted_rule): a rule refused at
 /// load is quarantined, counted (rules_rejected_total{reason}), logged once with a
@@ -211,22 +216,20 @@ public:
     /// Borrows the shared pool. `overlay` is this release's unit overlay (used to
     /// validate authored rules and to compute unresolved units); `kinds` are the
     /// durable selector attribute kinds and alias a static catalog that must outlive
-    /// the store. Smoke-reads enablement_meta: is_open() is true iff the v3 schema
-    /// is present, i.e. PluginConfigStore migrated first.
+    /// the store. Smoke-reads the seeded enablement_meta row and projects (LIMIT 0)
+    /// every column the runtime selects from the three tables: is_open() is true iff
+    /// the v3 schema is present and complete, i.e. PluginConfigStore migrated first.
     EnablementStore(pg::PgPool& pool, enablement::UnitOverlay overlay,
                     std::vector<std::string_view> kinds);
 
     EnablementStore(const EnablementStore&) = delete;
     EnablementStore& operator=(const EnablementStore&) = delete;
 
-    /// The server's boot composition, in one place so it is testable below ServerImpl:
-    /// construct (a store that did not open is an error), wire metrics, record this
-    /// release's overlay digest (a failure is an error; a changed digest is logged and
-    /// makes every row stale) and classify the continuity anchor at `anchor_path`
-    /// (an unreadable store is an error). The string is the refusal reason, for the
-    /// caller's startup log. A Regressed VERDICT is NOT an error: the store is declared
-    /// regressed (issuing freezes, /readyz reports it) and the server still boots. The
-    /// overlay build and digest are process-wide facts the caller establishes first.
+    /// The server's boot composition, testable below ServerImpl: open, wire metrics,
+    /// record the overlay digest and classify the continuity anchor at `anchor_path`. A
+    /// failure at any step is the error string, for the startup log. A Regressed VERDICT
+    /// is NOT an error: it is declared (issuing freezes, /readyz reports it) and the
+    /// server still boots.
     [[nodiscard]] static std::expected<std::unique_ptr<EnablementStore>, std::string>
     boot(pg::PgPool& pool, enablement::UnitOverlay overlay, std::string_view overlay_digest,
          std::vector<std::string_view> kinds, const std::filesystem::path& anchor_path,

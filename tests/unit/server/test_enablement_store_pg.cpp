@@ -9,13 +9,9 @@
 // test_principal_lock_gate.hpp) before releasing it, so the interleaving they claim
 // is the one that ran; no case sleeps on a clock.
 //
-// The server's boot composition is EnablementStore::boot, tested below for each of its
-// refusals (the store does not open, the overlay hash cannot be recorded, the continuity
-// check cannot read the store) and for the two outcomes that must NOT refuse (a healthy
-// boot, and a declared regression). Two inputs to it are process-wide facts the caller
-// establishes first, so a test cannot inject them: the overlay build and its digest.
-// The one-line mapping of a boot() refusal to startup_failed_ in server.cpp has no unit
-// seam short of constructing a ServerImpl.
+// Not covered: boot()'s overlay build and digest are process-wide facts the caller establishes
+// first, and the mapping of a refusal to startup_failed_ in server.cpp has no unit seam short of
+// a ServerImpl.
 
 #include "agent_registry.hpp" // detail::scope_kind_catalog
 #include "capability_decls/all_fragments.hpp"
@@ -43,7 +39,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -128,9 +123,8 @@ std::string sqlstate_of(const std::string& dsn, const std::string& sql) {
     return state != nullptr ? state : "?";
 }
 
-/// Clear a regression declaration by hand. The store deliberately has no API for it:
-/// accepting a regressed state starts a new ordering of states (ADR-3006 D14), which is
-/// not this store's to define. The caller refreshes the instance under test afterwards.
+/// Clear a declaration by hand (the store has no API for it, ADR-3006 D14); the caller refreshes
+/// the instance under test afterwards.
 void clear_regression(const std::string& dsn) {
     exec_sql(dsn, "UPDATE plugin_config_store.enablement_meta SET regressed_at = NULL, "
                   "regressed_reason = ''");
@@ -148,33 +142,22 @@ std::string read_file(const fs::path& p) {
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
-/// True once some backend of THIS database is blocked on a RELATION lock (a table lock).
-/// The shared wait_for_lock_waiter covers advisory and row-lock (transactionid) waits only,
-/// so the snapshot case, which parks the loader on a table lock, polls for this one itself.
-/// Like that helper this is an event-style poll (there is no event to wait on in another
-/// backend); the deadline only bounds a failing test.
-bool wait_for_relation_waiter(PgPool& pool) {
-    const auto end = std::chrono::steady_clock::now() + yuzu::test::kLockWaitDeadline;
-    while (std::chrono::steady_clock::now() < end) {
-        if (auto probe = pool.try_acquire_for(std::chrono::milliseconds(100))) {
-            PgResult r = pg::exec_params(
-                probe.get(),
-                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
-                "AND wait_event_type = 'Lock' AND wait_event = 'relation'",
-                std::vector<std::string>{});
-            if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1 &&
-                std::atoi(PQgetvalue(r.get(), 0, 0)) > 0)
-                return true;
-        }
-        std::this_thread::sleep_for(yuzu::test::kLockWaitPoll);
-    }
-    return false;
-}
-
 /// Release a raw connection's open transaction. Safe to call when none is open (the
 /// server answers with a notice), so it can run from a Workers pre-join callback.
 void end_txn(PgConn& conn, const char* verb) {
     PgResult r{PQexec(conn.get(), verb)};
+}
+
+/// A raw connection holding the enablement_meta row (FOR UPDATE) in an open transaction; the
+/// caller ends it with ROLLBACK. A plain SELECT of the row is not blocked, a write to it is.
+PgConn hold_meta_row(const std::string& dsn) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    REQUIRE(PgResult{PQexec(conn.get(), "BEGIN")}.ok());
+    REQUIRE(PgResult{PQexec(conn.get(), "SELECT 1 FROM plugin_config_store.enablement_meta "
+                                        "WHERE id = 1 FOR UPDATE")}
+                .status() == PGRES_TUPLES_OK);
+    return conn;
 }
 
 // Captures spdlog output for one case (restored in the destructor).
@@ -271,6 +254,17 @@ private:
     std::optional<yuzu::test::PostgresTestDb> db_;
     std::optional<PgPool> pool_;
 };
+
+/// Write an anchor file ahead of the store (a dump restored behind it). The existence check
+/// matters: an unwritable fixture would read as a MISSING anchor and exercise the wrong branch.
+void write_anchor_ahead(const EnablementPg& f, const EnablementStore::MetaRow& meta) {
+    fs::create_directories(f.anchor().parent_path());
+    {
+        std::ofstream out(f.anchor(), std::ios::binary | std::ios::trunc);
+        out << en::render_anchor({meta.store_id, meta.epoch, meta.counter + 10});
+    }
+    REQUIRE(fs::exists(f.anchor()));
+}
 
 en::RuleRow row(std::string id, std::vector<std::string> units, std::string selector = "__all__",
                 std::string prov = "operator") {
@@ -587,7 +581,8 @@ TEST_CASE("EnablementStore: load_rules returns a version and rows from ONE snaps
     std::expected<EnablementStore::LoadedRules, EnablementStore::Error> parked;
     yuzu::test::Workers workers([&] { end_txn(a, "ROLLBACK"); });
     workers.add([&] { parked = f.store->load_rules(); });
-    REQUIRE(wait_for_relation_waiter(f.pool()));
+    REQUIRE(yuzu::test::wait_for_lock_waiter(f.pool(), yuzu::test::kLockWaitDeadline,
+                                             "'relation'"));
 
     // The author adds a rule and bumps the version in ONE transaction while the loader waits.
     REQUIRE(PgResult{PQexec(a.get(), "INSERT INTO plugin_config_store.enablement_rules (id, units, "
@@ -859,6 +854,22 @@ TEST_CASE("EnablementStore: an input change landing before the write leaves the 
                              "WHERE resolved_version < 2") == 1);
 }
 
+TEST_CASE("EnablementStore: a batch naming one agent twice is refused before any counter is reserved",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(2);
+    const auto before = f.store->get_meta();
+    auto dup = f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1},
+                                                   {"ep002", 1, {}, kH1},
+                                                   {"ep001", 1, {}, kH2}},
+                                                  {}, 1));
+    REQUIRE_FALSE(dup.has_value());
+    CHECK(dup.error() == EnablementStore::Error::InvalidInput);
+    CHECK(f.store->get_meta()->counter == before->counter);
+    CHECK(f.store->get_endpoint("ep001")->desired_hash.empty());
+    CHECK(f.store->get_endpoint("ep002")->desired_hash.empty());
+}
+
 TEST_CASE("EnablementStore: a batch at a stale epoch is fenced and writes nothing",
           "[pg][store][enablement]") {
     EnablementPg f;
@@ -960,9 +971,7 @@ TEST_CASE("EnablementStore: the continuity anchor - unwitnessed, regressed, idem
     CHECK(f.counter("yuzu_server_enablement_anchor_unwitnessed_total") == 1);
     CHECK(f.store->regression().anchor_unwitnessed);
     CHECK_FALSE(f.store->regression().regressed);
-    std::ifstream in(f.anchor(), std::ios::binary);
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    auto parsed = en::parse_anchor(text);
+    auto parsed = en::parse_anchor(read_file(f.anchor()));
     REQUIRE(parsed.has_value());
     CHECK(parsed->store_id == meta0->store_id);
     CHECK(parsed->counter == meta0->counter);
@@ -971,10 +980,7 @@ TEST_CASE("EnablementStore: the continuity anchor - unwitnessed, regressed, idem
     CHECK(*healthy->check_continuity_at_boot(f.anchor()) == en::Continuity::Ok);
 
     // The file ahead of the store (a dump restored behind it): Regressed, declared once.
-    {
-        std::ofstream out(f.anchor(), std::ios::binary | std::ios::trunc);
-        out << en::render_anchor({meta0->store_id, meta0->epoch, meta0->counter + 10});
-    }
+    write_anchor_ahead(f, *meta0);
     auto second = f.make_store();
     auto verdict = second->check_continuity_at_boot(f.anchor());
     REQUIRE(verdict.has_value());
@@ -993,15 +999,10 @@ TEST_CASE("EnablementStore: the continuity anchor - unwitnessed, regressed, idem
 
     // write_anchor on a regressed store never lowers the file.
     CHECK(second->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Refused);
-    {
-        std::ifstream again(f.anchor(), std::ios::binary);
-        std::string now((std::istreambuf_iterator<char>(again)), std::istreambuf_iterator<char>());
-        CHECK(en::parse_anchor(now)->counter == meta0->counter + 10);
-    }
+    CHECK(en::parse_anchor(read_file(f.anchor()))->counter == meta0->counter + 10);
 
-    // Another store's id, an unparseable file and an over-long one are all regressions. The
-    // store has no way to clear a declaration (resolution starts a new ordering and is not
-    // its to define), so each round is reset by hand.
+    // Another store's id, an unparseable file and an over-long one are all regressions; each
+    // round is reset by hand.
     const auto reset_by_hand = [&] {
         clear_regression(f.dsn());
         f.store->refresh_regression();
@@ -1028,10 +1029,6 @@ TEST_CASE("EnablementStore: write_anchor reads the meta row, and the file, autho
           "[pg][store][enablement]") {
     EnablementPg f;
     REQUIRE(f.store->check_continuity_at_boot(f.anchor()).has_value());
-    const auto read_file = [&] {
-        std::ifstream in(f.anchor(), std::ios::binary);
-        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    };
 
     // A SECOND instance declares; the first has not refreshed its cache.
     auto other = f.make_store();
@@ -1039,25 +1036,21 @@ TEST_CASE("EnablementStore: write_anchor reads the meta row, and the file, autho
     REQUIRE_FALSE(f.store->regression().regressed); // A's cache is stale ...
     f.seed(1);
     exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET counter = counter + 4");
-    const std::string untouched = read_file();
+    const std::string untouched = read_file(f.anchor());
     // ... but the write is authoritative: refused, and the file is unchanged.
     CHECK(f.store->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Refused);
     CHECK(f.counter("yuzu_server_enablement_anchor_write_refused_total", {{"reason", "regressed"}}) == 1);
-    CHECK(read_file() == untouched);
+    CHECK(read_file(f.anchor()) == untouched);
 
-    // Clear it by hand, then put the FILE ahead while the instance runs: refused, declared,
-    // not lowered.
+    // Put the FILE ahead while the instance runs: refused, declared, not lowered.
     clear_regression(f.dsn());
     other->refresh_regression();
     REQUIRE_FALSE(other->regression().regressed);
     const auto meta = f.store->get_meta();
-    {
-        std::ofstream out(f.anchor(), std::ios::binary | std::ios::trunc);
-        out << en::render_anchor({meta->store_id, meta->epoch, meta->counter + 10});
-    }
+    write_anchor_ahead(f, *meta);
     CHECK(f.store->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Refused);
     CHECK(f.counter("yuzu_server_enablement_anchor_write_refused_total", {{"reason", "file_ahead"}}) == 1);
-    CHECK(en::parse_anchor(read_file())->counter == meta->counter + 10);
+    CHECK(en::parse_anchor(read_file(f.anchor()))->counter == meta->counter + 10);
     CHECK(query1(f.dsn(), "SELECT regressed_reason FROM plugin_config_store.enablement_meta") == "store_behind");
 }
 
@@ -1074,9 +1067,7 @@ TEST_CASE("EnablementStore: a successful anchor write replaces the file and leav
     REQUIRE(f.store->set_desired_batch(
         f.batch({{"ep001", 1, {"wol.wake"}, kH1}, {"ep002", 1, {}, kH2}}, {}, 2)));
     CHECK(f.store->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Written);
-    std::ifstream in(f.anchor(), std::ios::binary);
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    const auto parsed = en::parse_anchor(text);
+    const auto parsed = en::parse_anchor(read_file(f.anchor()));
     REQUIRE(parsed.has_value());
     const auto meta = f.store->get_meta();
     CHECK(*parsed == en::Anchor{meta->store_id, meta->epoch, meta->counter});
@@ -1148,6 +1139,60 @@ TEST_CASE("EnablementStore: a second replica answers pending-with-age from the p
     CHECK_FALSE(acked->pending_age_seconds.has_value());
 }
 
+TEST_CASE("EnablementStore: a report behind the issued state reopens pending after an acknowledgement",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(2);
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 2");
+    REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 2)));
+    const auto first = f.store->get_endpoint("ep001");
+    REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {}, kH2}}, {}, 2)));
+    const auto second = f.store->get_endpoint("ep001");
+    REQUIRE(second.has_value());
+    REQUIRE(second->desired_counter == first->desired_counter + 1);
+    REQUIRE(f.store->record_report("ep001", second->desired_epoch, second->desired_counter, kH2));
+    // Every read below goes through a second instance: the answer is the persisted row's.
+    PgPool pool_b{{.conninfo = f.dsn(), .size = 2}};
+    auto b = f.make_store(&pool_b);
+    CHECK_FALSE(b->get_endpoint("ep001")->pending);
+
+    // An endpoint restored from an older snapshot reports state 1, BEHIND the issued state 2.
+    REQUIRE(f.store->record_report("ep001", first->desired_epoch, first->desired_counter, kH1));
+    auto behind = b->get_endpoint("ep001");
+    REQUIRE(behind.has_value());
+    CHECK(behind->pending);
+    CHECK(behind->pending_age_seconds.has_value());
+
+    // A second backward report keeps the original age rather than restarting it. The age is
+    // set in SQL, not on a clock.
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_endpoints SET pending_since = "
+                      "now() - interval '2 hours' WHERE agent_id = 'ep001'");
+    REQUIRE(f.store->record_report("ep001", first->desired_epoch, 0, ""));
+    auto kept = b->get_endpoint("ep001");
+    REQUIRE(kept.has_value());
+    CHECK(kept->pending);
+    REQUIRE(kept->pending_age_seconds.has_value());
+    CHECK(*kept->pending_age_seconds >= 7100);
+    CHECK(*kept->pending_age_seconds <= 7300);
+
+    // The exact acknowledgement clears it again.
+    REQUIRE(f.store->record_report("ep001", second->desired_epoch, second->desired_counter, kH2));
+    auto cleared = b->get_endpoint("ep001");
+    CHECK_FALSE(cleared->pending);
+    CHECK_FALSE(cleared->pending_age_seconds.has_value());
+
+    // A report AHEAD of the issued state leaves it alone (report_ahead is its witness) ...
+    auto ahead = f.store->record_report("ep001", second->desired_epoch,
+                                        second->desired_counter + 100, kH2);
+    REQUIRE(ahead.has_value());
+    CHECK(*ahead == EnablementStore::ReportOutcome::Ahead);
+    CHECK_FALSE(b->get_endpoint("ep001")->pending);
+    // ... and a never-issued row has nothing to be behind, whatever it reports.
+    REQUIRE(f.store->record_report("ep002", 1, 0, ""));
+    REQUIRE(f.store->record_report("ep002", 0, 0, ""));
+    CHECK_FALSE(b->get_endpoint("ep002")->pending);
+}
+
 TEST_CASE("EnablementStore: has_held_state is a durable latch that empty reports and "
           "re-registration and a new store never clear",
           "[pg][store][enablement]") {
@@ -1216,10 +1261,33 @@ TEST_CASE("EnablementStore: a read that cannot be served is a typed Unavailable,
     CHECK(store->list_rules(true).has_value());
 }
 
+TEST_CASE("EnablementStore: an incomplete v3 schema leaves the store closed and boot refuses it",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    const auto closed_after = [&](const std::string& ddl) {
+        exec_sql(f.dsn(), ddl);
+        CHECK_FALSE(f.make_store()->is_open());
+        auto refused =
+            EnablementStore::boot(f.pool(), make_overlay(), kH1, kinds(), f.anchor(), nullptr);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find("open failed") != std::string::npos);
+        CHECK_FALSE(fs::exists(f.anchor()));
+    };
+    SECTION("a column the endpoint reader selects is missing") {
+        closed_after("ALTER TABLE plugin_config_store.enablement_endpoints DROP COLUMN pending_since");
+    }
+    SECTION("a column only the report writer uses is missing") {
+        closed_after("ALTER TABLE plugin_config_store.enablement_endpoints DROP COLUMN last_report_at");
+    }
+    SECTION("the rules table is missing") {
+        closed_after("DROP TABLE plugin_config_store.enablement_rules");
+    }
+    SECTION("a column the meta reader selects is missing") {
+        closed_after("ALTER TABLE plugin_config_store.enablement_meta DROP COLUMN job_cursor");
+    }
+}
+
 // -- Boot ----------------------------------------------------------------------------
-//
-// EnablementStore::boot is the server's whole composition of the store, so each refusal the
-// server turns into startup_failed_ is a branch here.
 
 TEST_CASE("EnablementStore: a healthy boot opens the store and records the overlay and witnesses the anchor",
           "[pg][store][enablement]") {
@@ -1253,12 +1321,7 @@ TEST_CASE("EnablementStore: boot refuses when the overlay hash cannot be recorde
     PgPool short_pool{{.conninfo = f.dsn(), .size = 2, .lock_timeout_ms = 100}};
     // A holds the meta row; the construction smoke read (a plain SELECT) is not blocked, the
     // overlay-hash UPDATE is, and gives up at the pool's lock timeout.
-    PgConn a{PQconnectdb(f.dsn().c_str())};
-    REQUIRE(PQstatus(a.get()) == CONNECTION_OK);
-    REQUIRE(PgResult{PQexec(a.get(), "BEGIN")}.ok());
-    REQUIRE(PgResult{PQexec(a.get(), "SELECT 1 FROM plugin_config_store.enablement_meta WHERE id = 1 "
-                                     "FOR UPDATE")}
-                .status() == PGRES_TUPLES_OK);
+    PgConn a = hold_meta_row(f.dsn());
     auto refused = EnablementStore::boot(short_pool, make_overlay(), kH1, kinds(), f.anchor(), nullptr);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("overlay hash") != std::string::npos);
@@ -1281,19 +1344,9 @@ TEST_CASE("EnablementStore: boot refuses when a disagreeing anchor cannot be dec
     REQUIRE(f.store->sync_overlay_hash(kH1).value());
     const auto meta = f.store->get_meta();
     REQUIRE(meta.has_value());
-    fs::create_directories(f.dir.path);
-    {
-        std::ofstream out(f.anchor(), std::ios::binary | std::ios::trunc);
-        out << en::render_anchor({meta->store_id, meta->epoch, meta->counter + 10});
-    }
-    REQUIRE(fs::exists(f.anchor())); // an unwritable fixture would read as a MISSING anchor
+    write_anchor_ahead(f, *meta);
     PgPool short_pool{{.conninfo = f.dsn(), .size = 2, .lock_timeout_ms = 100}};
-    PgConn a{PQconnectdb(f.dsn().c_str())};
-    REQUIRE(PQstatus(a.get()) == CONNECTION_OK);
-    REQUIRE(PgResult{PQexec(a.get(), "BEGIN")}.ok());
-    REQUIRE(PgResult{PQexec(a.get(), "SELECT 1 FROM plugin_config_store.enablement_meta WHERE id = 1 "
-                                     "FOR UPDATE")}
-                .status() == PGRES_TUPLES_OK);
+    PgConn a = hold_meta_row(f.dsn());
     auto refused = EnablementStore::boot(short_pool, make_overlay(), kH1, kinds(), f.anchor(), nullptr);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("continuity") != std::string::npos);
@@ -1306,13 +1359,7 @@ TEST_CASE("EnablementStore: a declared regression does not stop the server booti
     EnablementPg f;
     const auto meta = f.store->get_meta();
     REQUIRE(meta.has_value());
-    fs::create_directories(f.dir.path);
-    {
-        // The anchor is ahead of the store: a dump restored behind it.
-        std::ofstream out(f.anchor(), std::ios::binary | std::ios::trunc);
-        out << en::render_anchor({meta->store_id, meta->epoch, meta->counter + 10});
-    }
-    REQUIRE(fs::exists(f.anchor())); // an unwritable fixture would read as a MISSING anchor
+    write_anchor_ahead(f, *meta); // a dump restored behind the anchor
     auto booted = EnablementStore::boot(f.pool(), make_overlay(), kH1, kinds(), f.anchor(), &f.metrics);
     // A regression is a fact the store declares and /readyz reports, not a startup refusal.
     REQUIRE(booted.has_value());

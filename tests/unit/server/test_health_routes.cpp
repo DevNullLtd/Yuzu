@@ -531,35 +531,26 @@ TEST_CASE("health_routes: GET /readyz carries exactly one `enablement` object wi
         CHECK(e["report_ahead"] == false);
     }
     SECTION("all three at once are all visible, and none changes the verdict") {
-        // The verdict is derived solely from `failed_stores`, so the gate's INPUT is what
-        // is pinned: with the store closed the body is "not ready" in every case, and a
-        // regression, an unwitnessed anchor or report-ahead endpoints must add NO entry to
-        // `failed_stores` (a new gating row for any of them would). Residual: a mutant that
-        // folded a regression into the existing `enablement_store` row is only
-        // distinguishable with an OPEN store, i.e. on the Postgres surface.
+        // The verdict is derived solely from `failed_stores`, so that is what is pinned: with the
+        // store closed the body is "not ready" in every case and none of these states may add an
+        // entry. Residual: a mutant folding a regression into the `enablement_store` row needs an
+        // OPEN store to tell apart (the Postgres surface).
         const auto quiet = json::parse(fetch());
         const auto baseline = quiet["failed_stores"];
         const auto baseline_status = quiet["status"];
         REQUIRE(baseline.is_array());
         CHECK(baseline_status == "not ready");
 
-        EnablementStore::RegressionState regressed;
-        regressed.regressed = true;
-        regressed.reason = "store_behind";
-        EnablementStore::RegressionState unwitnessed;
-        unwitnessed.anchor_unwitnessed = true;
-        EnablementStore::RegressionState ahead;
-        ahead.report_ahead_endpoints = 3;
-        EnablementStore::RegressionState all = regressed;
-        all.anchor_unwitnessed = true;
-        all.report_ahead_endpoints = 3;
-
         for (const auto& [label, st] :
              std::vector<std::pair<const char*, EnablementStore::RegressionState>>{
-                 {"regressed alone", regressed},
-                 {"unwitnessed alone", unwitnessed},
-                 {"report-ahead alone", ahead},
-                 {"all three", all}}) {
+                 {"regressed alone", {.regressed = true, .reason = "store_behind"}},
+                 {"unwitnessed alone", {.anchor_unwitnessed = true}},
+                 {"report-ahead alone", {.report_ahead_endpoints = 3}},
+                 {"all three",
+                  {.regressed = true,
+                   .reason = "store_behind",
+                   .anchor_unwitnessed = true,
+                   .report_ahead_endpoints = 3}}}) {
             INFO(label);
             closed.store.set_regression_state_for_test(st);
             const auto raw = fetch();

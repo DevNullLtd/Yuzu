@@ -267,8 +267,10 @@ release (ADR-3006 D10/D14).
 - **`record_report` is one conditional `UPDATE`.** The `CASE` that clears `pending_since` and the
   `WHERE` that suppresses a duplicate are evaluated against the row's current version under its
   row lock, so a report equal to the PREVIOUS desired state never clears `pending_since` for a
-  state issued in between. A report above the store's highest `(epoch, counter)` is flagged
-  (`report_ahead`) and counted, never declared here.
+  state issued in between. An exact acknowledgement clears `pending_since`; a report BEHIND the
+  row's issued `(epoch, counter)` reopens it (keeping the original age while still pending), so
+  pending-with-age holds whenever the endpoint is behind. A report above the store's highest
+  `(epoch, counter)` is flagged (`report_ahead`) and counted, never declared here.
 - **The epoch fence at the batch write.** `(epoch, counter)` is issued only inside
   `set_desired_batch`, by the leader. Its first data statement is one `UPDATE` of the meta row
   that reserves the counter range, requires `regressed_at IS NULL` and embeds
@@ -291,8 +293,9 @@ release (ADR-3006 D10/D14).
   dump restored under a running server). The contents are fsynced before the rename, so a crash can
   never leave a torn anchor (which would read as a false regression); the directory entry is
   best-effort, so a crash right after the rename may leave the previous anchor, which is at or
-  below the store (Ok on restart). A crash between a batch commit and the anchor write leaves the
-  file below the store, also Ok.
+  below the store (Ok on restart). This change writes the anchor on an unwitnessed boot and never
+  lowers it; rewriting it after each batch arrives with the resolver job, and a crash between a
+  batch commit and that write leaves the file below the store, also Ok.
 - **Overlay changes.** A release that changes the unit overlay (a unit, its OS bits or a
   requirement edge) bumps `rules_version` at boot (`sync_overlay_hash`), so every row becomes stale.
 - **The loader's two duties** (`make_persisted_rule`, `enablement_resolver.hpp`): a rule refused at

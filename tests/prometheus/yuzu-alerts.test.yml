@@ -3815,12 +3815,7 @@ tests:
 
   # ── YuzuEnablementRegressed / YuzuEnablementRulesRejected (ADR-3006) ──────
   #
-  # The enablement store's two alerts that carry a threshold or a duration. A
-  # regression freezes desired-state issuing, so the critical rule must (a) fire
-  # once the gauge has been held past for: 5m, (b) stay quiet on a blip shorter
-  # than that, and (c) resolve when the declaration is cleared. A rule loader that
-  # refuses a persisted rule must page on a RISE of the counter and stay quiet on a
-  # flat one, which is the zero-seeded healthy shape.
+  # The enablement store's two alerts that carry a threshold or a duration.
 
   # CASE: a held regression fires, a short blip does not, and a cleared one resolves.
   # s1 is regressed from minute 3 to 23 (fires once held 5m, i.e. from minute 8);
