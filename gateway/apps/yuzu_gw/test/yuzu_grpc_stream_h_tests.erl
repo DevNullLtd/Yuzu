@@ -971,7 +971,7 @@ in_conn(Fun) ->
 %% linked. unlink/1 comes first: once it has returned, that link can never
 %% deliver an exit signal to the test process, whenever the handler dies.
 stop_handlers(Linked, Reported) ->
-    Pids = lists:usort((links() -- Linked) ++ Reported),
+    Pids = lists:usort([P || P <- (links() -- Linked) ++ Reported, is_pid(P)]),
     Monitors = [begin
                     Ref = erlang:monitor(process, P),
                     true = unlink(P),
