@@ -75,10 +75,20 @@ def cd_target(command):
     (`$VAR`, a substitution, `cd -`, an option), or a subshell `(...)` or an
     `||` before the `gh` (whether the cd applies depends on how it ran). The
     caller then falls back to the starting directory rather than guessing."""
-    toks, target = _tokens(command), None
+    toks, target, subst = _tokens(command), None, 0
     for i, tok in enumerate(toks):
-        if _is_separator(tok) and ("(" in tok or ")" in tok or "||" in tok):
-            return None
+        if _is_separator(tok):
+            # `$(` opens a command substitution, not a subshell: it does not
+            # change the directory the next command runs in, so skip it.
+            if tok.startswith("(") and i and toks[i - 1].endswith("$"):
+                subst += tok.count("(")
+                continue
+            if subst and tok.startswith(")"):
+                subst -= 1
+                if "(" not in tok and "||" not in tok:
+                    continue
+            if "(" in tok or ")" in tok or "||" in tok:
+                return None
         start = i == 0 or _is_separator(toks[i - 1])
         if start and toks[i:i + 3] == ["gh", "pr", "create"]:
             return target

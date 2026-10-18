@@ -587,7 +587,7 @@ def main(argv):
         root, argv = Path(argv[1]).resolve(), argv[2:]
     if not argv:
         return run_facts(root)
-    if argv[0] == "--list":
+    if argv == ["--list"]:
         for cat, items in current_drift(root).items():
             for i in items:
                 print(f"{cat}\t{i}")
@@ -599,7 +599,7 @@ def main(argv):
         return write_baseline(root / BASELINE_REL, current_drift(root), "--allow-growth" in argv[1:])
     if argv[0] == "--touch" and len(argv) in (3, 4):
         return run_touch(argv[1], argv[2], argv[3] if len(argv) == 4 else None, root)
-    print(__doc__.split("Usage:", 1)[1].split("Exit:", 1)[0], file=sys.stderr)
+    print("usage:" + __doc__.split("Usage", 1)[1].split("Exit:", 1)[0], file=sys.stderr)
     return 2
 
 

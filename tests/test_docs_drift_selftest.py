@@ -628,6 +628,10 @@ class RootIsData(unittest.TestCase):
             self.assertEqual(d.run_facts(Path(tmp)), 1)  # empty tree: fails closed
             self.assertFalse((planted / "EXECUTED").exists())
 
+    def test_bad_invocations_are_usage_errors(self):
+        for argv in (["--bogus"], ["--touch"], ["--touch", "a"], ["--list", "--nope"]):
+            self.assertEqual(d.main(argv), 2, argv)
+
     def test_root_flag_checks_the_named_tree(self):
         self.assertEqual(d.main(["--root", str(ROOT)]), 0)
         with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
@@ -657,6 +661,8 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.cd_target("cd a; cd b && gh pr create"), os.path.join("a", "b"))
         self.assertEqual(hook.cd_target("cd /abs && gh pr create"), "/abs")
         self.assertEqual(hook.cd_target("cd ~/wt && gh pr create"), os.path.expanduser("~/wt"))
+        self.assertEqual(hook.cd_target("cd wt && BR=$(git branch --show-current) && gh pr create"), "wt")
+        self.assertEqual(hook.cd_target('cd wt && gh pr create --body "$(cat b.md)"'), "wt")
         for unresolvable in ('cd "$WT" && gh pr create', "cd - && gh pr create",
                              "cd -P x && gh pr create", "cd `pwd` && gh pr create",
                              "(cd x) && gh pr create", "(cd x && true); gh pr create",
