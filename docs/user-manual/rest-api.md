@@ -10730,7 +10730,7 @@ empty queue — rather than a `503`; prefer `GET /api/v1/approvals/pending/count
 
 #### `GET /fragments/approvals`
 
-HTML fragment behind the Instructions Approvals tab and the Approvals page (`/approvals`). Requires `Approval:Read`. `view=page` renders the page list (pending by default); `status` is one of `pending`, `approved`, `rejected`, `expired`, and an empty value means every status. An unknown `status` answers `200` with a `data-invalid="status"` note, a failed store read answers `200` with `data-degraded="store"`, and a refused caller gets `200` with `data-denied="true"` (the dashboard drops `4xx` bodies). The page view lists the 100 most recent rows and marks a cut list with `data-truncated="1"`.
+HTML fragment behind the Instructions Approvals tab and the Approvals page (`/approvals`). Requires `Approval:Read`. `view=page` renders the page list (pending by default); `status` is one of `pending`, `approved`, `rejected`, `expired`, and an empty value means every status. An unknown `status` answers `200` with a `data-invalid="status"` note, a failed store read answers `200` with `data-degraded="store"`, and a refused caller gets `200` with `data-denied="true"` (the dashboard drops `4xx` bodies). The page view lists the 100 most recent rows and marks a cut list with `data-truncated="1"`. On the page view, Approve and Reject buttons render only for a session that passes the approver class check (an interactive, human, non-engine session), holds `Approval:Approve`, and sees at least one pending request that it did not submit itself; they are a render hint, and `POST /api/approvals/{id}/approve|reject` re-checks everything.
 
 #### `POST /api/approvals/{id}/approve`
 
@@ -10748,9 +10748,9 @@ Approve a pending instruction execution. `comment` is capped at 4,000 bytes; a l
 | `403` | A4 envelope, message `approver_assurance_required:<reason>` | Class refusal. `<reason>` is `non_interactive_session` (API-token, MCP-token or any other non-cookie session), `engine_principal` or `non_human_principal`. Audited as `approval.approve` / `approval.reject` with `result=denied` and `detail=approver_assurance:<reason>` (best effort). |
 | `503` | `{"error":{"code":503,"message":"service unavailable"}}` | The approval store is not available. |
 | `503` | A4 envelope | MFA step-up is not wired (fail closed); the decision was not recorded. |
-| `401` | step-up envelope, `meta.mfa_step_up_required: true`, `meta.challenge_url` | The session's MFA proof is older than `--mfa-step-up-window-secs`. Complete the step-up and retry. |
 | `403` | step-up envelope, message `MFA step-up is not available for SAML sessions in this release` | A SAML session while step-up is on (#4935). |
-| `503` | A4 envelope, message `authentication store is temporarily unavailable` | The step-up gate could not read the account's MFA status; it fails closed. |
+| `503` | A4 envelope, message `authentication store is temporarily unavailable` | The step-up gate could not read the account's MFA status; it fails closed (a local account's status read can also answer a `401` whose remediation reads `auth_db unavailable`). |
+| `401` | step-up envelope, `meta.mfa_step_up_required: true`, `meta.challenge_url` | The session's MFA proof is older than `--mfa-step-up-window-secs`. Complete the step-up and retry. |
 | `503` | A4 envelope, header `Sec-Audit-Failed: true`, `retry_after_ms: 5000` | The `attempted` audit row could not be written, so the decision was not applied and the ticket stays pending (#5823). |
 | `400` | `{"error":"<reason>"}` | The store refused the decision, for example the reviewer is the submitter, or the ticket is no longer pending. Audited as `denied`. |
 
