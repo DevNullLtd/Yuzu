@@ -57,8 +57,9 @@ in with a local account or OIDC. Scripts that approve with a session cookie must
 
 **If you set `--mfa-step-up-window-secs=0`,** approval loses its MFA requirement and is protected by the
 interactive-session rule only. Review every `approval.approve` audit row with `result=success` if you run
-that way. Each decision also writes a `result=attempted` row first, so do not count both (see
-[Audit Log](audit-log.md)).
+that way, and reconcile them against the `attempted` rows. Each decision also writes a `result=attempted` row
+first, so do not count both, and a decision whose outcome row failed to write leaves only the `attempted` row
+(see [Audit Log](audit-log.md)).
 
 **Find affected automation before you upgrade.** Nothing is listed for you, so search the audit log for
 callers that approved or rejected without a signed-in browser session.
