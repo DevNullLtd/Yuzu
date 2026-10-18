@@ -80,9 +80,14 @@ not run passes.
 (`approval.approve` / `approval.reject`, `result=attempted`) is written before the decision: if
 it cannot be stored the route returns `503` with `Sec-Audit-Failed: true`, nothing is applied and
 the request stays pending. The outcome row (`result=success` or `result=denied`) is best effort:
-if only it fails, the response carries no `Sec-Audit-Failed` header and the counter above is the only
-trace. A lost `success` row means the decision was applied; a lost `denied` row means the store
-refused it and the request is still pending. After an incident, find every approval ticket that has
+if only it fails, the response carries no `Sec-Audit-Failed` header and the counter above is the alert
+signal (it is not the only trace: on a connection-pool timeout or an INSERT error the server log also
+carries an `AuditStore::log` error line naming the action and saying the event was lost; a closed audit
+store logs nothing there). A lost `success` row means the decision was applied; a lost `denied` row
+means the store refused the decision, so this request applied nothing and the ticket keeps its prior
+state. That is usually still pending, but the store also refuses a ticket that was already reviewed or
+does not exist, and an update failure cannot prove the update did not commit, so read the ticket's
+real status rather than assuming it is pending. After an incident, find every approval ticket that has
 more `attempted` rows than outcome rows and check that approval's status (the Approvals page, or
 `GET /api/v1/approvals/{id}`) before trusting the audit trail. Compare COUNTS per `target_id`, not
 the mere presence of an outcome row: a ticket can carry several `attempted` rows (a refused attempt,
