@@ -969,7 +969,17 @@ public:
         service_scope_global_safe_override_for_test_ = std::move(table);
     }
 
+    /// Run `fn` in `/auth/callback` right after the FIRST provider-replaced check passes and
+    /// before any group, role or session work, so a test can land a Settings-save swap exactly
+    /// in the span the SECOND check (made after the session is minted) exists to cover. Test-only
+    /// seam, same shape as `set_mfa_pending_cap_for_test`; never set in production.
+    void set_after_first_provider_check_for_test(std::function<void()> fn) {
+        after_first_provider_check_for_test_ = std::move(fn);
+    }
+
 private:
+    std::function<void()> after_first_provider_check_for_test_;
+
     /// Whether `(securable_type, operation)` clears the service-scope
     /// default-deny gate: the test override if one is set, else the real
     /// `authz::kServiceScopeGlobalSafe` table via

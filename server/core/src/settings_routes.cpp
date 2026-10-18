@@ -28,6 +28,7 @@
 #include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
+#include "oidc_writer_gate.hpp" // writer priority for the OIDC lock (#5692 UP-13)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
@@ -2603,7 +2604,23 @@ std::string SettingsRoutes::render_nvd_fragment() {
 std::string SettingsRoutes::render_directory_fragment() {
     std::string html;
 
-    bool oidc_configured = !cfg_->oidc_issuer.empty() && !cfg_->oidc_client_id.empty();
+    // A Settings save assigns these under the exclusive OIDC lock; read them under the shared
+    // one so a page render never overlaps a save's writes (the callers hold neither lock).
+    std::string snap_issuer, snap_client_id, snap_redirect_uri, snap_admin_group;
+    bool snap_secret_set = false; // the secret itself is never copied into this render
+    bool snap_skip_tls_verify = false;
+    {
+        yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+        std::shared_lock oidc_lock(*oidc_mu_);
+        snap_issuer = cfg_->oidc_issuer;
+        snap_client_id = cfg_->oidc_client_id;
+        snap_secret_set = !cfg_->oidc_client_secret.empty();
+        snap_redirect_uri = cfg_->oidc_redirect_uri;
+        snap_admin_group = cfg_->oidc_admin_group;
+        snap_skip_tls_verify = cfg_->oidc_skip_tls_verify;
+    }
+
+    bool oidc_configured = !snap_issuer.empty() && !snap_client_id.empty();
 
     if (oidc_configured) {
         html += "<div style=\"margin-bottom:1rem\">"
@@ -2622,9 +2639,9 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <label>Issuer URL</label>"
             "  <input type=\"text\" name=\"issuer\" "
             "value=\"" +
-            html_escape(cfg_->oidc_issuer) +
+            html_escape(snap_issuer) +
             "\" "
-            "placeholder=\"https://login.microsoftonline.com/{tenant}/v2.0\" "
+            "placeholder=\"https://login.microsoftonline.com/&lt;tenant-guid&gt;/v2.0\" "
             "style=\"flex:1;min-width:0\">"
             "</div>";
 
@@ -2632,7 +2649,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <label>Client ID</label>"
             "  <input type=\"text\" name=\"client_id\" "
             "value=\"" +
-            html_escape(cfg_->oidc_client_id) +
+            html_escape(snap_client_id) +
             "\" "
             "placeholder=\"Application (client) ID from Azure portal\" "
             "style=\"flex:1;min-width:0\">"
@@ -2643,7 +2660,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <input type=\"password\" name=\"client_secret\" "
             "value=\"\" "
             "placeholder=\"" +
-            (cfg_->oidc_client_secret.empty() ? std::string("Client secret value")
+            (!snap_secret_set ? std::string("Client secret value")
                                               : std::string("********")) +
             "\" "
             "style=\"flex:1;min-width:0\">"
@@ -2653,9 +2670,10 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <label>Redirect URI</label>"
             "  <input type=\"text\" name=\"redirect_uri\" "
             "value=\"" +
-            html_escape(cfg_->oidc_redirect_uri) +
+            html_escape(snap_redirect_uri) +
             "\" "
-            "placeholder=\"(auto-computed from web address)\" "
+            "placeholder=\"Required: https://&lt;server&gt;/auth/callback, exactly as registered "
+            "at the IdP\" "
             "style=\"flex:1;min-width:0\">"
             "</div>";
 
@@ -2663,13 +2681,13 @@ std::string SettingsRoutes::render_directory_fragment() {
             "  <label>Admin Group ID</label>"
             "  <input type=\"text\" name=\"admin_group\" "
             "value=\"" +
-            html_escape(cfg_->oidc_admin_group) +
+            html_escape(snap_admin_group) +
             "\" "
             "placeholder=\"Entra group object ID for admin role mapping\" "
             "style=\"flex:1;min-width:0\">"
             "</div>";
 
-    std::string tls_checked = cfg_->oidc_skip_tls_verify ? " checked" : "";
+    std::string tls_checked = snap_skip_tls_verify ? " checked" : "";
     html += "<div class=\"form-row\">"
             "  <label>Skip TLS Verify</label>"
             "  <label class=\"toggle\">"
@@ -4239,14 +4257,67 @@ void SettingsRoutes::register_routes(
         auto admin_group = extract_form_value(req.body, "admin_group");
         auto skip_tls_verify = extract_form_value(req.body, "skip_tls_verify");
 
+        // The dashboard's htmx config does not swap a 4xx body (see the 503 branch of the DEX
+        // routing save), so each refusal below also carries a toast: without it Save would show
+        // nothing and nothing would be stored.
         if (issuer.empty() || client_id.empty()) {
             res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Issuer URL and Client ID are required","level":"error"}})");
             auto html = render_directory_fragment() +
                         "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
                         "hx-swap-oob=\"true\">Issuer URL and Client ID are required.</div>";
             res.set_content(html, "text/html; charset=utf-8");
             return;
         }
+        // A provider without a redirect_uri never fetches discovery and /auth/oidc/start answers
+        // 500, so a blank value is a configuration that cannot sign in: refuse it here rather than
+        // report a saved one. (Only the startup flag path fills in a localhost default.)
+        if (redirect_uri.find_first_not_of(" \t\r\n") == std::string::npos) {
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Redirect URI is required: enter the callback URL registered at the IdP","level":"error"}})");
+            auto html = render_directory_fragment() +
+                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
+                        "hx-swap-oob=\"true\">Redirect URI is required: enter the callback URL "
+                        "registered at the IdP (https://&lt;server&gt;/auth/callback).</div>";
+            res.set_content(html, "text/html; charset=utf-8");
+            return;
+        }
+
+        // Retirement of the provider this save replaces. Declared BEFORE the save lock below so
+        // that, destroyed in reverse order, it runs AFTER the lock is released: a retire() that
+        // has to wait (more than kMaxRetired providers each still in a request) then delays only
+        // this reply, never another save's read-modify-write.
+        struct RetireOnExit {
+            std::unique_ptr<oidc::OidcProvider> unpublished;
+            ~RetireOnExit() {
+                // retire() can throw (allocation, a mutex failure) and a destructor is
+                // implicitly noexcept, so an escaping exception would terminate the server. The
+                // provider is owned either by retire()'s by-value parameter (destroyed on
+                // unwind, which waits for its leases and never leaks) or by the retirement list,
+                // so swallowing here cannot lose or double-free it.
+                try {
+                    oidc::OidcProvider::retire(std::move(unpublished));
+                } catch (const std::exception& e) {
+                    // Nothing was lost, but the retirement bound did not run: say so.
+                    try {
+                        spdlog::error("OIDC settings save: retiring the replaced provider failed "
+                                      "({}); the provider is destroyed or kept on the list, "
+                                      "never lost",
+                                      e.what());
+                    } catch (...) {
+                    }
+                } catch (...) {
+                }
+            }
+        } retire_on_exit;
+
+        // One save at a time. Reading the stored secret ("leave it alone" when the field is
+        // blank), building the provider, swapping it in and persisting are one unit: two
+        // interleaved saves could otherwise leave the live provider on one secret and the store
+        // on another, both reporting success. Sign-ins never take this mutex.
+        std::lock_guard save_lock(oidc_save_mu_);
 
         // The redaction placeholder is not a credential. It reaches this handler when an
         // operator copies it out of the startup log or a config.update audit detail -- the
@@ -4268,7 +4339,14 @@ void SettingsRoutes::register_routes(
         // one, and it covers every other caller (PUT /api/config included).
         if (is_exactly_redaction_placeholder(client_secret))
             client_secret.clear();
-        auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
+        std::string stored_secret;
+        {
+            // No writer-gate pass here: this thread holds `oidc_save_mu_`, and only the holder of
+            // that mutex ever raises a ticket, so none can be outstanding.
+            std::shared_lock oidc_lock(*oidc_mu_);
+            stored_secret = cfg_->oidc_client_secret;
+        }
+        auto effective_secret = client_secret.empty() ? stored_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
 
         std::unique_ptr<oidc::OidcProvider> new_provider;
@@ -4280,6 +4358,14 @@ void SettingsRoutes::register_routes(
             oidc_cfg.redirect_uri = redirect_uri;
             oidc_cfg.admin_group_id = admin_group;
             oidc_cfg.skip_tls_verify = skip_tls;
+            // OS-level egress switch: copied from the server config, never from the request.
+            oidc_cfg.allow_private_networks = cfg_->oidc_allow_private_networks;
+            // Same for the NAT64 declaration (--oidc-nat64-prefix); validated at startup, so an
+            // unparsable value here can only mean a Config built outside main.cpp: fail closed.
+            if (auto prefixes = oidc::egress::parse_nat64_prefix_list(cfg_->oidc_nat64_prefixes))
+                oidc_cfg.nat64_prefixes = std::move(*prefixes);
+            else
+                throw std::runtime_error("the server's --oidc-nat64-prefix value is invalid");
             // ADR-2001 §1 gap (Task 2 follow-up): this hot-reload path builds its
             // own local OidcConfig and previously left scim_link_claim at its
             // struct default ("sub"), silently reverting an operator's
@@ -4292,25 +4378,13 @@ void SettingsRoutes::register_routes(
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
 
-            auto v2_pos = issuer.rfind("/v2.0");
-            if (v2_pos != std::string::npos) {
-                auto base = issuer.substr(0, v2_pos);
-                oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
-                oidc_cfg.token_endpoint = base + "/oauth2/v2.0/token";
-            } else {
-                oidc_cfg.authorization_endpoint = issuer + "/authorize";
-                oidc_cfg.token_endpoint = issuer + "/token";
-            }
-
-            auto src_script =
-                std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
-            if (std::filesystem::exists(src_script))
-                oidc_cfg.exchange_script = src_script.string();
-
             new_provider = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         } catch (const std::exception& e) {
             spdlog::error("OIDC provider reinit failed: {}", e.what());
             res.status = 500;
+            // htmx swaps neither 4xx nor 5xx, so a toast is the only thing the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"OIDC provider could not be initialised; see the server log","level":"error"}})");
             auto html = render_directory_fragment() +
                         "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
                         "hx-swap-oob=\"true\">OIDC init failed: " +
@@ -4319,14 +4393,25 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // The swap holds the exclusive lock only for these assignments: sign-ins keep the
+        // provider they started with through a lease and run their network I/O without the
+        // lock, so this does not wait for them. The unpublished provider goes to
+        // `retire_on_exit` (declared above, before the save lock), so it is retired when this
+        // handler exits, after the settings are persisted and the response is built and after
+        // the save lock is released; it is destroyed by the first later retirement or drain once
+        // its last in-flight request has finished (releasing the last lease does not destroy it).
         {
+            // Writer priority (UP-13): readers wait at the gate while this save asks for the lock.
+            yuzu::server::oidc::OidcWriterGate::Ticket writer_ticket;
             std::unique_lock lock(*oidc_mu_);
+            writer_ticket.release(); // owned: readers may queue on the lock again
             cfg_->oidc_issuer = issuer;
             cfg_->oidc_client_id = client_id;
             cfg_->oidc_client_secret = effective_secret;
             cfg_->oidc_redirect_uri = redirect_uri;
             cfg_->oidc_admin_group = admin_group;
             cfg_->oidc_skip_tls_verify = skip_tls;
+            retire_on_exit.unpublished = std::move(*oidc_provider_);
             *oidc_provider_ = std::move(new_provider);
         }
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
@@ -4408,10 +4493,24 @@ void SettingsRoutes::register_routes(
 
         auto issuer = extract_form_value(req.body, "issuer");
         auto skip_tls_str = extract_form_value(req.body, "skip_tls_verify");
-        bool skip_tls = (skip_tls_str == "true") || cfg_->oidc_skip_tls_verify;
+        // Copy the two saved values under the shared lock (a save writes them under the unique
+        // lock); the network I/O below runs without it.
+        bool saved_skip_tls = false;
+        bool allow_private = false; // OS-level egress switch; never read from the form
+        std::string nat64_text;     // OS-level NAT64 declaration; never read from the form
+        std::string saved_issuer;
+        {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+            std::shared_lock lock(*oidc_mu_);
+            saved_skip_tls = cfg_->oidc_skip_tls_verify;
+            allow_private = cfg_->oidc_allow_private_networks;
+            nat64_text = cfg_->oidc_nat64_prefixes;
+            saved_issuer = cfg_->oidc_issuer;
+        }
+        bool skip_tls = (skip_tls_str == "true") || saved_skip_tls;
 
         if (issuer.empty())
-            issuer = cfg_->oidc_issuer;
+            issuer = std::move(saved_issuer);
 
         if (issuer.empty()) {
             res.set_content("<span class=\"feedback-error\">Enter an Issuer URL first.</span>",
@@ -4419,86 +4518,43 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto discovery_url = issuer;
-        if (!discovery_url.ends_with("/"))
-            discovery_url += "/";
-        discovery_url += ".well-known/openid-configuration";
-
         audit_fn_(req, "oidc.test", "attempt", "OidcConfig", issuer, "");
 
-        try {
-            std::string url = discovery_url;
-            std::string scheme;
-            if (url.starts_with("https://")) {
-                scheme = "https://";
-                url = url.substr(8);
-            } else if (url.starts_with("http://")) {
-                scheme = "http://";
-                url = url.substr(7);
-            } else {
-                res.set_content("<span class=\"feedback-error\">Invalid issuer URL scheme (must be "
-                                "http or https).</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            auto slash = url.find('/');
-            auto host = (slash != std::string::npos) ? url.substr(0, slash) : url;
-            auto path = (slash != std::string::npos) ? url.substr(slash) : "/";
-
-            auto client = std::make_unique<httplib::Client>(scheme + host);
-            client->set_connection_timeout(10);
-            client->set_read_timeout(10);
-            client->set_write_timeout(10);
-            client->enable_server_certificate_verification(!skip_tls);
-
-            auto result = client->Get(path);
-
-            int status_code = result ? result->status : 0;
-            std::string body_copy = result ? result->body : "";
-            std::string err_str = result ? "" : httplib::to_string(result.error());
-            client.reset();
-
-            if (status_code == 200) {
-                auto j = nlohmann::json::parse(body_copy);
-                std::string auth_ep = j.value("authorization_endpoint", "");
-                std::string token_ep = j.value("token_endpoint", "");
-                if (!auth_ep.empty() && !token_ep.empty()) {
-                    res.set_content(
-                        "<span class=\"feedback-ok\">"
-                        "Connected &#x2014; discovered authorization and token endpoints</span>",
-                        "text/html; charset=utf-8");
-                } else {
-                    res.set_content(
-                        "<span class=\"feedback-error\">"
-                        "Discovery succeeded but missing authorization/token endpoints.</span>",
-                        "text/html; charset=utf-8");
-                }
-            } else if (status_code == 0) {
-                res.set_content(
-                    "<span class=\"feedback-error\">"
-                    "Discovery failed: " +
-                        html_escape(err_str) + "</span>",
-                    "text/html; charset=utf-8");
-            } else {
-                res.set_content(
-                    "<span class=\"feedback-error\">"
-                    "Discovery failed: HTTP " +
-                        std::to_string(status_code) + "</span>",
-                    "text/html; charset=utf-8");
-            }
-        } catch (const nlohmann::json::exception& e) {
-            res.set_content(
-                "<span class=\"feedback-error\">"
-                "Discovery response is not valid JSON: " +
-                    html_escape(e.what()) + "</span>",
-                "text/html; charset=utf-8");
-        } catch (const std::exception& e) {
-            res.set_content(
-                "<span class=\"feedback-error\">"
-                "Discovery failed: " +
-                    html_escape(e.what()) + "</span>",
-                "text/html; charset=utf-8");
+        // The login's own path: the same bounded GET and the same document validation
+        // (issuer match, absolute endpoints on the issuer's scheme) a login applies.
+        const auto fail = [&res](const std::string& what) {
+            res.set_content("<span class=\"feedback-error\">" + html_escape(what) + "</span>",
+                            "text/html; charset=utf-8");
+        };
+        const auto nat64 = oidc::egress::parse_nat64_prefix_list(nat64_text);
+        if (!nat64) {
+            fail("The server's --oidc-nat64-prefix value is invalid; fix it and restart.");
+            return;
         }
+        auto doc = oidc::OidcProvider::fetch_discovery_document(
+            issuer, skip_tls, allow_private, oidc::OidcProvider::kHttpOperationTimeoutMs, *nat64);
+        if (!doc) {
+            fail("Discovery failed: " + doc.error());
+            return;
+        }
+        auto jwks_body = oidc::OidcProvider::http_get_bounded(
+            doc->jwks_uri, skip_tls, allow_private, oidc::OidcProvider::kHttpOperationTimeoutMs,
+            *nat64);
+        if (!jwks_body) {
+            fail("Discovery succeeded but the JWKS could not be fetched: " + jwks_body.error());
+            return;
+        }
+        auto keys = oidc::OidcProvider::parse_jwks(*jwks_body);
+        if (!keys || keys->empty()) {
+            fail("Discovery succeeded but the JWKS has no usable signing keys" +
+                 (keys ? std::string{} : ": " + keys.error()));
+            return;
+        }
+        res.set_content("<span class=\"feedback-ok\">"
+                        "Connected &#x2014; discovered authorization, token and JWKS endpoints; " +
+                            std::to_string(keys->size()) + " signing key" +
+                            (keys->size() == 1 ? "" : "s") + "</span>",
+                        "text/html; charset=utf-8");
     });
 
     // -- Settings API: User management (admin only, HTMX) ----------------------
