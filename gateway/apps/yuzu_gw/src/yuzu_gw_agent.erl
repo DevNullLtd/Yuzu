@@ -263,7 +263,10 @@ init(#{owner_key := Key} = Start) ->
             init_owner(Args#{registered_ack => maps:get(registered_ack, Start, undefined)},
                        Key, Home);
         {ok, #{pid := Predecessor}} ->
-            ok = yuzu_gw_agent_sup:owner_set(Key, [{pid, self()}]),
+            %% The row keeps naming the predecessor until recover/3 takes it
+            %% over (in one row update with the announced state): until then
+            %% the stream still delivers to the predecessor, and heartbeat
+            %% admission reads a dead owner as "being restarted".
             {ok, recovering, {recover, Key, Predecessor}, [{next_event, internal, recover}]};
         none ->
             {ok, recovering, {recover, Key, undefined}, [{next_event, internal, recover}]}
@@ -415,15 +418,17 @@ recover(Key, Predecessor, #{args := Args, home := Home, announced := Announced,
                             restarts := Restarts0, connected_at := ConnectedAt}) ->
     Now = erlang:monotonic_time(millisecond),
     Restarts = [T || T <- Restarts0, Now - T < ?RESTART_WINDOW_MS] ++ [Now],
-    ok = yuzu_gw_agent_sup:owner_set(Key, [{restarts, Restarts}]),
     Data = restored_data(Args, Key, Home, ConnectedAt),
-    case Announced of
-        A when A =:= connected; A =:= ending ->
-            ok = yuzu_gw_agent_sup:owner_set(Key, [{announced, disconnected}]),
-            announce_disconnected(Data, owner_crashed);
-        _ ->
-            ok
-    end,
+    %% One row update: this process becomes the row's owner and, if the
+    %% predecessor's last notice was CONNECTED, the row says DISCONNECTED
+    %% (cast next). Heartbeat admission (yuzu_gw_agent_sup:held_session/1)
+    %% admits a session whose row names a dead owner or is `disconnected'
+    %% (being recovered), so the agent's heartbeats are admitted throughout.
+    SendDisconnected = Announced =:= connected orelse Announced =:= ending,
+    ok = yuzu_gw_agent_sup:owner_set(
+           Key, [{restarts, Restarts}, {pid, self()}]
+                ++ [{announced, disconnected} || SendDisconnected]),
+    SendDisconnected andalso announce_disconnected(Data, owner_crashed),
     if
         Announced =:= none; Announced =:= ending ->
             %% Never announced (it died registering; its caller has answered the
@@ -448,7 +453,7 @@ try_recover(Predecessor, #data{agent_id = AgentId, stream_pid = StreamPid} = Dat
                                          [{announced, connected},
                                           {connected_at, Recovered#data.connected_at}]),
         Next = announce_connected(Recovered),
-        emit_owner_restart(recovered),
+        emit_owner_restart(AgentId, recovered, none),
         logger:info("Agent ~s: owner process restarted; session recovered on the same stream",
                     [yuzu_gw_env:log_text(AgentId)]),
         {next_state, Next, Recovered}
@@ -476,7 +481,7 @@ give_up(#data{agent_id = AgentId, session_id = SessionId, stream_pid = StreamPid
         undefined -> ok;
         _         -> StreamPid ! close_stream
     end,
-    emit_owner_restart(Outcome),
+    emit_owner_restart(AgentId, Outcome, Why),
     case Outcome of
         gave_up ->
             logger:warning("Agent ~s: owner process restarted more than ~b times in ~b s; "
@@ -594,8 +599,11 @@ restored_data(#{agent_id := AgentId, agent_info := AgentInfo, peer_addr := PeerA
           stream_home_id = Home,
           owner_key    = Key}.
 
-emit_owner_restart(Outcome) ->
-    telemetry:execute([yuzu, gw, agent, owner_restart], #{count => 1}, #{outcome => Outcome}).
+%% The agent id and the reason ride in the metadata for tracing only (the
+%% metric is labelled by outcome alone).
+emit_owner_restart(AgentId, Outcome, Why) ->
+    telemetry:execute([yuzu, gw, agent, owner_restart], #{count => 1},
+                      #{outcome => Outcome, agent_id => AgentId, why => Why}).
 
 %%--------------------------------------------------------------------
 %% State: connecting — waiting for subscribe handler pid

@@ -302,7 +302,11 @@ that session's `Subscribe` stream. A session that has registered but not yet
 subscribed is held to the connection that sent its `Register`. The check reads
 node-local state only: a session held by another gateway node is not admitted here,
 and the decision does not depend on what the server currently knows about the
-session.
+session. A session whose agent process died and is being restarted to recover it
+stays held, on the same connection, until the restarted process registers it again
+or ends it (see [When an agent's owner process crashes](#when-an-agents-owner-process-crashes)):
+a rejection there would make the agent drop the stream being recovered, and the
+released agents listed below can wedge on it.
 
 A heartbeat that does not meet both conditions is answered with gRPC `NOT_FOUND`
 (`unknown session`), counted, and not buffered or forwarded. The answer is the same
@@ -4352,6 +4356,21 @@ avoid it (#5695):
    newer session meanwhile, the server is unreachable, the server answers that
    another session holds the agent), the owner closes the stream and ends after
    the `DISCONNECTED`: the agent reconnects by itself.
+
+   The agent's heartbeats stay admitted, on the connection the session is bound
+   to, from the owner's death until the restarted owner has registered the
+   session again or ended it. The registry drops a dead owner's session at
+   once, and the restarted owner registers it again only after the
+   `DISCONNECTED` has settled, which with hundreds of owners killed at once
+   waits behind the other notices (up to about 0.4 s for 500 on a 16-core
+   host). Heartbeat admission therefore also accepts a session whose owner, in
+   the owner table, is dead or is a restarted owner recovering it (not one
+   being ended, and not one superseded by a newer session of the agent). A live
+   owner missing from the registry because the registry itself restarted is not
+   covered: those heartbeats still fail closed, so the agent registers again. Before this, a heartbeat that fell in the gap was
+   answered `NOT_FOUND`, and the agent dropped the stream the owner was
+   recovering and registered a new session: 1 to 3 of 500 killed owners per run
+   at 5,000 agents.
 4. **A crash loop gives up.** One owner may be restarted at most 3 times within
    60 s. The next restart sends the `DISCONNECTED` if it was not already sent,
    closes the stream and ends, logging one WARN (`owner process restarted more

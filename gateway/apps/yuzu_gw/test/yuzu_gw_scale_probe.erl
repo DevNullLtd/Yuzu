@@ -21,7 +21,7 @@
 %% Crash and supervisor reports logged in this node (planned_stop counts them).
 -export([count_crash_reports/0, crash_reports/0]).
 %% Kill agent owner processes (owner_kill, OWNER-RESTART #5695).
--export([kill_owners/1]).
+-export([kill_owners/1, owner_events/1]).
 -export([log/2]).  %% logger handler callback
 %% The upstream as the gateway's own telemetry sees it (upstream_trace/0).
 -export([upstream_trace/0, upstream_trace_reset/0, handle_event/4]).
@@ -29,7 +29,8 @@
 -define(TRACE, yuzu_gw_scale_probe_trace).
 -define(TRACE_EVENTS, [[yuzu, gw, upstream, rpc_latency], [yuzu, gw, upstream, rpc_error],
                        [yuzu, gw, upstream, circuit_state],
-                       [yuzu, gw, upstream, registration_replay_triggered]]).
+                       [yuzu, gw, upstream, registration_replay_triggered],
+                       [yuzu, gw, agent, owner_restart]]).
 -export([init/1]).
 
 -define(NAME, yuzu_gw_scale_probe).
@@ -79,6 +80,14 @@ kill_owners(Ids) ->
                             end
                     end, Ids).
 
+%% @doc What each restarted owner of these agents did: {AgentId, SystemTimeMs,
+%% Outcome, Why}.
+-spec owner_events([binary()]) -> [{binary(), integer(), atom(), term()}].
+owner_events(Ids) ->
+    lists:append([[{Id, T, O, W} || {{owner, _, T, _}, O, W}
+                                        <- ets:match_object(?TRACE, {{owner, Id, '_', '_'}, '_', '_'})]
+                  || Id <- Ids]).
+
 %% @doc What the gateway's own telemetry saw of the upstream since start/1 (or
 %% upstream_trace_reset/0): every breaker transition with its time (ms since the
 %% trace started), the BatchHeartbeat flushes' RPC time (stats, and how many
@@ -120,6 +129,10 @@ handle_event([yuzu, gw, upstream, circuit_state], _, #{state := S}, _) ->
 handle_event([yuzu, gw, upstream, registration_replay_triggered], #{count := N}, Meta, _) ->
     K = maps:get(trigger, Meta, unknown),
     ets:update_counter(?TRACE, {trigger, K}, N, {{trigger, K}, 0});
+handle_event([yuzu, gw, agent, owner_restart], _, #{agent_id := Id} = Meta, _) ->
+    ets:insert(?TRACE, {{owner, Id, erlang:system_time(millisecond),
+                         erlang:unique_integer([monotonic])},
+                        maps:get(outcome, Meta, unknown), maps:get(why, Meta, none)});
 handle_event(_, _, _, _) ->
     ok.
 

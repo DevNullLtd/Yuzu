@@ -50,7 +50,9 @@ owner_restart_test_() ->
       {timeout, 60, {"a superseded owner's crash sends nothing for the newer session",
                      fun superseded_owner_crash/0}},
       {timeout, 120, {"a kill during a planned stop: no resurrection, no double DISCONNECTED",
-                      fun kill_during_planned_stop/0}}]}.
+                      fun kill_during_planned_stop/0}},
+      {timeout, 60, {"the agent's heartbeats stay admitted while its owner is being restarted",
+                     fun heartbeat_admitted_during_restart/0}}]}.
 
 setup() ->
     _ = application:stop(yuzu_gw),
@@ -164,6 +166,10 @@ gone_stream_is_not_resurrected() ->
     ?assertEqual(1, length(notices(S, 'CONNECTED'))),
     ?assertEqual([], presented(Id, S)),
     ?assertEqual(error, yuzu_gw_registry:lookup(Id)),
+    %% Nothing holds the session any more: its heartbeats are refused.
+    ?assertEqual({reject, unknown_session},
+                 yuzu_gw_heartbeat_admission:check(
+                   yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, undefined), S)),
     ?assertEqual([disconnected_only], outcomes()).
 
 crash_loop_gives_up() ->
@@ -205,18 +211,59 @@ mass_crash_escalates() ->
     %% ended.
     ?assertEqual(ok, wait_until(fun() -> lists:all(fun consistent/1, Agents) end, 15000)).
 
+%% Between the owner's death (the registry drops its session index row at once)
+%% and the restarted owner registering again (after its predecessor's
+%% DISCONNECTED has settled upstream, which under a mass crash waits behind the
+%% other notices) the agent's heartbeat must still be admitted on its own
+%% connection: a refusal is NOT_FOUND, and the agent then drops the very stream
+%% the owner is recovering and registers a new session (found at scale: 2 of
+%% 500 killed owners at 5,000 agents). Here the DISCONNECTED is held at the
+%% server until the heartbeat has been checked.
+heartbeat_admitted_during_restart() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Id = <<"or-hb">>,
+    #{owner := Owner, session := S, conn := Conn} =
+        start_with_stream(Id, <<Id/binary, "-session">>, fun relay_stream/1, #{bind => true}),
+    Ctx = yuzu_grpc:new_ctx(#{}, Conn, undefined, undefined, undefined),
+    ?assertEqual(ok, yuzu_gw_heartbeat_admission:check(Ctx, S)),
+    ets:insert(?TAB, {cfg, hold_disconnected, true}),
+    exit(Owner, kill),
+    %% The registry has dropped the dead owner's session row ...
+    ?assertEqual(ok, wait_until(fun() -> yuzu_gw_registry:lookup_session(S) =:= error end,
+                                ?PROMPT_MS)),
+    %% ... and the restarted owner is waiting for its DISCONNECTED to settle.
+    ?assertEqual(ok, wait_until(fun() -> notices(S, 'DISCONNECTED') =/= [] end, ?PROMPT_MS)),
+    ?assertEqual(error, yuzu_gw_registry:lookup_session(S)),
+    ?assertEqual(ok, yuzu_gw_heartbeat_admission:check(Ctx, S)),
+    %% Not on another connection.
+    Other = spawn(fun() -> receive _ -> ok end end),
+    ets:insert(?TAB, {proc, Other}),
+    ?assertMatch({reject, _},
+                 yuzu_gw_heartbeat_admission:check(
+                   yuzu_grpc:new_ctx(#{}, Other, undefined, undefined, undefined), S)),
+    ets:match_delete(?TAB, {cfg, hold_disconnected, '_'}),
+    ?assertEqual(ok, wait_until(fun() -> length(notices(S, 'CONNECTED')) >= 2 end, ?PROMPT_MS)),
+    ?assertEqual(ok, yuzu_gw_heartbeat_admission:check(Ctx, S)),
+    ?assertEqual([recovered], outcomes()).
+
 superseded_owner_crash() ->
     {ok, _} = application:ensure_all_started(yuzu_gw),
     Id = <<"or-super">>,
-    #{owner := Old, session := S1} = start_relayed(Id, <<"or-super-s1">>),
-    #{owner := New, session := S2} = start_relayed(Id, <<"or-super-s2">>),
+    #{owner := Old, session := S1, conn := Conn1} =
+        start_with_stream(Id, <<"or-super-s1">>, fun relay_stream/1, #{bind => true}),
+    #{owner := New, session := S2} =
+        start_with_stream(Id, <<"or-super-s2">>, fun relay_stream/1, #{bind => true}),
+    %% The superseded session admits no heartbeat, owner table or not.
+    Ctx1 = yuzu_grpc:new_ctx(#{}, Conn1, undefined, undefined, undefined),
+    ?assertEqual({reject, unknown_session}, yuzu_gw_heartbeat_admission:check(Ctx1, S1)),
     exit(Old, kill),
     ?assertEqual(ok, wait_until(fun() -> notices(S1, 'DISCONNECTED') =/= [] end, ?PROMPT_MS)),
     timer:sleep(500),
     ?assertEqual([], notices(S2, 'DISCONNECTED')),
     ?assertEqual([], presented(Id, S1)),
     ?assertEqual({ok, New}, yuzu_gw_registry:lookup(Id)),
-    ?assertEqual(1, length(notices(S1, 'DISCONNECTED'))).
+    ?assertEqual(1, length(notices(S1, 'DISCONNECTED'))),
+    ?assertEqual({reject, unknown_session}, yuzu_gw_heartbeat_admission:check(Ctx1, S1)).
 
 kill_during_planned_stop() ->
     {ok, _} = application:ensure_all_started(yuzu_gw),
@@ -251,6 +298,11 @@ mock() ->
                                                    maps:get(session_id, Req),
                                                    maps:get(stream_home_id, Req),
                                                    erlang:monotonic_time(microsecond)}),
+                                 maps:get(event, Req) =:= 'DISCONNECTED' andalso
+                                     hold_while(fun() -> ets:lookup(?TAB, cfg) =/= [] andalso
+                                                         [x || {cfg, hold_disconnected, true}
+                                                                   <- ets:lookup(?TAB, cfg)] =/= []
+                                                end, 10000),
                                  {ok, #{acknowledged => true}, #{}};
                              <<"ProxyRegister">> ->
                                  [{cfg, register_delay_ms, Delay} | _] =
@@ -270,6 +322,14 @@ mock() ->
                                  {ok, #{}, #{}}
                          end
                      end).
+
+hold_while(Pred, Left) when Left > 0 ->
+    case Pred() of
+        true  -> timer:sleep(10), hold_while(Pred, Left - 10);
+        false -> true
+    end;
+hold_while(_Pred, _Left) ->
+    true.
 
 notices(Session, Event) ->
     [{H, T} || {notice, E, _A, S, H, T} <- ets:lookup(?TAB, notice), S =:= Session, E =:= Event].
@@ -345,16 +405,25 @@ start_relayed(Id, Session) ->
 start_with_stream(Id, Fun) ->
     start_with_stream(Id, <<Id/binary, "-session">>, Fun).
 
+start_with_stream(Id, Session, Fun) ->
+    start_with_stream(Id, Session, Fun, #{}).
+
 %% A stream process (Fun(Conn) is its body once its owner is known) whose owner
 %% is started through the agent supervisor, as the Subscribe handler does.
-start_with_stream(Id, Session, Fun) ->
+%% Opts: bind => true binds the session to the stand-in connection (its
+%% heartbeats are then admitted on that connection only).
+start_with_stream(Id, Session, Fun, Opts) ->
     Parent = self(),
     Conn = spawn(fun conn_loop/0),
     Stream = spawn(fun() ->
-                           Args = #{agent_id => Id, agent_info => #{agent_id => Id},
-                                    stream_pid => self(), peer_addr => <<"127.0.0.1">>,
-                                    session_id => Session,
-                                    register_req => #{info => #{agent_id => Id}}},
+                           Args0 = #{agent_id => Id, agent_info => #{agent_id => Id},
+                                     stream_pid => self(), peer_addr => <<"127.0.0.1">>,
+                                     session_id => Session,
+                                     register_req => #{info => #{agent_id => Id}}},
+                           Args = case maps:get(bind, Opts, false) of
+                                      true  -> Args0#{conn_key => Conn};
+                                      false -> Args0
+                                  end,
                            {ok, Owner} = yuzu_gw_agent_sup:start_agent(Args),
                            Parent ! {started, self(), Owner},
                            Fun({Conn, Owner})

@@ -41,7 +41,7 @@
 
 %% Control API (called in the load-generator node through peer:call).
 -export([start/1, stop_all/0, spawn_agents/1, set_config/1, status/0, attempts/0,
-         truth/0, disconnect/1, fanout/1, counters/0]).
+         truth/0, disconnect/1, fanout/1, counters/0, ended/1]).
 %% Agent process entry
 -export([agent_init/2]).
 %% gen_server
@@ -52,6 +52,8 @@
 -define(AGENTS, yuzu_gw_scale_fleet_agents).
 -define(ATTEMPTS, yuzu_gw_scale_fleet_attempts).
 -define(COUNTERS, yuzu_gw_scale_fleet_counters).
+%% Every session end, {AgentId, Why, SystemTimeMs} (owner_kill names them).
+-define(ENDED, yuzu_gw_scale_fleet_ended).
 
 -define(REGISTER, <<"/yuzu.agent.v1.AgentService/Register">>).
 -define(SUBSCRIBE, <<"/yuzu.agent.v1.AgentService/Subscribe">>).
@@ -155,6 +157,12 @@ counters() ->
 
 %% @doc Make these agents drop their connection (a flap). They come back by
 %% their own retry rule when `reconnect' is true.
+%% @doc Each session end of these agents: {AgentId, Why, SystemTimeMs}, Why one
+%% of subscribe_ended, heartbeat_not_found, connection_lost, dropped.
+-spec ended([binary()]) -> [{binary(), atom(), integer()}].
+ended(Ids) ->
+    lists:append([ets:lookup(?ENDED, Id) || Id <- Ids]).
+
 -spec disconnect([binary()]) -> ok.
 disconnect(Ids) ->
     [P ! drop || Id <- Ids, {_, P, _, _, _, _, _, _, _, _} <- ets:lookup(?AGENTS, Id), is_pid(P)],
@@ -170,6 +178,7 @@ init(Cfg) ->
                       {read_concurrency, true}]),
     ets:new(?ATTEMPTS, [named_table, public, duplicate_bag, {write_concurrency, true}]),
     ets:new(?COUNTERS, [named_table, public, set, {write_concurrency, true}]),
+    ets:new(?ENDED, [named_table, public, duplicate_bag, {write_concurrency, true}]),
     ets:insert(?COUNTERS, [{K, 0} || K <- [commands_received, responses_sent, heartbeats_sent,
                                            heartbeats_not_found, heartbeats_failed,
                                            connections_lost, subscribe_ended]]),
@@ -372,6 +381,7 @@ heartbeat_done(A, _Other) ->
 %% The session is over: count it, then reconnect by the retry rule (or stop).
 session_ended(#a{id = Id} = A, Why) ->
     Why =:= subscribe_ended andalso bump(subscribe_ended),
+    ets:insert(?ENDED, {Id, Why, erlang:system_time(millisecond)}),
     case ets:lookup(?AGENTS, Id) of
         [{_, _, _, _, _, _, _, _, _, Disc}] ->
             ets:update_element(?AGENTS, Id, [{?F_STATE, down}, {?F_DISC, Disc + 1}])

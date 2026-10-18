@@ -503,6 +503,8 @@ owner_kill(Config) ->
     #{disconnects := Disc1} = load_call(Config, status, []),
     SupAfter = gw_call(Config, erlang, whereis, [yuzu_gw_agent_sup]),
     Restarts = maps:map(fun(K, V) -> V - maps:get(K, Restarts0) end, owner_restarts(Config)),
+    Counters = load_call(Config, counters, []),
+    Unrecovered = owner_kill_unrecovered(Config, Killed, Sessions, After, T0),
     R = #{setup => Pre,
           killed => length(Killed),
           disconnected_received => Disc,
@@ -518,6 +520,8 @@ owner_kill(Config) ->
           agent_disconnects_during => Disc1 - Disc0,
           agent_sup_restarted => SupBefore =/= SupAfter,
           owner_restarts => Restarts,
+          fleet_counters => Counters,
+          unrecovered => Unrecovered,
           fanout => maps:without([latencies_ms], Fan),
           convergence => convergence(Config),
           settle => Settle,
@@ -534,10 +538,36 @@ owner_kill_progress(Config, Sessions, T0) ->
                       case Disc of #{S := TD} -> T >= TD; _ -> false end],
     Recovered = maps:from_list(Conn),
     #{disconnected => map_size(Disc), recovered => map_size(Recovered),
+      recovered_set => sets:from_list(maps:keys(Recovered), [{version, 2}]),
       last_connected_ms => lists:max([T0 | maps:values(Recovered)])}.
 
 %% The gateway's own count of restarted owners by outcome (0 for a gateway that
 %% predates the counter, so the scenario reports on it too).
+%% For each killed agent that is not recovered at the server or did not keep its
+%% session, everything each side saw, in ms since the kill: the fake server's
+%% registrations and notices for the agent, the agent's session ends (why), and
+%% the restarted owner's outcome. At most 20.
+owner_kill_unrecovered(Config, Killed, Sessions, After, T0) ->
+    #{recovered_set := Rec} = owner_kill_progress(Config, Sessions, T0),
+    Bad = [{Id, S} || {Id, S} <- Killed,
+                      not sets:is_element(S, Rec) orelse maps:get(Id, After, none) =/= S],
+    Ids = [Id || {Id, _} <- lists:sublist(Bad, 20)],
+    Registers = up_call(Config, registers, []),
+    Notices = up_call(Config, notices, []),
+    Ended = load_call(Config, ended, [Ids]),
+    Owners = gw_call(Config, ?PROBE, owner_events, [Ids]),
+    Rel = fun(T) -> T - T0 end,
+    [#{agent => Id, session => S,
+       session_after => maps:get(Id, After, null),
+       server => lists:keysort(2,
+                   [{register, Rel(Recv), Kind, Sess} || {A, Kind, Recv, _Done, Sess, _} <- Registers,
+                                                         A =:= Id, Recv >= T0 - 1000]
+                   ++ [{Ev, Rel(T), Sess} || {A, Sess, Ev, T} <- Notices, A =:= Id,
+                                             T >= T0 - 1000]),
+       agent_ended => [{Why, Rel(T)} || {A, Why, T} <- Ended, A =:= Id, T >= T0 - 1000],
+       owner => [{O, Rel(T), W} || {A, T, O, W} <- Owners, A =:= Id]}
+     || {Id, S} <- lists:sublist(Bad, 20)].
+
 owner_restarts(Config) ->
     maps:from_list([{O, case catch gw_call(Config, prometheus_counter, value,
                                            [yuzu_gw_agent_owner_restarts_total,
