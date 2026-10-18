@@ -356,6 +356,29 @@ static bool deny_mcp_token_session(
     return false;
 }
 
+// Same-site refusal for a privileged write that a cookie session can reach: the cookie is an
+// ambient credential a cross-site page can ride, so a cookie session must name this site in
+// Origin or Referer (token callers are exempt; a cookie session with neither header is
+// refused). Call it AFTER the authorization gates and any step-up, so a caller who is not
+// authorized learns nothing from the refusal, and BEFORE the body is read or anything is
+// mutated. `target_id` names the endpoint on the `csrf.denied` row. Returns true (having
+// written the 403 A4 body and attempted the audit row) when the caller must stop.
+static bool refuse_cross_site_cookie_write(const auth::Session& s, const httplib::Request& req,
+                                           httplib::Response& res,
+                                           const RestApiV1::AuditFn& audit,
+                                           std::span<const std::string> trusted_origins,
+                                           const std::string& target_id) {
+    if (!browser_write_is_cross_site(s.auth_source, req.get_header_value("Host"),
+                                     req.get_header_value("Origin"),
+                                     req.get_header_value("Referer"), trusted_origins))
+        return false;
+    (void)detail::emit_behavioral_audit(audit, req, res, "csrf.denied", "denied", "Endpoint",
+                                        target_id, "cross-site or header-less browser write refused");
+    res.status = 403;
+    res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+    return true;
+}
+
 // Maps an EnginePrincipalStore/ApiTokenStore `std::expected<..., string>`
 // failure message to an HTTP status. The stores are string-typed-error, not
 // exception-typed — this keeps the mapping in one place instead of
@@ -6539,8 +6562,9 @@ void RestApiV1::register_routes(
     // resource rather than needing a second one).
     sink.Post(
         R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments)",
-        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped](
-            const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped,
+         trusted_origins = csrf_trusted_origins_](const httplib::Request& req,
+                                                  httplib::Response& res) {
             // Explicit per-route service-scope deny (routed-concern clause 4:
             // EXTEND this file's existing helper, never fork) — the predicate
             // below ALSO denies a service-scoped token structurally, but this
@@ -6641,6 +6665,9 @@ void RestApiV1::register_routes(
             }
             if (step_up_fn &&
                 !step_up_fn(req, res, *session, "POST /api/v1/rbac/roles/{name}/assignments"))
+                return;
+            if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
+                                               "rbac_role_assignment"))
                 return;
 
             const std::string role_name = req.matches[1].str();
@@ -6869,7 +6896,8 @@ void RestApiV1::register_routes(
     sink.Delete(
         R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments/([A-Za-z0-9._-]+))",
         [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped,
-         metrics_registry](const httplib::Request& req, httplib::Response& res) {
+         metrics_registry, trusted_origins = csrf_trusted_origins_](const httplib::Request& req,
+                                                                    httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "rbac.role.unassigned", "User",
                     "service-scoped token blocked from RBAC role unassignment",
@@ -6958,6 +6986,9 @@ void RestApiV1::register_routes(
             if (step_up_fn &&
                 !step_up_fn(req, res, *session,
                             "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}"))
+                return;
+            if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
+                                               "rbac_role_assignment"))
                 return;
 
             const std::string role_name = req.matches[1].str();
@@ -7048,7 +7079,8 @@ void RestApiV1::register_routes(
     sink.Put(
         "/api/v1/rbac/enforcement",
         [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped,
-         metrics_registry](const httplib::Request& req, httplib::Response& res) {
+         metrics_registry, trusted_origins = csrf_trusted_origins_](const httplib::Request& req,
+                                                                    httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "rbac.enforcement_changed", "Setting",
                     "service-scoped token blocked from RBAC enforcement toggle",
@@ -7108,6 +7140,9 @@ void RestApiV1::register_routes(
                     }))
                 return;
             if (step_up_fn && !step_up_fn(req, res, *session, "PUT /api/v1/rbac/enforcement"))
+                return;
+            if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
+                                               "rbac_enforcement"))
                 return;
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -15679,7 +15714,8 @@ void RestApiV1::register_routes(
     // dashboards and audit-trail tooling can be exercised end-to-end now.
     sink.Post("/api/v1/guaranteed-state/push", [auth_fn, perm_fn, audit_fn, step_up_fn,
                                                 guaranteed_state_store, guardian_push_fn,
-                                                deny_fleet_wide_service_scoped](
+                                                deny_fleet_wide_service_scoped,
+                                                trusted_origins = csrf_trusted_origins_](
                                                     const httplib::Request& req,
                                                     httplib::Response& res) {
         // BLOCKING finding from external review (PR #3156): ITServiceOwner
@@ -15702,6 +15738,9 @@ void RestApiV1::register_routes(
         if (!perm_fn(req, res, "GuaranteedState", "Push"))
             return;
         if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/push"))
+            return;
+        if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
+                                           "guaranteed_state_push"))
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
@@ -15912,21 +15951,12 @@ void RestApiV1::register_routes(
             if (step_up_fn &&
                 !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/policy-generation/raise"))
                 return;
-            // A cookie session must name this site in Origin or Referer (token callers are
-            // exempt), the same refusal the other cookie-authorised writes apply. It runs
-            // after the administrator gate and step-up so a caller who is not an
-            // administrator learns nothing, and before the body is read.
-            if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
-                                            req.get_header_value("Origin"),
-                                            req.get_header_value("Referer"), trusted_origins)) {
-                (void)detail::emit_behavioral_audit(
-                    audit_fn, req, res, "csrf.denied", "denied", "Endpoint", target_id,
-                    "cross-site or header-less browser write refused");
-                res.status = 403;
-                res.set_content(detail::a4_error(res, "cross-site request refused"),
-                                "application/json");
+            // A cookie session must name this site in Origin or Referer; it runs after the
+            // administrator gate and step-up so a caller who is not an administrator learns
+            // nothing, and before the body is read.
+            if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
+                                               target_id))
                 return;
-            }
 
             // Checked after the administrator gate so a caller who is not one learns nothing
             // about the Guardian stores' state.

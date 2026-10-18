@@ -302,6 +302,130 @@ TEST_CASE("REST PUT /rbac/enforcement: a step-up denial blocks the write before 
         CHECK(a.action != "rbac.enforcement_changed");
 }
 
+// ── REST: same-site gate for cookie sessions ──────────────────────────────────
+
+namespace {
+std::size_t enforcement_csrf_denied_rows(const RbacRoleHarness& h) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "csrf.denied" && a.result == "denied" && a.target_type == "Endpoint" &&
+            a.target_id == "rbac_enforcement")
+            ++n;
+    return n;
+}
+std::size_t enforcement_rows(const RbacRoleHarness& h) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "rbac.enforcement_changed")
+            ++n;
+    return n;
+}
+// A durable Administrator with the grant an RBAC-off to on transition requires.
+void enforcement_admin_caller(RbacRoleHarness& h) {
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+}
+} // namespace
+
+TEST_CASE("REST PUT /rbac/enforcement: a cookie session with a cross-site Origin is refused 403 "
+          "with a csrf.denied row and no mutation",
+          "[pg][rest][rbac][a1][csrf]") {
+    RbacRoleHarness h;
+    enforcement_admin_caller(h);
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = h.set_enforcement_rest(true);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    CHECK(enforcement_csrf_denied_rows(h) == 1);
+    CHECK_FALSE(h.rbac->is_rbac_enabled());
+    CHECK(enforcement_rows(h) == 0);
+    // The gate runs after the step-up and before the body is read.
+    CHECK(h.step_up_actions.size() == 1);
+}
+
+TEST_CASE("REST PUT /rbac/enforcement: a cookie session with no Origin and no Referer is "
+          "refused, a same-site Origin or Referer alone proceeds",
+          "[pg][rest][rbac][a1][csrf]") {
+    RbacRoleHarness h;
+    enforcement_admin_caller(h);
+
+    SECTION("neither header") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}};
+        auto res = h.set_enforcement_rest(true);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(enforcement_csrf_denied_rows(h) == 1);
+        CHECK_FALSE(h.rbac->is_rbac_enabled());
+    }
+    SECTION("same-site Origin only") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+        auto res = h.set_enforcement_rest(true);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(enforcement_csrf_denied_rows(h) == 0);
+        CHECK(h.rbac->is_rbac_enabled());
+    }
+    SECTION("same-site Referer only") {
+        h.sink.default_headers = {{"Host", "yuzu.test"},
+                                  {"Referer", "https://yuzu.test/settings"}};
+        auto res = h.set_enforcement_rest(true);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(enforcement_csrf_denied_rows(h) == 0);
+        CHECK(h.rbac->is_rbac_enabled());
+    }
+}
+
+TEST_CASE("REST PUT /rbac/enforcement: an api_token session is exempt from the same-site gate "
+          "even with a foreign Origin",
+          "[pg][rest][rbac][a1][csrf]") {
+    RbacRoleHarness h;
+    enforcement_admin_caller(h);
+    h.session_auth_source = "api_token";
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = h.set_enforcement_rest(true);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(enforcement_csrf_denied_rows(h) == 0);
+    CHECK(h.rbac->is_rbac_enabled());
+}
+
+TEST_CASE("REST PUT /rbac/enforcement: the same-site gate runs before the body is read, so a "
+          "cross-site request with a malformed body is 403, not 400",
+          "[pg][rest][rbac][a1][csrf]") {
+    RbacRoleHarness h;
+    enforcement_admin_caller(h);
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    for (const std::string body : {"not json", R"({})", R"({"enabled":"true"})"}) {
+        INFO("body=" << body);
+        auto res = h.put_rest("/api/v1/rbac/enforcement", body);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    CHECK(enforcement_rows(h) == 0);
+    CHECK_FALSE(h.rbac->is_rbac_enabled());
+}
+
+TEST_CASE("REST PUT /rbac/enforcement: a non-administrator with a cross-site Origin learns only "
+          "the administrator denial",
+          "[pg][rest][rbac][a1][csrf]") {
+    RbacRoleHarness h;
+    REQUIRE(h.auth_db->upsert_user("plainuser", "hash", "salt", auth::Role::user).has_value());
+    h.session_user = "plainuser";
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = h.set_enforcement_rest(true);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] != "cross-site request refused");
+    CHECK(enforcement_csrf_denied_rows(h) == 0);
+    CHECK(h.step_up_actions.empty());
+}
+
 // ── REST: audit fail-closed ──────────────────────────────────────────────────
 
 TEST_CASE("REST PUT /rbac/enforcement: fails CLOSED (503) when its audit write drops, though "

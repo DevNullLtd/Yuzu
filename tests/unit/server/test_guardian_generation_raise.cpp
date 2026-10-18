@@ -45,15 +45,9 @@ constexpr const char* kRoute = "/api/v1/guaranteed-state/policy-generation/raise
 constexpr const char* kTool = "raise_guardian_policy_generation";
 constexpr const char* kCounter = "yuzu_server_guardian_policy_generation_raise_total";
 
-// RbacRoleHarness whose REST requests carry a same-site Host and Origin by default, as a
-// browser's cookie-session write does; a test overrides `sink.default_headers` to vary that.
-struct RaiseHarness : RbacRoleHarness {
-    explicit RaiseHarness(GuardianStores stores = GuardianStores::kBoth,
-                          std::vector<std::string> csrf_trusted_origins = {})
-        : RbacRoleHarness(stores, std::move(csrf_trusted_origins)) {
-        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
-    }
-};
+// RbacRoleHarness already sends a same-site Host and Origin with every REST request; a test
+// overrides `sink.default_headers` to vary that.
+using RaiseHarness = RbacRoleHarness;
 
 json valid_body(std::int64_t target = 5) {
     return {{"target_generation", target}, {"acknowledge_rule_set_replaced", true}};

@@ -58,6 +58,7 @@ namespace {
 
 struct AuditRecord {
     std::string action, result, target_id, detail;
+    std::string target_type;
 };
 
 /// RbacStore co-located on AuthDbPg's own pool/database, NOT RbacStorePg's
@@ -184,7 +185,8 @@ struct RbacRoleHarness {
 
     /// `csrf_trusted_origins` is handed to `RestApiV1::set_csrf_trusted_origins` BEFORE the
     /// routes register, because the route captures the list by value; empty (the default)
-    /// leaves the same-host-only behaviour every existing harness user relies on.
+    /// leaves the same-host-only behaviour every existing harness user relies on. REST
+    /// requests carry a same-site Host and Origin by default (see `sink.default_headers`).
     explicit RbacRoleHarness(GuardianStores guardian_stores = GuardianStores::kNone,
                              std::vector<std::string> csrf_trusted_origins = {}) {
         REQUIRE(rbac->is_open());
@@ -238,11 +240,16 @@ struct RbacRoleHarness {
             return true;
         };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string&,
+                               const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
-            audit_log.push_back({action, result, target_id, detail});
+            audit_log.push_back({action, result, target_id, detail, target_type});
             return audit_persists(result);
         };
+
+        // The REST routes refuse a cookie session whose Origin/Referer does not name this
+        // site, so every REST request carries a same-site Host and Origin, as a browser's
+        // does. A test varies the cross-site cases by assigning `sink.default_headers`.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
 
         api.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
         api.register_routes(sink, rest_auth_fn, perm_fn, audit_fn,
@@ -307,9 +314,9 @@ struct RbacRoleHarness {
             return true;
         };
         auto mcp_audit_fn = [this](const httplib::Request&, const std::string& action,
-                                   const std::string& result, const std::string&,
+                                   const std::string& result, const std::string& target_type,
                                    const std::string& target_id, const std::string& detail) -> bool {
-            audit_log.push_back({action, result, target_id, detail});
+            audit_log.push_back({action, result, target_id, detail, target_type});
             return audit_persists(result);
         };
         auto agents_fn = []() -> nlohmann::json { return nlohmann::json::array(); };

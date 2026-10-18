@@ -1113,6 +1113,153 @@ TEST_CASE("REST assign: the get_role() internal-inconsistency check maps to "
     CHECK(h.rbac->get_principal_roles("user", "jane").empty());
 }
 
+// ── REST: same-site gate for cookie sessions ─────────────────────────────────
+
+namespace {
+std::size_t assignment_csrf_denied_rows(const RbacRoleHarness& h) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "csrf.denied" && a.result == "denied" && a.target_type == "Endpoint" &&
+            a.target_id == "rbac_role_assignment")
+            ++n;
+    return n;
+}
+std::size_t assignment_rows(const RbacRoleHarness& h) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "rbac.role.assigned" || a.action == "rbac.role.unassigned")
+            ++n;
+    return n;
+}
+constexpr const char* kAssignJane = R"({"principal_type":"user","principal_id":"jane"})";
+} // namespace
+
+TEST_CASE("REST POST .../rbac/roles/{name}/assignments: a cookie session with a cross-site "
+          "Origin is refused 403 with a csrf.denied row and no grant",
+          "[pg][rest][rbac][a2][csrf]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = h.assign_rest("Operator", kAssignJane);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    CHECK(assignment_csrf_denied_rows(h) == 1);
+    CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+    CHECK(assignment_rows(h) == 0);
+}
+
+TEST_CASE("REST DELETE .../rbac/roles/{name}/assignments/{principal_id}: a cookie session with "
+          "a cross-site Origin is refused 403 with a csrf.denied row and the grant stays",
+          "[pg][rest][rbac][a2][csrf]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", "jane", "Operator"}).has_value());
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = h.unassign_rest("Operator", "jane");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    CHECK(assignment_csrf_denied_rows(h) == 1);
+    CHECK(h.rbac->get_principal_roles("user", "jane").size() == 1);
+    CHECK(assignment_rows(h) == 0);
+}
+
+TEST_CASE("REST rbac role assignments: a cookie session with no Origin and no Referer is "
+          "refused, a same-site Origin or Referer alone proceeds",
+          "[pg][rest][rbac][a2][csrf]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    SECTION("neither header, assign") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}};
+        auto res = h.assign_rest("Operator", kAssignJane);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(assignment_csrf_denied_rows(h) == 1);
+        CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+    }
+    SECTION("neither header, unassign") {
+        REQUIRE(h.rbac->assign_role({"user", "jane", "Operator"}).has_value());
+        h.sink.default_headers = {{"Host", "yuzu.test"}};
+        auto res = h.unassign_rest("Operator", "jane");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(assignment_csrf_denied_rows(h) == 1);
+        CHECK(h.rbac->get_principal_roles("user", "jane").size() == 1);
+    }
+    SECTION("same-site Origin, assign then unassign") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+        auto assigned = h.assign_rest("Operator", kAssignJane);
+        REQUIRE(assigned);
+        CHECK(assigned->status == 201);
+        auto removed = h.unassign_rest("Operator", "jane");
+        REQUIRE(removed);
+        CHECK(removed->status == 200);
+        CHECK(assignment_csrf_denied_rows(h) == 0);
+    }
+    SECTION("same-site Referer only, assign") {
+        h.sink.default_headers = {{"Host", "yuzu.test"},
+                                  {"Referer", "https://yuzu.test/settings"}};
+        auto res = h.assign_rest("Operator", kAssignJane);
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        CHECK(assignment_csrf_denied_rows(h) == 0);
+    }
+}
+
+TEST_CASE("REST rbac role assignments: an api_token session is exempt from the same-site gate "
+          "even with a foreign Origin",
+          "[pg][rest][rbac][a2][csrf]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.session_auth_source = "api_token";
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto assigned = h.assign_rest("Operator", kAssignJane);
+    REQUIRE(assigned);
+    CHECK(assigned->status == 201);
+    auto removed = h.unassign_rest("Operator", "jane");
+    REQUIRE(removed);
+    CHECK(removed->status == 200);
+    CHECK(assignment_csrf_denied_rows(h) == 0);
+}
+
+TEST_CASE("REST rbac role assignments: the same-site gate runs before the body is read, so a "
+          "cross-site request with a malformed body is 403, not 400",
+          "[pg][rest][rbac][a2][csrf]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = h.assign_rest("Operator", "not json");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(assignment_csrf_denied_rows(h) == 1);
+    CHECK(assignment_rows(h) == 0);
+}
+
+TEST_CASE("REST rbac role assignments: a non-administrator with a cross-site Origin learns "
+          "only the administrator denial",
+          "[pg][rest][rbac][a2][csrf]") {
+    RbacRoleHarness h;
+    REQUIRE(h.auth_db->upsert_user("plainuser", "hash", "salt", auth::Role::user).has_value());
+    h.session_user = "plainuser";
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    for (int i = 0; i < 2; ++i) {
+        auto res = i == 0 ? h.assign_rest("Operator", kAssignJane)
+                          : h.unassign_rest("Operator", "jane");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(nlohmann::json::parse(res->body)["error"]["message"] !=
+              "cross-site request refused");
+    }
+    CHECK(assignment_csrf_denied_rows(h) == 0);
+}
+
 // ── REST: audit fail-closed ──────────────────────────────────────────────────
 
 TEST_CASE("REST assign: fails CLOSED (503) when its audit write drops",

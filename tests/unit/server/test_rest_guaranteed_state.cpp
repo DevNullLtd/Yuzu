@@ -200,6 +200,12 @@ struct RestGsHarness {
     // before the fleet /status route migrated to real tokens via
     // service_scoped_token_headers() — its own service-token-denial test).
     std::string session_token_scope_service;
+    // The resolved session's auth_source. "local" is a cookie session, which the same-site
+    // gate on POST /push applies to; "api_token" is a bearer caller, which it exempts.
+    std::string session_auth_source{"local"};
+    // Calls the wired guardian_push_fn received (POST /push's fan-out), so a test can prove a
+    // refused request never reached it.
+    int guardian_push_calls{0};
 
     // When false, perm_fn denies (403) — lets a test prove the permission gate
     // runs BEFORE any audit emission on the DEX read surface (default grants,
@@ -452,6 +458,7 @@ struct RestGsHarness {
             s.username = session_user;
             s.role = session_role;
             s.token_scope_service = session_token_scope_service;
+            s.auth_source = session_auth_source;
             return s;
         };
 
@@ -632,6 +639,11 @@ struct RestGsHarness {
                                   : yuzu::server::make_local_guardian_api(store.get(),
                                                                            baseline_store.get());
 
+        // A cookie session's write must name this site in Origin or Referer (POST /push
+        // enforces it), so every request carries a same-site Host and Origin as a browser's
+        // does. A test varies the cross-site cases by assigning `sink.default_headers`.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac_,
                             /*mgmt_store=*/&mgmt_,
@@ -657,7 +669,11 @@ struct RestGsHarness {
                             /*result_set_store=*/nullptr,
                             dispatch_arg,
                             /*step_up_fn=*/{},
-                            /*guardian_push_fn=*/{},
+                            /*guardian_push_fn=*/
+                            [this](const std::string&, bool) {
+                                ++guardian_push_calls;
+                                return 0;
+                            },
                             dex_perf_fn_,
                             net_perf_fn_,
                             /*lockout_clear_fn=*/{},
@@ -1688,6 +1704,109 @@ TEST_CASE("REST gs.push: service-scoped token → 403, .permission names Push (t
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "guaranteed_state.push");
     CHECK(h.audit_log[0].result == "denied");
+}
+
+namespace {
+std::size_t push_csrf_denied_rows(const RestGsHarness& h) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "csrf.denied" && a.result == "denied" && a.target_type == "Endpoint" &&
+            a.target_id == "guaranteed_state_push")
+            ++n;
+    return n;
+}
+std::size_t push_rows(const RestGsHarness& h) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "guaranteed_state.push")
+            ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("REST gs.push: a cookie session with a cross-site Origin is refused 403 with a "
+          "csrf.denied row and no fan-out",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({"full_sync":true})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    CHECK(push_csrf_denied_rows(h) == 1);
+    CHECK(push_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 0);
+}
+
+TEST_CASE("REST gs.push: a cookie session with no Origin and no Referer is refused, a same-site "
+          "Origin or Referer alone proceeds",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+
+    SECTION("neither header") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}};
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(push_csrf_denied_rows(h) == 1);
+        CHECK(h.guardian_push_calls == 0);
+    }
+    SECTION("same-site Origin only") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(push_csrf_denied_rows(h) == 0);
+        CHECK(h.guardian_push_calls == 1);
+    }
+    SECTION("same-site Referer only") {
+        h.sink.default_headers = {{"Host", "yuzu.test"},
+                                  {"Referer", "https://yuzu.test/guardian"}};
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(push_csrf_denied_rows(h) == 0);
+        CHECK(h.guardian_push_calls == 1);
+    }
+}
+
+TEST_CASE("REST gs.push: an api_token session is exempt from the same-site gate even with a "
+          "foreign Origin",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.session_auth_source = "api_token";
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(push_csrf_denied_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 1);
+}
+
+TEST_CASE("REST gs.push: the same-site gate runs before the body is read, so a cross-site request "
+          "with a malformed body is 403, not 400",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", "not json");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(push_csrf_denied_rows(h) == 1);
+    CHECK(push_rows(h) == 0);
+}
+
+TEST_CASE("REST gs.push: a caller without GuaranteedState:Push with a cross-site Origin learns "
+          "only the permission denial",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.grant_perms = false;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("cross-site request refused") == std::string::npos);
+    CHECK(push_csrf_denied_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 0);
 }
 
 TEST_CASE("REST gs.status: returns store rule_count rollup", "[pg][rest][guaranteed_state][status]") {
