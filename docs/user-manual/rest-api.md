@@ -2231,8 +2231,9 @@ the CA store is unavailable.
 revocation freshness without downloading the DER list: `crl_version`,
 `crl_published_at` and `crl_next_update` (epoch seconds), `crl_revoked_count`
 and `crl_stale`. The first four are `null` when no list is published, and
-`crl_revoked_count` is also `null` for a list published before entry counts were
-recorded; they are never `0`. `crl_stale` is `true` when the latest list was not
+`crl_revoked_count` is also `null` (never a fabricated `0`) for a list published
+before entry counts were recorded; `0` means a published list with no revoked
+entries. `crl_stale` is `true` when the latest list was not
 built from the current revoked set (a revocation is missing from it, no list is
 published, or its entry count was not recorded), `false` when it covers every
 revocation, and `null` when the comparison read failed. It does not reflect
