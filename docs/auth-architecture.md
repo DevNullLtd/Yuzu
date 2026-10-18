@@ -607,8 +607,11 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   with a typed `403` (A4 envelope);
 - a **fresh MFA step-up** through the same `require_mfa_step_up` gate as the other step-up endpoints
   (so the same pass-through for an account the gate cannot ask for a factor applies: a local account
-  that never enrolled, or an OIDC session without an `amr` proof under a mode that does not protect
-  its role); a requirement that the approver holds an enrolled factor is tracked in #6079;
+  with no enrolled factor, which `mfa_step_up.cpp` passes in every `--mfa-enforcement` mode, and an OIDC
+  session without an `amr` proof whenever the mode does not protect its role, i.e. everything except
+  `--mfa-enforcement=required` and, for admins, `admin-only`). `required` closes the OIDC case only when
+  the IdP asserts `amr`; otherwise an OIDC approver gets `401` and loops through re-SSO. A requirement
+  that the approver holds an enrolled factor in every mode is tracked in #6079;
 - a **human principal**, never an engine principal;
 - a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`).
 
@@ -621,7 +624,9 @@ Consequences, each deliberate:
   #3151).
 - **SAML approvers are blocked while step-up is on.** SAML sessions can never pass step-up (#4935),
   so a SAML-authenticated user cannot approve. This is the SAML consequence of "MFA enforcement with
-  SAML" below, not a separate rule.
+  SAML" below, not a separate rule. With `--mfa-step-up-window-secs=0` the window check returns before
+  the SAML branch and a SAML session is admitted. A SAML-only deployment therefore has no working
+  approver path until #4935 is decided (known limitation, tracked in #6098).
 - **`--mfa-step-up-window-secs=0` lowers the assurance to "interactive session" only.** The step-up
   gate is off for approvals as for every other step-up endpoint. Operators who rely on approvals as a
   control should not set it; if they do, review every `approval.approve` row with `result=success` (each decision also leaves a
@@ -1586,7 +1591,8 @@ applies to these two flags).
 session hitting any step-up-gated endpoint (token mint/revoke,
 session revoke, Guardian rule write, software deploy, user delete/role change,
 approval approve/reject) receives a `403` with `"MFA step-up is not available for SAML sessions in this
-release"` — regardless of `--mfa-enforcement` mode. The gate (`require_mfa_step_up`
+release"` — regardless of `--mfa-enforcement` mode, while step-up is enabled
+(`--mfa-step-up-window-secs=0` disables the gate before this branch is reached). The gate (`require_mfa_step_up`
 in `mfa_step_up.cpp`) exits with an honest denial before reaching the local
 `mfa_status` lookup, which would fail anyway (SAML users have no local `users`
 row). This means:

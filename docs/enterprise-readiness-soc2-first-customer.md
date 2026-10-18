@@ -378,12 +378,19 @@ principal that is not an engine principal, `Approval:Approve`, a reviewer who is
 submitter, and the existing MFA step-up gate. API-token and MCP sessions are refused with a typed
 `403` (MCP: `-32003`). Read the step-up half as what it is: the gate can only ask for a factor the
 account has. **Residual risk:** an approval can complete without a second factor when (a) the
-approver is a local account that never enrolled in MFA, (b) the approver is an OIDC session whose
-identity provider asserted no `amr` proof under the default `--mfa-enforcement=optional`, or (c) the
-server runs with `--mfa-step-up-window-secs=0`. SAML approvers are blocked while step-up is on
-(#4935). A requirement that the approver holds an enrolled factor, whatever the enforcement mode, is
-tracked in #6079; until it lands, a deployment that relies on approvals as a CC6.3 control should run
-`--mfa-enforcement=required` and leave `--mfa-step-up-window-secs` above zero. Operator-facing detail: `docs/user-manual/instructions.md`, "Who can
+approver is a local account with no enrolled MFA factor (the gate passes it in every
+`--mfa-enforcement` mode; `required`, and `admin-only` for admins, force enrolment at login, so in
+practice any account under `optional` and a non-admin under `admin-only`), (b) the approver is an
+OIDC session whose identity provider asserted no `amr` proof, unless `--mfa-enforcement=required`
+(under `admin-only` this still passes for a non-admin role), or (c) the server runs with
+`--mfa-step-up-window-secs=0`. SAML approvers are blocked while step-up is on (#4935); a
+SAML-only deployment has no working approver path until that is decided (known limitation,
+tracked in #6098). A requirement that the approver holds an enrolled factor, whatever the
+enforcement mode, is tracked in #6079; until it lands, a deployment that relies on approvals as a
+CC6.3 control should run `--mfa-enforcement=required` and leave `--mfa-step-up-window-secs` above
+zero. Know the cost of `required` first: the identity provider must assert `amr` for approvers (an
+OIDC session without it gets `401` and loops through re-sign-in, locking those approvers out), every
+local user must enrol at login, and SAML users are denied at every step-up gate. Operator-facing detail: `docs/user-manual/instructions.md`, "Who can
 approve".
 
 ---

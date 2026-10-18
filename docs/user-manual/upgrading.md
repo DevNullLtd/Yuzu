@@ -6,8 +6,8 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
 the dashboard Approvals page, and the MCP tools `approve_request` / `reject_request`) now require all of:
-an interactive cookie session (local or OIDC), a fresh MFA step-up, a human principal and not an engine
-principal. The existing rule that the reviewer cannot be the submitter is unchanged.
+an interactive cookie session (local or OIDC), a fresh MFA step-up (with the pass-through described below), a human
+principal and not an engine principal. The existing rule that the reviewer cannot be the submitter is unchanged.
 
 - **API-token and MCP-token sessions are refused** with a typed `403` (A4 error envelope).
 - **MCP can no longer approve or reject.** The MCP transport is not an approval surface (it
@@ -16,11 +16,20 @@ principal. The existing rule that the reviewer cannot be the submitter is unchan
   ADR-1005's exception ledger (entry 2026-10-18: "human review is a human-session act"). The tools stay registered, and listing pending
   approvals through MCP is unchanged. Their tier/permission mapping is `Approval:Approve` (it was
   mapped as `Approval:Write`, #3151).
-- **SAML users cannot approve while MFA step-up is on.** SAML sessions can never pass step-up (#4935).
+- **SAML users cannot approve while MFA step-up is on.** SAML sessions can never pass step-up (#4935). A
+  deployment whose approvers all sign in through SAML therefore has no working approver path until they are given
+  an OIDC provider or a local account, or step-up is turned off fleet-wide with `--mfa-step-up-window-secs=0`
+  (under `--auth-mode=sso-only` the only local sign-in left is the break-glass account, which is not a substitute).
+  This is a known limitation, tracked in #6098.
 - **"Fresh MFA step-up" is not a guarantee of a second factor.** The step-up gate can only ask for a factor the
-  account has. A local account that never enrolled in MFA, an OIDC session whose identity provider asserted no
-  `amr` proof under the default `--mfa-enforcement=optional`, and any session when
-  `--mfa-step-up-window-secs=0` all pass it. Requiring that the approver holds an enrolled factor is tracked in #6079.
+  account has, so it passes without a second factor for a local account with no enrolled factor (in every
+  `--mfa-enforcement` mode; `required`, and `admin-only` for admins, force enrolment at login, so in practice any
+  account under `optional` and a non-admin under `admin-only`), for an OIDC session whose identity provider
+  asserted no `amr` proof **unless `--mfa-enforcement=required`** (under `admin-only` it still passes for a
+  non-admin role), and for any session when `--mfa-step-up-window-secs=0`. `--mfa-enforcement=required` closes the
+  OIDC case only if your identity provider asserts `amr` for approvers: an OIDC session without it gets `401` and
+  loops through re-sign-in, which locks those approvers out. Requiring that the approver holds an enrolled factor
+  in every mode is tracked in #6079.
 - **A degraded session read fails closed.** The route answers `503` and the request stays pending; it no
   longer records the reviewer `unknown` (#4128).
 - **The attempt is audited first.** If the audit row cannot be written, approve and reject return `503`

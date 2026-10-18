@@ -674,7 +674,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
    - **2026-10-18 - approving and rejecting is a human-session act: MCP
      `approve_request` / `reject_request` and the legacy REST
      `POST /api/approvals/{id}/approve|reject` (#6061).** A "no" on Decision
-     1's both-surfaces requirement, in two parts:
+     1's both-surfaces requirement, in two parts (MCP and REST), followed by the exception's
+     scope, the MFA caveat and the revisit rule:
      - **MCP: registered, discoverable, permanently refused.** Both tools stay
        in `tools/list`, and after the `Approval:Approve` permission check they
        always answer `-32003` with the message
@@ -696,6 +697,16 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **The exception relaxes no control; it makes approval stricter.** It
        waives only the twin. Authentication, authorization, audit and the
        reviewer-is-not-the-submitter rule are unchanged or tighter.
+     - **"Fresh MFA step-up" has a known pass-through, tracked in #6079.** The step-up gate
+       (`require_mfa_step_up`) can only ask for a factor the account has, so a local account with no
+       enrolled factor passes it in every `--mfa-enforcement` mode, an OIDC session whose identity
+       provider asserted no `amr` proof passes it unless `--mfa-enforcement=required` (under
+       `admin-only` for a non-admin role too), and any session passes it with
+       `--mfa-step-up-window-secs=0`. SAML sessions are refused while step-up is on (#4935), so a
+       SAML-only deployment has no working approver path (known limitation, tracked in #6098).
+       Requiring an enrolled factor of the approver in every mode is #6079; until it ships, this
+       exception rests on the interactive-session and human-principal rules, with the step-up as a
+       strengthening where the account has a factor.
      - **Revisit 2027-01-18** is a re-confirmation date for a standing
        decision, not a work-item deadline. The decision changes only if MCP
        gains a human-presence proof that a bearer token cannot replay, or a

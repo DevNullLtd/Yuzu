@@ -522,7 +522,7 @@ Expected response:
 
 **4. Approve it.**
 
-Approving needs a signed-in session cookie from a different user than the submitter (an API token is refused with `403`) and a fresh MFA step-up. If the server answers `401` with `meta.mfa_step_up_required`, post your code to `/login/mfa/stepup` on the same cookie and retry. A cookie-session `POST` must also carry an `Origin` (or `Referer`) naming the server, as a browser sends; a request with neither is refused with `403`. See [Who can approve](user-manual/instructions.md#who-can-approve).
+Approving needs a signed-in session cookie from a different user than the submitter (an API token is refused with `403`) and a fresh MFA step-up (an account with no enrolled MFA factor passes the step-up, so enrol your approvers; see #6079). If the server answers `401` with `meta.mfa_step_up_required`, post your code to `/login/mfa/stepup` on the same cookie and retry. A cookie-session `POST` must also carry an `Origin` (or `Referer`) naming the server, as a browser sends; a request with neither is refused with `403`. See [Who can approve](user-manual/instructions.md#who-can-approve).
 
 ```bash
 curl -s -X POST http://localhost:8080/api/approvals/d4e5f6a7-.../approve \

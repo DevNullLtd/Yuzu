@@ -615,18 +615,30 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   changes. If the session's MFA proof is older than `--mfa-step-up-window-secs` (default 300), the
   request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
   inline, and a script posts the code to `/login/mfa/stepup` and retries (see
-  [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). As on every
-  step-up endpoint, the gate cannot demand a factor an account does not have: a local account that
-  never enrolled in MFA, or an SSO account whose identity provider did not assert MFA, passes it
-  while `--mfa-enforcement=optional`. To make a fresh factor mandatory for every approver, run with
-  `--mfa-enforcement=required`. A requirement that the approver specifically holds an enrolled factor,
-  whatever the enforcement mode, is tracked in #6079.
+  [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). **Read
+  "fresh MFA step-up" with its limit.** As on every step-up endpoint, the gate cannot demand a factor
+  an account does not have, so it passes without a second factor for: a local account with no
+  enrolled MFA factor (the gate itself passes it in every `--mfa-enforcement` mode; `required`, and
+  `admin-only` for admins, make login force enrolment first, so in practice this is any account under
+  `optional` and a non-admin under `admin-only`); an SSO account whose identity provider did not
+  assert MFA (`amr`), **unless `--mfa-enforcement=required`** (under `admin-only` it still passes for
+  a non-admin role); and any session when `--mfa-step-up-window-secs=0`. To make a fresh factor
+  mandatory for every approver, run with `--mfa-enforcement=required`, and know its prerequisite and
+  cost first: your identity provider must assert `amr` for approvers (an SSO session without it gets
+  `401` and loops through re-sign-in, locking those approvers out), every local user must enrol at
+  login, and SAML users are refused at every step-up gate. A requirement that the approver
+  specifically holds an enrolled factor, whatever the enforcement mode, is tracked in #6079.
 - **A human principal.** An engine principal is never admitted.
 - **Not the submitter.** Unchanged: the reviewer cannot be the person who submitted the request
   (HTTP 400, audited as denied).
 - **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who
   signed in through SAML is refused with `403` while step-up is on. Approvers who use SAML cannot
   approve until they sign in with a local account or OIDC, or step-up is disabled (next point).
+  **A deployment where every approver signs in through SAML has no working approver path** until
+  they are given an OIDC provider or a local account, or you accept losing step-up fleet-wide with
+  `--mfa-step-up-window-secs=0`. Under `--auth-mode=sso-only` the only local sign-in left is the
+  break-glass account, which is not a substitute. This is a known limitation, tracked in #6098 (the
+  SAML step-up decision is #4935).
 - **If you disable step-up, assurance drops.** `--mfa-step-up-window-secs=0` turns the step-up gate
   off for approve and reject along with every other step-up endpoint. Approval then requires only an
   interactive session with the permission. Do not run that way if approvals are a control you rely
@@ -1384,8 +1396,9 @@ curl -s -b cookies.txt http://localhost:8080/api/approvals/pending/count
 POST /api/approvals/{id}/approve
 ```
 
-Approve and reject need a signed-in session cookie, a fresh MFA step-up and a same-site
-`Origin`/`Referer`; an API or MCP token is refused with `403`. See
+Approve and reject need a signed-in session cookie, a fresh MFA step-up (which an account with no
+enrolled factor passes, #6079) and a same-site `Origin`/`Referer`; an API or MCP token is refused
+with `403`. See
 [Who can approve](#who-can-approve) and the error table in the [REST API reference](rest-api.md).
 
 The reviewer must be a different operator than the submitter — self-approval
