@@ -27,6 +27,8 @@
 #include "pg/secret_codec.hpp"
 #include "totp.hpp"
 
+#include <yuzu/log_token.hpp> // log_key_token: IdP-controlled principal in log lines
+
 #include <spdlog/spdlog.h>
 
 #include <libpq-fe.h>
@@ -60,7 +62,11 @@ bool is_valid_username(const std::string& username) {
     }
     for (char c : username) {
         if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_' && c != '-') {
-            spdlog::warn("Username validation failed: invalid character '{}' in '{}'", c, username);
+            // `username` can be an IdP-derived SSO principal (is_valid_principal calls this first
+            // for every OIDC sign-in): fold the log copies, never the value under test.
+            spdlog::warn("Username validation failed: invalid character '{}' in '{}'",
+                         ::yuzu::log_key_token(std::string_view(&c, 1)),
+                         ::yuzu::log_key_token(username));
             return false;
         }
     }
@@ -770,11 +776,13 @@ std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& 
                                                               const std::string& display_name,
                                                               const std::string& source) {
     if (principal.starts_with(kEngineReservedPrefix)) {
-        spdlog::warn("upsert_sso_identity rejected reserved 'engine:' principal: '{}'", principal);
+        spdlog::warn("upsert_sso_identity rejected reserved 'engine:' principal: '{}'",
+                     ::yuzu::log_key_token(principal));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     if (!is_valid_principal(principal)) {
-        spdlog::warn("upsert_sso_identity rejected invalid principal: '{}'", principal);
+        spdlog::warn("upsert_sso_identity rejected invalid principal: '{}'",
+                     ::yuzu::log_key_token(principal));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     // ★ SECURITY (security-guardian LOW): reject an embedded NUL in any of
@@ -806,7 +814,7 @@ std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& 
         "RETURNING id",
         std::vector<std::string>{principal, source, iss, sub, display_name});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
-        spdlog::error("upsert_sso_identity failed for '{}'", principal);
+        spdlog::error("upsert_sso_identity failed for '{}'", ::yuzu::log_key_token(principal));
         return std::unexpected(AuthDBError::WriteFailed);
     }
     return {};
@@ -851,7 +859,8 @@ std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& 
     // and its reserved-prefix branch explicitly rejects every byte < 0x20
     // (NUL included) plus a control/shell-metacharacter set.
     if (!is_valid_principal(username)) {
-        spdlog::warn("get_user rejected invalid username/principal: '{}'", username);
+        spdlog::warn("get_user rejected invalid username/principal: '{}'",
+                     ::yuzu::log_key_token(username));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     auto lease = impl_->pool.try_acquire_for(kReadTimeout);

@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -183,7 +184,9 @@ public:
     ///
     /// `step_up_fn` (PR2, optional) — when present, the 2 user-management
     /// Settings mutations (DELETE user, POST user role) gate behind it
-    /// after admin_fn passes. Empty functor disables the gate entirely.
+    /// after admin_fn passes, and the 2 API-token mutations (POST, DELETE
+    /// /api/settings/api-tokens) gate behind it after perm_fn and auth_fn
+    /// pass. Empty functor disables the gate entirely.
     void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, AdminFn admin_fn,
                          PermFn perm_fn, AuditFn audit_fn, Config& cfg, auth::AuthManager& auth_mgr,
                          auth::AutoApproveEngine& auto_approve, ApiTokenStore* api_token_store,
@@ -231,7 +234,7 @@ private:
     /// Optional `otpauth_uri` / `secret_b32` / `recovery_codes` are populated
     /// by the POST handlers for the one-time reveal after enroll / verify /
     /// regenerate. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
-    std::string render_mfa_fragment(const std::string& username,
+    std::string render_mfa_fragment(const auth::Session& session,
                                     const std::string& new_otpauth_uri = {},
                                     const std::string& new_secret_b32 = {},
                                     const std::vector<std::string>& new_recovery_codes = {},
@@ -253,7 +256,10 @@ private:
     std::string render_dex_alerts_fragment();
     std::string render_mcp_fragment();
     std::string render_nvd_fragment();
-    std::string render_directory_fragment();
+    /// The OIDC SSO form. `message` renders INSIDE #oidc-feedback (an out-of-band
+    /// swap into it is destroyed by the main swap, so a save error was never seen).
+    std::string render_directory_fragment(const std::string& message = {},
+                                          bool message_is_error = true);
     /// Plugin code-signing settings — operator-managed trust bundle and
     /// require-signature toggle. The PEM bundle lives in
     /// auth::default_cert_dir() / "plugin-trust-bundle.pem"; the require
@@ -335,6 +341,10 @@ private:
     GatewaySessionCountFn gateway_session_count_fn_;
     AgentsJsonFn agents_json_fn_;
     std::shared_mutex* oidc_mu_{};
+    /// Serializes POST /api/settings/oidc end to end (stored-secret read, provider build, swap,
+    /// persist) so two saves cannot interleave. Never taken by a sign-in; lock order: this, then
+    /// `*oidc_mu_` (shared or exclusive), never the reverse.
+    std::mutex oidc_save_mu_;
     std::unique_ptr<oidc::OidcProvider>* oidc_provider_{};
     yuzu::MetricsRegistry* metrics_registry_{};
     StepUpFn step_up_fn_;

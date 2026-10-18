@@ -1419,6 +1419,10 @@ if build_server
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
       'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
+      'unit/server/test_access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
+      'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
+      'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
+      'unit/server/test_access_audit_authz.cpp', # Audit and reviews page: [pg] persona matrix through the real gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -1472,6 +1476,9 @@ if build_server
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
+      'unit/server/test_oidc_https.cpp', # #5692: discovery + JWKS over TLS, incl. the handler-thread leg
+      'unit/server/test_oidc_egress_policy.cpp', # #5692: pure address-class policy for OIDC fetches
+      'unit/server/test_oidc_egress.cpp', # #5692: the policy applied to real fetches (pin, refusal, cross-host)
       'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_sha256_steps.cpp',
       'unit/server/test_oidc_routes.cpp',
@@ -1520,6 +1527,8 @@ if build_server
       'unit/server/test_operator_surface_twins.cpp',
       'unit/server/test_schedule_params.cpp',
       'unit/server/test_plugin_config_parsers.cpp',
+      'unit/server/test_enablement_resolver.cpp',
+      'unit/server/test_enablement_units.cpp',
       'unit/server/test_plugin_config_store_pg.cpp',
       'unit/server/test_plugin_config_routes.cpp',
       'unit/server/test_upload_grant_parsers.cpp',
@@ -1604,6 +1613,10 @@ if build_server
       'unit/server/test_compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
       'unit/server/test_device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
       'unit/server/test_dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
+      # pure DEX score policy JSON: parse, canonical, revision, in-force resolution - no store, no I/O, no [pg]
+      'unit/server/test_dex_score_policy_json.cpp',
+      # bounded-refresh score policy provider over injected read/clock fns - no store, no sleeps, no [pg]
+      'unit/server/test_dex_score_policy_provider.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -1615,6 +1628,11 @@ if build_server
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
+      'unit/server/test_guardian_reconcile_budget.cpp', # #5513: reconcile admission budget (leaky bucket)
+      'unit/server/test_guardian_reconcile_gate.cpp', # #5513: reconcile claim map + admit-before-claim ordering
+      'unit/server/test_guardian_generation_cache.cpp', # #5513: TTL-cached policy-generation read
+      'unit/server/test_guardian_rule_bundle.cpp', # #5513: per-generation rule-bundle memo
+      'unit/server/test_agent_registry_scope_for_agent.cpp', # #5513: single-agent scope evaluator
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
@@ -1640,6 +1658,7 @@ if build_server
       'unit/server/test_ca_routes.cpp',
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
+      'unit/server/test_developer_writes.cpp', # System > Developer and API: Load generator Start/Stop script pins
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
@@ -1738,6 +1757,7 @@ if build_server
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_settings_security_ui.cpp', # Security and sign-in page: pure panel renderers + page pins + no-PG route cases
       'unit/server/test_groups_enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
       'unit/server/test_groups_page.cpp', # Groups and enrolment page: /groups gate, headers, template contract
       'unit/server/test_groups_js.cpp', # Groups and enrolment page: string pins on yuzu-groups.js
@@ -2001,7 +2021,8 @@ if build_server
   #     rebalancing a shard needs only the right suite: kwarg here, ci.yml
   #     is untouched, and the partition invariant below proves the property.
   #     ci.yml DOES still hardcode BY NAME: the 3 non-pg server test names
-  #     (A/B/C), 'mcp bridge teardown allocation budget', 'server pg shard
+  #     (A/B/C), 'mcp bridge teardown allocation budget', 'guardian cache
+  #     allocation-failure sweep', 'server pg shard
   #     partition invariant', and (Phase 2) 'server pg smoke' — renaming any
   #     of those, or adding a new top-level `suite:`
   #     anywhere in the build (tests/meson.build or the root meson.build —
@@ -2923,6 +2944,29 @@ if build_server
       suite: ['server', 'server-checks'],
       timeout: 60,
     )
+
+    # ── #5513 Guardian single-flight cache allocation-failure sweep ──────────
+    # Fails every allocation inside GuardianGenerationCache / GuardianRuleBundleCache
+    # get() (and GuardianReconcileGate::decide()) in turn and checks the NEXT call is not
+    # wedged (FlightGuard / noexcept install / run_fetch / run_loader). Replaces the global
+    # operator new, so: its own binary, absent from sanitizer builds, Linux-only (same
+    # reasons as the probe above).
+    # The caches, the budget and the gate are header-only and self-contained: nothing from
+    # yuzu_server_core. The binary links only Catch2 and builds only because make_bundle
+    # (inline, calls scope::parse from scope_engine.cpp) is never called here: do not call
+    # make_bundle in this binary.
+    guardian_cache_alloc_sweep_exe = executable(
+      'yuzu_guardian_cache_alloc_sweep_tests',
+      files('unit/server/test_guardian_cache_alloc_sweep.cpp'),
+      cpp_args: test_partial_init_args,
+      dependencies: [catch2_dep],
+    )
+    test(
+      'guardian cache allocation-failure sweep',
+      guardian_cache_alloc_sweep_exe,
+      suite: ['server', 'server-checks'],
+      timeout: 60,
+    )
   endif
 endif
 
@@ -3104,6 +3148,15 @@ test('capability catalogue completeness',
   timeout: 30,
 )
 
+# ADR-3006: kUnitOs in enablement_units.hpp == the os-capability-matrix generated block,
+# both directions. Hermetic - reads sources only.
+test('enablement os applicability',
+  _python3_test,
+  args: [files('test_enablement_os_applicability.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Wave 11 PR11.2-a: the network_config `routes` instruction definition exists and matches the
 # row the plugin emits (id, dispatch pair, approval mode, platforms, ordered columns). Hermetic.
 test('network_config routes definition',
@@ -3153,6 +3206,16 @@ test('embed_content idempotent',
 test('instructions risk table',
   _python3_test,
   args: [files('test_instructions_risk_table.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The /test Instructions gate's parameter synthesis must satisfy every definition's
+# validation.pattern (the server answers 400 otherwise). Hermetic — imports the
+# runner and parses content/definitions/, starts no server.
+test('instructions runner parameter synthesis',
+  _python3_test,
+  args: [files('test_instructions_runner_params.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -3529,6 +3592,16 @@ test('access users production wiring lexical gate',
   timeout: 30,
 )
 
+# Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
+# audit store read that returns nullopt for a closed store). Source-text only, so Python.
+# Suite 'docs' for the same reason as the Users page gate above.
+test('access audit production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_audit_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #5678: static lexical gate pinning that BOTH disconnect paths (direct Subscribe in
 # agent_service_impl.cpp, gateway DISCONNECTED in gateway_service_impl.cpp) mirror a departure into
 # durable presence only through mirror_departure_to_presence() with the real gate; the direct path
@@ -3552,6 +3625,18 @@ test('presence departure wiring lexical gate (#5678)',
 test('gateway-upstream guard registration lexical gate',
   _python3_test,
   args: [files('test_gateway_peer_registration_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #6016: static lexical gate pinning that only default_certs.cpp mints the server identity URI
+# (`yuzu://<install>/server`) the gateway management plane will admit by: no other file names
+# server_identity_uri() or the "/server" suffix literal, issue_leaf() has one production caller,
+# and sign_csr() has a closed, reviewed set of call sites. Carries its own in-memory mutation
+# self-test. No build required. Suite 'docs' for the same reason as the gateway-upstream gate above.
+test('server identity URI minting lexical gate (#6016)',
+  _python3_test,
+  args: [files('test_server_identity_uri_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -3706,6 +3791,21 @@ test('split interlock tripwire selftest',
   args: [files('test_split_interlock_tripwire_selftest.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Personal-data commit guard (scripts/ci/check-personal-data.py) and its
+# self-test. Both also run in .github/workflows/docs-lint.yml on every PR.
+test('personal data guard',
+  _python3_test,
+  args: [files('../scripts/ci/check-personal-data.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+test('personal data guard selftest',
+  _python3_test,
+  args: [files('test_check_personal_data_selftest.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # #1611 tripwire: the TSan suppression in unit/test_runner_main.cpp is honest

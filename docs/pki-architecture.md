@@ -24,11 +24,55 @@ life; see "Default certificates" below). **Every install generates its own root
 | Leaf | Consumer | Key | Validity | Identity |
 |---|---|---|---|---|
 | `default-https` | Dashboard HTTPS listener | EC P-256 | sized to CA notAfter | SAN: `localhost`, `127.0.0.1`, `::1`, `<hostname>` |
-| `default-server` | Agent + management gRPC listeners | EC P-256 | sized to CA notAfter | same |
+| `default-server` | Agent + management gRPC listeners | EC P-256 | sized to CA notAfter | same DNS/IP SANs, **plus the server-only URI SAN `yuzu://<ca-fingerprint>/server`** (#6016) |
 | `default-gateway` | Gateway listener + upstream client (PR5) | EC P-256 | sized to CA notAfter | same |
 | per-agent leaf | Agent gRPC **client** cert (mTLS identity) | EC P-256 (agent-generated) | ~1y, auto-renew at 2/3 | `CN=<agent_id>`, URI SAN `yuzu://<ca-fingerprint>/agent/<agent_id>` |
 
-The three server-side leaves share one SAN set: the base `localhost` / `127.0.0.1` /
+The `default-server` leaf is the only leaf in the system that carries the URI SAN
+`yuzu://<ca-fingerprint>/server` (the same colon-stripped, upper-case CA fingerprint the
+agent URI uses; one shared helper, `install_id_from_fingerprint`). It is the identity a
+peer can use to tell the **server** from a **gateway**, whose CA-signed leaf shares every
+other SAN with it. Nothing an agent or gateway can send can obtain it: `sign_agent_csr`
+ignores the CSR's subject, SAN and EKU and only ever emits `yuzu://<ca-fingerprint>/agent/<id>`
+with clientAuth only, and `--cert-san` accepts DNS/IP values only. Operator-supplied
+certificates, `--no-default-certs`, and the `--mgmt-tls-server-*` override never carry it.
+This release only mints it; the gateway management plane does not check it yet and
+still admits the server by SPKI pin. A later release will check the URI (#6016).
+
+An install whose set predates the URI is upgraded **in place on the first boot of a build
+that mints it**: only `default-server.pem` is re-issued, under the **same root and the same
+key** (so every existing `mgmt_peer_pins` entry stays valid), signed with the on-disk CA
+key; the superseded certificate's `ca_store` row is revoked (`superseded`), not purged,
+and `default-marker.json` is untouched, so rolling back is safe (an older build ignores
+the extra URI). "Superseded" is bookkeeping, not a compromise signal: the new certificate
+certifies the same key, so the revocation does not (and must not) be read as the key being
+withdrawn. To keep that true, the CA store records an operator-typed revocation reason that
+collides with a system marker (`superseded`, `unpublished`; compared trimmed and case-insensitively)
+qualified as `operator-supplied: <text>`, and from this release on only the bootstrap itself writes the bare markers (a row revoked
+earlier, or backfilled from a legacy `ca.db`, could carry an operator-typed bare `superseded`).
+The upgrade is audited as `server.default_certs_server_identity_upgraded` (both serials in the
+detail; `result=warning` and `superseded_revoked=false` when the old serial's revoke could not be
+confirmed, in which case the old row may still be active and should be revoked from the CA page or
+`POST /api/v1/ca/revoke`; that case is not retried, because the next boot finds the set intact).
+If the old serial was revoked by an operator for a real reason (for example key compromise) in the
+moments while the upgrade ran, the upgrade revokes the new certificate with the same reason (the key
+is withdrawn). The audit row is then `result=warning` with `superseded_revoked=false` (the old row is
+revoked, but not as `superseded`) and `replacement_withdrawn=true`, and the server keeps serving that
+file until the set is re-keyed, exactly as if the operator had revoked the live leaf after boot. If
+revoking the replacement also failed, the detail carries `replacement_withdraw_failed=true` and the NEW serial is still
+active over a withdrawn key: revoke it from the CA page or `POST /api/v1/ca/revoke` and re-key the
+set. The error log names the serial.
+A failure before the new certificate is published is logged and retried on every boot; it never
+blocks startup. The CRL carries no revocation reason code, so on the wire a `superseded` entry
+reads like any other revocation; the reason is visible in the CA inventory only.
+
+The URI format is stable: `yuzu://` + the SHA-256 of the root certificate's DER as 64 upper-case hex digits with no colons + `/server`. For an install's CA file it is
+`echo "yuzu://$(openssl x509 -in default-ca.pem -noout -fingerprint -sha256 | cut -d= -f2 | tr -d :)/server"`.
+Operator-supplied certificates never carry it, and this release does not consume it.
+
+The upgrade is skipped on purpose, with a warning on **every** boot and `yuzu_server_identity_uri_present` at `0`, when: the server key was withdrawn (the current server certificate, or any other certificate over the same key, whatever its purpose, was revoked for a reason other than `superseded` (a same-key sibling: other than `superseded` or `unpublished`); re-certifying it would undo that revocation, so re-key the set instead, which also changes the server key every gateway `mgmt_peer_pins` entry refers to), or when anything stops the new certificate being signed or published (the CA key is not in the cert directory, the cert directory is not writable, the CA inventory is unreachable). An intentionally read-only cert directory therefore keeps the gauge at `0` and the warning harmless; the identity appears the first boot the directory is writable. The gauge describes the file `default-server.pem`, not what each listener serves: it is a readiness signal for the identity only when the agent and management listeners use the default certificates. Replicas that share one database should share one `--ca-dir`: a replica holding a separate copy of the pre-upgrade certificate upgrades it independently (its old serial is already revoked as `superseded`, which does not stop it).
+
+The three server-side leaves otherwise share one SAN set: the base `localhost` / `127.0.0.1` /
 `::1` / `<hostname>` plus any operator `--cert-san` extras (`dns:<name>`, `ip:<addr>`,
 or a bare value auto-classified by IP-literal shape; repeatable, and a single value
 may be comma-separated). `--cert-san` is the supported way to make the built-in certs
@@ -54,7 +98,7 @@ client-identity binding becomes cryptographic with no new mechanism.
 | `server/core/src/x509_ca.{hpp,cpp}` (`yuzu::server::pki`) | Pure-OpenSSL engine: EC keygen, self-sign root, sign leaf from CSR (POP-verified, server-chosen subject/SAN/EKU), build CRL, SHA-256 fingerprint, parse, `verify_chain`. No SQLite / config / store deps — value types + PEM/DER strings only. |
 | `server/core/src/key_provider.{hpp,cpp}` | `KeyProvider` interface + `FileKeyProvider` (0600 PEM in a 0700 dir). The HSM/PKCS#11 seam — `key_ref` is an opaque token (the absolute path today). |
 | `server/core/src/ca_store.{hpp,cpp}` (Postgres schema `ca_store`, ADR-0053) | Inventory + lifecycle: `ca_root`, `ca_issued`, `ca_crl_versions`. **Metadata only — the root private key is never in the DB**, only its opaque `key_ref`. |
-| `server/core/src/default_certs.{hpp,cpp}` | First-boot bootstrap: root + 3 server leaves + `default-marker.json`. Idempotent; regenerate-whole-set on corruption / clock-skew. |
+| `server/core/src/default_certs.{hpp,cpp}` | First-boot bootstrap: root + 3 server leaves + `default-marker.json`. Idempotent; regenerate-whole-set on corruption / clock-skew; re-issues only the server leaf in place when it predates the identity URI (#6016). |
 | `agents/core/src/agent_csr.{hpp,cpp}` | Agent-side, self-contained OpenSSL (the agent cannot link `x509_ca`): EC P-256 keypair + CSR generation, 0600 key persistence (leaf and chain 0644), renew-at-2/3 inspection (a cert/key mismatch or unreadable key counts as missing and re-enrols). |
 | `server/core/src/ca_routes.{hpp,cpp}` | The `/api/v1/ca/*` REST surface (PR4). |
 
@@ -103,7 +147,8 @@ A fresh install no longer refuses to start without operator certs — on first b
 directory (`auth::default_cert_dir()`, override `--ca-dir`) and the server is
 encrypted + server-authenticated with zero operator action. It is impossible to
 miss: ERROR startup banner, audit `server.default_certs_generated` +
-`server.default_certs_in_use`, Prometheus `yuzu_server_default_certs_active`,
+`server.default_certs_in_use` (+ `server.default_certs_server_identity_upgraded` on the one boot that
+re-issues the server leaf, #6016), Prometheus `yuzu_server_default_certs_active`,
 `/health` `tls.*`, `/readyz` `ca_store`/`ca_root`. Opt out with
 `--no-default-certs`. Full detail: `docs/auth-architecture.md` "Default
 certificates".

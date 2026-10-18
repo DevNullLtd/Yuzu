@@ -251,12 +251,44 @@ def _synth_string(name: str, schema: dict) -> str:
     return "x" * max(int(min_len), 1)
 
 
+# Values tried, in order, when the name-based string default fails the parameter's
+# `validation.pattern`. The server rejects a value that does not match (HTTP 400), so
+# without this the runner reports a false FAIL for every pattern-constrained string
+# whose name the table above does not recognise.
+_PATTERN_FALLBACKS = (
+    "10",                                    # digits
+    "info",                                  # log level
+    "192.0.2.0/30",                          # CIDR; RFC 5737 TEST-NET-1, never routed
+    "true",                                  # boolean string
+    "00000000-0000-0000-0000-000000000000",  # UUID
+    "00:00:00:00:00:00",                     # MAC
+)
+
+
+def _fit_pattern(value: str, schema: dict) -> str:
+    """`value` if it satisfies the schema's `validation.pattern`, else the first fallback
+    that does; `value` unchanged when there is no pattern or nothing matches (the server
+    then reports the mismatch, which is the honest outcome). The server matches with RE2
+    PartialMatch (an unanchored search, as `re.search` is); Python's `re` is not RE2, so a
+    pattern it cannot compile is left to the server rather than raised here."""
+    pattern = (schema.get("validation") or {}).get("pattern")
+    if not pattern:
+        return value
+    try:
+        rx = re.compile(pattern)
+    except re.error:
+        return value
+    return next((c for c in (value, *_PATTERN_FALLBACKS) if rx.search(c)), value)
+
+
 def _value_for_property(name: str, schema: dict) -> Any:
     """Synthesise a sane default for a single parameter property.
 
     Honours, in order: explicit YAML `default:`, `enum:`, then a per-host
     name-based table for common parameter shapes (path, sql, url, sha256,
-    group, thumbprint, ioc_*, directory, etc.).
+    group, thumbprint, ioc_*, directory, etc.), then fits a string to its
+    `validation.pattern` (`_fit_pattern`). A default or enum value is used as
+    written and is never pattern-fitted.
     """
     # 1. Honour an explicit default if the YAML provides one.
     if "default" in schema and schema["default"] not in (None, ""):
@@ -269,7 +301,7 @@ def _value_for_property(name: str, schema: dict) -> Any:
     t = schema.get("type", "string")
 
     if t in ("string", None):
-        return _synth_string(name, schema)
+        return _fit_pattern(_synth_string(name, schema), schema)
 
     if t in ("integer", "int", "int32", "int64", "number"):
         validation = schema.get("validation", {}) or {}
