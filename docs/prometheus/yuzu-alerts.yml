@@ -2874,6 +2874,100 @@ groups:
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
+      # The heartbeat reconcile aborts, sending nothing, when a store it depends on
+      # cannot be read, and counts every such abort as
+      # yuzu_server_guardian_reconciles_total{result="degraded"}. The causes are the
+      # policy generation read (the first read before admission and the fresh read
+      # after it), the rule store, the Baseline deployed-set read, a rule bundle load
+      # that timed out waiting for another load or threw, and the tag or property
+      # store during per-agent scope evaluation. YuzuGuardianReadDegraded counts only
+      # the rule store reads of those, and the policy generation read and the Baseline
+      # deployed-set read bump no read-degrade counter at all, so without this rule a
+      # generation or Baseline store outage leaves every behind agent unreconciled with
+      # nothing paging. Overlap with YuzuGuardianReadDegraded (rule store),
+      # YuzuTagStoreReadDegraded and YuzuCustomPropertiesReadDegraded (scope reads) is
+      # deliberate: this one answers "is the reconcile itself failing", the others name
+      # the store. The counter is pre-seeded to 0 at boot (see
+      # docs/observability-conventions.md), so the first abort after boot is an
+      # increase. sum() makes a multi-replica fleet one signal.
+      - alert: YuzuGuardianReconcileDegraded
+        expr: |
+          sum(increase(yuzu_server_guardian_reconciles_total{result="degraded"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian heartbeat reconcile is aborting on an unreadable store"
+          description: >-
+            yuzu_server_guardian_reconciles_total{result="degraded"} increased over
+            the last 10 minutes: heartbeat reconciles are aborting because a store
+            could not be read, and nothing is sent to the agents concerned (the abort
+            is fail-closed, so a narrowed or empty rule set is never pushed). Agents
+            that are behind the server's policy generation stay behind until the read
+            recovers, and an agent with nothing armed yet receives no rules, unscoped
+            rules included. The counter covers the policy generation read, the rule
+            store, the Baseline deployed-set read, a rule bundle load failure, and the
+            tag or property store read during scope evaluation. Find which: the
+            guaranteed_state.reconcile audit rows with result=degraded and a detail
+            beginning "heartbeat reconcile ABORTED" name the cause ("policy generation
+            unreadable", "rule store degraded", "baseline store degraded", "rule
+            bundle load failed", "scope store degraded"), and the server warn log
+            carries the same. The first policy generation read, before admission,
+            writes no audit row, so a rising counter with no such rows points at that
+            read. A rule store cause also fires YuzuGuardianReadDegraded and a scope
+            cause also fires YuzuTagStoreReadDegraded or
+            YuzuCustomPropertiesReadDegraded; the other causes fire only this alert.
+            Check Postgres reachability and yuzu_pg_* pool saturation first. The
+            agents are retried on later heartbeats, so no operator action is needed
+            once the store recovers.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#4-push-to-agents"
+
+      # yuzu_server_guardian_agent_generation_ahead_total flags an agent that reports a
+      # policy generation ABOVE the server's, usually because the Guardian state store
+      # was restored to an earlier state or rebuilt while the agents kept the
+      # generation they persisted. Such an agent refuses every full push labelled below
+      # the generation it holds, so rule and Baseline edits stop reaching it, and the
+      # server cannot otherwise see that: the reconcile counts the agent as converged
+      # and sends nothing. The counter is a throttled flag, not a count: at most one
+      # increment per minute per replica, and only after a fresh store read confirms the
+      # agent is ahead. The window must stay well above one minute plus the agent
+      # heartbeat interval (30 s by default) so a sample is not missed; 15m clears about
+      # 15 minutes after the fix. Do not read rate() of this counter as a magnitude.
+      # Blind spot: an agent whose boot re-arm is unresolved reports generation 0 while
+      # it still refuses a lower-labelled push, so it is never counted here (see
+      # guaranteed-state.md, Restoring the policy generation, Detection limits).
+      - alert: YuzuGuardianAgentGenerationAhead
+        expr: |
+          sum(increase(yuzu_server_guardian_agent_generation_ahead_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An agent holds a Guardian policy generation above the server's"
+          description: >-
+            yuzu_server_guardian_agent_generation_ahead_total increased over the last
+            15 minutes: at least one agent reports a Guardian policy generation above
+            the server's. That agent refuses every full push labelled below the
+            generation it holds, so rule and Baseline edits are not delivered to it
+            until the server's generation reaches its own. The usual cause is a
+            Guardian state store restored to an earlier state or rebuilt while agents
+            kept their persisted generation. The counter is sampled at most once a
+            minute per replica and does not count agents. The server warn line
+            "Guardian heartbeat reconcile: agent_id=... reports policy generation N
+            above the server's M" names one sampled agent with both numbers; take the
+            highest held generation from several agents' refusal log lines, not one
+            sampled value. Before raising, check that the rule store and the deployed
+            Baselines hold the policy you want enforced fleet-wide, because the raise
+            converges every behind agent to exactly that rule set. Then use the
+            supported raise (POST /api/v1/guaranteed-state/policy-generation/raise or
+            the MCP tool raise_guardian_policy_generation) with a target of the highest
+            held generation plus one. The alert stays firing for about 15 minutes after
+            the fix; confirm with
+            changes(yuzu_server_guardian_agent_generation_ahead_total[3m]) being 0 on
+            every replica rather than by waiting for it to clear. An agent whose boot
+            re-arm is unresolved reports generation 0 and is not counted by this alert.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#restoring-the-policy-generation"
+
   - name: yuzu-audit
     # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view,
     # dex.perf.device.view, network.device.view, and response.read on the v1 query,
