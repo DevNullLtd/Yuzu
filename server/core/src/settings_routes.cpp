@@ -40,6 +40,7 @@
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
+#include "settings_security_render.hpp" // Security page: pure SSO / 2FA / HTTPS / mTLS renderers
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -87,6 +88,8 @@ template <typename Req> auto settings_req_get_file(const Req& req, const std::st
 // Settings page HTML template (defined in settings_ui.cpp).
 extern const char* const kSettingsHtml;
 extern const char* const kSettingsDataHtml; // settings_data_ui.cpp (SYS-4)
+// Security and sign-in page template (defined in settings_security_ui.cpp).
+extern const char* const kSettingsSecurityHtml;
 
 // GatewayUpstreamServiceImpl and AgentRegistry are inner classes of server.cpp.
 // We use callbacks (AgentsJsonFn, GatewaySessionCountFn) to avoid depending on
@@ -460,196 +463,16 @@ std::string SettingsRoutes::render_tls_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/tls formats the SAME
     // JSON as its response body instead of re-deriving these fields.
     const auto v = settings_model::build_tls_settings(*cfg_);
-    const bool tls_enabled = v.at("enabled").get<bool>();
-
-    std::string checked = tls_enabled ? " checked" : "";
-    std::string status_cls = tls_enabled ? "role-ok" : "role-bad";
-    std::string status_text = tls_enabled ? "Enabled" : "Disabled";
-    std::string fields_opacity = tls_enabled ? "1" : "0.4";
-
-    auto path_or_no_file = [](const nlohmann::json& j) -> std::string {
-        auto s = j.get<std::string>();
-        return s.empty() ? "No file" : html_escape(s);
-    };
-    std::string cert_name = path_or_no_file(v.at("server_cert_path"));
-    std::string key_name = path_or_no_file(v.at("server_key_path"));
-    std::string ca_name = path_or_no_file(v.at("ca_cert_path"));
-
-    std::string html =
-        "<form id=\"tls-form\">"
-        "<div class=\"form-row\">"
-        "  <label>gRPC mTLS</label>"
-        "  <label class=\"toggle\">"
-        "    <input type=\"checkbox\" name=\"tls_enabled\" value=\"true\"" +
-        checked +
-        "           hx-post=\"/api/settings/tls\" hx-target=\"#tls-feedback\""
-        "           hx-swap=\"innerHTML\">"
-        "    <span class=\"slider\"></span>"
-        "  </label>"
-        "  <span class=\"role-badge " +
-        status_cls + "\">" + status_text +
-        "</span>"
-        "</div>"
-        "<div style=\"margin-top:1rem;opacity:" +
-        fields_opacity +
-        "\">"
-        "  <div class=\"form-row\">"
-        "    <label>Server Certificate</label>"
-        "    <div class=\"file-upload\">"
-        "      <form hx-post=\"/api/settings/cert-upload\" hx-target=\"#tls-feedback\" "
-        "hx-swap=\"innerHTML\""
-        "            hx-encoding=\"multipart/form-data\" "
-        "style=\"display:flex;align-items:center;gap:0.75rem\">"
-        "        <input type=\"hidden\" name=\"type\" value=\"cert\">"
-        "        <input type=\"file\" name=\"file\" accept=\".pem,.crt,.cer\""
-        "               onchange=\"this.form.requestSubmit()\" style=\"display:none\" "
-        "id=\"cert-file\">"
-        "        <button type=\"button\" class=\"btn btn-secondary\""
-        "                onclick=\"document.getElementById('cert-file').click()\">Upload "
-        "PEM</button>"
-        "        <span class=\"file-name\">" +
-        cert_name +
-        "</span>"
-        "      </form>"
-        "      <details>"
-        "        <summary class=\"btn btn-secondary\" "
-        "          style=\"cursor:pointer;display:inline-block\">Paste PEM</summary>"
-        "        <form hx-post=\"/api/settings/cert-paste\" "
-        "              hx-target=\"#tls-section\" hx-swap=\"innerHTML\" "
-        "              style=\"margin-top:0.5rem\">"
-        "          <input type=\"hidden\" name=\"type\" value=\"cert\">"
-        "          <textarea name=\"content\" "
-        "            style=\"width:100%;min-height:150px;resize:vertical\" "
-        "            placeholder=\"-----BEGIN CERTIFICATE-----&#10;...paste PEM content...&#10;"
-        "-----END CERTIFICATE-----\"></textarea>"
-        "          <button type=\"submit\" class=\"btn btn-primary\" "
-        "            style=\"margin-top:0.5rem\">Save</button>"
-        "        </form>"
-        "      </details>"
-        "    </div>"
-        "  </div>"
-        "  <div class=\"form-row\">"
-        "    <label>Server Private Key</label>"
-        "    <div class=\"file-upload\">"
-        "      <form hx-post=\"/api/settings/cert-upload\" hx-target=\"#tls-feedback\" "
-        "hx-swap=\"innerHTML\""
-        "            hx-encoding=\"multipart/form-data\" "
-        "style=\"display:flex;align-items:center;gap:0.75rem\">"
-        "        <input type=\"hidden\" name=\"type\" value=\"key\">"
-        "        <input type=\"file\" name=\"file\" accept=\".pem,.key\""
-        "               onchange=\"this.form.requestSubmit()\" style=\"display:none\" "
-        "id=\"key-file\">"
-        "        <button type=\"button\" class=\"btn btn-secondary\""
-        "                onclick=\"document.getElementById('key-file').click()\">Upload "
-        "PEM</button>"
-        "        <span class=\"file-name\">" +
-        key_name +
-        "</span>"
-        "      </form>"
-        "      <details>"
-        "        <summary class=\"btn btn-secondary\" "
-        "          style=\"cursor:pointer;display:inline-block\">Paste PEM</summary>"
-        "        <form hx-post=\"/api/settings/cert-paste\" "
-        "              hx-target=\"#tls-section\" hx-swap=\"innerHTML\" "
-        "              style=\"margin-top:0.5rem\">"
-        "          <input type=\"hidden\" name=\"type\" value=\"key\">"
-        "          <textarea name=\"content\" "
-        "            style=\"width:100%;min-height:150px;resize:vertical\" "
-        "            placeholder=\"-----BEGIN PRIVATE KEY-----&#10;...paste PEM content...&#10;"
-        "-----END PRIVATE KEY-----\"></textarea>"
-        "          <button type=\"submit\" class=\"btn btn-primary\" "
-        "            style=\"margin-top:0.5rem\">Save</button>"
-        "        </form>"
-        "      </details>"
-        "    </div>"
-        "  </div>"
-        "  <div class=\"form-row\">"
-        "    <label>CA Certificate</label>"
-        "    <div class=\"file-upload\">"
-        "      <form hx-post=\"/api/settings/cert-upload\" hx-target=\"#tls-feedback\" "
-        "hx-swap=\"innerHTML\""
-        "            hx-encoding=\"multipart/form-data\" "
-        "style=\"display:flex;align-items:center;gap:0.75rem\">"
-        "        <input type=\"hidden\" name=\"type\" value=\"ca\">"
-        "        <input type=\"file\" name=\"file\" accept=\".pem,.crt,.cer\""
-        "               onchange=\"this.form.requestSubmit()\" style=\"display:none\" "
-        "id=\"ca-file\">"
-        "        <button type=\"button\" class=\"btn btn-secondary\""
-        "                onclick=\"document.getElementById('ca-file').click()\">Upload "
-        "PEM</button>"
-        "        <span class=\"file-name\">" +
-        ca_name +
-        "</span>"
-        "      </form>"
-        "      <details>"
-        "        <summary class=\"btn btn-secondary\" "
-        "          style=\"cursor:pointer;display:inline-block\">Paste PEM</summary>"
-        "        <form hx-post=\"/api/settings/cert-paste\" "
-        "              hx-target=\"#tls-section\" hx-swap=\"innerHTML\" "
-        "              style=\"margin-top:0.5rem\">"
-        "          <input type=\"hidden\" name=\"type\" value=\"ca\">"
-        "          <textarea name=\"content\" "
-        "            style=\"width:100%;min-height:150px;resize:vertical\" "
-        "            placeholder=\"-----BEGIN CERTIFICATE-----&#10;...paste PEM content...&#10;"
-        "-----END CERTIFICATE-----\"></textarea>"
-        "          <button type=\"submit\" class=\"btn btn-primary\" "
-        "            style=\"margin-top:0.5rem\">Save</button>"
-        "        </form>"
-        "      </details>"
-        "    </div>"
-        "  </div>"
-        "</div>"
-        "</form>";
-
-    // Insecure-skip-client-verify (one-way TLS) — color red when enabled to flag the
-    // weakened posture in the operator dashboard, not just the warm-orange "warning" hue.
-    const bool insecure_skip = v.at("insecure_skip_client_verify").get<bool>();
-    std::string owt_cls = insecure_skip ? "role-badge role-bad" : "role-badge";
-    std::string owt_text = insecure_skip
-                               ? "Client cert verification DISABLED (--insecure-skip-client-verify)"
-                               : "Disabled (mTLS enforced)";
-    html += "<div class=\"form-row\" style=\"margin-top:0.75rem\">"
-            "  <label>Insecure Skip Client Verify</label>"
-            "  <span class=\"" +
-            owt_cls + "\">" + owt_text +
-            "</span>"
-            "</div>";
-
-    // Management TLS overrides
-    auto path_or_using_agent = [](const nlohmann::json& j) -> std::string {
-        auto s = j.get<std::string>();
-        return s.empty() ? "Using agent TLS" : html_escape(s);
-    };
-    std::string mgmt_cert = path_or_using_agent(v.at("mgmt_server_cert_path"));
-    std::string mgmt_key = path_or_using_agent(v.at("mgmt_server_key_path"));
-    std::string mgmt_ca = path_or_using_agent(v.at("mgmt_ca_cert_path"));
-
-    html +=
-        "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--line)\">"
-        "<div class=\"sub-head\" style=\"margin-top:0\">"
-        "Management listener TLS override</div>"
-        "<div class=\"form-row\">"
-        "  <label>Mgmt Certificate</label>"
-        "  <span class=\"file-name\">" +
-        mgmt_cert +
-        "</span>"
-        "</div>"
-        "<div class=\"form-row\">"
-        "  <label>Mgmt Private Key</label>"
-        "  <span class=\"file-name\">" +
-        mgmt_key +
-        "</span>"
-        "</div>"
-        "<div class=\"form-row\">"
-        "  <label>Mgmt CA Cert</label>"
-        "  <span class=\"file-name\">" +
-        mgmt_ca +
-        "</span>"
-        "</div>"
-        "</div>";
-
-    html += "<div class=\"feedback\" id=\"tls-feedback\"></div>";
-    return html;
+    security_render::TlsView view;
+    view.enabled = v.at("enabled").get<bool>();
+    view.cert_path = v.at("server_cert_path").get<std::string>();
+    view.key_path = v.at("server_key_path").get<std::string>();
+    view.ca_path = v.at("ca_cert_path").get<std::string>();
+    view.insecure_skip_client_verify = v.at("insecure_skip_client_verify").get<bool>();
+    view.mgmt_cert_path = v.at("mgmt_server_cert_path").get<std::string>();
+    view.mgmt_key_path = v.at("mgmt_server_key_path").get<std::string>();
+    view.mgmt_ca_path = v.at("mgmt_ca_cert_path").get<std::string>();
+    return security_render::render_tls(view);
 }
 
 std::string SettingsRoutes::render_users_fragment(const std::string& current_username) {
@@ -1641,170 +1464,68 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     return html;
 }
 
-std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
+std::string SettingsRoutes::render_mfa_fragment(const auth::Session& session,
                                                 const std::string& new_otpauth_uri,
                                                 const std::string& new_secret_b32,
                                                 const std::vector<std::string>& new_recovery_codes,
                                                 const std::string& enrollment_pending_for_verify,
                                                 const std::string& error_msg) {
-    // The fragment renders one of three lifecycle states:
-    //   1. Not enrolled — "Enable MFA" button
-    //   2. Provisional (enrollment initiated, code not yet verified) —
-    //      secret/URI shown, "Enter code to verify" form
-    //   3. Enrolled — status + "Regenerate recovery codes" + "Disable" buttons
+    // The fragment renders one of: store unavailable, SSO-managed, status unavailable,
+    //   1. Not enrolled — "Set up two-factor"
+    //   2. Provisional (enrollment initiated, code not yet verified) — secret/URI on the first
+    //      reveal only, then the code form. A wrong code re-renders the form WITHOUT the secret
+    //      (repeated verify failures must not fish it back out).
+    //   3. Enrolled — status + Regenerate + Disable, with a one-time recovery-code reveal.
+    const std::string& username = session.username;
+    security_render::MfaView view;
+    view.error_msg = error_msg;
+    view.enforcement_mode = cfg_ ? cfg_->mfa_enforcement : "optional";
+    view.enforcement_protects = mfa_enforcement_protects(view.enforcement_mode, session.role);
+
     auto* auth_db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
     if (!auth_db) {
-        return "<span class=\"muted\">MFA store unavailable (no AuthDB configured).</span>";
+        view.kind = security_render::MfaKind::kStoreUnavailable;
+        return security_render::render_mfa(view);
+    }
+    // An IdP principal (oidc:/saml:/ad:) has no local two-factor and fails the strict username
+    // check in mfa_status; say whose it is instead of printing "User not found".
+    if (is_reserved_identity_prefix(username)) {
+        view.kind = security_render::MfaKind::kSsoManaged;
+        return security_render::render_mfa(view);
     }
 
-    std::string html;
-    if (!error_msg.empty()) {
-        html += "<div class=\"error-msg feedback-error\" role=\"alert\" "
-                "style=\"margin-bottom: 0.75rem;\">" +
-                html_escape(error_msg) + "</div>";
-    }
-
-    // Provisional verification panel. Two shapes:
-    //   (a) First reveal post-init — `new_otpauth_uri` and
-    //       `new_secret_b32` are non-empty, render the QR/URI + verify
-    //       form (one-time reveal).
-    //   (b) Retry after a failed verify — empty new_otpauth_uri /
-    //       new_secret_b32 but `enrollment_pending_for_verify` is set:
-    //       render only the verify form with a hint to wait for the
-    //       next 30s window. We DO NOT re-reveal the secret here —
-    //       repeatedly re-emitting it on every failed verify would
-    //       defeat the one-time-reveal property (Gate 4 happy-path B3
-    //       + security defence-in-depth: an attacker triggering verify
-    //       failures should not fish the secret back).
     if (!enrollment_pending_for_verify.empty()) {
-        if (!new_otpauth_uri.empty()) {
-            // Server-rendered QR (issue #1232). The SVG is from the trusted
-            // qrcodegen encoder over our own otpauth URI — not operator input —
-            // so it is injected raw (it must not be html_escaped or it won't
-            // render). Empty on encode failure → text fallback still shows.
-            const std::string qr_svg = otpauth_qr_svg(new_otpauth_uri);
-            html += "<div class=\"token-reveal\">"
-                    "  <div class=\"token-reveal-header\">"
-                    "    SCAN THIS WITH YOUR AUTHENTICATOR APP — secret shown only once"
-                    "  </div>";
-            if (!qr_svg.empty()) {
-                html += "  <div style=\"display:flex;justify-content:center;margin:0.75rem 0\">"
-                        "    <div style=\"background:white;padding:8px;border-radius:var(--rad-panel);"
-                        "line-height:0\">" +
-                        qr_svg +
-                        "</div>"
-                        "  </div>"
-                        "  <div class=\"hint\" style=\"text-align:center\">Can't scan? Enter the secret below manually.</div>";
-            }
-            html += "  <div class=\"hint\" style=\"margin-top:0.5rem\">Base32 secret (manual entry):</div>"
-                    "  <code>" +
-                    html_escape(new_secret_b32) +
-                    "</code>"
-                    "  <div class=\"hint\" style=\"margin-top:0.5rem\">otpauth URI:</div>"
-                    "  <code style=\"display:block;word-break:break-all\">" +
-                    html_escape(new_otpauth_uri) +
-                    "</code>"
-                    "</div>";
-        } else {
-            html += "<div class=\"hint\" style=\"margin-bottom:0.75rem\">"
-                    "Codes refresh every 30 seconds — wait for the next code shown by your "
-                    "authenticator and try again. If you have lost the original QR code, "
-                    "press <strong>Disable MFA</strong> below and restart enrollment."
-                    "</div>";
-        }
-        html += "<form hx-post=\"/api/settings/mfa/verify\""
-                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
-                "      style=\"margin-top:1rem\">"
-                "  <div class=\"mini-field\">"
-                "    <label>Verification code from your app</label>"
-                "    <input type=\"text\" name=\"code\" inputmode=\"numeric\" "
-                "autocomplete=\"one-time-code\" autocapitalize=\"none\" autocorrect=\"off\" "
-                "spellcheck=\"false\" required style=\"width:120px\">"
-                "  </div>"
-                "  <button class=\"btn btn-primary\" type=\"submit\">Confirm</button>"
-                "  <button class=\"btn btn-secondary\" type=\"submit\""
-                "          hx-post=\"/api/settings/mfa/disable\""
-                "          hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
-                "          formnovalidate"
-                "          style=\"margin-left:0.5rem\">Disable MFA</button>"
-                "</form>";
-        return html;
+        view.kind = security_render::MfaKind::kProvisional;
+        view.otpauth_uri = new_otpauth_uri;
+        view.secret_b32 = new_secret_b32;
+        // Server-rendered QR (issue #1232), empty on encode failure (text fallback still shows).
+        if (!new_otpauth_uri.empty())
+            view.qr_svg = otpauth_qr_svg(new_otpauth_uri);
+        return security_render::render_mfa(view);
     }
 
     auto status_res = auth_db->mfa_status(username);
     if (!status_res) {
-        // Read-only display path — no session/MFA-skip decision is made
-        // here either way, but ★ (architect BLOCK follow-through) the
-        // message must not misreport a store/decrypt failure
-        // (SecretUnavailable/QueryFailed) as "user not found" — that would
-        // mislead an operator into thinking the account is gone rather than
-        // that MFA state is temporarily unreadable (retry, don't panic).
+        // Read-only display path — the message must not misreport a store/decrypt failure
+        // (SecretUnavailable/QueryFailed) as "user not found" (retry, don't panic).
         const bool store_unavailable = is_store_unavailable(status_res.error());
         if (store_unavailable && metrics_registry_) {
             metrics_registry_
                 ->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
                 .increment();
         }
-        return html +
-               (store_unavailable
-                    ? "<span class=\"muted\">MFA status is temporarily unavailable "
-                      "(authentication store error) — retry shortly.</span>"
-                    : "<span class=\"muted\">User not found for MFA status.</span>");
+        view.kind = store_unavailable ? security_render::MfaKind::kStatusUnavailable
+                                      : security_render::MfaKind::kUserNotFound;
+        return security_render::render_mfa(view);
     }
     const auto& status = *status_res;
-
-    if (!new_recovery_codes.empty()) {
-        html += "<div class=\"token-reveal\">"
-                "  <div class=\"token-reveal-header\">"
-                "    STORE THESE RECOVERY CODES NOW — each can be used once to bypass MFA"
-                "  </div>"
-                "  <ul style=\"font-family:var(--mono);margin:0.5rem 0;padding-left:1.25rem\">";
-        for (const auto& code : new_recovery_codes) {
-            html += "<li><code>" + html_escape(code) + "</code></li>";
-        }
-        html += "</ul></div>";
-    }
-
-    html += "<div style=\"display:flex;align-items:center;gap:1rem;margin-bottom:1rem\">";
-    if (status.enrolled) {
-        html += "<span class=\"role-badge role-ok\">Enabled</span>"
-                "<span class=\"hint\">"
-                "Enrolled " +
-                html_escape(status.enrolled_at) + " UTC</span>";
-    } else if (!status.disabled_at.empty()) {
-        html += "<span class=\"role-badge\">Disabled</span>"
-                "<span class=\"hint\">"
-                "Last disabled " +
-                html_escape(status.disabled_at) + " UTC</span>";
-    } else {
-        html += "<span class=\"role-badge\">Not enrolled</span>";
-    }
-    html += "</div>";
-
-    if (status.enrolled) {
-        html += "<div style=\"margin-bottom:0.75rem\">"
-                "Recovery codes remaining: <strong>" +
-                std::to_string(status.recovery_codes_remaining) +
-                "</strong></div>"
-                "<form hx-post=\"/api/settings/mfa/recovery-codes\""
-                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
-                "      style=\"display:inline-block;margin-right:0.5rem\">"
-                "  <button class=\"btn btn-secondary\" type=\"submit\">Regenerate recovery codes</button>"
-                "</form>"
-                "<form hx-post=\"/api/settings/mfa/disable\""
-                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
-                "      hx-confirm=\"Disable MFA for your account? Step-up authentication will no "
-                "longer be required.\""
-                "      style=\"display:inline-block\">"
-                "  <button class=\"btn btn-danger\" type=\"submit\">Disable MFA</button>"
-                "</form>";
-    } else {
-        html += "<form hx-post=\"/api/settings/mfa/init\""
-                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\">"
-                "  <button class=\"btn btn-primary\" type=\"submit\">Enable MFA</button>"
-                "</form>";
-    }
-    return html;
+    view.kind = status.enrolled ? security_render::MfaKind::kEnrolled
+                                : security_render::MfaKind::kNotEnrolled;
+    view.enrolled_at = status.enrolled_at;
+    view.disabled_at = status.disabled_at;
+    view.recovery_codes_remaining = static_cast<int>(status.recovery_codes_remaining);
+    view.new_recovery_codes = new_recovery_codes;
+    return security_render::render_mfa(view);
 }
 
 std::string SettingsRoutes::render_pending_fragment() {
@@ -2241,62 +1962,13 @@ std::string SettingsRoutes::render_https_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/https formats the SAME
     // JSON as its response body instead of re-deriving these fields.
     const auto v = settings_model::build_https_settings(*cfg_);
-    const bool https_enabled = v.at("enabled").get<bool>();
-
-    std::string html;
-
-    std::string status_cls = https_enabled ? "role-badge role-ok" : "role-badge";
-    std::string status_text = https_enabled ? "Enabled" : "Disabled";
-
-    html += "<div class=\"form-row\">"
-            "  <label>HTTPS</label>"
-            "  <span class=\"" + status_cls + "\">" + status_text +
-            "</span>"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>HTTPS Port</label>"
-            "  <code>" +
-            std::to_string(v.at("port").get<int>()) +
-            "</code>"
-            "</div>";
-
-    auto path_or_not_configured = [](const nlohmann::json& j) -> std::string {
-        auto s = j.get<std::string>();
-        return s.empty() ? "Not configured" : html_escape(s);
-    };
-    std::string https_cert = path_or_not_configured(v.at("cert_path"));
-    std::string https_key = path_or_not_configured(v.at("key_path"));
-
-    html += "<div class=\"form-row\">"
-            "  <label>Certificate</label>"
-            "  <span class=\"file-name\">" +
-            https_cert +
-            "</span>"
-            "</div>";
-    html += "<div class=\"form-row\">"
-            "  <label>Private Key</label>"
-            "  <span class=\"file-name\">" +
-            https_key +
-            "</span>"
-            "</div>";
-
-    const bool redirect = v.at("redirect").get<bool>();
-    std::string redir_cls = redirect ? "role-badge role-ok" : "role-badge";
-    std::string redir_text = redirect ? "Enabled" : "Disabled";
-    html += "<div class=\"form-row\">"
-            "  <label>HTTP Redirect</label>"
-            "  <span class=\"" + redir_cls + "\">" + redir_text +
-            "</span>"
-            "</div>";
-
-    if (!https_enabled) {
-        html += "<p class=\"section-note\">"
-                "Start the server with <code>--https --https-cert &lt;path&gt; --https-key "
-                "&lt;path&gt;</code> to enable.</p>";
-    }
-
-    return html;
+    security_render::HttpsView view;
+    view.enabled = v.at("enabled").get<bool>();
+    view.port = v.at("port").get<int>();
+    view.cert_path = v.at("cert_path").get<std::string>();
+    view.key_path = v.at("key_path").get<std::string>();
+    view.redirect = v.at("redirect").get<bool>();
+    return security_render::render_https(view);
 }
 
 std::string SettingsRoutes::render_analytics_fragment() {
@@ -2613,118 +2285,29 @@ std::string SettingsRoutes::render_nvd_fragment() {
     return html;
 }
 
-std::string SettingsRoutes::render_directory_fragment() {
-    std::string html;
-
-    // A Settings save assigns these under the exclusive OIDC lock; read them under the shared
-    // one so a page render never overlaps a save's writes (the callers hold neither lock).
-    std::string snap_issuer, snap_client_id, snap_redirect_uri, snap_admin_group;
-    bool snap_secret_set = false; // the secret itself is never copied into this render
-    bool snap_skip_tls_verify = false;
+std::string SettingsRoutes::render_directory_fragment(const std::string& message,
+                                                      bool message_is_error) {
+    security_render::DirectoryView view;
     {
+        // The save handler reassigns cfg_->oidc_* and the provider under the unique lock; read
+        // the form values and the live provider state under the shared one.
         yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
-        std::shared_lock oidc_lock(*oidc_mu_);
-        snap_issuer = cfg_->oidc_issuer;
-        snap_client_id = cfg_->oidc_client_id;
-        snap_secret_set = !cfg_->oidc_client_secret.empty();
-        snap_redirect_uri = cfg_->oidc_redirect_uri;
-        snap_admin_group = cfg_->oidc_admin_group;
-        snap_skip_tls_verify = cfg_->oidc_skip_tls_verify;
+        std::shared_lock lock(*oidc_mu_);
+        view.issuer = cfg_->oidc_issuer;
+        view.client_id = cfg_->oidc_client_id;
+        view.redirect_uri = cfg_->oidc_redirect_uri;
+        view.admin_group = cfg_->oidc_admin_group;
+        view.secret_stored = !cfg_->oidc_client_secret.empty();
+        view.skip_tls_verify = cfg_->oidc_skip_tls_verify;
+        const bool configured = !cfg_->oidc_issuer.empty() && !cfg_->oidc_client_id.empty();
+        const bool running = oidc_provider_ && *oidc_provider_ && (*oidc_provider_)->is_enabled();
+        view.state = running      ? security_render::SsoState::kRunning
+                     : configured ? security_render::SsoState::kSavedNotRunning
+                                  : security_render::SsoState::kNotConfigured;
     }
-
-    bool oidc_configured = !snap_issuer.empty() && !snap_client_id.empty();
-
-    if (oidc_configured) {
-        html += "<div style=\"margin-bottom:1rem\">"
-                "  <span class=\"role-badge role-ok\">Configured</span>"
-                "</div>";
-    } else {
-        html += "<div style=\"margin-bottom:1rem\">"
-                "  <span class=\"role-badge role-warn\">Not configured</span>"
-                "</div>";
-    }
-
-    html += "<form hx-post=\"/api/settings/oidc\" "
-            "hx-target=\"#directory-section\" hx-swap=\"innerHTML\">";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Issuer URL</label>"
-            "  <input type=\"text\" name=\"issuer\" "
-            "value=\"" +
-            html_escape(snap_issuer) +
-            "\" "
-            "placeholder=\"https://login.microsoftonline.com/&lt;tenant-guid&gt;/v2.0\" "
-            "style=\"flex:1;min-width:0\">"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Client ID</label>"
-            "  <input type=\"text\" name=\"client_id\" "
-            "value=\"" +
-            html_escape(snap_client_id) +
-            "\" "
-            "placeholder=\"Application (client) ID from Azure portal\" "
-            "style=\"flex:1;min-width:0\">"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Client Secret</label>"
-            "  <input type=\"password\" name=\"client_secret\" "
-            "value=\"\" "
-            "placeholder=\"" +
-            (!snap_secret_set ? std::string("Client secret value")
-                                              : std::string("********")) +
-            "\" "
-            "style=\"flex:1;min-width:0\">"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Redirect URI</label>"
-            "  <input type=\"text\" name=\"redirect_uri\" "
-            "value=\"" +
-            html_escape(snap_redirect_uri) +
-            "\" "
-            "placeholder=\"Required: https://&lt;server&gt;/auth/callback, exactly as registered "
-            "at the IdP\" "
-            "style=\"flex:1;min-width:0\">"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Admin Group ID</label>"
-            "  <input type=\"text\" name=\"admin_group\" "
-            "value=\"" +
-            html_escape(snap_admin_group) +
-            "\" "
-            "placeholder=\"Entra group object ID for admin role mapping\" "
-            "style=\"flex:1;min-width:0\">"
-            "</div>";
-
-    std::string tls_checked = snap_skip_tls_verify ? " checked" : "";
-    html += "<div class=\"form-row\">"
-            "  <label>Skip TLS Verify</label>"
-            "  <label class=\"toggle\">"
-            "    <input type=\"checkbox\" name=\"skip_tls_verify\" value=\"true\"" +
-            tls_checked +
-            ">"
-            "    <span class=\"slider\"></span>"
-            "  </label>"
-            "  <span class=\"role-badge role-bad\">"
-            "Insecure — dev only</span>"
-            "</div>";
-
-    html += "<div style=\"margin-top:1rem;display:flex;gap:0.75rem;align-items:center\">"
-            "  <button class=\"btn btn-primary\" type=\"submit\">Save OIDC Configuration</button>"
-            "  <button class=\"btn btn-secondary\" type=\"button\" "
-            "hx-post=\"/api/settings/oidc/test\" "
-            "hx-target=\"#oidc-feedback\" hx-swap=\"innerHTML\" "
-            "hx-include=\"closest form\">Test Connection</button>"
-            "</div>";
-
-    html += "</form>";
-
-    html += "<div class=\"feedback\" id=\"oidc-feedback\"></div>";
-
-    return html;
+    view.message = message;
+    view.message_is_error = message_is_error;
+    return security_render::render_directory(view);
 }
 
 // ── Plugin code-signing settings ────────────────────────────────────────────
@@ -3044,6 +2627,16 @@ void SettingsRoutes::register_routes(
             return;
         }
         res.set_content(kSettingsHtml, "text/html; charset=utf-8");
+    });
+
+    // Security and sign-in (System page): SSO, two-factor, dashboard HTTPS, agent mTLS. Hosts
+    // the same four fragments /settings loads; no new fragment or REST route.
+    sink.Get("/settings/security", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!admin_fn_(req, res)) {
+            res.set_redirect("/");
+            return;
+        }
+        res.set_content(kSettingsSecurityHtml, "text/html; charset=utf-8");
     });
 
     // -- Settings HTMX fragment endpoints -------------------------------------
@@ -4085,7 +3678,7 @@ void SettingsRoutes::register_routes(
                      cfg_->tls_enabled ? "enabled" : "disabled");
         res.set_header("HX-Retarget", "#tls-section");
         res.set_header("HX-Trigger",
-                       R"({"showToast":{"message":"TLS settings saved","level":"success"}})");
+                       R"({"showToast":{"message":"The mTLS value shown changed. It is not saved; the start-up flags decide.","level":"info"}})");
         res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
     });
 
@@ -4173,7 +3766,7 @@ void SettingsRoutes::register_routes(
 
         if (type.empty() || content.empty()) {
             res.status = 400;
-            res.set_header("HX-Retarget", "#tls-section");
+            res.set_header("HX-Retarget", "#tls-feedback");
             res.set_content(
                 "<span class=\"feedback-error\">Type and PEM content are required.</span>",
                 "text/html; charset=utf-8");
@@ -4182,7 +3775,7 @@ void SettingsRoutes::register_routes(
 
         if (content.size() > 65536) {
             res.status = 400;
-            res.set_header("HX-Retarget", "#tls-section");
+            res.set_header("HX-Retarget", "#tls-feedback");
             res.set_content(
                 "<span class=\"feedback-error\">PEM content too large (max 64 KB).</span>",
                 "text/html; charset=utf-8");
@@ -4192,7 +3785,7 @@ void SettingsRoutes::register_routes(
         if (content.find("-----BEGIN") == std::string::npos ||
             content.find("-----END") == std::string::npos) {
             res.status = 400;
-            res.set_header("HX-Retarget", "#tls-section");
+            res.set_header("HX-Retarget", "#tls-feedback");
             res.set_content("<span class=\"feedback-error\">Invalid PEM: must contain -----BEGIN "
                             "and -----END markers.</span>",
                             "text/html; charset=utf-8");
@@ -4210,7 +3803,7 @@ void SettingsRoutes::register_routes(
             out_name = "ca.pem";
         else {
             res.status = 400;
-            res.set_header("HX-Retarget", "#tls-section");
+            res.set_header("HX-Retarget", "#tls-feedback");
             res.set_content("<span class=\"feedback-error\">Type must be cert, key, or ca.</span>",
                             "text/html; charset=utf-8");
             return;
@@ -4277,11 +3870,20 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto issuer = extract_form_value(req.body, "issuer");
-        auto client_id = extract_form_value(req.body, "client_id");
+        // Trimmed: the start-up flag path trims admin_group, this one did not, and a trailing
+        // space silently demotes every SSO admin at their next sign-in.
+        auto trimmed = [&](const char* key) {
+            auto v = extract_form_value(req.body, key);
+            const auto b = v.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos)
+                return std::string{};
+            return v.substr(b, v.find_last_not_of(" \t\r\n") - b + 1);
+        };
+        auto issuer = trimmed("issuer");
+        auto client_id = trimmed("client_id");
         auto client_secret = extract_form_value(req.body, "client_secret");
-        auto redirect_uri = extract_form_value(req.body, "redirect_uri");
-        auto admin_group = extract_form_value(req.body, "admin_group");
+        auto redirect_uri = trimmed("redirect_uri");
+        auto admin_group = trimmed("admin_group");
         auto skip_tls_verify = extract_form_value(req.body, "skip_tls_verify");
 
         // The dashboard's htmx config does not swap a 4xx body (see the 503 branch of the DEX
@@ -4291,10 +3893,8 @@ void SettingsRoutes::register_routes(
             res.status = 400;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Issuer URL and Client ID are required","level":"error"}})");
-            auto html = render_directory_fragment() +
-                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
-                        "hx-swap-oob=\"true\">Issuer URL and Client ID are required.</div>";
-            res.set_content(html, "text/html; charset=utf-8");
+            res.set_content(render_directory_fragment("Issuer URL and Client ID are required."),
+                            "text/html; charset=utf-8");
             return;
         }
         // A provider without a redirect_uri never fetches discovery and /auth/oidc/start answers
@@ -4304,11 +3904,10 @@ void SettingsRoutes::register_routes(
             res.status = 400;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Redirect URI is required: enter the callback URL registered at the IdP","level":"error"}})");
-            auto html = render_directory_fragment() +
-                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
-                        "hx-swap-oob=\"true\">Redirect URI is required: enter the callback URL "
-                        "registered at the IdP (https://&lt;server&gt;/auth/callback).</div>";
-            res.set_content(html, "text/html; charset=utf-8");
+            res.set_content(
+                render_directory_fragment("Redirect URI is required: enter the callback URL "
+                                          "registered at the IdP (https://<server>/auth/callback)."),
+                "text/html; charset=utf-8");
             return;
         }
 
@@ -4412,11 +4011,9 @@ void SettingsRoutes::register_routes(
             // htmx swaps neither 4xx nor 5xx, so a toast is the only thing the operator sees.
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"OIDC provider could not be initialised; see the server log","level":"error"}})");
-            auto html = render_directory_fragment() +
-                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
-                        "hx-swap-oob=\"true\">OIDC init failed: " +
-                        html_escape(e.what()) + "</div>";
-            res.set_content(html, "text/html; charset=utf-8");
+            res.set_content(
+                render_directory_fragment(std::string("OIDC init failed: ") + e.what()),
+                "text/html; charset=utf-8");
             return;
         }
 
@@ -4493,15 +4090,15 @@ void SettingsRoutes::register_routes(
             }
             audit_fn_(req, "oidc.configure", "failure", "OidcConfig", issuer,
                       "persist failed: " + joined);
-            auto html = render_directory_fragment() +
-                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
-                        "hx-swap-oob=\"true\">OIDC applied to the running server, but these "
-                        "settings could NOT be saved: " +
-                        html_escape(joined) +
-                        ". Any other settings in this form WERE saved, so the stored "
-                        "configuration is now inconsistent with the running server. Fix the "
-                        "cause and save again.</div>";
-            res.set_content(html, "text/html; charset=utf-8");
+            res.set_content(
+                render_directory_fragment(
+                    "OIDC applied to the running server, but these settings could NOT be "
+                    "saved: " +
+                    joined +
+                    ". Any other settings in this form WERE saved, so the stored "
+                    "configuration is now inconsistent with the running server. Fix the "
+                    "cause and save again."),
+                "text/html; charset=utf-8");
             return;
         }
 
@@ -7012,7 +6609,7 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
-        res.set_content(render_mfa_fragment(session->username), "text/html; charset=utf-8");
+        res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
     });
 
     sink.Post("/api/settings/mfa/init", [this, set_no_store, origin_safe](
@@ -7031,7 +6628,7 @@ void SettingsRoutes::register_routes(
             audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username,
                       "auth_db unavailable");
             res.set_content(
-                render_mfa_fragment(session->username, {}, {}, {}, {}, "MFA backend unavailable"),
+                render_mfa_fragment(*session, {}, {}, {}, {}, "MFA backend unavailable"),
                 "text/html; charset=utf-8");
             return;
         }
@@ -7047,7 +6644,7 @@ void SettingsRoutes::register_routes(
             // Settings init/verify).
             audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
                       "credential_changed");
-            res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+            res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                 kMfaCredentialChangedMsg),
                             "text/html; charset=utf-8");
             return;
@@ -7069,13 +6666,13 @@ void SettingsRoutes::register_routes(
                 }
             }
             audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username, msg);
-            res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {}, msg),
+            res.set_content(render_mfa_fragment(*session, {}, {}, {}, {}, msg),
                             "text/html; charset=utf-8");
             return;
         }
         audit_fn_(req, "mfa.enroll.initiated", "ok", "User", session->username, "");
         set_no_store(res);
-        res.set_content(render_mfa_fragment(session->username, init->otpauth_uri,
+        res.set_content(render_mfa_fragment(*session, init->otpauth_uri,
                                             init->secret_base32, {}, session->username),
                         "text/html; charset=utf-8");
     });
@@ -7095,7 +6692,7 @@ void SettingsRoutes::register_routes(
                   auto code = extract_form_value(req.body, "code");
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
                       return;
@@ -7110,7 +6707,7 @@ void SettingsRoutes::register_routes(
                       // the credential change); the session is being revoked.
                       audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
                                 "credential_changed");
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           kMfaCredentialChangedMsg),
                                       "text/html; charset=utf-8");
                       return;
@@ -7145,7 +6742,7 @@ void SettingsRoutes::register_routes(
                                     "already enrolled by a concurrent verify; no duplicate "
                                     "enrollment");
                           res.set_content(
-                              render_mfa_fragment(session->username, {}, {}, {}, session->username,
+                              render_mfa_fragment(*session, {}, {}, {}, session->username,
                                                   "MFA is already enrolled on this account."),
                               "text/html; charset=utf-8");
                           return;
@@ -7165,7 +6762,7 @@ void SettingsRoutes::register_routes(
                               ? "Authentication store is temporarily unavailable — retry shortly."
                               : "Code rejected. Try the next code shown by your authenticator "
                                 "(codes refresh every 30 seconds).";
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {},
                                                           session->username, msg),
                                       "text/html; charset=utf-8");
                       return;
@@ -7174,7 +6771,7 @@ void SettingsRoutes::register_routes(
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);
-                  res.set_content(render_mfa_fragment(session->username, {}, {}, *codes_res),
+                  res.set_content(render_mfa_fragment(*session, {}, {}, *codes_res),
                                   "text/html; charset=utf-8");
               });
 
@@ -7192,7 +6789,7 @@ void SettingsRoutes::register_routes(
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
                       return;
@@ -7202,7 +6799,7 @@ void SettingsRoutes::register_routes(
                       audit_fn_(req, "mfa.recovery_codes.generated", "error", "User",
                                 session->username, "regeneration failed");
                       res.set_content(
-                          render_mfa_fragment(session->username, {}, {}, {}, {},
+                          render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Could not regenerate codes"),
                           "text/html; charset=utf-8");
                       return;
@@ -7210,7 +6807,7 @@ void SettingsRoutes::register_routes(
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued (rotation)");
                   set_no_store(res);
-                  res.set_content(render_mfa_fragment(session->username, {}, {}, *codes),
+                  res.set_content(render_mfa_fragment(*session, {}, {}, *codes),
                                   "text/html; charset=utf-8");
               });
 
@@ -7227,7 +6824,7 @@ void SettingsRoutes::register_routes(
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
                       return;
@@ -7249,7 +6846,7 @@ void SettingsRoutes::register_routes(
                                 "blocked: mfa_enforcement=" + mfa_mode);
                       res.set_content(
                           render_mfa_fragment(
-                              session->username, {}, {}, {}, {},
+                              *session, {}, {}, {}, {},
                               "MFA is required by policy (enforcement=" + mfa_mode +
                                   ") and cannot be disabled for your account."),
                           "text/html; charset=utf-8");
@@ -7259,13 +6856,13 @@ void SettingsRoutes::register_routes(
                   if (!r) {
                       audit_fn_(req, "mfa.disabled", "error", "User", session->username,
                                 "disable failed");
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "Could not disable MFA"),
                                       "text/html; charset=utf-8");
                       return;
                   }
                   audit_fn_(req, "mfa.disabled", "ok", "User", session->username, "");
-                  res.set_content(render_mfa_fragment(session->username),
+                  res.set_content(render_mfa_fragment(*session),
                                   "text/html; charset=utf-8");
               });
 }

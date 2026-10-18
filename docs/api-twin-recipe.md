@@ -607,12 +607,15 @@ see §5 for which chokepoints apply.
     lower, `BASELINE_GENERIC_PLANNED` included) or the `GRANDFATHERED_MAX` / set-size pair should be
     rebased immediately before merge: two PRs that each change the same baseline by the same
     amount merge cleanly yet fail the ratchet on the merged tree, and two PRs that each remove a
-    different grandfathered id and lower the max merge clean and leave the set at 15 with the max
-    at 16. The fix is to set the constants to the values the checker prints, then re-run
+    different grandfathered id and lower the max merge clean and leave the set one id smaller than
+    the max. The fix is to set the constants to the values the checker prints, then re-run
     `--render-doc` and splice the block again. A route rename changes its derived
     `capability_id`: rename the id in the JSON (a grandfathered row that is renamed must be
     converted to the strict shape, unless the set is edited, which is review-only, since the set
     is keyed by id).
+    Flipping a converted #520 row to twinned also needs the MCP tier decision amended
+    (`mcp_policy.hpp` `tier_allows`, the ADR-1005 #4028 entry and the `docs/mcp-server.md` bullet
+    "Server administration surfaces stay REST-only (#520)"), which the gate does not check.
 
 ---
 

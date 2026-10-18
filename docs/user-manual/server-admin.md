@@ -2404,7 +2404,7 @@ assurance package if you answer data-egress questions.
 
 ### vNEXT — `POST /login` returns 202 for MFA-enrolled users (breaking)
 
-Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `POST /login` and treat anything other than `HTTP 200 + {"status":"ok"}` as failure will silently break the first time an authenticating user enrolls in TOTP MFA via Settings → Multi-Factor Authentication. The new response is `HTTP 202` with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — handle this branch by posting `mfa_pending_token` + the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `POST /login/mfa` to mint the session cookie. See `docs/user-manual/authentication.md` § Multi-Factor Authentication for the full flow.
+Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `POST /login` and treat anything other than `HTTP 200 + {"status":"ok"}` as failure will silently break the first time an authenticating user enrolls in TOTP MFA via Settings → Security and sign-in → Two-factor sign-in. The new response is `HTTP 202` with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — handle this branch by posting `mfa_pending_token` + the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `POST /login/mfa` to mint the session cookie. See `docs/user-manual/authentication.md` § Multi-Factor Authentication for the full flow.
 
 MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` now **enforce** — see the breaking note in `docs/user-manual/upgrading.md`), `--mfa-step-up-window-secs` (default `300`), `--mfa-login-pending-secs` (default `120`), and the break-glass `--mfa-reset <username>` (clears a locked-out user's MFA and exits, writing an `mfa.reset.breakglass` audit row — see `docs/ops-runbooks/auth-db-recovery.md`). Recovery code format changed from `XXXXX-XXXXX` (50 bits) to `XXXX-XXXX-XXXX-XXXX` (80 bits) — codes printed by earlier PR1 commits remain valid until consumed or regenerated. The break-glass procedure for a user who has lost both their authenticator and all recovery codes — and the recovery path for an operator locked out by an enforcement misconfiguration (SSO IdP not asserting `amr`, or a sole admin who could not enroll) — lives at `docs/ops-runbooks/auth-db-recovery.md`.
 
@@ -2938,9 +2938,9 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 
 | Section | Fragment Route | Description |
 |---|---|---|
-| TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
+| TLS Configuration | `/fragments/settings/tls` | Agent (gRPC) certificate, key and CA upload or paste, plus the in-memory mTLS display switch. Does not control dashboard HTTPS (see `/fragments/settings/https`, read-only). Shown on **Settings → Security and sign-in** as "Agent connections (mTLS)". |
 | User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. The **Users and roles** page (`/access/users`) in the Access section of the sidebar offers add, remove, change role, revoke sessions, and your own password change and sign-out-everywhere; resetting another user's password stays here or on the REST route. |
-| Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
+| Two-factor sign-in (MFA) | `/fragments/settings/mfa` | Shown on **Settings → Security and sign-in**. Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. Also shown on the **Groups and enrolment** page (`/groups`, **Estate** group), from the same fragment. |
 | Pending Agent Approvals | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. Also shown on **Groups and enrolment**. |
 | Auto-Approve Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). Also shown on **Groups and enrolment**. |
@@ -2949,7 +2949,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. The upload form also takes an optional detached CMS **Signature** (`.sig`, max 64 KB), stored as a sidecar beside the binary and served to agents on `CheckForUpdate` — see *Signing update binaries*. The server stores but never verifies it. |
 | Tag Compliance | *(moved)* | Now the **Compliance by tag** panel on the Compliance page; see [Tag Compliance](#tag-compliance). |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
-| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart rebuilds the provider from the command-line/environment value, so a durable rotation must update that too; the stored admin group is the exception and still applies; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
+| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with a "Test SSO" button (checks the issuer's discovery document and signing keys). Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart rebuilds the provider from the command-line/environment value, so a durable rotation must update that too; the stored admin group is the exception and still applies; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
 | Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). A view over the same `AuditLog:Read`/`AuditLog:Attest`-gated `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. See `docs/auth-architecture.md` "Periodic access reviews". |
 
@@ -3051,7 +3051,7 @@ signer leaf's own **expiry** already matters: once its `not_after` passes,
 
 The Yuzu server has **two independent TLS surfaces**:
 
-1. **HTTPS** — the dashboard and REST API (port 8443 by default). Configured via `--https-cert` / `--https-key` (or runtime via the Settings page). Disabled with `--no-https`.
+1. **HTTPS** — the dashboard and REST API (port 8443 by default). Configured via `--https-cert` / `--https-key` (the Settings page only displays it). Disabled with `--no-https`.
 2. **gRPC TLS** — the agent listener (port 50051) and the management listener (port 50052). Configured via `--cert` / `--key` / `--ca-cert` (and optionally `--management-cert` / `--management-key` / `--management-ca-cert` for a separate management cert). Disabled entirely with `--no-tls`.
 
 The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).
@@ -3112,10 +3112,10 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 
 ### Via Settings Page
 
-1. Navigate to **Settings > TLS Configuration**.
-2. Toggle **Enable HTTPS**.
-3. Upload PEM-encoded certificate and private key files using the **Upload PEM** button, or paste PEM content directly using the **Paste PEM** button.
-4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS, except GET/HEAD on the four health-probe paths (see Probing a TLS-enabled server).
+The **Settings → Security and sign-in** page has two certificate panels, and neither one turns HTTPS on:
+
+1. **Dashboard HTTPS** is read-only. It shows whether HTTPS is on, the port, the certificate and key paths and the HTTP redirect. The dashboard certificate and key come from `--https-cert` / `--https-key` and reload from disk when the files change (not when the server runs with `--no-cert-reload`). There is no HTTPS toggle and no dashboard-certificate upload.
+2. **Agent connections (mTLS)** uploads or pastes the three agent (gRPC) files: server certificate, private key and CA certificate. Each replace asks for confirmation, overwrites the file with no backup, and does not change the running listeners (gRPC certificate hot-reload is not supported). After a restart the server uses the uploaded file only if `--cert`, `--key` and `--ca-cert` name it; if they do and the material is wrong, the server will not start. The gateway command plane pins the server certificate, so changing it can stop command forwarding. The mTLS switch on this panel changes only the value this server reports; it is not saved.
 
 ### Certificate Requirements
 
@@ -5137,7 +5137,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/fragments/settings/tls` | Render the TLS configuration fragment (HTMX). |
-| `POST` | `/api/settings/tls` | Update TLS settings (enable/disable, port). |
+| `POST` | `/api/settings/tls` | Change the in-memory mTLS value this server reports (not saved; start-up flags decide). |
 | `POST` | `/api/settings/cert-upload` | Upload PEM certificate and key files (multipart form). |
 | `POST` | `/api/settings/cert-paste` | Paste PEM certificate content (form-encoded). |
 
@@ -5227,6 +5227,19 @@ A store that does not answer is shown as an unavailable panel, never as an empty
 | `GET` | `/fragments/access/principals/detail` | One principal with its active credentials and roles (HTMX). `?id=engine:<slug>`. Same gate. Writes an `engine_principal.get` audit row, plus `engine_principal.role.listed` when the roles were read. A revoked principal's revocation detail needs `AuditLog:Read` and is otherwise shown as withheld (also when the grant could not be confirmed). |
 
 Each panel loads on its own. A refused browser session writes no denied-access audit row for any of them (the panels load automatically, so opening the page must not fill the audit log); a refused API or MCP token that reaches a fragment URL does. The no-administrator check at the top of the principals panel (a call to `/api/v1/engine-principals/audit/no-admin`, which needs `AuditLog:Read`) runs only when the principals fragment reports that the caller holds that permission. The `AuditLog:Read` checks that decide this (and whether a revoked principal's free-text detail is shown) are quiet for browser sessions only: a non-browser caller that holds `EnginePrincipal:Read` but not `AuditLog:Read` writes one ordinary permission-denied row per principals-list load and per revoked-principal detail load. The no-administrator result is a statement about the roles and grants the server could read: a role read that degrades is not distinguishable from "no roles" on that route, so the page words a clean result accordingly. Device tokens are not shown on this page.
+
+### Audit and reviews page
+
+`/access/audit` (Access group in the navigation) shows the audit log, an authentication sample and the audit retention period. It is read-only. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty. See [Audit Log](audit-log.md#dashboard-viewer) for what each panel shows.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/access/audit` | The page. Redirects to `/login` without a session. |
+| `GET` | `/fragments/access/audit/log` | Audit log panel (HTMX). Gated on `AuditLog:Read`. Query: `range` (`1h`, `24h` or `7d`), `principal`, `action` (exact), `offset` (0 to 10000). Fixed 50-row pages; `limit` is never read. Writes no audit row. |
+| `GET` | `/fragments/access/audit/sample` | Authentication sample (HTMX). Gated on `AuditLog:Read`. Query: `limit` (1 to 1000). Requested only by the **Draw sample** button; writes an `audit.auth_sample.exported` row. |
+| `GET` | `/fragments/access/audit/retention` | Retention panel (HTMX). Gated on `ServerConfig:Read`. Requested only by the **Show retention** button. |
+
+A request the page cannot honour (an unknown range, an `offset` past 10000, a NUL byte in a filter, a bad sample size) is answered with status 200 and a short note, because htmx discards 4xx and 5xx bodies; nothing is read from the store.
 
 ### OTA Updates
 
