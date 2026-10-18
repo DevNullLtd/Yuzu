@@ -906,3 +906,28 @@ TEST_CASE("approval_routes: wiring -- server.cpp still calls register_approval_r
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_approval_routes(") != std::string::npos);
 }
+
+// QE-1 (#6061): the Deps block is built with designated initialisers, and omitting one
+// COMPILES (the member is value-initialised). Dropping `.step_up_fn` would 503 every real
+// approval (the route fails closed on an unwired closure); dropping `.csrf_trusted_origins`
+// would silently narrow the same-site gate to the request's own Host, rejecting every
+// deployment behind a TLS-terminating proxy. Neither shows up in the handler tests, which
+// build their own Deps, so pin both inside the production call.
+TEST_CASE("approval_routes: wiring -- server.cpp passes step_up_fn and csrf_trusted_origins "
+          "into the approval Deps",
+          "[server][routes][approval_routes]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const auto call = src.find("approval::register_approval_routes(");
+    REQUIRE(call != std::string::npos);
+    // The call's Deps block ends at the ApprovalManager pointer, its last member.
+    const auto end = src.find(".approval_manager = approval_manager_.get()", call);
+    REQUIRE(end != std::string::npos);
+    const std::string block = src.substr(call, end - call);
+    CHECK(block.find(".step_up_fn = step_up_fn") != std::string::npos);
+    CHECK(block.find(".csrf_trusted_origins = cfg_.csrf_trusted_origins") != std::string::npos);
+    CHECK(block.find(".perm_fn = perm_fn") != std::string::npos);
+    CHECK(block.find(".resolve_session_fn = resolve_session_fn") != std::string::npos);
+    CHECK(block.find(".audit_fn = audit_fn") != std::string::npos);
+}
