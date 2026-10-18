@@ -180,8 +180,9 @@ dispatches.
    cannot be decided again.
 5. Clean up. Reject every test request that is still pending, from the dashboard Approvals page or with
    `POST /api/approvals/{id}/reject` (same gates as approve: a human session with a fresh step-up, a same-site
-   `Origin`, and not the submitter). A ticket that is already `approved` cannot be rejected; it stays in the list
-   until its 7-day lifetime has passed and, for an instruction-origin ticket, dispatches nothing. Record the
+   `Origin`, and not the submitter). A ticket that is already `approved` cannot be rejected; it stays listed as
+   `approved`, flips to `expired` when the next approval submission is accepted (#6098), is never deleted, and, for an
+   instruction-origin ticket, dispatches nothing. Record the
    ids of the approved test tickets in your change record so nobody mistakes them for a real decision later.
 
 **Rolling back, or running mixed versions.** This change adds no schema, so a rollback starts cleanly. What
