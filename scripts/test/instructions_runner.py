@@ -1300,8 +1300,11 @@ def write_output(path: str, payload: dict, exclusive: bool = False) -> None:
             if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
                 raise OSError("refusing to write: not a regular file with a single link")
             os.ftruncate(fd, 0)
-        if hasattr(os, "set_blocking"):
-            os.set_blocking(fd, True)
+        if getattr(os, "O_NONBLOCK", 0) and hasattr(os, "set_blocking"):
+            try:
+                os.set_blocking(fd, True)
+            except OSError:
+                pass   # Windows limits set_blocking to pipes; a regular file never needed it
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fd = -1   # the file object owns it now
             fh.write(json.dumps(payload, indent=2))
