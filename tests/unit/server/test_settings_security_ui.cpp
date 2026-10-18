@@ -573,14 +573,15 @@ TEST_CASE("OIDC save: issuer, client id, redirect URI and admin group are trimme
     // config is what this case pins.
     auto res = h.sink.Post("/api/settings/oidc",
                            "issuer=%20https%3A%2F%2Fidp.example%20&client_id=%20cid%20"
-                           "&client_secret=&redirect_uri=%20&admin_group=%20grp%20%0A"
+                           "&client_secret=&redirect_uri=%20https%3A%2F%2Fyuzu.example%2Fauth%2Fcallback%20"
+                           "&admin_group=%20grp%20%0A"
                            "&skip_tls_verify=false",
                            kForm);
     REQUIRE(res);
     CHECK(h.cfg.oidc_issuer == "https://idp.example");
     CHECK(h.cfg.oidc_client_id == "cid");
     CHECK(h.cfg.oidc_admin_group == "grp");
-    CHECK(h.cfg.oidc_redirect_uri.empty());
+    CHECK(h.cfg.oidc_redirect_uri == "https://yuzu.example/auth/callback");
     CHECK_THAT(res->body, ContainsSubstring("settings could NOT be saved"));
     CHECK(count_of(res->body, "id=\"oidc-feedback\"") == 1);
 }

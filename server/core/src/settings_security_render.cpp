@@ -240,7 +240,7 @@ std::string render_directory(const DirectoryView& v) {
            "hx-swap=\"innerHTML\" hx-include=\"#oidc-issuer, #oidc-skip-tls\" "
            "hx-params=\"issuer,skip_tls_verify\">Test SSO</button></div>"
            "<p class=\"hint\" style=\"padding:0 16px 12px\">Test checks the issuer's discovery "
-           "document only. Client ID and secret are not tested. Nothing is saved. The stored "
+           "document and its signing keys. Client ID and secret are not tested. Nothing is saved. The stored "
            "skip-TLS setting also applies to the test.</p>";
 
     out += "<div id=\"oidc-feedback\" role=\"status\" aria-live=\"polite\" "
