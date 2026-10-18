@@ -274,6 +274,91 @@ header rather than a redirect, so a panel never swaps the sign-in page into itse
 must probe `/livez`, `/readyz`, `/health` or `/home` instead (`/home` answers `200` without a session). Scripts
 that sign in with `POST /login` need no change. Bookmarks to `/login` keep working through the redirect.
 
+## Behaviour change: an over-long facet value is left out of the response's facets (#5623)
+
+**What changed.** A facet value over 2048 bytes (measured in bytes on the value as stored) is now
+excluded from a response's facets, never truncated. The response row, its output and every other facet
+of that response still persist. Before, one such value made the whole facet insert fail and the response
+lost ALL of its facets. The limit exists because the value is part of two database indexes, which refuse
+an entry over about 2.7 KB. A new counter, `yuzu_server_response_facets_dropped_total{reason}` (`value_too_long`,
+`cap`, `batch_failed`), counts the distinct (column, value) facets that did not persist; it is
+published only after the response commits, is pre-seeded at 0 at boot, and a failed commit publishes
+nothing. No alert rule ships or is owed: it is a data-completeness signal, and a per-response marker
+and alert are tracked in #5630. See [`metrics.md`](metrics.md).
+
+**Stored values.** Older servers indexed values that fit the database index limit: about 2.6 KB for an
+incompressible value (less the instruction id length), and far more for a value that compresses well
+(measured on PostgreSQL 18.4: 99,999 bytes of repeated text inserted, 499,998 were rejected). So values
+from 2049 bytes up to that limit were indexed before and are not now. Rows already stored by an older
+server stay readable until retention removes them.
+Facet rows are removed with their response by the existing reaper (`--response-retention-days`,
+default 90); nothing new is added.
+
+**Effect on the dashboard.** For newly ingested responses a value over 2048 bytes is no longer indexed,
+including values between 2049 bytes and about 2.6 KB that older servers could index, and compressible
+values far larger than that. The facet filter, the dropdowns and the group-from-results and create-group
+counts therefore show nothing or "0 agents" for such a value, and a direct group-from-results submit
+answers `422` "No agents match" and creates no group when no agent matches. Every one of these surfaces
+now says so when an active exact-value filter (typed, or applied by a saved View's default) is longer
+than 2048 bytes:
+
+- **Results page.** A static hint in the results summary, "A filter value is longer than 2048 bytes.
+  Newly stored responses do not index values that long, so this filter may match nothing. Clear the
+  filter (or switch the View to Default) and use the Search box." The hint never repeats the value, and
+  the results, counts, Create Group button and the `422` are unchanged.
+- **REST agent-count preview and MCP preview tool.** `GET /api/v1/management-groups/agent-count-preview`
+  and `preview_management_group_agent_count` add `unindexed_filter_keys` to the result: the filter keys
+  (for example `output`, never the values) whose value is longer than 2048 bytes, measured as ingest stores it (a NUL or invalid UTF-8 byte counts as 3). It is always present
+  and is empty when no filter is over the bound. When it is not empty, `agent_count` can be 0 or an
+  undercount. `agent_count`, the status codes and the `503` degrade are unchanged, so a client that
+  ignores the new field behaves as before.
+- **Create-group form.** In place of "N agents will be added" it shows a static sentence, "A filter value
+  is longer than 2048 bytes. Newly stored responses do not index values that long, so the agent count
+  may be wrong." The submit button works as before.
+- **Direct group-from-results submit.** It still answers `422` and creates no group. When the `422` is
+  for an empty selection while a filter value is over the bound, the message adds "A filter value is
+  longer than 2048 bytes; values that long are not indexed in newly stored responses, so this may be an
+  undercount."
+
+For a value in the 2049 bytes to about 2.6 KB band the answer 0 can be wrong: agents whose newly
+ingested output contains the value are not counted, because the value is not indexed. Rows ingested
+before the upgrade, when older servers indexed it, are still counted, so the count from older rows can
+still match.
+
+**5,000-facet cap.** Above 5,000 distinct facets in one response, the facets kept are now chosen in a
+fixed order: most lines first, then column index ascending, then value ascending. Before, they were
+whichever the server happened to hold first, so a rare value could be cut and the choice was not
+repeatable. Different rare values may therefore survive or be lost compared with before.
+
+**Lost facets are not recoverable.** A response whose facets were lost (`batch_failed`, or cut by
+`cap`) has no facets re-derived later, and nothing marks the response as affected (#5630).
+**What to do depends on the reason.** `batch_failed` (the facet insert was refused, for example by an
+unusually long echoed command id): run the command again; the new run gets a fresh response, and
+RECREATE any static group built from the affected response from the NEW run, because running the
+command again does not repair an existing group. `cap`: the same output keeps the same 5,000 facets,
+so a re-run cuts the same ones; use a command or filter that returns fewer distinct values, or accept the
+short result (#5630 tracks a marker). `value_too_long`: there is nothing to re-run, the value is never
+indexed. To find a response that lost facets, search the server log (a `cap` or `batch_failed` response
+logs a warning with its `response_id`); a `value_too_long` exclusion logs only at debug level, so at the
+default level only the counter shows it.
+
+**Rolling upgrade.** The change is server-only: there is no schema, configuration, agent or gateway step,
+the order in which replicas are upgraded does not matter, and rolling back is starting the previous
+server binary. What differs during a rollout:
+
+- **Ingest decides the facets.** A facet is lost, or kept, on whichever replica ingested the response. An
+  old replica that ingests a response carrying a value too long for the database index drops ALL facets
+  of that response; a new replica excludes only the long value and keeps the rest.
+- **Every replica reads the same table.** Every replica reads the same `response_facets` rows, so a group
+  built from a response that an OLD replica ingested is short whichever replica builds the group.
+  Upgrading the replica that serves the group does not repair it; use the workaround above.
+- **A typed filter with a NUL or invalid UTF-8 byte.** A new replica matches such a filter in the form it
+  is stored in; an old replica cuts a NUL filter short at the database (so it can match a different
+  value) and fails the read for invalid UTF-8, which shows as an unavailable count. During a rollout the
+  same request can therefore answer differently on different replicas.
+
+See [`response-store.md`](response-store.md) (Facets are bounded).
+
 ## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
 
 **What changed.** Deleting (deactivating) an account and demoting a local `admin` account now go through
