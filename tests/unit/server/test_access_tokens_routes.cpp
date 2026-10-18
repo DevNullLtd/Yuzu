@@ -718,6 +718,18 @@ TEST_CASE("principals routes: capability is a Security:Write probe only when RBA
         CHECK(std::ranges::count(h.perm_calls, std::pair<std::string, std::string>{"Security", "Write"}) == 0);
     }
     {
+        Harness h;  // RBAC on, Security:Write granted: the controls are drawn after exactly one probe each
+        h.rbac = true;
+        h.wire();
+        const auto list = h.sink.dispatch("GET", "/fragments/access/principals/list");
+        const auto det = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+        REQUIRE(list);
+        REQUIRE(det);
+        CHECK_THAT(list->body, ContainsSubstring("data-tk=\"principal-new\""));
+        CHECK_THAT(det->body, ContainsSubstring("data-tk=\"principal-mint\""));
+        CHECK(std::ranges::count(h.perm_calls, std::pair<std::string, std::string>{"Security", "Write"}) == 2);
+    }
+    {
         Harness h;
         h.rbac = true;
         h.perm_deny.insert("Security:Write");
