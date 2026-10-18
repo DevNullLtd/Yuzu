@@ -1220,12 +1220,14 @@ std::string statement_from(const std::string& code, std::string_view anchor) {
 }
 } // namespace
 
-// G8-QE-1 (UP-3/UP-4 closure evidence). The skew defect cannot be simulated in-process (the
-// database clock is not injectable, and the behavioural tests above run both clocks on one
-// host), so this pins the CAUSE at the source: the review/consume stamps and every expiry
-// cutoff are authored in-SQL from kDbNowEpochSql, and the process clock is read at exactly
-// one documented place (submit()'s submitted_at). Reusing submit_stamp_epoch() for
-// reviewed_at, or adding a second process-clock read, fails here.
+// G8-QE-1 / R3-QE-1 (UP-3/UP-4 closure evidence). The skew defect cannot be simulated
+// in-process (the database clock is not injectable, and the behavioural tests above run both
+// clocks on one host), so this pins the CAUSE at the source: the review/consume stamps and
+// every expiry cutoff -- review, consume CAS, consume's expiry diagnostic, ticket_is_live(),
+// the shared liveness predicate and both submit() sweeps -- are authored in-SQL from
+// kDbNowEpochSql, and the process clock is read at exactly one documented place (submit()'s
+// submitted_at). Reusing submit_stamp_epoch() for reviewed_at, or adding a second clock read
+// of ANY spelling (the file-wide clock-API ban below), fails here.
 TEST_CASE("ApprovalManager: review and consume stamps and every expiry cutoff are authored "
           "in-SQL from the database clock; the process clock is read at ONE site "
           "(UP-3/UP-4 source tripwire)",
@@ -1235,9 +1237,24 @@ TEST_CASE("ApprovalManager: review and consume stamps and every expiry cutoff ar
     // (a) The process clock: ONE system_clock read (inside submit_stamp_epoch's body) and
     // ONE submit_stamp_epoch call site (submit()'s submitted_at), plus the definition.
     CHECK(count_occurrences(code, "system_clock::now") == 1);
+    CHECK(count_occurrences(code, "::now(") == 1); // no other clock's now() (R3-QE-1)
     CHECK(count_occurrences(code, "submit_stamp_epoch(") == 2); // definition + the one call
-    CHECK(code.find("std::time(") == std::string::npos);
-    CHECK(code.find("time(nullptr)") == std::string::npos);
+    // File-wide ban on every other way to read a clock from C++ code or SQL (R3-QE-1): a new
+    // process-clock cutoff cannot slip in under a spelling the exact-match checks above miss.
+    for (const std::string_view banned :
+         {"steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
+          "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(", "time(nullptr)",
+          "time(NULL)", "time(0)", "localtime", "gmtime", "clock_timestamp", "current_timestamp",
+          "statement_timestamp", "transaction_timestamp", "localtimestamp"}) {
+        INFO("banned clock API: " << banned);
+        CHECK(code.find(banned) == std::string::npos);
+    }
+    // The one database clock: SQL `now()` appears only in kDbNowEpochSql's own definition
+    // (the C++ `system_clock::now()` call is the one "::now()" subtracted here).
+    CHECK(count_occurrences(code, "now()") - count_occurrences(code, "::now()") == 1);
+    const auto db_now_def = statement_from(code, "constexpr const char* kDbNowEpochSql");
+    REQUIRE_FALSE(db_now_def.empty());
+    CHECK(db_now_def.find("now()") != std::string::npos);
     const auto submitted_at = statement_from(code, "const std::string submitted_at");
     REQUIRE_FALSE(submitted_at.empty());
     CHECK(submitted_at.find("submit_stamp_epoch(") != std::string::npos);
@@ -1246,25 +1263,33 @@ TEST_CASE("ApprovalManager: review and consume stamps and every expiry cutoff ar
     // via the shared liveness predicate) and none of them can reach the process clock.
     const auto review = statement_from(code, "const std::string review_sql");
     const auto consume = statement_from(code, "const std::string consume_sql");
+    const auto why = statement_from(code, "const std::string why_sql"); // consume's diagnostic
     const auto db_now = statement_from(code, "const std::string db_now");
     const auto sweep_pending = statement_from(code, "const std::string sweep_pending_sql");
     const auto sweep_approved = statement_from(code, "const std::string sweep_approved_sql");
     const auto live_now = statement_from(code, "const std::string now =");
     const auto live_stmt = statement_from(code, "const std::string live_sql");
-    for (const auto* stmt :
-         {&review, &consume, &db_now, &sweep_pending, &sweep_approved, &live_now, &live_stmt})
+    // ApprovalManager::ticket_is_live()'s own query (not the live_sql local in submit()).
+    constexpr std::string_view kIsLiveAnchor =
+        "const std::string sql = \"SELECT 1 FROM approval_manager.approvals WHERE id = $1 AND \"";
+    CHECK(count_occurrences(code, kIsLiveAnchor) == 1);
+    const auto is_live = statement_from(code, kIsLiveAnchor);
+    for (const auto* stmt : {&review, &consume, &why, &db_now, &sweep_pending, &sweep_approved,
+                             &live_now, &live_stmt, &is_live})
         REQUIRE_FALSE(stmt->empty());
 
     CHECK(review.find("kDbNowEpochSql") != std::string::npos);   // reviewed_at
     CHECK(consume.find("kDbNowEpochSql") != std::string::npos);  // consumed_at
     CHECK(consume.find("ticket_live_sql()") != std::string::npos);
+    CHECK(why.find("ticket_live_sql()") != std::string::npos);   // consume's expiry diagnostic
+    CHECK(is_live.find("ticket_live_sql()") != std::string::npos); // ticket_is_live()
     CHECK(db_now.find("kDbNowEpochSql") != std::string::npos);   // the pending-sweep cutoff
     CHECK(sweep_pending.find("db_now") != std::string::npos);
     CHECK(live_now.find("kDbNowEpochSql") != std::string::npos); // the liveness predicate
     CHECK(live_stmt.find("ticket_live_sql()") != std::string::npos);
     CHECK(sweep_approved.find("live_sql") != std::string::npos); // approved sweep cutoff
-    for (const auto* stmt : {&review, &consume, &db_now, &sweep_pending, &sweep_approved, &live_now,
-                             &live_stmt}) {
+    for (const auto* stmt : {&review, &consume, &why, &db_now, &sweep_pending, &sweep_approved,
+                             &live_now, &live_stmt, &is_live}) {
         CHECK(stmt->find("submit_stamp_epoch") == std::string::npos);
         CHECK(stmt->find("system_clock") == std::string::npos);
     }
