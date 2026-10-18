@@ -611,7 +611,7 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   session without an `amr` proof whenever the mode does not protect its role, i.e. everything except
   `--mfa-enforcement=required` and, for admins, `admin-only`). `required` closes the OIDC case only when
   the IdP asserts an MFA-method `amr`; otherwise an OIDC session gets `401` and loops through re-SSO
-  at every step-up endpoint, not only approval (recovery is restarting in a non-`required` mode). A requirement
+  at every step-up endpoint, not only approval (recovery is restarting in `optional`, not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only`; see [MFA on SSO sessions](user-manual/authentication.md#mfa-on-sso-sessions-pr-3) and the [recovery runbook](ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). A requirement
   that the approver holds an enrolled factor in every mode is tracked in #6079;
 - a **human principal**, never an engine principal;
 - a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`);

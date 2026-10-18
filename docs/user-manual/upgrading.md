@@ -29,8 +29,10 @@ principal and not an engine principal. The existing rule that the reviewer canno
   non-admin role), and for any session when `--mfa-step-up-window-secs=0`. `--mfa-enforcement=required` closes the
   OIDC case only if your identity provider asserts an MFA-method `amr` for approvers: an OIDC session without one
   gets `401` and loops through re-sign-in at every step-up endpoint, not only approval, which locks those operators
-  out of all of them. Check `amr` before enabling `required`; the way back is restarting the server in a
-  non-`required` mode. (SAML sessions are refused at step-up gates in every mode, independent of `required`.) Requiring that the approver holds an enrolled factor
+  out of all of them. Check `amr` before enabling `required`; the way back is restarting the server in
+  `optional`, not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only` (see
+  [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the
+  [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). (SAML sessions are refused at step-up gates in every mode, independent of `required`.) Requiring that the approver holds an enrolled factor
   in every mode is tracked in #6079.
 - **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
   `/api/approvals/{id}/approve` or `/reject` that authenticates with a session cookie and carries no `Origin` or
@@ -93,8 +95,8 @@ and move each approval step to a person on a signed-in session.
 **What that search cannot see.** The audit query finds token and MCP approvers only. The approvers most likely
 to hit the new behaviour are human accounts, which carry `principal_class = 'human'` and so look the same before
 and after the upgrade: SAML users (refused at step-up), OIDC users whose identity provider asserts no MFA-method
-`amr` (refused under `--mfa-enforcement=required`, stepped up under `admin-only` for an admin, and passed
-through otherwise), and local accounts with no enrolled factor (passed through without a second factor). To
+`amr` (refused with a `401` re-sign-in loop under `--mfa-enforcement=required`, and also under `admin-only` for an
+admin, and passed through otherwise), and local accounts with no enrolled factor (passed through without a second factor). To
 list the SAML and `amr`-less OIDC operators who have signed in, query the login rows in the audit store (the
 retention window applies):
 

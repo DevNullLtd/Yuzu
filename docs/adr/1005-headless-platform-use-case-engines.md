@@ -701,7 +701,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (`require_mfa_step_up`) can only ask for a factor the account has, so a local account with no
        enrolled factor passes it in every `--mfa-enforcement` mode, an OIDC session whose identity
        provider asserted no `amr` proof passes it unless `--mfa-enforcement=required` (under
-       `admin-only` a non-admin role passes and an admin is stepped up), and any session passes it with
+       `admin-only` a non-admin role passes and an admin is refused with a `401` re-sign-in loop), and any session passes it with
        `--mfa-step-up-window-secs=0`. SAML sessions are refused while step-up is on (#4935), so a
        SAML-only deployment has no working approver path (known limitation, tracked in #6098).
        Requiring an enrolled factor of the approver in every mode is #6079; until it ships, this

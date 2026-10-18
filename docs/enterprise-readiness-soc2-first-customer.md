@@ -390,8 +390,10 @@ enforcement mode, is tracked in #6079; until it lands, a deployment that relies 
 CC6.3 control should run `--mfa-enforcement=required` and leave `--mfa-step-up-window-secs` above
 zero. Know the cost of `required` first: the identity provider must assert an MFA-method `amr` for
 approvers, and an OIDC session without one gets `401` and loops through re-sign-in at EVERY step-up
-endpoint, not only approval (verify `amr` before enabling; the way back is restarting in a
-non-`required` mode), and every local user must enrol at login. SAML users are refused at step-up
+endpoint, not only approval (verify `amr` before enabling; the way back is restarting in
+`optional`, not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only`; see
+[MFA on SSO sessions](user-manual/authentication.md#mfa-on-sso-sessions-pr-3) and the
+[recovery runbook](ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)), and every local user must enrol at login. SAML users are refused at step-up
 gates in every mode, independent of `required`.
 
 *Second residual, CC8.1 (maker-checker on scheduled runs, tracked in #6096):* the time an approval was
