@@ -29,8 +29,9 @@ taskkill //F //IM yuzu-agent.exe  2>/dev/null || true
 sleep 2
 
 # 1. environment
-source /c/Users/natha/Yuzu/setup_msvc_env.sh >/dev/null 2>&1
-cd /c/Users/natha/Yuzu
+WINHOME="$(cygpath -u "$USERPROFILE")"   # e.g. /c/Users/<user>
+source "$WINHOME/Yuzu/setup_msvc_env.sh" >/dev/null 2>&1
+cd "$WINHOME/Yuzu"
 
 # 2. fetch + checkout feat/viz-engine
 git fetch origin feat/viz-engine 2>&1 | tail -1
@@ -41,9 +42,9 @@ git pull --ff-only 2>&1 | tail -1
 meson compile -C build-windows-debug \
     || meson compile -C build-windows
 
-BUILDDIR="/c/Users/natha/Yuzu/build-windows-debug"
+BUILDDIR="$WINHOME/Yuzu/build-windows-debug"
 [ -x "$BUILDDIR/server/core/yuzu-server.exe" ] \
-    || BUILDDIR="/c/Users/natha/Yuzu/build-windows"
+    || BUILDDIR="$WINHOME/Yuzu/build-windows"
 
 # 4. UAT scaffold
 UAT_DIR="/tmp/yuzu-uat-win-noGW"

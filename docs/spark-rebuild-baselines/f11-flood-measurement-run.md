@@ -147,7 +147,7 @@ meter.
 ## Live DGRHP window
 
 Rig-side patch (never committed - diff quoted here for the record, applied to
-`/c/Users/daver/yuzu-pr3a` at pinned commit `0023efc33`, the same commit this
+`/c/Users/<user>/yuzu-pr3a` at pinned commit `0023efc33`, the same commit this
 worktree's branch was cut from):
 
 ```diff

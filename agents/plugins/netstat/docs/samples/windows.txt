@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash f31d206bb2ee
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM (tailnet address replaced with a placeholder) · leg-hash f31d206bb2ee
 == action=netstat_list
 tcp|0.0.0.0|22|0.0.0.0|0|LISTEN|5148
 tcp|198.51.100.121|22|198.51.100.77|53137|ESTABLISHED|5148

@@ -63,8 +63,8 @@ ssh Shulgi 'C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm --needed pytho
 # through 'agent registered at i=7' lives in the session transcript;
 # the meaningful invariants for re-deriving it:
 #   - taskkill /F /IM yuzu-{server,agent}.exe  (clean slate)
-#   - source /c/Users/natha/Yuzu/setup_msvc_env.sh
-#   - meson compile -C /c/Users/natha/Yuzu/build-windows  (if stale)
+#   - source /c/Users/<user>/Yuzu/setup_msvc_env.sh
+#   - meson compile -C /c/Users/<user>/Yuzu/build-windows  (if stale)
 #   - generate PBKDF2 admin config:
 #       python -c "..." > yuzu-server.cfg
 #   - start yuzu-server.exe with --web-port 18080

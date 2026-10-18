@@ -658,9 +658,9 @@
           },
           "row_count": 3,
           "rows": [
-            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b1|-|-",
-            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b0|-|-",
-            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b3|-|-"
+            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac000000000001|-|-",
+            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac000000000002|-|-",
+            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac000000000003|-|-"
           ],
           "truncated": false
         }
@@ -671,7 +671,7 @@
         "leg_hash": "25220299bc79",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (USB hub serial replaced with a placeholder)"
+        "privilege": "euid 501 (USB hub serial and Thunderbolt controller IDs replaced with placeholders)"
       }
     },
     "windows": {

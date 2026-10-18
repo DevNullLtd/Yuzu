@@ -70,7 +70,7 @@ git rev-parse HEAD origin/dev   # both printed f7a000fc33da5c715da133988ce986f10
 
 # MSVC + rig env (never vcvars64.bat)
 source ./setup_msvc_env.sh
-source /c/Users/daver/weecolin-env.sh
+source /c/Users/<user>/weecolin-env.sh
 
 # fresh build dir (build-windows was locked by the live UAT rig, see above)
 bash scripts/setup.sh --tests --builddir build-windows-mi1b

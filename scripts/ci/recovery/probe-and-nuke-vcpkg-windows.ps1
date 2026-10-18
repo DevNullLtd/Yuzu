@@ -14,7 +14,8 @@
 #
 # Run it from an interactive shell (the runner's interactive user) NOT from a service
 # context — the LOCALAPPDATA probe distinguishes interactive-user
-# vs LOCAL SYSTEM profile by hard-coding both paths, but everything else
+# vs LOCAL SYSTEM profile: the interactive path comes from $env:USERPROFILE and
+# the LOCAL SYSTEM path is hard-coded, but everything else
 # uses absolute paths so it doesn't matter who runs it.
 
 $ErrorActionPreference = 'Continue'  # keep going even if one path errors

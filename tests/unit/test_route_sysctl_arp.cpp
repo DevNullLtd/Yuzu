@@ -32,7 +32,7 @@ namespace {
 // structure, lengths and offsets are unchanged. 16 rt_msghdr records.
 // Derived expected entries (ip -> mac), in on-wire order:
 //   [skipped: 169.254.169.254 has sdl_alen==0 — unresolved, no MAC yet]
-//   169.254.230.249 -> 00:00:5e:00:53:10
+//   169.254.0.1 -> 00:00:5e:00:53:10
 //   192.0.2.1     -> 00:00:5e:00:53:11
 //   192.0.2.61    -> 00:00:5e:00:53:12
 //   192.0.2.71    -> 00:00:5e:00:53:13
@@ -69,7 +69,7 @@ constexpr unsigned char kRtFlagsLlinfo[] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x02, 0x00, 0x00,
-    0xa9, 0xfe, 0xe6, 0xf9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xa9, 0xfe, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x14, 0x12, 0x0b, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00, 0x00, 0x5e, 0x00,
     0x53, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x02, 0x00, 0x00,
     0xc0, 0x00, 0x02, 0xde, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -252,7 +252,7 @@ TEST_CASE("parse_rt_flags_llinfo decodes the real captured routing-socket blob",
     CHECK_FALSE(parsed.truncated); // a real, whole capture must not look partial
     REQUIRE(entries.size() == 15);
 
-    CHECK(entries[0].ip == "169.254.230.249");
+    CHECK(entries[0].ip == "169.254.0.1");
     CHECK(entries[0].mac == "00:00:5e:00:53:10");
     CHECK(entries[1].ip == "192.0.2.1");
     CHECK(entries[1].mac == "00:00:5e:00:53:11");
@@ -332,14 +332,14 @@ TEST_CASE("parse_rt_flags_llinfo never crashes or loops on a malformed blob",
     }
 
     SECTION("second record truncated mid-way — first record still parses") {
-        // Keep both full records for 169.254.230.249 (144*2=288 bytes) plus
+        // Keep both full records for 169.254.0.1 (144*2=288 bytes) plus
         // a partial third record; the parser must return the two complete
         // ones and stop cleanly on the partial tail, no OOB read.
         std::vector<unsigned char> blob(std::begin(kRtFlagsLlinfo),
                                         std::begin(kRtFlagsLlinfo) + 288 + 50);
         const auto parsed = parse_rt_flags_llinfo(std::span{blob});
         REQUIRE(parsed.records.size() == 1); // only the 2nd real record has a resolved MAC
-        CHECK(parsed.records[0].ip == "169.254.230.249");
+        CHECK(parsed.records[0].ip == "169.254.0.1");
         CHECK(parsed.records[0].mac == "00:00:5e:00:53:10");
         // THE POINT of the type: the records returned are individually true,
         // but the caller must learn the table is INCOMPLETE. Returning this

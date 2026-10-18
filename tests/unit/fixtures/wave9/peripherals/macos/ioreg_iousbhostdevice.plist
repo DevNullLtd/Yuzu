@@ -95,7 +95,7 @@
 		<key>kUSBAddress</key>
 		<integer>2</integer>
 		<key>kUSBContainerID</key>
-		<string>688a9dfb-5ded-4358-ab64-909679624b06</string>
+		<string>00000000-0000-4000-8000-000000000001</string>
 		<key>kUSBCurrentConfiguration</key>
 		<integer>1</integer>
 		<key>kUSBHubIdlePolicy</key>
@@ -210,7 +210,7 @@
 		<key>kUSBAddress</key>
 		<integer>1</integer>
 		<key>kUSBContainerID</key>
-		<string>688a9dfb-5ded-4358-ab64-909679624b06</string>
+		<string>00000000-0000-4000-8000-000000000001</string>
 		<key>kUSBCurrentConfiguration</key>
 		<integer>1</integer>
 		<key>kUSBHubIdlePolicy</key>

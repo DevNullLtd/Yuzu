@@ -7,4 +7,4 @@ status: REAL CAPTURE
 lines: 236 (budget 236)
 
 Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.
-Redacted 2026-10-18: the per-unit USB hub serial number (including inside the UsbDeviceSignature data) and the Thunderbolt switch UIDs are replaced with same-length synthetic values (Thunderbolt UIDs keep the 0x05AC vendor prefix); no captured byte other than those was changed.
+Redacted 2026-10-18: the per-unit USB hub serial number (including inside the UsbDeviceSignature data) and the two USB container-ID UUIDs are replaced with synthetic values; no captured byte other than those was changed.
