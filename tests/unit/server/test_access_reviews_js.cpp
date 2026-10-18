@@ -12,6 +12,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <cctype>
 #include <regex>
 #include <string>
 #include <vector>
@@ -131,4 +132,49 @@ TEST_CASE("reviews glue: a read fragment whose audit row failed is flagged in it
     REQUIRE(w != std::string::npos);
     CHECK_THAT(js.substr(w), !ContainsSubstring("ar-audit-failed"));
     CHECK_THAT(js.substr(w), ContainsSubstring("banner(r.auditFailed"));
+}
+
+TEST_CASE("reviews glue: the attributes on a drawn grant row are exactly the dataset fields the script reads",
+          "[access-reviews][js]") {
+    const std::string& js = yuzu::server::kYuzuAuditJs;
+    CampaignView v;
+    v.campaign.campaign_id = "c1";
+    v.campaign.status = "open";
+    AccessReviewAttestationRow a;
+    a.principal_type = "group";
+    a.principal_id = "it-ops";
+    a.role_name = "Operator";
+    a.decision = "pending";
+    v.attestations = {a};
+    const std::string drawn = render_campaign(v, true);
+
+    // The row carries the whole frozen tuple, in three separate attributes (no joined key, so a
+    // comma or a colon in a value cannot blur two grants together).
+    const std::string tr = "<tr data-principal-type=\"group\" data-principal-id=\"it-ops\" "
+                           "data-role-name=\"Operator\">";
+    CHECK_THAT(drawn, ContainsSubstring(tr));
+
+    // Each data-* attribute on that row becomes a camelCase dataset name; the script must read
+    // every one, or Attest and Flag would post an undefined field and the write would be refused.
+    const auto row_at = drawn.find(tr);
+    REQUIRE(row_at != std::string::npos);
+    const std::string tag = drawn.substr(row_at, tr.size());
+    const std::regex attr(R"re(data-([a-z]+(?:-[a-z]+)*)=)re");
+    int seen = 0;
+    for (std::sregex_iterator it(tag.begin(), tag.end(), attr), end; it != end; ++it, ++seen) {
+        std::string camel;
+        bool up = false;
+        for (const char c : (*it)[1].str()) {
+            if (c == '-') { up = true; continue; }
+            camel += up ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c;
+            up = false;
+        }
+        INFO("dataset." << camel);
+        CHECK_THAT(js, ContainsSubstring("d." + camel));
+    }
+    CHECK(seen == 3);
+    // ... and the request body names them in the shape the REST route validates.
+    for (const char* field : {"principal_type: d.principalType", "principal_id: d.principalId",
+                              "role_name: d.roleName"})
+        CHECK_THAT(js, ContainsSubstring(field));
 }
