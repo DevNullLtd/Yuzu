@@ -34,9 +34,14 @@ Definitions whose id is NOT in the override map are classified by plugin, then s
   type=question/query                   -> safe
   type=action                           -> mutating
 
-The runner broadcasts: it sends no agent_ids and no scope. A definition on a Destructive or
-Forensics capability row (the server requires an explicit target) and a server-internal one
-therefore cannot pass when selected with --risks; they are classified, not exercisable yet.
+The runner broadcasts: it sends no agent_ids and no scope. The exception is the opt-in classes
+destructive and forensic (a Destructive or Forensics capability row, for which the server refuses
+a broadcast and wants exactly one explicit, in-scope agent id): --target-agent-id ID sends
+`agent_ids: [ID]` with each dispatch of those classes only. Selecting either class with --risks
+and no --target-agent-id is a configuration error (exit 2, nothing dispatched), and so is
+selecting one against a non-loopback --dashboard unless --allow-remote is given: those
+instructions change or read a real device. A server-internal definition names no agent plugin
+(the dispatch chokepoint denies it), so it is never sent a target and cannot pass.
 """
 
 from __future__ import annotations
@@ -74,6 +79,10 @@ DEFAULT_DISPATCH_TIMEOUT_S = 10
 DEFAULT_POLL_TIMEOUT_S = 30
 DEFAULT_PARALLELISM = 4
 DEFAULT_RISKS = ("safe", "mutating")  # what runs in the default gate
+
+# Risk classes whose rows the server refuses to broadcast: dispatched to --target-agent-id.
+TARGETED_RISKS = ("destructive", "forensic")
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 
 ALL_RISKS = ("safe", "mutating", "destructive", "forensic", "server-internal", "network-disrupt",
              "interactive")
@@ -371,9 +380,13 @@ class YuzuClient:
             if resp.status not in (200, 302, 303):
                 raise RuntimeError(f"login failed: HTTP {resp.status}")
 
-    def execute_instruction(self, def_id: str, params: dict) -> tuple[int, dict]:
-        body = json.dumps({"params": {k: str(v) if not isinstance(v, str) else v
-                                       for k, v in params.items()}}).encode()
+    def execute_instruction(self, def_id: str, params: dict,
+                            agent_ids: list[str] | None = None) -> tuple[int, dict]:
+        body_obj: dict[str, Any] = {"params": {k: str(v) if not isinstance(v, str) else v
+                                                for k, v in params.items()}}
+        if agent_ids:
+            body_obj["agent_ids"] = agent_ids
+        body = json.dumps(body_obj).encode()
         req = urllib.request.Request(
             f"{self.base}/api/instructions/{urllib.parse.quote(def_id)}/execute",
             data=body, headers={"Content-Type": "application/json",
@@ -406,9 +419,17 @@ class YuzuClient:
 # ── single-definition exerciser ────────────────────────────────────────────
 
 
+def error_message(payload: Any) -> str:
+    """The message of an A4 error body; tolerates a string `error`, a missing one, a non-dict body."""
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(err, dict):
+        err = err.get("message")
+    return err if isinstance(err, str) else ""
+
+
 def exercise(client: YuzuClient, defn: Definition,
              param_overrides: dict[str, dict[str, Any]],
-             poll_timeout_s: int) -> Outcome:
+             poll_timeout_s: int, target_agent_id: str = "") -> Outcome:
     started = time.monotonic()
 
     # Honour YAML `platforms:` — definitions that don't list the current
@@ -429,7 +450,10 @@ def exercise(client: YuzuClient, defn: Definition,
                        note=f"param-synth: {e}")
 
     try:
-        code, payload = client.execute_instruction(defn.id, params)
+        if target_agent_id and defn.risk in TARGETED_RISKS:
+            code, payload = client.execute_instruction(defn.id, params, [target_agent_id])
+        else:
+            code, payload = client.execute_instruction(defn.id, params)
     except Exception as e:
         return Outcome(defn.id, defn.risk, "error",
                        int((time.monotonic() - started) * 1000),
@@ -443,7 +467,7 @@ def exercise(client: YuzuClient, defn: Definition,
                        note=f"approval={defn.approval_mode}")
 
     if code != 200:
-        msg = payload.get("error", {}).get("message") if isinstance(payload, dict) else ""
+        msg = error_message(payload)
         return Outcome(defn.id, defn.risk, "fail",
                        int((time.monotonic() - started) * 1000),
                        http_code=code,
@@ -541,12 +565,31 @@ def db_record_metric(repo_root: Path, run_id: str, name: str,
 # ── orchestration ──────────────────────────────────────────────────────────
 
 
+def targeting_error(args: argparse.Namespace) -> str:
+    """Why the selected risk classes cannot be dispatched as configured, or "" if they can."""
+    if not set(args.risks) & set(TARGETED_RISKS):
+        return ""
+    if not args.target_agent_id:
+        return (f"--risks {'/'.join(sorted(set(args.risks) & set(TARGETED_RISKS)))} needs "
+                "--target-agent-id: the server refuses a broadcast for these classes")
+    host = urllib.parse.urlsplit(args.dashboard).hostname or ""
+    if host not in LOOPBACK_HOSTS and not args.allow_remote:
+        return (f"--risks destructive/forensic against a non-loopback dashboard ({host or '?'}) "
+                "needs --allow-remote")
+    return ""
+
+
 def run(args: argparse.Namespace) -> int:
     repo_root = Path(__file__).resolve().parents[2]
     risk_table_path = Path(args.risk_table) if args.risk_table else \
         repo_root / "scripts/test/instructions-risk-classification.json"
     content_dir = Path(args.content_dir) if args.content_dir else \
         repo_root / "content/definitions"
+
+    bad = targeting_error(args)
+    if bad:
+        print(f"instructions_runner: {bad}", file=sys.stderr)
+        return 2
 
     overrides = load_risk_table(risk_table_path)
     all_defs = load_definitions(content_dir, overrides)
@@ -592,7 +635,7 @@ def run(args: argparse.Namespace) -> int:
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallelism) as pool:
         future_map = {pool.submit(exercise, client, d, param_overrides,
-                                   args.poll_timeout): d for d in runnable}
+                                   args.poll_timeout, args.target_agent_id): d for d in runnable}
         for fut in concurrent.futures.as_completed(future_map):
             outcome = fut.result()
             outcomes.append(outcome)
@@ -639,7 +682,7 @@ def run(args: argparse.Namespace) -> int:
     # Exit code:
     #   0  - all runnable instructions passed (or pending_approval, expected)
     #   1  - one or more fail/error
-    #   2  - infrastructure failure (login, content-dir empty)
+    #   2  - infrastructure or configuration failure (login, content-dir empty, opt-in targeting)
     if counts["fail"] > 0 or counts["error"] > 0:
         return 1
     return 0
@@ -655,6 +698,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--risks", nargs="+", default=list(DEFAULT_RISKS),
                    choices=list(ALL_RISKS),
                    help=f"risk classes to run (default: {' '.join(DEFAULT_RISKS)})")
+    p.add_argument("--target-agent-id", default="",
+                   help="agent id sent as the sole target of destructive/forensic dispatches "
+                        "(required to select those classes)")
+    p.add_argument("--allow-remote", action="store_true",
+                   help="allow destructive/forensic classes against a non-loopback --dashboard")
     p.add_argument("--match", default="",
                    help="restrict to definition IDs matching this regex")
     p.add_argument("--only-id", default="",

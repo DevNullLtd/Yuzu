@@ -3201,6 +3201,15 @@ test('instructions runner parameter synthesis',
   timeout: 30,
 )
 
+# The same runner sends an explicit target for the destructive and forensic classes only, and
+# refuses them without --target-agent-id or (off loopback) --allow-remote. Hermetic (fake client).
+test('instructions runner explicit target',
+  _python3_test,
+  args: [files('test_instructions_runner_target.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
 # scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
 # script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;

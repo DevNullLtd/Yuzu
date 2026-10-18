@@ -10,11 +10,11 @@
 #
 # Defaults run only the safe+mutating definitions the runner can dispatch (it
 # prints the exact counts). Opt-in classes, via --risks: destructive and forensic
-# (the server refuses a broadcast for these and the runner broadcasts),
-# server-internal (catalog-only definitions the dispatch chokepoint denies),
-# interactive, and network-disrupt (the quarantine ceremony, PR B). The runner
-# supplies no explicit targets, so selecting destructive, forensic or server-internal
-# is expected to fail (HTTP 400/503) until it can. The destructive
+# (the server refuses a broadcast for these, so they need --target-agent-id, and a
+# non-loopback --dashboard also needs --allow-remote),
+# server-internal (catalog-only definitions the dispatch chokepoint denies, so they
+# cannot pass),
+# interactive, and network-disrupt (the quarantine ceremony, PR B). The destructive
 # instructions are the candidate pool for PR C's hand-written semantic-correctness
 # overrides. scripts/test/instructions-risk-classification.json is the authority.
 #
@@ -40,6 +40,8 @@ PASSWORD=""
 RUN_ID=""
 GATE_NAME="instructions"
 RISKS=("safe" "mutating")
+TARGET_AGENT_ID=""
+ALLOW_REMOTE=0
 MATCH=""
 ONLY_ID=""
 PARALLELISM="4"
@@ -63,9 +65,13 @@ Optional:
   --risks LIST             comma-separated risk classes to run
                            (default: safe,mutating; choices: safe, mutating,
                            destructive, forensic, server-internal,
-                           network-disrupt, interactive; destructive,
-                           forensic and server-internal cannot pass yet:
-                           the runner sends no explicit targets)
+                           network-disrupt, interactive; destructive and
+                           forensic need --target-agent-id, and
+                           server-internal cannot pass)
+  --target-agent-id ID     the one agent sent as the target of destructive and
+                           forensic dispatches
+  --allow-remote           permit destructive/forensic against a non-loopback
+                           --dashboard (refused by default)
   --match REGEX            run only definition ids matching this regex
   --only-id ID             run exactly one definition (debugging)
   --parallelism N          concurrent dispatches (default: 4)
@@ -86,6 +92,8 @@ while [[ $# -gt 0 ]]; do
         --run-id)           RUN_ID="$2"; shift 2 ;;
         --gate-name)        GATE_NAME="$2"; shift 2 ;;
         --risks)            IFS=',' read -ra RISKS <<< "$2"; shift 2 ;;
+        --target-agent-id)  TARGET_AGENT_ID="$2"; shift 2 ;;
+        --allow-remote)     ALLOW_REMOTE=1; shift ;;
         --match)            MATCH="$2"; shift 2 ;;
         --only-id)          ONLY_ID="$2"; shift 2 ;;
         --parallelism)      PARALLELISM="$2"; shift 2 ;;
@@ -128,6 +136,8 @@ ARGS=(
     --gate-name "$GATE_NAME"
 )
 [[ -n "$RUN_ID" ]]          && ARGS+=(--run-id "$RUN_ID")
+[[ -n "$TARGET_AGENT_ID" ]] && ARGS+=(--target-agent-id "$TARGET_AGENT_ID")
+[[ "$ALLOW_REMOTE" -eq 1 ]] && ARGS+=(--allow-remote)
 [[ -n "$MATCH" ]]           && ARGS+=(--match "$MATCH")
 [[ -n "$ONLY_ID" ]]         && ARGS+=(--only-id "$ONLY_ID")
 [[ -n "$PARAMS_OVERRIDE" ]] && ARGS+=(--params-override "$PARAMS_OVERRIDE")
