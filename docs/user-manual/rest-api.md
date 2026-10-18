@@ -10059,13 +10059,17 @@ The campaign list. Same gate, store read and audit row as `GET /api/v1/access-re
 One campaign's frozen grants (undecided first, capped at 1000 rows with a banner) plus its summary card, swapped out of band. Same gate, read and audit row as `GET /api/v1/access-reviews/{id}` (MCP `get_access_review`).
 
 - **Query:** `id` — 1 to 64 of `A-Z a-z 0-9 _ -`. Empty returns the placeholder; any other value is a 200 "No campaign with that id" note and nothing is read or audited.
+- **Response (403):** The gate's own response; an engine-class session is refused exactly as the REST route refuses it (A4 body, `access_review.get` denied with detail `engine_session_denied`).
 - **Audit:** `access_review.get`, `target_id=<campaign_id>`. An unknown campaign and a store fault write none.
 
 **`GET /fragments/access/reviews/grants`**
 
 The live grant population, requested only by the **Show current grants** button. Same gate, read and audit row as `GET /api/v1/access-reviews/export` (MCP `export_access_review`).
 
+- **Response (403):** The gate's own response; an engine-class session is refused exactly as the REST route refuses it (A4 body, `access_review.exported` denied with detail `engine_session_denied`).
 - **Audit:** `access_review.exported`, `detail=format=view rows=<N> rbac_enforcement=<value>`.
+
+Denied-access rows: the campaign list loads itself, so a refused browser session writes none for it; the campaign and grants fragments are requested by a click (or by the `?campaign=<id>` link for the campaign), so a refused caller writes the ordinary permission-denied row. A refused API or MCP token writes one on every fragment.
 
 The page makes every change (open, close, attest, flag) by calling the existing `POST /api/v1/access-reviews` routes; there is no dashboard-only write route. Flag records `flagged_revoke` evidence only and never revokes a grant.
 

@@ -569,7 +569,12 @@ one-way and may leave grants undecided. `/access/audit?campaign=<id>` opens a ca
 Viewing writes the same rows as the REST reads: `access_review.list` for the list,
 `access_review.get` for a campaign and `access_review.exported` (`format=view`) for the current
 grants, so opening a campaign leaves a row in the trail. If the access review store does not
-answer, the panel is a red box, never "no reviews".
+answer, the panel is a red box, never "no reviews". The campaign list loads on every page view,
+so a refused browser session writes no denied-access row for it; opening a campaign (including
+by the `?campaign=<id>` link) and reading the current grants are deliberate requests, and a
+refused caller writes the ordinary permission-denied row for each. A refused API or MCP token
+writes one on every fragment, and an engine-class session is refused on all three with an
+`access_review.*` row, `result=denied`, `detail=engine_session_denied`.
 
 **Retention.** Shows the configured retention period (`--audit-retention-days`, 365 days by
 default) and that cleanup runs hourly. It needs `ServerConfig:Read`, which is

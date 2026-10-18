@@ -5244,6 +5244,8 @@ Each panel loads on its own. A refused browser session writes no denied-access a
 
 A request the page cannot honour (an unknown range, an `offset` past 10000, a NUL byte in a filter, a bad sample size) is answered with status 200 and a short note, because htmx discards 4xx and 5xx bodies; nothing is read from the store.
 
+Which refusals leave a denied-access audit row differs by panel, because some panels load themselves and some wait for a click. The campaign list loads on every page view, so a refused browser session writes no denied-access row for it (opening the page must not fill the audit log). Opening a campaign, including by the `?campaign=<id>` link (which loads that campaign when the page opens), and reading the current grants are deliberate requests: a refused caller writes the ordinary permission-denied row. A refused API or MCP token that reaches any of the three fragment URLs writes one every time. An engine-class session is refused with `403` on all three fragments and leaves an `access_review.list`, `access_review.get` or `access_review.exported` row with `result=denied` and `detail=engine_session_denied`, as the REST twins do.
+
 ### OTA Updates
 
 | Method | Route | Description |
