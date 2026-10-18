@@ -20,6 +20,7 @@
 //
 // Header-only and free of server types so a unit test drives it with a stub evaluator.
 
+#include <cstddef>
 #include <expected>
 #include <string>
 #include <unordered_map>

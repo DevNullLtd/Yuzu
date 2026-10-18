@@ -240,7 +240,8 @@ TEST_CASE("HeartbeatIngestion: a throwing quarantine reconcile fn logs neutralis
     CHECK(logs.find("agent_x_") != std::string::npos);
     CHECK(logs.find("boom_FORGED-LINE__[31m") != std::string::npos);
     CHECK(logs.find('\x1b') == std::string::npos);
-    CHECK(logs.find('\r') == std::string::npos);
+    // A lone mid-line CR counts everywhere; Windows spdlog's trailing "\r\n" does not.
+    CHECK(yuzu::test::stray_control_bytes(logs) == 0);
     // The single trailing eol is the only newline.
     CHECK(std::count(logs.begin(), logs.end(), '\n') == 1);
 }

@@ -20700,7 +20700,16 @@ private:
                 if (scope.empty()) {
                     targets = registry_.all_ids();
                 } else if (scope.starts_with("group:") && mgmt_group_store_) {
-                    for (const auto& m : mgmt_group_store_->get_members(scope.substr(6)))
+                    // A degraded membership read aborts the push (-2): an empty
+                    // cohort here would read as "no members" and narrow the fan-out.
+                    auto members = mgmt_group_store_->get_members_checked(scope.substr(6));
+                    if (!members) {
+                        spdlog::warn("Guardian push: group member read degraded - aborting "
+                                     "push (scope={})",
+                                     ::yuzu::log_key_token(scope));
+                        return -2;
+                    }
+                    for (const auto& m : *members)
                         targets.push_back(m.agent_id);
                 } else {
                     // `parsed_scope` was parsed (and an invalid scope refused) at the top.
