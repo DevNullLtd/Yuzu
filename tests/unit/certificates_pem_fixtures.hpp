@@ -14,7 +14,7 @@
 
 // ── Real capture: System.keychain, first block ──────────────────────────────
 //
-// Captured 2026-08-14T19:06:27Z host=Alexs-MacBook-Air.local macos=26.5.2,
+// Captured 2026-08-14T19:06:27Z host=(redacted) macos=26.5.2,
 // rc=0, by: sh -c "security find-certificate -a -p
 // /Library/Keychains/System.keychain | head -c 500000" -- this is the FIRST PEM
 // block of that capture, a genuine macOS system-identity certificate,

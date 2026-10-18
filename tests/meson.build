@@ -1472,6 +1472,9 @@ if build_server
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
+      'unit/server/test_oidc_https.cpp', # #5692: discovery + JWKS over TLS, incl. the handler-thread leg
+      'unit/server/test_oidc_egress_policy.cpp', # #5692: pure address-class policy for OIDC fetches
+      'unit/server/test_oidc_egress.cpp', # #5692: the policy applied to real fetches (pin, refusal, cross-host)
       'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_sha256_steps.cpp',
       'unit/server/test_oidc_routes.cpp',
@@ -1617,6 +1620,11 @@ if build_server
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
+      'unit/server/test_guardian_reconcile_budget.cpp', # #5513: reconcile admission budget (leaky bucket)
+      'unit/server/test_guardian_reconcile_gate.cpp', # #5513: reconcile claim map + admit-before-claim ordering
+      'unit/server/test_guardian_generation_cache.cpp', # #5513: TTL-cached policy-generation read
+      'unit/server/test_guardian_rule_bundle.cpp', # #5513: per-generation rule-bundle memo
+      'unit/server/test_agent_registry_scope_for_agent.cpp', # #5513: single-agent scope evaluator
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
@@ -2006,7 +2014,8 @@ if build_server
   #     rebalancing a shard needs only the right suite: kwarg here, ci.yml
   #     is untouched, and the partition invariant below proves the property.
   #     ci.yml DOES still hardcode BY NAME: the 3 non-pg server test names
-  #     (A/B/C), 'mcp bridge teardown allocation budget', 'server pg shard
+  #     (A/B/C), 'mcp bridge teardown allocation budget', 'guardian cache
+  #     allocation-failure sweep', 'server pg shard
   #     partition invariant', and (Phase 2) 'server pg smoke' — renaming any
   #     of those, or adding a new top-level `suite:`
   #     anywhere in the build (tests/meson.build or the root meson.build —
@@ -2928,6 +2937,29 @@ if build_server
       suite: ['server', 'server-checks'],
       timeout: 60,
     )
+
+    # ── #5513 Guardian single-flight cache allocation-failure sweep ──────────
+    # Fails every allocation inside GuardianGenerationCache / GuardianRuleBundleCache
+    # get() (and GuardianReconcileGate::decide()) in turn and checks the NEXT call is not
+    # wedged (FlightGuard / noexcept install / run_fetch / run_loader). Replaces the global
+    # operator new, so: its own binary, absent from sanitizer builds, Linux-only (same
+    # reasons as the probe above).
+    # The caches, the budget and the gate are header-only and self-contained: nothing from
+    # yuzu_server_core. The binary links only Catch2 and builds only because make_bundle
+    # (inline, calls scope::parse from scope_engine.cpp) is never called here: do not call
+    # make_bundle in this binary.
+    guardian_cache_alloc_sweep_exe = executable(
+      'yuzu_guardian_cache_alloc_sweep_tests',
+      files('unit/server/test_guardian_cache_alloc_sweep.cpp'),
+      cpp_args: test_partial_init_args,
+      dependencies: [catch2_dep],
+    )
+    test(
+      'guardian cache allocation-failure sweep',
+      guardian_cache_alloc_sweep_exe,
+      suite: ['server', 'server-checks'],
+      timeout: 60,
+    )
   endif
 endif
 
@@ -3157,6 +3189,16 @@ test('embed_content idempotent',
 test('instructions risk table',
   _python3_test,
   args: [files('test_instructions_risk_table.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The /test Instructions gate's parameter synthesis must satisfy every definition's
+# validation.pattern (the server answers 400 otherwise). Hermetic — imports the
+# runner and parses content/definitions/, starts no server.
+test('instructions runner parameter synthesis',
+  _python3_test,
+  args: [files('test_instructions_runner_params.py')],
   suite: 'docs',
   timeout: 30,
 )

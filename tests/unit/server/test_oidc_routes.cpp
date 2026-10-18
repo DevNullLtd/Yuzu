@@ -6,10 +6,8 @@
  * (The binding tests at the end of this file DO have a loopback IdP: test_oidc_mock_idp.hpp.)
  *
  * `OidcProvider::handle_callback`'s success path exchanges the auth code for
- * tokens over HTTP/subprocess (`exchange_script`) and fetches JWKS from the
- * IdP — there is no mock-IdP harness in this codebase (test_oidc_provider.cpp
- * covers only the pure-function/parsing layer), so this file covers what IS
- * reachable without a live IdP: the callback's early-exit failure paths
+ * tokens over HTTP and fetches JWKS from the IdP. The early cases in this
+ * file need no IdP and cover the callback's early-exit failure paths
  * (IdP error response, missing code/state, unknown PKCE state — none of
  * which touch the network) and the resulting
  * `yuzu_auth_oidc_login_total{result=error}` counter (#1828.2). The
@@ -27,18 +25,27 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "oidc_provider.hpp"
+#include "oidc_writer_gate.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "session_store.hpp"
 #include "test_oidc_mock_idp.hpp"
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <thread>
+#include <chrono>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -171,6 +178,45 @@ TEST_CASE("OIDC callback — IdP error response increments yuzu_auth_oidc_login_
     REQUIRE_FALSE(events.empty());
     CHECK(events.front().action == "auth.oidc_login_failed");
     CHECK(events.front().result == "error");
+}
+
+TEST_CASE("OIDC callback — an IdP error with line breaks cannot forge a log line or an audit "
+          "detail - and the response is unchanged",
+          "[pg][oidc][auth_routes][log_fold][security]") {
+    OidcRoutesFixture fix;
+    fix.oidc_provider = std::make_unique<oidc::OidcProvider>(make_minimal_oidc_config());
+    REQUIRE(fix.oidc_provider->is_enabled());
+
+    // Unauthenticated, no IdP involved: both parameters are attacker-chosen. The error carries
+    // LF plus the audit detail's own separators; the description carries LF and the Unicode breaks.
+    yuzu::test::LogCapture cap;
+    auto res = fix.sink.dispatch(
+        "GET", "/auth/callback?error=x%0AFORGED%3Brole%3Dadmin&error_description=a%0Ab%C2%85c"
+               "%E2%80%A8d%E2%80%A9e");
+    cap.stop();
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 302);
+    CHECK(res->get_header_value("Location") == "/login?error=sso_denied");
+    CHECK(res->body.empty());
+
+    const auto logs = cap.text();
+    CAPTURE(logs);
+    const auto at = logs.find("OIDC error from IdP");
+    REQUIRE(at != std::string::npos);
+    const auto rest = logs.substr(at);
+    CHECK(std::count(rest.begin(), rest.end(), '\n') == 1); // only the terminator
+    CHECK(logs.find("\nFORGED") == std::string::npos);
+    CHECK(logs.find("\xC2\x85") == std::string::npos);
+    CHECK(logs.find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(logs.find("\xE2\x80\xA9") == std::string::npos);
+
+    const auto events = fix.audit_events();
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "error");
+    CAPTURE(events.front().detail);
+    CHECK(events.front().detail == "idp error: x_FORGED_role_admin");
+    CHECK(events.front().detail.find('\n') == std::string::npos);
 }
 
 TEST_CASE("OIDC callback — missing code/state increments "
@@ -336,8 +382,13 @@ oidc::OidcConfig flow_cfg(const std::string& token_endpoint) {
     c.issuer = "https://idp.example.test";
     c.client_id = "yuzu-test-client";
     c.redirect_uri = "https://yuzu.example.test/auth/callback";
-    c.authorization_endpoint = c.issuer + "/authorize"; // skips discovery (no network)
+    c.authorization_endpoint = c.issuer + "/authorize"; // explicit: no discovery (no network)
     c.token_endpoint = token_endpoint;
+    // Explicit and refused instantly: were the per-field rule to regress, a flow fails here
+    // instead of reaching a real discovery fetch.
+    c.jwks_uri = "http://127.0.0.1:1/jwks";
+    // The mock IdPs listen on loopback, which the egress policy refuses by default.
+    c.allow_private_networks = true;
     return c;
 }
 
@@ -613,7 +664,487 @@ TEST_CASE("OIDC binding route: the IdP's GET callback is not subject to a same-o
     CHECK(r->get_header_value("Location") == "/home");
 }
 
+// ---------------------------------------------------------------------------
+// Discovery (#5692): the routes against an IdP whose endpoints and JWKS come ONLY from its
+// discovery document (no explicit endpoint, no add_test_jwks_key).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct DiscoveryRig {
+    yuzu::server::test::MockIdp idp;
+    OidcRoutesFixture fix;
+    oidc::OidcConfig cfg;
+
+    explicit DiscoveryRig(bool explicit_authorize = false) {
+        cfg.issuer = idp.base();
+        cfg.client_id = "yuzu-test-client";
+        cfg.redirect_uri = "https://yuzu.example.test/auth/callback";
+        cfg.allow_private_networks = true; // the mock IdP listens on loopback
+        if (explicit_authorize)
+            cfg.authorization_endpoint = idp.base() + "/authorize";
+        fix.oidc_provider = std::make_unique<oidc::OidcProvider>(cfg);
+        fix.cfg.oidc_redirect_uri = cfg.redirect_uri;
+    }
+
+    std::unique_ptr<httplib::Response> get(Browser& b, const std::string& path) {
+        auto r = fix.sink.dispatch("GET", path, {}, "application/json", b.headers());
+        REQUIRE(r != nullptr);
+        b.absorb(*r);
+        return r;
+    }
+
+    /// The callback request the IdP would send the browser to for the flow `start` began.
+    std::string callback_path(const httplib::Response& start) {
+        const auto back = idp.follow_authorize(start.get_header_value("Location"));
+        REQUIRE(back.starts_with(cfg.redirect_uri + "?"));
+        return "/auth/callback" + back.substr(cfg.redirect_uri.size());
+    }
+};
+
+} // namespace
+
+TEST_CASE("OIDC discovery route: a full login works with endpoints and JWKS from discovery alone",
+          "[pg][oidc][oidc_discovery][auth_routes]") {
+    DiscoveryRig rig;
+    Browser a;
+    auto start = rig.get(a, "/auth/oidc/start");
+    REQUIRE(start->status == 302);
+    CHECK(start->get_header_value("Location").starts_with(rig.idp.base() + "/authorize?"));
+    CHECK(a.jar.count("__Host-yuzu_oidc_bind") == 1);
+
+    auto cb = rig.get(a, rig.callback_path(*start));
+    CHECK(cb->status == 302);
+    CHECK(cb->get_header_value("Location") == "/home");
+    CHECK(has_cookie_named(*cb, "yuzu_session="));
+    const auto events = rig.fix.audit_events(1);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login");
+    CHECK(events.front().result == "ok");
+    CHECK(rig.idp.discovery_calls.load() == 1);
+    CHECK(rig.idp.jwks_calls.load() == 1);
+}
+
+TEST_CASE("OIDC discovery route: discovery down at login start answers 500 with no cookie - no "
+          "redirect and no stored flow",
+          "[pg][oidc][oidc_discovery][auth_routes]") {
+    DiscoveryRig rig;
+    rig.idp.with([](yuzu::server::test::MockIdp& m) { m.discovery_status = 500; });
+    Browser a;
+    auto r = rig.get(a, "/auth/oidc/start");
+    CHECK(r->status == 500);
+    CHECK(r->get_header_value("Location").empty());
+    CHECK(set_cookies(*r).empty());
+    CHECK(rig.fix.oidc_provider->pending_flow_count_for_test() == 0);
+    const auto body = nlohmann::json::parse(r->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"].value("code", 0) == 500);
+}
+
+TEST_CASE(
+    "OIDC discovery route: discovery down at the callback is a refused sign-in - audited as a "
+    "failure - with no session",
+    "[pg][oidc][oidc_discovery][auth_routes]") {
+    DiscoveryRig rig(/*explicit_authorize=*/true); // the start needs no discovery
+    rig.idp.with([](yuzu::server::test::MockIdp& m) { m.discovery_status = 500; });
+    Browser a;
+    auto start = rig.get(a, "/auth/oidc/start");
+    REQUIRE(start->status == 302);
+    auto cb = rig.get(a, rig.callback_path(*start));
+    CHECK(cb->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK_FALSE(has_cookie_named(*cb, "yuzu_session="));
+    CHECK(rig.idp.token_calls.load() == 0); // never got as far as the token endpoint
+    const auto events = rig.fix.audit_events(1);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "failure");
+}
+
+// ---------------------------------------------------------------------------
+// IdP-controlled JSON of the wrong type (#5692): the provider answers with an error, never an
+// exception, so the route still audits the failure, counts it and spends the binding cookie.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string forged_jwt(const std::string& header_json, const std::string& payload_json) {
+    const auto b64 = [](const std::string& s) {
+        return oidc::OidcProvider::base64url_encode(std::vector<uint8_t>(s.begin(), s.end()));
+    };
+    return b64(header_json) + "." + b64(payload_json) + "." + b64("sig");
+}
+
+} // namespace
+
+TEST_CASE(
+    "OIDC binding route: IdP JSON of the wrong type is a failed sign-in that is audited - counted "
+    "and spends the binding cookie",
+    "[pg][oidc][oidc_binding][oidc_discovery][auth_routes]") {
+    BindingRig rig;
+    Browser a;
+    const auto flow = rig.start(a);
+    // The key `start` registered for this flow: lets a SIGNED token reach the claims parser.
+    const std::string kid = "kid-" + flow.state.substr(0, 8);
+    const std::string payload = yuzu::server::test::id_token_payload(rig.cfg, "n");
+
+    SECTION("a header whose alg is a number") {
+        rig.idp.set_id_token(forged_jwt(R"({"alg":123,"kid":")" + kid + R"("})", payload));
+    }
+    SECTION("a header whose alg is an array") {
+        rig.idp.set_id_token(forged_jwt(R"({"alg":[],"kid":")" + kid + R"("})", payload));
+    }
+    SECTION("a header whose kid is null") {
+        rig.idp.set_id_token(forged_jwt(R"({"alg":"RS256","kid":null})", payload));
+    }
+    SECTION("a header whose kid is a number") {
+        rig.idp.set_id_token(forged_jwt(R"({"alg":"RS256","kid":5})", payload));
+    }
+    SECTION("a token-endpoint error body whose error is a number") {
+        rig.idp.with([](yuzu::server::test::MockIdp& m) { m.token_body = R"({"error":5})"; });
+    }
+    SECTION("a token-endpoint error body whose error_description is null") {
+        rig.idp.with([](yuzu::server::test::MockIdp& m) {
+            m.token_body = R"({"error":"invalid_grant","error_description":null})";
+        });
+    }
+    SECTION("a signed token whose aud is an array holding a number") {
+        auto claims = nlohmann::json::parse(payload);
+        claims["aud"] = nlohmann::json::array({123});
+        rig.idp.set_id_token(yuzu::server::test::rs256_sign(kid, claims.dump()));
+    }
+    SECTION("a document that throws something the parsers do not catch (number overflow)") {
+        rig.idp.with([](yuzu::server::test::MockIdp& m) {
+            m.token_body = R"({"id_token":"x","pad":1e999})";
+        });
+    }
+
+    auto r = rig.get(a, "/auth/callback?code=c&state=" + flow.state);
+    CHECK(r->status == 302);
+    CHECK(r->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK(binding_cookie_cleared(*r)); // the flow was matched and spent
+    CHECK_FALSE(has_cookie_named(*r, "yuzu_session="));
+    CHECK(rig.idp.token_calls.load() == 1);
+    const auto events = rig.fix.audit_events(1);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "failure");
+    CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
+}
+
+// create_oidc_session returns an EMPTY token when the durable session row cannot be written
+// (ADR-0007 fail-safe). The callback must treat that as a failed sign-in: no cookie, no ok audit
+// row, no ok counter.
+TEST_CASE(
+    "OIDC binding route: a session that cannot be persisted is a failed sign-in - not a success",
+    "[pg][oidc][oidc_binding][auth_routes]") {
+    BindingRig rig;
+    yuzu::server::SessionStore store{*rig.fix.audit_pool};
+    REQUIRE(store.is_open());
+    rig.fix.auth_mgr.set_session_store(&store);
+    // Declared after `store`, so it is destroyed first: the manager never outlives its store.
+    struct Detach {
+        auth::AuthManager& mgr;
+        ~Detach() { mgr.set_session_store(nullptr); }
+    } detach{rig.fix.auth_mgr};
+
+    // Control: with the store intact the same flow signs in.
+    Browser ok_browser;
+    const auto ok_flow = rig.start(ok_browser, "alice-sub");
+    auto ok = rig.callback(ok_browser, ok_flow);
+    REQUIRE(ok->get_header_value("Location") == "/home");
+    REQUIRE(has_cookie_named(*ok, "yuzu_session="));
+
+    // Fault: drop the durable session schema so the next INSERT fails.
+    {
+        auto lease = rig.fix.audit_pool->acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::exec_params(lease.get(), "DROP SCHEMA session_store CASCADE",
+                                      std::vector<std::string>{});
+    }
+    Browser b;
+    const auto flow = rig.start(b, "bob-sub");
+    auto r = rig.callback(b, flow);
+    CHECK(r->status == 302);
+    CHECK(r->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK_FALSE(has_cookie_named(*r, "yuzu_session="));
+    CHECK(binding_cookie_cleared(*r));
+
+    const auto events = rig.fix.audit_events(10);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "failure");
+    CHECK(events.front().detail == "reason=session_create_failed");
+    const auto ok_rows = std::count_if(events.begin(), events.end(), [](const AuditEvent& e) {
+        return e.action == "auth.oidc_login" && e.result == "ok";
+    });
+    CHECK(ok_rows == 1); // only the control login: the failed one wrote no ok row
+    CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
+}
+
+TEST_CASE("OIDC route: a provider swap does not wait for an in-flight sign-in start",
+          "[pg][oidc][oidc_discovery][oidc_lease][auth_routes]") {
+    // /auth/oidc/start runs lazy discovery (network I/O). It used to hold the shared oidc_mu_
+    // for all of it, so a Settings save (exclusive lock) waited for the slowest fetch and every
+    // new sign-in waited behind that save. Now the route holds a lease, not the lock.
+    DiscoveryRig rig;
+    rig.idp.hold_discovery();
+    Browser a;
+    // Declared BEFORE the worker and its release guard: if a failing check unwinds the test,
+    // the guard releases the held fetch (so the worker's lease ends) before this provider's
+    // destructor, which waits for that lease, runs.
+    std::unique_ptr<oidc::OidcProvider> unpublished;
+    std::atomic<int> start_status{0};
+    std::thread worker([&] {
+        auto r = rig.fix.sink.dispatch("GET", "/auth/oidc/start", {}, "application/json",
+                                       a.headers());
+        start_status.store(r ? r->status : -1);
+    });
+    // Declared after `worker`, so it runs first on any exit (a failing REQUIRE included): the
+    // held fetch is released and the thread joined before anything it captured is destroyed.
+    struct ReleaseAndJoin {
+        yuzu::server::test::MockIdp& idp;
+        std::thread& t;
+        ~ReleaseAndJoin() {
+            idp.release_discovery();
+            if (t.joinable())
+                t.join();
+        }
+    } release_and_join{rig.idp, worker};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (rig.idp.discovery_calls.load() < 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    REQUIRE(rig.idp.discovery_calls.load() == 1); // the request is inside its fetch
+
+    // What the Settings save does: take the exclusive lock, swap, release, retire.
+    {
+        // try_lock may fail spuriously, so retry for a bounded time; a request that really held
+        // the lock for its whole fetch (the old behavior) never lets go while discovery is held.
+        std::unique_lock exclusive(rig.fix.oidc_mu, std::defer_lock);
+        const auto lock_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!exclusive.try_lock() && std::chrono::steady_clock::now() < lock_deadline)
+            std::this_thread::yield();
+        REQUIRE(exclusive.owns_lock()); // the in-flight request does not hold the lock
+        unpublished = std::move(rig.fix.oidc_provider);
+        rig.fix.oidc_provider = std::make_unique<oidc::OidcProvider>(rig.cfg);
+    }
+    oidc::OidcProvider::drain_retired();
+    oidc::OidcProvider::retire(std::move(unpublished)); // returns although the request is live
+    CHECK(oidc::OidcProvider::retired_count_for_test() == 1);
+
+    rig.idp.release_discovery();
+    worker.join();
+    CHECK(start_status.load() == 302); // the request finished on the provider it started with
+    oidc::OidcProvider::drain_retired();
+    CHECK(oidc::OidcProvider::retired_count_for_test() == 0);
+}
+
+TEST_CASE("OIDC route: a Settings swap during an in-flight callback does not wait for it and "
+          "the callback is then refused - no session under the replaced configuration",
+          "[pg][oidc][oidc_discovery][oidc_lease][auth_routes]") {
+    // /auth/callback does the token POST and the JWKS fetch (the long network I/O). Two things
+    // must hold, for each IdP step the callback can be stuck in:
+    //  (1) the route holds a lease, not oidc_mu_, so the exclusive swap of a Settings save is
+    //      not delayed by the callback (this is the callback half of the lock finding);
+    //  (2) a callback that finishes after the save replaced the provider is REFUSED before any
+    //      group, role or session work: the operator changed the configuration (an admin group,
+    //      the issuer), and no session may be minted under the old one after the save returned.
+    DiscoveryRig rig;
+    oidc::OidcProvider::drain_retired();
+    const bool stuck_in_token_post = GENERATE(true, false);
+    CAPTURE(stuck_in_token_post);
+    Browser a;
+    auto start = rig.get(a, "/auth/oidc/start");
+    REQUIRE(start->status == 302);
+    const std::string callback = rig.callback_path(*start);
+
+    // Declared before the worker and its guard (see the start test above for the ordering).
+    std::unique_ptr<oidc::OidcProvider> unpublished;
+    if (stuck_in_token_post)
+        rig.idp.hold_token();
+    else
+        rig.idp.hold_jwks();
+    std::unique_ptr<httplib::Response> callback_res;
+    std::thread worker([&] {
+        callback_res = rig.fix.sink.dispatch("GET", callback, {}, "application/json", a.headers());
+    });
+    struct ReleaseAndJoin {
+        yuzu::server::test::MockIdp& idp;
+        std::thread& t;
+        ~ReleaseAndJoin() {
+            idp.release_token();
+            idp.release_jwks();
+            if (t.joinable())
+                t.join();
+        }
+    } release_and_join{rig.idp, worker};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const auto step_calls = [&] {
+        return stuck_in_token_post ? rig.idp.token_calls.load() : rig.idp.jwks_calls.load();
+    };
+    while (step_calls() < 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    REQUIRE(step_calls() == 1); // the callback is inside the IdP step
+
+    {
+        std::unique_lock exclusive(rig.fix.oidc_mu, std::defer_lock);
+        const auto lock_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!exclusive.try_lock() && std::chrono::steady_clock::now() < lock_deadline)
+            std::this_thread::yield();
+        REQUIRE(exclusive.owns_lock()); // (1) the in-flight callback does not hold the lock
+        unpublished = std::move(rig.fix.oidc_provider);
+        // The "save": a new provider (a changed admin group would live in rig.fix.cfg).
+        rig.fix.cfg.oidc_admin_group = "a-different-admin-group";
+        rig.fix.oidc_provider = std::make_unique<oidc::OidcProvider>(rig.cfg);
+    }
+    oidc::OidcProvider::retire(std::move(unpublished)); // returns although the callback is live
+    CHECK(oidc::OidcProvider::retired_count_for_test() == 1);
+
+    rig.idp.release_token();
+    rig.idp.release_jwks();
+    worker.join();
+    REQUIRE(callback_res != nullptr);
+    CHECK(callback_res->status == 302);
+    CHECK(callback_res->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK_FALSE(has_cookie_named(*callback_res, "yuzu_session=")); // (2) no session was minted
+    const auto events = rig.fix.audit_events(1);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "failure");
+    CHECK(events.front().detail == "reason=provider_replaced");
+    CHECK(binding_cookie_cleared(*callback_res)); // the flow was matched and spent
+    // No login succeeded at any point: not merely "the newest row is a failure".
+    const auto all_events = rig.fix.audit_events(20);
+    CHECK(std::count_if(all_events.begin(), all_events.end(), [](const AuditEvent& e) {
+              return e.action == "auth.oidc_login" && e.result == "ok";
+          }) == 0);
+    CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
+    // The role label a wrongly minted login would carry is not known here, so none may exist.
+    for (const char* role : {"admin", "user"})
+        CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "ok"}, {"role", role}}) ==
+              0.0);
+    oidc::OidcProvider::drain_retired();
+    CHECK(oidc::OidcProvider::retired_count_for_test() == 0);
+}
+
+TEST_CASE("OIDC route: a Settings swap between the first provider check and the session mint "
+          "leaves no usable session - the minted one is invalidated and no cookie is set",
+          "[pg][oidc][oidc_lease][auth_routes]") {
+    // The second provider check (made right after create_oidc_session) exists for the span the
+    // first one cannot cover: the group sync, the SCIM read and the durable session write. The
+    // test seam runs the "save" (exclusive lock, swap, retire) in exactly that span.
+    DiscoveryRig rig;
+    oidc::OidcProvider::drain_retired();
+    yuzu::server::SessionStore store{*rig.fix.audit_pool};
+    REQUIRE(store.is_open());
+    rig.fix.auth_mgr.set_session_store(&store);
+    // Declared after `store`, so it is destroyed first: the manager never outlives its store.
+    struct Detach {
+        auth::AuthManager& mgr;
+        ~Detach() { mgr.set_session_store(nullptr); }
+    } detach{rig.fix.auth_mgr};
+
+    const auto durable_rows = [&] {
+        auto lease = rig.fix.audit_pool->acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(),
+                                               "SELECT count(*) FROM session_store.sessions",
+                                               std::vector<std::string>{});
+        return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+    };
+
+    // Control: with no save in the span the same flow signs in and leaves one durable row.
+    {
+        Browser c;
+        auto start = rig.get(c, "/auth/oidc/start");
+        REQUIRE(start->status == 302);
+        auto ok = rig.fix.sink.dispatch("GET", rig.callback_path(*start), {}, "application/json",
+                                        c.headers());
+        REQUIRE(ok != nullptr);
+        REQUIRE(ok->get_header_value("Location") == "/home");
+        REQUIRE(has_cookie_named(*ok, "yuzu_session="));
+        REQUIRE(durable_rows() == 1);
+    }
+
+    std::unique_ptr<oidc::OidcProvider> unpublished;
+    rig.fix.auth_routes->set_after_first_provider_check_for_test([&] {
+        std::unique_lock exclusive(rig.fix.oidc_mu); // the callback holds a lease, not this lock
+        unpublished = std::move(rig.fix.oidc_provider);
+        rig.fix.cfg.oidc_admin_group = "a-different-admin-group";
+        rig.fix.oidc_provider = std::make_unique<oidc::OidcProvider>(rig.cfg);
+    });
+    Browser b;
+    auto start = rig.get(b, "/auth/oidc/start");
+    REQUIRE(start->status == 302);
+    // The hook swaps AFTER handle_callback accepted the flow and the first check passed.
+    auto res = rig.fix.sink.dispatch("GET", rig.callback_path(*start), {}, "application/json",
+                                     b.headers());
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 302);
+    CHECK(res->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK_FALSE(has_cookie_named(*res, "yuzu_session="));
+    CHECK(binding_cookie_cleared(*res));
+    CHECK(durable_rows() == 1); // only the control login's row: the minted one was deleted
+
+    const auto events = rig.fix.audit_events(20);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "failure");
+    CHECK(events.front().detail == "reason=provider_replaced;post_mint=true");
+    CHECK(std::count_if(events.begin(), events.end(), [](const AuditEvent& e) {
+              return e.action == "auth.oidc_login" && e.result == "ok";
+          }) == 1); // the control login only
+    CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
+    oidc::OidcProvider::retire(std::move(unpublished));
+    oidc::OidcProvider::drain_retired();
+}
+
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+TEST_CASE("OIDC route: the landing page and the sign-in start wait at the writer gate while a "
+          "Settings save is waiting for the OIDC lock",
+          "[pg][oidc][oidc_lease][oidc_gate][auth_routes]") {
+    // Pins the WIRING of the writer gate in auth_routes.cpp (#5692 UP-13): deleting a
+    // `reader_pass()` there brings writer starvation back with every other test still green.
+    OidcRoutesFixture fix;
+    fix.oidc_provider = std::make_unique<oidc::OidcProvider>(flow_cfg("http://127.0.0.1:1/token"));
+    fix.cfg.oidc_redirect_uri = "https://yuzu.example.test/auth/callback";
+    auto& gate = yuzu::server::oidc::OidcWriterGate::instance();
+    REQUIRE(gate.waiting_for_test() == 0);
+    for (const std::string path : {std::string("/home"), std::string("/auth/oidc/start")}) {
+        CAPTURE(path);
+        std::optional<yuzu::server::oidc::OidcWriterGate::Ticket> ticket;
+        ticket.emplace(gate); // a save waiting for the exclusive lock
+        std::atomic<bool> done{false};
+        std::unique_ptr<httplib::Response> res;
+        Browser b;
+        std::thread worker([&] {
+            res = fix.sink.dispatch("GET", path, {}, "application/json", b.headers());
+            done = true;
+        });
+        struct ReleaseAndJoin {
+            std::optional<yuzu::server::oidc::OidcWriterGate::Ticket>& tk;
+            std::thread& t;
+            ~ReleaseAndJoin() {
+                tk.reset();
+                if (t.joinable())
+                    t.join();
+            }
+        } release_and_join{ticket, worker};
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK_FALSE(done.load()); // held at the gate
+        ticket.reset();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!done.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        CHECK(done.load());
+        worker.join();
+        REQUIRE(res != nullptr);
+    }
+}
 
 TEST_CASE("OIDC binding route: a digest failure at login start answers 500 with no cookie and no redirect",
           "[pg][oidc][oidc_binding][oidc_hash_failure][auth_routes]") {
