@@ -1573,16 +1573,13 @@ static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk,
 
     BIGNUM* bn_n = base64url_to_bn(n_str);
     BIGNUM* bn_e = base64url_to_bn(e_str);
-    if (!bn_n || !bn_e) {
-        BN_free(bn_n);
-        BN_free(bn_e);
-        return nullptr;
-    }
-    if (BN_num_bits(bn_n) < kMinRsaModulusBits) {
-        BN_free(bn_n);
-        BN_free(bn_e);
-        if (refusal != nullptr)
+    // One cleanup path for every refusal here: the size floor shares it with the parse failures
+    // (BN_free(nullptr) is a no-op), so the floor adds no cleanup of its own.
+    if (!bn_n || !bn_e || BN_num_bits(bn_n) < kMinRsaModulusBits) {
+        if (refusal != nullptr && bn_n && bn_e)
             *refusal = "RSA modulus under 2048 bits";
+        BN_free(bn_n);
+        BN_free(bn_e);
         return nullptr;
     }
 
