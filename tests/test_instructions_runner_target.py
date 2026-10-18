@@ -23,13 +23,18 @@ import instructions_runner as ir  # noqa: E402
 
 AGENT = "agent-under-test"
 HOSTNAME = "Box-1"
-ANSWERED = [{"output": "x", "status": "ok", "rc": 0}]
+ANSWERED = [{"output": "x", "status": 1, "error_detail": ""}]  # the wire row shape
 
 
 def make_def(risk, plugin="p"):
     return ir.Definition(id=f"x.{risk}", plugin=plugin, action="a", type="action", platforms=[],
                          parameters={}, result_columns=[], approval_mode="auto", risk=risk,
                          file="x.yaml")
+
+
+class NullManifest:
+    def record(self, *a, **k):
+        pass
 
 
 class RecordingClient:
@@ -72,11 +77,17 @@ class TargetIsSent(unittest.TestCase):
         for risk in ("destructive", "forensic"):
             with self.subTest(risk=risk):
                 client = RecordingClient()
-                out = ir.exercise(client, make_def(risk), {f"x.{risk}": {}}, 30, AGENT)
+                out = ir.exercise(client, make_def(risk), {f"x.{risk}": {}}, 30, AGENT, "", NullManifest())
                 self.assertEqual(out.status, "pass")
                 self.assertTrue(out.dispatched)
                 self.assertEqual([c[2] for c in client.calls], [[AGENT]])
                 self.assertEqual([c[1] for c in client.calls], [{}])
+
+    def test_a_targeted_definition_is_never_dispatched_unrecorded(self):
+        client = RecordingClient()
+        out = ir.exercise(client, make_def("destructive"), {"x.destructive": {}}, 30, AGENT)
+        self.assertEqual((out.status, client.calls), ("error", []))
+        self.assertIn("no manifest", out.note)
 
     def test_safe_and_mutating_send_nothing_extra(self):
         for risk in ("safe", "mutating", "server-internal"):

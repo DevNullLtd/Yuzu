@@ -44,7 +44,7 @@ broadcast for those and wants an explicit, in-scope agent id (exactly one for Fo
 run that selects either class with --risks is a targeted run and needs all of:
 
   --target-agent-id ID     the one connected agent; sent as `agent_ids: [ID]` with those classes
-                           only (every other dispatch is byte-identical to an untargeted run)
+                           only (every other dispatch has the same request body as before)
   --confirm-target HOST    that agent's hostname; checked against GET /api/agents before anything
                            is sent, together with the agent being listed (connected)
   --run-id ID              names the manifest and the User-Agent
@@ -55,7 +55,14 @@ run that selects either class with --risks is a targeted run and needs all of:
 
 Anything missing is a configuration error: exit 2, nothing dispatched. These instructions change
 or read a real device, so a targeted run is serial, appends each dispatch to a manifest before
-sending it, and stops dispatching on Ctrl-C (exit 130). A server-internal definition is never
+sending it, waits for every response row to finish, and passes only if each is SUCCESS with no
+error_detail. Ctrl-C and SIGTERM stop dispatching (exit 130); a dispatch already sent is reported
+as in_flight_unknown. Exit codes: 0 all passed, 1 a failure or error (or an early stop on one),
+2 configuration/login/pre-flight error with nothing dispatched, 130 interrupted.
+
+--confirm-target is a wrong-target typo guard against what the connected server reports. It cannot
+detect an ssh -L tunnel or a port forward to a different stack, and it is not an authorisation or
+approval control; use a dedicated admin account on a disposable stack. A server-internal definition is never
 sent a target: it names no agent plugin, so if selected it is broadcast and the dispatch
 chokepoint denies it. A server.* row that the risk table classes destructive is skipped in a
 targeted run for the same reason.
@@ -72,6 +79,7 @@ import json
 import os
 import platform
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -103,6 +111,7 @@ DEFAULT_RISKS = ("safe", "mutating")  # what runs in the default gate
 # Risk classes whose rows the server refuses to broadcast: dispatched to --target-agent-id.
 TARGETED_RISKS = ("destructive", "forensic")
 LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 ALL_RISKS = ("safe", "mutating", "destructive", "forensic", "server-internal", "network-disrupt",
              "interactive")
@@ -136,7 +145,11 @@ class Outcome:
     execution_id: str = ""
     response_count: int = 0
     note: str = ""
-    dispatched: bool = False   # an execute POST was attempted (the manifest line precedes it)
+    dispatched: bool = False   # the server accepted the execute POST (HTTP 200), or it was sent
+                               # and the run ended before the result came back
+
+    def __post_init__(self) -> None:
+        self.note = esc(self.note)  # a name or message from the server or an agent (CWE-117)
 
     def short(self) -> str:
         bits = [f"{self.id} [{self.risk}]", self.status.upper(), f"{self.duration_ms}ms"]
@@ -376,6 +389,17 @@ def synthesise_params(spec_params: dict, override: dict[str, Any] | None = None)
 # ── REST client ────────────────────────────────────────────────────────────
 
 
+def esc(text: Any) -> str:
+    """Escape ASCII control characters (and ESC, DEL) as \\xNN so a name or message the server or
+    an agent reported can neither forge a log line nor drive a terminal (CWE-117)."""
+    return "".join(f"\\x{ord(c):02x}" if ord(c) < 0x20 or ord(c) == 0x7f else c for c in str(text))
+
+
+def clip(text: Any, limit: int = 200) -> str:
+    s = str(text)
+    return s if len(s) <= limit else s[:limit] + "..."
+
+
 def wire_params(params: dict) -> dict[str, str]:
     """The params as they go on the wire (every value a string); the manifest records the same."""
     return {k: str(v) if not isinstance(v, str) else v for k, v in params.items()}
@@ -414,8 +438,6 @@ class YuzuClient:
         with self.opener.open(urllib.request.Request(f"{self.base}/api/agents"),
                               timeout=self.timeout) as resp:
             payload = json.loads(resp.read() or b"[]")
-        if isinstance(payload, dict):
-            payload = payload.get("agents", payload.get("data"))
         if not isinstance(payload, list):
             raise ValueError("unexpected /api/agents body")
         return payload
@@ -461,31 +483,82 @@ class Manifest:
     def __init__(self, path: Path, run_id: str):
         self.path = path
         self.run_id = run_id
-        self._fh = path.open("a", encoding="utf-8")
+        # Owner-only, never through a symlink where the platform can say so; "\n" on every OS.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        self._fh = os.fdopen(os.open(path, flags, 0o600), "a", encoding="utf-8", newline="\n")
         self._lock = threading.Lock()
 
-    def record(self, defn: Definition, target: str, params: dict) -> None:
-        line = json.dumps({"ts": datetime.datetime.now(datetime.timezone.utc)
-                                   .strftime("%Y-%m-%dT%H:%M:%SZ"),
-                           "run_id": self.run_id, "id": defn.id, "risk": defn.risk,
-                           "target_agent_id": target, "params": wire_params(params)},
-                          sort_keys=True)
+    @staticmethod
+    def _now() -> str:
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _write(self, obj: dict) -> None:
+        line = json.dumps(obj, sort_keys=True)
         with self._lock:
             self._fh.write(line + "\n")
             self._fh.flush()
             os.fsync(self._fh.fileno())
 
+    def start(self, **fields: Any) -> None:
+        """The first line: what this run was pointed at (no credentials)."""
+        self._write({"event": "run-start", "ts": self._now(), "run_id": self.run_id, **fields})
+
+    def record(self, defn: Definition, target: str, params: dict) -> None:
+        self._write({"event": "dispatch", "ts": self._now(), "run_id": self.run_id,
+                     "id": defn.id, "risk": defn.risk, "target_agent_id": target,
+                     "params": wire_params(params)})
+
     def close(self) -> None:
-        self._fh.close()
+        try:
+            self._fh.close()
+        except OSError:
+            pass  # never mask the summary or exit 130
 
 
 # ── single-definition exerciser ────────────────────────────────────────────
+
+POLL_INTERVAL_S = 0.5
+# Consecutive 401/403 answers to a targeted execute that end the run: the session is gone or
+# the account lost its grant, and every remaining row would fail the same way.
+AUTH_ABORT_AFTER = 3
+# CommandResponse::Status as the server serialises it in GET /api/responses/{id} rows.
+STATUS_NAMES = {0: "RUNNING", 1: "SUCCESS", 2: "FAILURE", 3: "TIMEOUT", 4: "REJECTED"}
+# Legacy string spellings of a frame still in flight; the wire sends integer 0.
+INTERIM_STATUSES = ("running", "pending", "queued", "in_progress", "started", "dispatched")
+
+
+class RunControl:
+    """State shared by the workers and run(): the stop flag, which dispatches were begun."""
+
+    def __init__(self) -> None:
+        self.stop = threading.Event()
+        self.sent: set[str] = set()   # definition ids whose execute POST was begun
+        self.abort_reason = ""
+        self._auth_failures = 0
+        self._lock = threading.Lock()
+
+    def request_stop(self, reason: str = "") -> None:
+        if reason and not self.abort_reason:
+            self.abort_reason = reason
+        self.stop.set()
+
+    def mark_sent(self, def_id: str) -> None:
+        with self._lock:
+            self.sent.add(def_id)
+
+    def note_status(self, code: int) -> None:
+        with self._lock:
+            self._auth_failures = self._auth_failures + 1 if code in (401, 403) else 0
+            tripped = self._auth_failures >= AUTH_ABORT_AFTER
+        if tripped:
+            self.request_stop(f"{AUTH_ABORT_AFTER} consecutive HTTP 401/403 answers to execute: "
+                              "the session or the account's grant is gone; stopping")
 
 
 def error_message(payload: Any) -> str:
     """The A4 error body's message, prefixed by its reason/code token when it has one.
 
-    Tolerates a string `error`, a missing one and a non-dict body.
+    Tolerates a string `error`, a missing one and a non-dict body. Control characters are escaped.
     """
     if not isinstance(payload, dict):
         return ""
@@ -497,8 +570,8 @@ def error_message(payload: Any) -> str:
         err = err.get("message")
     msg = err if isinstance(err, str) else ""
     if not isinstance(tag, str) or not tag:
-        return msg
-    return f"{tag}: {msg}" if msg else tag
+        return esc(msg)
+    return esc(f"{tag}: {msg}" if msg else tag)
 
 
 def targeted_skip_reason(defn: Definition, param_overrides: dict[str, dict[str, Any]],
@@ -523,25 +596,73 @@ def targeted_skip_reason(defn: Definition, param_overrides: dict[str, dict[str, 
     return ""
 
 
-# A response still in flight; for a destructive/forensic row that is not an answer.
-INTERIM_STATUSES = ("running", "pending", "queued", "in_progress", "started", "dispatched")
+def _int_status(r: Any) -> int | None:
+    s = r.get("status") if isinstance(r, dict) else None
+    return s if isinstance(s, int) and not isinstance(s, bool) else None
+
+
+def row_in_flight(r: Any) -> bool:
+    """A response row that is still RUNNING (integer 0 on the wire; legacy strings too)."""
+    if not isinstance(r, dict):
+        return False
+    s = r.get("status")
+    if isinstance(s, str):
+        return s.lower() in INTERIM_STATUSES
+    return _int_status(r) == 0
+
+
+def grade_targeted(responses: list, poll_timeout_s: int) -> str:
+    """"" if every row finished SUCCESS with no error_detail, else the reason it is a fail.
+
+    The wire row is {id, instruction_id, agent_id, timestamp, status, output, error_detail} with
+    an integer status; a legacy string status or `rc` can only add a failure, never a pass.
+    """
+    problems: list[str] = []
+    running = 0
+    for r in responses:
+        if not isinstance(r, dict):
+            problems.append("a response row is not an object")
+            continue
+        if row_in_flight(r):
+            running += 1
+            continue
+        reasons: list[str] = []
+        s = _int_status(r)
+        if s is None:
+            raw = r.get("status")
+            reasons.append("error" if raw == "error" else f"unrecognised status {clip(raw, 40)!r}")
+        elif s != 1:
+            reasons.append(STATUS_NAMES.get(s, f"status={s}"))
+        rc = r.get("rc", r.get("return_code", 0))
+        if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
+            reasons.append(f"rc={rc}")
+        detail = r.get("error_detail")
+        if isinstance(detail, str) and detail.strip():
+            reasons.append(f"error_detail={clip(detail)!r}")
+        if reasons:
+            problems.append(f"{clip(r.get('agent_id', '?'), 64)}: {', '.join(reasons)}")
+    notes = problems[:3] + ([f"(+{len(problems) - 3} more)"] if len(problems) > 3 else [])
+    if running or not responses:
+        notes.append(f"still running after {poll_timeout_s}s; the action may still be executing "
+                     "on the target")
+    return "; ".join(notes)
 
 
 def exercise(client: YuzuClient, defn: Definition,
              param_overrides: dict[str, dict[str, Any]],
              poll_timeout_s: int, target_agent_id: str = "", target_os: str = "",
-             manifest: Manifest | None = None) -> Outcome:
-    sent = [False]
+             manifest: Manifest | None = None, control: RunControl | None = None) -> Outcome:
+    accepted = [False]
     out = _exercise(client, defn, param_overrides, poll_timeout_s, target_agent_id, target_os,
-                    manifest, sent)
-    out.dispatched = sent[0]
+                    manifest, accepted, control or RunControl())
+    out.dispatched = accepted[0]
     return out
 
 
 def _exercise(client: YuzuClient, defn: Definition,
               param_overrides: dict[str, dict[str, Any]],
               poll_timeout_s: int, target_agent_id: str, target_os: str,
-              manifest: Manifest | None, sent: list[bool]) -> Outcome:
+              manifest: Manifest | None, accepted: list[bool], control: RunControl) -> Outcome:
     started = time.monotonic()
     targeted = defn.risk in TARGETED_RISKS
 
@@ -569,20 +690,30 @@ def _exercise(client: YuzuClient, defn: Definition,
     except Exception as e:
         return Outcome(defn.id, defn.risk, "error", ms(), note=f"param-synth: {e}")
 
-    if targeted and manifest is not None:
+    if targeted and manifest is None:
+        return Outcome(defn.id, defn.risk, "error", ms(),
+                       note="no manifest: refusing to dispatch unrecorded")
+
+    # Checked immediately before the manifest line and the POST: nothing new starts after an abort.
+    if control.stop.is_set():
+        return Outcome(defn.id, defn.risk, "skip", ms(), note="aborted before dispatch")
+
+    if targeted:
         try:
             manifest.record(defn, target_agent_id, params)
         except Exception as e:
             return Outcome(defn.id, defn.risk, "error", ms(), note=f"manifest: {e}")
 
     try:
-        sent[0] = True
+        control.mark_sent(defn.id)
         if targeted:
             code, payload = client.execute_instruction(defn.id, params, [target_agent_id])
         else:
             code, payload = client.execute_instruction(defn.id, params)
     except Exception as e:
         return Outcome(defn.id, defn.risk, "error", ms(), note=f"dispatch: {type(e).__name__}: {e}")
+    if targeted:
+        control.note_status(code)
 
     if code in (200, 202) and not isinstance(payload, dict):
         return Outcome(defn.id, defn.risk, "error", ms(), http_code=code,
@@ -600,6 +731,7 @@ def _exercise(client: YuzuClient, defn: Definition,
                        http_code=code,
                        note=f"HTTP {code} {msg}".strip())
 
+    accepted[0] = True  # the server accepted the dispatch: the action has been started
     command_id = payload.get("command_id", "")
     execution_id = payload.get("execution_id", "")
     if not command_id:
@@ -613,15 +745,26 @@ def _exercise(client: YuzuClient, defn: Definition,
     responses: list = []
     response_count = 0
     while time.monotonic() < deadline:
+        if control.stop.is_set():
+            return Outcome(defn.id, defn.risk, "error", ms(), http_code=code,
+                           command_id=command_id, execution_id=execution_id,
+                           note="in_flight_unknown: dispatch was sent, result not collected")
         last_payload = client.get_responses(command_id)
         responses = last_payload.get("responses", []) if isinstance(last_payload, dict) else []
         response_count = len(responses)
-        if response_count > 0:
-            # Response received from at least one agent
+        # A destructive/forensic row waits for every row to leave RUNNING (the agent sends
+        # periodic RUNNING frames and finalises the row in place); the rest take the first answer.
+        if response_count > 0 and not (targeted and any(row_in_flight(r) for r in responses)):
             break
-        time.sleep(0.5)
+        time.sleep(POLL_INTERVAL_S)
 
     duration_ms = ms()
+
+    if targeted:
+        bad = grade_targeted(responses, poll_timeout_s)
+        return Outcome(defn.id, defn.risk, "fail" if bad else "pass",
+                       duration_ms, http_code=code, command_id=command_id,
+                       execution_id=execution_id, response_count=response_count, note=bad)
 
     if response_count == 0:
         last_err = last_payload.get("error") if isinstance(last_payload, dict) else None
@@ -631,33 +774,13 @@ def _exercise(client: YuzuClient, defn: Definition,
                        note=f"no response within {poll_timeout_s}s"
                             + (f" (last poll: {last_err})" if last_err else ""))
 
-    if targeted:
-        # Stricter than the safe/mutating grading below: an error answer with no output, or a
-        # frame still in flight, is not a pass for a row that changes or reads a real device.
-        def failed(r: Any) -> bool:
-            if not isinstance(r, dict):
-                return True
-            rc = r.get("rc", r.get("return_code", 0))
-            return r.get("status") == "error" or (isinstance(rc, int) and rc != 0)
-
-        bad = [r for r in responses if failed(r)]
-        interim = [r for r in responses if isinstance(r, dict)
-                   and str(r.get("status", "")).lower() in INTERIM_STATUSES]
-        if bad or interim:
-            return Outcome(defn.id, defn.risk, "fail",
-                           duration_ms, http_code=code, command_id=command_id,
-                           execution_id=execution_id, response_count=response_count,
-                           note=(f"{len(bad)} of {response_count} responses errored" if bad
-                                 else f"{len(interim)} of {response_count} responses not terminal"))
-        return Outcome(defn.id, defn.risk, "pass",
-                       duration_ms, http_code=code, command_id=command_id,
-                       execution_id=execution_id, response_count=response_count)
-
     # Loose shape validation: trust the agent's structured `status` and
     # `rc` fields rather than greping the body for "error|". Several
     # legitimate-empty cases (event_logs.errors returning rows whose
     # column-0 label is "error", agent_logging emitting an empty marker)
     # would otherwise be misclassified.
+    # NOTE: this safe/mutating grading still compares a string `status` and an `rc`, neither
+    # of which the server's integer-status rows carry; tracked as a follow-up, unchanged here.
     sane_count = 0
     error_count = 0
     for r in responses:
@@ -736,24 +859,51 @@ def targeting_error(args: argparse.Namespace) -> str:
     except ValueError:
         host = ""
     if host not in LOOPBACK_HOSTS and not args.allow_remote:
-        return (f"--risks {'/'.join(classes)} against a non-loopback dashboard ({host or '?'}) "
+        return (f"--risks {'/'.join(classes)} against a non-loopback dashboard ({esc(host) or '?'}) "
                 "needs --allow-remote")
     return ""
 
 
+def _no_duplicate_keys(pairs: list) -> dict:
+    seen: set = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r}")
+        seen.add(key)
+    return dict(pairs)
+
+
 def load_param_overrides(path: str) -> dict[str, dict[str, Any]]:
-    """Read --params-override ({definition_id: {param: value}}); raises ValueError on any defect."""
+    """Read --params-override ({definition_id: {param: value}}); raises ValueError on any defect.
+
+    A value must be a string or an integer (a boolean is written as the string "true"/"false");
+    a duplicate key at any level is an error, because the last one would silently win.
+    """
     try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:  # missing, unreadable, malformed JSON, bad encoding
+        raw = json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_keys)
+    except (OSError, ValueError) as e:  # missing, unreadable, malformed JSON, bad encoding, duplicate key
         raise ValueError(f"--params-override {path}: {type(e).__name__}: {e}") from e
     if not isinstance(raw, dict):
         raise ValueError(f"--params-override {path}: top level must be an object")
     out = {k: v for k, v in raw.items() if not k.startswith("_")}
-    for k, v in out.items():
-        if not isinstance(v, dict):
-            raise ValueError(f"--params-override {path}: the entry for {k!r} must be an object")
+    for def_id, entry in out.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"--params-override {path}: the entry for {def_id!r} must be an object")
+        for key, value in entry.items():
+            if not (isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))):
+                raise ValueError(
+                    f"--params-override {path}: {def_id!r} parameter {key!r} must be a string or an "
+                    f"integer, not {type(value).__name__} (write a boolean as \"true\" or \"false\")")
     return out
+
+
+def redact_url(url: str) -> str:
+    """The dashboard URL without any userinfo, for the banner and the manifest."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
+    except ValueError:
+        return "?"
 
 
 def preflight(client: YuzuClient, args: argparse.Namespace) -> tuple[dict | None, str]:
@@ -761,20 +911,30 @@ def preflight(client: YuzuClient, args: argparse.Namespace) -> tuple[dict | None
     agent list; an agent is listed while it is connected) and check --confirm-target."""
     try:
         agents = client.list_agents()
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read() or b"{}")
+        except Exception:
+            body = {}
+        err = body.get("error") if isinstance(body, dict) else None
+        perm = (err.get("permission") if isinstance(err, dict) else None) or \
+               (body.get("permission") if isinstance(body, dict) else None)
+        msg = error_message(body)
+        return None, (f"GET /api/agents answered HTTP {e.code}" + (f": {msg}" if msg else "")
+                      + (f" (needs {esc(perm)})" if isinstance(perm, str) else "")
+                      + "; the route needs Infrastructure:Read")
     except Exception as e:
-        return None, f"cannot read the agent list (GET /api/agents): {type(e).__name__}: {e}"
+        return None, f"cannot read the agent list (GET /api/agents): {type(e).__name__}: {esc(e)}"
     agent = next((a for a in agents
                   if isinstance(a, dict) and a.get("agent_id") == args.target_agent_id), None)
     if agent is None:
-        return None, f"agent {args.target_agent_id!r} is not in the server's connected-agent list"
-    if agent.get("online") is False:
-        return None, f"agent {args.target_agent_id!r} is offline"
+        return None, f"agent {esc(args.target_agent_id)!r} is not in the server's connected-agent list"
     hostname = str(agent.get("hostname") or "")
     if not hostname or hostname.casefold() != args.confirm_target.casefold():
-        return None, (f"--confirm-target {args.confirm_target!r} does not match the hostname of "
-                      f"agent {args.target_agent_id!r} ({hostname or 'unknown'!r})")
+        return None, (f"--confirm-target {esc(args.confirm_target)!r} does not match the hostname of "
+                      f"agent {esc(args.target_agent_id)!r} ({esc(hostname) or 'unknown'!r})")
     if not str(agent.get("os") or ""):
-        return None, f"agent {args.target_agent_id!r} reports no os"
+        return None, f"agent {esc(args.target_agent_id)!r} reports no os"
     return agent, ""
 
 
@@ -785,6 +945,10 @@ def run(args: argparse.Namespace) -> int:
     content_dir = Path(args.content_dir) if args.content_dir else \
         repo_root / "content/definitions"
 
+    if args.run_id and not RUN_ID_RE.match(args.run_id):
+        print("instructions_runner: --run-id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63} "
+              "(it names the manifest file and the User-Agent)", file=sys.stderr)
+        return 2
     bad = targeting_error(args)
     if bad:
         print(f"instructions_runner: {bad}", file=sys.stderr)
@@ -820,16 +984,16 @@ def run(args: argparse.Namespace) -> int:
 
     known = {d.id for d in all_defs}
     for stray in sorted(set(param_overrides) - known):
-        print(f"instructions_runner: --params-override names no definition: {stray}",
+        print(f"instructions_runner: --params-override names no definition: {esc(stray)}",
               file=sys.stderr)
 
     classes = selected_targeted(args)
     targeted_defs = [d for d in runnable if d.risk in TARGETED_RISKS]
-    covered = [d for d in targeted_defs if not targeted_skip_reason(d, param_overrides)]
-    if classes and not covered:
-        print(f"instructions_runner: no {'/'.join(classes)} definition is covered by "
-              "--params-override (a typo'd id, or an entry that lacks required parameters); "
-              "nothing dispatched", file=sys.stderr)
+    if classes and not [d for d in targeted_defs if not targeted_skip_reason(d, param_overrides)]:
+        print(f"instructions_runner: no {'/'.join(classes)} definition has a --params-override entry "
+              "that covers its required parameters (a typo'd id, or an entry missing a required "
+              "parameter)" + ("" if args.params_override else "; pass --params-override FILE")
+              + "; nothing dispatched", file=sys.stderr)
         return 2
 
     run_id = args.run_id or uuid.uuid4().hex[:8]
@@ -837,7 +1001,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         client.login(args.user, args.password)
     except Exception as e:
-        print(f"instructions_runner: login failed: {e}", file=sys.stderr)
+        print(f"instructions_runner: login failed: {esc(e)}", file=sys.stderr)
         return 2
 
     target_os = ""
@@ -850,11 +1014,25 @@ def run(args: argparse.Namespace) -> int:
             print(f"instructions_runner: {why}; nothing dispatched", file=sys.stderr)
             return 2
         target_os = str(agent["os"]).lower()
+        usable = [d for d in targeted_defs if not targeted_skip_reason(d, param_overrides, target_os)]
+        for d in targeted_defs:
+            reason = targeted_skip_reason(d, param_overrides, target_os)
+            if reason and d.id in param_overrides:
+                print(f"instructions_runner: warning: override for {d.id} skipped: {reason}",
+                      file=sys.stderr)
+        if not usable:
+            print(f"instructions_runner: no {'/'.join(classes)} definition is eligible on the "
+                  f"target (os={esc(target_os)}) with its override; nothing dispatched",
+                  file=sys.stderr)
+            return 2
         manifest_path = args.manifest or str(Path.cwd() / f"instructions-runner-{run_id}.manifest.jsonl")
         try:
             manifest = Manifest(Path(manifest_path), run_id)
+            manifest.start(dashboard=redact_url(args.dashboard), target_agent_id=args.target_agent_id,
+                           hostname=str(agent.get("hostname")), os=target_os,
+                           agent_version=str(agent.get("agent_version", "?")), classes=classes)
         except OSError as e:
-            print(f"instructions_runner: cannot open the manifest {manifest_path}: {e}",
+            print(f"instructions_runner: cannot open the manifest {manifest_path}: {esc(e)}",
                   file=sys.stderr)
             return 2
         # Same-path writers (filesystem.*, registry.*) race at parallelism > 1.
@@ -862,37 +1040,66 @@ def run(args: argparse.Namespace) -> int:
             print("instructions_runner: destructive/forensic classes run one at a time "
                   f"(--parallelism {parallelism} ignored)")
             parallelism = 1
-        usable = [d for d in targeted_defs if not targeted_skip_reason(d, param_overrides, target_os)]
-        print(f"instructions_runner: TARGETED RUN target={args.target_agent_id} "
-              f"host={agent.get('hostname')} os={target_os} version={agent.get('agent_version', '?')} "
-              f"dashboard={args.dashboard} classes={','.join(classes)} "
+        print(f"instructions_runner: TARGETED RUN target={esc(args.target_agent_id)} "
+              f"host={esc(agent.get('hostname'))} os={esc(target_os)} "
+              f"version={esc(agent.get('agent_version', '?'))} "
+              f"dashboard={redact_url(args.dashboard)} classes={','.join(classes)} "
               f"covered={len(usable)} skipped={len(targeted_defs) - len(usable)} "
               f"manifest={manifest_path}")
+        if selected_risks & set(DEFAULT_RISKS):
+            print("instructions_runner: mixed run: safe/mutating definitions are still sent to "
+                  "EVERY agent")
 
     outcomes: list[Outcome] = []
     started_at = time.monotonic()
     aborted = ""
+    control = RunControl()
+    future_map: dict[concurrent.futures.Future, Definition] = {}
+
+    def collect(fut: concurrent.futures.Future) -> None:
+        if fut.cancelled():
+            return
+        d = future_map[fut]
+        try:
+            outcome = fut.result()
+        except Exception as e:
+            outcome = Outcome(d.id, d.risk, "error", 0, note=f"{type(e).__name__}: {e}")
+        outcomes.append(outcome)
+        if args.verbose or outcome.status in ("fail", "error"):
+            print(f"  {outcome.short()}")
+        if args.run_id:
+            db_record_timing(repo_root, args.run_id, args.gate_name, outcome.id, outcome.duration_ms)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=parallelism)
+    pending: set = set()
     try:
-        future_map = {pool.submit(exercise, client, d, param_overrides, args.poll_timeout,
-                                  args.target_agent_id, target_os, manifest): d for d in runnable}
-        for fut in concurrent.futures.as_completed(future_map):
-            try:
-                outcome = fut.result()
-            except Exception as e:
-                d = future_map[fut]
-                outcome = Outcome(d.id, d.risk, "error", 0, note=f"{type(e).__name__}: {e}")
-            outcomes.append(outcome)
-            if args.verbose or outcome.status in ("fail", "error"):
-                print(f"  {outcome.short()}")
-            if args.run_id:
-                db_record_timing(repo_root, args.run_id, args.gate_name,
-                                  outcome.id, outcome.duration_ms)
+        for d in runnable:
+            future_map[pool.submit(exercise, client, d, param_overrides, args.poll_timeout,
+                                   args.target_agent_id, target_os, manifest, control)] = d
+        pending = set(future_map)
+        # A timed wait, not as_completed: a bare lock wait is not interruptible on Windows.
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
+            for fut in done:
+                collect(fut)
     except BaseException as e:  # KeyboardInterrupt included: stop further dispatch, keep the record
         aborted = type(e).__name__
+        control.request_stop()
         pool.shutdown(wait=False, cancel_futures=True)
         print(f"instructions_runner: aborted ({aborted}); dispatch stopped", file=sys.stderr)
+        try:  # let a worker that was mid-poll hand back what it has
+            done, pending = concurrent.futures.wait(pending, timeout=1.0)
+            for fut in done:
+                collect(fut)
+        except BaseException:
+            pass
+        have = {o.id for o in outcomes}
+        for d in runnable:
+            if d.id in control.sent and d.id not in have:
+                outcomes.append(Outcome(d.id, d.risk, "error", 0, dispatched=True,
+                                        note="in_flight_unknown: dispatch was sent, result not collected"))
+                print(f"  {outcomes[-1].short()}")
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
         if manifest is not None:
@@ -906,8 +1113,11 @@ def run(args: argparse.Namespace) -> int:
         counts[o.status] = counts.get(o.status, 0) + 1
     # Risk-filtered defs never enter the executor; add them to the skip tally.
     counts["skip"] += len(skipped)
+    # dispatched = the server accepted the POST (HTTP 200: the action was started), or it was
+    # sent and the run ended before its result came back; a 202 pending_approval is not.
     dispatched = sum(1 for o in outcomes if o.dispatched)
     targeted_dispatched = sum(1 for o in outcomes if o.dispatched and o.risk in TARGETED_RISKS)
+    run_skips = sum(1 for o in outcomes if o.status == "skip")
 
     summary = (f"instructions_runner: {counts['pass']} pass / "
                f"{counts['fail']} fail / {counts['pending_approval']} pending / "
@@ -918,9 +1128,11 @@ def run(args: argparse.Namespace) -> int:
         by_class = " ".join(f"{c}={sum(1 for o in outcomes if o.status == 'skip' and o.risk == c)}"
                             for c in classes)
         print(f"instructions_runner: skipped by class: {by_class}")
-        print(f"instructions_runner: {dispatched} of {len(runnable)} definitions dispatched; "
-              f"{counts['pending_approval']} pending_approval, "
-              f"{sum(1 for o in outcomes if o.status == 'skip')} skipped")
+        print(f"instructions_runner: {dispatched} dispatched, {counts['pending_approval']} "
+              f"pending_approval (not executed), {run_skips} skipped, "
+              f"{counts['fail'] + counts['error']} failed (of {len(runnable)} selected)")
+    if control.abort_reason:
+        print(f"instructions_runner: {control.abort_reason}", file=sys.stderr)
 
     if args.output:
         Path(args.output).write_text(json.dumps({
@@ -929,11 +1141,12 @@ def run(args: argparse.Namespace) -> int:
             "run_id": run_id,
             "risks": sorted(selected_risks),
             "target_agent_id": args.target_agent_id,
-            "dashboard": args.dashboard,
+            "dashboard": redact_url(args.dashboard),
             "user": args.user,
             "skipped": counts["skip"],
+            "dispatched": dispatched,
             "manifest": manifest_path,
-            "aborted": aborted,
+            "aborted": aborted or control.abort_reason,
             "outcomes": [asdict(o) for o in outcomes],
         }, indent=2))
 
@@ -954,46 +1167,80 @@ def run(args: argparse.Namespace) -> int:
 
     # Exit code:
     #   0   - all runnable instructions passed (or pending_approval, expected)
-    #   1   - one or more fail/error, or the run was aborted by an error
+    #   1   - one or more fail/error, or the run stopped early on an error
     #   2   - infrastructure or configuration failure (login, content-dir empty, opt-in targeting,
-    #         --params-override, target pre-flight)
-    #   130 - interrupted (Ctrl-C)
+    #         --params-override, --run-id, target pre-flight); nothing was dispatched
+    #   130 - interrupted (Ctrl-C or SIGTERM)
     if aborted == "KeyboardInterrupt":
         return 130
-    if aborted or counts["fail"] > 0 or counts["error"] > 0:
+    if aborted or control.abort_reason or counts["fail"] > 0 or counts["error"] > 0:
         return 1
     return 0
 
 
 EPILOG = """\
-Destructive and forensic runs (--risks destructive forensic):
-  needs --target-agent-id ID --confirm-target HOSTNAME --run-id ID --params-override FILE
-  The dashboard must be loopback (127.0.0.1, ::1, localhost) or --allow-remote is given.
-  Before any dispatch the runner looks ID up in GET /api/agents, prints its hostname, OS and
-  version, and requires HOSTNAME to match (case-insensitive). Definitions run one at a time, each
-  with exactly the --params-override entry for its id (no synthesised values) and only if that
-  entry supplies every required parameter; every other definition is skipped, not dispatched.
-  Each dispatch is appended to a manifest (--manifest PATH, default
-  instructions-runner-<run-id>.manifest.jsonl) before it is sent.
+Exit codes: 0 every dispatched instruction passed (or is pending approval); 1 one or more failed or
+errored, or the run stopped early on an error; 2 a configuration, login or pre-flight error, with
+nothing dispatched; 130 interrupted (Ctrl-C or SIGTERM).
 
---params-override file ({definition id: {parameter: value}}; an empty {} is valid only for a
-definition with no required parameters):
+Destructive and forensic runs (--risks destructive forensic)
+  Example, against a dedicated disposable stack on loopback:
+    python3 scripts/test/instructions_runner.py --dashboard http://127.0.0.1:8080 \\
+        --user uat-admin --password 'PASSWORD' --risks destructive forensic \\
+        --target-agent-id AGENT_ID --confirm-target HOSTNAME --run-id my-run-1 \\
+        --params-override overrides.json --output outcomes.json
+  AGENT_ID and HOSTNAME: the Devices page of the dashboard, or GET /api/agents (agent_id, hostname).
+  Needed: --target-agent-id, --confirm-target, --run-id and --params-override; the dashboard must be
+  loopback (127.0.0.1, ::1, localhost) or --allow-remote is given. Before any dispatch the runner
+  looks the id up in GET /api/agents, prints its hostname, OS and version, and requires HOSTNAME to
+  match (case-insensitive). Definitions run one at a time, each with exactly its --params-override
+  entry (no synthesised values) and only if that entry supplies every required parameter; every
+  other definition is skipped, not dispatched. Each dispatch is appended to a manifest
+  (--manifest PATH, default instructions-runner-<run-id>.manifest.jsonl) before it is sent, and a
+  destructive/forensic row passes only when every response row is SUCCESS with no error_detail.
+  Ctrl-C and SIGTERM stop further dispatch; a dispatch already sent is reported in_flight_unknown.
+
+  --confirm-target is a wrong-target typo guard against what the connected server reports. It cannot
+  detect an ssh -L tunnel or a port forward to a different stack, and it is not an authorisation or
+  approval control. Use a dedicated admin account on a disposable stack. The password on the command
+  line is visible in ps: prefer that dedicated account; http:// with --allow-remote sends it in
+  cleartext. With safe/mutating in the same --risks, those definitions are still sent to EVERY agent.
+
+  Eligible ids: the entries classed destructive or forensic in the "_overrides" of
+  scripts/test/instructions-risk-classification.json; each one's required parameters are under
+  spec.parameters.required in content/definitions/*.yaml.
+
+--params-override file ({definition id: {parameter: value}}). Values are strings or integers (write
+a boolean as the string "true" or "false"); a duplicate key is an error; top-level keys starting
+with "_" are ignored; an empty {} is valid only for a definition with no required parameters:
   {
-    "agent.storage.clear": {},
-    "agent.storage.set": {"key": "yuzu_uat_probe", "value": "1"}
+    "_comment": "ignored",
+    "device.tags.clear": {},
+    "device.filesystem.append": {"path": "/tmp/yuzu_uat_scratch.txt", "content": "x"}
   }
+  (device.filesystem.append needs the file to exist already on the target.)
 
-Side effects, and how to restore (the runner does not undo any of them):
+Side effects (NOT exhaustive: every destructive/forensic row in the risk table applies; the runner
+undoes none of them):
   device.tags.clear              removes the target's tags
   agent.storage.clear            removes every key in the target's agent storage
-  crossplatform.tar.rollup       runs a TAR rollup on the target
-  server.policy.invalidate_all   invalidates cached policy state; a server.* row, so the runner
-                                 skips it (listed so nobody runs it by hand and is surprised)
-  filesystem.* writes            change files at the paths in your override
-  registry.* writes              change registry values/keys named in your override
-  power plan                     changes the active power plan
-  testing.chargen.start          streams until stopped: run testing.chargen.stop (mutating
-                                 class; not selected by a destructive-only run) against the target
+  crossplatform.tar.rollup       permanently deletes TAR rows past retention; not recoverable; no
+                                 approval gate
+  security.certificates.delete   deletes a certificate from the target's store
+  agent.content_dist.stage / execute_staged / cleanup / upload_file
+                                 execute_staged RUNS the staged artefact on the target
+  crossplatform.printing.clear_queue   cancels a print job; irreversible
+  crossplatform.service.set_start_mode changes a service's start mode
+  device.script_exec.*           runs arbitrary script text on the target
+  agent.http_client.download     writes a downloaded file to the target
+  device.wol.wake                sends a Wake-on-LAN packet
+  workflow.config_search_and_replace   rewrites a config file on the target
+  device.filesystem.*            change files at the paths in your override
+  windows.registry.*             change or delete registry values/keys named in your override
+  crossplatform.power.set_power_plan   changes the active power plan
+  testing.chargen.start          streams until stopped: run testing.chargen.stop (mutating class;
+                                 not selected by a destructive-only run) against the target
+  server.* rows (for example server.policy.invalidate_all) are skipped, never sent.
 """
 
 
@@ -1003,16 +1250,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--dashboard", required=True,
                    help="Yuzu dashboard root, e.g. http://localhost:8080")
     p.add_argument("--user", default="admin")
-    p.add_argument("--password", required=True)
+    p.add_argument("--password", required=True,
+                   help="visible in ps on the command line; use a dedicated disposable-stack account")
     p.add_argument("--risks", nargs="+", default=list(DEFAULT_RISKS),
                    choices=list(ALL_RISKS),
-                   help=f"risk classes to run (default: {' '.join(DEFAULT_RISKS)})")
+                   help=f"risk classes to run, space-separated (default: {' '.join(DEFAULT_RISKS)})")
     p.add_argument("--target-agent-id", default="",
                    help="id of the one connected agent that destructive/forensic definitions "
                         "are dispatched to (required to select those classes)")
     p.add_argument("--confirm-target", default="",
                    help="the target agent's hostname, which must match the server's agent list "
-                        "(required with --target-agent-id)")
+                        "(required whenever destructive or forensic is selected, with "
+                        "--target-agent-id and --run-id)")
     p.add_argument("--allow-remote", action="store_true",
                    help="allow destructive/forensic classes against a non-loopback --dashboard "
                         "(loopback: 127.0.0.1, ::1, localhost)")
@@ -1036,8 +1285,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--output", default="",
                    help="write per-instruction outcomes to this JSON file")
     p.add_argument("--run-id", default="",
-                   help="if set, record timings/metrics to test-runs DB; also names the "
-                        "User-Agent and the manifest (required for destructive/forensic)")
+                   help="[A-Za-z0-9][A-Za-z0-9._-]{0,63}; if set, record timings/metrics to the "
+                        "test-runs DB; also names the User-Agent and the manifest (required for "
+                        "destructive/forensic)")
     p.add_argument("--gate-name", default="instructions",
                    help="gate name to scope timings under (default: instructions)")
     p.add_argument("--verbose", action="store_true",
@@ -1048,13 +1298,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return ns
 
 
+def _raise_interrupt(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    previous = None
+    try:  # SIGTERM takes the same abort path as Ctrl-C (summary, --output, exit 130)
+        previous = signal.signal(signal.SIGTERM, _raise_interrupt)
+    except (ValueError, OSError, AttributeError):  # not the main thread, or no such signal
+        pass
     try:
         return run(args)
     except KeyboardInterrupt:
         print("instructions_runner: interrupted", file=sys.stderr)
         return 130
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":

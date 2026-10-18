@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """test_instructions_runner_hardening.py - the destructive/forensic path of the /test
---instructions runner against a fake Yuzu server (#5261, governance round).
+--instructions runner against a fake Yuzu server (#5261, governance rounds).
 
 A targeted run changes or reads a real device, so these tests drive ir.main() end to end against
 an in-process HTTP server on an ephemeral 127.0.0.1 port and assert what the server SAW: which
-POSTs arrived, with which body, and whether the manifest line existed when each one did. Covers
-the override gate, the override file, the proxy bypass, abort and error handling, the strict
-grading of those two classes, the target pre-flight and its confirmation, and attribution.
+POSTs arrived, with which body, and whether the manifest line existed when each one did. The
+fake's /api/responses emits the REAL row shape (integer `status`, `error_detail`, no `rc`),
+because a fake that emits shapes the server never produces proves nothing about grading.
 
 Runnable standalone: `python3 tests/test_instructions_runner_hardening.py`. Hermetic: loopback
 sockets on ephemeral ports and temp dirs only; the test-runs DB writers are replaced.
@@ -16,7 +16,9 @@ import http.server
 import io
 import json
 import os
+import signal
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -32,7 +34,16 @@ import instructions_runner as ir  # noqa: E402
 AGENT = "agent-under-test"
 HOSTNAME = "Box-1"
 RUN_ID = "run-5261"
-GOOD = [{"output": "x", "status": "ok", "rc": 0}]
+RUNNING, SUCCESS, FAILURE, TIMEOUT, REJECTED = 0, 1, 2, 3, 4
+
+
+def row(status=SUCCESS, output="x", error_detail="", agent_id=AGENT):
+    """A /api/responses row exactly as response_routes.cpp serialises it."""
+    return {"id": 1, "instruction_id": "c", "agent_id": agent_id, "timestamp": 1,
+            "status": status, "output": output, "error_detail": error_detail}
+
+
+GOOD = [row()]
 
 
 class FakeYuzu:
@@ -48,9 +59,11 @@ class FakeYuzu:
         self.agents = [{"agent_id": AGENT, "hostname": HOSTNAME, "os": "linux", "arch": "x86_64",
                         "agent_version": "9.9.9"}]
         self.agents_code = 200
-        self.responses = GOOD
+        self.agents_raw = None         # bytes: replaces the /api/agents body
+        self.polls = lambda command_id, n: GOOD      # -> rows for poll number n of a command
         self.responses_raw = None      # bytes: replaces the /api/responses body
         self.execute = None            # callable(post) -> (code, bytes, delay_s) or None
+        self._polled = {}
         self._lock = threading.Lock()
         fake = self
 
@@ -72,10 +85,15 @@ class FakeYuzu:
             def do_GET(self):
                 fake.requests.append(("GET", self.path, self.headers.get("User-Agent")))
                 if self.path == "/api/agents":
-                    self._send(fake.agents_code, json.dumps(fake.agents).encode())
+                    body = fake.agents_raw if fake.agents_raw is not None else \
+                        json.dumps(fake.agents).encode()
+                    self._send(fake.agents_code, body)
                 elif self.path.startswith("/api/responses/"):
+                    cid = self.path.rsplit("/", 1)[1]
+                    with fake._lock:
+                        n = fake._polled[cid] = fake._polled.get(cid, 0) + 1
                     body = fake.responses_raw if fake.responses_raw is not None else \
-                        json.dumps({"responses": fake.responses}).encode()
+                        json.dumps({"responses": fake.polls(cid, n)}).encode()
                     self._send(200, body)
                 else:
                     self._send(404, b"{}")
@@ -108,7 +126,8 @@ class FakeYuzu:
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
 
     def close(self):
         self.server.shutdown()
@@ -149,9 +168,12 @@ class Result:
     def outcome(self, def_id):
         return next(o for o in self.summary["outcomes"] if o["id"] == def_id)
 
+    def dispatch_lines(self):
+        return [m for m in self.manifest if m.get("event") == "dispatch"]
+
 
 class RunnerCase(unittest.TestCase):
-    """Per-test fake server, temp dir and stubbed test-runs DB writers."""
+    """Per-test fake server, temp dir, fast polling and stubbed test-runs DB writers."""
 
     def setUp(self):
         self.fake = FakeYuzu()
@@ -164,10 +186,13 @@ class RunnerCase(unittest.TestCase):
             p = mock.patch.object(ir, name, lambda *a, _s=sink, **k: _s.append(a))
             p.start()
             self.addCleanup(p.stop)
+        p = mock.patch.object(ir, "POLL_INTERVAL_S", 0.02)
+        p.start()
+        self.addCleanup(p.stop)
         self.fake.manifest_path = str(self.tmp / "manifest.jsonl")
 
     def run_runner(self, defs, *, overrides=None, raw_overrides=None, risks=("destructive",),
-                   targeted=True, extra=(), dashboard=None, patch_as_completed=None):
+                   targeted=True, extra=(), dashboard=None):
         content, table = write_content(self.tmp, defs)
         argv = ["--dashboard", dashboard or self.fake.url, "--password", "p",
                 "--content-dir", str(content), "--risk-table", str(table),
@@ -182,18 +207,29 @@ class RunnerCase(unittest.TestCase):
             argv += ["--params-override", str(path)]
         argv += list(extra)
         out, err = io.StringIO(), io.StringIO()
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(contextlib.redirect_stdout(out))
-            stack.enter_context(contextlib.redirect_stderr(err))
-            if patch_as_completed:
-                stack.enter_context(mock.patch.object(ir.concurrent.futures, "as_completed",
-                                                      patch_as_completed))
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = ir.main(argv)
         outfile = self.tmp / "out.json"
         summary = json.loads(outfile.read_text()) if outfile.exists() else None
         mf = Path(self.fake.manifest_path)
         manifest = [json.loads(line) for line in mf.read_text().splitlines()] if mf.exists() else []
         return Result(rc, out.getvalue(), err.getvalue(), summary, manifest)
+
+    def interrupt_after_posts(self, count):
+        """A stand-in for concurrent.futures.wait that raises KeyboardInterrupt (Ctrl-C) once,
+        after `count` execute POSTs have reached the server, then behaves normally."""
+        real, state = ir.concurrent.futures.wait, {"raised": False}
+
+        def wait(fs, timeout=None, return_when=ir.concurrent.futures.FIRST_COMPLETED):
+            if not state["raised"]:
+                deadline = time.monotonic() + 10
+                while len(self.fake.posts) < count and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                state["raised"] = True
+                raise KeyboardInterrupt
+            return real(fs, timeout=timeout, return_when=return_when)
+
+        return mock.patch.object(ir.concurrent.futures, "wait", wait)
 
 
 class OverrideGate(RunnerCase):
@@ -204,19 +240,45 @@ class OverrideGate(RunnerCase):
     def test_typod_id_dispatches_nothing_and_exits_2_before_login(self):
         r = self.run_runner(self.DEFS, overrides={"t.clea": {}})
         self.assertEqual(r.rc, 2)
-        self.assertIn("covered by --params-override", r.err)
+        self.assertIn("covers its required parameters", r.err)
         self.assertEqual((self.fake.posts, self.fake.logins), ([], 0))
 
-    def test_no_override_file_at_all_dispatches_nothing(self):
+    def test_no_override_file_at_all_says_to_pass_one(self):
         r = self.run_runner(self.DEFS)
         self.assertEqual((r.rc, self.fake.posts, self.fake.logins), (2, [], 0))
+        self.assertIn("pass --params-override FILE", r.err)
 
     def test_bad_override_file_exits_2_before_login(self):
-        for label, raw in (("malformed", "{nope"), ("list", "[]"), ("string entry", '{"t.clear": 1}')):
+        for label, raw in (("malformed", "{nope"), ("list", "[]"), ("string entry", '{"t.clear": 1}'),
+                           ("duplicate top", '{"t.clear": {}, "t.clear": {}}'),
+                           ("duplicate nested", '{"t.clear": {"a": "1", "a": "2"}}')):
             with self.subTest(label):
                 r = self.run_runner(self.DEFS, raw_overrides=raw)
                 self.assertEqual((r.rc, self.fake.posts, self.fake.logins), (2, [], 0))
                 self.assertIn("--params-override", r.err)
+
+    def test_bad_override_on_an_untargeted_run_also_exits_2(self):
+        r = self.run_runner([definition("t.safe", "safe")], risks=("safe",), targeted=False,
+                            raw_overrides="{nope")
+        self.assertEqual((r.rc, self.fake.posts, self.fake.logins), (2, [], 0))
+
+    def test_only_strings_and_integers_are_accepted_as_values(self):
+        for label, value in (("null", None), ("bool", True), ("false", False), ("list", ["a"]),
+                             ("dict", {"a": 1}), ("float", 1.5)):
+            with self.subTest(label):
+                r = self.run_runner(self.DEFS, overrides={"t.clear": {"opt": value}})
+                self.assertEqual((r.rc, self.fake.posts, self.fake.logins), (2, [], 0))
+                self.assertIn("'t.clear'", r.err)
+                self.assertIn("'opt'", r.err)
+        r = self.run_runner(self.DEFS, overrides={"t.other": {"a": 7}, "t.clear": {"opt": "true"}})
+        self.assertEqual(r.rc, 0, r.err)
+        self.assertEqual(next(p for p in self.fake.posts if p["id"] == "t.other")["body"]["params"],
+                         {"a": "7"})
+
+    def test_underscore_keys_are_ignored(self):
+        r = self.run_runner(self.DEFS, overrides={"_comment": 5, "t.clear": {}})
+        self.assertEqual(r.rc, 0, r.err)
+        self.assertEqual(self.fake.posted_ids(), ["t.clear"])
 
     def test_missing_override_file_exits_2_before_login(self):
         r = self.run_runner(self.DEFS, extra=["--params-override", str(self.tmp / "absent.json")])
@@ -228,7 +290,7 @@ class OverrideGate(RunnerCase):
             "t.clear": {},                  # parameterless: {} is a real entry
             "t.path": {"path": "/x"},       # lacks 'mode'
             "t.other": {"a": "1"},          # covers the required 'a' only
-            "t.safe_entry_for_another_class": {"zz": "1"},
+            "t.not_a_definition": {"zz": "1"},
         })
         self.assertEqual(r.rc, 0, r.err)
         by_id = {p["id"]: p for p in self.fake.posts}
@@ -241,6 +303,7 @@ class OverrideGate(RunnerCase):
         self.assertEqual(skipped["status"], "skip")
         self.assertIn("lacks required", skipped["note"])
         self.assertFalse(skipped["dispatched"])
+        self.assertIn("warning: override for t.path skipped", r.err)  # not only under --verbose
 
     def test_empty_entry_for_a_definition_with_required_params_is_skipped(self):
         r = self.run_runner(self.DEFS, overrides={"t.clear": {}, "t.path": {}})
@@ -258,6 +321,7 @@ class OverrideGate(RunnerCase):
         self.assertEqual(r.rc, 0, r.err)
         safe = next(p for p in self.fake.posts if p["id"] == "t.safe")
         self.assertEqual(safe["body"], {"params": {"host": "127.0.0.1"}})
+        self.assertIn("mixed run: safe/mutating definitions are still sent to EVERY agent", r.out)
 
     def test_server_rows_are_skipped_even_with_an_override(self):
         defs = [definition("server.x", "destructive", plugin="server_internal"),
@@ -266,6 +330,14 @@ class OverrideGate(RunnerCase):
         self.assertEqual(self.fake.posted_ids(), ["t.clear"])
         self.assertIn("server-internal: never dispatched with a target",
                       r.outcome("server.x")["note"])
+
+    def test_run_id_is_validated_before_login(self):
+        for bad in ("../x", "-lead", "a b", "x" * 65, "a/b"):
+            with self.subTest(bad):
+                r = self.run_runner([definition("t.safe", "safe")], risks=("safe",), targeted=False,
+                                    extra=[f"--run-id={bad}"])
+                self.assertEqual((r.rc, self.fake.logins), (2, 0))
+                self.assertIn("--run-id", r.err)
 
 
 class Attribution(RunnerCase):
@@ -276,12 +348,56 @@ class Attribution(RunnerCase):
         self.assertEqual(len(self.fake.posts), 3)
         for post in self.fake.posts:
             seen = [json.loads(line) for line in post["manifest"].splitlines()]
-            self.assertIn(post["id"], [m["id"] for m in seen], "manifest line must precede the POST")
-        for m in r.manifest:
+            self.assertIn(post["id"], [m.get("id") for m in seen], "manifest line must precede the POST")
+        for m in r.dispatch_lines():
             self.assertEqual((m["run_id"], m["target_agent_id"], m["risk"], m["params"]),
                              (RUN_ID, AGENT, "destructive", {}))
             self.assertRegex(m["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual({ua for _, _, ua in self.fake.requests}, {f"yuzu-instructions-runner/{RUN_ID}"})
+
+    def test_manifest_starts_with_a_run_start_line_without_credentials(self):
+        self.assertEqual(ir.redact_url("http://admin:s3cret@127.0.0.1:8080/x?y=1"),
+                         "http://127.0.0.1:8080/x")
+        r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        first = r.manifest[0]
+        self.assertEqual((first["event"], first["hostname"], first["os"], first["agent_version"],
+                          first["target_agent_id"], first["run_id"]),
+                         ("run-start", HOSTNAME, "linux", "9.9.9", AGENT, RUN_ID))
+        self.assertEqual(first["dashboard"], self.fake.url)
+        self.assertNotIn("--password", Path(self.fake.manifest_path).read_text())
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX file modes")
+    def test_manifest_is_owner_only(self):
+        self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        self.assertEqual(stat.S_IMODE(os.stat(self.fake.manifest_path).st_mode), 0o600)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW") and hasattr(os, "symlink"), "needs O_NOFOLLOW")
+    def test_manifest_refuses_a_symlink(self):
+        target = self.tmp / "elsewhere.txt"
+        target.write_text("")
+        os.symlink(target, self.fake.manifest_path)
+        r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        self.assertEqual((r.rc, self.fake.posts), (2, []))
+        self.assertIn("cannot open the manifest", r.err)
+        self.assertEqual(target.read_text(), "")
+
+    def test_a_manifest_write_failure_means_no_post(self):
+        with mock.patch.object(ir.Manifest, "record", side_effect=OSError("disk full")):
+            r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        self.assertEqual(self.fake.posts, [])
+        self.assertEqual(r.rc, 1)
+        self.assertIn("manifest:", r.outcome("t.clear")["note"])
+
+    def test_closing_the_manifest_never_raises(self):
+        m = ir.Manifest(self.tmp / "m.jsonl", "r")
+
+        class Broken:
+            def close(self):
+                raise OSError("EIO")
+
+        m._fh.close()
+        m._fh = Broken()
+        m.close()
 
     def test_targeted_definitions_run_one_at_a_time(self):
         defs = [definition(f"t.d{i}", "destructive") for i in range(4)]
@@ -291,18 +407,42 @@ class Attribution(RunnerCase):
         self.assertEqual(self.fake.max_inflight, 1)
         self.assertIn("one at a time", r.out)
 
-    def test_summary_banner_and_metric(self):
-        defs = [definition("t.clear", "destructive"), definition("t.path", "destructive", required=["p"])]
-        r = self.run_runner(defs, overrides={"t.clear": {}})
+    def test_banner_summary_tally_and_metric(self):
+        defs = [definition("t.clear", "destructive"), definition("t.path", "destructive", required=["p"]),
+                definition("t.appr", "destructive")]
+        self.fake.execute = lambda post: (202, b'{"status": "pending_approval", "approval_id": "a1"}', 0) \
+            if post["id"] == "t.appr" else (200, json.dumps({"command_id": "c"}).encode(), 0)
+        r = self.run_runner(defs, overrides={"t.clear": {}, "t.appr": {}})
         self.assertIn("TARGETED RUN target=agent-under-test host=Box-1 os=linux version=9.9.9", r.out)
-        self.assertIn("covered=1 skipped=1", r.out)
-        self.assertIn("1 of 2 definitions dispatched; 0 pending_approval, 1 skipped", r.out)
+        self.assertIn("covered=2 skipped=1", r.out)
+        # a 202 is not a dispatch: nothing ran
+        self.assertIn("1 dispatched, 1 pending_approval (not executed), 1 skipped, 0 failed", r.out)
         s = r.summary
         self.assertEqual((s["target_agent_id"], s["dashboard"], s["user"], s["skipped"], s["manifest"],
-                          s["risks"]),
-                         (AGENT, self.fake.url, "admin", 1, self.fake.manifest_path, ["destructive"]))
-        self.assertIn(("instructions_targeted_dispatched", 1),
-                      [(a[2], a[3]) for a in self.metrics if a[2] == "instructions_targeted_dispatched"])
+                          s["risks"], s["dispatched"]),
+                         (AGENT, self.fake.url, "admin", 1, self.fake.manifest_path, ["destructive"], 1))
+        self.assertEqual([a[3] for a in self.metrics if a[2] == "instructions_targeted_dispatched"], [1])
+        self.assertFalse(r.outcome("t.appr")["dispatched"])
+
+    def test_agent_reported_strings_are_escaped(self):
+        evil = "Box\x1b[31m\n-1"
+        self.fake.agents = [dict(self.fake.agents[0], hostname=evil, agent_version="1\x07")]
+        r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}},
+                            targeted=False, extra=["--target-agent-id", AGENT, "--confirm-target", evil,
+                                                   "--run-id", RUN_ID])
+        self.assertEqual(r.rc, 0, r.err)
+        self.assertNotIn("\x1b", r.out + r.err)
+        self.assertNotIn("\x07", r.out + r.err)
+        self.assertIn("Box\\x1b[31m\\x0a-1", r.out)
+
+    def test_error_text_from_the_server_is_escaped(self):
+        self.assertEqual(ir.error_message({"error": {"message": "a\x1bb\nc"}}), "a\\x1bb\\x0ac")
+        self.fake.execute = lambda post: (400, json.dumps(
+            {"error": {"code": 400, "message": "bad\x1b[2Jthing\r\nFORGED"}}).encode(), 0)
+        r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        self.assertNotIn("\x1b", r.out + r.err)
+        self.assertEqual(r.rc, 1)
+        self.assertNotIn("\r", r.out + r.err)
 
     def test_a_target_with_padding_is_sent_stripped(self):
         r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}},
@@ -318,6 +458,16 @@ class Attribution(RunnerCase):
         self.assertEqual((r.rc, self.fake.posts, self.fake.logins), (2, [], 0))
         self.assertIn("--run-id", r.err)
 
+    def test_three_consecutive_auth_failures_stop_the_run(self):
+        defs = [definition(f"t.d{i}", "destructive") for i in range(6)]
+        self.fake.execute = lambda post: (401, b'{"error": {"code": 401, "message": "no session"}}', 0)
+        r = self.run_runner(defs, overrides={d["id"]: {} for d in defs})
+        self.assertEqual(r.rc, 1)
+        self.assertEqual(len(self.fake.posts), 3)
+        self.assertIn("consecutive HTTP 401/403", r.err)
+        self.assertEqual(sum(1 for o in r.summary["outcomes"] if o["status"] == "skip"), 3)
+        self.assertEqual(r.summary["dispatched"], 0)  # the server accepted none of them
+
 
 class Preflight(RunnerCase):
     DEFS = [definition("t.clear", "destructive")]
@@ -326,23 +476,34 @@ class Preflight(RunnerCase):
     def refused(self, r):
         self.assertEqual(r.rc, 2, r.err)
         self.assertEqual(self.fake.posts, [])
+        self.assertFalse(Path(self.fake.manifest_path).exists(), "no manifest for a refused run")
+
+    def run_confirm(self, confirm, target=AGENT):
+        return self.run_runner(self.DEFS, overrides=self.OV, targeted=False,
+                               extra=["--target-agent-id", target, "--confirm-target", confirm,
+                                      "--run-id", RUN_ID])
 
     def test_unknown_id(self):
         self.fake.agents = [dict(self.fake.agents[0], agent_id="someone-else")]
         self.refused(self.run_runner(self.DEFS, overrides=self.OV))
 
-    def test_offline_id(self):
-        self.fake.agents = [dict(self.fake.agents[0], online=False)]
-        r = self.run_runner(self.DEFS, overrides=self.OV)
-        self.refused(r)
-        self.assertIn("offline", r.err)
+    def test_hostname_mismatch_including_substrings_in_both_directions(self):
+        for confirm in ("Other-Box", "Box", "Box-1-extra", "-1"):
+            with self.subTest(confirm):
+                self.refused(self.run_confirm(confirm))
+                self.assertIn("does not match", self.run_confirm(confirm).err)
 
-    def test_hostname_mismatch(self):
-        r = self.run_runner(self.DEFS, overrides=self.OV, targeted=False,
-                            extra=["--target-agent-id", AGENT, "--confirm-target", "Other-Box",
-                                   "--run-id", RUN_ID])
-        self.refused(r)
-        self.assertIn("does not match", r.err)
+    def test_agent_id_is_matched_exactly(self):
+        self.fake.agents = [
+            {"agent_id": "a10", "hostname": "Host-A10", "os": "linux", "agent_version": "1"},
+            {"agent_id": "a1", "hostname": "Host-A1", "os": "linux", "agent_version": "1"}]
+        r = self.run_confirm("Host-A1", target="a1")
+        self.assertEqual(r.rc, 0, r.err)
+        self.assertEqual(self.fake.posts[0]["body"]["agent_ids"], ["a1"])
+        self.fake.posts.clear()
+        self.refused_substring = self.run_confirm("Host-A10", target="a1")
+        self.assertEqual(self.refused_substring.rc, 2)
+        self.assertEqual(self.fake.posts, [])
 
     def test_missing_confirm_target(self):
         r = self.run_runner(self.DEFS, overrides=self.OV, targeted=False,
@@ -350,16 +511,23 @@ class Preflight(RunnerCase):
         self.refused(r)
         self.assertEqual(self.fake.logins, 0)
 
-    def test_unreadable_endpoint(self):
-        self.fake.agents_code = 500
+    def test_unreadable_endpoint_surfaces_the_a4_message_and_permission(self):
+        self.fake.agents_code = 403
+        self.fake.agents_raw = json.dumps({"error": {"code": 403, "message": "denied",
+                                                     "permission": "Zed:Read"}}).encode()
         r = self.run_runner(self.DEFS, overrides=self.OV)
         self.refused(r)
-        self.assertIn("cannot read the agent list", r.err)
+        self.assertIn("HTTP 403", r.err)
+        self.assertIn("denied", r.err)
+        self.assertIn("(needs Zed:Read)", r.err)
+        self.assertIn("Infrastructure:Read", r.err)
+
+    def test_non_list_agent_body_is_refused(self):
+        self.fake.agents_raw = b'{"agents": "nope"}'
+        self.refused(self.run_runner(self.DEFS, overrides=self.OV))
 
     def test_confirmation_is_case_insensitive_and_posts(self):
-        r = self.run_runner(self.DEFS, overrides=self.OV, targeted=False,
-                            extra=["--target-agent-id", AGENT, "--confirm-target", HOSTNAME.upper(),
-                                   "--run-id", RUN_ID])
+        r = self.run_confirm(HOSTNAME.upper())
         self.assertEqual(r.rc, 0, r.err)
         self.assertEqual(self.fake.posted_ids(), ["t.clear"])
 
@@ -370,6 +538,16 @@ class Preflight(RunnerCase):
         r = self.run_runner(defs, overrides={"t.win": {}, "t.nix": {}})
         self.assertEqual(self.fake.posted_ids(), ["t.win"])
         self.assertIn("target os=windows", r.outcome("t.nix")["note"])
+        self.assertIn("warning: override for t.nix skipped", r.err)
+
+    def test_nothing_eligible_on_the_targets_os_exits_2_without_a_manifest(self):
+        defs = [definition("t.win", "destructive", platforms=["windows"]),
+                definition("t.win2", "forensic", platforms=["windows"])]
+        r = self.run_runner(defs, risks=("destructive", "forensic"),
+                            overrides={"t.win": {}, "t.win2": {}})
+        self.refused(r)
+        self.assertIn("eligible on the target", r.err)
+        self.assertIn("os=linux", r.err)
 
 
 class ProxyBypass(RunnerCase):
@@ -429,7 +607,14 @@ class ErrorsAndAbort(RunnerCase):
         self.assertEqual(r.rc, 1)
         out = r.outcome("t.d0")
         self.assertEqual(out["status"], "fail")  # an answer-less dispatch, not a runner crash
-        self.assertIn("no response within", out["note"])
+        self.assertIn("still running after 1s", out["note"])
+
+    def test_a_poll_that_returns_html_on_a_safe_row_is_reported_not_raised(self):
+        self.fake.responses_raw = b"<html>"
+        r = self.run_runner([definition("t.safe", "safe")], risks=("safe",), targeted=False,
+                            extra=["--poll-timeout", "1"])
+        out = r.outcome("t.safe")
+        self.assertEqual(out["status"], "fail")
         self.assertIn("JSONDecodeError", out["note"])
 
     def test_a_future_that_raises_is_an_error_outcome_and_the_rest_still_run(self):
@@ -447,60 +632,209 @@ class ErrorsAndAbort(RunnerCase):
         self.assertIn("RuntimeError", r.outcome("t.d1")["note"])
         self.assertEqual(self.fake.posted_ids(), ["t.d0", "t.d2"])
 
+    def slow_posts(self, delay=0.4):
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), delay)
+
     def test_interrupt_stops_dispatch_and_keeps_the_record(self):
         defs = [definition(f"t.q{i}", "destructive") for i in range(12)]
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.4)
-
-        def interrupt_after_two(futures, *a, **k):
-            deadline = time.monotonic() + 10
-            while len(self.fake.posts) < 2 and time.monotonic() < deadline:
-                time.sleep(0.01)
-            raise KeyboardInterrupt
-            yield  # pragma: no cover
-
-        r = self.run_runner(defs, overrides={d["id"]: {} for d in defs},
-                            patch_as_completed=interrupt_after_two)
-        time.sleep(1.0)  # the in-flight POST finishes; nothing queued behind it may start
+        self.slow_posts()
+        with self.interrupt_after_posts(2):
+            r = self.run_runner(defs, overrides={d["id"]: {} for d in defs})
+        time.sleep(1.0)  # an in-flight POST finishes; nothing queued behind it may start
         self.assertEqual(r.rc, 130)
         self.assertEqual(len(self.fake.posts), 2)
         self.assertEqual(r.summary["aborted"], "KeyboardInterrupt")
-        self.assertEqual(len(r.manifest), 2)
+        self.assertEqual(len(r.dispatch_lines()), 2)
+
+    def test_untargeted_interrupt_is_stopped_by_cancel_futures_alone(self):
+        defs = [definition(f"t.s{i}", "safe") for i in range(12)]
+        self.slow_posts()
+        with self.interrupt_after_posts(2), mock.patch.object(ir.RunControl, "request_stop"):
+            r = self.run_runner(defs, risks=("safe",), targeted=False, extra=["--parallelism", "1"])
+        time.sleep(1.0)
+        self.assertEqual((r.rc, len(self.fake.posts)), (130, 2))
+
+    def test_the_stop_flag_alone_stops_new_dispatch(self):
+        defs = [definition(f"t.s{i}", "safe") for i in range(12)]
+        self.slow_posts()
+        real = ir.concurrent.futures.ThreadPoolExecutor.shutdown
+
+        def no_cancel(self_, wait=True, *, cancel_futures=False):
+            return real(self_, wait=False)
+
+        with self.interrupt_after_posts(2), \
+                mock.patch.object(ir.concurrent.futures.ThreadPoolExecutor, "shutdown", no_cancel):
+            r = self.run_runner(defs, risks=("safe",), targeted=False, extra=["--parallelism", "1"])
+        time.sleep(1.5)
+        self.assertEqual((r.rc, len(self.fake.posts)), (130, 2))
+
+    def test_exercise_starts_nothing_once_stop_is_set(self):
+        class Never:
+            def execute_instruction(self, *a, **k):
+                raise AssertionError("POST after stop")
+
+        control = ir.RunControl()
+        control.request_stop()
+        for risk in ("safe", "destructive"):
+            d = ir.Definition(id="g", plugin="p", action="a", type="action", platforms=[],
+                              parameters={}, result_columns=[], approval_mode="auto", risk=risk,
+                              file="g.yaml")
+            out = ir.exercise(Never(), d, {"g": {}}, 5, AGENT, "linux", NullManifest(), control)
+            self.assertEqual(out.status, "skip")
+            self.assertIn("aborted", out.note)
+
+    def test_the_main_wait_is_timed_so_an_interrupt_can_land_on_windows(self):
+        calls, real = [], ir.concurrent.futures.wait
+
+        def spy(fs, timeout=None, return_when=ir.concurrent.futures.ALL_COMPLETED):
+            calls.append(timeout)
+            return real(fs, timeout=timeout, return_when=return_when)
+
+        with mock.patch.object(ir.concurrent.futures, "wait", spy):
+            self.run_runner(self.DEFS, overrides=self.OV)
+        self.assertTrue(calls)
+        self.assertTrue(all(t is not None and t <= 1 for t in calls), calls)
+
+    def test_a_stop_during_polling_reports_the_dispatch_as_in_flight(self):
+        control = ir.RunControl()
+
+        class Client:
+            def execute_instruction(self, *a, **k):
+                return 200, {"command_id": "c"}
+
+            def get_responses(self, command_id):
+                control.request_stop()
+                return {"responses": [row(status=RUNNING)]}
+
+        d = ir.Definition(id="g", plugin="p", action="a", type="action", platforms=[], parameters={},
+                          result_columns=[], approval_mode="auto", risk="destructive", file="g.yaml")
+        with mock.patch.object(ir, "POLL_INTERVAL_S", 0.01):
+            out = ir.exercise(Client(), d, {"g": {}}, 5, AGENT, "linux", NullManifest(), control)
+        self.assertEqual((out.status, out.dispatched), ("error", True))
+        self.assertIn("in_flight_unknown", out.note)
+
+    def test_an_interrupt_during_a_stalled_dispatch_reports_it_as_in_flight(self):
+        defs = [definition(f"t.q{i}", "destructive") for i in range(3)]
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 3.0)
+        with self.interrupt_after_posts(1):
+            r = self.run_runner(defs, overrides={d["id"]: {} for d in defs})
+        self.assertEqual(r.rc, 130)
+        out = r.outcome("t.q0")
+        self.assertEqual((out["status"], out["dispatched"]), ("error", True))
+        self.assertIn("in_flight_unknown", out["note"])
+        self.assertIn("in_flight_unknown", r.out)
+        self.assertEqual(r.summary["dispatched"], 1)
+        self.assertEqual([a[3] for a in self.metrics if a[2] == "instructions_targeted_dispatched"], [1])
+        self.assertEqual(len(self.fake.posts), 1)
+        time.sleep(3.2)  # let the stalled handler finish before the fake closes
+
+    @unittest.skipIf(sys.platform == "win32", "os.kill(SIGTERM) terminates a Windows process")
+    @unittest.skipUnless(threading.current_thread() is threading.main_thread(), "signals need the main thread")
+    def test_sigterm_takes_the_same_path_as_ctrl_c(self):
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 3.0)
+        before = signal.getsignal(signal.SIGTERM)
+        timer = threading.Timer(0.8, os.kill, (os.getpid(), signal.SIGTERM))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        r = self.run_runner(self.DEFS, overrides=self.OV)
+        self.assertEqual(r.rc, 130)
+        self.assertEqual(r.summary["aborted"], "KeyboardInterrupt")
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+        time.sleep(3.2)
+
+
+class NullManifest:
+    def record(self, *a, **k):
+        pass
 
 
 class Grading(unittest.TestCase):
+    """exercise() against the REAL response row shape."""
+
     class Client:
-        def __init__(self, responses):
-            self.responses = responses
+        def __init__(self, polls):
+            self.polls, self.n = polls, 0
 
         def execute_instruction(self, def_id, params, agent_ids=None):
             return 200, {"command_id": "c"}
 
         def get_responses(self, command_id):
-            return {"responses": self.responses}
+            rows = self.polls[min(self.n, len(self.polls) - 1)]
+            self.n += 1
+            return {"responses": rows}
 
-    def grade(self, risk, responses):
+    def setUp(self):
+        p = mock.patch.object(ir, "POLL_INTERVAL_S", 0.01)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def grade(self, risk, *polls, timeout=30):
         d = ir.Definition(id="g", plugin="p", action="a", type="action", platforms=[], parameters={},
                           result_columns=[], approval_mode="auto", risk=risk, file="g.yaml")
-        return ir.exercise(self.Client(responses), d, {"g": {}}, 30, AGENT).status
+        return ir.exercise(self.Client(list(polls)), d, {"g": {}}, timeout, AGENT, "linux", NullManifest())
 
-    def test_targeted_rows_fail_on_an_errored_or_unfinished_answer(self):
-        for label, resp in (("error, no output", [{"status": "error", "rc": 1, "output": ""}]),
-                            ("rc only", [{"status": "ok", "rc": 2, "output": ""}]),
-                            ("running", [{"status": "running", "output": ""}]),
-                            ("one bad of two", GOOD + [{"status": "error", "output": "x"}])):
-            for risk in ("destructive", "forensic"):
-                with self.subTest(label=label, risk=risk):
-                    self.assertEqual(self.grade(risk, resp), "fail")
+    def test_success_with_no_error_detail_passes(self):
+        for risk in ("destructive", "forensic"):
+            for output in ("x", ""):
+                with self.subTest(risk=risk, output=output):
+                    self.assertEqual(self.grade(risk, [row(output=output)]).status, "pass")
 
-    def test_targeted_rows_still_pass_a_clean_empty_answer(self):
-        self.assertEqual(self.grade("destructive", [{"status": "ok", "rc": 0, "output": ""}]), "pass")
+    def test_failure_timeout_and_rejected_fail_with_or_without_output(self):
+        for status, name in ((FAILURE, "FAILURE"), (TIMEOUT, "TIMEOUT"), (REJECTED, "REJECTED")):
+            for output in ("", "some output"):
+                for risk in ("destructive", "forensic"):
+                    with self.subTest(status=name, output=output, risk=risk):
+                        out = self.grade(risk, [row(status=status, output=output)])
+                        self.assertEqual(out.status, "fail")
+                        self.assertIn(name, out.note)
 
-    def test_safe_and_mutating_grading_is_unchanged(self):
+    def test_success_with_an_error_detail_fails_and_names_it(self):
+        out = self.grade("destructive", [row(error_detail="plugin said no\x1b[2J")])
+        self.assertEqual(out.status, "fail")
+        self.assertIn("plugin said no", out.note)
+        self.assertNotIn("\x1b", out.note)
+
+    def test_running_then_success_passes_after_waiting(self):
+        out = self.grade("destructive", [row(status=RUNNING, output="")], [row(status=RUNNING)],
+                         [row(status=SUCCESS)])
+        self.assertEqual(out.status, "pass")
+
+    def test_running_forever_fails_when_the_deadline_passes(self):
+        out = self.grade("destructive", [row(status=RUNNING, output="")], timeout=1)
+        self.assertEqual(out.status, "fail")
+        self.assertIn("still running after 1s", out.note)
+        self.assertIn("may still be executing", out.note)
+
+    def test_one_agent_still_running_or_failed_among_successes_fails(self):
+        done, running = row(agent_id="a1"), row(status=RUNNING, agent_id="a2")
+        self.assertEqual(self.grade("destructive", [done, running], timeout=1).status, "fail")
+        self.assertEqual(self.grade("destructive", [done, row(status=FAILURE, agent_id="a2")]).status, "fail")
+
+    def test_no_rows_at_all_fails(self):
+        out = self.grade("forensic", [], timeout=1)
+        self.assertEqual(out.status, "fail")
+        self.assertIn("still running after 1s", out.note)
+
+    def test_a_status_that_is_not_the_wire_integer_never_passes(self):
+        for resp in ({"status": "ok", "output": "x"}, {"status": None}, {"status": True},
+                     {"status": "error", "output": ""}, {"status": 1, "rc": 3}, "not-an-object"):
+            with self.subTest(resp=resp):
+                self.assertEqual(self.grade("destructive", [resp]).status, "fail")
+
+    def test_the_real_shape_probe_each_non_success_status_with_empty_output_fails(self):
+        for status in (FAILURE, TIMEOUT, REJECTED):
+            self.assertEqual(self.grade("destructive", [row(status=status, output="")]).status, "fail")
+        self.assertEqual(self.grade("destructive", [row(status=RUNNING, output="")], timeout=1).status, "fail")
+
+    def test_safe_and_mutating_grading_is_the_original_one(self):
+        # Unchanged on purpose (a separate follow-up): it reads a string status and an `rc`.
         for risk in ("safe", "mutating"):
-            for resp in ([{"status": "error", "rc": 1, "output": ""}], [{"status": "running", "output": ""}]):
-                with self.subTest(risk=risk, resp=resp):
-                    self.assertEqual(self.grade(risk, resp), "pass")
-            self.assertEqual(self.grade(risk, [{"status": "error", "rc": 1, "output": "boom"}]), "fail")
+            with self.subTest(risk=risk):
+                self.assertEqual(self.grade(risk, [row(status=RUNNING, output="")]).status, "pass")
+                self.assertEqual(self.grade(
+                    risk, [{"status": "error", "rc": 1, "output": "boom"}]).status, "fail")
+                self.assertEqual(self.grade(
+                    risk, [{"status": "error", "rc": 1, "output": ""}]).status, "pass")
 
 
 class RunWiring(unittest.TestCase):

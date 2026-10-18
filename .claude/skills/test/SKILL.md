@@ -23,9 +23,9 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
                        — quarantine ceremony (~30-40s): exercises the security.quarantine
                          cluster (isolate / release / status / whitelist) with the
                          self-disconnect/auto-resume dance. DO NOT RUN ON A REMOTE / SSH-ONLY
-                         HOST — see safety section below. PR C will add hand-written
-                         semantic-correctness tests for the destructive instructions
-                         (`--instructions-destructive`).
+                         HOST — see safety section below. Destructive and forensic
+                         InstructionDefinitions are never run by /test; drive the runner by
+                         hand (see "`--instructions` mode" below).
 /test --force-cleanup  — tear down THIS RUN's dangling test containers before starting
 /test --keep-stack     — leave docker stacks running after the run (debugging)
 ```
@@ -549,18 +549,31 @@ if [[ "$MODE" == "instructions" ]]; then
 fi
 ```
 
-The runner's exit code is recorded as the `Instructions` gate row above, and that row sets the run's overall_status: 0 → PASS; 1 (one or more instruction fail/error) or 2 (login, content-dir, or targeting/override configuration error) → FAIL.
+The runner's exit code is recorded as the `Instructions` gate row above, and that row sets the run's overall_status: 0 -> PASS; 1 (one or more instruction fail/error, or the run stopped early on an error) or 2 (login, content-dir, or targeting/override/pre-flight configuration error, with nothing dispatched) -> FAIL. 130 means the runner was interrupted (Ctrl-C or SIGTERM). `/test` never selects destructive or forensic.
 
-A destructive or forensic run is opt-in and targets one agent. The `--params-override` file is a JSON object keyed by definition id; each value is an object of parameter name to value (an explicit `{}` for a parameterless definition). A definition with no entry is skipped:
+A destructive or forensic run is opt-in, by hand, and targets exactly one agent on a dedicated disposable stack. It needs `--target-agent-id`, `--confirm-target` (that agent's hostname), `--run-id` and a `--params-override` file, and a loopback `--dashboard` (127.0.0.1, ::1, localhost) unless `--allow-remote` is given. Get the agent id and hostname from the dashboard Devices page or `GET /api/agents`. The runner runs the definitions one at a time, checks the id and hostname against the server's agent list before any dispatch, writes each dispatch to a manifest file before sending it, and passes a destructive/forensic row only when every response row is SUCCESS with no `error_detail`. Note the bash entry takes `--risks` as a comma list while the Python runner takes them space-separated:
+
+```bash
+bash scripts/test/instructions-tests.sh --dashboard http://127.0.0.1:8080 \
+    --user uat-admin --password 'PASSWORD' --risks destructive,forensic \
+    --target-agent-id AGENT_ID --confirm-target HOSTNAME --run-id my-run-1 \
+    --params-override overrides.json --output outcomes.json
+```
+
+`--confirm-target` is a wrong-target typo guard against what the connected server reports. It cannot detect an `ssh -L` tunnel or a port forward to a different stack, and it is not an authorisation or approval control; use a dedicated admin account on a disposable stack. The password on the command line is visible in `ps`, and `http://` with `--allow-remote` sends it in cleartext. If safe/mutating classes are in the same `--risks`, those definitions are still sent to every agent.
+
+The eligible ids are the entries classed `destructive` or `forensic` in the `_overrides` of `scripts/test/instructions-risk-classification.json`; each one's required parameters are under `spec.parameters.required` in `content/definitions/*.yaml`. The `--params-override` file is a JSON object keyed by definition id; each value is an object of parameter name to value, strings or integers only (write a boolean as `"true"`/`"false"`; a duplicate key is an error; top-level keys starting with `_` are ignored). An explicit `{}` is valid only for a parameterless definition. A definition with no entry, a missing required parameter, a `server.*` row, or one not eligible on the target's OS is skipped, never guessed:
 
 ```json
 {
-  "device.filesystem.append": {"path": "/tmp/yuzu_test_scratch.txt", "content": "x"},
-  "device.tags.clear": {}
+  "device.tags.clear": {},
+  "device.filesystem.append": {"path": "/tmp/yuzu_test_scratch.txt", "content": "x"}
 }
 ```
 
-Side effects / how to restore: `device.tags.clear`, `agent.storage.clear` and `crossplatform.tar.rollup` delete agent-side tags, storage and TAR rows with no undo; the destructive `server.*` definitions (for example `server.policy.invalidate_all`, which drops cached policy state) are skipped, never sent. Filesystem writes, registry values and the power plan stay changed until you revert them by hand. `testing.chargen.start` keeps generating until `testing.chargen.stop` is run.
+(`device.filesystem.append` needs the file to exist already on the target.)
+
+Side effects / how to restore (the runner undoes none of them; this list is NOT exhaustive and every destructive/forensic row in the risk table applies): `device.tags.clear` and `agent.storage.clear` delete the target's tags and storage keys with no undo; `crossplatform.tar.rollup` permanently deletes TAR rows past retention, is not recoverable and has no approval gate; `security.certificates.delete` deletes a certificate; `agent.content_dist.stage`/`execute_staged`/`cleanup`/`upload_file` (`execute_staged` RUNS the staged artefact); `crossplatform.printing.clear_queue` is irreversible; `crossplatform.service.set_start_mode`; `device.script_exec.*` runs arbitrary script text; `agent.http_client.download`; `device.wol.wake`; `workflow.config_search_and_replace`; filesystem writes, registry values and the power plan stay changed until you revert them by hand. The destructive `server.*` definitions (for example `server.policy.invalidate_all`) are skipped, never sent. `testing.chargen.start` keeps generating until `testing.chargen.stop` is run against the target.
 
 ### `--instructions-quarantine` mode (the self-disconnect ceremony)
 

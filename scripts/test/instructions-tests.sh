@@ -16,9 +16,15 @@
 # has the full rules and the side effects),
 # server-internal (catalog-only definitions the dispatch chokepoint denies, so they
 # cannot pass),
-# interactive, and network-disrupt (the quarantine ceremony, PR B). The destructive
-# instructions are the candidate pool for PR C's hand-written semantic-correctness
-# overrides. scripts/test/instructions-risk-classification.json is the authority.
+# interactive, and network-disrupt (the quarantine ceremony, PR B).
+# scripts/test/instructions-risk-classification.json is the authority.
+#
+# A destructive/forensic run is by hand, on a dedicated disposable stack. NOTE: --risks
+# here is a comma list (--risks destructive,forensic); the Python runner it calls takes
+# the classes space-separated. --confirm-target is a wrong-target typo guard against
+# what the connected server reports; it cannot detect an ssh -L tunnel or a port forward
+# to a different stack, and it is not an authorisation control. The password on the
+# command line is visible in ps; http:// with --allow-remote sends it in cleartext.
 #
 # Usage:
 #   bash scripts/test/instructions-tests.sh \
@@ -27,9 +33,11 @@
 #       --run-id "$RUN_ID" --gate-name instructions
 #
 # Returns:
-#   0  every runnable instruction passed (or returned expected pending_approval)
-#   1  one or more failed / errored
-#   2  argument or infrastructure error (login, content-dir empty)
+#   0    every runnable instruction passed (or returned expected pending_approval)
+#   1    one or more failed / errored, or the run stopped early on an error
+#   2    argument, infrastructure or pre-flight error (login, content-dir empty,
+#        destructive/forensic targeting, --params-override, --run-id); nothing dispatched
+#   130  interrupted (Ctrl-C or SIGTERM)
 
 set -uo pipefail
 
@@ -64,9 +72,12 @@ Required:
 
 Optional:
   --user NAME              admin user (default: admin)
-  --run-id ID              record per-instruction timings to test-runs DB
+  --run-id ID              record per-instruction timings to test-runs DB; also
+                           names the User-Agent and the manifest (required for
+                           destructive/forensic; [A-Za-z0-9][A-Za-z0-9._-]{0,63})
   --gate-name NAME         gate name to scope timings under (default: instructions)
-  --risks LIST             comma-separated risk classes to run
+  --risks LIST             COMMA-separated risk classes to run (the Python
+                           runner takes them space-separated)
                            (default: safe,mutating; choices: safe, mutating,
                            destructive, forensic, server-internal,
                            network-disrupt, interactive; destructive and
@@ -76,18 +87,21 @@ Optional:
   --target-agent-id ID     the id of the one connected agent sent as the target
                            of destructive and forensic dispatches
   --confirm-target HOST    that agent's hostname (must match the server's agent
-                           list; required with --target-agent-id)
+                           list; required whenever destructive or forensic is
+                           selected, with --target-agent-id and --run-id)
   --manifest PATH          destructive/forensic dispatch record, written before
                            each dispatch (default: in the current directory)
   --allow-remote           permit destructive/forensic against a non-loopback
                            --dashboard (refused by default)
   --match REGEX            run only definition ids matching this regex
   --only-id ID             run exactly one definition (debugging)
-  --parallelism N          concurrent dispatches (default: 4)
+  --parallelism N          concurrent dispatches (default: 4; forced to 1 when
+                           destructive or forensic is selected)
   --poll-timeout SECONDS   per-instruction response poll cap (default: 30)
-  --params-override FILE   JSON mapping {definition_id: {param: value}} —
-                           hand-written overrides for the schema-synthesised
-                           defaults (used by PR C semantic-correctness suite)
+  --params-override FILE   JSON mapping {definition_id: {param: value}} (strings
+                           or integers) — overrides for the schema-synthesised
+                           defaults; for destructive/forensic it is required and
+                           is the whole params object. See the runner's --help.
   --output FILE            write per-instruction outcomes JSON
   --verbose                print every outcome (default: fail/error only)
 EOF
