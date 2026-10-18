@@ -388,12 +388,13 @@ int do_product_codes(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+namespace inv = yuzu::msi_packages::inventory;
+
 // list_inventory: the machine-context roster for the daily installed-software
 // sync. Buffer-then-emit: write_output only appends, and the status row must
 // lead, so the whole roster is built (pure, msi_packages_inventory.hpp) first.
 // A status answer is not a failed command, so every leg returns 0.
 int do_list_inventory(yuzu::CommandContext& ctx) {
-    namespace inv = yuzu::msi_packages::inventory;
 #ifdef _WIN32
     const auto roster = inv::collect(
         [](unsigned c, auto&& on_code) { return enumerate_machine_products(c, on_code); },
@@ -450,8 +451,6 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 
 } // namespace
 
-namespace inventory = yuzu::msi_packages::inventory;
-
 class MsiPackagesPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "msi_packages"; }
@@ -493,8 +492,8 @@ public:
             return 1;
         } catch (...) {
             try {
-                ctx.write_output(inventory::format_status_row(
-                    action, inventory::StatusLevel::constrained, "msi_packages:exception"));
+                ctx.write_output(inv::format_status_row(
+                    action, inv::StatusLevel::constrained, "msi_packages:exception"));
                 ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
                                       YUZU_RESULT_COMPLETENESS_PARTIAL, "msi_packages:exception");
             } catch (...) {

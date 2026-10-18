@@ -14,6 +14,7 @@
 
 #include <yuzu/plugin.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -1913,6 +1914,10 @@ TEST_CASE("msi_packages adapter: maps the builder-rendered Kingsley capture",
     CHECK(e.kind == "pkg");
     CHECK(e.ecosystem == "msi");
     CHECK(e.package_id == "{0B1B5000-3C0E-41C0-83C4-4C914420AE93}");
+    // a lower-case registered code is carried verbatim (no GUID case normalisation)
+    CHECK(std::any_of(r.entries.begin(), r.entries.end(), [](const SwEntry& x) {
+        return x.package_id == "{41120dd7-deb4-4bca-be34-265fc243d4f3}";
+    }));
     CHECK(e.install_date.empty());
     CHECK(e.epoch.empty());
     CHECK(e.release.empty());

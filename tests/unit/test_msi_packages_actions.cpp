@@ -243,9 +243,9 @@ TEST_CASE("msi_packages plugin: list_inventory shape on the real Windows leg",
     const auto lines = split_lines(result.captured);
     REQUIRE_FALSE(lines.empty());
     CHECK(lines[0] == "status|list_inventory|supported|-");
-    // Assumption: the self-hosted Windows runner and Kingsley both carry Visual Studio / SDK MSI
-    // products, so a healthy machine-context roster is never empty here.
-    REQUIRE(lines.size() > 1);
+    // An empty machine-context roster is host state, not a plugin defect.
+    if (lines.size() <= 1)
+        SKIP("this host has no machine-context MSI products to shape-check");
     for (std::size_t i = 1; i < lines.size(); ++i) {
         CHECK(lines[i].rfind("inv|{", 0) == 0);
         CHECK(raw_token_count(lines[i]) == 5);

@@ -140,9 +140,9 @@ AdaptedRows failed(std::string reason) {
     return r;
 }
 
-// `pkg_inventory` grammar -- shared by msi_packages.list_inventory
-// (msi_packages_inventory.hpp format_status_row) -- (pkg_inventory_parsers.hpp format_status_row /
-// format_manager_row / format_package_row / format_store_row): exactly one
+// `pkg_inventory` grammar (pkg_inventory_parsers.hpp format_status_row /
+// format_manager_row / format_package_row / format_store_row), shared by
+// msi_packages.list_inventory (msi_packages_inventory.hpp format_status_row): exactly one
 // `status|<action>|<supported|constrained|unsupported>|<tokens or ->` row, plus
 // data rows. Status decides success; malformed DATA rows are dropped. A status
 // row answering a different action is not counted (-> "bad status").
