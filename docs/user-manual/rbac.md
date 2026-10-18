@@ -11,9 +11,12 @@ Toggle RBAC via `PUT /api/v1/rbac/enforcement` (or the `set_rbac_enforcement` MC
 ```bash
 curl -s -b cookies.txt -X PUT \
   http://localhost:8080/api/v1/rbac/enforcement \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
 ```
+
+A call authorised by a session cookie must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`); without one, or with one naming another site, it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers need no header. The same rule applies to the two role-assignment routes under "Fleet-Wide Role Assignment" below.
 
 The toggle refuses unless the **calling operator** passes BOTH of the following: a `403` unless they hold authority under the regime that is durably true **right now** (the SOURCE regime — this closes a cross-replica cache-staleness gap in the outer admin gate itself, see below), and a `409` unless they would remain a durable administrator under the **destination** regime after the switch — it never gambles with a lockout.
 
@@ -738,6 +741,7 @@ Changing the sign-in provider settings (`POST /api/settings/oidc`, and `PUT /api
 # Grant the Operator role to a user, fleet-wide
 curl -s -b cookies.txt -X POST \
   http://localhost:8080/api/v1/rbac/roles/Operator/assignments \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "principal_type": "user",
@@ -746,8 +750,11 @@ curl -s -b cookies.txt -X POST \
 
 # Revoke it again
 curl -s -b cookies.txt -X DELETE \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/rbac/roles/Operator/assignments/jane.doe
 ```
+
+These two examples send `Origin` because a session-cookie call without a same-site `Origin` or `Referer` is refused `403` `cross-site request refused` (audited as `csrf.denied`); an API-token call needs no header.
 
 Key constraints:
 

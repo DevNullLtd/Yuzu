@@ -1712,7 +1712,7 @@ Change the caller's own **local-account** password (#5342). The caller proves th
 
 1. Authentication (`401` without a session).
 2. Session class: an API, MCP or engine token, or a service-scoped token, is `403 token_session`; an OIDC or SAML session is `409 not_local` (change it at the identity provider).
-3. Same-site request: `Origin`/`Referer` must be the dashboard's own origin (or a `--csrf-trusted-origins` entry), and a request carrying **neither** header is refused — `403 csrf`. `Content-Type` must be `application/json` — `415` (not audited).
+3. Same-site request: `Origin`/`Referer` must be the dashboard's own origin (or a `--csrf-trusted-origin` entry), and a request carrying **neither** header is refused — `403 csrf`. `Content-Type` must be `application/json` — `415` (not audited).
 4. MFA step-up, when the account is enrolled and its proof is stale — `401` step-up envelope (`meta.mfa_step_up_required`, `meta.challenge_url`).
 5. Body and length policy — `400`, **not audited** (nothing security-relevant was attempted, and a policy rejection never records the length). The body is never echoed, because it may hold a password.
 6. The current password, through the same lockout-accounted check as `POST /login`: a wrong password is `403 wrong_current` and counts toward [account lockout](server-admin.md#server-cli-flags); a locked account gets the **same** `403` and message (`account_locked` in the audit row only — no lock-state oracle). A password that could not be verified — the auth store could not be read, or the stored password changed while it was being checked — is a retryable `503 verify_transient` and never counts. If the lockout counter cannot be recorded the answer is `503 store_unavailable` (fail closed: an uncounted guess is never answered as an ordinary wrong password). A correct current password clears a non-zero failure counter (`auth.lockout.cleared`, `detail=reset_on_password_change`).
@@ -2914,6 +2914,8 @@ are all structurally denied before any store read — an MCP-tiered credential
 must use the `assign_rbac_role` MCP tool instead, which carries its own
 supervised-tier + approval-ticket gate ([#520](https://github.com/Tr3kkR/Yuzu/issues/520)).
 
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_role_assignment`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate, the current-regime re-check and MFA step-up and before the body is read.
+
 **Request body:**
 
 ```json
@@ -2967,9 +2969,10 @@ route enforces, but stays classified 400 (not 503) for if that ever
 changes; `401` — not authenticated, or MFA
 step-up not satisfied; `403` — the caller does not hold a durable
 Administrator role, does not hold authority under the regime that is durably
-true right now, is a service-scoped/engine session, or presented an
+true right now, is a service-scoped/engine session, presented an
 MCP-tier bearer token of any tier (use the `assign_rbac_role` MCP tool
-instead); `503` — the RBAC or `AuthDB` store is unavailable (including when
+instead), or made a cross-site cookie-session call (`cross-site request
+refused`); `503` — the RBAC or `AuthDB` store is unavailable (including when
 the admin gate itself cannot confirm durable authority — now logged and
 audited as a `denied` row, not silently invisible), a genuine store/query
 fault while writing the grant (as opposed to a client-validation rejection,
@@ -3003,6 +3006,8 @@ unassigning a role the principal did not hold still returns success.
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
 above (including the MCP-tier-token structural denial), plus MFA step-up.
 
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_role_assignment`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate, the current-regime re-check and MFA step-up and before the body is read.
+
 **Response:**
 
 ```json
@@ -3014,7 +3019,8 @@ the caller does not hold a durable Administrator role, does not hold
 authority under the regime that is durably true right now (A1: same fresh
 re-check as the `POST` route above, including its SAML #5182 structural
 exclusion), is a service-scoped/engine session, presented an MCP-tier bearer
-token of any tier (use the `unassign_rbac_role` MCP tool instead), or
+token of any tier (use the `unassign_rbac_role` MCP tool instead), made a
+cross-site cookie-session call (`cross-site request refused`), or
 (`{name}=="Administrator"` only) is attempting to remove their **own**
 Administrator assignment (self-lockout
 guard — a caller can never revoke their own standing Administrator authority
@@ -3050,6 +3056,8 @@ session, which is exempt from step-up entirely (`mfa_step_up.cpp`), the same
 accepted deviation `docs/user-manual/rbac.md`'s SSO/break-glass callout
 notes for the equivalent case. A service-scoped API token and an engine
 session are both structurally denied before any store read.
+
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_enforcement`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate and MFA step-up and before the body is read.
 
 **Request body:**
 
@@ -3087,7 +3095,8 @@ JSON boolean; `401` — MFA step-up not satisfied (see the exemption above);
 service-scoped/engine session, carries a non-empty `mcp_tier` bearer token
 (denied before the admin check even runs; REST has no
 tier/approval concept to legitimize a tiered bearer token the way MCP's own
-dispatch guard does), or (on a real transition) does not hold
+dispatch guard does), makes a cross-site cookie-session call
+(`cross-site request refused`), or (on a real transition) does not hold
 authority under the regime that is durably true **right now** — enabling
 requires the caller's own local `admin` role, disabling requires the
 caller's own fleet-wide `Administrator` grant (this closes a cross-replica
@@ -9104,6 +9113,7 @@ Per-device all-guards view (#4037, api-parity #2146 Batch A) — every guard's s
 Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. The fan-out is live: the server resolves `scope` to the in-scope agents and delivers each a per-agent filtered rule set (only rules whose `os_target` and `scope_expr` match that agent).
 
 - **Permission:** `GuaranteedState:Push`
+- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `guaranteed_state_push`), not as `guaranteed_state.push`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the permission check and MFA step-up and before the body is read.
 - **Request body:**
 
 | Field | Type | Required | Description |
@@ -9112,7 +9122,7 @@ Queue a push of the active rule set to scoped agents. Returns `202 Accepted` —
 | `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise they merge. |
 
 - **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.agents` (number of agents the push was dispatched to), `data.scope`.
-- **4xx:** `400` if the JSON body is present but not an object, or if `scope` fails to parse as a Scope DSL expression; `403` if a service-scoped API token calls this route — the single most severe instance of this confinement-gap class on this branch, since a `full_sync` push mutates what every OTHER service's agents enforce, not merely reads it. An invalid `scope` is refused with `400` before the fan-out reads the policy generation, the rule list or the deployed set, so it wins over a degraded-store `503` and does not disturb the heartbeat reconcile; a `group:` scope is not parsed here when a management-group store is wired (it names a group, and its members are looked up later).
+- **4xx:** `400` if the JSON body is present but not an object, or if `scope` fails to parse as a Scope DSL expression; `403` `cross-site request refused` for a cross-site or header-less cookie-session call (see above); `403` if a service-scoped API token calls this route — the single most severe instance of this confinement-gap class on this branch, since a `full_sync` push mutates what every OTHER service's agents enforce, not merely reads it. An invalid `scope` is refused with `400` before the fan-out reads the policy generation, the rule list or the deployed set, so it wins over a degraded-store `503` and does not disturb the heartbeat reconcile; a `group:` scope is not parsed here when a management-group store is wired (it names a group, and its members are looked up later).
 - **5xx:** `503` (A4 envelope, `retry_after_ms: 5000`) when a store read the push depends on could not be answered: the policy generation, the rule store, the Baseline deployed set, the tag store or custom-property store (read while resolving the push scope or the scope of a rule), or, for a `group:` scope, the management-group membership. Nothing was sent to any agent: the push is refused rather than fanned out with an empty or narrowed rule set (ADR-0038). Retry once the store recovers. The audit row is `result=denied` with detail `store degraded scope="<sanitised-expr>"`. The heartbeat reconcile applies the same fail-closed rule (it declines to re-push rather than push an empty set).
 - **Audit:** `guaranteed_state.push` (`success` / `denied`). A server-initiated re-push to a lagging agent on heartbeat reconnect is audited separately under `guaranteed_state.reconcile` (principal `system`).
 - **MCP twin:** `push_guardian_rules` (#2146 Batch B1) — same gate, same scope-string push mechanism (not the shared `command_dispatch_fn`/`check_targeting_shape` chokepoint). Genuinely non-idempotent, annotated `idempotentHint:false`.

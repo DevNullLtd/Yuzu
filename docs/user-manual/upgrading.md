@@ -2,6 +2,14 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: four privileged REST routes refuse cross-site cookie writes
+
+**What changed.** A call to `PUT /api/v1/rbac/enforcement`, `POST /api/v1/rbac/roles/{name}/assignments`, `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` or `POST /api/v1/guaranteed-state/push` authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`). Otherwise it answers `403` `cross-site request refused` and is audited as `csrf.denied`. The check runs after the authorization gates and MFA step-up, so a caller who is not authorized learns nothing from it, and before the request body is read. The password routes, the response-template routes and `POST /api/v1/guaranteed-state/policy-generation/raise` already apply the same rule. API, MCP and engine token callers are not affected.
+
+**Who is affected.** A script or tool that signs in with a cookie and calls one of these routes without an `Origin` or `Referer` header now gets `403`. No dashboard page calls these routes.
+
+**How to fix.** Call the route with an API token, or send an `Origin` header matching the dashboard origin (for example `-H "Origin: https://yuzu.example.com"`). Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`. No configuration or data migration is required.
+
 ## Behaviour change: the macOS agent package installs transactionally and can refuse
 
 This applies to every macOS `.pkg`, including the release package.

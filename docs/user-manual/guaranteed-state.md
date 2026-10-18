@@ -186,7 +186,7 @@ curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/push \
   -d '{"scope": "tag:env=prod", "full_sync": true}'
 ```
 
-Requires `GuaranteedState:Push`. Returns `202 Accepted`. Audits `guaranteed_state.push` with `result=success` and `detail=rules=<N> full_sync=<bool> scope="<expr>" agents=<count>`, where `agents` is the number of in-scope agents the push was dispatched to (across the direct gRPC and gateway transports).
+Requires `GuaranteedState:Push`. The example uses an API token; a call authorised by a session cookie must instead carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`) and is otherwise refused `403` `cross-site request refused`, audited as `csrf.denied`. Returns `202 Accepted`. Audits `guaranteed_state.push` with `result=success` and `detail=rules=<N> full_sync=<bool> scope="<expr>" agents=<count>`, where `agents` is the number of in-scope agents the push was dispatched to (across the direct gRPC and gateway transports).
 
 The push is dispatched to in-scope agents; the `agents=<count>` field records how many were targeted. Delivery is best-effort for gateway-connected agents under an upstream outage (durable buffering is Guardian A3), so a non-zero `agents` count records **dispatch, not a per-agent delivery receipt**. SIEM correlation should treat the count as "push fanned out to N agents," and corroborate actual enforcement against the drift/sync records at `/api/v1/guaranteed-state/events`.
 
