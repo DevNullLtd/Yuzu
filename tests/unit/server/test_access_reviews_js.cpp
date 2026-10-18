@@ -91,3 +91,26 @@ TEST_CASE("reviews page: the panels carry the renderer's sentences and nothing l
     CHECK_THAT(t, !ContainsSubstring("id=\"ar-grants\" hx-get"));
     CHECK_THAT(t, !ContainsSubstring("hx-get=\"/fragments/access/reviews/grants\" hx-trigger"));
 }
+
+TEST_CASE("reviews page: htmx history is off before htmx loads, because campaign rows push a URL",
+          "[access-reviews][js]") {
+    // A campaign row carries hx-push-url, which makes htmx snapshot the whole page (audit rows,
+    // campaigns, grants) into localStorage unless history is disabled. The meta is read once, at
+    // htmx load, so it must come first.
+    const std::string rows = render_campaigns(std::vector<AccessReviewCampaignRow>{[] {
+                                                  AccessReviewCampaignRow c;
+                                                  c.campaign_id = "c1";
+                                                  c.status = "open";
+                                                  return c;
+                                              }()},
+                                              false);
+    CHECK_THAT(rows, ContainsSubstring("hx-push-url="));
+    for (const std::string t : {std::string(kAccessAuditTemplate), std::string(kAccessAuditHtml)}) {
+        const auto meta = t.find("<meta name=\"htmx-config\"");
+        const auto htmx = t.find("<script src=\"/static/htmx.js\">");
+        REQUIRE(meta != std::string::npos);
+        REQUIRE(htmx != std::string::npos);
+        CHECK(meta < htmx);
+        CHECK_THAT(t, ContainsSubstring("{\"allowEval\":false,\"historyEnabled\":false}"));
+    }
+}

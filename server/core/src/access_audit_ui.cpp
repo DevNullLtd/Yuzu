@@ -3,6 +3,11 @@
 // The `data-denied` / `data-unavailable` sentences are byte-equal to the constants in
 // access_audit_render.hpp; test_access_audit_js.cpp pins the equality.
 // The literal is far below MSVC's 16,380-byte raw-string cap (C2026).
+//
+// The htmx-config meta MUST precede the htmx script (htmx reads it once, at load):
+// `historyEnabled:false` keeps htmx from snapshotting this page into localStorage when a campaign
+// row pushes its URL. The snapshot would carry the audit log, the campaign list and any grant
+// tables past logout, defeating the fragments' `Cache-Control: no-store, private`.
 
 #include "access_audit_ui.hpp"
 
@@ -17,6 +22,7 @@ extern const char* const kAccessAuditTemplate =
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Yuzu - Audit and reviews</title>
   <link rel="stylesheet" href="/static/yuzu.css">
+  <meta name="htmx-config" content='{"allowEval":false,"historyEnabled":false}'>
   <script src="/static/htmx.js"></script>
   <script src="/static/yuzu-access.js" defer></script>
   <script src="/static/yuzu-dialog.js" defer></script>
