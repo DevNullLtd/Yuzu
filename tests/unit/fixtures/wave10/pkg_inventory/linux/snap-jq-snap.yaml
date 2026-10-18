@@ -1,0 +1,11 @@
+apps:
+  jq:
+    command: command-jq.wrapper
+architectures:
+- amd64
+confinement: strict
+description: The jq command
+grade: stable
+name: jq
+summary: The jq command
+version: 1.5+dfsg-1

@@ -41,7 +41,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | None — outbound sockets and a write to an operator-chosen path need no elevated grant | 2026-09-07 as `SYSTEM` | `download`: `error\|failed to open destination file for writing` if the destination directory isn't writable |
-| macOS | agent daemon | None | 2026-09-07 at euid 501 (alex, unprivileged) | same as above |
+| macOS | agent daemon | None | 2026-09-07 at euid 501 (jsmith, unprivileged) | same as above |
 | Linux | agent daemon | None | 2026-09-06 at euid 0 (container) | same as above |
 
 No subprocess execution on any platform — cpp-httplib's native socket client (`getaddrinfo`/`socket`/`connect`) runs in-process everywhere. Outbound network access to the operator-supplied URL's resolved address is required, subject to the SSRF filter above; on Windows, HTTPS additionally requires OpenSSL to have been found at build time (`CPPHTTPLIB_OPENSSL_SUPPORT`) — if it wasn't, every `https://` request on that build returns `status|0` / an `HTTPS not supported (OpenSSL not available)` message instead of connecting.

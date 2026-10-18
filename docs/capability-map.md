@@ -1625,7 +1625,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | installed_apps | Y | Y | Y | Software |
 | runtimes | - | Y | - | Software |
 | msi_packages | Y | - | Y | Software |
-| pkg_inventory | - | - | Y | Software |
+| pkg_inventory | - | Y | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |

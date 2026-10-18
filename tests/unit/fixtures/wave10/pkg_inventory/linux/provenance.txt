@@ -1,0 +1,34 @@
+Directory: tests/unit/fixtures/wave10/pkg_inventory/linux/
+Captured 2026-10-14 for the pkg_inventory Linux leg tests (test_pkg_inventory_linux_parsers.cpp).
+
+tree.manifest + snap-<name>-snap.yaml (six files)
+  Status: REAL CAPTURE
+  host:     Kingsley, WSL2 Ubuntu 26.04.1 LTS (kernel 6.18.54.1-microsoft-standard-WSL2, amd64)
+  software: snapd 2.77.1 (series 16), flatpak 1.16.6
+  identity: root
+  date:     2026-10-14T16:27Z
+  commands: which for the ten manager names; ls of /etc/apt/sources.list.d, /var/lib/snapd/snaps, /snap,
+            /snap/<name> (with the `current` link text) and /var/lib/flatpak/{app,runtime}; find over
+            /var/lib/flatpak/{app,runtime} (with link texts); cat of /snap/<name>/<rev>/meta/snap.yaml for
+            the six installed snaps (btop core core24 hello-world jq snapd).
+  Reduced:  the manifest records names and link texts only. File bodies the leg never reads (the .snap
+            images, apt source contents) are empty T: payloads; the six snap.yaml files are verbatim
+            (F:), because the leg parses version and type from them. Flatpak commit directories are
+            empty D: entries.
+  Shapes:   core is `type: os`, core24 `type: base`, snapd `type: snapd`; core24 carries a quoted version
+            ('20260824'); hello-world has flow-style architectures and an indented `apps:` block;
+            jq has `version:` after `name:`; the other snaps have no `type:` (snapd's default, app).
+            Flatpak: two apps and seven runtimes (including the .Locale extensions and two branches of
+            org.freedesktop.Platform.GL.default), every branch with an `active` link to its 64-hex commit.
+
+Not captured / not exercised against real data:
+  - flatpak `metadata` files (runtime field, appdata version): not read by the leg.
+  - apt source file CONTENTS, and any dnf / pacman / apk / rpm / dpkg database fact.
+  - a `snap disable`d snap (no `current` link), an unmounted revision, a parallel-instance snap
+    (name_key), and every degraded or hostile layout: these are SYNTHETIC in-code trees in the test TU,
+    not captures.
+
+WSL-vs-bare-metal caveat: the host is a WSL2 guest, not bare metal. Under WSL2 the snap squashfs mounts
+are real loop mounts and /snap, /var/lib/snapd and /var/lib/flatpak have the layouts snapd and flatpak
+create everywhere; but this capture does not prove behaviour on a bare-metal or LXD host (for example
+a squashfuse mount that is not readable by an unprivileged user).

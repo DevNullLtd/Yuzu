@@ -1725,7 +1725,7 @@ TEST_CASE("macos::path_under_network_mount: a network mount at or above the path
     CHECK(macos::path_under_network_mount("/Users/carol/Library/x", real));
     CHECK(macos::path_under_network_mount("/System/Volumes/Data/home/dave", real));
     CHECK_FALSE(macos::path_under_network_mount("/Users/carolyn/Library", real));
-    CHECK_FALSE(macos::path_under_network_mount("/Users/alex/Library", real));
+    CHECK_FALSE(macos::path_under_network_mount("/Users/jsmith/Library", real));
     CHECK_FALSE(macos::path_under_network_mount("/homework", real));
     // A network root covers every path.
     CHECK(macos::path_under_network_mount("/Users/x", std::vector<macos::MountEntry>{{"/", "nfs"}}));
