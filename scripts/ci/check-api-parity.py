@@ -1121,7 +1121,10 @@ def stale_grandfather_errors(rows, grandfathered):
 
 # An HTTP method as the ledger spells it: ASCII capitals only (the capability id and the
 # gate's messages embed it, so no newline or other character may ride along).
-_METHOD_RE = re.compile(r"[A-Z]+")
+_METHOD_RE = re.compile(r"[A-Z]{1,16}")
+# A route path as the ledger spells it (letters, digits and `_ . : / { } -`, at most 200 characters):
+# the gate's messages embed it, so no newline or other control character may ride along.
+_PATH_RE = re.compile(r"[A-Za-z0-9_.:/{}-]{1,200}")
 
 
 def row_shape_error(row):
@@ -1136,7 +1139,9 @@ def row_shape_error(row):
     if not all(isinstance(row[k], str) for k in ("method", "path", "capability_id")):
         return "method, path and capability_id must be strings"
     if not _METHOD_RE.fullmatch(row["method"]):
-        return f"method must be upper-case ASCII letters (GET, POST, ...), got {row['method'][:20]!r}"
+        return f"method must be 1-16 upper-case ASCII letters (GET, POST, ...), got {row['method'][:20]!r}"
+    if not _PATH_RE.fullmatch(row["path"]):
+        return f"path must be 1-200 characters from A-Z a-z 0-9 _ . : / {{ }} -, got {row['path'][:40]!r}"
     rest, mcp = row["rest_v1_twin"], row["mcp_twin"]
     # A bare-string rest_v1_twin is documentary prose on a non-twinned row.
     rest_ok = (all(isinstance(rest.get(k), str) for k in ("method", "path"))
@@ -1145,7 +1150,9 @@ def row_shape_error(row):
         return ("rest_v1_twin must be null, a string or an object with string "
                 "method and path; mcp_twin null or a string")
     if isinstance(rest, dict) and not _METHOD_RE.fullmatch(rest["method"]):
-        return f"rest_v1_twin method must be upper-case ASCII letters, got {rest['method'][:20]!r}"
+        return f"rest_v1_twin method must be 1-16 upper-case ASCII letters, got {rest['method'][:20]!r}"
+    if isinstance(rest, dict) and not _PATH_RE.fullmatch(rest["path"]):
+        return f"rest_v1_twin path must be 1-200 characters from A-Z a-z 0-9 _ . : / {{ }} -, got {rest['path'][:40]!r}"
     return None
 
 
@@ -1185,7 +1192,7 @@ def load_ledger(ledger_dir=None):
                 continue
             for msg in status_errors(row["status"], row["capability_id"],
                                      GRANDFATHERED_LEGACY_EXCEPTIONS):
-                errors.append(f"{f}[{idx}] ({row['method']} {row['path']}): {msg}")
+                errors.append(f"{f}[{idx}] ({row['method'][:20]!r} {row['path'][:40]!r}): {msg}")
             expected_id = capability_id_for(row["method"], row["path"])
             if row["capability_id"] != expected_id:
                 errors.append(f"{f}[{idx}] ({row['method']} {row['path']}): "
@@ -1845,6 +1852,11 @@ def _selftest_body():
                             (dict(good, method="get"), "upper-case"), (dict(good, method="GE T"), "upper-case"),
                             (dict(good, method=""), "upper-case"), (dict(good, method="G\u0415T"), "upper-case"),
                             (dict(good, method="GET\n::error::injected"), "upper-case"),
+                            (dict(good, method="A" * 17), "upper-case"),
+                            (dict(good, path="/x\n::error::injected"), "path must be"), (dict(good, path=""), "path must be"),
+                            (dict(good, path="/x y"), "path must be"), (dict(good, path="/" + "a" * 200), "path must be"),
+                            (dict(good, path="/x\u0435"), "path must be"),
+                            (dict(good, rest_v1_twin={"method": "GET", "path": "/x\n::error::x"}), "rest_v1_twin path"),
                             (dict(good, rest_v1_twin={"method": "get", "path": "/x"}), "rest_v1_twin method"),
                             (dict(good, rest_v1_twin={"method": "GET\n::error::x", "path": "/x"}), "rest_v1_twin method")):
         err = row_shape_error(bad_row)
@@ -2185,7 +2197,9 @@ def _selftest_body():
     check(rc_l == 0 and "or retire it" not in out_l, f"lapse: no warning far from the date, got {out_l[:200]}")
 
     expect("bad-method", _drive(base_rows + [_mk("bm", "retire", method="GET\n::error::injected")]), 1,
-           "method must be upper-case", absent=("\n::error::injected",))
+           "method must be 1-16 upper-case", absent=("\n::error::injected",))
+    expect("bad-path", _drive(base_rows + [_mk("bp", "retire", path="/x\n::error::injected")]), 1,
+           "path must be", absent=("\n::error::injected",))
     expect("missing-domain", _drive(base_rows, skip_domains=("tar",)), 1, "missing for declared domain")
     expect("planned-lookalike", _drive(base_rows + [_mk("p21460", "planned:#21460")]), 0)
     for label, rows_c, kw, needles in cases:
