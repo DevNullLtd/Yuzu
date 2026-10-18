@@ -96,21 +96,26 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
 
+            // One probe per render, and only when some pending row is not the caller's own
+            // (self-review is refused server-side whatever the grant). Never per row. Shared
+            // by both views (#6061): the tab used to offer Approve/Reject on the class check
+            // alone, so a Viewer-level approver-class session saw buttons the route would
+            // refuse with a 403 the tab cannot surface.
+            const bool decidable_row = std::any_of(
+                listed->approvals.begin(), listed->approvals.end(), [&](const auto& a) {
+                    return a.status == "pending" &&
+                           (session->username.empty() || a.submitted_by != session->username);
+                });
+            const bool can_decide = approver_class_ok && decidable_row && deps.probe_perm_fn &&
+                                    deps.probe_perm_fn(req, "Approval", "Approve");
+
             if (view_page) {
                 operate_pages::NameLookupMemo names(operate_pages::instruction_name_resolver(deps.instruction_store));
                 operate_pages::ApprovalListView view;
                 view.truncated = listed->truncated;
                 view.status_filter = status;
                 view.now = static_cast<int64_t>(std::time(nullptr));
-                // One probe per render, and only when some pending row is not the caller's
-                // own (self-review is refused server-side whatever the grant). Never per row.
-                const bool decidable_row = std::any_of(
-                    listed->approvals.begin(), listed->approvals.end(), [&](const auto& a) {
-                        return a.status == "pending" &&
-                               (session->username.empty() || a.submitted_by != session->username);
-                    });
-                view.can_decide = approver_class_ok && decidable_row && deps.probe_perm_fn &&
-                                  deps.probe_perm_fn(req, "Approval", "Approve");
+                view.can_decide = can_decide;
                 view.rows.reserve(listed->approvals.size());
                 for (const auto& a : listed->approvals) {
                     operate_pages::ApprovalRowView row;
@@ -164,7 +169,7 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             html += "<span class=\"hint\">"
                                     "You submitted this — another reviewer must "
                                     "approve</span>";
-                        } else if (approver_class_ok) {
+                        } else if (can_decide) {
                             html += "<button class=\"btn btn-primary btn-sm\" "
                                     "hx-post=\"/api/approvals/" +
                                     a.id +
