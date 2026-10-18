@@ -604,6 +604,10 @@ see §5 for which chokepoints apply.
     Re-tagging a `planned:#2146` row as a strict exception lowers `BASELINE_GENERIC_PLANNED` and
     leaves `BASELINE_UNTWINNED` unchanged; a NEW exception row (a new route) raises
     `BASELINE_UNTWINNED`.
+    If the gate reports a preprocessor line in `kTools[]` or `kResources[]`, the scan does not model
+    conditional compilation there: teach it that directive, or move the line out of the array (a line
+    inside a raw-string schema that begins with `#` or `%:` is refused too, and so is one that
+    follows a `*/`). A revisit-date notice also appears on the run's summary page when one is near.
     Then regenerate the doc block: run `python3 scripts/ci/check-api-parity.py --render-doc` and
     replace the region from the BEGIN line through the END line inclusive, in
     `docs/api-parity-ledger.md`, with its output. A PR that edits a `BASELINE_*` constant (raise or

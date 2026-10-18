@@ -102,6 +102,7 @@ USAGE
 import argparse
 import datetime
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -535,6 +536,20 @@ OWNER_FILE_DOMAIN_FALLBACK = {
     "dashboard_ui.cpp": "other",
     "rest_api_v1.cpp": "other",
 }
+
+
+def step_summary(text):
+    """Appends `text` to the GitHub step summary (the run's front page) when
+    GITHUB_STEP_SUMMARY names a file; any failure to write is ignored: a
+    summary is a convenience and must never change the gate's result."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except OSError:
+        pass
 
 
 def gh(kind, msg):
@@ -1459,6 +1474,7 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
     lapse = revisit_lapse_warning(ledger_rows, today or datetime.date.today())
     if lapse:
         gh("warning", f"check-api-parity: {lapse}")
+        step_summary(f"### API parity: exception revisit dates\n\n{lapse}\n")
 
     # 1. every extracted fragment/legacy route must be ledgered.
     unledgered = sorted(set(bucket_a) - set(ledger_rows))
@@ -2121,6 +2137,28 @@ def _selftest():
     rc_l, out_l = _drive(base_rows, today=day_a + one_day)
     check(rc_l == 0 and out_l.count("::warning::check-api-parity: ") == 1 and "or retire it" in out_l
           and "::error::" not in out_l, f"lapse: run_check warns once and still passes, got {rc_l}: {out_l[:300]}")
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dsum:
+        summ = Path(dsum) / "summary.md"
+        for env_val, want in ((str(summ), True), (str(Path(dsum) / "no_such_dir" / "x.md"), False), (None, False)):
+            saved = os.environ.get("GITHUB_STEP_SUMMARY")
+            if env_val is None:
+                os.environ.pop("GITHUB_STEP_SUMMARY", None)
+            else:
+                os.environ["GITHUB_STEP_SUMMARY"] = env_val
+            try:
+                rc_s, out_s = _drive(base_rows, today=day_a + one_day)
+            finally:
+                if saved is None:
+                    os.environ.pop("GITHUB_STEP_SUMMARY", None)
+                else:
+                    os.environ["GITHUB_STEP_SUMMARY"] = saved
+            check(rc_s == 0 and "::error::" not in out_s,
+                  f"step summary: an unwritable or unset summary path never changes the result, got {rc_s}: {out_s[:200]}")
+        body_s = summ.read_text(encoding="utf-8") if summ.exists() else ""
+        check("exception revisit dates" in body_s and "or retire it" in body_s and body_s.count("###") == 1,
+              f"step summary: the lapse notice is appended once when the path is writable, got {body_s!r}")
+        rc_s, out_s = _drive(base_rows, today=day_a - 100 * one_day)
+        check(not summ.read_text(encoding="utf-8").count("###") > 1, "step summary: nothing is appended when no revisit date is near")
     rc_l, out_l = _drive(base_rows, today=day_a - 100 * one_day)
     check(rc_l == 0 and "or retire it" not in out_l, f"lapse: no warning far from the date, got {out_l[:200]}")
 

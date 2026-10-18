@@ -688,9 +688,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      of the set is machine-caught,
      while growth paired with a raise of its maximum, a swap or a rebind to a
      row with the same slug is review-only. These five rows are a disclosed
-     residual not covered by #5955. The eight `twinned-rest-only`
-     rows are open gaps counted by the ratchet and tracked by #5963 (the two
-     hardware rows also by #4456).
+     residual not covered by #5955. Nine `twinned-rest-only` rows
+     are open gaps counted by the ratchet: eight are tracked by #5963 (the
+     hardware rows also by #4456); the ninth,
+     `post.fragments-tar-retention-paused-purge`, is not named in #5963 and
+     has no tracker recorded here.
 
 ## Interim rules (until the named follow-ups ship)
 
