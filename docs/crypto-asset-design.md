@@ -1,9 +1,10 @@
 # Cryptographic asset inventory: design and phasing
 
-**Status:** design reference, mostly proposed. Only slice 1, the crypto-library view (PR #6056), is
-built; everything from [Slice 2](#slice-2-certificate-inventory) on is a proposal that each slice
-must confirm before it builds. Claims about existing code are checked against `dev` at the date
-below and cite the file they come from. A claim marked **Proposed** is a design intent that has not
+**Status:** design reference, mostly proposed. Only slice 1, the crypto-library view, is built, in
+PR #6056, which is open and not yet merged to `dev`. Everything from
+[Slice 2](#slice-2-certificate-inventory) on is a proposal that each slice must confirm before it
+builds. Claims about existing code are checked against `dev` at the date below, and claims about
+slice 1 against #6056's branch; each cites the file it comes from. A claim marked **Proposed** is a design intent that has not
 been built or tested.
 
 Last checked against code: 2026-10-18.
@@ -39,8 +40,10 @@ and the ways this could ship wrong. The operator manual for what is built is
    Phase 3 and the Forensics tier. ADR-0016 says its "no PII" reasoning was built for
    `installed_software` and does not transfer to another source unchanged, so each new source needs
    its own classification.
-4. **Every read is confined.** Fleet reads go through the admit-then-filter chokepoint
-   (`authorize_list_read`, ADR-0017), and every surface ships as REST and MCP twins with audit
+4. **Every read is confined.** Fleet reads go through an ADR-0017 admit-then-filter gate:
+   `require_fleet_read` for per-device reads, as slice 1 does, or `authorize_list_read` for rollups
+   that cannot be filtered. They are not interchangeable: `authorize_list_read` refuses a
+   service-scoped session outright (`auth_routes.hpp`). and every surface ships as REST and MCP twins with audit
    (ADR-1005, the agentic-first rules).
 
 ## Building blocks that already exist
@@ -51,8 +54,10 @@ All checked against `dev`:
   `subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage`, the same 8 fields on
   every leg. Dates are day-granular and the thumbprint is SHA-1. It reports no key algorithm, key
   size or signature algorithm.
-  - Linux reads only the first PEM block of each file, so that deletes are not widened to a whole
-    bundle (`certificates_plugin.cpp`, the `parse_pem_certs` comment).
+  - Linux reads only the first PEM block of each file, so `list` omits every later certificate in a
+    bundle. Matching only the first block limits which thumbprints can trigger a delete of a bundle
+    file, but a delete naming that first certificate still removes the whole file
+    (`certificates_plugin.cpp`, the comment above `read_cert_entry`).
   - A Windows read may fall back from LocalMachine to CurrentUser when LocalMachine cannot be
     opened. That result is marked CONSTRAINED. Delete is LocalMachine-only and fails closed (#4377).
   - On macOS, the System keychains are read in-process through SecItem. The login keychain goes
@@ -63,7 +68,9 @@ All checked against `dev`:
   - `netstat` lists sockets with state and PID. Process name and path come from its `attribution`
     action.
   - `netprobe` measures ICMP, TCP-connect and DNS timing.
-  - Neither performs a TLS handshake, so TLS discovery would be new code.
+  - Neither performs a TLS handshake. `http_client` fetches `https` URLs, but it blocks private
+    ranges and reports nothing about the negotiated parameters, so TLS discovery would be new
+    code.
 - **Software and posture plugins:** `pkg_inventory`, `installed_apps`, `runtimes`,
   `platform_security`, `system_hardening` and `local_security_policy`.
 - **ADR-0016 daily sync.** The typed sources are `installed_software`, `app_perf`, `device_ci`,
@@ -85,14 +92,16 @@ Slice 1 is the low-hanging fruit: a server-side view over data the fleet already
 - **What it does.** It joins the existing `installed_software` table against a curated rule table
   compiled into the server. There is no new agent code and no new store.
 - **Families.** The rule table has 12: OpenSSL, LibreSSL, BoringSSL, GnuTLS, NSS, Mbed TLS,
-  wolfSSL, Libgcrypt, libsodium, Nettle, Botan and Bouncy Castle. Every response carries
-  `table_version`; it is `2` today (`kCryptoTableVersion`).
+  wolfSSL, Libgcrypt, libsodium, Nettle, Botan and Bouncy Castle. Every successful response
+  carries `table_version`; it is `2` today (`kCryptoTableVersion`).
 - **Surfaces.**
   - The `/crypto` page and its two dashboard fragments.
   - `GET /api/v1/crypto/libraries` and `GET /api/v1/crypto/libraries/devices`.
   - The MCP tools `get_crypto_libraries` and `list_crypto_library_devices`.
-- **Access.** Every surface is gated on `Inventory:Read`, with confinement. While RBAC enforcement
-  is off, a service-scoped token is refused with `403`.
+- **Access.** Every data surface (both fragments, both REST routes, both MCP tools) is gated on
+  `Inventory:Read` with confinement; the page shell needs only a session. While RBAC enforcement is
+  off, a service-scoped token is refused: `403` on REST, a refusal notice in the fragments, and an
+  error on MCP.
 - **What it proves.** Package presence and version only. It does not show that a library is in use,
   and it cannot see statically linked or vendored copies.
 
@@ -103,7 +112,7 @@ Known follow-ups are #6044 to #6050, #6052 and #6109.
 **Proposed.** It starts after #6056 merges and after the placement ADR (#6051).
 
 - **A new action, not a change to `list`.** `list` is a stable contract, and its Linux leg's
-  first-PEM-only rule exists to keep deletes narrow. A new read-only action can enumerate every
+  first-PEM-only rule limits which requests can reach a bundle-file delete. A new read-only action can enumerate every
   certificate in a bundle without touching the delete path.
 - **Fields.**
   - Emit OIDs rather than names: `key_alg_oid`, `key_bits_or_curve` and `sig_alg_oid`.
@@ -168,13 +177,14 @@ Known follow-ups are #6044 to #6050, #6052 and #6109.
     collector's facts. On failure, the previous facts are kept and marked stale;
   - serialised concurrent replaces for one agent, as the software store already does;
   - collection-disable semantics, byte and row budgets, purge, and per-source coverage reporting.
-- **A store.** A new born-on-Postgres store would follow ADR-0006 and ADR-0012: fail-closed
-  construction and server-receipt timestamps.
+- **A store.** A new born-on-Postgres store would follow ADR-0006 and ADR-0007 (Postgres,
+  fail-closed construction) and ADR-0012 (a declared runtime failure posture, bounded acquires, one
+  lease per operation). It stamps freshness with server receipt time, as ADR-0016 requires (#1685).
 - **Access and projection.**
   - Decide the securable: `Inventory`, `Security`, or a new `Crypto` securable (open decision 2).
   - Decide, per action and per field, what each tier sees, including with RBAC off. Paths stay out
-    of the daily blob and are served on demand at a stricter tier, the same rule ADR-0016 applies
-    to install locations.
+    of the daily blob and are served on demand, as ADR-0016 does for install locations. Whether an
+    on-demand read needs a stricter tier is decided per field (open decision 3).
 - **Surfaces.** REST list and summary, an MCP twin, and a CycloneDX export (see
   [CBOM export](#cbom-export-cyclonedx-17)).
 - **Metrics.** Low-cardinality only, never one label per certificate. Each alert rule in
@@ -182,30 +192,36 @@ Known follow-ups are #6044 to #6050, #6052 and #6109.
 
 ## CBOM export (CycloneDX 1.7)
 
-**Status:** not built; the target version is decided (below). Yuzu has no CycloneDX code today. Its only CycloneDX use is the release
-workflow, which generates SBOMs of Yuzu's own binaries with `anchore/sbom-action`.
+**Status:** not built; the target version is decided (below). No Yuzu product code emits CycloneDX
+today. Its only CycloneDX use is release tooling: `release.yml` generates SBOMs of Yuzu's release
+artifacts and images with `anchore/sbom-action`, and `scripts/check-release-artifacts.sh` checks
+that they exist.
 
-**Background.** CycloneDX added cryptographic assets in 1.6 (2024). 1.7 keeps the same model and
+**Background.** CycloneDX added cryptographic assets in 1.6 (2024-04-09). 1.7 keeps the same model and
 extends it:
 
 | Version | Released | Crypto support |
 |---|---|---|
-| 1.6 | 2024 (1.6.1: 2024-11-07, 1.6.2: 2026-06-02) | `component.type` `cryptographic-asset` and `cryptoProperties`. Asset types are `algorithm`, `certificate`, `protocol` and `related-crypto-material`. Certificates carry `subjectName`, `issuerName`, `notValidBefore`, `notValidAfter`, `signatureAlgorithmRef` and `subjectPublicKeyRef`. Key material types include `private-key`, `public-key`, `secret-key` and `token`. Protocol types include `tls` and `ssh`. |
-| 1.7 | 2025-10-21 (1.7.2: 2026-09-17) | Same four asset types. Certificates add `serialNumber`, `fingerprint`, `certificateState` and lifecycle dates. Protocol types add `dtls` and `quic`. |
+| 1.6 | 2024-04-09 (1.6.1: 2024-11-07, 1.6.2: 2026-06-02) | `component.type` `cryptographic-asset` and `cryptoProperties`. Asset types are `algorithm`, `certificate`, `protocol` and `related-crypto-material`. Certificates carry `subjectName`, `issuerName`, `notValidBefore`, `notValidAfter`, `signatureAlgorithmRef` and `subjectPublicKeyRef`. Key material types include `private-key`, `public-key`, `secret-key` and `token`. Protocol types include `tls` and `ssh`. |
+| 1.7 | 2025-10-21 (1.7.2: 2026-09-17) | Same four asset types. Certificates add `serialNumber`, `fingerprint`, `certificateState`, lifecycle dates and `relatedCryptographicAssets`, and deprecate `signatureAlgorithmRef` and `subjectPublicKeyRef` in favour of `relatedCryptographicAssets`. Protocol types add `dtls` and `quic`, among others. |
 
 This was checked against the published JSON schemas `bom-1.6.schema.json` and
 `bom-1.7.schema.json` in `CycloneDX/specification`.
 
-**Decision: the export targets CycloneDX 1.7** (decided 2026-10-18). 1.7's certificate fields
-(`serialNumber`, `fingerprint`) map directly onto what Slice 2 would collect; 1.6 would need custom
-properties for them. The export pins `bom-1.7.schema.json` and CI validates every export against
+**Decision: the export targets CycloneDX 1.7** (decided 2026-10-18). 1.7 adds `serialNumber`, which
+the existing plugin already emits, and a `fingerprint` hash object; 1.6 would need custom
+properties for both. The schema defines `fingerprint` as a hash of the certificate excluding its
+signature, so the export must decide whether the plugin's SHA-1 whole-certificate thumbprint, or a
+new digest, belongs in that field. The export pins `bom-1.7.schema.json` and CI validates every export against
 it. A consumer that reads only 1.6 is not a target. Supporting one would be a separate, explicit
 change.
 
 **Mapping notes:**
 
 - Certificate dates map to `notValidBefore` and `notValidAfter`.
-- Algorithms are separate `algorithm` components that certificates reference.
+- Algorithms and keys are separate components that certificates reference through
+  `relatedCryptographicAssets`, not the deprecated `signatureAlgorithmRef` and
+  `subjectPublicKeyRef`.
 - A library from Slice 1 is an ordinary `library` component, not a `cryptographic-asset`.
 - The export shows facts only. CycloneDX also has strength fields such as
   `nistQuantumSecurityLevel` and `classicalSecurityLevel`. Filling those in is interpretation, so
