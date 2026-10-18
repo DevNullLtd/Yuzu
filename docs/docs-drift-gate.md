@@ -170,4 +170,4 @@ Known gap in a sibling gate: the plugin README touch rule's bash parser
 (`scripts/ci/check-plugin-readme-touch.sh`) still honours a `docs-unchanged:` line
 inside raw HTML, its job still lives in `docs-lint.yml` without `edited`, and it diffs
 the payload's `base.sha`, which goes stale once `dev` advances. This gate
-closes all three for itself; the sibling is tracked separately.
+closes all three for itself; the sibling's gaps are tracked in #4621 and #6129.
