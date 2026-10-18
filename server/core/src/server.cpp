@@ -161,6 +161,7 @@
 #include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
+#include "access_audit_routes.hpp" // Audit and reviews page (Phase 2 UI): /access/audit
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
@@ -2255,6 +2256,7 @@ public:
         for (const auto result : {"swept", "capped", "noop", "declined", "declined_no_anchor",
                                   "skipped_lock", "failed"})
             metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
+        seed_response_facet_metrics(metrics_);
         // #4644/#4703 response-route observability: strict-parse rejections and cut
         // exports, closed label sets seeded by the same header the emit sites use.
         seed_response_metrics(metrics_);
@@ -4416,38 +4418,37 @@ public:
             oidc_cfg.redirect_uri = cfg_.oidc_redirect_uri;
             oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
             oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
+            oidc_cfg.allow_private_networks = cfg_.oidc_allow_private_networks;
+            bool nat64_prefixes_valid = true;
+            if (auto prefixes = oidc::egress::parse_nat64_prefix_list(cfg_.oidc_nat64_prefixes)) {
+                oidc_cfg.nat64_prefixes = std::move(*prefixes);
+                if (!oidc_cfg.nat64_prefixes.empty())
+                    spdlog::info("OIDC egress: --oidc-nat64-prefix is set; {} NAT64 prefix(es) "
+                                 "are decoded before OIDC requests are vetted; a configured prefix "
+                                 "can permit HTTPS connections to ULA addresses even when "
+                                 "--oidc-allow-private-networks is off, so declare only actual "
+                                 "translation prefixes",
+                                 oidc_cfg.nat64_prefixes.size());
+            } else {
+                // main.cpp refuses to start on an unparsable list; a Config built elsewhere must
+                // not silently run without the declared prefixes (fail closed: no provider).
+                nat64_prefixes_valid = false;
+                spdlog::error("OIDC egress: --oidc-nat64-prefix is not a valid list; OIDC login "
+                              "is disabled");
+            }
             oidc_cfg.scim_link_claim = cfg_.oidc_scim_link_claim;
             if (cfg_.oidc_skip_tls_verify)
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
-            // Fallback endpoints for Entra ID — OidcProvider constructor will
-            // override from the OIDC discovery document if reachable.
-            // Entra v2.0 pattern: issuer is .../v2.0, endpoints are .../oauth2/v2.0/...
-            auto issuer = cfg_.oidc_issuer;
-            auto v2_pos = issuer.rfind("/v2.0");
-            if (v2_pos != std::string::npos) {
-                auto base = issuer.substr(0, v2_pos);
-                oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
-                oidc_cfg.token_endpoint = base + "/oauth2/v2.0/token";
-            } else {
-                oidc_cfg.authorization_endpoint = issuer + "/authorize";
-                oidc_cfg.token_endpoint = issuer + "/token";
-            }
-            // Token exchange helper script (Python subprocess workaround for
-            // httplib OpenSSL client issues on Windows)
-            auto script_dir =
-                std::filesystem::path(cfg_.auth_config_path).parent_path().parent_path() /
-                "scripts" / "oidc_token_exchange.py";
-            // Try source tree location first (development), then installed location
-            auto src_script =
-                std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
-            if (std::filesystem::exists(src_script))
-                oidc_cfg.exchange_script = src_script.string();
-            else if (std::filesystem::exists(script_dir))
-                oidc_cfg.exchange_script = script_dir.string();
-            spdlog::info("OIDC exchange script: {}", oidc_cfg.exchange_script);
-
-            oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
+            if (cfg_.oidc_allow_private_networks)
+                spdlog::info("OIDC egress: --oidc-allow-private-networks is set; loopback, "
+                             "RFC 1918, carrier-grade NAT and unique-local addresses are "
+                             "reachable for OIDC requests (link-local and cloud-metadata "
+                             "addresses stay refused)");
+            // Endpoints and jwks_uri are NOT derived here: OidcProvider reads them from the
+            // issuer's discovery document on first use (#5692).
+            if (nat64_prefixes_valid)
+                oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         }
 
         // Initialize SAML 2.0 SP provider if configured.
@@ -8147,7 +8148,12 @@ public:
         return true;
     }
 
-    ~ServerImpl() override { stop(); }
+    ~ServerImpl() override {
+        stop();
+        // Providers a Settings save swapped out while a sign-in was still using them (#5692).
+        // stop() has ended the web threads, so every lease is released and this cannot wait.
+        oidc::OidcProvider::drain_retired();
+    }
 
     [[nodiscard]] bool startup_failed() const override { return startup_failed_; }
 
@@ -15833,6 +15839,35 @@ private:
                                            s.validation_regex});
                         return out;
                     },
+            });
+
+        // Audit and reviews page (Phase 2 UI), audit half: /access/audit, its log, sample and
+        // retention fragments and the page's static glue. Each fragment is gated on the same
+        // securable as its REST twin: the auto-loading log by the quiet probe (no denial row
+        // per page view), the on-request sample and retention by the loud `perm_fn`. The audit
+        // read returns nullopt when the store is closed or did not answer, never an empty
+        // vector for that.
+        yuzu::server::access_audit::register_access_audit_routes(
+            inline_sink,
+            yuzu::server::access_audit::Deps{
+                .auth_fn = auth_fn,
+                .perm_fn = perm_fn,
+                .quiet_perm_fn = draw_perm_fn,
+                .audit_fn = audit_fn,
+                .query_fn = [this](const AuditQuery& q, std::size_t* pool_size)
+                    -> std::optional<std::vector<AuditEvent>> {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return std::nullopt;
+                    return audit_store_->query(q, pool_size);
+                },
+                .retention_days_fn =
+                    [this]() {
+                        // The enforced figure (the store copies it at construction), not the
+                        // live config value; without a store, the startup config.
+                        return audit_store_ ? audit_store_->retention_days()
+                                            : cfg_.audit_retention_days;
+                    },
+                .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
             });
 
         // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the

@@ -23,7 +23,7 @@ churns the ledger. Each row records:
 
 - `capability_id` - an id DERIVED from the method and path (it changes if a
   route is renamed, and the gate requires it to match).
-- `rest_v1_twin` - the `/api/v1/*` route that serves the same capability, if
+- `rest_v1_twin` - the `/api/vN/*` route that serves the same capability, if
   one exists.
 - `mcp_twin` - the MCP tool name that serves the same capability, if one
   exists.
@@ -43,9 +43,12 @@ churns the ledger. Each row records:
   union of other ledgered capabilities, not a 1:1 twin),
   `exception:#<issue> revisit:<YYYY-MM-DD> <reason>` (a deliberate, reviewed
   exception with a tracking issue and a revisit date - an ADR-1005 ledger
-  entry, not a free pass; a size-pinned set of older rows predates the shape
-  and is grandfathered by `capability_id` in the script - extending it,
-  swapping an id or rebinding an id to another row is caught only in review), or `retire` (the
+  entry, not a free pass; the `<issue>` may be the originating or decision
+  issue and need not be open, e.g. #520 and #2102 are closed as of
+  2026-10-17; a few rows with no machine-checked dated revisit are
+  grandfathered by `capability_id` in a size-pinned set in the script, named
+  in ADR-1005's 2026-10-15 entry - extending it, swapping an id or rebinding
+  an id to another row is caught only in review), or `retire` (the
   fragment route no longer exists; kept for history until the ledger row
   itself is deleted).
 
@@ -159,6 +162,8 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 
 **Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
 
+**Known asymmetry on the dashboard API-token pair.** `POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` apply the same permission, MFA step-up, store-availability, tier/TTL and ownership rules as `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}`. They differ in being narrower or in shape: the form has no `scope_service` (no service-scoped minting) and takes `ttl_hours` where the REST route takes `expires_at`; its audit rows are written through `AuditStore::log` and carry no user-agent, principal-class or session-id stamp; and MCP `create_api_token` has no step-up, by design (an MCP-tier token is required, with approval at the supervised tier). The rows stay `twinned`. The Settings page cannot yet prompt for the step-up code, so an MFA-enrolled operator whose proof has expired is refused without feedback and must re-authenticate.
+
 **Known asymmetry on the discovered-devices pair.** The legacy `GET /api/discovery/results` row is
 `twinned` to `GET /api/v1/network/discovered-devices` / `list_discovered_devices`, but the raw route is
 not retired and is not equivalent: it is unbounded (no `limit`, no `truncated`), returns the
@@ -189,15 +194,15 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | instructions | 27 | 14 | 13 |
 | compliance-policy | 22 | 5 | 17 |
 | settings | 26 | 7 | 19 |
-| rbac | 13 | 0 | 13 |
+| rbac | 13 | 2 | 11 |
 | auth-mfa | 7 | 0 | 7 |
 | engine-principals | 3 | 0 | 3 |
 | access-reviews | 2 | 0 | 2 |
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 1 | 14 |
 | enrollment | 21 | 4 | 17 |
-| other | 79 | 16 | 63 |
-| **Total** | **325** | **98** | **227** |
+| other | 82 | 17 | 65 |
+| **Total** | **328** | **101** | **227** |
 
 Registered `/api/vN/*` routes: 251. OpenAPI `paths` entries: 250. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 191.
 
