@@ -1167,22 +1167,22 @@ TEST_CASE("REAL records: Power-Troubleshooter 1 resume metric", "[dex][parse][re
 TEST_CASE("PRIVACY + REAL: User32 1074 restart — process + reason kept, user dropped",
           "[dex][parse][real][privacy]") {
     // Real layout: param1 = "path\app.exe (HOST)", param3 = reason, param5 =
-    // action, param7 = the initiating USER ("DGRHP\daver") — never read.
+    // action, param7 = the initiating USER ("CONTOSO\jsmith") — never read.
     const EventFields f = {
-        {"param1", "C:\\Windows\\SystemApps\\Host\\StartMenuExperienceHost.exe (DGRHP)"},
-        {"param2", "DGRHP"},
+        {"param1", "C:\\Windows\\SystemApps\\Host\\StartMenuExperienceHost.exe (WORKSTATION01)"},
+        {"param2", "WORKSTATION01"},
         {"param3", "Other (Unplanned)"},
         {"param4", "0x0"},
         {"param5", "restart"},
         {"param6", ""},
-        {"param7", "DGRHP\\daver"}};
+        {"param7", "CONTOSO\\jsmith"}};
     const auto o = extract_signal("System", "User32", 1074, 4, f);
     REQUIRE(o);
     CHECK(o->obs_type == "os.restart_initiated");
     CHECK(o->subject == "StartMenuExperienceHost.exe"); // basename, host suffix cut
     CHECK(o->sentence.find("restart") != std::string::npos);
     for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
-        CHECK(field.find("daver") == std::string::npos);
+        CHECK(field.find("jsmith") == std::string::npos);
 }
 
 TEST_CASE("REAL records: any-error specs catch live ids (TPM 1801, Biometrics 1014, MDM 844)",

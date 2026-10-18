@@ -181,7 +181,7 @@ repo before anything was changed. Four amendments accepted, one refuted.
 | 1+2 | Add round ordinal and seven more fields to the ledger row | Ledger is now a specified JSONL schema with `pass_ordinal`, `finding_id`, `provenance`, `caused_by`, `adjudicated_by`, `waiver_rationale`, native **and** mapped severity. **Explicitly does not adopt** the signed-waiver merge contract — the columns exist so a future decision has somewhere to write. |
 | 3 | `docs-writer` has no mandate over in-code prose | Confirmed: its brief has zero references to comments or in-code text. The original routing created an ownership gap. Now split — **`docs-writer` owns WORDING** (extended to in-code comments and log/error strings), **the domain agent owns TRUTH**, with an explicit routing table. Normative architecture text routes to `architect`. |
 | 5 | Changelog fragment carries an unrelated issue's number | Confirmed — **#2596 is a real, open, unrelated issue** (macOS sqlite linking). Renamed to `2604-…`. |
-| §8 | Reviewer briefs that are wrong today | Three stale `CHANGELOG.md` `[Unreleased]` instructions rewritten to the fragment convention (the breaking-change *coverage* check was retargeted, not deleted). Four `/mnt/c/Users/natha/Yuzu` paths replaced with `<repo-root>`. |
+| §8 | Reviewer briefs that are wrong today | Three stale `CHANGELOG.md` `[Unreleased]` instructions rewritten to the fragment convention (the breaking-change *coverage* check was retargeted, not deleted). Four `/mnt/c/Users/<user>/Yuzu` paths replaced with `<repo-root>`. |
 
 ### Refuted — amendment 4
 
