@@ -16,12 +16,37 @@ Meson is the sole build system. **Every time you add, remove, or rename a source
   contract `deploy/windows/toolchain-contract.json` pins 1.11.1; the build's hard floor is
   `meson_version: '>=1.3.0'`), Ninja
 - CMake (required by Meson's cmake dependency method — not used as a build system)
-- C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
+- C++23 compiler: GCC 15+, Clang 21+, MSVC 19.44+ (Visual Studio 2022 17.14), or Apple Clang 21+.
+  This is exactly the set CI builds and tests; see "Compiler floor" below for why, and for what it
+  means on RHEL 9 and the Ubuntu/Debian LTS releases.
 - vcpkg (set `VCPKG_ROOT`)
 - Optional, for the Erlang gateway: Erlang/OTP 28.4 or any later 28.x, plus rebar3. `meson setup`
   finds it (kerl, asdf, mise, Homebrew `erlang@28`, distro packages, the Windows installer) and skips
   the gateway with a warning if none matches; see `docs/erlang-gateway-build.md`.
 - For vcpkg's libpq port (Postgres substrate, ADR-0006; builds postgresql from source): **Linux** needs `bison flex` (apt); **macOS** needs `autoconf automake libtool` (brew); **Windows** none extra (vcpkg auto-acquires winflexbison)
+
+### Compiler floor
+
+The floor is the compiler set CI builds and tests on every push, and nothing older (#5929). On
+2026-10-15 those legs reported GCC 15.2.0 (Ubuntu 26.04, `Linux gcc-15 *`), Ubuntu Clang 21.1.8
+(`Linux clang-21 *`), MSVC 19.44.35228 (`Windows MSVC *`, toolset 14.44, VS 2022 17.14) and Apple
+clang 21.0.0 (`macOS *`). The shipped container images and the release Linux tarballs and packages
+are built with the same GCC 15.
+
+An older compiler can still build Yuzu, but nothing tests the result, and older compilers have
+already produced silent miscompiles. GCC 14 and earlier do not implement P2718R0 (lifetime extension
+of temporaries in a range-for initializer). Code that is correct under GCC 15 is a use-after-free
+under GCC 14, and `/test --full` on RHEL 9 with `gcc-toolset-14` found six such sites in the unit
+tests that no CI leg could see (#5924). Treat a build with a compiler below the floor as unsupported.
+
+What a packager needs to do now:
+
+| Platform | Distro compiler | What to do |
+|---|---|---|
+| Ubuntu 26.04 LTS | GCC 15 (default), Clang 21 | Nothing. This is the CI platform. |
+| Ubuntu 24.04 LTS | GCC 13 (default), GCC 14 in the archive; no GCC 15 | Use `gcc-15` from the `ppa:ubuntu-toolchain-r/test` PPA (it publishes 15.2.0 for noble), or build on Ubuntu 26.04 or in an `ubuntu:26.04` container. A binary built on 26.04 can need newer glibc and libstdc++ symbol versions than 24.04 ships (the release server needs `GLIBCXX_3.4.34`); see "Linux native packages: minimum distribution" in `docs/user-manual/README.md`. |
+| Debian 13 (trixie) | GCC 14; no GCC 15 in main or trixie-backports | Build on Ubuntu 26.04 or in a container, as for 24.04. The shipped images moved off `debian:trixie-slim` for this reason. |
+| RHEL / Rocky / Alma 9 | GCC 11 (system); `gcc-toolset-14` and `gcc-toolset-15` in AppStream | Use `gcc-toolset-15`, not `-14`. `scripts/setup-rhel9.sh` now installs it; see `docs/rhel9-build-setup.md`. |
 
 ### Quick start (setup script)
 ```bash

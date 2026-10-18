@@ -1,10 +1,17 @@
 # Cedar & Vale demo — frontend tier: Envoy + co-located yuzu-agent.
 #
 # Envoy's official image is Ubuntu 22.04 (glibc 2.35), too old for the
-# trixie-built agent (needs GLIBC_2.38 / GLIBCXX_3.4.32). So we run Envoy's
-# binary on a debian:trixie-slim base instead — an Ubuntu-22.04-built Envoy
-# binary is forward-compatible with trixie's newer glibc (verified: it runs),
-# and trixie matches the agent. One base, both processes happy.
+# agent (needs GLIBC_2.38 / GLIBCXX_3.4.32). So we run Envoy's binary on a
+# debian:trixie-slim base instead — an Ubuntu-22.04-built Envoy binary is
+# forward-compatible with trixie's newer glibc (verified: it runs), and trixie
+# satisfies the agent. One base, both processes happy.
+# The agent comes from Dockerfile.agent, which builds on ubuntu:26.04 with
+# gcc-15 since #5929. Its measured needs (GLIBC_2.38, GLIBCXX_3.4.32,
+# CXXABI_1.3.15) are met by trixie's glibc 2.41 and GCC 14 libstdc++; the
+# agent and all 70 plugins were run on debian:trixie-slim (arm64) at #5929. That is a
+# property of today's agent, not a guarantee: yuzu-server, built the same way,
+# already needs GCC 15's GLIBCXX_3.4.34, and if the agent ever does too this
+# tier stops starting with a "GLIBCXX_3.4.34 not found" loader error.
 #
 # Envoy listens on :8080 (a "web" port), which is what makes fleet-viz classify
 # this host into the frontend tier (top of the stack). It reverse-proxies to the

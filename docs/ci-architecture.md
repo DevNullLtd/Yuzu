@@ -856,13 +856,41 @@ Linux, then release.yml + the remaining Windows→Wee Tam stragglers (#1615). Th
 supporting scaffolding:
 
 - Native files `meson/native/linux-gcc15.ini` + `linux-clang21.ini` are the live
-  toolchain files (they also set `-fuse-ld=mold`; see Build speed below). The
-  24.04 `linux-gcc13.ini`/`linux-clang19.ini` stay only for the GHA-hosted
-  ubuntu-24.04 canary.
-- The CI runner image (`Dockerfile.ci-linux`), the local `Dockerfile.ci`, and the
-  four sanitizer images (`Dockerfile.{server,agent}-{asan,tsan}`) are on
-  `ubuntu:26.04` + gcc-15/clang-21. `gcc-13`/`clang-19` stay installable from the
-  archive but are not the defaults.
+  toolchain files (they also set `-fuse-ld=mold`; see Build speed below). No CI
+  job uses `linux-gcc13.ini` or `linux-clang19.ini` any more: the GHA-hosted
+  workflow canary and `fork-dynamic-review.yml` moved to `ubuntu-26.04` +
+  gcc-15 + `linux-gcc15.ini` in #5929. `linux-gcc13.ini` stays because it sets
+  only `cpp_std` (no mold), which the RHEL 9 recipe and
+  `scripts/test/coverage-gate.sh` need; its name is historical.
+- The CI runner image (`Dockerfile.ci-linux`), the local `Dockerfile.ci`, the
+  four sanitizer images (`Dockerfile.{server,agent}-{asan,tsan}`) and, since
+  #5929, the builder stages of the four shipped images
+  (`Dockerfile.{server,agent}` and their `.chisel` variants) are on
+  `ubuntu:26.04` + gcc-15. `Dockerfile.server` / `Dockerfile.agent` also moved
+  their runtime stage from `debian:trixie-slim` to `ubuntu:26.04`, because a
+  gcc-15 binary needs 26.04's libstdc++ and glibc. `gcc-13`/`clang-19` stay
+  installable from the archive but no build uses them.
+
+### Compiler floor = the CI compiler set (#5929)
+
+The supported compiler floor is exactly what the CI legs above build and test:
+GCC 15, Clang 21, MSVC 19.44 (VS 2022 17.14) and Apple Clang 21
+(`docs/build-guide.md` "Compiler floor"). Two rules follow from it:
+
+- **No CI leg on a compiler below the floor.** The last one, the gcc-13
+  workflow canary (compile-only, ubuntu-24.04), moved to gcc-15 on the
+  GitHub-hosted `ubuntu-26.04` image rather than being deleted: the canary's job
+  is catching workflow regressions on a fresh host, and that is
+  compiler-independent. `fork-dynamic-review.yml` moved with it.
+- **Moving a leg's compiler moves the floor in the same change.** Update
+  `docs/build-guide.md`, `README.md` and the agent briefs that state it
+  (`.claude/agents/cpp-expert.md`, `cross-platform.md`, `build-ci.md`,
+  `.codex/skills/cpp-expert/SKILL.md`).
+
+Artifacts built with GCC 15: the release Linux tarball, `.deb` and `.rpm`
+(`release.yml` `build-linux`, Big Tam, `linux-gcc15.ini`), and the published
+`yuzu-server` / `yuzu-*-chisel` images (`release.yml` builds them on Big Tam from
+the Dockerfiles above).
 - `pre-release.yml`'s `install-deb` smoke matrix has an `ubuntu:26.04` leg.
 
 `ImageOS` stays `ubuntu24` on every leg (setup-beam has no `ubuntu26` prebuilt
@@ -2152,8 +2180,12 @@ the new names.
 `scripts/ci/detect-code-change.sh` owns both the path rules and `git diff`
 error handling. If the diff cannot be established, it returns changed=true so
 the canary runs fail-closed. Canary mirrors the linux build on a fresh-disk
-GHA-hosted `ubuntu-24.04` with `actions/cache` for vcpkg + ccache — catches
-workflow regressions before main.
+GHA-hosted `ubuntu-26.04` (gcc-15, mold, `linux-gcc15.ini` — the Big Tam
+toolchain; ubuntu-24.04/gcc-13 until #5929) with `actions/cache` for vcpkg +
+ccache — catches workflow regressions before main. The `ubuntu-26.04` hosted
+image was a GitHub public preview when the canary moved; if it is withdrawn,
+run the job in an `ubuntu:26.04` container rather than reverting to a
+below-floor compiler.
 
 **Diff semantics differ by event, deliberately.** A push asks "what did this
 push move", so it diffs two-dot against `github.event.before`. A pull request
@@ -2171,7 +2203,7 @@ also assert the caller passes a resolved head.
 original instance: a workspace-wide `hashFiles` glob picked up the vendored
 headers the vcpkg restore had just materialised, so the key differed between a
 cold and a warm run.) The canary's ccache key is now a **rolling 3-day bucket**
-(`ccache-canary-x64-linux-<epoch/259200>`, computed from the runner clock —
+(`ccache-canary-gcc15-x64-linux-<epoch/259200>`, computed from the runner clock —
 trivially unreachable by any restore): the source-hash key it replaces never
 exact-hit on a repo doing ~75 commits/day, so every run saved a fresh multi-GB
 entry, the pool ran 7x over GitHub's 10 GB repo quota, and LRU eviction both
@@ -2207,7 +2239,10 @@ throwaway `trusted-fork/pr-<N>` branch, so whatever fork code writes lands in a
 scope no `dev`/`main`/PR run can restore from, and the wrapper purges it after
 the run (#4471). Every PR bases on `dev`, so a dev-scoped entry serves all of them; main-only
 warming left the scope empty for five weeks and each PR saved a private ~843 MB
-duplicate (#3233). Note the canary key hashes `vcpkg.json` /
+duplicate (#3233). The `gcc15-` segment in both canary keys is a toolchain discriminator: a new
+compiler must not exact-hit a vcpkg tree built by the old one, or every run
+rebuilds every port and then skips its save (the #3229 shape). Change the
+segment whenever the canary's compiler changes. Note the canary key hashes `vcpkg.json` /
 `vcpkg-configuration.json` / `triplets/x64-linux.cmake`, which the
 `ci-infrastructure` class does not match, so a manifest bump on `dev` does not
 itself re-warm the new key.

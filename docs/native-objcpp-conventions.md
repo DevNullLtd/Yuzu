@@ -70,10 +70,13 @@ plugin's `plugin.h` ABI entry points, exactly as for a `.cpp` one.
 
 ## The C++23 flag: `-std=c++23` vs `-std=c++2b`
 
-Apple Clang 15 (the Command Line Tools SDK floor this project targets,
-`-mmacosx-version-min=13.3`) rejects the canonical `-std=c++23` spelling for
-Objective-C++ and requires the pre-standardization alias `-std=c++2b`; newer
-Apple Clang accepts `-std=c++23` directly. **Probe, never hardcode**: ask the
+Apple Clang 15 rejects the canonical `-std=c++23` spelling for Objective-C++
+and requires the pre-standardization alias `-std=c++2b`; newer Apple Clang
+accepts `-std=c++23` directly. The supported floor is now Apple Clang 21 (what
+the macOS CI leg runs; `docs/build-guide.md` "Compiler floor"), which accepts
+`-std=c++23`, and the deployment target stays `-mmacosx-version-min=13.3`.
+The probe below is kept because it is free and keeps an older toolchain's
+failure a clear one. **Probe, never hardcode**: ask the
 `objcpp` compiler object (`meson.get_compiler('objcpp').has_argument(...)`)
 which spelling it accepts and pick that one, so a build on an older toolchain
 does not fail with an "unknown argument" configure error while a build on a

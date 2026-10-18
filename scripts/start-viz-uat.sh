@@ -512,7 +512,7 @@ cmd_start() {
   # Three modes:
   #   container (default): spin up the dockerised yuzu-agent under the
   #                        in-container-agent compose profile. Thin agent on a
-  #                        debian:trixie-slim base — almost no loopback chatter,
+  #                        ubuntu:26.04 base — almost no loopback chatter,
   #                        useful as a smoke test for the registration path but
   #                        weak for PR-8+ visual demos.
   #   vm:                  do not start a containerised agent. Print the

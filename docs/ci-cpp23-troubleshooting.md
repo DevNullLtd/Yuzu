@@ -4,6 +4,8 @@
 
 This was written after spending a full day debugging CI failures for [Yuzu](https://github.com/Tr3kkR/Yuzu), a cross-platform C++23 endpoint management platform. Every issue below was discovered the hard way.
 
+> **Supported compilers today (#5929):** GCC 15+, Clang 21+, MSVC 19.44+ (VS 2022 17.14) and Apple Clang 21+ — exactly the set CI builds and tests; see "Compiler floor" in `docs/build-guide.md`. The sections below were written when CI ran GCC 13, Clang 18/19 and Apple Clang 15/16 on `ubuntu-24.04` and `macos-14`. Those compilers are now below the floor and the matrix at the end of this page is a historical record of them, not a support statement. The lessons (libstdc++ selection by Clang, Meson flag translation, `ld64` flags, ccache with native files) still apply.
+
 ---
 
 ## 1. Clang 18 + GitHub Actions = broken `std::expected`
@@ -262,7 +264,9 @@ This is how we found most of the issues above — fast iteration in Docker, then
 
 ---
 
-## Summary: the C++23 CI compatibility matrix
+## Summary: the C++23 CI compatibility matrix (historical, pre-#5929 compilers)
+
+Every compiler in this table is below the current floor. For the floor compilers (GCC 15, Clang 21, MSVC 19.44, Apple Clang 21) see the matrix in `.claude/agents/cpp-expert.md`; the divergences it still records at the floor are Apple libc++'s missing `std::chrono::clock_cast` and MSVC's unverified P2718R0 (range-for temporary lifetime extension) support.
 
 | Feature | GCC 13 | Clang 18 | Clang 19 | MSVC 19.38+ | Apple Clang 15 | Apple Clang 16 |
 |---------|--------|----------|----------|-------------|----------------|----------------|

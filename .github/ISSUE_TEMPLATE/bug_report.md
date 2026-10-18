@@ -25,6 +25,6 @@ labels: bug
 ## Environment
 
 - **OS**: <!-- e.g., Ubuntu 24.04, Windows 11, macOS 14 -->
-- **Compiler**: <!-- e.g., GCC 13, Clang 17, MSVC 19.38 -->
+- **Compiler**: <!-- e.g., GCC 15.2, Clang 21.1, MSVC 19.44, Apple Clang 21 (`<compiler> --version`). Older compilers are unsupported; see docs/build-guide.md "Compiler floor". -->
 - **Build type**: <!-- Debug or Release -->
 - **Commit/version**: <!-- git rev-parse HEAD -->

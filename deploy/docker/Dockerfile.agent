@@ -3,27 +3,28 @@
 # Run:    docker run --network host yuzu-agent --server localhost:50051 --no-tls
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────
-FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS builder
+FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03 AS builder
 
 # TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
 # arm64; default keeps the historical x64 build path.
 ARG TRIPLET=x64-linux
 ARG YUZU_BUILD_JOBS=
 
-# Base: debian:trixie-slim (Debian 13). gcc-13 13.3.0 ships in main; CDN
-# (deb.debian.org) is reliably reachable when Canonical's archive.ubuntu.com /
-# ports.ubuntu.com are blocked at the build host's network egress.
+# Base: ubuntu:26.04 (Resolute) — the same OS and GCC 15 toolchain as the Big
+# Tam self-hosted Linux CI pool (#5929); see Dockerfile.server for why the
+# previous debian:trixie-slim + gcc-13 base was dropped (trixie has no gcc-15).
+# mold is required by meson/native/linux-gcc15.ini (-fuse-ld=mold).
 COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake ninja-build gcc-13 g++-13 pkg-config make linux-libc-dev \
+    cmake ninja-build gcc-15 g++-15 mold pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
     bison flex libsystemd-dev libblkid-dev \
     autoconf automake libtool \
     python3-pip python3-venv python3-yaml \
-    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
-    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
-    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-13 100 \
-    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 100 \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 100 \
+    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-15 100 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-15 100 \
     && pip3 install --break-system-packages --require-hashes -r /tmp/requirements-meson.txt \
     && rm -rf /var/lib/apt/lists/*
 
@@ -36,17 +37,20 @@ COPY vcpkg.json vcpkg-configuration.json ./
 RUN /opt/vcpkg/vcpkg install --triplet ${TRIPLET} --x-manifest-root=.
 
 COPY . .
-# LTO is intentionally OFF for the agent: linking the executable across the
-# DSO boundary (libyuzu_agent_core.so) plus the static yuzu_proto archive
-# triggers Debian binutils 2.43+ undefined-reference errors on protobuf
-# type ctors/dtors. The same gcc-13 + binutils on Ubuntu noble swallowed
-# the mismatch silently; trixie's binutils is stricter about LTO contract
-# at DSO/static-archive boundaries. Server build keeps LTO because its
-# yuzu_proto archive is private to its TU set with no DSO crossing. The
-# proper fix is to propagate -flto into yuzu_proto's archive build, which
-# is a meson refactor out of scope for this PR.
+# LTO is intentionally OFF for the agent (no -Db_lto=true below). History:
+# with gcc-13 on debian:trixie, linking the executable across the DSO
+# boundary (libyuzu_agent_core.so) plus the static yuzu_proto archive under
+# LTO hit Debian binutils 2.43+ undefined-reference errors on protobuf type
+# ctors/dtors; the same gcc-13 + binutils on Ubuntu noble had swallowed the
+# mismatch silently. The image now builds with gcc-15 on Ubuntu 26.04 and
+# links with mold (meson/native/linux-gcc15.ini). ci.yml's gcc-15 release leg
+# already links the whole tree, agent included, with -Db_lto=true on that same
+# toolchain, which suggests the failure no longer reproduces there — but the
+# image build has not been switched to LTO or tested with it, so it stays off
+# here (Dockerfile.server does not enable LTO either). The proper fix for the
+# original failure is to propagate -flto into yuzu_proto's archive build.
 RUN meson setup builddir \
-    --native-file meson/native/linux-gcc13.ini \
+    --native-file meson/native/linux-gcc15.ini \
     --buildtype=release \
     -Dcmake_prefix_path=/src/vcpkg_installed/${TRIPLET} \
     -Dpkg_config_path=/src/vcpkg_installed/${TRIPLET}/lib/pkgconfig \
@@ -55,10 +59,22 @@ RUN meson setup builddir \
     && meson compile -C builddir ${YUZU_BUILD_JOBS:+-j "${YUZU_BUILD_JOBS}"}
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────
-FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+# Same OS release as the builder (ubuntu:26.04, same digest): the agent, its
+# core DSO and every plugin link libstdc++/libgcc_s/libc dynamically. Measured
+# on the arm64 build at #5929 they need only GLIBC_2.38, GLIBCXX_3.4.32 and
+# CXXABI_1.3.15 (yuzu-server, built the same way, already needs GCC 15's
+# GLIBCXX_3.4.34), but nothing stops the next change from pulling in a GCC 15
+# symbol, so the runtime pairs with the builder's release rather than relying
+# on that. Static libstdc++ is not an option here — the executable, the core
+# DSO and each plugin DSO would each get a private copy (#5929).
+# libssl3t64 is the 26.04 (64-bit time_t) name of trixie's libssl3.
+# `useradd -r yuzu-agent` still allocates uid/gid 999 on ubuntu:26.04, as on
+# debian:trixie-slim (checked 2026-10-16), so an agent data volume written by
+# a pre-#5929 image stays owned by the runtime user after an upgrade.
+FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 libsqlite3-0 libsystemd0 libblkid1 ca-certificates bash \
+    libssl3t64 libsqlite3-0 libsystemd0 libblkid1 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu-agent \
     # Cert group (PKI #1289): FIXED gid 2000, identical across server/gateway/

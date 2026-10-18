@@ -20,9 +20,10 @@
 #
 # The container is command-only: no image is built or tagged, no Yuzu build
 # runs inside it, and the repo is bind-mounted READ-ONLY. It installs g++ +
-# libsystemd-dev (matching deploy/docker/Dockerfile.agent's debian:trixie-slim
-# base) fresh each run — this script is a local dev check, not CI, so the
-# apt cost is traded for zero image-maintenance burden.
+# libsystemd-dev (matching deploy/docker/Dockerfile.agent's ubuntu:26.04 base,
+# whose default g++ is GCC 15 — the supported compiler floor, #5929) fresh
+# each run — this script is a local dev check, not CI, so the apt cost is
+# traded for zero image-maintenance burden.
 #
 # Usage:  bash scripts/dev/check-linux-tu-syntax.sh [extra TU paths...]
 # Install: Docker Desktop — https://docs.docker.com/desktop/setup/install/mac-install/
@@ -43,7 +44,7 @@ fi
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root" || exit 1
 
-image="debian:trixie-slim"
+image="ubuntu:26.04"
 
 # Linux-only TUs worth checking. Extend as new ones land.
 tus=(
@@ -61,7 +62,7 @@ tus=(
 # never failing the whole check, when it is not.
 test_tu="tests/unit/test_firewall_parsers.cpp"
 
-# The container script below runs entirely inside the debian:trixie-slim
+# The container script below runs entirely inside the ubuntu:26.04
 # container against the read-only bind-mounted repo at /repo. It prints
 # "ok"/"FAIL" lines per TU (mirroring the Windows sibling's format) and exits
 # non-zero if any TU failed to compile.

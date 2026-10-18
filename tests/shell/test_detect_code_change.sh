@@ -262,9 +262,9 @@ if [ -f "$workflow" ]; then
   # the 10 GB quota). The bucket value comes from the runner clock via
   # CCACHE_BUCKET, unreachable by any restore step by construction.
   expect_caller false "canary ccache key does not hash sources at all" \
-    "key: ccache-canary-x64-linux-.*hashFiles"
+    "key: ccache-canary-gcc15-x64-linux-.*hashFiles"
   expect_caller true  "canary ccache key is the time bucket" \
-    'key: ccache-canary-x64-linux-\$\{\{ env\.CCACHE_BUCKET \}\}'
+    'key: ccache-canary-gcc15-x64-linux-\$\{\{ env\.CCACHE_BUCKET \}\}'
   # CCACHE_BUCKET and CCACHE_PREV_BUCKET must come from ONE runner-clock
   # read: two independent `date` calls can straddle the 259200s boundary
   # (self-healing next run, but pointless to risk when one read serves
@@ -284,7 +284,7 @@ if [ -f "$workflow" ]; then
     'CCACHE_PREV_BUCKET=\$\(\( now / 259200 - 1 \)\)'
   # A pair of assertions checking only "the right value appears somewhere"
   # and "a bare prefix isn't the first line" both pass even if a bare
-  # `ccache-canary-x64-linux-` fallback is ADDED as a trailing second
+  # `ccache-canary-gcc15-x64-linux-` fallback is ADDED as a trailing second
   # restore-keys line — the exact hazard this test exists to catch,
   # reintroduced further down instead of in place. Anchor the WHOLE
   # restore-keys block instead: nothing may appear between the correct
@@ -293,7 +293,7 @@ if [ -f "$workflow" ]; then
   # line is the single most likely harmless edit here, and this test
   # exists to catch a real regression, not to red on a comment.
   expect_caller true  "canary ccache restore-key fallback is the previous bucket and nothing else" \
-    'restore-keys: \| *ccache-canary-x64-linux-\$\{\{ env\.CCACHE_PREV_BUCKET \}\}( #[^-]*)? *- name'
+    'restore-keys: \| *ccache-canary-gcc15-x64-linux-\$\{\{ env\.CCACHE_PREV_BUCKET \}\}( #[^-]*)? *- name'
   # #3269: a cancelled run must not write a thin ccache entry that later
   # same-source runs exact-hit and then decline to replace.
   expect_caller true  "canary ccache save is gated on the Build step outcome" \

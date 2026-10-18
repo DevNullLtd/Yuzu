@@ -121,10 +121,12 @@ The runtime slice set per image:
 The runtime image is 100% Ubuntu 26.04 chisel slices. The *builder* stage is
 throwaway scaffolding:
 
-- server / agent build on `debian:trixie-slim` (proven, fast with the existing
-  vcpkg/ccache cache mounts; Canonical apt mirrors have historically been flaky
-  from CI). Build-on-older-glibc / run-on-newer-glibc is the safe direction.
-  Pass `--build-arg BUILDER_IMAGE=ubuntu:26.04` to compile on Ubuntu itself.
+- server / agent build on `ubuntu:26.04` with gcc-15, the Big Tam CI toolchain
+  and the supported compiler floor (#5929); builder and runtime are the same
+  release, so the chiselled `libstdc++6`/`libc6` slices match what the binaries
+  were linked against. (They built on `debian:trixie-slim` with gcc-13 until
+  #5929; trixie has no gcc-15.) A `--build-arg BUILDER_IMAGE=...` override must
+  provide gcc-15 + mold and must not be newer than the 26.04 runtime.
 - gateway builds on `erlang:28` (debian/**glibc**, NOT `erlang:28-alpine`) — the
   bundled ERTS + crypto NIF must link the same libc family as the chiselled
   Ubuntu runtime.
