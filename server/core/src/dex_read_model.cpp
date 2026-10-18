@@ -246,22 +246,42 @@ json figures_json(const DexStabilityFigures& f) {
             {"score", std::move(score)}};
 }
 
+// The policy block. Poor's lower edge is fixed at 0 by the score and is shown
+// as 0.0 for completeness; it is not a stored field. This `tiers` shape
+// (tiers.<tier>.{edge,name}) is a read-model projection, not the stored document
+// shape (tiers.edges.*, tiers.names.*): the global tiers only, with no weights and
+// no per-application override values.
+json policy_json(const DexPolicyInForce& p) {
+    const auto& t = p.policy.tiers;
+    json tiers{{"excellent", {{"edge", t.edges.excellent}, {"name", t.names[0]}}},
+               {"good", {{"edge", t.edges.good}, {"name", t.names[1]}}},
+               {"fair", {{"edge", t.edges.fair}, {"name", t.names[2]}}},
+               {"poor", {{"edge", 0.0}, {"name", t.names[3]}}}};
+    return {{"source", p.source},
+            {"revision", p.revision},
+            {"fault", p.fault.empty() ? json(nullptr) : json(p.fault)},
+            {"tiers", std::move(tiers)}};
+}
+
 } // namespace
 
 DexAppsModel dex_apps_model_from_rows(const std::string& window,
                                       const std::vector<DexAppStabilityRow>& rows,
-                                      std::optional<int64_t> population, const DexScorePolicy& policy) {
+                                      std::optional<int64_t> population,
+                                      const DexPolicyInForce& policy) {
     DexAppsModel m;
     m.window = window;
     m.population = population;
+    m.policy = policy;
     std::map<std::string, std::size_t> index; // subject -> position in m.apps
     // Totals first, so a version row seen before its total still finds its app.
     for (const auto& r : rows) {
         if (r.version)
             continue;
-        const DexEffectivePolicy eff = resolve_dex_score_policy(policy, r.subject);
+        const DexEffectivePolicy eff = resolve_dex_score_policy(policy.policy, r.subject);
         DexAppStability a;
         a.subject = r.subject;
+        a.profile = eff.profile;
         a.figures = apps_figures(r, population, eff);
         a.version_count = r.version_count;
         m.apps_total = std::max(m.apps_total, r.apps_total);
@@ -275,7 +295,7 @@ DexAppsModel dex_apps_model_from_rows(const std::string& window,
         const auto it = index.find(r.subject);
         if (it == index.end())
             continue;
-        const DexEffectivePolicy eff = resolve_dex_score_policy(policy, r.subject);
+        const DexEffectivePolicy eff = resolve_dex_score_policy(policy.policy, r.subject);
         DexAppVersionStability v;
         v.version = *r.version;
         v.figures = apps_figures(r, population, eff);
@@ -302,14 +322,17 @@ DexAppsModel dex_apps_model_from_rows(const std::string& window,
 DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string& window,
                                   const std::string& since,
                                   const std::optional<std::vector<std::string>>& online_windows,
-                                  const DexScorePolicy& policy) {
+                                  const DexPolicyInForce& policy) {
     DexAppsModel m;
     m.window = window;
     // A score under an invalid policy is never published: the resolver requires
-    // a policy that passed dex_score_policy_fault.
-    if (const auto f = dex_score_policy_fault(policy)) {
+    // a policy that passed dex_score_policy_fault. The provider already serves
+    // the shipped defaults for a refused stored document, so this is the
+    // defence in depth for a caller that hands over an unvalidated policy.
+    if (const auto f = dex_score_policy_fault(policy.policy)) {
         spdlog::warn("build_dex_apps_model: score policy rejected: {}", dex_policy_fault_label(f->fault));
         m.degraded = true;
+        m.degraded_reason = "score_policy_invalid";
         return m;
     }
     if (!store) {
@@ -345,6 +368,7 @@ std::string dex_apps_json(const DexAppsModel& model) {
             versions.push_back(std::move(vo));
         }
         o["subject"] = a.subject;
+        o["profile"] = dex_policy_profile_label(a.profile);
         o["versions"] = std::move(versions);
         o["version_count"] = a.version_count;
         o["versions_truncated"] = a.versions_truncated;
@@ -356,6 +380,7 @@ std::string dex_apps_json(const DexAppsModel& model) {
     out["apps_truncated"] = model.apps_truncated;
     out["population"] = model.population ? json(*model.population) : json(nullptr);
     out["population_basis"] = kDexAppsPopulationBasis;
+    out["policy"] = policy_json(model.policy);
     return out.dump();
 }
 
