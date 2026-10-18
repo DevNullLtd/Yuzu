@@ -20660,7 +20660,7 @@ private:
                 if (!generation_opt) {
                     spdlog::warn("Guardian push: policy-generation read degraded — aborting "
                                  "push (scope={})",
-                                 scope);
+                                 ::yuzu::log_key_token(scope));
                     return -2; // store degraded → 503, never a wrong-generation fan-out
                 }
                 const std::uint64_t generation = *generation_opt;
@@ -20673,7 +20673,8 @@ private:
                 if (!rules_result) {
                     spdlog::warn("Guardian push: list_rules degraded ({}) — aborting push "
                                  "(scope={})",
-                                 rules_result.error(), scope);
+                                 ::yuzu::log_key_token(rules_result.error()),
+                                 ::yuzu::log_key_token(scope));
                     return -2;
                 }
                 // Baseline gate: push only Guards that are members of a *deployed*
@@ -20687,7 +20688,8 @@ private:
                 if (!deployed_result) {
                     spdlog::warn("Guardian push: deployed_member_rule_ids degraded ({}) — "
                                  "aborting push (scope={})",
-                                 deployed_result.error(), scope);
+                                 ::yuzu::log_key_token(deployed_result.error()),
+                                 ::yuzu::log_key_token(scope));
                     return -2;
                 }
                 const auto rules =
