@@ -171,7 +171,7 @@ TEST_CASE("actions glue: copy and limits match the matrix", "[access-tokens][js]
     // Overlap choices that fit the old token's remaining life; the default is the longest up to 7 days.
     CHECK_THAT(js(), ContainsSubstring("d === 1 || d * DAY + OVERLAP_MARGIN <= leftSecs"));
     CHECK_THAT(js(), ContainsSubstring("filter(function (d) { return d <= 7; }).pop()"));
-    CHECK_THAT(js(), ContainsSubstring("Number(d.expiresAt) - serverNow()"));
+    CHECK_THAT(js(), ContainsSubstring("e - serverNow()"));
     CHECK_THAT(js(), ContainsSubstring("wholeNumber(v.days, 1, 90)"));
     // The recovery sentence names the 2-minute window and the way out after it.
     CHECK_THAT(js(), ContainsSubstring("Rotate again within 2 minutes to get the same secret."));
