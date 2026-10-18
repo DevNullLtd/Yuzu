@@ -143,14 +143,17 @@ changes is which checks run.
   binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
   database produces a ticket the new binaries treat as not yet live (a recall over MCP answers
   `approval expired (past its 7-day lifetime)`, although the ticket is in fact ahead of the clock), and a replica
-  running behind shortens the ticket's life by the same amount. Correcting the clock does not bring such a ticket
-  back: the next approval submission on any replica that is accepted moves it to `expired` for good, with only an
-  info log line as a trace, so request approval again. (A submission refused because the pending queue is full
+  running behind shortens the ticket's life by the same amount. Once the next accepted approval submission on any
+  replica has run, such a ticket is `expired` for good, with only an info log line as a trace, and correcting the
+  clock does not bring it back, so request approval again. Until that submission has run nothing has been
+  written, so correcting the clock first makes the ticket live again: if the query in `docs/clock-guarded-retention.md` finds
+  held-back tickets, fix the clock before anyone submits an approval request. (A submission refused because the pending queue is full
   rolls its sweeps back, so the ticket stays `approved` and unusable until a later submission is accepted.) A
   query that lists approved tickets ahead of the database clock (until that sweep runs) is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness". The same applies to a
   database host whose own clock is stepped backwards by more than 5 minutes: an approved, unused ticket whose review
   time is more than 5 minutes ahead of the new database time (roughly, one reviewed within the last
-  (step size minus 5 minutes) before the step) is expired permanently, and older approved tickets stay live
+  (step size minus 5 minutes) before the step) is expired permanently once an accepted submission has swept it
+  (until then correcting the clock restores it), and older approved tickets stay live
   (observability tracked in #6098).
 - Submission time (`submitted_at`) and the schedule's own run stamps still come from the clock of the server that
   wrote them, not from the database. Keep every server NTP-synchronised. When the server that submitted an approval

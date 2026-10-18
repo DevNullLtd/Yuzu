@@ -652,8 +652,11 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
   - A **backward** step of more than 300 s makes an approved, unconsumed ticket read as ahead of the
     database clock when its `reviewed_at` is more than 300 s ahead of the NEW database time (roughly,
     the tickets reviewed within the last (step size minus 300 s) before the step; older approved
-    tickets stay live), and the approved sweep expires those, **permanently**. No code path un-expires a ticket, and correcting the clock afterwards
-    does not restore them. The pending sweep is the one a backward step blunts: its cutoff moves into
+    tickets stay live), and the approved sweep expires those, **permanently** once it has run. No code path un-expires a ticket, so
+    correcting the clock after an accepted `submit()` has swept them does not restore them. Before that
+    first accepted `submit()`, nothing has been written: the upper bound is a pure predicate, so a held-back
+    ticket is live again once the database clock catches up, and correcting the clock before any approval is
+    submitted preserves it (hold submissions until the clock is right if the query below returns rows). The pending sweep is the one a backward step blunts: its cutoff moves into
     the past, so it matches fewer rows.
   - Either way the requester must ask again. The only trace of the approved sweep is an info log line
     ("expired N approved-but-unconsumed approval tickets"); there is no metric or audit row, the consume
