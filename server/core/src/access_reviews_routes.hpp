@@ -6,7 +6,8 @@
 /// the existing REST v1 routes, never a dashboard-only route.
 ///
 /// Routes (all GET):
-///   /fragments/access/reviews/campaigns      campaign list; loud AccessReview:Read
+///   /fragments/access/reviews/campaigns      campaign list; AccessReview:Read through the quiet probe
+///                                            (the list loads itself on every page view)
 ///   /fragments/access/reviews/campaign       one campaign + summary card (?id=); loud AccessReview:Read
 ///   /fragments/access/reviews/grants         live grant population; loud AccessReview:Read
 ///

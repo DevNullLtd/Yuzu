@@ -4,8 +4,9 @@
  *        TestRouteSink. Every closure is injected; nothing reads a store or a clock.
  *
  * Pinned, in order of consequence:
- *   - the loud gate runs BEFORE any read, on exactly AccessReview:Read; the control hint is a
- *     SEPARATE probe on AccessReview:Attest and is never mistaken for the gate;
+ *   - the gate (loud, or the quiet probe for the self-loading campaign list) runs BEFORE any
+ *     read, on exactly AccessReview:Read; the control hint is a SEPARATE probe on
+ *     AccessReview:Attest and is never mistaken for the gate;
  *   - an engine-class session is refused like the REST twins refuse it (403, A4 body with a
  *     correlation id, a denied row with detail `engine_session_denied`) on EVERY fragment;
  *   - each success writes exactly the twin's audit tuple, a malformed id writes none and reads
