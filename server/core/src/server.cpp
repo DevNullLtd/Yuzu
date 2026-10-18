@@ -19636,6 +19636,9 @@ private:
         // #2537: same ordering rule as DashboardRoutes above — register_routes
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        ca_routes_->set_read_probe([this](const httplib::Request& req) {
+            return auth_routes_->has_permission(req, "Security", "Read");
+        });
         ca_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
             [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); },

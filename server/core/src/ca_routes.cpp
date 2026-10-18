@@ -1052,6 +1052,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
              [perm_fn, ca_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Security", "Read"))
                      return;
+                 res.set_header("Cache-Control", "no-store");
                  res.set_content(render_ca(ca_store, wants_pki_view(req)),
                                  "text/html; charset=utf-8");
              });
@@ -1065,7 +1066,8 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // never touch the owner, so copying the (small, boot-immutable) list keeps it
     // that way and raises no question about CaRoutes outliving the sink.
     const auto csrf_trusted = csrf_trusted_origins_;
-    sink.Post("/api/settings/ca/revoke", [perm_fn, audit_fn, ca_store, revoke_core, csrf_trusted](
+    const auto read_probe = read_probe_;
+    sink.Post("/api/settings/ca/revoke", [perm_fn, audit_fn, ca_store, revoke_core, csrf_trusted, read_probe](
                                              const httplib::Request& req, httplib::Response& res) {
         // H-1 (#1241): this revoke is authorized by the yuzu_session COOKIE alone
         // (a forged revoke = fleet-wide lockout DoS), so it carries a CSRF gate.
@@ -1112,11 +1114,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         // than swapping a bare <span> into #ca-section (which blanked the whole
         // panel until reload — #1241 happy/UP-6).
         const bool pki_view = wants_pki_view(req);
+        // The panel lists every issued serial and subject, so it goes only to a caller who may read
+        // it. Quiet probe (no response, no denial row); an unwired probe means cannot read.
+        const bool can_read = read_probe && read_probe(req);
+        res.set_header("Cache-Control", "no-store");
         auto error_panel = [&](int status, const std::string& msg) {
             res.status = status;
             set_error_toast(res, msg);
             res.set_content("<div class=\"alert alert-error\" style=\"margin-bottom:0.75rem\">" +
-                                html_escape(msg) + "</div>" + render_ca(ca_store, pki_view),
+                                html_escape(msg) + "</div>" + (can_read ? render_ca(ca_store, pki_view) : std::string{}),
                             "text/html; charset=utf-8");
         };
         if (!ca_store || !ca_store->is_open()) {
@@ -1147,7 +1153,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         }
         if (!rv.audit_ok)
             res.set_header("Sec-Audit-Failed", "true");
-        res.set_content(render_ca(ca_store, pki_view), "text/html; charset=utf-8");
+        res.set_content((can_read ? render_ca(ca_store, pki_view) : std::string{}), "text/html; charset=utf-8");
     });
 
     // ── POST /api/settings/ca/import-chain ── dashboard subordinate import (PR6).
@@ -1158,7 +1164,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // the new Trust mode badge shows. The submitted PEMs are NEVER echoed back
     // into the fragment, so this wrapper adds no HTML-injection surface.
     sink.Post("/api/settings/ca/import-chain",
-              [perm_fn, audit_fn, ca_store, import_chain_fn, publish_crl_fn, csrf_trusted](
+              [perm_fn, audit_fn, ca_store, import_chain_fn, publish_crl_fn, csrf_trusted, read_probe](
                   const httplib::Request& req, httplib::Response& res) {
                   const std::string origin = req.get_header_value("Origin");
                   const std::string referer = req.get_header_value("Referer");
@@ -1181,12 +1187,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                       return;
                   }
                   const bool pki_view = wants_pki_view(req);
+                  // Panel only for a caller who may read it; unwired probe means cannot read.
+                  const bool can_read = read_probe && read_probe(req);
+                  res.set_header("Cache-Control", "no-store");
                   auto error_panel = [&](int status, const std::string& msg) {
                       res.status = status;
                       set_error_toast(res, msg);
                       res.set_content(
                           "<div class=\"alert alert-error\" style=\"margin-bottom:0.75rem\">" +
-                              html_escape(msg) + "</div>" + render_ca(ca_store, pki_view),
+                              html_escape(msg) + "</div>" + (can_read ? render_ca(ca_store, pki_view) : std::string{}),
                           "text/html; charset=utf-8");
                   };
                   if (!ca_store || !ca_store->is_open() || !import_chain_fn) {
@@ -1281,7 +1290,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                       body += "<div class=\"alert alert-warning\" style=\"margin-bottom:0.75rem\">"
                               "Subordinated, but the CRL could not be republished — external CRL "
                               "consumers will not see the new issuer until the next publish.</div>";
-                  body += render_ca(ca_store, pki_view);
+                  body += (can_read ? render_ca(ca_store, pki_view) : std::string{});
                   res.set_content(body, "text/html; charset=utf-8");
               });
 }

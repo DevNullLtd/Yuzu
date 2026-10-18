@@ -231,8 +231,17 @@ public:
         csrf_trusted_origins_ = std::move(origins);
     }
 
+    /// Whether the caller holds `Security:Read`, decided without writing a response or a denial
+    /// row (`AuthRoutes::has_permission`). The dashboard revoke / import wrappers use it to
+    /// decide whether to append the CA panel to their reply: they are gated on Delete / Write,
+    /// which do not imply Read. Set BEFORE `register_routes`. Leaving it unset fails closed
+    /// (the wrappers return only their banner text).
+    using ReadProbeFn = std::function<bool(const httplib::Request&)>;
+    void set_read_probe(ReadProbeFn probe) { read_probe_ = std::move(probe); }
+
 private:
     std::vector<std::string> csrf_trusted_origins_;
+    ReadProbeFn read_probe_;
 };
 
 } // namespace yuzu::server

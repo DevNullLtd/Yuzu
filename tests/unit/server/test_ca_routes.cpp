@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <set>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -65,6 +66,11 @@ struct Harness {
     test::TestRouteSink sink;
     std::vector<AuditRow> audits;
     bool perm_allow{true};
+    // Operation-aware denial: an operation named here ("Read", "Delete", "Write") is refused
+    // while the others pass, so a role that holds Delete or Write without Read can be modelled.
+    std::set<std::string> deny_ops;
+    // false leaves the CaRoutes read probe unset (the wrappers must then fail closed).
+    bool probe_wired{true};
     bool crl_succeeds{true};   // when false, publish_crl_fn returns nullopt (GAP-2)
     bool audit_succeeds{true}; // when false, AuditFn returns false (#1240 Sec-Audit-Failed)
     int crl_calls{0};
@@ -121,7 +127,7 @@ struct Harness {
                                        const std::string& type, const std::string& op) {
             last_perm_type = type;
             last_perm_op = op;
-            if (!perm_allow) {
+            if (!perm_allow || deny_ops.count(op) != 0) {
                 res.status = 403;
                 res.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
                 return false;
@@ -159,6 +165,10 @@ struct Harness {
             last_issue_issued_by = issued_by;
             return issue_result;
         };
+        if (probe_wired)
+            routes.set_read_probe([this](const httplib::Request&) {
+                return perm_allow && deny_ops.count("Read") == 0;
+            });
         routes.register_routes(sink, auth, perm, audit, null_store ? nullptr : store.get(), crl,
                                export_csr, import_chain, issue_code_signing);
     }
@@ -1635,4 +1645,134 @@ TEST_CASE("ca_routes: a pre-count CRL row reports a null revoked count, not 0",
     REQUIRE(page);
     CHECK(page->body.find("Not recorded") != std::string::npos);
     CHECK(page->body.find("Not confirmed current") != std::string::npos);
+}
+
+// ── Wrapper replies carry the CA panel only for a caller who may read it ────────────────────
+
+namespace {
+
+// Strings that only the rendered panel can contain: the seeded cert's serial and subject, the
+// panel's own table, and the CRL figures block.
+void check_no_inventory(const std::string& body) {
+    CHECK(body.find("agent-DEAD") == std::string::npos);
+    CHECK(body.find("DEAD</") == std::string::npos);
+    CHECK(body.find("<table") == std::string::npos);
+    CHECK(body.find("Revocation") == std::string::npos);
+    CHECK(body.find("Fingerprint") == std::string::npos);
+}
+
+const std::unordered_map<std::string, std::string> kSameOrigin = {{"Host", "yuzu.example"},
+                                                                  {"Origin", "https://yuzu.example"}};
+
+} // namespace
+
+TEST_CASE("ca_routes: revoke wrapper without Security:Read returns only the banner",
+          "[ca_routes][pki][security][pg]") {
+    for (const char* view : {"", "&view=pki"}) {
+        Harness h;
+        REQUIRE(h.store->set_root(sample_root()));
+        REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+        h.deny_ops = {"Read"};
+        h.wire();
+        const std::string v = view;
+
+        // Error path: invalid serial -> 400, toast kept, banner only.
+        auto bad = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=zz" + v, "",
+                                   "application/x-www-form-urlencoded", kSameOrigin);
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+        CHECK(bad->body.find("Invalid certificate serial.") != std::string::npos);
+        CHECK_FALSE(bad->get_header_value("HX-Trigger").empty());
+        check_no_inventory(bad->body);
+
+        // Success path: still revokes (Delete is held), reply is not the panel.
+        auto ok = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=DEAD" + v, "",
+                                  "application/x-www-form-urlencoded", kSameOrigin);
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(h.store->is_revoked("DEAD"));
+        check_no_inventory(ok->body);
+    }
+}
+
+TEST_CASE("ca_routes: import wrapper without Security:Read returns only the banner",
+          "[ca_routes][pki][subordinate][security][pg]") {
+    for (const char* view : {"", "&view=pki"}) {
+        Harness h;
+        REQUIRE(h.store->set_root(sample_root()));
+        REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+        h.deny_ops = {"Read"};
+        h.wire();
+        const std::string v = view;
+
+        auto none = h.sink.dispatch("POST", "/api/settings/ca/import-chain?x=1" + v, "",
+                                    "application/x-www-form-urlencoded", kSameOrigin);
+        REQUIRE(none);
+        CHECK(none->status == 400);
+        CHECK(none->body.find("required") != std::string::npos);
+        CHECK_FALSE(none->get_header_value("HX-Trigger").empty());
+        check_no_inventory(none->body);
+
+        h.import_outcome = CaRoutes::ImportOutcome::Ok;
+        auto ok = h.sink.dispatch(
+            "POST", "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR" + v, "",
+            "application/x-www-form-urlencoded", kSameOrigin);
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(h.import_calls == 1);
+        check_no_inventory(ok->body);
+    }
+}
+
+TEST_CASE("ca_routes: wrappers with a Read-holding caller still return the panel; no-store set",
+          "[ca_routes][pki][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.wire();
+    auto bad = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=zz&view=pki", "",
+                               "application/x-www-form-urlencoded", kSameOrigin);
+    REQUIRE(bad);
+    CHECK(bad->body.find("agent-DEAD") != std::string::npos);
+    CHECK(bad->get_header_value("Cache-Control") == "no-store");
+    h.import_outcome = CaRoutes::ImportOutcome::Ok;
+    auto imp = h.sink.dispatch(
+        "POST", "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR&view=pki", "",
+        "application/x-www-form-urlencoded", kSameOrigin);
+    REQUIRE(imp);
+    CHECK(imp->body.find("agent-DEAD") != std::string::npos);
+    CHECK(imp->get_header_value("Cache-Control") == "no-store");
+}
+
+TEST_CASE("ca_routes: wrappers fail closed when no read probe is wired",
+          "[ca_routes][pki][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.probe_wired = false;
+    h.wire();
+    auto bad = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=zz", "",
+                               "application/x-www-form-urlencoded", kSameOrigin);
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    check_no_inventory(bad->body);
+}
+
+TEST_CASE("ca_routes: the CA fragment is no-store, and refuses a caller without Security:Read",
+          "[ca_routes][pki][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.wire();
+    for (const char* path : {"/fragments/settings/ca", "/fragments/settings/ca?view=pki"}) {
+        auto frag = h.sink.Get(path);
+        REQUIRE(frag);
+        CHECK(frag->status == 200);
+        CHECK(frag->get_header_value("Cache-Control") == "no-store");
+    }
+    h.deny_ops = {"Read"};
+    auto denied = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+    check_no_inventory(denied->body);
 }
