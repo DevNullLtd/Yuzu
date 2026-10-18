@@ -323,6 +323,15 @@ enum class ConsumeFailure {
 /// the two can never disagree about when a ticket dies.
 inline constexpr std::int64_t kApprovalTicketTtlSeconds = 7 * 24 * 3600;
 
+/// How far into the FUTURE (database time) an approved ticket's `reviewed_at` may sit and
+/// still count as live. `reviewed_at` is stamped by the database now, so a healthy row is
+/// never ahead of `now()`; the slack only absorbs a row written by another path and the
+/// boundary of a statement racing the clock. A ticket beyond it is NOT live (consume refuses
+/// it, ScheduleRunner will not fire it, the sweep expires it): the lifetime check is a
+/// lower bound on `reviewed_at`, and without this upper bound a far-future value satisfies
+/// it for as long as the skew lasts (#6061, governance UP-3). 5 minutes.
+inline constexpr std::int64_t kApprovalReviewedAtSlackSeconds = 300;
+
 /// Longest reviewer comment `approve`/`reject` accept, in bytes. The guard lives in
 /// set_review_status, where REST and MCP meet. The dialogs cap input at 1000 UTF-16
 /// units, at most 4000 UTF-8 bytes, so the two limits never disagree.
@@ -542,6 +551,15 @@ public:
     /// kApprovalTicketTtlSeconds of DATABASE time, so an approved ticket past
     /// its lifetime is refused (ConsumeFailure::kExpired) even if no submit()
     /// has swept it yet. The refusal leaves the row untouched.
+
+    /// Is `id` an approved, unconsumed ticket still inside its lifetime, by DATABASE time?
+    /// This is the one liveness predicate (`ticket_live_sql()` in the .cpp): the same text
+    /// gates the consume CAS and submit()'s approved-ticket sweep, so an approved ticket
+    /// that consume would refuse as expired is never fired by ScheduleRunner either
+    /// (#6061, governance SG-2). A store failure is an error, not `false`: the caller
+    /// (the scheduler) holds the occurrence rather than treating an unreadable ticket as
+    /// a dead one. Read-only; consumes nothing.
+    [[nodiscard]] std::expected<bool, std::string> ticket_is_live(const std::string& id) const;
 
     /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
     /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect
