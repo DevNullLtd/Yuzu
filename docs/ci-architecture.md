@@ -464,7 +464,7 @@ suite also runs (the touch-rule one off Windows only, #5428).
 `scripts/ci/check-docs-drift.py` extends the plugin README idea to the rest of the
 product, in two layers. Fact parity (hermetic, in the required `changelog-order` job and
 the `docs` suite) asserts every `/api/vN/` route, MCP tool and server/agent CLI flag is
-named in its owning user-manual doc, reusing `check-api-parity.py`'s extractors. It ratchets
+named in the user manual, reusing `check-api-parity.py`'s extractors. It ratchets
 against the by-name `scripts/ci/docs-drift-baseline.json` with the same only-shrinks rule
 as the definition-description ratchet below. The `doc-coupling-touch-rule` job, in its
 own `doc-coupling.yml` workflow so that editing the PR body re-runs it, applies
@@ -472,7 +472,8 @@ own `doc-coupling.yml` workflow so that editing the PR body re-runs it, applies
 body carries `doc-coupling-exempt: <rule-id> — <reason>`. It is advisory until the
 repository owner adds it to the required checks. A Claude Code `PreToolUse` hook runs both
 layers before `gh pr create`, always using the project tree's own copy of the gate.
-Details, and how to extend the fact categories: `docs/docs-drift-gate.md`.
+Details, the runbook for a `dev` turned red by drift, and how to extend the fact
+categories: `docs/docs-drift-gate.md`.
 
 ### Definition-description ratchet (`definition-descriptions` job + `docs` suite)
 

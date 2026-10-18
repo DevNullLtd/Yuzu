@@ -6,7 +6,7 @@ two layers, both implemented by `scripts/ci/check-docs-drift.py`.
 
 | Layer | What it checks | Failure is | Escape hatch |
 |---|---|---|---|
-| **Fact parity** | Named facts in the code appear in their owning doc | A hard block | None, apart from the by-name baseline of known gaps, which only shrinks |
+| **Fact parity** | Named facts in the code appear in the user manual | A hard block | None, apart from the by-name baseline of known gaps, which only shrinks |
 | **Touch rule** | Coupled code changed → a coupled doc changed | A failing check, advisory in CI until the repository owner adds `Doc-coupling touch rule` to the required checks; the PR hook enforces it for sessions that load the hook | `doc-coupling-exempt: <rule-id> — <reason>` in the PR body |
 
 A third, semantic layer already exists and stays advisory: the `docs-writer`
@@ -21,7 +21,7 @@ replacement for that review.
 | `rest_undocumented` | every `/api/vN/` route registration (not `OPTIONS`) | a heading `` #### `METHOD /api/vN/...` `` in `docs/user-manual/rest-api.md` |
 | `rest_stale` | — | every such heading names a route that still exists |
 | `mcp_undocumented` | every `kTools[]` entry in `mcp_server.cpp` | the backticked tool name in `docs/user-manual/mcp.md` |
-| `flag_undocumented` | every `--flag` named in a CLI11 `add_option`/`add_flag` call in `FLAG_SOURCES`, as a literal or a `k*` string constant defined in a `server/core/src` or `agents/core/src` header | the flag anywhere under `docs/user-manual/` |
+| `flag_undocumented` | every `--flag` named in a CLI11 `add_option`/`add_flag` call in `FLAG_SOURCES`, as a literal or a `k*` string constant defined in a header under `server/core/src` or `agents/core/src` | the flag anywhere under `docs/user-manual/` |
 
 Route and tool extraction is shared with `scripts/ci/check-api-parity.py`, never
 re-implemented, so the two gates can't disagree about the route or tool table.
@@ -50,7 +50,8 @@ today's counts). If that fires, fix the extractor; don't lower the floor.
 
 `--update-baseline` (alias `--write-baseline`) regenerates the file but refuses to
 **add** entries unless passed `--allow-growth`. Growing the baseline needs a reason in the PR description; the
-expected answer to new drift is to write the docs.
+expected answer to new drift is to write the docs, and a growth PR should cite the
+issue that tracks documenting the new entries.
 
 **Known limit: two PRs can each pass and still break `dev` together.** The ratchet
 requires an exact match, so two PRs that each pass against `dev` can, once both merge,
@@ -59,6 +60,30 @@ deletions cleanly, so nothing conflicts. The fix is a one-line follow-up. Requir
 branches to be up to date before merge, or a merge queue, prevents it; both are
 branch-protection settings. The other by-name ratchets (personal data, definition
 descriptions) share this limit.
+
+### When `dev` is red from drift
+
+1. Run `python3 -I scripts/ci/check-docs-drift.py` on `dev` and read the names it
+   prints.
+2. A `stale` entry: run `python3 -I scripts/ci/check-docs-drift.py --update-baseline`.
+   Removing entries needs no `--allow-growth`.
+3. A `rest_stale` heading for a deleted route: delete or correct that heading.
+4. A `new` gap: document it, or add it to the baseline with `--allow-growth` and an
+   issue reference in the PR description.
+5. Open the fix as a small PR of its own.
+
+If the gate itself misbehaves, for example an extraction floor trips after a
+refactor, fix the extractor in the same way and don't lower the floor. There is
+no switch to turn the check off: it runs inside the required job, and disabling it
+means a reviewed change to `docs-lint.yml` like any other.
+
+### Open PRs when this lands
+
+CI checks a pull request's merge with `dev`, not its branch alone, so open PRs get
+the gate on their next run without a rebase. A PR that adds an undocumented route,
+tool or flag goes red until the docs are added. A PR that happens to document a
+baseline gap must also delete that baseline line. The PR hook, by contrast, does
+nothing on a branch that predates the gate until it is rebased.
 
 ## Layer 2: the touch rule
 
@@ -77,6 +102,9 @@ doc-coupling-exempt: devices — internal refactor, no behaviour change
 - **The line must render as plain text.** It may be a bullet. A line inside a fenced
   code block, an HTML comment or raw HTML doesn't count; that includes anything from a
   line opening an HTML block to the next blank line, and a multi-line tag attribute.
+- **The evidence record** of an exemption is the PR body at merge time and the job's
+  log, which lists each exemption the job honoured. Actions logs
+  expire (90 days by default), so the merged PR body is the durable copy.
 - **Editing the body re-runs the check.** The job lives in its own workflow,
   `doc-coupling.yml`, which also triggers on `edited`, so adding an exemption doesn't
   need a new push.
@@ -141,4 +169,4 @@ Known gap in a sibling gate: the plugin README touch rule's bash parser
 (`scripts/ci/check-plugin-readme-touch.sh`) still honours a `docs-unchanged:` line
 inside raw HTML, its job still lives in `docs-lint.yml` without `edited`, and it diffs
 the payload's `base.sha`, which goes stale once `dev` advances. This gate
-closes both for itself; the sibling is tracked separately.
+closes all three for itself; the sibling is tracked separately.

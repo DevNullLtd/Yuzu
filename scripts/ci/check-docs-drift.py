@@ -4,8 +4,8 @@
 Two layers, one script:
 
 1. FACT PARITY (hermetic, default mode). Extracts facts an operator or an
-   agentic worker relies on from the code and asserts the owning user-manual
-   doc names each one:
+   agentic worker relies on from the code and asserts the user manual
+   names each one:
 
      rest_undocumented  every /api/vN/ route registration has a heading
                         `#### \\`METHOD /api/vN/...\\`` in docs/user-manual/rest-api.md
@@ -111,7 +111,7 @@ MIN_EXTRACTED = {"routes": 120, "tools": 90, "flags": 60}
 
 # Where `inline constexpr std::string_view kFooFlag = "--foo";` constants live,
 # for calls written `add_option(std::string{kFooFlag}, ...)`.
-FLAG_CONSTANT_GLOBS = ("server/core/src/*.hpp", "agents/core/src/*.hpp")
+FLAG_CONSTANT_GLOBS = ("server/core/src/**/*.hpp", "agents/core/src/**/*.hpp")
 
 CATEGORIES = ("rest_undocumented", "rest_stale", "mcp_undocumented", "flag_undocumented")
 
@@ -142,9 +142,14 @@ def read_tree_file(root, path):
         fd = os.open(real, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except OSError as e:
         raise ValueError(f"{path} cannot be opened ({e.strerror})") from None
-    with os.fdopen(fd, "rb") as f:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(f"{path} is not a regular file")
+        f = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with f:
         data = f.read(MAX_READ_BYTES + 1)
     if len(data) > MAX_READ_BYTES:
         raise ValueError(f"{path} is larger than {MAX_READ_BYTES} bytes")
@@ -278,10 +283,13 @@ def current_drift(root=ROOT):
     tools = parity.extract_mcp_tools()
     manual = "\n".join(read_tree_file(root, p) for p in sorted((root / USER_MANUAL).glob("*.md")))
     constants = flag_constants(read_tree_file(root, f) for g in FLAG_CONSTANT_GLOBS for f in sorted(root.glob(g)))
-    flags = extract_flags({rel: read_tree_file(root, root / rel) for rel in FLAG_SOURCES}, constants)
+    sources = {rel: read_tree_file(root, root / rel) for rel in FLAG_SOURCES}
+    flags = extract_flags(sources, constants)
     floors = extraction_floor_errors({"routes": len(versioned), "tools": len(tools), "flags": len(flags)})
+    # Per source, not via flags.values(): a flag defined in two sources is
+    # attributed to the first only, which must not trip the second's floor.
     floors += [f"{rel} yields no flags - its add_option/add_flag calls are not extractable"
-               for rel in FLAG_SOURCES if rel not in flags.values()]
+               for rel, text in sources.items() if not extract_flags({rel: text}, constants)]
     if floors:
         raise RuntimeError("; ".join(floors))
     return compute_drift(versioned, doc_routes, tools, read_tree_file(root, root / MCP_DOC),
@@ -582,6 +590,9 @@ def main(argv):
                 print(f"{cat}\t{i}")
         return 0
     if argv[0] in ("--update-baseline", "--write-baseline"):
+        if set(argv[1:]) - {"--allow-growth"}:
+            print(f"check-docs-drift: unknown argument(s) {argv[1:]}", file=sys.stderr)
+            return 2
         return write_baseline(root / BASELINE_REL, current_drift(root), "--allow-growth" in argv[1:])
     if argv[0] == "--touch" and len(argv) in (3, 4):
         return run_touch(argv[1], argv[2], argv[3] if len(argv) == 4 else None, root)

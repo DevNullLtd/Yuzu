@@ -143,7 +143,8 @@ class Extraction(unittest.TestCase):
     def test_real_gateway_peer_flags_are_extracted(self):
         # The UP-4 case: these three are defined through constants.
         consts = d.flag_constants(d.read_tree_file(ROOT, f) for g in d.FLAG_CONSTANT_GLOBS for f in ROOT.glob(g))
-        flags = d.extract_flags({rel: (ROOT / rel).read_text() for rel in d.FLAG_SOURCES}, consts)
+        flags = d.extract_flags({rel: (ROOT / rel).read_text(encoding="utf-8", errors="replace")
+                                 for rel in d.FLAG_SOURCES}, consts)
         for f in ("--gateway-peer-pin", "--gateway-peer-pin-file", "--insecure-gateway-peer"):
             self.assertIn(f, flags)
 
@@ -333,7 +334,7 @@ class SyntheticRepo(unittest.TestCase):
     """--root, --write-baseline and --touch end to end against a real git repo."""
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_")
-        self.repo = Path(self._tmp.name)
+        self.repo = Path(self._tmp.name) / "repo"
         synthetic_tree(self.repo)
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True, env=hermetic_env())
         git(self.repo, "add", "-A")
@@ -370,7 +371,7 @@ class SyntheticRepo(unittest.TestCase):
     def touch(self, head, body=None):
         args = ["--root", str(self.repo), "--touch", self.base, head]
         if body is not None:
-            bf = self.repo.parent / (self.repo.name + "-body.md")
+            bf = self.repo.parent / "touch-body.md"
             bf.write_text(body)
             args.append(str(bf))
         return d.main(args)
@@ -404,8 +405,8 @@ class SyntheticRepo(unittest.TestCase):
         self.assertEqual(d.main(["--root", str(self.repo)]), 1)
 
     def test_tree_git_config_cannot_run_commands(self):
-        marker = self.repo.parent / (self.repo.name + "-FSMONITOR")
-        hook = self.repo / "fsmon.sh"
+        marker = self.repo.parent / "FSMONITOR"
+        hook = self.repo.parent / "fsmon-gate.sh"
         hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
         hook.chmod(0o755)
         git(self.repo, "config", "core.fsmonitor", str(hook))
@@ -418,6 +419,111 @@ class SyntheticRepo(unittest.TestCase):
         d.main(["--root", str(self.repo)])
         d.main(["--root", str(self.repo), "--touch", self.base, "HEAD"])
         self.assertFalse(marker.exists())
+
+    def test_update_baseline_rejects_unknown_arguments(self):
+        baseline = self.repo / d.BASELINE_REL
+        before = baseline.read_bytes()
+        self.assertEqual(d.main(["--root", str(self.repo), "--update-baseline", "--help"]), 2)
+        self.assertEqual(baseline.read_bytes(), before)
+
+    def test_a_flag_shared_by_two_sources_does_not_trip_the_floor(self):
+        src = self.repo / d.FLAG_SOURCES[1]
+        src.write_text(src.read_text() + 'app.add_option("--flag-0", x);\n')  # also in main.cpp
+        write(self.repo, d.FLAG_SOURCES[2], 'app.add_option("--flag-0", x);\n')  # ONLY a duplicate
+        self.assertEqual(d.current_drift(self.repo)["flag_undocumented"], [])
+
+    def outside_copy(self, name, text):
+        """A regular file OUTSIDE the repo (next to it in the same tempdir)."""
+        path = self.repo.parent / name
+        path.write_text(text)
+        return path
+
+    def symlink_or_skip(self, target, link):
+        if not hasattr(os, "symlink"):
+            self.skipTest("no symlinks")
+        link.unlink(missing_ok=True)
+        try:
+            os.symlink(target, link)
+        except OSError:
+            self.skipTest("cannot create symlinks here")
+
+    def test_guard_outside_tree_alone(self):
+        """A symlink to an ordinary, small, regular file outside the tree:
+        only the outside-the-tree check can refuse it."""
+        doc = self.repo / d.REST_DOC
+        target = self.outside_copy("outside-rest-api.md", doc.read_text())
+        self.symlink_or_skip(target, doc)
+        with self.assertRaisesRegex(ValueError, "outside the tree"):
+            d.current_drift(self.repo)
+
+    def test_guard_regular_file_alone(self):
+        """A FIFO inside the tree: only the regular-file check refuses it
+        (and O_NONBLOCK keeps the open from hanging)."""
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs")
+        doc = self.repo / d.REST_DOC
+        doc.unlink()
+        os.mkfifo(doc)
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            d.read_tree_file(self.repo, doc)
+
+    def test_guard_size_cap_alone(self):
+        doc = self.repo / d.REST_DOC
+        old = d.MAX_READ_BYTES
+        d.MAX_READ_BYTES = 8
+        try:
+            write(self.repo, d.REST_DOC, "123456789")  # 9 bytes
+            with self.assertRaisesRegex(ValueError, "larger than 8 bytes"):
+                d.read_tree_file(self.repo, doc)
+            write(self.repo, d.REST_DOC, "12345678")   # control: exactly the cap
+            self.assertEqual(d.read_tree_file(self.repo, doc), "12345678")
+        finally:
+            d.MAX_READ_BYTES = old
+
+    def test_parity_inputs_are_vetted_before_extraction(self):
+        """check-api-parity reads server/core/src/*.cpp itself, unbounded; the
+        gate must vet those files first."""
+        target = self.outside_copy("outside.cpp", 'sink.Get("/api/v1/outside", h);\n')
+        self.symlink_or_skip(target, self.repo / "server/core/src/zz_link.cpp")
+        with self.assertRaisesRegex(ValueError, "outside the tree"):
+            d.current_drift(self.repo)
+
+    def test_symlinked_parent_directory_is_refused(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("no symlinks")
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_") as outside:
+            manual = self.repo / d.USER_MANUAL
+            for f in manual.iterdir():
+                (Path(outside) / f.name).write_bytes(f.read_bytes())
+                f.unlink()
+            manual.rmdir()
+            try:
+                os.symlink(outside, manual)
+            except OSError:
+                self.skipTest("cannot create symlinks here")
+            with self.assertRaisesRegex(ValueError, "outside the tree"):
+                d.current_drift(self.repo)
+
+    def test_a_directory_where_a_file_is_expected_fails_closed_without_leaking(self):
+        doc = self.repo / d.REST_DOC
+        doc.unlink()
+        doc.mkdir()
+        with self.assertRaisesRegex(ValueError, "not a regular file|cannot be opened"):
+            d.read_tree_file(self.repo, doc)
+
+    def test_newer_schema_keys_are_ignored_by_an_older_gate(self):
+        """The hook runs the PROJECT's gate on a possibly newer tree: unknown
+        manifest/baseline keys must be ignored, not crash or flip the result."""
+        man = self.repo / d.MANIFEST_REL
+        data = json.loads(man.read_text())
+        data["schema_version"] = 99
+        data["rules"][0]["future_field"] = ["x"]
+        man.write_text(json.dumps(data))
+        base = self.repo / d.BASELINE_REL
+        b = json.loads(base.read_text())
+        b["some_future_category"] = ["anything"]
+        base.write_text(json.dumps(b))
+        self.assertEqual(d.main(["--root", str(self.repo)]), 0)
 
     def test_touch_fails_closed(self):
         self.assertEqual(self.touch("0" * 40), 1)  # unknown commit
@@ -438,6 +544,27 @@ class SyntheticRepo(unittest.TestCase):
         r = subprocess.run([sys.executable, "-I", str(HOOK)], input=payload, capture_output=True,
                            text=True, env=env, timeout=120)
         return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"] if r.stdout else ""
+
+    def test_hook_does_not_run_the_trees_fsmonitor(self):
+        marker = self.repo.parent / "FSMONITOR-HOOK"
+        script = self.repo.parent / "fsmon.sh"
+        script.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+        script.chmod(0o755)
+        git(self.repo, "config", "core.fsmonitor", str(script))
+        subprocess.run(["git", "-C", str(self.repo), "ls-files"], capture_output=True, env=hermetic_env())
+        if not marker.exists():
+            self.skipTest("this git does not run core.fsmonitor for ls-files")
+        write(self.repo, "server/core/src/coupled_a.cpp", "int a = 1;\n")
+        self.commit()  # this test's own git add/commit runs the fsmonitor too
+        marker.unlink(missing_ok=True)
+        self.assertIn("coupled:", self.run_hook("gh pr create --title t"))
+        self.assertFalse(marker.exists())
+
+    def test_hook_fails_open_without_a_base_ref(self):
+        git(self.repo, "update-ref", "-d", "refs/remotes/origin/dev")
+        write(self.repo, "server/core/src/coupled_a.cpp", "int a = 1;\n")
+        self.commit()
+        self.assertEqual(self.run_hook("gh pr create --title t"), "")
 
     def test_hook_follows_a_leading_cd(self):
         write(self.repo, "server/core/src/coupled_a.cpp", "int a = 1;\n")
@@ -466,6 +593,8 @@ class SyntheticRepo(unittest.TestCase):
         self.assertEqual(self.run_hook('gh pr create -b "doc-coupling-exempt: coupled — refactor only"'), "")
         write(self.repo, "body.md", "doc-coupling-exempt: coupled — refactor only\n")
         self.assertEqual(self.run_hook("gh pr create -F body.md"), "")
+        write(self.repo, "body.md", "no exemption here\n")  # control: the file IS read
+        self.assertIn("coupled:", self.run_hook("gh pr create -F body.md"))
         (self.repo / "body.md").unlink()
         self.add_undocumented_tool()
         self.commit()
@@ -499,6 +628,7 @@ class Hook(unittest.TestCase):
             "cd w && gh pr create -F b.md": ["-F", "b.md"],
             "git push\ngh pr create --title t": ["--title", "t"],
             "git push; gh pr create": [],
+            "(cd a && true); gh pr create --title t": ["--title", "t"],
             'gh pr create \\\n  --base main \\\n  --body "b"': ["--base", "main", "--body", "b"],
             "gh pr create\\\n --title t": ["--title", "t"],
             'gh pr create --body "a\nb" && echo done': ["--body", "a\nb"],
@@ -511,9 +641,27 @@ class Hook(unittest.TestCase):
 
     def test_cd_target(self):
         self.assertEqual(hook.cd_target("cd wt && gh pr create"), "wt")
-        self.assertEqual(hook.cd_target("cd a; cd b && gh pr create"), "b")
+        self.assertEqual(hook.cd_target("cd a; cd b && gh pr create"), os.path.join("a", "b"))
+        self.assertEqual(hook.cd_target("cd /abs && gh pr create"), "/abs")
+        for unresolvable in ('cd "$WT" && gh pr create', "cd - && gh pr create",
+                             "cd -P x && gh pr create", "cd `pwd` && gh pr create"):
+            self.assertIsNone(hook.cd_target(unresolvable), unresolvable)
         self.assertIsNone(hook.cd_target("gh pr create && cd x"))
         self.assertIsNone(hook.cd_target("echo cd x && gh pr create"))
+
+    def test_deny_text_is_cleaned(self):
+        self.assertEqual(hook._clean("a\u202eb\x1bc\u200bd\U0001F600e\u061cf"), "a?b?c?d?e?f")
+        self.assertEqual(hook._clean("ok — fine\n\tindent"), "ok — fine\n\tindent")
+
+    def test_body_file_read_is_capped(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
+            (Path(tmp) / "b.md").write_text("x" * 20)
+            old = hook._MAX_BODY
+            hook._MAX_BODY = 5
+            try:
+                self.assertEqual(hook.pr_args(["-F", "b.md"], tmp), ("dev", "xxxxx"))
+            finally:
+                hook._MAX_BODY = old
 
     def test_pr_args(self):
         self.assertEqual(hook.pr_args(["--base=main", "--body", "b"], "/"), ("main", "b"))

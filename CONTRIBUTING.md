@@ -146,6 +146,21 @@ coding agents): [`changelog.d/README.md`](changelog.d/README.md). Changes with
 no operator-visible effect (pure refactors, CI plumbing, test-only) can skip
 the fragment.
 
+## Documentation drift
+
+A PR that adds a REST route, an MCP tool or a CLI flag must document it in the
+user manual, or the required `CHANGELOG order` check fails and names what is
+missing. A PR that changes code mapped in `scripts/ci/doc-coupling.json` must
+also change one of that area's docs, or say why the docs are still accurate with
+a line in the PR body:
+
+```
+doc-coupling-exempt: <rule-id> — <reason>
+```
+
+How both checks work, and what to do when one fails:
+[`docs/docs-drift-gate.md`](docs/docs-drift-gate.md).
+
 ## Coding Standards
 
 The project follows C++23 conventions enforced by `.clang-tidy`:

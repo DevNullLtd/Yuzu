@@ -3731,7 +3731,7 @@ test('issue lifecycle docs',
 )
 
 # Code-to-docs drift gate (docs/docs-drift-gate.md): REST routes, MCP tools
-# and CLI flags named in their owning user-manual doc, ratcheted by name; the
+# and CLI flags named in the user manual, ratcheted by name; the
 # self-test drives every failure branch and also runs the gate on the tree.
 # Hermetic — parses sources and throwaway git repos, builds nothing.
 test('docs drift gate',
