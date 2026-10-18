@@ -91,6 +91,7 @@
 
     %% Mgmt-plane peer authorization (#1422)
     [yuzu, gw, mgmt_auth, rejected],
+    [yuzu, gw, mgmt_auth, admitted],
     [yuzu, gw, mgmt_auth, pin_unresolved],
 
     %% Certificate files (yuzu_gw_mgmt_pins' tick, yuzu_gw_cert_files): a
@@ -346,6 +347,14 @@ handle_event([yuzu, gw, mgmt_auth, rejected], #{count := N}, Meta, _Config) ->
     Reason = maps:get(reason, Meta, unknown),
     prometheus_counter:inc(yuzu_gw_mgmt_auth_rejected_total,
                            [atom_to_binary(Reason, utf8)], N);
+
+%% `admitted` counts every management peer the auth_fun let in, by the method
+%% that admitted it (closed set: identity | pin), so an operator moving an
+%% installation from pins to the server identity (#6016) can see which path is
+%% carrying the traffic before narrowing the mode.
+handle_event([yuzu, gw, mgmt_auth, admitted], #{count := N}, Meta, _Config) ->
+    Method = closed(maps:get(method, Meta, undefined), [identity, pin]),
+    prometheus_counter:inc(yuzu_gw_mgmt_auth_admitted_total, [Method], N);
 
 handle_event([yuzu, gw, mgmt_auth, pin_unresolved], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_mgmt_auth_pin_unresolved_total, [], N);
@@ -711,7 +720,8 @@ closed(_Value, _Set) ->
 -spec mgmt_auth_reject_reasons() -> [atom()].
 mgmt_auth_reject_reasons() ->
     [internal_error, no_pins_configured, no_pins_resolved, pin_mismatch,
-     missing_server_auth_eku, bad_peer_cert, bad_pin_config].
+     missing_server_auth_eku, bad_peer_cert, bad_pin_config,
+     no_uri_san, identity_mismatch, identity_unresolved, revoked].
 
 %% The closed set of `reason' values on yuzu_gw_heartbeat_rejected_total: every
 %% `{reject, Reason}' yuzu_gw_heartbeat_admission:check/2 returns except
@@ -878,10 +888,18 @@ metric_specs() ->
         {counter, [
             {name, yuzu_gw_mgmt_auth_rejected_total},
             {labels, [reason]},
-            {help, "Mgmt-plane (:50063) peers rejected by the #1422 SPKI peer pin, "
-                   "by reason atom (closed set; no certificate contents). Sustained "
-                   "non-zero = probing by a CA-cert holder, or a misrotated pin "
-                   "killing server command forwarding"}]},
+            {help, "Mgmt-plane (:50063) peers rejected by the peer authorization "
+                   "(#1422 SPKI pin, #6016 server identity and deny-list), by reason "
+                   "atom (closed set; no certificate contents). Sustained non-zero = "
+                   "probing by a CA-cert holder, a misrotated pin, or a server "
+                   "certificate without the identity, killing server command "
+                   "forwarding"}]},
+        {counter, [
+            {name, yuzu_gw_mgmt_auth_admitted_total},
+            {labels, [method]},
+            {help, "Mgmt-plane (:50063) peers admitted by the peer authorization, "
+                   "by the method that admitted them (closed set: identity | pin; "
+                   "no certificate contents)"}]},
         {counter, [
             {name, yuzu_gw_heartbeat_rejected_total},
             {labels, [reason]},
@@ -1482,6 +1500,8 @@ seed_metrics() ->
     [prometheus_counter:inc(yuzu_gw_mgmt_auth_rejected_total,
                             [atom_to_binary(R, utf8)], 0)
      || R <- mgmt_auth_reject_reasons()],
+    [prometheus_counter:inc(yuzu_gw_mgmt_auth_admitted_total, [M], 0)
+     || M <- [<<"identity">>, <<"pin">>]],
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
     [prometheus_counter:inc(yuzu_gw_heartbeat_rejected_total,

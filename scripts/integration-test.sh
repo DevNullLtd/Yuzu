@@ -658,11 +658,14 @@ if $USE_TLS; then
     # mgmt_peer_pins naming the SERVER's default leaf as a `cert_file' pin, the
     # shipped form: the gateway pins that leaf's SPKI and requires serverAuth. The
     # gateway's own leaf (a valid certificate of the same CA, serverAuth included)
-    # is therefore NOT admitted on it, which the Common Test suite checks. It binds
-    # loopback; the limits and http2 values are the shipped ones.
+    # is therefore NOT admitted on it, which the Common Test suite checks. The mode is the
+    # opt-in transition one (#6016; the shipped configs stay on pin): the server is admitted by the identity its leaf
+    # carries, derived here from the single-certificate default-ca.pem, or by that pin.
+    # It binds loopback; the limits and http2 values are the shipped ones.
     cat > "$GW_SYS_CONFIG" << ERLCFG
 [
     {yuzu_gw, [$GW_COMMON_CFG
+        {mgmt_peer_auth_mode, identity_or_pin},
         {mgmt_peer_pins, [{cert_file, "$CA_DIR/default-server.pem"}]},
         {grpc_listeners, [
             #{name => agent,
@@ -1327,7 +1330,8 @@ fi
 # The server dials the gateway's management listener for every command it routes
 # to a gateway-connected agent. That listener is the privileged command plane, so
 # it runs here in the production posture (see the gateway sys.config above):
-# strict mutual TLS and an SPKI pin on the server's leaf. #5175 was an h2 stream
+# strict mutual TLS, and the server admitted by its identity or its SPKI pin
+# (this rig opts in to identity_or_pin; the shipped configs stay on pin). #5175 was an h2 stream
 # crash on exactly this call (every SendCommand reached the server as 'Socket
 # closed' with no gRPC status). The commands below go through the server's REST
 # API, so the real server's real gRPC client makes the calls: one round trip, then
@@ -1511,6 +1515,17 @@ MGMTPY
     GW_REJECTED=$(awk '/^yuzu_gw_mgmt_auth_rejected_total/ { sum += $NF } END { print sum + 0 }' \
         <<< "$GW_METRICS_AFTER")
     assert_eq "Gateway rejected no management call from the pinned server" "0" "${GW_REJECTED%.*}"
+    # #6016: the gateway admits the server by the identity the C++ server minted onto its leaf
+    # (the gateway derives it from the single-certificate CA file). The identity is checked
+    # before the pin, so a derivation that differed by a byte would still pass every command
+    # above, by the pin, and only these counters would show it.
+    GW_ADMITTED_IDENTITY=$(awk '/^yuzu_gw_mgmt_auth_admitted_total\{method="identity"\}/ { sum += $NF } END { print sum + 0 }' \
+        <<< "$GW_METRICS_AFTER")
+    GW_ADMITTED_PIN=$(awk '/^yuzu_gw_mgmt_auth_admitted_total\{method="pin"\}/ { sum += $NF } END { print sum + 0 }' \
+        <<< "$GW_METRICS_AFTER")
+    assert_ge "Gateway admitted the server by its identity for every forwarded command" \
+        "$((MGMT_BURST + 1))" "${GW_ADMITTED_IDENTITY%.*}"
+    assert_eq "Gateway fell back to the pin for no forwarded command" "0" "${GW_ADMITTED_PIN%.*}"
 fi
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1563,6 +1578,9 @@ if $RUN_GATEWAY_CT; then
             # The leaf the gateway pins: the server's own.
             "YUZU_MGMT_CERT=$CA_DIR/default-server.pem"
             "YUZU_MGMT_KEY=$CA_DIR/default-server.key"
+            # The install CA's key, to mint the leaves the identity cases present
+            # (a server key renewal, a same-key re-issue, another install's identity).
+            "YUZU_MGMT_CA_KEY=$CA_DIR/default-ca.key"
             # Valid leaves of the same CA that are NOT pinned: the gateway's own
             # (serverAuth present, so only the SPKI pin refuses it) and the real
             # agent's enrolled leaf (clientAuth only).
