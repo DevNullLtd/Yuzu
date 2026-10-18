@@ -16113,6 +16113,7 @@ private:
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
                              .step_up_fn = step_up_fn,
+                             .csrf_trusted_origins = cfg_.csrf_trusted_origins,
                              .approval_manager = approval_manager_.get(),
                          });
 

@@ -48,6 +48,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -97,6 +98,9 @@ struct Harness {
     /// prove step-up precedes the `attempted` row.
     std::vector<size_t> audits_at_step_up;
 
+    /// `Config::csrf_trusted_origins` handed to the same-site gate.
+    std::vector<std::string> csrf_trusted_origins;
+
     bool audit_succeeds{true};
     std::vector<AuditRow> audits;
     std::vector<EventRow> events;
@@ -106,6 +110,7 @@ struct Harness {
     void wire() {
         approval::Deps deps;
         deps.approval_manager = approval_manager;
+        deps.csrf_trusted_origins = csrf_trusted_origins;
         deps.perm_fn = [this](const httplib::Request&, httplib::Response& res,
                               const std::string& type, const std::string& op) {
             last_perm_type = type;
@@ -143,6 +148,10 @@ struct Harness {
                                     const json& attrs, const json& payload_data) {
             events.push_back({event_type, attrs, payload_data});
         };
+        // A browser's same-site write: the cookie-write gate (WriteGate) refuses a POST
+        // without a matching Origin/Referer, so every request carries one unless a test
+        // overrides it.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
         approval::register_approval_routes(sink, deps);
     }
 };
@@ -574,6 +583,99 @@ TEST_CASE("approval_routes: a bearer or engine caller is refused 403 with a type
             CHECK(h.audits[0].result == "denied");
             CHECK(h.audits[0].detail == std::string("approver_assurance:") + c.reason);
         }
+    }
+}
+
+TEST_CASE("approval_routes: a cross-site or Origin-less cookie POST is refused 403 (audited "
+          "csrf.denied) before the class check, step-up, the attempted row and any mutation",
+          "[server][routes][approval_routes][csrf]") {
+    const std::unordered_map<std::string, std::string> cross_site[] = {
+        {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}},
+        {{"Host", "yuzu.test"}, {"Referer", "https://evil.test/x"}},
+        {{"Host", "yuzu.test"}}, // a browser always sends one on a write
+    };
+    for (const auto& hdrs : cross_site) {
+        for (const char* verb : {"approve", "reject"}) {
+            Harness h; // null approval_manager: a store reach would crash
+            h.wire();
+            h.sink.default_headers = hdrs;
+
+            auto res = h.sink.Post(std::string("/api/approvals/abc123/") + verb, "{}");
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            CHECK(body(res->body)["error"]["message"] == "cross-site request refused");
+            CHECK(h.step_up_labels.empty()); // refused before step-up
+            CHECK(h.events.empty());
+            REQUIRE(h.audits.size() == 1); // csrf.denied only: no attempted/success row
+            CHECK(h.audits[0].action == "csrf.denied");
+            CHECK(h.audits[0].result == "denied");
+        }
+    }
+}
+
+TEST_CASE("approval_routes: a cross-site POST leaves a pending ticket pending, and the same "
+          "request from this site then decides it",
+          "[pg][server][routes][approval_routes][csrf]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto id = mgr->submit("def-csrf", "submitter1", "group:x", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id);
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.wire();
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}};
+    auto bad = h.sink.Post("/api/approvals/" + *id + "/approve", "{}");
+    REQUIRE(bad);
+    CHECK(bad->status == 403);
+    auto still = mgr->get(*id);
+    REQUIRE(still);
+    CHECK(still->status == "pending");
+
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+    auto good = h.sink.Post("/api/approvals/" + *id + "/approve", "{}");
+    REQUIRE(good);
+    CHECK(good->status == 200);
+    auto after = mgr->get(*id);
+    REQUIRE(after);
+    CHECK(after->status == "approved");
+}
+
+TEST_CASE("approval_routes: a configured trusted origin and the request's own site pass the "
+          "same-site gate; a perm_fn denial still wins over it",
+          "[server][routes][approval_routes][csrf]") {
+    {
+        Harness h; // null manager: passing the gate reaches the 503 store-unavailable body
+        h.wire();
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+        auto res = h.sink.Post("/api/approvals/abc123/approve", "{}");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(h.audits.empty());
+    }
+    {
+        // A reverse-proxy origin named in --csrf-trusted-origin is same-site.
+        Harness h;
+        h.csrf_trusted_origins = {"https://proxy.test"};
+        h.wire();
+        h.sink.default_headers = {{"Host", "internal:8080"}, {"Origin", "https://proxy.test"}};
+        auto res = h.sink.Post("/api/approvals/abc123/reject", "{}");
+        REQUIRE(res);
+        CHECK(res->status == 503); // past the gate; null manager
+        CHECK(h.audits.empty());
+        h.sink.default_headers = {{"Host", "internal:8080"}, {"Origin", "https://other.test"}};
+        auto bad = h.sink.Post("/api/approvals/abc123/reject", "{}");
+        REQUIRE(bad);
+        CHECK(bad->status == 403);
+    }
+    {
+        Harness h;
+        h.perm_allow = false;
+        h.wire();
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}};
+        auto res = h.sink.Post("/api/approvals/abc123/approve", "{}");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.audits.empty()); // the permission 403 came first: no csrf.denied row
     }
 }
 

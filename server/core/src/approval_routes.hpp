@@ -34,6 +34,10 @@
 ///   2. The session is re-resolved; an unresolvable one is a 503 A4 envelope
 ///      (#4128). It used to become reviewer "unknown", which can never equal a
 ///      real `submitted_by` and so defeated the separation-of-duties check.
+///   2b. SAME-SITE GATE (`WriteGate`, #6061 SG-1): a cookie-authorised POST
+///      must name this site in Origin/Referer (403, `csrf.denied` row, before
+///      anything else is touched). Token callers are exempt from it and are
+///      refused by the class check instead.
 ///   3. Class check (`approver_assurance.hpp`): interactive local/OIDC/SAML
 ///      cookie session, `principal_kind == "human"`, not an engine principal.
 ///      A bearer or engine caller gets a 403 A4 envelope whose message is
@@ -87,6 +91,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -154,6 +159,12 @@ struct Deps {
     /// enrolled and `--mfa-step-up-window-secs=0` (see mfa_step_up.hpp), so
     /// "fresh step-up" means exactly what it means on every other gated route.
     StepUpFn step_up_fn;
+    /// `Config::csrf_trusted_origins` (normalised at boot) for the same-site
+    /// write gate on approve/reject (`WriteGate::refuse_cross_site`,
+    /// `audited_write.hpp`) -- extra origins a cookie-authorised POST may
+    /// legitimately come from (a TLS-terminating reverse proxy). Empty means
+    /// only the request's own Host is same-site.
+    std::vector<std::string> csrf_trusted_origins;
     /// `ServerImpl::approval_manager_`. Null -> every route degrades per the
     /// STORE-UNAVAILABLE ASYMMETRY documented above (this file's header).
     ApprovalManager* approval_manager{nullptr};
