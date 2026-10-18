@@ -337,14 +337,17 @@ deadline(#{chan := Chan}) ->
 
 %% With grpc-timeout sent (the default), the gateway's own listener ends the
 %% handler a tenth early (yuzu_grpc_stream_h:deadline_ms/1) and answers status 4,
-%% so the client gets the server's answer, not its local timeout.
+%% so the client gets the server's answer, not its local timeout. The timeout is
+%% 5000 ms so that margin is 500 ms: at 1000 ms it was 100 ms, and a loaded CI
+%% runner (macOS, #5695) delivered the trailers after the client's own timeout.
 server_deadline(#{chan := Chan}) ->
+    Timeout = 5000,
     T0 = erlang:monotonic_time(millisecond),
     ?assertMatch({error, {<<"4">>, _}, _},
                  yuzu_grpc_client:unary(#{}, ?HEARTBEAT, #{session_id => <<"sleep">>}, def(),
-                                        #{channel => Chan, timeout => 1000})),
+                                        #{channel => Chan, timeout => Timeout})),
     Elapsed = erlang:monotonic_time(millisecond) - T0,
-    ?assert(Elapsed < 1000),
+    ?assert(Elapsed < Timeout),
     ?assertMatch({ok, #{acknowledged := true}, _}, heartbeat(Chan, <<"ok">>)).
 
 %% The call is given up on at 300 ms. The stream is cancelled (RST_STREAM), so the
