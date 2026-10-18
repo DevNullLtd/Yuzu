@@ -2761,7 +2761,10 @@ static const ToolDef kTools[] = {
      "approver_assurance_required:<reason> (reason: non_interactive_session, "
      "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
      "A human reviewer decides via the dashboard Approvals page or POST "
-     "/api/approvals/{id}/approve from an interactive session with a fresh MFA step-up.",
+     "/api/approvals/{id}/approve from an interactive session that passes the existing "
+     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required, an "
+     "OIDC session without an amr proof pass it; --mfa-step-up-window-secs=0 disables it; "
+     "SAML sessions are refused, #4935; an enrolled-factor requirement is tracked in #6079).",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -2781,7 +2784,10 @@ static const ToolDef kTools[] = {
      "approver_assurance_required:<reason> (reason: non_interactive_session, "
      "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
      "A human reviewer decides via the dashboard Approvals page or POST "
-     "/api/approvals/{id}/reject from an interactive session with a fresh MFA step-up.",
+     "/api/approvals/{id}/reject from an interactive session that passes the existing "
+     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required, an "
+     "OIDC session without an amr proof pass it; --mfa-step-up-window-secs=0 disables it; "
+     "SAML sessions are refused, #4935; an enrolled-factor requirement is tracked in #6079).",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -19466,10 +19472,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                   std::string(approval::approver_refusal_reason(refusal)));
                 res.set_content(
                     a4_error(kPermissionDenied, approval::approver_refusal_message(refusal),
-                             "approving or rejecting requires an interactive human session with "
-                             "a fresh MFA step-up; MCP, API-token and engine credentials cannot "
-                             "decide an approval. Ask a human reviewer to use the dashboard "
-                             "Approvals page.",
+                             "approving or rejecting requires an interactive human session "
+                             "(passing the MFA step-up gate); MCP, API-token and engine "
+                             "credentials cannot decide an approval. Ask a human reviewer to "
+                             "use the dashboard Approvals page.",
                              /*retry_after_ms=*/-1, /*cid_override=*/{}, audit_ok),
                     "application/json");
                 return;

@@ -87,8 +87,8 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
                                 std::string(approval::approver_refusal_reason(refusal)));
         write_a4(res, 403, approval::approver_refusal_message(refusal),
                  "approving or rejecting requires an interactive human session (local or OIDC "
-                 "login) with a fresh MFA step-up; API-token, MCP and engine credentials cannot "
-                 "decide an approval. Use the dashboard Approvals page.");
+                 "login) that passes the MFA step-up gate; API-token, MCP and engine "
+                 "credentials cannot decide an approval. Use the dashboard Approvals page.");
         return;
     }
 

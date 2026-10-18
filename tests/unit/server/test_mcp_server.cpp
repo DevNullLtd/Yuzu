@@ -1901,6 +1901,9 @@ TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST,
     for (const std::string* text : {&blob, &about}) {
         CHECK(text->find("approver_assurance_required:*") != std::string::npos);
         CHECK(text->find("human act") != std::string::npos);
+        // G8-AR-3: "step-up" is the existing gate with its pass-throughs, not a guarantee
+        // that the approver holds an enrolled factor; the handshake must say so (#6079).
+        CHECK(text->find("#6079") != std::string::npos);
     }
     // The old claim that an MCP caller can decide a ticket must not return.
     CHECK(blob.find("approve/reject maker-checker tickets") == std::string::npos);
