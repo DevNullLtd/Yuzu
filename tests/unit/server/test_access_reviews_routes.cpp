@@ -13,6 +13,7 @@
  *   - a dropped or throwing audit write sets Sec-Audit-Failed once and the page still renders.
  */
 
+#include "access_audit_ui.hpp"
 #include "access_reviews_render.hpp"
 #include "access_reviews_routes.hpp"
 #include "test_route_sink.hpp"
@@ -23,6 +24,8 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <regex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -401,4 +404,46 @@ TEST_CASE("reviews routes: a dropped or throwing audit write sets Sec-Audit-Fail
             CHECK(res->get_header_value_count("Sec-Audit-Failed") == 1);
         }
     }
+}
+
+TEST_CASE("reviews routes: every fragment URL the page names is a registered route and each panel "
+          "targets and reloads from its own",
+          "[access-reviews][routes]") {
+    Harness h;
+    h.wire();
+    const std::string t = kAccessAuditTemplate;
+    AccessReviewCampaignRow row;
+    row.campaign_id = "abc123";
+    row.status = "open";
+    // The page template plus what the renderers draw into it (campaign rows, the Retry button).
+    const std::string drawn = t +
+                              access_reviews::render_campaigns(std::vector<AccessReviewCampaignRow>{row}, false) +
+                              access_reviews::render_campaign(access::Unavailable{}, false, "abc123");
+
+    std::set<std::string> named;
+    const std::regex url(R"re((/fragments/access/reviews/[a-z]+))re");
+    for (std::sregex_iterator it(drawn.begin(), drawn.end(), url), end; it != end; ++it)
+        named.insert((*it)[1].str());
+    CHECK(named == std::set<std::string>{kCampaigns, kCampaign, kGrants});
+    // A typo or a retarget names a route nothing serves: the sink returns no response for it.
+    for (const auto& path : named) {
+        INFO(path);
+        const auto res = h.get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+
+    const auto has = [&](const char* pattern) { return std::regex_search(drawn, std::regex(pattern)); };
+    // The list loads itself and reloads from the same URL.
+    CHECK(has(R"re(<section[^>]*id="ar-campaigns"[^>]*hx-get="/fragments/access/reviews/campaigns"[^>]*hx-trigger="load")re"));
+    CHECK(has(R"re(<section[^>]*id="ar-campaigns"[^>]*data-src="/fragments/access/reviews/campaigns")re"));
+    // The campaign and grants panels reload from their own fragment.
+    CHECK(has(R"re(<section[^>]*id="ar-campaign"[^>]*data-src="/fragments/access/reviews/campaign")re"));
+    CHECK(has(R"re(<section[^>]*id="ar-grants"[^>]*data-src="/fragments/access/reviews/grants")re"));
+    // The grants button fetches the grants into the grants panel; a campaign row (and the
+    // campaign's Retry) fetches one campaign into the campaign panel.
+    CHECK(has(R"re(<button[^>]*hx-get="/fragments/access/reviews/grants"[^>]*hx-target="#ar-grants"[^>]*>Show current grants</button>)re"));
+    CHECK(has(R"re(hx-get="/fragments/access/reviews/campaign\?id=abc123" hx-target="#ar-campaign")re"));
+    for (const char* id : {"id=\"ar-campaigns\"", "id=\"ar-campaign\"", "id=\"ar-grants\""})
+        CHECK_THAT(t, ContainsSubstring(id));
 }
