@@ -23,7 +23,7 @@ churns the ledger. Each row records:
 
 - `capability_id` - an id DERIVED from the method and path (it changes if a
   route is renamed, and the gate requires it to match).
-- `rest_v1_twin` - the `/api/v1/*` route that serves the same capability, if
+- `rest_v1_twin` - the `/api/vN/*` route that serves the same capability, if
   one exists.
 - `mcp_twin` - the MCP tool name that serves the same capability, if one
   exists.
@@ -43,9 +43,12 @@ churns the ledger. Each row records:
   union of other ledgered capabilities, not a 1:1 twin),
   `exception:#<issue> revisit:<YYYY-MM-DD> <reason>` (a deliberate, reviewed
   exception with a tracking issue and a revisit date - an ADR-1005 ledger
-  entry, not a free pass; a size-pinned set of older rows predates the shape
-  and is grandfathered by `capability_id` in the script - extending it,
-  swapping an id or rebinding an id to another row is caught only in review), or `retire` (the
+  entry, not a free pass; the `<issue>` may be the originating or decision
+  issue and need not be open, e.g. #520 and #2102 are closed as of
+  2026-10-17; a few rows with no machine-checked dated revisit are
+  grandfathered by `capability_id` in a size-pinned set in the script, named
+  in ADR-1005's 2026-10-15 entry - extending it, swapping an id or rebinding
+  an id to another row is caught only in review), or `retire` (the
   fragment route no longer exists; kept for history until the ledger row
   itself is deleted).
 
