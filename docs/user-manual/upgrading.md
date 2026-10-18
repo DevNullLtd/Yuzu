@@ -78,7 +78,8 @@ changes is which checks run.
   binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
   database produces a ticket the new binaries treat as not yet live (consume answers
   `approval expired (past its 7-day lifetime)`), and a replica running behind shortens the ticket's life by
-  the same amount. Fix the clock and request approval again.
+  the same amount. Fix the clock and request approval again. A query that lists approved tickets ahead of the
+  database clock is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness".
 - Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
   from it.
 

@@ -569,6 +569,53 @@ strictly safer than falsely cancelling it, since there is no repair path today t
 `agents_targeted` from `agent_exec_status`. Verified bidirectionally: the regression test fails
 (force-cancels the row) with the clause removed from all three sites, and passes with it restored.
 
+### `ApprovalManager` ticket liveness (#6061) - a recorded disposition, not a retention pass
+
+Listed here because the routed trigger fires on any wall-clock cutoff in `approval_manager.cpp`, not
+because the store adopts the apparatus. An approval ticket is "live" while it is `approved`,
+unconsumed and `reviewed_at` lies within `[db_now - 7 days, db_now + 300 s]`. That test is ONE SQL
+predicate (`ticket_live_sql()` in `approval_manager.cpp`, constants `kApprovalTicketTtlSeconds` and
+`kApprovalReviewedAtSlackSeconds` in `approval_manager.hpp`), used by four sites that must never
+disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-ticket sweep, and
+`ticket_is_live()`, which `ScheduleRunner` calls before it fires an approved schedule ticket.
+
+- **It is a liveness check and a state transition, not a bulk delete.** The consume is a per-row CAS
+  that refuses and leaves the row untouched. The sweep is `UPDATE ... SET status = 'expired'`, never a
+  `DELETE`; ADR-0065 lines 232-240 ("Expiry-sweep clock-guard adjudication") record why the seven-part
+  apparatus's trigger is not met for the sweep. Expired rows stay queryable and auditable.
+- **Parts 1-4 DECLINED: there is no per-replica clock reading to probe, persist, sanitise or dedupe.**
+  The cutoff is Postgres `now()` evaluated in-SQL, and `submitted_at`, `reviewed_at` and `consumed_at`
+  are authored by the same statement's `now()`, so the stored value and the cutoff share one clock
+  domain (the SessionStore direction, #3715). Nothing about this pass depends on a replica's
+  `system_clock`; running it on every replica is safe, so the SINGLE-WRITER caveat does not apply.
+- **Part 3's "ahead of now" clause is what the upper bound is.** A lower bound alone honours a
+  far-future `reviewed_at` for as long as the skew lasts and the sweep never reaches it. The 300 s slack
+  is an absolute number chosen for a healthy row (stamped by the database, so never ahead of `now()`)
+  plus statement-boundary jitter; do not copy it to another store.
+- **Part 5 (cap) NOT adopted for the sweep:** it has no per-pass limit. It runs lazily inside `submit()`
+  and only moves rows already past the lifetime to `expired`, which removes no data.
+- **Part 6 (missing anchor): not applicable,** there is no anchor. **Part 7:** the 7-day lifetime is an
+  absolute duration.
+- **Premise withdrawn.** The earlier reasoning that a 7-day window makes app-clock versus database-clock
+  skew immaterial was wrong (governance ledger `6061-approver-assurance.yut0p2`, UP-3): a `reviewed_at`
+  stamped from a replica's clock and compared with the database's passed the lower bound while it was
+  in the future. Stamping in SQL, plus the upper bound, is the fix. This follows the house rule in
+  `docs/user-manual/server-admin.md` of never comparing an app-host clock to a database-host clock.
+- **Residual, stated plainly.** The database host's own clock is still the authority. A forward jump of
+  it makes live tickets read as expired, and a sweep that runs while it is wrong moves them to
+  `expired` for good: correcting the clock does not restore them, the requester must ask again. A
+  backward jump makes the sweep match nothing; `submit()` logs a WARN when the pending queue is full and
+  the stale-pending sweep expired nothing. No dedicated skew detector or metric exists for this store.
+  To find tickets the upper bound is holding back (approved, unconsumed, `reviewed_at` ahead of the
+  database clock by more than the slack):
+
+  ```sql
+  SELECT id, definition_id, submitted_by, reviewed_at
+  FROM approval_manager.approvals
+  WHERE status = 'approved' AND consumed_at = 0
+    AND reviewed_at > EXTRACT(EPOCH FROM now())::bigint + 300;
+  ```
+
 ### `guardian_lifecycle_journal.cpp`
 
 Satisfies parts **1/3/4/5 ONLY** — its reading is in-process and deliberately NOT persisted, so **do
