@@ -1500,6 +1500,7 @@ TEST_CASE("default_certs: a revoke that matches nothing is never a confirmed sup
         auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
         CHECK_FALSE(out.revoke_confirmed);
         CHECK(out.replacement_withdrawn);
+        CHECK_FALSE(out.replacement_withdraw_failed);
         CHECK(status_of(new_serial).first == CertStatus::Revoked);
         CHECK(status_of(new_serial).second == "key compromise");
         CHECK(status_of(old_serial).second == "key compromise"); // never rewritten
@@ -1518,6 +1519,15 @@ TEST_CASE("default_certs: a revoke that matches nothing is never a confirmed sup
         auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
         CHECK(out.revoke_confirmed);
         CHECK_FALSE(out.replacement_withdrawn);
+        CHECK(status_of(new_serial).first == CertStatus::Active);
+    }
+
+    SECTION("an old row carrying the system unpublished marker is not a withdrawal") {
+        REQUIRE(store.revoke_system(old_serial, kRevokeReasonUnpublished).value_or(false));
+        auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
+        CHECK_FALSE(out.revoke_confirmed);
+        CHECK_FALSE(out.replacement_withdrawn);
+        CHECK_FALSE(out.replacement_withdraw_failed);
         CHECK(status_of(new_serial).first == CertStatus::Active);
     }
 

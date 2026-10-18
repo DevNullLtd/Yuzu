@@ -5,6 +5,7 @@
 #include "pg/pg_session_advisory_lock.hpp"
 #include "x509_ca.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/secure_zero.hpp>
 
 #include <nlohmann/json.hpp>
@@ -1052,7 +1053,7 @@ struct StagedFile {
         if (row->has_value() && (*row)->status == CertStatus::Revoked) {
             if ((*row)->revocation_reason != kRevokeReasonSuperseded)
                 return skip("the current default-server leaf is revoked (reason: '" +
-                            (*row)->revocation_reason +
+                            yuzu::log_token((*row)->revocation_reason) +
                             "') — not re-certifying its key. To replace it, re-key the set "
                             "(this also changes the server key your gateway mgmt_peer_pins refer "
                             "to; see docs/user-manual/upgrading.md)");
@@ -1073,7 +1074,7 @@ struct StagedFile {
                 continue;
             if (pki::issuer_key_id(r.cert_pem) == key_id)
                 return skip("a certificate for the same server key (serial " + r.serial_hex +
-                            ") was revoked (reason: '" + r.revocation_reason +
+                            ") was revoked (reason: '" + yuzu::log_token(r.revocation_reason) +
                             "') — not re-certifying its key. To replace it, re-key the set "
                             "(see docs/user-manual/upgrading.md)");
         }
@@ -1141,7 +1142,8 @@ struct StagedFile {
     }
 
     // Recorded but never published: withdraw the orphan row (best-effort, but never silent —
-    // the revoked set is append-only, so a failure here leaves an ACTIVE orphan, see #6068).
+    // a failure here leaves an ACTIVE orphan row for a certificate that was never published,
+    // #6068).
     const auto withdraw_unpublished = [&] {
         if (!ca_store)
             return;
@@ -1173,6 +1175,7 @@ struct StagedFile {
             settle_superseded_server_leaf(*ca_store, old_info->serial_hex, issued->serial_hex);
     const bool revoke_confirmed = settled.revoke_confirmed;
     const bool replacement_withdrawn = settled.replacement_withdrawn;
+    const bool replacement_withdraw_failed = settled.replacement_withdraw_failed;
 
     spdlog::warn("default_certs: re-issued default-server.pem with the server identity URI SAN "
                  "{} (same root, same key — existing pins remain valid)",
@@ -1190,6 +1193,7 @@ struct StagedFile {
     out.new_server_serial = issued->serial_hex;
     out.superseded_revoke_confirmed = revoke_confirmed;
     out.replacement_withdrawn = replacement_withdrawn;
+    out.replacement_withdraw_failed = replacement_withdraw_failed;
     out.server_identity_upgraded = true; // last: the flag implies the serials above are set
     return true;
 }
@@ -1322,21 +1326,33 @@ SupersessionOutcome settle_superseded_server_leaf(CaStore& ca_store, const std::
                      old_serial);
     } else if ((*again)->revocation_reason == kRevokeReasonSuperseded) {
         out.revoke_confirmed = true; // a sibling's identical upgrade got there first
+    } else if ((*again)->revocation_reason == kRevokeReasonUnpublished) {
+        // A system bookkeeping marker, never a withdrawal: do not copy it onto the replacement
+        // (the same-key scan ignores it, so copying would launder the key).
+        spdlog::warn("default_certs: the superseded default-server leaf (serial {}) carries the "
+                     "system marker 'unpublished'; not treating it as a withdrawal",
+                     old_serial);
     } else {
         // Revoked for a real reason between the guard and the publish: the key is
         // withdrawn, and the replacement just published shares it. Carry the withdrawal to
         // the replacement so no active serial remains over that key.
         const std::string reason = (*again)->revocation_reason;
         auto w = ca_store.revoke_system(new_serial, reason);
-        out.replacement_withdrawn = w.has_value();
+        // Ok(false) = the replacement row is unknown or already revoked: nothing was
+        // withdrawn BY THIS CALL, so only a revoke that took effect counts.
+        out.replacement_withdrawn = w.has_value() && *w;
+        out.replacement_withdraw_failed = !out.replacement_withdrawn;
         spdlog::error("default_certs: the superseded default-server leaf (serial {}) was revoked "
                       "(reason: '{}') while it was being replaced — its key is withdrawn; {}",
-                      old_serial, reason,
-                      w ? "the replacement (serial " + new_serial +
-                              ") was revoked to match. Re-key the set (see "
-                              "docs/user-manual/upgrading.md)"
-                        : "revoking the replacement (serial " + new_serial +
-                              ") FAILED: " + w.error() + " — revoke it manually");
+                      old_serial, yuzu::log_token(reason),
+                      out.replacement_withdrawn
+                          ? "the replacement (serial " + new_serial +
+                                ") was revoked to match. Re-key the set (see "
+                                "docs/user-manual/upgrading.md)"
+                          : (w ? "revoking the replacement (serial " + new_serial +
+                                     ") matched no active row — check it in the CA inventory"
+                               : "revoking the replacement (serial " + new_serial +
+                                     ") FAILED: " + w.error() + " — revoke it manually"));
     }
     return out;
 }

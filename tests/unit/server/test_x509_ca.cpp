@@ -963,10 +963,10 @@ TEST_CASE("x509_ca: verify_chain_to_bundle finds the anchor among several certs"
     REQUIRE_FALSE(verify_chain_to_bundle(leaf->cert_pem, "not a cert"));
 }
 
-// #6016: the gateway's mgmt plane will admit the server by the URI SAN (PR 2; today it
-// still pins the SPKI) `yuzu://<install>/server`. An agent can submit a CSR requesting exactly that
-// URI; sign_csr must issue the agent's server-chosen identity and NOTHING from
-// the CSR — never the server URI, never serverAuth.
+// #6016: the gateway's mgmt plane will admit the server by the URI SAN
+// `yuzu://<install>/server` (PR 2; today it still pins the SPKI). An agent can
+// submit a CSR requesting exactly that URI; sign_csr must issue the agent's
+// server-chosen identity and NOTHING from the CSR - never the server URI, never serverAuth.
 TEST_CASE("x509_ca: a CSR requesting the server identity URI is issued without it (#6016)",
           "[pki][leaf][security]") {
     auto ca = make_test_ca();

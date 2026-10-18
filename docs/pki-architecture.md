@@ -55,9 +55,13 @@ detail; `result=warning` and `superseded_revoked=false` when the old serial's re
 confirmed, in which case the old row may still be active and should be revoked from the CA page or
 `POST /api/v1/ca/revoke`; that case is not retried, because the next boot finds the set intact).
 If the old serial was revoked by an operator for a real reason (for example key compromise) in the
-moments while the upgrade ran, the upgrade also revokes the new certificate with the same reason (the
-key is withdrawn), the detail adds `replacement_withdrawn=true`, and the server keeps serving that
-file until the set is re-keyed — exactly as if the operator had revoked the live leaf after boot.
+moments while the upgrade ran, the upgrade revokes the new certificate with the same reason (the key
+is withdrawn). The audit row is then `result=warning` with `superseded_revoked=false` (the old row is
+revoked, but not as `superseded`) and `replacement_withdrawn=true`, and the server keeps serving that
+file until the set is re-keyed, exactly as if the operator had revoked the live leaf after boot. If
+revoking the replacement also failed, the detail carries `replacement_withdraw_failed=true` and the NEW serial is still
+active over a withdrawn key: revoke it from the CA page or `POST /api/v1/ca/revoke` and re-key the
+set. The error log names the serial.
 A failure before the new certificate is published is logged and retried on every boot; it never
 blocks startup. The CRL carries no revocation reason code, so on the wire a `superseded` entry
 reads like any other revocation; the reason is visible in the CA inventory only.

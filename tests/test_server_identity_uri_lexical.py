@@ -16,7 +16,9 @@ mistaken for a comment):
   4. `revoke_system` (the system-reserved revocation reasons) is mentioned only in
      default_certs.cpp and ca_store.{hpp,cpp}: an operator surface must go through
      `CaStore::revoke`, which qualifies a reason that collides with a system marker.
-  5. `sign_csr(` is called from exactly: x509_ca.* (the primitive), default_certs.cpp (1: the
+  5. `settle_superseded_server_leaf` (the public wrapper over revoke_system, exposed for tests) is
+     mentioned only in default_certs.hpp / default_certs.cpp.
+  6. `sign_csr(` is called from exactly: x509_ca.* (the primitive), default_certs.cpp (1: the
      server-leaf upgrade) and server.cpp (2: sign_agent_csr and the code-signing issuer).
      A new signer is a new reviewed decision, not a drive-by.
 
@@ -90,6 +92,8 @@ def problems(files: dict[str, str]) -> list[str]:
             found.append(f"{path}: mentions server_identity_uri( outside default_certs")
         if base != "default_certs.cpp" and re.search(r'"/server"', text):
             found.append(f'{path}: builds the "/server" URI suffix outside default_certs.cpp')
+        if base not in URI_FILES and re.search(r"\bsettle_superseded_server_leaf\b", text):
+            found.append(f"{path}: mentions settle_superseded_server_leaf outside default_certs")
         if base not in {"default_certs.cpp", "ca_store.hpp", "ca_store.cpp"} and re.search(
                 r"\brevoke_system\b", text):
             found.append(f"{path}: mentions revoke_system outside default_certs/ca_store")
@@ -148,6 +152,8 @@ def self_test() -> int:
            "store->revoke_system(s, kRevokeReasonSuperseded);"}, False)
     expect("revoke_system as a pointer-to-member", {**good, "core/src/ca_routes.cpp":
            "auto f = &CaStore::revoke_system;"}, False)
+    expect("settle_superseded_server_leaf in a route", {**good, "core/src/ca_routes.cpp":
+           "settle_superseded_server_leaf(*store, a, b);"}, False)
     expect("new issue_leaf caller", {**good, "core/src/ca_routes.cpp": "pki::issue_leaf(a);"}, False)
     expect("third sign_csr in server.cpp", {**good, "core/src/server.cpp":
            good["core/src/server.cpp"] + "\npki::sign_csr(z);"}, False)
