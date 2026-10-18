@@ -1717,6 +1717,37 @@ TEST_CASE("GuardianEngine #5513: a second restart while unresolved re-derives th
     }
 }
 
+TEST_CASE("GuardianEngine #5513: an unresolved boot re-arm does not weaken the lower-generation "
+          "refusal, and the report stays 0",
+          "[guardian][engine][boot_rearm][generation]") {
+    // While a boot re-arm is unresolved the agent REPORTS generation 0, but the refusal of a
+    // full_sync below the held generation compares against the real held generation (the
+    // persisted kG), not the reported 0. A full_sync labelled kG - 1 must therefore still be
+    // refused whole, and the refusal must not clear the unresolved state or move the report.
+    constexpr std::uint64_t kG = 6;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, kG, two_registry_rules());
+
+    BootedEngine b{db.path};
+    b.start(exhaust_on("r1"));
+    REQUIRE(b.engine->boot_rearm_unresolved());
+    REQUIRE(b.engine->policy_generation() == 0);
+    REQUIRE(b.engine->rule_count() == 2);
+    REQUIRE(b.engine->lower_generation_refusals() == 0);
+
+    auto refused = b.engine->apply_rules(
+        push_at(kG - 1, {GuardianFixture::make_registry_rule("r3", "audit")}, /*full_sync=*/true));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(b.engine->lower_generation_refusals() == 1);
+    CHECK(b.engine->rule_count() == 2); // nothing was torn down or replaced
+    CHECK(b.engine->boot_rearm_unresolved());
+    CHECK(b.engine->policy_generation() == 0);
+    const auto report = b.engine->generation_report();
+    CHECK(report.reported == 0);
+    CHECK(report.boot_rearm_unresolved);
+    CHECK(b.engine->get_status().policy_generation() == kG);
+}
+
 TEST_CASE("GuardianEngine #5513: generation 0 and a never-pushed boot never confuse the "
           "report",
           "[guardian][engine][boot_rearm]") {

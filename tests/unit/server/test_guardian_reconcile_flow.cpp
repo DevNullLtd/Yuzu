@@ -45,6 +45,7 @@
 #include <variant>
 #include <vector>
 
+#include "../test_log_capture.hpp"
 #include "guaranteed_state.pb.h"
 
 using namespace std::chrono_literals;
@@ -223,9 +224,9 @@ public:
                 return session_os;
             },
             .session_id = [this](const std::string& agent_id) -> std::string {
-                if (session_id_fn)
-                    return session_id_fn(agent_id);
-                return "sess-1";
+                std::lock_guard lk(session_mu);
+                session_id_agents.push_back(agent_id);
+                return current_session;
             },
             .eval_scope = [this](const std::string& agent_id,
                                  const yuzu::scope::Expression& expr)
@@ -250,7 +251,7 @@ public:
                                                           "no props store"});
                 case ScopeOutcome::StoreDegraded:
                     return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded,
-                                                          "tag store down"});
+                                                          store_degraded_detail});
                 case ScopeOutcome::PrincipalUnresolved:
                     return std::unexpected(
                         ScopeEvalError{ScopeEvalError::Kind::PrincipalUnresolved, "no principal"});
@@ -311,6 +312,10 @@ public:
             t += count(l);
         return t;
     }
+    // Agents seen reporting a generation above the server's (NOT a result label either).
+    double ahead() {
+        return metrics.counter("yuzu_server_guardian_agent_generation_ahead_total").value();
+    }
     // The dedicated counter of the epoch-check abort (NOT a result label of reconciles_total).
     double invalidated() {
         return metrics.counter("yuzu_server_guardian_reconcile_invalidated_total").value();
@@ -344,8 +349,17 @@ public:
     std::optional<std::string> deployed_error;
     bool rules_throw{false};
     std::optional<std::string> session_os{"linux"};
-    // Overrides the session id the flow reads (default: "sess-1" on every call).
-    std::function<std::string(const std::string&)> session_id_fn;
+    // The detail text a StoreDegraded scope evaluation carries.
+    std::string store_degraded_detail{"tag store down"};
+    // The session id the flow reads. A test flips it from a hook to model a re-registration at
+    // that point; every agent id the flow asked about is recorded.
+    void set_session(std::string id) {
+        std::lock_guard lk(session_mu);
+        current_session = std::move(id);
+    }
+    std::mutex session_mu;
+    std::string current_session{"sess-1"};
+    std::vector<std::string> session_id_agents;
     std::unordered_map<std::string, ScopeOutcome> scope_outcomes;
     bool send_result{true};
     std::function<void()> list_hook;
@@ -636,14 +650,22 @@ TEST_CASE("GuardianReconcileFlow: an admitted agent with no session keeps its cl
 
 TEST_CASE("GuardianReconcileFlow: an agent that re-registers during the load gets nothing and counts no_session",
           "[guardian][reconcile_flow]") {
+    // The push is built for the session read at the start. The session changes at a point
+    // between the start read and the send; the check just before the send must see it, so the
+    // moment of the second read matters (a read taken before the store reads cannot).
     Rig rig;
-    // The first read (start of run) sees one session; every later read, including the one just
-    // before the send, sees the replacement. The push was built for the first session.
-    std::atomic<int> reads{0};
-    rig.session_id_fn = [&](const std::string&) -> std::string {
-        return reads.fetch_add(1) == 0 ? "sess-1" : "sess-2";
-    };
-    rig.run();
+    const std::string agent = "agent-under-test";
+    SECTION("during the rule load") {
+        rig.list_hook = [&] { rig.set_session("sess-2"); };
+    }
+    SECTION("during scope evaluation") {
+        rig.set_rules({rule("open"), rule("scoped", "", "tag:grp == inside")});
+        rig.scope_outcomes["inside"] = ScopeOutcome::Member;
+        rig.eval_hook = [&] { rig.set_session("sess-2"); };
+    }
+    yuzu::test::LogCapture log{spdlog::level::info};
+    rig.run(agent, 3);
+    log.stop();
     CHECK(rig.sent.empty());
     CHECK(rig.count("no_session") == 1.0);
     CHECK(rig.count("sent") == 0.0);
@@ -652,12 +674,23 @@ TEST_CASE("GuardianReconcileFlow: an agent that re-registers during the load get
     CHECK(rig.gate.claims_size() == 1);  // KEPT, like every other post-admission exit
     CHECK(rig.gate.in_flight() == 0);
     CHECK(rig.duration_count() == 1);
+    // One read at the start, one before the send, both for the agent under test.
+    REQUIRE(rig.session_id_agents.size() == 2);
+    for (const auto& id : rig.session_id_agents)
+        CHECK(id == agent);
+    // The log names both causes: a re-registration and a removed session look the same here.
+    CHECK(log.text().find("re-registered, or its session was removed") != std::string::npos);
+}
 
-    // An unchanged session still sends (the check is not a blanket refusal).
+TEST_CASE("GuardianReconcileFlow: an unchanged session still sends, and asks about the right agent",
+          "[guardian][reconcile_flow]") {
     Rig steady;
-    steady.run();
+    steady.run("agent-under-test", 3);
     CHECK(steady.sent.size() == 1);
     CHECK(steady.count("sent") == 1.0);
+    REQUIRE(steady.session_id_agents.size() == 2);
+    for (const auto& id : steady.session_id_agents)
+        CHECK(id == "agent-under-test");
 }
 
 TEST_CASE("GuardianReconcileFlow: an unreadable fresh generation aborts before the bundle load",
@@ -706,6 +739,132 @@ TEST_CASE("GuardianReconcileFlow: a fresh generation not ahead of the agent send
     CHECK(rig.gate.in_flight() == 0);
     CHECK(rig.duration_count() == 1);
     CHECK(rig.gate.claims_size() == 1);
+}
+
+// ---------------------------------------------------------------------------------------
+// An agent whose applied generation is ABOVE the server's: it refuses full pushes, so the
+// reconcile cannot help it. Counted and logged (confirmed against the store, throttled).
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("GuardianReconcileFlow: an agent above the server generation is counted and logged once a minute",
+          "[guardian][reconcile_flow]") {
+    Rig rig;  // the store generation is 7
+    yuzu::test::LogCapture log{spdlog::level::info};
+    rig.run("agent-ahead", 99);
+    CHECK(rig.sent.empty());
+    CHECK(rig.total() == 0.0);
+    CHECK(rig.audits.empty());
+    CHECK(rig.gate.claims_size() == 0);  // still a converged exit: no admission, no duration
+    CHECK(rig.duration_count() == 0);
+    CHECK(rig.ahead() == 1.0);
+    CHECK(rig.fetch_calls == 2);  // the cached read, then one fresh confirmation
+
+    // A second heartbeat inside the window adds neither a counter tick, a log line nor a read.
+    rig.run("agent-ahead", 99);
+    CHECK(rig.ahead() == 1.0);
+    CHECK(rig.fetch_calls == 2);
+
+    // After the window the next one reports again.
+    rig.shed_clock.advance(60s);
+    rig.run("agent-ahead", 99);
+    CHECK(rig.ahead() == 2.0);
+    CHECK(rig.fetch_calls == 3);
+
+    // The store generation catches up: the agent is no longer ahead, nothing is counted.
+    rig.store_generation = 99;
+    rig.clock.advance(5s);  // past the generation cache TTL
+    rig.shed_clock.advance(60s);
+    rig.run("agent-ahead", 99);
+    CHECK(rig.ahead() == 2.0);
+    CHECK(rig.sent.empty());
+
+    log.stop();
+    const auto text = log.text();
+    std::size_t lines = 0;
+    for (auto p = text.find("reports policy generation 99 above the server's 7");
+         p != std::string::npos;
+         p = text.find("reports policy generation 99 above the server's 7", p + 1))
+        ++lines;
+    CHECK(lines == 2);
+    CHECK(text.find("agent_id=agent-ahead reports policy generation 99") != std::string::npos);
+    CHECK(text.find("until the server generation reaches 99") != std::string::npos);
+}
+
+TEST_CASE("GuardianReconcileFlow: a lagging generation cache does not report an agent as ahead",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.run("agent-1", 3);  // admitted and sent; the cache now holds 7
+    REQUIRE(rig.sent.size() == 1);
+    rig.store_generation = 120;  // the store moved on; the cache has not expired
+    yuzu::test::LogCapture log{spdlog::level::info};
+    rig.run("agent-2", 99);  // above the cached 7, below the real 120
+    log.stop();
+    CHECK(rig.ahead() == 0.0);
+    CHECK(rig.sent.size() == 1);
+    CHECK(log.text().find("above the server's") == std::string::npos);
+}
+
+TEST_CASE("GuardianReconcileFlow: an unreadable confirmation read reports nothing",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.on_fetch = [&](int n) -> GuardianGenerationCache::Result {
+        if (n == 1)
+            return 7;
+        return std::unexpected(std::string("pg down"));
+    };
+    yuzu::test::LogCapture log{spdlog::level::info};
+    rig.run("agent-ahead", 99);
+    log.stop();
+    CHECK(rig.ahead() == 0.0);
+    CHECK(rig.total() == 0.0);  // the degraded counter belongs to the admitted path only
+    CHECK(log.text().find("above the server's") == std::string::npos);
+}
+
+TEST_CASE("GuardianReconcileFlow: a fresh generation below the agent's is reported without another read",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.on_fetch = [&](int n) -> GuardianGenerationCache::Result {
+        return n == 1 ? 7 : 1;  // the cached read says behind, the fresh read says the agent is ahead
+    };
+    yuzu::test::LogCapture log{spdlog::level::info};
+    rig.run("agent-1", 3);
+    log.stop();
+    CHECK(rig.sent.empty());
+    CHECK(rig.ahead() == 1.0);
+    CHECK(rig.fetch_calls == 2);  // the confirmation reused the fresh value the push read
+    CHECK(log.text().find("reports policy generation 3 above the server's 1") !=
+          std::string::npos);
+}
+
+// ---------------------------------------------------------------------------------------
+// Store and agent text in log lines is neutralised (CWE-117).
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("GuardianReconcileFlow: store error text never puts a control byte in a log line",
+          "[guardian][reconcile_flow]") {
+    const std::string hostile = "store down\r\n\x1b[31mFORGED";
+    Rig rig;
+    SECTION("scope store degraded") {
+        rig.set_rules({rule("scoped", "", "tag:grp == inside")});
+        rig.scope_outcomes["inside"] = ScopeOutcome::StoreDegraded;
+        rig.store_degraded_detail = hostile;
+    }
+    SECTION("fresh generation unreadable") {
+        rig.on_fetch = [&](int n) -> GuardianGenerationCache::Result {
+            if (n == 1)
+                return 7;
+            return std::unexpected(hostile);
+        };
+    }
+    SECTION("rule store degraded") { rig.rules_error = hostile; }
+    SECTION("deployed set degraded") { rig.deployed_error = hostile; }
+    yuzu::test::LogCapture log{spdlog::level::warn};
+    rig.run("agent-1", 3);
+    log.stop();
+    REQUIRE(rig.count("degraded") == 1.0);
+    const auto text = log.text();
+    CHECK(text.find("FORGED") != std::string::npos);  // the line was written, folded
+    CHECK(yuzu::test::stray_control_bytes(text) == 0);
 }
 
 TEST_CASE("GuardianReconcileFlow: a failed bundle load aborts with the per-source wording and is negative-cached",

@@ -179,6 +179,9 @@ struct Harness {
     bool audit_throws{false};
     int audit_attempts{0}; // every call, persisted or not
     std::vector<PushCall> pushes;
+    // What the push stub returns: the agent count, -1 (unparseable scope) or -2 (a store read
+    // the fan-out depends on degraded).
+    int push_result{1};
     // Every perm_fn call, so a test can prove a polled fragment makes exactly
     // its own one gate check and no extra capability probes (S2).
     int perm_calls{0};
@@ -200,7 +203,7 @@ struct Harness {
     // degrade path (the nullable-dependency default `register_routes` itself
     // documents) — cpp-safety flagged this path as untested in the #4252 Gate 3
     // review.
-    explicit Harness(bool with_metrics = true) {
+    explicit Harness(bool with_metrics = true, bool with_push = true) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
@@ -257,11 +260,12 @@ struct Harness {
         auto agents_json_fn = [this]() -> std::string { return agents_json; };
         auto push_fn = [this](const std::string& scope, bool full_sync) -> int {
             pushes.push_back({scope, full_sync});
-            return 1;
+            return push_result;
         };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, store.get(),
-                               baselines.get(), agents_json_fn, push_fn,
+                               baselines.get(), agents_json_fn,
+                               with_push ? GuardianRoutes::PushFn{push_fn} : GuardianRoutes::PushFn{},
                                with_metrics ? &metrics : nullptr,
                                [this](const httplib::Request&, httplib::Response& res,
                                       const auth::Session&, const std::string& label) -> bool {
@@ -616,6 +620,148 @@ TEST_CASE("delete_baseline_action is gated on GuaranteedState:Delete",
     CHECK(res->status == 403);
     CHECK(h.baselines->get_baseline("bl1").has_value()); // still there
     CHECK(h.pushes.empty());                             // the fleet was never touched
+}
+
+namespace {
+
+// The last audit row recorded for `action`, or nullptr.
+const AuditRecord* last_audit(const Harness& h, const std::string& action) {
+    const AuditRecord* found = nullptr;
+    for (const auto& a : h.audit_log)
+        if (a.action == action)
+            found = &a;
+    return found;
+}
+
+bool has(const std::string& hay, const std::string& needle) {
+    return hay.find(needle) != std::string::npos;
+}
+
+} // namespace
+
+TEST_CASE("deploy_baseline: a push that reports a degraded store read audits degraded and warns",
+          "[pg][guardian_routes][baseline][deploy][degraded]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+    h.push_result = -2;
+
+    auto res = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK(h.audit_count("guaranteed_state.baseline.deploy", "degraded") == 1);
+    CHECK(h.audit_count("guaranteed_state.baseline.deploy", "success") == 0);
+    const auto* row = last_audit(h, "guaranteed_state.baseline.deploy");
+    REQUIRE(row != nullptr);
+    CHECK(has(row->detail, "a store read degraded - fan-out deferred to reconcile"));
+    const auto toast = res->get_header_value("HX-Trigger");
+    CHECK(has(toast, "\"level\":\"warning\""));
+    CHECK(has(toast, "a store read degraded"));
+    CHECK_FALSE(has(toast, "rule store degraded"));
+}
+
+TEST_CASE("deploy_baseline: with no push function wired it is NOT audited as a store degrade",
+          "[pg][guardian_routes][baseline][deploy][degraded]") {
+    Harness h{/*with_metrics=*/true, /*with_push=*/false};
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+
+    auto res = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(res != nullptr);
+    CHECK(h.audit_count("guaranteed_state.baseline.deploy", "degraded") == 0);
+    const auto* row = last_audit(h, "guaranteed_state.baseline.deploy");
+    REQUIRE(row != nullptr);
+    CHECK(row->result == "success");
+    CHECK(has(row->detail, "push not wired/failed"));
+}
+
+TEST_CASE("delete_baseline_action: every outcome of the convergence push is told apart",
+          "[pg][guardian_routes][baseline][delete][degraded]") {
+    const std::string action = "guaranteed_state.baseline.delete";
+    SECTION("a store read degraded: audited degraded, warning toast") {
+        Harness h;
+        h.seed_guard("g1", "GuardOne");
+        h.seed_baseline("bl1", "BL1", {"g1"});
+        REQUIRE(h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                                "application/x-www-form-urlencoded") != nullptr);
+        h.push_result = -2;
+        auto res = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/delete", "",
+                                   "application/x-www-form-urlencoded");
+        REQUIRE(res != nullptr);
+        CHECK_FALSE(h.baselines->get_baseline("bl1").has_value());
+        const auto* row = last_audit(h, action);
+        REQUIRE(row != nullptr);
+        CHECK(row->result == "degraded");
+        CHECK(has(row->detail, "fan-out deferred to reconcile"));
+        CHECK(has(row->detail, "a store read degraded"));
+        const auto toast = res->get_header_value("HX-Trigger");
+        CHECK(has(toast, "\"level\":\"warning\""));
+        CHECK(has(toast, "a store read degraded"));
+    }
+    SECTION("agents reached: success with the count") {
+        Harness h;
+        h.seed_guard("g1", "GuardOne");
+        h.seed_baseline("bl1", "BL1", {"g1"});
+        REQUIRE(h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                                "application/x-www-form-urlencoded") != nullptr);
+        h.push_result = 4;
+        auto res = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/delete", "",
+                                   "application/x-www-form-urlencoded");
+        REQUIRE(res != nullptr);
+        const auto* row = last_audit(h, action);
+        REQUIRE(row != nullptr);
+        CHECK(row->result == "success");
+        CHECK(has(row->detail, "reconciled agents=4"));
+        CHECK(has(res->get_header_value("HX-Trigger"), "\"level\":\"success\""));
+    }
+    SECTION("zero agents is still a reconciled count") {
+        Harness h;
+        h.seed_guard("g1", "GuardOne");
+        h.seed_baseline("bl1", "BL1", {"g1"});
+        REQUIRE(h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                                "application/x-www-form-urlencoded") != nullptr);
+        h.push_result = 0;
+        REQUIRE(h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/delete", "",
+                                "application/x-www-form-urlencoded") != nullptr);
+        const auto* row = last_audit(h, action);
+        REQUIRE(row != nullptr);
+        CHECK(row->result == "success");
+        CHECK(has(row->detail, "reconciled agents=0"));
+    }
+    SECTION("a draft: no push at all") {
+        Harness h;
+        h.seed_baseline("bl1", "BL1", {});
+        h.push_result = -2;  // would read as a degrade if the push were (wrongly) consulted
+        auto res = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/delete", "",
+                                   "application/x-www-form-urlencoded");
+        REQUIRE(res != nullptr);
+        CHECK(h.pushes.empty());
+        const auto* row = last_audit(h, action);
+        REQUIRE(row != nullptr);
+        CHECK(row->result == "success");
+        CHECK(has(row->detail, "(draft)"));
+        CHECK(has(res->get_header_value("HX-Trigger"), "\"level\":\"success\""));
+    }
+    SECTION("no push function wired: success, but the fleet was not re-converged") {
+        Harness h{/*with_metrics=*/true, /*with_push=*/false};
+        h.seed_guard("g1", "GuardOne");
+        h.seed_baseline("bl1", "BL1", {"g1"});
+        REQUIRE(h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                                "application/x-www-form-urlencoded") != nullptr);
+        auto res = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/delete", "",
+                                   "application/x-www-form-urlencoded");
+        REQUIRE(res != nullptr);
+        CHECK_FALSE(h.baselines->get_baseline("bl1").has_value());
+        const auto* row = last_audit(h, action);
+        REQUIRE(row != nullptr);
+        CHECK(row->result == "success");
+        CHECK(has(row->detail,
+                  "(was deployed; push not wired or failed; fleet not re-converged)"));
+        CHECK_FALSE(has(row->detail, "fan-out deferred to reconcile"));
+        CHECK(has(res->get_header_value("HX-Trigger"), "\"level\":\"warning\""));
+    }
 }
 
 TEST_CASE("update_baseline_from_form is gated on GuaranteedState:Write",

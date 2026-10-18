@@ -1272,7 +1272,7 @@ MUTATIONS.append(("begin_admitted hoisted above decide", _hoist_begin, "(h)"))
 NEXT = "case GuardianReconcileGate::Decision::"
 MUTATIONS += [
     ("Converged case loses its return",
-     _resub(r"(Decision::Converged:\s*)return;", r"\1(void)0;"), "(j)"),
+     _resub(r"(Decision::Converged:(?:(?!\bcase\b).)*?)\breturn;", r"\1(void)0;"), "(j)"),
     ("RateLimited case loses its return",
      _resub(r"return;(\s*" + NEXT + r"Shed: \{)", r"\1"), "(j)"),
     ("Shed case loses its return",

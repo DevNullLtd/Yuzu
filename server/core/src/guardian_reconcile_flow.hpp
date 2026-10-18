@@ -11,9 +11,9 @@
 /// dependencies that are NOT header-only value collaborators are injected, as nine callables
 /// (`store_wired`, `list_rules`, `deployed_ids`, `session_os`, `eval_scope`, `send_push`,
 /// `audit`, `random_suffix`, `now`) plus the `duration` histogram pointer. `now` is the one
-/// injected clock, and it drives the shed-log throttle only: the `DurationObserver` reads
-/// `steady_clock::now()` directly (and observes into `duration`), and the audit timestamps read
-/// `system_clock::now()` directly.
+/// injected clock, and it drives the shed-log and agent-ahead throttles only: the
+/// `DurationObserver` reads `steady_clock::now()` directly (and observes into `duration`), and
+/// the audit timestamps read `system_clock::now()` directly.
 ///
 /// WHAT STAYS IN server.cpp (deliberately, because it is security-relevant wiring and not
 /// control flow): the `DispatchCaller{.system = true}` construction and the
@@ -40,7 +40,7 @@
 /// shutdown order (servers drained before any store is reset).
 ///
 /// Thread-safe to the extent its collaborators are: `run()` is called concurrently from every
-/// heartbeat thread and holds no state of its own except the shed-log throttle atomic.
+/// heartbeat thread and holds no state of its own except the two log-throttle atomics.
 
 #include <atomic>
 #include <chrono>
@@ -110,7 +110,7 @@ struct GuardianReconcileFlowDeps {
     std::function<void(const AuditEvent&)> audit;
     /// The random hex suffix of a command id (`auth::AuthManager::bytes_to_hex(random_bytes(8))`).
     std::function<std::string()> random_suffix;
-    /// Clock for the shed-log throttle. Empty = `steady_clock::now`.
+    /// Clock for the log throttles. Empty = `steady_clock::now`.
     std::function<std::chrono::steady_clock::time_point()> now;
 };
 
@@ -210,7 +210,12 @@ public:
         switch (guardian_reconcile_gate_.decide(agent_id, agent_gen, current,
                                                 &shed_cause)) {
         case GuardianReconcileGate::Decision::Converged:
-            return;  // agent already at or ahead of current policy
+            // Converged: the agent is at or ahead of the current policy, so nothing is sent.
+            // An agent AHEAD of the server is not a healthy converged state: it refuses full
+            // pushes below its own generation, so it is checked and reported (throttled).
+            if (agent_gen > current)
+                report_agent_ahead(agent_id, agent_gen, std::nullopt);
+            return;
         case GuardianReconcileGate::Decision::RateLimited:
             metrics_
                 .counter("yuzu_server_guardian_reconciles_total",
@@ -368,11 +373,16 @@ public:
         if (!fresh_res) {
             spdlog::warn("Guardian heartbeat reconcile: policy generation unreadable "
                          "({}) - aborting re-push for agent_id={}",
-                         fresh_res.error(), ::yuzu::log_id_token(agent_id));
+                         ::yuzu::log_key_token(fresh_res.error()),
+                         ::yuzu::log_id_token(agent_id));
             abort_degraded("policy generation unreadable", fresh_res.error());
             return;
         }
         const std::uint64_t fresh_generation = *fresh_res;
+        // An agent above the fresh generation is not a healthy converged one (see the Converged
+        // case); the value is already in hand, so the check needs no further store read.
+        if (agent_gen > fresh_generation)
+            report_agent_ahead(agent_id, agent_gen, fresh_generation);
         if (fresh_generation <= agent_gen)
             return;  // converged against the fresh value: nothing to send
         // The rule bundle for this generation (#5513), loaded at most once per
@@ -420,19 +430,22 @@ public:
             case guardian::BundleLoadError::Source::rules:
                 spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) - "
                              "aborting re-push for agent_id={}",
-                             err.detail, ::yuzu::log_id_token(agent_id));
+                             ::yuzu::log_key_token(err.detail),
+                             ::yuzu::log_id_token(agent_id));
                 abort_degraded("rule store degraded", err.detail);
                 break;
             case guardian::BundleLoadError::Source::deployed:
                 spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
                              "degraded ({}) - aborting re-push for agent_id={}",
-                             err.detail, ::yuzu::log_id_token(agent_id));
+                             ::yuzu::log_key_token(err.detail),
+                             ::yuzu::log_id_token(agent_id));
                 abort_degraded("baseline store degraded", err.detail);
                 break;
             case guardian::BundleLoadError::Source::other:
                 spdlog::warn("Guardian heartbeat reconcile: rule bundle load failed "
                              "({}) - aborting re-push for agent_id={}",
-                             err.detail, ::yuzu::log_id_token(agent_id));
+                             ::yuzu::log_key_token(err.detail),
+                             ::yuzu::log_id_token(agent_id));
                 abort_degraded("rule bundle load failed", err.detail);
                 break;
             }
@@ -504,7 +517,8 @@ public:
         if (scope_degraded) {
             spdlog::warn("Guardian heartbeat reconcile: scope evaluation store degraded "
                          "({}) - aborting re-push for agent_id={}",
-                         ::yuzu::log_key_token(scope_degraded_detail), ::yuzu::log_id_token(agent_id));
+                         ::yuzu::log_key_token(scope_degraded_detail),
+                         ::yuzu::log_id_token(agent_id));
             abort_degraded("scope store degraded", scope_degraded_detail);
             return;  // send NOTHING: a narrowed full_sync would disarm the rule
         }
@@ -544,9 +558,9 @@ public:
                 .counter("yuzu_server_guardian_reconciles_total",
                          {{"result", "no_session"}})
                 .increment();
-            spdlog::info("Guardian heartbeat reconcile: agent_id={} re-registered while this "
-                         "re-push was being prepared - withholding it (retried on a later "
-                         "heartbeat)",
+            spdlog::info("Guardian heartbeat reconcile: agent_id={} re-registered, or its "
+                         "session was removed, while this re-push was being prepared - "
+                         "withholding it (retried on a later heartbeat)",
                          ::yuzu::log_id_token(agent_id));
             return;
         }
@@ -590,6 +604,41 @@ public:
     }
 
 private:
+    // An agent reports a policy generation above the server's. The agent refuses a full push
+    // labelled below the highest generation it has seen, so every full push to it is refused
+    // until the server generation catches up, which the heartbeat reconcile can neither fix
+    // nor otherwise see. Throttled to one check a
+    // minute per replica: only the CAS winner proceeds, and it confirms against the store first
+    // (the cached generation can lag the store by its TTL, so a lagging cache is not reported).
+    // `fresh` is the store value when the caller already holds it; a failed read here reports
+    // nothing (the degraded path counts store failures).
+    void report_agent_ahead(const std::string& agent_id, std::uint64_t agent_gen,
+                            std::optional<std::uint64_t> fresh) {
+        const auto now_rep = now_().time_since_epoch().count();
+        const auto interval_rep = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                      std::chrono::seconds(60))
+                                      .count();
+        auto last_rep = guardian_ahead_log_last_.load(std::memory_order_relaxed);
+        if (!((last_rep == kGuardianShedLogNever || now_rep - last_rep >= interval_rep) &&
+              guardian_ahead_log_last_.compare_exchange_strong(last_rep, now_rep,
+                                                               std::memory_order_relaxed)))
+            return;
+        if (!fresh) {
+            const auto res = guardian_generation_cache_.get_fresh();
+            if (!res)
+                return;
+            fresh = *res;
+        }
+        if (agent_gen <= *fresh)
+            return;
+        metrics_.counter("yuzu_server_guardian_agent_generation_ahead_total").increment();
+        spdlog::warn("Guardian heartbeat reconcile: agent_id={} reports policy generation {} "
+                     "above the server's {}; full pushes to it are refused by the agent until "
+                     "the server generation reaches {} (see Guaranteed State, restoring the "
+                     "policy generation)",
+                     ::yuzu::log_id_token(agent_id), agent_gen, *fresh, agent_gen);
+    }
+
     template <typename Fn>
     static void require(const Fn& fn, const char* name) {
         if (!fn)
@@ -622,6 +671,9 @@ private:
     static constexpr std::chrono::steady_clock::rep kGuardianShedLogNever =
         std::numeric_limits<std::chrono::steady_clock::rep>::min();
     std::atomic<std::chrono::steady_clock::rep> guardian_shed_log_last_{kGuardianShedLogNever};
+    // The same throttle for the agent-ahead check (report_agent_ahead), independent of the shed
+    // log.
+    std::atomic<std::chrono::steady_clock::rep> guardian_ahead_log_last_{kGuardianShedLogNever};
 };
 
 }  // namespace yuzu::server

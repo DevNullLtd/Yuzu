@@ -31,6 +31,59 @@ struct EnabledRow {
 
 using Members = std::expected<std::vector<std::string>, ScopeEvalError>;
 
+// `src` with every // and /* */ comment replaced by a space. String and character literals are
+// copied through untouched (a "//" inside one is not a comment), so a phrase that survives only
+// in a comment cannot satisfy a presence check below.
+std::string strip_comments(const std::string& src) {
+    std::string out;
+    out.reserve(src.size());
+    for (std::size_t i = 0; i < src.size();) {
+        const char c = src[i];
+        if (c == '"' || c == '\'') {
+            out += c;
+            ++i;
+            while (i < src.size() && src[i] != c) {
+                if (src[i] == '\\' && i + 1 < src.size())
+                    out += src[i++];
+                out += src[i++];
+            }
+            if (i < src.size())
+                out += src[i++];
+        } else if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            while (i < src.size() && src[i] != '\n')
+                ++i;
+            out += ' ';
+        } else if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            const auto close = src.find("*/", i + 2);
+            i = close == std::string::npos ? src.size() : close + 2;
+            out += ' ';
+        } else {
+            out += c;
+            ++i;
+        }
+    }
+    return out;
+}
+
+// True when the first `return` after `literal` in `body` is `return -2;` and no block closes
+// between the two: the degrade warning and the -2 sentinel sit in the same block.
+bool degrade_warning_returns_minus_two(const std::string& body, const std::string& literal) {
+    const auto at = body.find(literal);
+    if (at == std::string::npos)
+        return false;
+    const auto ret = body.find("return", at);
+    if (ret == std::string::npos)
+        return false;
+    // A `}` closes a block unless it is the end of a `{}` format placeholder.
+    for (std::size_t k = at; k < ret; ++k)
+        if (body[k] == '}' && (k == 0 || body[k - 1] != '{'))
+            return false;
+    std::size_t i = ret + std::string("return").size();
+    while (i < body.size() && (body[i] == ' ' || body[i] == '\t'))
+        ++i;
+    return body.compare(i, 3, "-2;") == 0;
+}
+
 } // namespace
 
 TEST_CASE("preflight_rule_scopes: resolves each distinct scope once and answers membership",
@@ -127,7 +180,7 @@ TEST_CASE("guardian_push_fn_ resolves rule scopes through the preflight before a
     REQUIRE(start != std::string::npos);
     const auto end = src.find("return sent;", start);
     REQUIRE(end != std::string::npos);
-    const std::string body = src.substr(start, end - start);
+    const std::string body = strip_comments(src.substr(start, end - start));
 
     CHECK(body.find("value_or(std::vector<std::string>{})") == std::string::npos);
     const auto pre = body.find("guardian::preflight_rule_scopes(");
@@ -141,4 +194,30 @@ TEST_CASE("guardian_push_fn_ resolves rule scopes through the preflight before a
     // Both the target resolution and the preflight answer a degraded read with the -2 sentinel.
     CHECK(body.find("target scope read degraded") != std::string::npos);
     CHECK(body.find("rule scope read degraded") != std::string::npos);
+    // A group: scope's membership is read through the checked accessor, whose failure is
+    // distinguishable from an empty group; the unchecked one would narrow the cohort silently.
+    CHECK(body.find("get_members_checked(") != std::string::npos);
+    CHECK(body.find("->get_members(") == std::string::npos);
+    CHECK(body.find("group member read degraded") != std::string::npos);
+    // Every degrade warning is followed, in the same block, by `return -2;`: a warning that
+    // fell through to the send would narrow the fan-out instead of aborting it.
+    for (const char* literal :
+         {"policy-generation read degraded", "list_rules degraded",
+          "deployed_member_rule_ids degraded", "group member read degraded",
+          "target scope read degraded", "rule scope read degraded"}) {
+        INFO(literal);
+        CHECK(degrade_warning_returns_minus_two(body, literal));
+    }
+}
+
+TEST_CASE("strip_comments keeps literals and drops comments (the wiring pin's own tooling)",
+          "[guardian][scope_preflight][wiring]") {
+    CHECK(strip_comments("a // return -2;\nb") == "a  \nb");
+    CHECK(strip_comments("a /* get_members_checked( */ b") == "a   b");
+    CHECK(strip_comments("\"x // y\" z") == "\"x // y\" z");
+    CHECK(degrade_warning_returns_minus_two("warn(\"w\"); return -2;", "w"));
+    CHECK_FALSE(degrade_warning_returns_minus_two("warn(\"w\"); } return -2;", "w"));
+    CHECK(degrade_warning_returns_minus_two("warn(\"w ({})\", x); return -2;", "w"));
+    CHECK_FALSE(degrade_warning_returns_minus_two("warn(\"w\"); return sent;", "w"));
+    CHECK_FALSE(degrade_warning_returns_minus_two("warn(\"w\");", "w"));
 }

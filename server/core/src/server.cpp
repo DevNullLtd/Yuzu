@@ -431,6 +431,11 @@ extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bun
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
 // kBundledDefinitions / kBundledSets / kBundledPluginDocs: bundled_content.hpp
 
+// guardian::preflight_rule_scopes skips a disabled row only through `requires { row.enabled; }`,
+// so renaming this member would silently turn that skip off. Fail the build instead.
+static_assert(requires(const GuaranteedStateRuleRow& r) { r.enabled; },
+              "preflight_rule_scopes reads GuaranteedStateRuleRow::enabled");
+
 std::string trim_ascii_whitespace(std::string_view s) {
     auto b = s.find_first_not_of(" \t\r\n");
     if (b == std::string_view::npos) return {};
@@ -5918,6 +5923,14 @@ public:
                               "store failure and not counted as result=degraded)",
                               "counter");
             metrics_.counter("yuzu_server_guardian_reconcile_invalidated_total");
+            metrics_.describe("yuzu_server_guardian_agent_generation_ahead_total",
+                              "Guardian heartbeat reconciles that found an agent reporting a "
+                              "policy generation above the server's (confirmed against a fresh "
+                              "store read, at most one check a minute per replica). The agent "
+                              "refuses full pushes until the server generation reaches its own, "
+                              "so nothing is sent to it",
+                              "counter");
+            metrics_.counter("yuzu_server_guardian_agent_generation_ahead_total");
             metrics_.describe("yuzu_server_guardian_reconcile_duration_seconds",
                               "Wall time of an ADMITTED Guardian heartbeat reconcile (from "
                               "admission to every exit, including aborted ones); the sizing "
@@ -17852,7 +17865,7 @@ private:
             // REST wiring; this lambda reads it when called (runtime), never at
             // registration time, so the ordering is fine.
             [this](const std::string& scope, bool full_sync) -> int {
-                return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
+                return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -1;
             },
             &metrics_, // #4252 — platform-support-matrix-stale counter
             step_up_fn); // Guard edit/delete twins: same MFA step-up as the REST PUT/DELETE
@@ -20646,8 +20659,11 @@ private:
             // GuaranteedStatePush from the store's enabled rules (typed
             // spark/assertion/remediation from spec_json) and deliver as a
             // `__guard__`/push_rules CommandRequest via the agent dispatch path (reuses
-            // the instruction-dispatch scope→send_to idiom). Returns the agent count, or
-            // -1 on an unparseable scope. See docs/guardian-mvp-contract.md (step 3/G12).
+            // the instruction-dispatch scope→send_to idiom). Returns the agent count, -1 on an
+            // unparseable scope, or -2 when a store read the fan-out depends on (policy
+            // generation, rules, deployed set, group members, or a tag or property read behind
+            // a scope) degraded: nothing was sent, and callers map -2 to a retryable store
+            // fault rather than an input error. See docs/guardian-mvp-contract.md (step 3/G12).
             // Also stored into guardian_push_fn_ (member) so baseline deploy / delete of a
             // deployed Baseline push via this exact fan-out. The parenthesised assignment
             // yields the assigned std::function, which is what gets passed here by value.
@@ -20660,7 +20676,8 @@ private:
                 // reconcile that is in flight on this replica, which a push that sends nothing
                 // has no business doing. The parsed expression is used for the target
                 // resolution further down. (A degraded store read below still returns -2 after
-                // the invalidations: the caller's bump already happened, so they stay due.)
+                // the invalidations: a caller that bumps the generation has already done so, and
+                // the heartbeat reconcile converges the fleet once the store recovers.)
                 std::optional<yuzu::scope::Expression> parsed_scope;
                 if (!scope.empty() && !(scope.starts_with("group:") && mgmt_group_store_)) {
                     auto parsed = yuzu::scope::parse(scope);
@@ -20673,6 +20690,10 @@ private:
                 // the heartbeat reconcile's cached generation (about 2 s stale) and held bundle
                 // so the next heartbeat decides from the post-bump state instead of waiting out
                 // the TTL.
+                // The REST and MCP pushes do not bump the generation but reach the same
+                // invalidations before the store reads, so a push against a degraded store also
+                // withholds the reconciles in flight on this replica; each withheld agent is
+                // admitted again when its 25 s claim expires.
                 // Rule create/update/delete on this replica reach the same two invalidations
                 // through GuaranteedStateStore::set_on_rule_mutation, and a Baseline update,
                 // delete or deployed create through BaselineStore::set_on_baseline_mutation
@@ -20756,17 +20777,16 @@ private:
                         return -1;
                     // No rs_store/principal passed — LOCAL-ONLY dispatch
                     // (registry_.send_to below), so evaluate_scope_local
-                    // (#4981 PR-1 B4) is correct: a from_result_set:/props.<key>
-                    // atom with no store wired still ABORTS (Unresolvable)
-                    // instead of silently evaluating the atom false (which a
-                    // NOT combinator inverted to a fleet-wide arm);
-                    // An Unresolvable expression (a permanent property of the scope
-                    // text) resolves to zero targets: arm nothing. A degraded store
-                    // read does NOT: it aborts the push (-2), because nothing is sent
-                    // and the caller keeps the bump due, instead of a push that
-                    // quietly addresses nobody (#5610). Unlike evaluate_scope, this
-                    // can never abort for a presence reason, so a presence-store blip
-                    // cannot periodically disarm this push.
+                    // (#4981 PR-1 B4) is correct: it can never abort for a presence
+                    // reason, so a presence-store blip cannot periodically disarm
+                    // this push. An Unresolvable expression (a from_result_set:/
+                    // props.<key> atom with no store wired: a permanent property of
+                    // the scope text) resolves to zero targets, so nothing is armed.
+                    // A degraded store read does NOT: it aborts the push (-2)
+                    // instead of a push that quietly addresses nobody (#5610). Any
+                    // generation bump has already happened by then, and the
+                    // heartbeat reconcile converges the fleet once the store
+                    // recovers.
                     auto resolved = registry_.evaluate_scope_local(
                         *parsed_scope, tag_store_.get(), custom_properties_store_.get());
                     if (resolved) {

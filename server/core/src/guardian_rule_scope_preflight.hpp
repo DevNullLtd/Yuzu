@@ -60,7 +60,8 @@ struct RuleScopePreflightError {
 
 /// `evaluate` is `(const yuzu::scope::Expression&) ->
 /// std::expected<std::vector<std::string>, ScopeEvalError>`; `Rules` is any range of rows with a
-/// `scope_expr` string (and, optionally, an `enabled` flag: a disabled row is skipped). Each distinct non-empty `scope_expr` is parsed and evaluated once.
+/// `scope_expr` string (and, optionally, an `enabled` flag: a disabled row is skipped). Each
+/// distinct non-empty `scope_expr` is parsed and evaluated once.
 template <class Rules, class Eval>
 [[nodiscard]] auto preflight_rule_scopes(const Rules& rules, Eval&& evaluate)
     -> std::expected<RuleScopeMembers, RuleScopePreflightError> {

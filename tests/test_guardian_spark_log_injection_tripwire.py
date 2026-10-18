@@ -2,8 +2,8 @@
 """#4665 / #5513 tripwire: no NEW spdlog:: call prints a rule-id/Spark-key-shaped value, a claimed
 agent id, agent-supplied free text or store error text unwrapped.
 
-Seven checks, numbered in the order they appear below. Check 1 is the #4665 rule-id / Spark-key
-check; checks 2 to 7 are the #5513 agent-id, free-text and store-error checks.
+Eight checks, numbered in the order they appear below. Check 1 is the #4665 rule-id / Spark-key
+check; checks 2 to 8 are the #5513 agent-id, free-text and store-error checks.
 
 CHECK 1 (#4665). #4665 closed CWE-117 log-injection on operator-authored Guardian `rule_id` /
 Spark `key` (and the path/hive/service/unit-name values a Spark mechanism embeds
@@ -216,6 +216,18 @@ whose format literal starts with "Gateway SendCommand" must wrap a response fram
 `.command_id()` accessor and any `.cluster_id` member or accessor; the expected target
 `expected_agent_id` comes from the session table and is not matched, and neither is the local
 `cmd_id` (a copy of the command id made before the print).
+
+CHECK 8 (GUARDIAN_RECONCILE_LOG_FILES, server/core/src/server.cpp and
+server/core/src/guardian_reconcile_flow.hpp) covers the Guardian push fan-out and the heartbeat
+reconcile flow. An spdlog:: statement whose format literal starts with "Guardian push:" (the fan-out
+in server.cpp) or "Guardian heartbeat reconcile:" or "Guardian: reconciled" (the flow header) must
+wrap, as a whole log_id_token / log_key_token call, any argument that is a bare `agent_id` (only
+`.size()`, `.empty()` and `.length()` on it are exempt), the bare push `scope` (the operator-supplied
+scope expression), `scope_degraded_detail`, a `.detail` member (a bundle load error), a store
+`.error()` result or a `.what()` message. It is lexical, like check 7: a literal that does not start
+with one of those prefixes, or a value copied into another local first, is not seen. The bare-name
+rules for `agent_id` and `scope` are scoped to those literals, so they do not apply to the rest of
+server.cpp.
 
 WHAT CHECKS 2 TO 7 DELIBERATELY DO NOT COVER (session-resolved ids). Log lines that print an
 agent id read back from the session table or the enrollment store print it as stored: the
@@ -1438,6 +1450,44 @@ def find_pki_signer_violations_in_text(text: str) -> list[tuple[int, str]]:
     return out
 
 
+# Check 8: the Guardian push fan-out (server.cpp) and the heartbeat reconcile flow
+# (guardian_reconcile_flow.hpp). Both print store error text, a bundle-load error detail and the
+# agent id; the fan-out also prints the operator-supplied push `scope`. Each must be wholly one
+# wrap call. The match is by the literal's prefix, so the bare-name rules do not reach the rest of
+# server.cpp (where `agent_id` and `scope` are common names).
+GUARDIAN_RECONCILE_LOG_FILES: tuple[str, ...] = (
+    "server/core/src/server.cpp",
+    "server/core/src/guardian_reconcile_flow.hpp",
+)
+_GUARDIAN_RECONCILE_LITERAL_PREFIXES = (
+    "Guardian push:",
+    "Guardian heartbeat reconcile:",
+    "Guardian: reconciled",
+)
+_GUARDIAN_RECONCILE_RAW_RE = re.compile(
+    r"(?<![\w.>:])(?:agent_id|scope)\b(?!\s*\.\s*(?:size|empty|length)\s*\()"
+    r"|\bscope_degraded_detail\b"
+    r"|(?:\.|->)\s*detail\b"
+    r"|(?:\.|->)\s*error\s*\(\s*\)"
+    r"|(?:\.|->)\s*what\s*\(\s*\)"
+)
+
+
+def find_guardian_reconcile_log_violations_in_text(text: str) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for pos, stmt in find_spdlog_statements_with_pos(text):
+        parsed = parse_call(stmt)
+        if parsed is None:
+            continue
+        if not parsed[0].lstrip().startswith(_GUARDIAN_RECONCILE_LITERAL_PREFIXES):
+            continue
+        for arg in split_top_level_args(parsed[1]):
+            if _GUARDIAN_RECONCILE_RAW_RE.search(arg) is not None and not argument_is_wrapped(arg):
+                out.append((text.count("\n", 0, pos) + 1, stmt))
+                break
+    return out
+
+
 # Check 5: logging forms the scanner above does not parse. find_spdlog_statements only
 # understands `spdlog::<level>(`, `spdlog::get(<name>)-><level>(` and `<logger>-><level>(`; any other form in the files of
 # the second check would print its arguments unexamined. They are absent today, so the guard
@@ -2192,6 +2242,48 @@ def _selfcheck() -> None:
         if find_pki_signer_violations_in_text(src):
             raise SystemExit(f"selfcheck: unexpected PKI signer violation: {src!r}")
 
+    # 14. The Guardian push fan-out and reconcile flow rule (find_guardian_reconcile_log_violations_in_text).
+    reconcile_must_match = [
+        'spdlog::warn("Guardian push: list_rules degraded ({}) - aborting push (scope={})",'
+        " rules_result.error(), ::yuzu::log_key_token(scope));",
+        'spdlog::warn("Guardian push: list_rules degraded ({}) - aborting push (scope={})",'
+        " ::yuzu::log_key_token(rules_result.error()), scope);",
+        'spdlog::warn("Guardian push: target scope read degraded ({}) - aborting (scope={})",'
+        " resolved.error().detail, ::yuzu::log_key_token(scope));",
+        'spdlog::warn("Guardian heartbeat reconcile: policy generation unreadable ({}) - aborting'
+        ' re-push for agent_id={}", fresh_res.error(), ::yuzu::log_id_token(agent_id));',
+        'spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) - aborting re-push for'
+        ' agent_id={}", err.detail, ::yuzu::log_id_token(agent_id));',
+        'spdlog::warn("Guardian heartbeat reconcile: scope evaluation store degraded ({}) - aborting'
+        ' re-push for agent_id={}", scope_degraded_detail, ::yuzu::log_id_token(agent_id));',
+        'spdlog::info("Guardian heartbeat reconcile: agent_id={} re-registered", agent_id);',
+        'spdlog::info("Guardian: reconciled agent {} (generation {} -> {})", agent_id, agent_gen, g);',
+        'spdlog::warn("Guardian heartbeat reconcile: x {}", e.what());',
+        'spdlog::warn("Guardian heartbeat reconcile: x {}", err . detail);',
+    ]
+    for src in reconcile_must_match:
+        if not find_guardian_reconcile_log_violations_in_text(src):
+            raise SystemExit(f"selfcheck: expected a Guardian reconcile log violation: {src!r}")
+    reconcile_must_not = [
+        'spdlog::warn("Guardian push: list_rules degraded ({}) - aborting push (scope={})",'
+        " ::yuzu::log_key_token(rules_result.error()), ::yuzu::log_key_token(scope));",
+        'spdlog::warn("Guardian heartbeat reconcile: policy generation unreadable ({}) - aborting'
+        ' re-push for agent_id={}", ::yuzu::log_key_token(fresh_res.error()),'
+        " ::yuzu::log_id_token(agent_id));",
+        'spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) - aborting re-push for'
+        ' agent_id={}", ::yuzu::log_key_token(err.detail), ::yuzu::log_id_token(agent_id));',
+        'spdlog::warn("Guardian heartbeat reconcile: x {}", ::yuzu::log_key_token(scope_degraded_detail));',
+        'spdlog::info("Guardian: reconciled agent {} (generation {} -> {})",'
+        " ::yuzu::log_id_token(agent_id), agent_gen, fresh_generation);",
+        'spdlog::warn("Guardian heartbeat reconcile: n {}", agent_id.size());',
+        'spdlog::warn("Guardian heartbeat reconcile: shed {} so far", shed_so_far);',
+        # Not a Guardian reconcile line: the bare-name rules are deliberately not applied elsewhere.
+        'spdlog::warn("Agent {} did a thing ({})", agent_id, scope);',
+    ]
+    for src in reconcile_must_not:
+        if find_guardian_reconcile_log_violations_in_text(src):
+            raise SystemExit(f"selfcheck: unexpected Guardian reconcile log violation: {src!r}")
+
 
 # ---------------------------------------------------------------------------
 # main
@@ -2345,6 +2437,13 @@ RULE_GROUPS: tuple[RuleGroup, ...] = (
         'spdlog::warn("PKI: sign_csr failed for agent {}", agent_id);',
     ),
     RuleGroup(
+        "GUARDIAN_RECONCILE_LOG_FILES",
+        lambda: GUARDIAN_RECONCILE_LOG_FILES,
+        lambda text, rel: _fmt_stmt_hits(rel, find_guardian_reconcile_log_violations_in_text(text)),
+        "agent",
+        'spdlog::warn("Guardian push: list_rules degraded ({}) - aborting push", r.error());',
+    ),
+    RuleGroup(
         "UNSCANNED_LOGGING_FILES",
         lambda: UNSCANNED_LOGGING_FILES,
         _find_unscanned,
@@ -2365,6 +2464,7 @@ REQUIRED_RULE_GROUPS: tuple[str, ...] = (
     "REGISTRY_FREE_TEXT_FILES",
     "COMMAND_TEXT_FILES",
     "PKI_SIGNER_FILES",
+    "GUARDIAN_RECONCILE_LOG_FILES",
     "UNSCANNED_LOGGING_FILES",
 )
 
