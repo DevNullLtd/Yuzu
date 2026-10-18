@@ -1175,8 +1175,11 @@ def load_ledger(ledger_dir=None):
     for f in sorted(ledger_dir.glob("*.json")):
         domain = f.stem
         if domain not in DOMAINS:
-            errors.append(f"{f}: filename '{domain}.json' is not one of the "
-                           f"declared domains {DOMAINS}")
+            # Not read further: an undeclared file's name is attacker-shaped text, so it is
+            # quoted (bounded repr) and none of its content or name is used again.
+            errors.append(f"{f.name[:60]!r}: filename is not one of the declared "
+                          f"domains {DOMAINS}")
+            continue
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
         except (ValueError, OSError, RecursionError) as e:  # ValueError: bad JSON/UTF-8, >4300-digit ints
@@ -2196,6 +2199,8 @@ def _selftest_body():
     rc_l, out_l = _drive(base_rows, today=day_a - 100 * one_day)
     check(rc_l == 0 and "or retire it" not in out_l, f"lapse: no warning far from the date, got {out_l[:200]}")
 
+    expect("odd-filename", _drive(base_rows, extra_files={"x\n::error::injected.json": "{bad"}), 1,
+           "not one of the declared domains", absent=("\n::error::injected",))
     expect("bad-method", _drive(base_rows + [_mk("bm", "retire", method="GET\n::error::injected")]), 1,
            "method must be 1-16 upper-case", absent=("\n::error::injected",))
     expect("bad-path", _drive(base_rows + [_mk("bp", "retire", path="/x\n::error::injected")]), 1,
@@ -2285,9 +2290,9 @@ def _selftest_body():
               and dumped.get("counts", {}).get("mcp_resources") == 1,
               f"dump-json: mcp_resources must be listed and counted, got rc={rc_j} {dumped}")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dd:
-        (Path(dd) / "x.json").mkdir()
+        (Path(dd) / "devices.json").mkdir()
         _rows, errs = load_ledger(dd)
-        check(any("x.json" in e and "invalid JSON" in e for e in errs),
+        check(any("devices.json" in e and "invalid JSON" in e for e in errs),
               f"load_ledger: a directory named *.json is a clean error, got {errs}")
 
     if failures:
