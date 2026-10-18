@@ -1505,8 +1505,8 @@ out the permits in force (`yuzu_gw_upstream_permit_limit`):
   permit each, and the gateway logs a WARN (`The server allows <N> concurrent
   streams on the gateway's connections; ...`). The other lanes can then hit the
   server's limit too, and a failed stream-status notification counts against the
-  circuit breaker as before. Raise the server's `--grpc-max-concurrent-streams`, or
-  the channel's `pool_size`.
+  circuit breaker as before. Raise the server's `--grpc-max-concurrent-streams`
+  (not the channel's `pool_size`; see "Keep one upstream connection" below).
 - Each change is logged (`Upstream permits in force: ...` or `Upstream permits
   lowered to the server's stream limit: ...`).
 
@@ -1521,8 +1521,26 @@ same. Each refusal is counted in `yuzu_gw_upstream_rpc_errors_total` under
 `code="too_many_streams"`.
 
 There is nothing to configure for this. To give the gateway more upstream capacity,
-raise the server's stream limit or the channel's `pool_size`; raising
-`upstream_register_concurrency` above what the server allows has no effect.
+raise the server's stream limit; raising `upstream_register_concurrency` above what
+the server allows has no effect.
+
+**Keep one upstream connection.** The server's limit applies to each connection on
+its own, and the gateway's HTTP/2 client enforces it per connection, but the gateway
+adds the limits of all the channel's connections together and sizes its permits from
+the total, while each call goes to one connection, round-robin. With one connection
+(the shipped default: `pool_size` 1 and one endpoint) the two agree. With more
+(`pool_size` above 1, or several endpoints; the gateway logs a WARN at boot for such
+a channel), one connection can be asked for more streams than the server allows on
+it; the gateway then refuses the call itself (`too_many_streams`), and on the
+stream-status lane, which does not retry, that counts against the circuit breaker.
+Keep `pool_size` 1 and one endpoint. A second, smaller window exists even with one
+connection: after it is lost, the gateway knows no limit until the server's
+`SETTINGS` arrives on the new connection, so the permits go back to the configured
+sizes (48 register and 8 inventory, plus the 61 reserved streams: 117). Against a
+server limit below that, the first burst after a redial can exceed it; the server
+resets the excess streams (`REFUSED_STREAM`), and each counts as an ordinary failed
+call (`code="stream_error"`). The C++ default of 128 leaves room. Per-connection
+accounting is #6057.
 
 **Upstream channel tuning** (read when the upstream channel configuration is parsed,
 at start-up; set it in the `yuzu_gw` section of `sys.config`. No `YUZU_GW_*`
@@ -1767,7 +1785,7 @@ those) is a dev or UAT posture, and the gateway refuses the unsafe half of it at
 
 | Channel option | Default | Meaning |
 |---|---|---|
-| `pool_size` | 1 | HTTP/2 connections **per endpoint**, 1 to 64 (a value outside that range is replaced by the default and the gateway logs a warning at boot, see [Bad values replaced by defaults](#bad-values-replaced-by-defaults)). One connection is what the grpcbox client held. **Raising it has consequences:** calls go round-robin over the live connections, so behind a layer-4 VIP in front of several server replicas the connections can land on different replicas (see "Several core replicas" under [What happens when the server restarts](#what-happens-when-the-server-restarts)), and after a certificate change the connections redial independently. Registration and inventory calls run one at a time, so a larger pool does not speed them up |
+| `pool_size` | 1 | HTTP/2 connections **per endpoint**, 1 to 64 (a value outside that range is replaced by the default and the gateway logs a warning at boot, see [Bad values replaced by defaults](#bad-values-replaced-by-defaults)). One connection is what the grpcbox client held. **Raising it has consequences:** calls go round-robin over the live connections, so behind a layer-4 VIP in front of several server replicas the connections can land on different replicas (see "Several core replicas" under [What happens when the server restarts](#what-happens-when-the-server-restarts)), and after a certificate change the connections redial independently, and the gateway sums the server's per-connection stream limit over them while each connection enforces its own (see "Keep one upstream connection", #6057). Registration and inventory calls run one at a time, so a larger pool does not speed them up. Keep 1 |
 | `connect_timeout` | 5000 | Milliseconds allowed for the TCP connect and, separately, for the TLS handshake, 1 to 600000 |
 | `max_receive_message_bytes` | 16777216 (16 MiB) | The largest response message accepted, up to 1 GiB; a larger one fails the call as soon as the limit is passed |
 
@@ -3506,7 +3524,7 @@ plus the call.
 | Symptom | What you see | Cause | Action |
 |---|---|---|---|
 | Agents slow to come back after a server restart on a large fleet | The server log shows more than one `[gateway] ProxyRegister succeeded` line per agent; agents give up on a `Register` after 30 s; `yuzu_gw_upstream_rpc_duration_ms` for the `register` rpc name has a high mean | Before the `upstream_tcp_nodelay` change, the 43 ms per-`Register` Nagle delay (OBSERVED on a rig, see above); otherwise a slow server: the register pool (48) drains at 48 divided by the server's answer time | Confirm `upstream_tcp_nodelay` is not `false` in the `yuzu_gw` section of `sys.config` (and that no endpoint has a hand-set `{nodelay, false}`); check the server's `ProxyRegister` latency and `yuzu_gw_upstream_permits_waiting{class="register"}`. A slow server shows as `yuzu_gw_upstream_slow` 1 and a duty cycle near 1; see "Slow server" below |
-| Registrations are being refused or abandoned while the gateway is busy | `yuzu_gw_upstream_permit_refused_total{class="register"}` rises (`queue_full` or `deadline`), with `yuzu_gw_upstream_calls_dropped_total{rpc_name="register"}` for the deadline case; agents log `UNAVAILABLE` and retry | Every register permit is held and the wait queue is full, or a request's deadline passed while it waited; nothing is sent for it, so no server session is created for a request nobody waits for | Look at the cause (a slow server `ProxyRegister`, a restart herd; see the table above). The refused agents retry; a sustained `queue_full` with a healthy server points at raising `upstream_register_concurrency` together with the channel's `pool_size` (see "Upstream call permits") |
+| Registrations are being refused or abandoned while the gateway is busy | `yuzu_gw_upstream_permit_refused_total{class="register"}` rises (`queue_full` or `deadline`), with `yuzu_gw_upstream_calls_dropped_total{rpc_name="register"}` for the deadline case; agents log `UNAVAILABLE` and retry | Every register permit is held and the wait queue is full, or a request's deadline passed while it waited; nothing is sent for it, so no server session is created for a request nobody waits for | Look at the cause (a slow server `ProxyRegister`, a restart herd; see the table above). The refused agents retry; a sustained `queue_full` with a healthy server points at raising `upstream_register_concurrency` together with the server's stream limit (see "Upstream call permits"; keep the channel's `pool_size` at 1, see "Keep one upstream connection") |
 
 **Slow server.** A gateway reaches the server through lanes of bounded capacity, and
 "slow" is defined from how often those lanes are full, not from a latency figure.

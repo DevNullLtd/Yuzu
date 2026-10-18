@@ -59,6 +59,20 @@
 %%%     register / configured register, rounded down, at least 1, at most the
 %%%     effective register.
 %%%   - With no capacity known, the configured sizes apply.
+%%%
+%%% Two limits of this sizing (#6057, from the independent review of
+%%% 2026-10-18). (1) The capacity is SUMMED over the channel's connections, but
+%%% gun enforces the server's limit PER CONNECTION and yuzu_grpc_client_channel:
+%%% pick/2 hands calls out round-robin, so with more than one connection
+%%% (pool_size above 1, or several endpoints) one connection can be asked for
+%%% more streams than the server allows on it. Keep pool_size 1 and one
+%%% endpoint, the shipped default; yuzu_gw_app warns at boot otherwise. (2)
+%%% After the connection is lost, the capacity is `none' until the new
+%%% connection's SETTINGS arrives, so the configured ceilings apply in that
+%%% redial window: 48 + 8 permits plus the 61 reserved streams, 117, which fits
+%%% the C++ default of 128; a server limit below that can be exceeded by the
+%%% first burst, and the server's REFUSED_STREAM reset is an ordinary
+%%% stream_error to yuzu_gw_upstream.
 %%% Every change is applied at once. A ceiling that drops below the permits
 %%% already held revokes nothing: those calls finish, and no permit of the pool
 %%% is granted until the held count is below the new ceiling. A ceiling that

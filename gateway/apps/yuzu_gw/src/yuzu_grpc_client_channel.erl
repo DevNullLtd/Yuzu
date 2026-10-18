@@ -33,7 +33,12 @@
 %%% while any of them declares none (RFC 9113: no limit); otherwise the sum of
 %%% the declared values. A connection that goes down or is retired leaves the
 %%% sum. Each change is passed to yuzu_gw_upstream_regulator, which sizes the
-%%% gateway's upstream permits from it.
+%%% gateway's upstream permits from it. The sum is right only for ONE
+%%% connection: gun enforces the limit per connection and pick/2 is
+%%% round-robin, so keep pool_size 1 and one endpoint (the shipped default; see
+%%% the regulator's module doc and #6057, which also covers the redial window
+%%% before the new connection's SETTINGS, and the `none' a killed channel never
+%%% sends from terminate/2).
 %%%
 %%% A call finding no connection up waits on one that is connecting (at most its
 %%% own timeout); if none is, it fails at once with the last connection error,
