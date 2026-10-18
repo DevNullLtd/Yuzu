@@ -47,8 +47,12 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <optional>
 #include <random>
+#include <stdexcept>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::pg::PgPool;
@@ -249,6 +253,179 @@ TEST_CASE("GuaranteedStateStore: policy_generation persists across reopen",
     PgPool pool2{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore reopened(pool2);
     CHECK(reopened.current_policy_generation() == 1);
+}
+
+// ── #5513 chaos-F1: the post-mutation hook ───────────────────────────────────
+
+namespace {
+
+// Make the best-effort generation bump fail deterministically: with its table renamed the
+// UPDATE errors (42P01), while the rule tables the mutation itself writes are untouched.
+// Restores on destruction.
+class BrokenBump {
+public:
+    // The constructor may REQUIRE (a throw there leaves no object, so no destructor runs); the
+    // destructor path below never throws, because a Catch2 REQUIRE failing during unwinding
+    // would std::terminate the whole binary.
+    explicit BrokenBump(PgPool& pool) : pool_(pool) {
+        active_ = rename("guardian_meta", "guardian_meta_off");
+        REQUIRE(active_);
+    }
+    ~BrokenBump() { (void)restore(); }
+    bool restore() noexcept {
+        if (!active_)
+            return true;
+        active_ = !rename("guardian_meta_off", "guardian_meta");
+        return !active_;
+    }
+    BrokenBump(const BrokenBump&) = delete;
+    BrokenBump& operator=(const BrokenBump&) = delete;
+
+private:
+    bool rename(const char* from, const char* to) noexcept {
+        try {
+            auto lease = pool_.acquire();
+            if (!lease)
+                return false;
+            const std::string sql =
+                std::string("ALTER TABLE guaranteed_state_store.") + from + " RENAME TO " + to;
+            pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+            return r.status() == PGRES_COMMAND_OK;
+        } catch (...) {
+            return false;
+        }
+    }
+    PgPool& pool_;
+    bool active_{false};
+};
+
+} // namespace
+
+TEST_CASE("GuaranteedStateStore: the rule-mutation hook fires once per successful create, update and delete",
+          "[pg][guaranteed_state_store][generation][rule_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    // What the hook sees: the committed row, the already-bumped generation, and whether a
+    // pool lease was free (the pool has size 1 below for that last probe, not here).
+    int fired = 0;
+    std::vector<std::optional<std::uint64_t>> generations_seen;
+    std::vector<bool> row_present_seen;
+    store.set_on_rule_mutation([&] {
+        ++fired;
+        generations_seen.push_back(store.current_policy_generation());
+        const auto row = store.get_rule("r1");
+        row_present_seen.push_back(row.has_value() && row->has_value());
+    });
+
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    CHECK(fired == 1);
+    auto upd = make_rule("r1", "guard-one");
+    upd.enabled = false;
+    REQUIRE(store.update_rule(upd));
+    CHECK(fired == 2);
+    REQUIRE(store.delete_rule("r1"));
+    CHECK(fired == 3);
+
+    // AFTER the bump attempt, not before it: each call saw its own bump already applied.
+    REQUIRE(generations_seen.size() == 3);
+    CHECK(generations_seen[0] == 1);
+    CHECK(generations_seen[1] == 2);
+    CHECK(generations_seen[2] == 3);
+    // AFTER commit: the create's row was visible, the delete's row already gone.
+    CHECK(row_present_seen[0]);
+    CHECK(row_present_seen[1]);
+    CHECK_FALSE(row_present_seen[2]);
+
+    // A mutation that did not commit does not fire it (nothing changed, nothing to invalidate).
+    CHECK_FALSE(store.update_rule(make_rule("nope", "missing")));
+    CHECK_FALSE(store.delete_rule("nope"));
+    REQUIRE(store.create_rule(make_rule("dup", "guard-dup")));
+    CHECK(fired == 4);
+    CHECK_FALSE(store.create_rule(make_rule("dup", "guard-dup")));  // conflict
+    CHECK(fired == 4);
+}
+
+TEST_CASE("GuaranteedStateStore: the rule-mutation hook still fires when the generation bump FAILED",
+          "[pg][guaranteed_state_store][generation][rule_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int fired = 0;
+    store.set_on_rule_mutation([&] { ++fired; });
+
+    BrokenBump broken(pool);
+    // The mutation itself succeeds (the caller is told so) even though the bump cannot.
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    CHECK(fired == 1);
+    auto upd = make_rule("r1", "guard-one");
+    upd.enabled = false;
+    REQUIRE(store.update_rule(upd));
+    CHECK(fired == 2);
+    REQUIRE(store.delete_rule("r1"));
+    CHECK(fired == 3);
+
+    REQUIRE(broken.restore());
+    // The generation never moved: this is exactly the case a generation-keyed cache cannot see.
+    CHECK(store.current_policy_generation() == 0);
+}
+
+TEST_CASE("GuaranteedStateStore: a throwing rule-mutation hook never breaks the mutation",
+          "[pg][guaranteed_state_store][generation][rule_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int fired = 0;
+    SECTION("std::exception") {
+        store.set_on_rule_mutation([&] {
+            ++fired;
+            throw std::runtime_error("hook exploded");
+        });
+    }
+    SECTION("a non-std exception") {
+        store.set_on_rule_mutation([&] {
+            ++fired;
+            throw 42;
+        });
+    }
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    const auto row = store.get_rule("r1");
+    REQUIRE(row.has_value());
+    CHECK(row->has_value());  // committed
+    CHECK(store.current_policy_generation() == 1);  // bumped
+    REQUIRE(store.delete_rule("r1"));
+    CHECK(fired == 2);
+
+    // And a store with no hook at all (the default, and what clearing it restores) is fine.
+    store.set_on_rule_mutation({});
+    REQUIRE(store.create_rule(make_rule("r2", "guard-two")));
+    CHECK(fired == 2);
+}
+
+TEST_CASE("GuaranteedStateStore: the rule-mutation hook runs with no pool lease held",
+          "[pg][guaranteed_state_store][generation][rule_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    // A single connection: if the mutating thread still held its lease while the hook ran, the
+    // hook's own acquire could not succeed.
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int leases_granted = 0;
+    int fired = 0;
+    store.set_on_rule_mutation([&] {
+        ++fired;
+        if (auto lease = pool.try_acquire_for(std::chrono::milliseconds(200)))
+            ++leases_granted;
+    });
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.update_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.delete_rule("r1"));
+    CHECK(fired == 3);
+    CHECK(leases_granted == 3);
 }
 
 // ── Rule CRUD ──────────────────────────────────────────────────────────────

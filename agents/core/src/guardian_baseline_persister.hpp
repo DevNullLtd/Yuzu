@@ -95,6 +95,9 @@
  * Order: engine mtx_ -> persist_mu_ -> registry_mu_ (snapshot/erase/attach) and persist_mu_ ->
  * KvStore::mu_; the worker takes persist_mu_ -> registry_mu_ and never mtx_
  * (WorkerHostileMutex). persist_mu_ is never taken under any runtime lock.
+ * `clock_mu_` (test clock only, see set_clock_for_test) is a LEAF: it guards one pointer
+ * swap or copy, takes nothing inside (a replaced clock is destroyed after it is released),
+ * may be taken under persist_mu_, and is never reached in production.
  *
  * HEARTBEAT: failure_signals() takes no lock (atomics only, no mtx_), so reading THIS tag
  * cannot be blocked by a long apply_rules. That is a property of this accessor only: the same
@@ -495,9 +498,29 @@ public:
     [[nodiscard]] std::uint32_t lock_waiters_for_test() const noexcept {
         return lock_waiters_.load(std::memory_order_relaxed);
     }
-    /// TEST-ONLY: replace the backoff clock (default steady_clock::now). Set before any pass
-    /// runs; not synchronised. No production caller.
-    void set_clock_for_test(std::function<Clock::time_point()> clock) { clock_ = std::move(clock); }
+    /// TEST-ONLY: replace this persister's clock (default steady_clock::now) -- it drives the
+    /// retry backoff, the stop-stage trouble threshold, and a pass's wall budget and per-write
+    /// timing, not only backoff. An empty function restores it. Safe against a live worker.
+    /// That matters, because the drain worker's lock-free retry-floor check reads the clock
+    /// with persist_mu_ NOT held, and tests install and restore a clock while the worker
+    /// runs: the old unsynchronised assignment was a data race on the std::function itself
+    /// (nightly TSan, the #4045 FakeClock4045 tests).
+    /// The clock is published as a shared_ptr under clock_mu_; a reader copies the pointer under
+    /// the lock and calls it OUTSIDE the lock, so a restore that lands mid-call cannot destroy
+    /// the function being called. No production caller.
+    void set_clock_for_test(std::function<Clock::time_point()> clock) {
+        std::shared_ptr<const std::function<Clock::time_point()>> next;
+        if (clock)
+            next = std::make_shared<const std::function<Clock::time_point()>>(std::move(clock));
+        const bool installed = next != nullptr;
+        {
+            std::lock_guard<std::mutex> lk{clock_mu_};
+            clock_.swap(next); // `next` now holds the old clock, destroyed after the unlock
+            // Inside the lock, so concurrent setters leave the flag in the same order as
+            // clock_ (a reader that sees a stale flag still falls back correctly).
+            has_test_clock_.store(installed, std::memory_order_release);
+        }
+    }
     /// TEST-ONLY: replace the backoff bounds (default 5 s initial, 60 s max). Safe against a
     /// live worker (it takes persist_mu_, which a failing pass holds while it reads them).
     void set_backoff_for_test(Clock::duration initial, Clock::duration max) {
@@ -555,7 +578,18 @@ public:
     }
 
 private:
-    [[nodiscard]] Clock::time_point now() const { return clock_ ? clock_() : Clock::now(); }
+    /// Production never installs a test clock, so it never reaches the lock: the flag is false
+    /// and this is steady_clock::now(). See set_clock_for_test for the test-clock path.
+    [[nodiscard]] Clock::time_point now() const {
+        if (!has_test_clock_.load(std::memory_order_acquire))
+            return Clock::now();
+        std::shared_ptr<const std::function<Clock::time_point()>> c;
+        {
+            std::lock_guard<std::mutex> lk{clock_mu_};
+            c = clock_;
+        }
+        return c ? (*c)() : Clock::now();
+    }
 
     KvStore* kv_;
     const std::shared_ptr<const std::atomic<std::uint64_t>> staging_drops_; ///< runtime drops
@@ -621,7 +655,11 @@ private:
     /// there); an early one ignores it.
     bool stalled_{false};
     Clock::rep stalled_at_{0};
-    std::function<Clock::time_point()> clock_;
+    /// TEST-ONLY clock (set_clock_for_test). clock_mu_ is a LEAF guarding only the pointer, never
+    /// held across the call.
+    mutable std::mutex clock_mu_;
+    std::shared_ptr<const std::function<Clock::time_point()>> clock_;
+    std::atomic<bool> has_test_clock_{false};
     std::function<void()> post_snapshot_hook_;
     std::function<void()> post_write_hook_;
 };

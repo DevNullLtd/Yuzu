@@ -548,7 +548,7 @@
     {
       "grant": "None — the ICMP ping socket, `connect()`, and `getaddrinfo` all work unprivileged",
       "if_refused": "n/a — no netprobe action is privilege-gated on macOS",
-      "measured": "2026-09-07 at euid 501, `alex` (`docs/samples/macos.txt:1`)",
+      "measured": "2026-09-07 at euid 501, `jsmith` (`docs/samples/macos.txt:1`)",
       "os": "macOS",
       "runs_as": "agent daemon, intended unprivileged `_yuzu` account (`docs/agent-privilege-model.md:12`)"
     },

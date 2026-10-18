@@ -110,6 +110,28 @@ customer-distribution lane. Before switching lanes, read the
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: dashboard API-token create and revoke apply MFA step-up
+
+`POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` (the Settings page's
+API-token Create and Revoke buttons) now apply the same step-up check as the REST token routes.
+
+- **SAML sessions** cannot satisfy the check and get `403` on both routes, as they already do on
+  `/api/v1/tokens`. A deployment whose only interactive sign-in is SAML (`--auth-mode=sso-only`)
+  therefore has no Settings-page route to create or revoke tokens. Create or revoke them from an
+  API-token or MCP caller (the step-up check does not apply to those), or sign in with the armed
+  break-glass account and create or revoke within `--mfa-step-up-window-secs` of that sign-in (the
+  account is MFA-enrolled, so it is gated like any other local account, and it must hold an
+  administrator role). If a deployment has neither an existing token nor a usable break-glass
+  account, the only remaining route is to restart with `--mfa-step-up-window-secs 0` as a
+  temporary measure: it disables the step-up check on every gated endpoint, not only these two
+  (see [Authentication](authentication.md)), so restore the window afterwards.
+- **OIDC sessions** are gated only when the identity provider attests MFA (`amr`) or
+  `--mfa-enforcement` protects the role.
+- **Local MFA-enrolled operators** whose proof is older than `--mfa-step-up-window-secs` must sign
+  in again before creating or revoking a token. The Settings page cannot yet prompt for the code,
+  so the button shows an error toast ("MFA step-up required") until the operator re-authenticates.
+- With no MFA enrolled and no SAML sign-in, nothing changes.
+
 ## Behaviour change: web UI wording and layout (Console, Home after sign-in, hidden quarantine controls)
 
 - **"Dashboard" is now "Console".** The navigation item, the Home tile, the page title,
@@ -132,6 +154,20 @@ customer-distribution lane. Before switching lanes, read the
   status instruction. No configuration change is needed.
 - **Colour schemes.** Settings > General > Appearance now offers six schemes (Slate stays
   the default). The choice is stored in the browser, not on the server.
+
+## Behaviour change: the Groups and enrolment page; the Settings enrolment panels look and act differently
+
+- **New page: Estate > Groups and enrolment** (`/groups`). It hosts the agent approval queue, the auto-approve rules and the enrolment tokens on one page. Management groups stay in Settings. The page opens for every signed-in user; the three panels need the Administrator account role, as they did in Settings, and a user without it sees "Not available to your account" in each panel.
+- **The Settings panels use the same renderers**, so they change too (**Enrollment Tokens**, **Pending Agent Approvals**, **Auto-Approve Policies**). Routes, element ids, form fields and the Administrator decision are unchanged, so a script that calls these routes still reaches them. Two behaviours differ for such scripts (a stale approve or deny, and a stale rule action, now answer `409`; see below). The one difference in the gate is audit: a refused browser session on the three auto-loading panels no longer writes an `auth.admin_required` row per panel per view (a refused token, and every refused write, still does). What you will see:
+  - Token **Expires** is shown in UTC (it was raw epoch seconds). The status (**Active**, **Expired**, **Exhausted** or **Revoked**, as before) is now a pill, and active tokens are listed first. The token reveal has a **Done** button.
+  - The approval queue shows when each agent asked to join (UTC) and gains **Forget**, which removes a waiting request (the agent is queued again the next time it asks to join). **Approve all** and **Deny all** replace the two-click buttons with a confirmation that gives the total and the first ten hostnames, and are disabled while the list shows only part of the queue.
+  - Auto-approve rules are described by what they match (hostname and cloud provider are agent-reported and not verified; address rules are IPv4 only; a CA fingerprint rule is marked as never matching at this release). The match mode is two buttons that each ask for confirmation, where it was a drop-down that applied at once. Enable and Add rule now ask for confirmation too, and Remove (which already asked) names the rule. Disable asks only in "all must match" mode, where it normally widens admission; for the last enabled rule it warns that no agent will be approved automatically until a rule is enabled. A rule that matches every agent is flagged **Matches every agent**.
+  - Each list shows at most 200 rows; the token and waiting-agent panels say how many are not shown.
+  - **Approve and Deny act only on an agent that is still waiting.** A request for an agent that was already approved or denied now answers `409` with the refreshed list and an error message; before, a stale Approve silently reversed a denial and a stale Deny turned an enrolled agent into a denied one. Scripts that approve an agent twice now get `409`, and so does a script that approves a denied agent to re-admit it: that used to work only because the store applied the decision without checking the row's status, and was never a supported recovery. A denial is permanent for that agent id, and there is no reinstate action today. A machine denied by mistake has to register as a new agent: reinstall it or wipe its agent data directory (a different `--agent-id` alone is not enough where client certificates are required), and remove or tighten any token or auto-approve rule that would admit it again; see [Agent enrollment](server-admin.md#agent-enrollment) and [Device Management](device-management.md#tier-1-manual-approval).
+  - **Rule Enable, Disable and Remove check the rule they were drawn for.** The dashboard now sends the rule's type and value (and, for a toggle, its state) with the request, and a request for a rule that moved, changed or was removed since the list loaded answers `409` with the refreshed list. Scripts that address a rule by position alone are unchanged.
+  - **Audit strings changed.** If a SIEM rule keys on them: `enrollment.auto_approve.rule_toggle` detail is now `type=<t> value=<v> enabled=<0|1> by=<operator>` (it was `enabled=<0|1> by=<operator>`); `enrollment.auto_approve.rule_remove` detail gains `type=` (`type=<t> value=<v> label=<l> by=<operator>`); and there are new refusal details with `result=denied`, `stale_rule_view` on rule toggle and remove and `refused_wrong_status` on approve and deny. `rule_not_found` also now accompanies a `409` when a dashboard request names a rule whose position is gone (it was only a `200` no-op). See [Audit Log](audit-log.md).
+  - The token and pending fragments, and the responses that mint tokens, carry `Cache-Control: no-store, private` and `Vary: Cookie`, so a proxy or the browser cache no longer keeps them. The re-rendered list that revoke, approve, deny, forget and the bulk actions return does not carry them.
+- No setting, migration or action is needed. Rolling back restores the earlier panels.
 
 ## Behaviour change: the plain-HTTP port answers the four health probes when HTTPS is on (#5906)
 

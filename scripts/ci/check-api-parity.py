@@ -334,7 +334,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # decisions, `exception:#520 revisit:...`), which count untwinned. 11 rows were reclassified that
 # way, so 216 -> 227, with no change in capability; a 12th (settings developer plugins) is
 # satisfied by the `resource:yuzu://plugin-docs` MCP resource twin and stays `twinned`.
-BASELINE_UNTWINNED = 227
+BASELINE_UNTWINNED = 225
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -355,12 +355,10 @@ REVISIT_MAX = datetime.date(2028, 12, 31)
 # change. Extending the set (+1 id together with MAX+1), swapping one id for another and rebinding
 # an id to a different row are NOT machine-enforced: they are caught only by review of the diff.
 # Never extend this set to unblock a new exception.
-GRANDFATHERED_MAX = 7
+GRANDFATHERED_MAX = 5
 GRANDFATHERED_LEGACY_EXCEPTIONS = frozenset({
     "get.fragments-auto-nvd",
     "get.fragments-settings-nvd",
-    "post.api-settings-api-tokens",
-    "delete.api-settings-api-tokens-param",
     "post.api-v1-users-me-password",
     "get.fragments-tar-process-tree-detail",
     "get.fragments-tar-process-tree-result",

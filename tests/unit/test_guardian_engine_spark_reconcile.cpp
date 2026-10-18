@@ -433,6 +433,13 @@ public:
         std::lock_guard<std::mutex> gate_lk{gate_mu_};
         return parked_watches_;
     }
+    /// Opens every gate above (each one latches or is idempotent), so no watch()/unwatch()
+    /// - parked now or entering later - can block. Fixture teardown only.
+    void release_all_gates() {
+        release_hang();
+        release_park_all();
+        release_isolated_unwatch_hang();
+    }
 
 private:
     std::atomic<int> watch_calls_{0};
@@ -645,6 +652,27 @@ struct SparkReconcileFixture {
     // teardown must complete before the SparkEngine it borrowed from is torn
     // down, since GuardianSparkEngineBackend holds a borrowed SparkEngine*.
     ~SparkReconcileFixture() {
+        // Quiesce the detached arm/disarm workers BEFORE anything they touch is destroyed.
+        // Releasing a parked mechanism does not wait for its worker: it resumes into
+        // SparkEngine::arm() on `spark_engine`, a member of this fixture, so without an
+        // edge from "worker finished" to "fixture destroyed" it can run after the frame
+        // is gone (nightly ASan stack-use-after-return in SparkEngine::arm, 2026-10-11, in
+        // the #2233 item 3 test). active_io_workers() counts a worker until its payload is
+        // destroyed (#4147), so 0 means none can still reach the mechanism or the engine.
+        // Bounded, like BootRig5513::shutdown(): a worker that never finishes is reported
+        // on stderr (no CHECK/REQUIRE -- this can run during unwind) and teardown proceeds
+        // as before. Not covered: a test that resets `engine` itself skips this wait.
+        if (mechanism)
+            mechanism->release_all_gates();
+        if (sibling_mechanism)
+            sibling_mechanism->release_all_gates();
+        if (engine &&
+            !yuzu::test::spin_until([this] { return engine->active_io_workers() == 0; },
+                                    std::chrono::seconds{10})) {
+            std::fprintf(stderr,
+                         "~SparkReconcileFixture: workers still alive after the bounded wait; "
+                         "proceeding with teardown anyway\n");
+        }
         engine.reset();
         spark_engine.stop();
     }
@@ -1205,11 +1233,8 @@ struct BootRig5513 {
 
     void release_gates() {
         for (FakeServiceMechanism* m : {mechanism, sibling_mechanism}) {
-            if (!m)
-                continue;
-            m->release_hang();
-            m->release_park_all();
-            m->release_isolated_unwatch_hang();
+            if (m)
+                m->release_all_gates();
         }
     }
 
@@ -5199,7 +5224,21 @@ TEST_CASE("rung 9c PR-2 Unit 6 gate: journal_maintenance_tick() does not advance
     // therefore false on every later tick, permanently (the server's heartbeat
     // reconcile only re-pushes while the agent reports a generation BEHIND its own -
     // this would silently and permanently stop that retry).
+    //
+    // The arm is PARKED in the mechanism across the push, not left to race it (nightly
+    // TSan, #4019). attach_rule(NonWaiting) reports Armed - not Accepted - whenever the
+    // detached arm worker commits before the push re-checks the claim
+    // (guardian_spark_runtime.cpp, "completion can precede this function's own
+    // resumption"); an Armed rule leaves nothing pending, so apply_rules() itself
+    // persists and advances the generation and the tick under test never gets to. Both
+    // orders are correct production behaviour. This test needs the Accepted one, so it
+    // makes the commit happen-after the push returns: watch() cannot return until
+    // release_hang(), which runs only once the push has. Without that edge the order was
+    // scheduler luck - TSan's slowdown lost it most nights (`1 == 0` below).
     SparkReconcileFixture f;
+    f.mechanism->hang_next_watch();
+    // Every exit path, declared after `f` so it runs first (governance cs-202).
+    yuzu::test::ScopeExit release_parked{[&] { f.mechanism->release_hang(); }};
 
     gpb::GuaranteedStatePush p;
     p.set_full_sync(true);
@@ -5207,14 +5246,23 @@ TEST_CASE("rung 9c PR-2 Unit 6 gate: journal_maintenance_tick() does not advance
     *p.add_rules() = make_service_rule("r1");
     REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString())
                 .exit_code == 0);
-    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds{30}));
+    REQUIRE(f.engine->ack_pending_count_for_test() == 1); // Accepted, not Armed
     REQUIRE(f.engine->policy_generation() == 0); // not yet acknowledged - no tick has run
+
+    // Let the arm commit, and wait for the worker's completion (which records the
+    // outcome) to finish - so the next tick's drain finds the receipt terminal.
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; }));
+    REQUIRE(f.engine->spark_armed_rule_count() == 1);
 
     // A real KV-write failure (not a fault-injection stand-in): drop the table through
     // a second connection to the SAME on-disk file, so persist_generation_locked()'s
     // kv_->set() call genuinely fails ("no such table") on THIS tick.
     drop_kv_store_table_for_test(f.db_.path);
     f.engine->journal_maintenance_tick();
+    // Non-vacuity: this tick drained the receipt, so it really attempted the persist.
+    REQUIRE(f.engine->ack_pending_count_for_test() == 0);
     // TARGET: the failed persist must NOT have published policy_generation_. Before the
     // fix, this was already 1 here - the exact bug the coordinator's gate caught.
     CHECK(f.engine->policy_generation() == 0);
