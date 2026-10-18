@@ -38,8 +38,9 @@ bool deny_engine_session(const ReviewsDeps& d, const auth::Session& s, const htt
     return true;
 }
 
-// AccessReview:Read (loud, or the quiet probe for the self-loading list), then the session, then the engine refusal. Nothing is read before
-// this returns true; on false the response is already written.
+// AccessReview:Read (loud, or the quiet probe for the self-loading list), then the session, then
+// the engine refusal. Nothing is read before this returns true; on false the response is already
+// written.
 bool gate(const ReviewsDeps& d, const ReviewsDeps::PermFn& perm, const httplib::Request& req,
           httplib::Response& res, const char* action) {
     if (!perm(req, res, "AccessReview", "Read"))
