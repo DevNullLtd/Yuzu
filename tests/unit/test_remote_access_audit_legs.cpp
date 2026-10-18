@@ -227,8 +227,9 @@ TEST_CASE("remote_access_audit legs: a clean read is supported, with every fixed
     CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|no|sshd_config");
     CHECK(kind_rows(l, "service").size() == 4);
     CHECK(row_with(l.rows, "service|ssh.socket|") == "service|ssh.socket|enabled|systemctl_is_enabled");
-    // MUTATION: dropping the 4th literal leaves a socket-activated Fedora/RHEL host reading as SSH off
-    CHECK(row_with(l.rows, "service|sshd.socket|") == "service|sshd.socket|enabled|systemctl_is_enabled");
+    // MUTATION: dropping the 4th literal leaves a socket-activated Fedora host reading as SSH off
+    CHECK(row_with(l.rows, "service|sshd.socket|") ==
+          "service|sshd.socket|enabled|systemctl_is_enabled");
     CHECK(row_with(l.rows, "file|alice|authorized_keys|") == "file|alice|authorized_keys|read|1|0|0");
     CHECK(row_with(l.rows, "file|bob|authorized_keys|") == "file|bob|authorized_keys|read|0|0|0");
     CHECK(row_with(l.rows, "file|alice|authorized_keys2|") == "file|alice|authorized_keys2|absent|-|-|-");
@@ -586,12 +587,14 @@ TEST_CASE("remote_access_audit legs: the config half honours the same run-start 
     CHECK(l.rows[0] == "source|sshd_config|read|1");
     CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|-|-");
 
-    // the Include DIRECTORY is a link (one readlink hop) over a per-file mount: the entry is judged under
-    // BOTH spellings, so the mounted one is never opened and its sibling still is.
+    // the Include DIRECTORY is a link (one readlink hop) over a per-file mount: the entry is judged
+    // under BOTH spellings, so the mounted one is never opened and its sibling still is.
     // MUTATION: dropping the resolved-spelling comparison opens share1.conf.
     f = healthy();
     f.prefixes = std::vector<std::string>{"/mnt/shares/share1.conf"};
-    f.resolve = [](const std::string& p) { return p == "/etc/ssh/conf.d" ? std::string{"/mnt/shares"} : p; };
+    f.resolve = [](const std::string& p) {
+        return p == "/etc/ssh/conf.d" ? std::string{"/mnt/shares"} : p;
+    };
     f.config_files["/etc/ssh/sshd_config"] = ok("Include /etc/ssh/conf.d/*.conf\n");
     f.listings["/etc/ssh/conf.d|*.conf"] = {"share1.conf", "ok.conf"};
     f.dir_files["/etc/ssh/conf.d/share1.conf"] = ok("PermitRootLogin yes\n");
@@ -600,7 +603,8 @@ TEST_CASE("remote_access_audit legs: the config half honours the same run-start 
     CHECK_FALSE(touched_mentions(f, "share1"));
     CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
     CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|-|-");
-    CHECK(row_with(l.rows, "config|passwordauthentication|") == "config|passwordauthentication|no|include:ok.conf");
+    CHECK(row_with(l.rows, "config|passwordauthentication|") ==
+          "config|passwordauthentication|no|include:ok.conf");
 
     // a dot-spelled Include directory and a mounted entry that sorts BEFORE its sibling.
     // MUTATION: dropping lexical_normal opens m.conf; `continue` -> `break` drops z.conf.
@@ -613,7 +617,53 @@ TEST_CASE("remote_access_audit legs: the config half honours the same run-start 
     l = list_posix(f.build());
     CHECK_FALSE(touched_mentions(f, "m.conf"));
     CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
-    CHECK(row_with(l.rows, "config|passwordauthentication|") == "config|passwordauthentication|no|include:z.conf");
+    CHECK(row_with(l.rows, "config|passwordauthentication|") ==
+          "config|passwordauthentication|no|include:z.conf");
+
+    // the Include DIRECTORY is a link to "/": the joined resolved spelling would be "//m.conf",
+    // which a byte compare never matches against the prefix "/m.conf". Two mounted entries and one
+    // local sibling: neither mounted entry is opened, the token is raised once, the skipped
+    // entries are not counted as read, and the sibling still parses.
+    // MUTATION: dropping lexical_normal from the resolved spelling opens m.conf;
+    // `++c.files_read` in the skip branch makes the source row say read|4.
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/m.conf", "/n.conf"};
+    f.resolve = [](const std::string& p) { return p == "/etc/ssh/conf.d" ? std::string{"/"} : p; };
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /etc/ssh/conf.d/*.conf\n");
+    f.listings["/etc/ssh/conf.d|*.conf"] = {"m.conf", "n.conf", "z.conf"};
+    f.dir_files["/etc/ssh/conf.d/m.conf"] = ok("PermitRootLogin yes\n");
+    f.dir_files["/etc/ssh/conf.d/n.conf"] = ok("PermitRootLogin yes\n");
+    f.dir_files["/etc/ssh/conf.d/z.conf"] = ok("PasswordAuthentication no\n");
+    l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "m.conf"));
+    CHECK_FALSE(touched_mentions(f, "n.conf"));
+    CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    {
+        const std::string tok = "include:network_mount_skipped";
+        CHECK(l.reason.find(tok) == l.reason.rfind(tok));
+    }
+    CHECK(l.rows[0] == "source|sshd_config|read|2");
+    CHECK(row_with(l.rows, "config|passwordauthentication|") ==
+          "config|passwordauthentication|no|include:z.conf");
+
+    // a single-file Include under a LINK parent over a per-file mount: the file is judged by name
+    // under the parent's one-hop target BEFORE it is itself lstat'ed (that lstat would traverse the
+    // link and reach a dead mount), so the file is never opened and its path is never asked of
+    // resolve_root.
+    // MUTATION: dropping the parent-spelling compare opens root.conf.
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/mnt/shares/root.conf"};
+    f.resolve = [](const std::string& p) {
+        return p == "/etc/ssh/conf.d" ? std::string{"/mnt/shares"} : p;
+    };
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /etc/ssh/conf.d/root.conf\n");
+    f.config_files["/etc/ssh/conf.d/root.conf"] = ok("PermitRootLogin yes\n");
+    l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "root.conf"));
+    CHECK(std::ranges::count(f.resolved, "/etc/ssh/conf.d/root.conf") == 0);
+    CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    CHECK(l.rows[0] == "source|sshd_config|read|1");
+    CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|-|-");
 
     // the config path is itself a link whose single readlink hop lands under a mount
     f = healthy();
@@ -759,7 +809,8 @@ TEST_CASE("remote_access_audit legs: service state arms", "[remote_access_audit]
     CHECK(row_with(l.rows, "service|ssh.service|") == "service|ssh.service|not-found|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|sshd.service|") == "service|sshd.service|disabled|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|ssh.socket|") == "service|ssh.socket|static|systemctl_is_enabled");
-    CHECK(row_with(l.rows, "service|sshd.socket|") == "service|sshd.socket|static|systemctl_is_enabled");
+    CHECK(row_with(l.rows, "service|sshd.socket|") ==
+          "service|sshd.socket|static|systemctl_is_enabled");
 
     f = healthy();
     f.runner = [](const std::vector<std::string>&) { return died(yuzu::agent::TerminationReason::deadline); };
@@ -947,7 +998,8 @@ TEST_CASE("remote_access_audit legs: a unit systemd 249/252 reports on stderr is
     CHECK(row_with(l.rows, "service|ssh.service|") == "service|ssh.service|not-found|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|sshd.service|") == "service|sshd.service|not-found|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|ssh.socket|") == "service|ssh.socket|not-found|systemctl_is_enabled");
-    CHECK(row_with(l.rows, "service|sshd.socket|") == "service|sshd.socket|not-found|systemctl_is_enabled");
+    CHECK(row_with(l.rows, "service|sshd.socket|") ==
+          "service|sshd.socket|not-found|systemctl_is_enabled");
     // the runner is asked for stderr: without it the line above is never seen
     REQUIRE(f.merge_flags.size() == 4);
     CHECK(std::ranges::all_of(f.merge_flags, [](bool m) { return m; }));
@@ -967,7 +1019,8 @@ TEST_CASE("remote_access_audit legs: a unit systemd 249/252 reports on stderr is
     CHECK(row_with(l.rows, "service|ssh.service|") == "service|ssh.service|enabled|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|sshd.service|") == "service|sshd.service|alias|systemctl_is_enabled");
     CHECK(row_with(l.rows, "service|ssh.socket|") == "service|ssh.socket|disabled|systemctl_is_enabled");
-    CHECK(row_with(l.rows, "service|sshd.socket|") == "service|sshd.socket|disabled|systemctl_is_enabled");
+    CHECK(row_with(l.rows, "service|sshd.socket|") ==
+          "service|sshd.socket|disabled|systemctl_is_enabled");
 
     // narrow: another stderr line that merely contains the words, or the right line on exit 0, is still a failure
     f = healthy();
@@ -1017,8 +1070,9 @@ TEST_CASE("remote_access_audit legs: a credential source the plugin does not rea
     CHECK(has_token(list_posix(f.build()), "macos:remote_access_audit:sshd_config:other_credential_sources"));
 
     // controls: the disabling values, a Match-scoped directive and an unread config raise nothing
-    for (const char* text : {"AuthorizedKeysCommand none\nHostbasedAuthentication no\nAuthenticationMethods any\n"
-                             "TrustedUserCAKeys none\nAuthorizedPrincipalsFile none\nAuthorizedPrincipalsCommand none\n",
+    for (const char* text : {"AuthorizedKeysCommand none\nHostbasedAuthentication no\n"
+                             "AuthenticationMethods any\nTrustedUserCAKeys none\n"
+                             "AuthorizedPrincipalsFile none\nAuthorizedPrincipalsCommand none\n",
                              "Match User bob\n  TrustedUserCAKeys /etc/ssh/ca.pub\n"}) {
         f = healthy();
         f.config_files["/etc/ssh/sshd_config"] = ok(text);
@@ -1030,8 +1084,9 @@ TEST_CASE("remote_access_audit legs: a credential source the plugin does not rea
     CHECK_FALSE(has_token(list_posix(f.build()), tok));
 }
 
-// MUTATION: dropping `gssapiauthentication` from kScalarKeys leaves a global `GSSAPIAuthentication yes`
-// with no row and no token. It is a login METHOD like password auth: reported as written, supported, no token.
+// MUTATION: dropping `gssapiauthentication` from kScalarKeys leaves a global
+// `GSSAPIAuthentication yes` with no row and no token. It is a login METHOD like password auth:
+// reported as written, supported, no token.
 TEST_CASE("remote_access_audit legs: GSSAPIAuthentication is reported as written, not flagged",
           "[remote_access_audit][legs]") {
     auto f = healthy();
@@ -1039,7 +1094,24 @@ TEST_CASE("remote_access_audit legs: GSSAPIAuthentication is reported as written
     const auto l = list_posix(f.build());
     CHECK(l.status == StatusState::supported);
     CHECK(l.reason.empty());
-    CHECK(row_with(l.rows, "config|gssapiauthentication|") == "config|gssapiauthentication|yes|sshd_config");
+    CHECK(row_with(l.rows, "config|gssapiauthentication|") ==
+          "config|gssapiauthentication|yes|sshd_config");
+
+    // first wins in directive order and carries its Include origin: a Match-scoped `yes` in the
+    // first Include is not global, the second Include's `no` is the first global value, and the
+    // main file's later `yes` loses.
+    // MUTATIONS: last-wins reports yes|sshd_config; applying a Match-scoped value reports
+    // yes|include:h.conf.
+    f = healthy();
+    f.config_files["/etc/ssh/sshd_config"] =
+        ok("Include /etc/ssh/h.conf\nInclude /etc/ssh/g.conf\nGSSAPIAuthentication yes\n");
+    f.config_files["/etc/ssh/h.conf"] = ok("Match User bob\n  GSSAPIAuthentication yes\n");
+    f.config_files["/etc/ssh/g.conf"] = ok("GSSAPIAuthentication no\n");
+    const auto m = list_posix(f.build());
+    CHECK(m.status == StatusState::supported);
+    CHECK(m.reason.empty());
+    CHECK(row_with(m.rows, "config|gssapiauthentication|") ==
+          "config|gssapiauthentication|no|include:g.conf");
 }
 
 // MUTATION: matching a closed-set keyword by prefix (`starts_with` in place of the exact lookup in

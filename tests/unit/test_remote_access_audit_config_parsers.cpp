@@ -302,6 +302,10 @@ TEST_CASE("remote_access_audit config: expand_include_pattern", "[remote_access_
     using K = IncludeSpec::Kind;
     CHECK(expand_include_pattern("a.conf").kind == K::single);
     CHECK(expand_include_pattern("a.conf").path == "/etc/ssh/a.conf"); // sshd prefixes SSHDIR
+    // a single file carries its parent directory and its own name
+    CHECK(expand_include_pattern("a.conf").dir == "/etc/ssh");
+    CHECK(expand_include_pattern("a.conf").leaf == "a.conf");
+    CHECK(expand_include_pattern("/a.conf").dir == "/");
     const auto g = expand_include_pattern("/etc/ssh/sshd_config.d/*.conf");
     CHECK(g.kind == K::glob);
     CHECK(g.dir == "/etc/ssh/sshd_config.d");

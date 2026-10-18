@@ -410,6 +410,16 @@ inline bool configured_path_on_network(const PosixFs& fs, const std::vector<std:
            (fs.resolve_root && under_prefix(fs.resolve_root(norm), prefixes));
 }
 
+/// True when the entry `name` of a directory is on a mount, judged by name under the lexically
+/// normalised configured spelling of the directory and, when it differs, its one-hop resolved
+/// spelling. Each joined path is normalised, so a directory resolving to "/" cannot yield "//name".
+inline bool entry_on_network(const std::vector<std::string>& prefixes, const std::string& dir_norm,
+                             const std::string& dir_resolved, std::string_view name) {
+    return under_prefix(lexical_normal(dir_norm + "/" + std::string{name}), prefixes) ||
+           (dir_resolved != dir_norm &&
+            under_prefix(lexical_normal(dir_resolved + "/" + std::string{name}), prefixes));
+}
+
 struct IncludeCtx {
     const PosixFs& fs;
     Tally& t;
@@ -454,11 +464,19 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
         return;
     }
     // The readers carry no deadline, so an Include file (or a listed directory) on a network
-    // mount is never opened; the directory and each listed entry are checked by name under both the
-    // configured and the one-hop resolved spelling of the directory; an entry that is itself a
-    // link into a mount is not resolved (README caveat 4).
-    if (configured_path_on_network(c.fs, c.prefixes,
-                                   spec.kind == IncludeSpec::Kind::single ? spec.path : spec.dir)) {
+    // mount is never opened. A glob's directory is checked as configured, and each listed entry by
+    // name under both spellings of its directory; a single file is checked by name under both
+    // spellings of its directory FIRST (the lstat in configured_path_on_network traverses the
+    // directory and would reach a dead per-file mount), then as itself. An entry that is itself a
+    // link into a mount, or a link chain, is not resolved (README caveat 4).
+    const std::string dir_norm = lexical_normal(spec.dir);
+    // A directory already on a mount is not lstat'ed again: the entry compare fires lexically.
+    const bool lstat_dir = c.fs.resolve_root && !under_prefix(dir_norm, c.prefixes);
+    const std::string dir_resolved = lstat_dir ? c.fs.resolve_root(dir_norm) : dir_norm;
+    const bool single = spec.kind == IncludeSpec::Kind::single;
+    if (single ? (entry_on_network(c.prefixes, dir_norm, dir_resolved, spec.leaf) ||
+                  configured_path_on_network(c.fs, c.prefixes, spec.path))
+               : (under_prefix(dir_norm, c.prefixes) || under_prefix(dir_resolved, c.prefixes))) {
         c.t.acc.add_failure(src_token(os, "include", "network_mount_skipped"));
         return;
     }
@@ -494,16 +512,13 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
         } else {
             if (too_many)
                 c.t.acc.add_failure(src_token(os, "include", "too_many"));
-            const std::string dir_norm = lexical_normal(spec.dir);
-            const std::string dir_resolved = c.fs.resolve_root ? c.fs.resolve_root(dir_norm) : dir_norm;
             for (const auto& n : names) {
                 if (c.files_read >= kMaxIncludeFiles) {
                     c.t.acc.add_failure(src_token(os, "include", "too_many"));
                     break;
                 }
                 // Lexical by name, under both spellings of the directory; no per-entry readlink.
-                if (under_prefix(lexical_normal(spec.dir + "/" + n), c.prefixes) ||
-                    (dir_resolved != dir_norm && under_prefix(dir_resolved + "/" + n, c.prefixes))) {
+                if (entry_on_network(c.prefixes, dir_norm, dir_resolved, n)) {
                     c.t.acc.add_failure(src_token(os, "include", "network_mount_skipped"));
                     continue;
                 }
@@ -596,8 +611,8 @@ inline std::optional<std::string> service_failure(const yuzu::agent::SubprocessR
 /// into the captured output: systemd 249/252 name a missing unit only there
 /// (parse_systemctl_is_enabled).
 inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
-    static constexpr std::array<std::string_view, 4> kUnits = {"ssh.service", "sshd.service", "ssh.socket",
-                                                               "sshd.socket"};
+    static constexpr std::array<std::string_view, 4> kUnits = {"ssh.service", "sshd.service",
+                                                               "ssh.socket", "sshd.socket"};
     ServiceOutcome out;
     bool any_answered = false;
     for (const auto unit : kUnits) {

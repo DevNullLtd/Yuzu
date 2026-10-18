@@ -63,8 +63,9 @@ metadata:
     quote is flagged: sshd -t is the validity check). It reports a
     SHA-256 fingerprint for every public key in the authorized_keys of the homes it walks (a
     certificate reports the fingerprint of the key it carries) with the option names it uses,
-    and whether the sshd service is enabled. A login that needs no key (password,
-    keyboard-interactive, GSSAPI) is governed by the config rows and reported as written. It
+    and whether the sshd service is enabled. A login that needs no key is governed by the
+    config rows: password, keyboard-interactive and GSSAPI are reported as written; other
+    no-key methods (KerberosAuthentication, a PAM-supplied method) are not read. It
     does not read every way to log in: a
     certificate authority, keys or principals supplied by a command, a principals file,
     host-based authentication and AuthenticationMethods are not read (when sshd_config sets

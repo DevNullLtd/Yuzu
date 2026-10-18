@@ -13,7 +13,8 @@
 ///
 /// `list` is ReadOnly/None -- the plugin never writes a file or changes a key or service. It
 /// reads sshd_config (links followed as sshd follows them) and each account's authorized_keys
-/// (no-follow), both bounded, runs one fixed read-only argv per sshd unit, and emits key FINGERPRINTS and option NAMES only.
+/// (no-follow), both bounded, runs one fixed read-only argv per sshd unit, and emits key
+/// FINGERPRINTS and option NAMES only.
 ///
 /// Grouped under the SAME `Forensics` securable execution_artifacts and privacy_permissions
 /// use (`rbac_store.cpp`'s seeded `types[]` entry; the string below MUST equal that seed

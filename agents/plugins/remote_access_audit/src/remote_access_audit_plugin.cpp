@@ -41,9 +41,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "configured access as written, not sshd's effective policy; the launchd override is "
          "not 'running'; CA trust, key and principals commands, a principals file, hostbased auth "
          "and AuthenticationMethods are not read; the Remote Login access list (pam_sacl) is "
-         "not read; key comments, option values and key-file paths are never emitted; only homes under "
-         "/Users owned by uid 500 or above, and /var/root, are walked; a symlinked key file or "
-         ".ssh is refused; network mounts are skipped"},
+         "not read; key comments, option values and key-file paths are never emitted; only homes "
+         "under /Users owned by uid 500 or above, and /var/root, are walked; a symlinked key "
+         "file or .ssh is refused; network mounts are skipped"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1,
          "per-profile .ssh\\authorized_keys, %ProgramData%\\ssh\\administrators_authorized_keys "

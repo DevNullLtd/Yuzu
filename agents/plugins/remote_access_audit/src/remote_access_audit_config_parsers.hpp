@@ -438,8 +438,8 @@ struct IncludeSpec {
     enum class Kind { single, glob, unsupported };
     Kind kind = Kind::unsupported;
     std::string path; ///< single: the file path
-    std::string dir;  ///< glob: the directory listed
-    std::string leaf; ///< glob: the fnmatch pattern for the entry name
+    std::string dir;  ///< the directory (glob: the one listed; single: the file's parent)
+    std::string leaf; ///< glob: the fnmatch pattern for the entry name; single: the file name
 };
 
 /// servconf.c prefixes an Include argument that does not start with '/' or '~' with SSHDIR
@@ -463,6 +463,8 @@ inline IncludeSpec expand_include_pattern(std::string_view arg) {
         return out;
     }
     out.kind = IncludeSpec::Kind::single;
+    out.dir = std::move(dir);
+    out.leaf = std::move(leaf);
     out.path = std::move(full);
     return out;
 }
