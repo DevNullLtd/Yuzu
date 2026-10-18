@@ -608,7 +608,7 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
 - a **fresh MFA step-up** through the same `require_mfa_step_up` gate as the other step-up endpoints
   (so the same pass-through for an account the gate cannot ask for a factor applies: a local account
   that never enrolled, or an OIDC session without an `amr` proof under a mode that does not protect
-  its role);
+  its role); a requirement that the approver holds an enrolled factor is tracked in #6079;
 - a **human principal**, never an engine principal;
 - a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`).
 

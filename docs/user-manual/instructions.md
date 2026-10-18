@@ -619,7 +619,8 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   step-up endpoint, the gate cannot demand a factor an account does not have: a local account that
   never enrolled in MFA, or an SSO account whose identity provider did not assert MFA, passes it
   while `--mfa-enforcement=optional`. To make a fresh factor mandatory for every approver, run with
-  `--mfa-enforcement=required`.
+  `--mfa-enforcement=required`. A requirement that the approver specifically holds an enrolled factor,
+  whatever the enforcement mode, is tracked in #6079.
 - **A human principal.** An engine principal is never admitted.
 - **Not the submitter.** Unchanged: the reviewer cannot be the person who submitted the request
   (HTTP 400, audited as denied).

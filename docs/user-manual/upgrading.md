@@ -16,6 +16,10 @@ principal. The existing rule that the reviewer cannot be the submitter is unchan
   approvals through MCP is unchanged. Their tier/permission mapping is `Approval:Approve` (it was
   mapped as `Approval:Write`, #3151).
 - **SAML users cannot approve while MFA step-up is on.** SAML sessions can never pass step-up (#4935).
+- **"Fresh MFA step-up" is not a guarantee of a second factor.** The step-up gate can only ask for a factor the
+  account has. A local account that never enrolled in MFA, an OIDC session whose identity provider asserted no
+  `amr` proof under the default `--mfa-enforcement=optional`, and any session when
+  `--mfa-step-up-window-secs=0` all pass it. Requiring that the approver holds an enrolled factor is tracked in #6079.
 - **A degraded session read fails closed.** The route answers `503` and the request stays pending; it no
   longer records the reviewer `unknown` (#4128).
 - **The attempt is audited first.** If the audit row cannot be written, approve and reject return `503`

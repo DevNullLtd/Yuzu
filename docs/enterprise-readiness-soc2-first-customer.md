@@ -372,6 +372,20 @@ Risk-register entry: an identity provider that removes a person who is the fleet
 administrator leaves that person active (loud: audit row, counter, critical event),
 until an operator promotes a second administrator and demotes the first.
 
+**Addendum: approver assurance for approve and reject (CC6.1/CC6.3, #6061).** Approving or
+rejecting an approval request requires an interactive human session (local or OIDC), a human
+principal that is not an engine principal, `Approval:Approve`, a reviewer who is not the
+submitter, and the existing MFA step-up gate. API-token and MCP sessions are refused with a typed
+`403` (MCP: `-32003`). Read the step-up half as what it is: the gate can only ask for a factor the
+account has. **Residual risk:** an approval can complete without a second factor when (a) the
+approver is a local account that never enrolled in MFA, (b) the approver is an OIDC session whose
+identity provider asserted no `amr` proof under the default `--mfa-enforcement=optional`, or (c) the
+server runs with `--mfa-step-up-window-secs=0`. SAML approvers are blocked while step-up is on
+(#4935). A requirement that the approver holds an enrolled factor, whatever the enforcement mode, is
+tracked in #6079; until it lands, a deployment that relies on approvals as a CC6.3 control should run
+`--mfa-enforcement=required` and leave `--mfa-step-up-window-secs` above zero. Operator-facing detail: `docs/user-manual/instructions.md`, "Who can
+approve".
+
 ---
 
 ## 3.3 Workstream C — Application and Infrastructure Security
