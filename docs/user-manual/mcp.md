@@ -1560,6 +1560,24 @@ counts those refusals specifically, and the audit row carries a `(lookup)` or
 `(origin/submitter unverified)` suffix, so the event is not silently
 indistinguishable from ordinary store contention.
 
+**A third cause is not a ticket problem at all: `approve_request` and
+`reject_request` are always refused (#6061).** After the `Approval:Approve`
+check passes, the call returns `-32003` with the stable message
+`approver_assurance_required:<reason>`, where `<reason>` is
+`non_interactive_session` (the usual case), `engine_principal` or
+`non_human_principal`. An agentic worker should key off the prefix, not the
+prose, and should not retry: no credential on this transport can decide an
+approval, so `error.data.retry_after_ms` is `null`. The audit row is `mcp.approve_request`
+or `mcp.reject_request` with `result=denied` and
+`detail=approval_id=<id> approver_assurance:<reason>`; if that row cannot be written, `error.data.audit_persisted` is `false`. A person decides in the
+dashboard Approvals page or with `POST /api/approvals/{id}/approve|reject` on a
+signed-in session.
+
+A recall of an approved ticket that has outlived its 7-day lifetime also returns
+`-32003`, with the distinct message `approval expired (past its 7-day lifetime)`;
+submit the call again without `approval_id` for a fresh ticket. Expiry is
+measured from the review, using database time.
+
 **Fix**: For an RBAC denial — grant the permission to the token creator's
 principal, or use an account with the required permissions. For a ticket recall —
 submit the call **without** `approval_id` to obtain a fresh approval ticket, then

@@ -10738,6 +10738,36 @@ Approve a pending instruction execution. `comment` is capped at 4,000 bytes; a l
 
 **Who may call it.** Requires `Approval:Approve` and an interactive cookie session (local or OIDC) with a fresh MFA step-up: a stale proof returns `401` with `meta.mfa_step_up_required: true` and `meta.challenge_url`, exactly as on the other step-up endpoints (`docs/user-manual/authentication.md`, "Step-up on high-risk surfaces"). An API-token or MCP-token session is refused with `403` and an A4 error envelope, and an engine principal is never admitted; a SAML session is refused with `403` because MFA step-up is not available to it (#4935). `--mfa-step-up-window-secs=0` disables the step-up requirement, leaving only the interactive-session rule. The step-up gate can only ask for a factor the account has, so a local account that never enrolled in MFA and an OIDC session with no `amr` proof under the default `--mfa-enforcement=optional` also pass it; requiring an enrolled factor of the approver is tracked in #6079. The reviewer cannot be the submitter (`400`, audited as denied). Fail-closed behaviour: if the caller's session cannot be resolved the route returns `503` and the request stays pending; the approval attempt is audited before the decision is applied, and if that audit row cannot be written the route returns `503` and changes nothing (#5823). An approved ticket not consumed within 7 days of its review is refused at consume. Full rules: `docs/user-manual/instructions.md`, "Who can approve".
 
+**Errors** (checked in this order; `POST /api/approvals/{id}/reject` is identical):
+
+| Status | Body | Cause |
+|---|---|---|
+| `403` | the standard permission-denied response | The caller lacks `Approval:Approve`. |
+| `503` | A4 envelope, `retry_after_ms: 5000` | The caller's session could not be resolved after the permission gate passed. The request stays pending and nothing is recorded. |
+| `403` | A4 envelope, message `cross-site request refused` | A cookie-session `POST` whose `Origin`/`Referer` names another site, or carries neither header (a `--csrf-trusted-origin` entry is accepted). Audited as `csrf.denied`; the ticket is unchanged and no step-up is spent. Token callers are not subject to this check and are refused by the next row instead. |
+| `403` | A4 envelope, message `approver_assurance_required:<reason>` | Class refusal. `<reason>` is `non_interactive_session` (API-token, MCP-token or any other non-cookie session), `engine_principal` or `non_human_principal`. Audited as `approval.approve` / `approval.reject` with `result=denied` and `detail=approver_assurance:<reason>` (best effort). |
+| `503` | `{"error":{"code":503,"message":"service unavailable"}}` | The approval store is not available. |
+| `503` | A4 envelope | MFA step-up is not wired (fail closed); the decision was not recorded. |
+| `401` | step-up envelope, `meta.mfa_step_up_required: true`, `meta.challenge_url` | The session's MFA proof is older than `--mfa-step-up-window-secs`. Complete the step-up and retry. |
+| `403` | step-up envelope, message `MFA step-up is not available for SAML sessions in this release` | A SAML session while step-up is on (#4935). |
+| `503` | A4 envelope, message `authentication store is temporarily unavailable` | The step-up gate could not read the account's MFA status; it fails closed. |
+| `503` | A4 envelope, header `Sec-Audit-Failed: true`, `retry_after_ms: 5000` | The `attempted` audit row could not be written, so the decision was not applied and the ticket stays pending (#5823). |
+| `400` | `{"error":"<reason>"}` | The store refused the decision, for example the reviewer is the submitter, or the ticket is no longer pending. Audited as `denied`. |
+
+Example class refusal:
+
+```json
+{
+  "error": {
+    "code": 403,
+    "message": "approver_assurance_required:non_interactive_session",
+    "correlation_id": "req-...",
+    "remediation": "approving or rejecting requires an interactive human session (local or OIDC login) with a fresh MFA step-up; API-token, MCP and engine credentials cannot decide an approval. Use the dashboard Approvals page."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
 #### `POST /api/approvals/{id}/reject`
 
 Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded. Same caller requirements and fail-closed behaviour as `POST /api/approvals/{id}/approve` above.
@@ -12060,6 +12090,7 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `POST /api/v1/engine-principals/{id}/credentials/rotate` (rotate a credential)
 - `POST /api/v1/engine-principals/{id}/credentials/confirm` (confirm a rotation cutover)
 - `POST /api/v1/engine-principals/{id}/transfer-owner` (reassign the responsible owner)
+- `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` (decide an approval request; cookie sessions only, API-token and MCP-token sessions get `403 approver_assurance_required:<reason>` instead of passing through, #6061)
 - `POST /api/v1/rbac/roles/{name}/assignments` (assign a fleet-wide RBAC role to a human user)
 - `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` (unassign a fleet-wide RBAC role from a human user)
 - `POST /api/v1/users/{username}/elevation-eligibility` and `POST /api/v1/users/elevation-eligibility?username=` (grant or revoke JIT-elevation eligibility)

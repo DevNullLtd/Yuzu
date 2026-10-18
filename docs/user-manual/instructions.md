@@ -655,7 +655,7 @@ with a signed-in session.
 ### Approval API
 
 Approve and reject need a signed-in session cookie (see [Who can approve](#who-can-approve)); a bearer
-token is refused. The examples assume a session that has completed MFA step-up.
+token is refused. The examples assume a session that has completed MFA step-up. A cookie-session `POST` must carry an `Origin` (or `Referer`) naming the server, as a browser sends; a request with neither, or naming another site, is refused with `403` (`--csrf-trusted-origin` entries are accepted). The error table is in the [REST API reference](rest-api.md).
 
 ```bash
 # Check pending approval count
@@ -665,12 +665,14 @@ curl -s -b cookies.txt \
 # Approve an execution request
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/approvals/REQ-001/approve \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Reviewed — safe to proceed."}'
 
 # Reject an execution request
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/approvals/REQ-001/reject \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Not approved for production during change freeze."}'
 ```
@@ -1381,6 +1383,10 @@ curl -s -b cookies.txt http://localhost:8080/api/approvals/pending/count
 POST /api/approvals/{id}/approve
 ```
 
+Approve and reject need a signed-in session cookie, a fresh MFA step-up and a same-site
+`Origin`/`Referer`; an API or MCP token is refused with `403`. See
+[Who can approve](#who-can-approve) and the error table in the [REST API reference](rest-api.md).
+
 The reviewer must be a different operator than the submitter — self-approval
 is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
 and the denied attempt is recorded in the audit log. The `comment` is capped at
@@ -1389,6 +1395,7 @@ and the denied attempt is recorded in the audit log. The `comment` is capped at
 ```bash
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/approvals/REQ-001/approve \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Approved."}'
 ```
@@ -1402,6 +1409,7 @@ POST /api/approvals/{id}/reject
 ```bash
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/approvals/REQ-001/reject \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Denied — change freeze in effect."}'
 ```

@@ -110,7 +110,7 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > handler. A recall against a still-**pending**
 > ticket returns the same `kApprovalRequired` envelope (keep polling
 > `status_url`); a rejected/expired/mismatched/consumed ticket returns
-> `kPermissionDenied` (-32003). `confirm_engine_rotation`'s recall additionally
+> `kPermissionDenied` (-32003) (an approved ticket past its 7-day lifetime gets the distinct message `approval expired (past its 7-day lifetime)`). `approve_request` / `reject_request` are a separate, unconditional `kPermissionDenied` (-32003) whose message is the stable prefix `approver_assurance_required:<reason>` (`<reason>` is `non_interactive_session`, `engine_principal` or `non_human_principal`; #6061), returned after the `Approval:Approve` check with `retry_after_ms` null and a `mcp.<tool>` `denied` audit row whose detail is `approval_id=<id> approver_assurance:<reason>`. `confirm_engine_rotation`'s recall additionally
 > runs a pre-consume precondition (#2443) that rechecks live rotation state
 > before consuming the ticket; a precondition failure also returns
 > `kPermissionDenied` (-32003) but with a distinct, deliberately generic
