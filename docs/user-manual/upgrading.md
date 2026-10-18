@@ -116,7 +116,7 @@ Settings gains a **Security and sign-in** page (`/settings/security`, administra
 
 - **Saving SSO trims whitespace.** `POST /api/settings/oidc` trims leading and trailing whitespace from `issuer`, `client_id`, `redirect_uri` and `admin_group` before validating and storing them. A value saved earlier with a trailing space is stored as typed until it is saved again; a trailing space in the admin group previously made the group match fail for every SSO administrator at the next sign-in.
 - **The mTLS switch toast no longer says "saved".** The switch changes only the value this server reports; it is not saved and start-up flags decide. Anything that matched the old toast text should be updated.
-- **Errors appear inside the panel.** A failed SSO save or a rejected certificate paste is now shown in the panel on the new page instead of being dropped. The HTTP statuses and response bodies are unchanged.
+- **Errors appear inside the panel.** A failed SSO save or a rejected certificate paste is now shown in the panel on the new page instead of being dropped. The HTTP statuses are unchanged; the error text now sits inside the panel markup instead of an out-of-band span.
 - **The panel is renamed.** "Multi-Factor Authentication" is now **Two-factor sign-in**, found under Settings → Security and sign-in. The `/fragments/settings/mfa` route is unchanged. The elevation error text for an account with no enrolled second factor names the new location.
 
 ## Behaviour change: dashboard API-token create and revoke apply MFA step-up

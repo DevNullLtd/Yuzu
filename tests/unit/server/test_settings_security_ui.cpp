@@ -162,6 +162,8 @@ TEST_CASE("SSO panel: Test SSO cannot send the client secret", "[settings][secur
     CHECK(html.find("</form>", test_at) == std::string::npos);
     CHECK_THAT(html, ContainsSubstring("hx-params=\"issuer,skip_tls_verify\""));
     CHECK_THAT(html, !ContainsSubstring("closest form"));
+    CHECK_THAT(html, ContainsSubstring("discovery document and its signing keys"));
+    CHECK_THAT(html, ContainsSubstring("Nothing is saved"));
     // Save joins the form through the `form` attribute and carries the confirm on the form.
     CHECK_THAT(html, ContainsSubstring("type=\"submit\" form=\"oidc-form\""));
     CHECK(forms_not_nested(html));
