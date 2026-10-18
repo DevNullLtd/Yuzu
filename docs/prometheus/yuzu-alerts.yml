@@ -1098,9 +1098,12 @@ groups:
       # a resend (a route store that could not be read for a few seconds) leaves
       # it above 0 for seconds; a server that keeps refusing keeps it above 0,
       # and the agents behind it are connected to the gateway but not recorded
-      # (not dispatchable) at the server. `for: 10m` is ten times the 60 s
-      # longest backoff between resends, so a refusal the server stops within a
-      # few minutes never fires, and a dip to 0 starts the ten minutes again.
+      # (not dispatchable) at the server. `for: 10m` is ten times the normal
+      # 60 s backoff cap and once the slow-phase interval (a CONNECTED refused
+      # 10 times in a row is resent every 8 to 10 minutes and waits in the set
+      # the whole time, so the gauge does not dip; the 10-refusal trade-off is
+      # #6077), so a refusal the server stops within a few minutes never fires,
+      # and a dip to 0 starts the ten minutes again.
       # The resends stop on their own when a session ends at the gateway, so a
       # gauge that stays above 0 for 10 minutes is a session that is still live
       # and still refused. INITIAL threshold and window, to be tuned on a real
