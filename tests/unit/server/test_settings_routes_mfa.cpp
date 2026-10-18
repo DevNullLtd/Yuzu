@@ -200,7 +200,7 @@ TEST_CASE("GET /fragments/settings/mfa renders 'Not enrolled' panel for fresh ad
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("Not enrolled") != std::string::npos);
-    CHECK(res->body.find("Enable MFA") != std::string::npos);
+    CHECK(res->body.find("Set up two-factor") != std::string::npos);
     // GETs are not CSRF-sensitive — no csrf.denied should fire.
     CHECK_FALSE(h.has_audit("csrf.denied"));
 }
@@ -262,7 +262,7 @@ TEST_CASE("POST /api/settings/mfa/recovery-codes regenerates 10 codes + cache he
     CHECK(res->get_header_value("Cache-Control") == "no-store, private");
     // Each recovery code is XXXX-XXXX-XXXX-XXXX (19 chars). Look for a
     // representative bullet pattern.
-    CHECK(res->body.find("STORE THESE") != std::string::npos);
+    CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
     CHECK(h.has_audit("mfa.recovery_codes.generated", "ok", "admin"));
 }
 
@@ -367,7 +367,7 @@ TEST_CASE("Settings MFA init/verify queued behind a password reset refuses with 
     CHECK(racing->status == 200);
     CHECK(racing->body.find("Your password changed during enrolment") != std::string::npos);
     CHECK(racing->body.find("otpauth://") == std::string::npos); // no reveal
-    CHECK(racing->body.find("STORE THESE") == std::string::npos); // no recovery codes
+    CHECK(racing->body.find("Store these recovery codes now") == std::string::npos); // no recovery codes
     CHECK(h.has_audit("mfa.enroll.failed", "error", "admin"));
     CHECK(h.audit_detail("mfa.enroll.failed") == "credential_changed");
     CHECK_FALSE(h.has_audit("mfa.enroll.verified"));

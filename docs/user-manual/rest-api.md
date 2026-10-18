@@ -9617,12 +9617,14 @@ outcome's granularity.
 | `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC discovery, JWKS and (Linux/macOS) token requests (insecure, dev only); the Windows token request ignores it. The save itself does not contact the IdP; use `/test` |
 
 - **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success. `400` with a red message when `issuer` or `client_id` is missing, or `redirect_uri` is blank; nothing is saved in that case. Each `400`, and the `500` returned when the provider cannot be built, also carries an error toast (`HX-Trigger: {"showToast":{"message":"...","level":"error"}}`) because the dashboard does not swap a 4xx or 5xx body. Saves are serialized: two concurrent saves run one after the other, and a blank `client_secret` keeps the secret stored when that save runs.
+- **Trimming:** `issuer`, `client_id`, `redirect_uri` and `admin_group` are trimmed of surrounding whitespace before they are validated and stored (a trailing space in `admin_group` previously made the group match fail for every SSO administrator at the next sign-in).
 - **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts the provider to that value (the stored `oidc_admin_group` still applies after a restart; see [When a change takes effect](#when-a-change-takes-effect)). Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
 **`POST /api/settings/oidc/test`** — Test OIDC discovery and signing-key connectivity.
 
 - **Permission:** Admin only
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
+- **Behaviour today:** an empty `issuer` falls back to the stored issuer; the stored skip-TLS flag is OR-ed with the posted one (a posted `false` cannot turn off a stored `true`); the typed issuer is not trimmed here (unlike the save route); and the check fetches the discovery document and the signing keys.
 - **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` (one request after the other, each with its own total time bound, so one call can take up to about 20 s in the worst case at the default timeouts: a slow discovery document followed by a stalled JWKS fetch; a dead IdP fails at the discovery step) and reports how many signing keys it found. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. The typed issuer and the `jwks_uri` are subject to the server's OIDC egress policy: an address the policy refuses (link-local and cloud-metadata always; loopback, RFC 1918, carrier-grade NAT and unique-local unless the server was started with `--oidc-allow-private-networks`) is not connected to, and the red feedback reads `Discovery failed: request failed: address not permitted by the OIDC egress policy` (never the resolved address). The switch is a server start-up option; no form field of this route or of `POST /api/settings/oidc` can change it. This is a connectivity check, not a guarantee of what a sign-in will hit: it uses the form's `issuer` (the saved issuer when blank), never reads or clears the running provider's discovery state (the 30 s no-retry window and the in-flight mark), and skips TLS verification when the form's `skip_tls_verify` is `"true"` OR the server's current value is true (an absent field cannot turn verification on while that value is true).
 
 #### `GET /api/v1/settings/oidc`
@@ -9672,7 +9674,7 @@ Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration c
 | `content` | string | Yes | PEM-encoded content (must contain `-----BEGIN`) |
 
 - **Response:** Re-rendered TLS Settings fragment (HTMX). Returns toast notification on success.
-- **Effect:** Writes PEM content to the server cert directory. A `key` is created owner-only (0600) and replaced atomically by rename (a symlink at the destination is replaced, not followed); a certificate directory the server creates is 0700, and an existing directory's mode is left as it is. Config is updated immediately; HTTPS cert hot-reload will pick up changes within the polling interval.
+- **Effect:** Writes PEM content to the server cert directory. A `key` is created owner-only (0600) and replaced atomically by rename (a symlink at the destination is replaced, not followed); a certificate directory the server creates is 0700, and an existing directory's mode is left as it is. The agent (gRPC) certificate, key or CA path in the running configuration is updated. This does not change the dashboard HTTPS certificate (that comes from `--https-cert`/`--https-key`), and the running gRPC listeners are not reloaded; after a restart the file is used only if `--cert`/`--key`/`--ca-cert` name it.
 
 ---
 
@@ -9771,7 +9773,7 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
 
 ### Settings — Multi-Factor Authentication (MFA / TOTP)
 
-These endpoints drive the **Settings → Multi-Factor Authentication** card. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than JSON. All five require an admin session and target `#mfa-section` for swap-in. SOC 2 CC6.6 — see `docs/auth-mfa-design.md`.
+These endpoints drive the **Settings → Security and sign-in → Two-factor sign-in** card. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than JSON. All five require an admin session and target `#mfa-section` for swap-in. SOC 2 CC6.6 — see `docs/auth-mfa-design.md`.
 
 **`GET /fragments/settings/mfa`** — Render the MFA card for the logged-in admin.
 
