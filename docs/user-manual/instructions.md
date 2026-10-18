@@ -663,7 +663,17 @@ with a signed-in session.
   cannot be written, the request returns `503` and nothing changes (#5823).
 - An approved request that has not been used within 7 days of its review is refused when it is
   consumed, even if no new request has been submitted since to sweep expired tickets. The check
-  uses database time. The submitter must request approval again.
+  uses database time. The submitter must request approval again. The status shown in the Approvals
+  tab and page, and returned by the list routes, is only rewritten to `expired` by the next approval
+  submission, so an aged approved request keeps showing `approved` until then although it can no
+  longer be used (tracked in #6098).
+
+**If the dialog says you do not have permission.** The Approvals dialog shows that one message for
+every `403`. The causes, in the order the server checks them: you lack `Approval:Approve`; the
+request carried no same-site `Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the
+public address is not listed in `--csrf-trusted-origin`); or you signed in through SAML while step-up
+is on. The Approve and Reject buttons are a render hint only: a SAML session is shown them and the
+route still refuses it.
 
 ### Approval API
 

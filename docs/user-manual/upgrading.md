@@ -30,12 +30,24 @@ principal and not an engine principal. The existing rule that the reviewer canno
   OIDC case only if your identity provider asserts `amr` for approvers: an OIDC session without it gets `401` and
   loops through re-sign-in, which locks those approvers out. Requiring that the approver holds an enrolled factor
   in every mode is tracked in #6079.
+- **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
+  `/api/approvals/{id}/approve` or `/reject` that authenticates with a session cookie and carries no `Origin` or
+  `Referer` naming this site now gets `403` (audited as `csrf.denied`, before any step-up is spent). A script that
+  signs in with `curl -b` must send `-H "Origin: <the server's own base URL>"`. A deployment behind a
+  TLS-terminating or Host-rewriting reverse proxy must declare the public address with `--csrf-trusted-origin`, as
+  for the sibling cookie-write routes above, or the dashboard's Approve and Reject buttons are refused. Token callers
+  are not subject to this check (they are refused as non-interactive sessions instead). The dashboard dialog shows
+  every `403` as "You do not have permission to decide approvals", so a missing `Origin` looks like a permission
+  problem there; see "Who can approve" in `instructions.md` for the causes.
 - **A degraded session read fails closed.** The route answers `503` and the request stays pending; it no
   longer records the reviewer `unknown` (#4128).
 - **The attempt is audited first.** If the audit row cannot be written, approve and reject return `503`
   and change nothing (#5823).
 - **Expiry is enforced at consume.** An approved request not used within 7 days of its review is refused
-  when it is consumed, using database time, even if no new request has been submitted since.
+  when it is consumed, using database time, even if no new request has been submitted since. The `status` shown on
+  the Approvals page and returned by the list routes (`GET /api/approvals`, `GET /api/v1/approvals`, MCP
+  `list_pending_approvals`) is only rewritten to `expired` by the next approval submission, so an aged approved ticket
+  keeps showing `approved` until then even though consume and `ScheduleRunner` already refuse it (tracked in #6098).
 
 **Who this affects.** Any automation that approved or rejected over MCP or with an API token. It will now
 fail. A supervised-tier agentic worker still requests approval and recalls with the `approval_id`, but a
