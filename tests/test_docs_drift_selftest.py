@@ -153,7 +153,7 @@ class Extraction(unittest.TestCase):
         for top in ("server/core/src", "agents/core/src"):
             for f in (ROOT / top).rglob("*"):
                 if f.suffix in (".cpp", ".hpp", ".h") and re.search(r"\badd_(?:option|flag)\s*\(",
-                                                                    f.read_text(errors="replace")):
+                                                                    f.read_text(encoding="utf-8", errors="replace")):
                     callers.add(f.relative_to(ROOT).as_posix())
         self.assertLessEqual(callers, set(d.FLAG_SOURCES), "add the file to FLAG_SOURCES")
 
@@ -212,12 +212,12 @@ class Ratchet(unittest.TestCase):
     def test_write_baseline_refuses_growth(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
             p = Path(tmp) / "b.json"
-            p.write_text(json.dumps({c: [] for c in d.CATEGORIES}))
+            p.write_text(json.dumps({c: [] for c in d.CATEGORIES}), encoding="utf-8")
             dr = self.drift(tools=["t"])
             self.assertEqual(d.write_baseline(p, dr, allow_growth=False), 1)
-            self.assertEqual(json.loads(p.read_text())["mcp_undocumented"], [])
+            self.assertEqual(json.loads(p.read_text(encoding="utf-8"))["mcp_undocumented"], [])
             self.assertEqual(d.write_baseline(p, dr, allow_growth=True), 0)
-            self.assertEqual(json.loads(p.read_text())["mcp_undocumented"], ["t"])
+            self.assertEqual(json.loads(p.read_text(encoding="utf-8"))["mcp_undocumented"], ["t"])
             self.assertEqual(d.write_baseline(p, self.drift(), allow_growth=False), 0)  # shrinking is free
 
 
@@ -352,7 +352,7 @@ class SyntheticRepo(unittest.TestCase):
 
     def add_undocumented_tool(self):
         path = self.repo / "server/core/src/mcp_server.cpp"
-        path.write_text(path.read_text().replace("};", '    {"zz_new", "d"},\n};'))
+        path.write_text(path.read_text(encoding="utf-8").replace("};", '    {"zz_new", "d"},\n};'), encoding="utf-8")
 
     def test_root_is_forwarded(self):
         self.assertEqual(d.main(["--root", str(self.repo)]), 0)
@@ -364,15 +364,15 @@ class SyntheticRepo(unittest.TestCase):
         self.add_undocumented_tool()
         baseline = self.repo / d.BASELINE_REL
         self.assertEqual(d.main(["--root", str(self.repo), "--update-baseline"]), 1)
-        self.assertEqual(json.loads(baseline.read_text())["mcp_undocumented"], [])
+        self.assertEqual(json.loads(baseline.read_text(encoding="utf-8"))["mcp_undocumented"], [])
         self.assertEqual(d.main(["--root", str(self.repo), "--write-baseline", "--allow-growth"]), 0)
-        self.assertEqual(json.loads(baseline.read_text())["mcp_undocumented"], ["zz_new"])
+        self.assertEqual(json.loads(baseline.read_text(encoding="utf-8"))["mcp_undocumented"], ["zz_new"])
 
     def touch(self, head, body=None):
         args = ["--root", str(self.repo), "--touch", self.base, head]
         if body is not None:
             bf = self.repo.parent / "touch-body.md"
-            bf.write_text(body)
+            bf.write_text(body, encoding="utf-8")
             args.append(str(bf))
         return d.main(args)
 
@@ -407,7 +407,7 @@ class SyntheticRepo(unittest.TestCase):
     def test_tree_git_config_cannot_run_commands(self):
         marker = self.repo.parent / "FSMONITOR"
         hook = self.repo.parent / "fsmon-gate.sh"
-        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
         hook.chmod(0o755)
         git(self.repo, "config", "core.fsmonitor", str(hook))
         # Control: an unguarded ls-files in this tree DOES run it ...
@@ -428,14 +428,14 @@ class SyntheticRepo(unittest.TestCase):
 
     def test_a_flag_shared_by_two_sources_does_not_trip_the_floor(self):
         src = self.repo / d.FLAG_SOURCES[1]
-        src.write_text(src.read_text() + 'app.add_option("--flag-0", x);\n')  # also in main.cpp
+        src.write_text(src.read_text(encoding="utf-8") + 'app.add_option("--flag-0", x);\n', encoding="utf-8")  # also in main.cpp
         write(self.repo, d.FLAG_SOURCES[2], 'app.add_option("--flag-0", x);\n')  # ONLY a duplicate
         self.assertEqual(d.current_drift(self.repo)["flag_undocumented"], [])
 
     def outside_copy(self, name, text):
         """A regular file OUTSIDE the repo (next to it in the same tempdir)."""
         path = self.repo.parent / name
-        path.write_text(text)
+        path.write_text(text, encoding="utf-8")
         return path
 
     def symlink_or_skip(self, target, link):
@@ -451,7 +451,7 @@ class SyntheticRepo(unittest.TestCase):
         """A symlink to an ordinary, small, regular file outside the tree:
         only the outside-the-tree check can refuse it."""
         doc = self.repo / d.REST_DOC
-        target = self.outside_copy("outside-rest-api.md", doc.read_text())
+        target = self.outside_copy("outside-rest-api.md", doc.read_text(encoding="utf-8"))
         self.symlink_or_skip(target, doc)
         with self.assertRaisesRegex(ValueError, "outside the tree"):
             d.current_drift(self.repo)
@@ -528,14 +528,14 @@ class SyntheticRepo(unittest.TestCase):
         """The hook runs the PROJECT's gate on a possibly newer tree: unknown
         manifest/baseline keys must be ignored, not crash or flip the result."""
         man = self.repo / d.MANIFEST_REL
-        data = json.loads(man.read_text())
+        data = json.loads(man.read_text(encoding="utf-8"))
         data["schema_version"] = 99
         data["rules"][0]["future_field"] = ["x"]
-        man.write_text(json.dumps(data))
+        man.write_text(json.dumps(data), encoding="utf-8")
         base = self.repo / d.BASELINE_REL
-        b = json.loads(base.read_text())
+        b = json.loads(base.read_text(encoding="utf-8"))
         b["some_future_category"] = ["anything"]
-        base.write_text(json.dumps(b))
+        base.write_text(json.dumps(b), encoding="utf-8")
         self.assertEqual(d.main(["--root", str(self.repo)]), 0)
 
     def test_touch_fails_closed(self):
@@ -561,7 +561,7 @@ class SyntheticRepo(unittest.TestCase):
     def test_hook_does_not_run_the_trees_fsmonitor(self):
         marker = self.repo.parent / "FSMONITOR-HOOK"
         script = self.repo.parent / "fsmon.sh"
-        script.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+        script.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
         script.chmod(0o755)
         git(self.repo, "config", "core.fsmonitor", str(script))
         subprocess.run(["git", "-C", str(self.repo), "ls-files"], capture_output=True, env=hermetic_env())
@@ -622,7 +622,7 @@ class RootIsData(unittest.TestCase):
             planted = Path(tmp) / "scripts" / "ci"
             planted.mkdir(parents=True)
             for name in ("check-api-parity.py", "check-docs-drift.py"):
-                (planted / name).write_text(PLANT)
+                (planted / name).write_text(PLANT, encoding="utf-8")
             mod = d.load_parity(tmp)
             self.assertEqual(mod.SERVER_SRC, Path(tmp) / "server" / "core" / "src")
             self.assertEqual(d.run_facts(Path(tmp)), 1)  # empty tree: fails closed
@@ -680,7 +680,7 @@ class Hook(unittest.TestCase):
 
     def test_body_file_read_is_capped(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
-            (Path(tmp) / "b.md").write_text("x" * 20)
+            (Path(tmp) / "b.md").write_text("x" * 20, encoding="utf-8")
             old = hook._MAX_BODY
             hook._MAX_BODY = 5
             try:
@@ -718,9 +718,9 @@ class Hook(unittest.TestCase):
             repo = Path(tmp)
             synthetic_tree(repo)
             mcp = repo / "server/core/src/mcp_server.cpp"
-            mcp.write_text(mcp.read_text().replace("};", '    {"zz_planted_drift", "d"},\n};'))
+            mcp.write_text(mcp.read_text(encoding="utf-8").replace("};", '    {"zz_planted_drift", "d"},\n};'), encoding="utf-8")
             for name in ("check-docs-drift.py", "check-api-parity.py"):
-                (repo / "scripts" / "ci" / name).write_text(PLANT)
+                (repo / "scripts" / "ci" / name).write_text(PLANT, encoding="utf-8")
             subprocess.run(["git", "init", "-q", tmp], check=True, env=hermetic_env())
             git(repo, "add", "-A")
             git(repo, "commit", "-qm", "plant")
