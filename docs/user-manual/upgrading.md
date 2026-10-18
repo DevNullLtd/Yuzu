@@ -110,6 +110,15 @@ customer-distribution lane. Before switching lanes, read the
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: the Security and sign-in page (single sign-on, two-factor, HTTPS and agent mTLS)
+
+Settings gains a **Security and sign-in** page (`/settings/security`, administrators only). It hosts the same four panels that `/settings` already loads, so no route, field name or audit row changes and `/settings` keeps working. What an operator or script can notice:
+
+- **Saving SSO trims whitespace.** `POST /api/settings/oidc` trims leading and trailing whitespace from `issuer`, `client_id`, `redirect_uri` and `admin_group` before validating and storing them. A value saved earlier with a trailing space is stored as typed until it is saved again; a trailing space in the admin group previously made the group match fail for every SSO administrator at the next sign-in.
+- **The mTLS switch toast no longer says "saved".** The switch changes only the value this server reports; it is not saved and start-up flags decide. Anything that matched the old toast text should be updated.
+- **Errors appear inside the panel.** A failed SSO save or a rejected certificate paste is now shown in the panel on the new page instead of being dropped. The HTTP statuses are unchanged; the error text now sits inside the panel markup instead of an out-of-band span.
+- **The panel is renamed.** "Multi-Factor Authentication" is now **Two-factor sign-in**, found under Settings → Security and sign-in. The `/fragments/settings/mfa` route is unchanged. The elevation error text for an account with no enrolled second factor names the new location.
+
 ## Behaviour change: dashboard API-token create and revoke apply MFA step-up
 
 `POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` (the Settings page's
@@ -2593,7 +2602,7 @@ What changes on upgrade if the flag is set to `admin-only` or `required`:
 **Before upgrading with the flag set, do ONE of:**
 
 1. **Recommended:** leave the flag at `optional`, upgrade, have all affected
-   users enroll (Settings → Multi-Factor Authentication), *then* set
+   users enroll (Settings → Security and sign-in → Two-factor sign-in), *then* set
    `admin-only`/`required` and restart. or
 2. Upgrade with the flag set and accept that affected un-enrolled users will
    be walked through enrollment on their next login.
@@ -2641,7 +2650,7 @@ closed (non-zero exit, refuses to serve)** otherwise:
    SP config on Linux/macOS with HTTPS) refuses to start (it would lock every
    operator out).
 2. (Recommended) Create a single break-glass local account and **enroll MFA on
-   it** (Settings → Multi-Factor Authentication). Point `--break-glass-user` at
+   it** (Settings → Security and sign-in → Two-factor sign-in). Point `--break-glass-user` at
    it. `sso-only` refuses to start if the named break-glass user doesn't exist or
    has no MFA enrolled — a break-glass account must carry a second factor.
 3. Restart with `--auth-mode=sso-only`. Local-password login is now rejected for
@@ -3453,7 +3462,7 @@ only in the old `auth.db` local-account tables is gone until re-established.
    `yuzu-server.cfg`.
 3. Re-create any other local operator accounts that are not SCIM-provisioned
    (Settings → Users), and have every user re-enrol MFA
-   (Settings → Multi-Factor Authentication).
+   (Settings → Security and sign-in → Two-factor sign-in).
 4. For SCIM-provisioned users, either wait for the next scheduled IdP sync or
    trigger one manually if your SCIM setup supports it; do not manually
    re-create SCIM-managed users (they will be re-provisioned).

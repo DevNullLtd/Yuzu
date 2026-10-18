@@ -161,6 +161,7 @@
 #include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
+#include "access_audit_routes.hpp" // Audit and reviews page (Phase 2 UI): /access/audit
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
@@ -15837,6 +15838,35 @@ private:
                                            s.validation_regex});
                         return out;
                     },
+            });
+
+        // Audit and reviews page (Phase 2 UI), audit half: /access/audit, its log, sample and
+        // retention fragments and the page's static glue. Each fragment is gated on the same
+        // securable as its REST twin: the auto-loading log by the quiet probe (no denial row
+        // per page view), the on-request sample and retention by the loud `perm_fn`. The audit
+        // read returns nullopt when the store is closed or did not answer, never an empty
+        // vector for that.
+        yuzu::server::access_audit::register_access_audit_routes(
+            inline_sink,
+            yuzu::server::access_audit::Deps{
+                .auth_fn = auth_fn,
+                .perm_fn = perm_fn,
+                .quiet_perm_fn = draw_perm_fn,
+                .audit_fn = audit_fn,
+                .query_fn = [this](const AuditQuery& q, std::size_t* pool_size)
+                    -> std::optional<std::vector<AuditEvent>> {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return std::nullopt;
+                    return audit_store_->query(q, pool_size);
+                },
+                .retention_days_fn =
+                    [this]() {
+                        // The enforced figure (the store copies it at construction), not the
+                        // live config value; without a store, the startup config.
+                        return audit_store_ ? audit_store_->retention_days()
+                                            : cfg_.audit_retention_days;
+                    },
+                .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
             });
 
         // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the
