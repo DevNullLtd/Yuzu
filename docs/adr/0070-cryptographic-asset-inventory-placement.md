@@ -176,13 +176,22 @@ For cryptography the test reduces to one distinction, which every row below appl
 > operator authors the judgement themselves, as policy content evaluated by a generic
 > engine.
 
-A **derived field** is core only if it is a pure function of stored raw fields and a value
+A **derived field** is core only if it is a pure function of collected raw facts and a value
 the caller supplies. A field that reads the server's clock, or applies a cut-off Yuzu
-chose, is a verdict and belongs to the engine. Under that rule:
+chose, is a verdict and belongs to the engine.
+
+This rule is scoped to Domain 41, and it is stricter than ADR-1005:47, which lists
+"histograms" as mechanism without saying who picks the bucket edges. In cryptography a
+fixed edge is itself a strength claim: a 2048/3072-bit boundary is a standards cut-off. So
+a Yuzu-chosen bucketing is a verdict here. Fixed-edge rollups in other domains are
+unaffected.
+
+Under that rule:
 
 | Field | Core? |
 |---|---|
-| `is_ca` (from basic constraints), `self_signed` (subject = issuer and the signature verifies under its own key) | yes |
+| `is_ca` (from basic constraints) | yes |
+| `self_signed` (subject = issuer and the signature verifies under its own key), computed by the agent at collection time and stored as a collected fact, because the server does not hold the signature bytes | yes |
 | `signature_hash` named from the signature OID | yes |
 | `days_remaining` | no — it reads "now" |
 | `signature_hash_strength` | no — it grades |
@@ -210,7 +219,7 @@ classify the work if it is built; they do not promise it.
 | Certificate collection (agent): read-only enumeration of certificate stores and trust-store files | 2 | **core** | Collection of estate facts. Parallel to `vuln_scan`'s inventory action, which ADR-1005 keeps core. Bound by D6 and D12. |
 | Certificate daily-sync source + typed store of raw X.509 fields | 2 | **core** | Transport and storage of collected facts (ADR-0016 §7 typed projection). Bound by D12. |
 | Raw X.509 fields: subject, issuer, serial, validity, key algorithm + size, signature algorithm, SANs, KU/EKU, basic constraints, SHA-256 fingerprint, store/location | 2 | **core** — subject and SAN may be personal data (D12) | Each is a field of the certificate as found on the device. Naming an algorithm is a fact; grading it is not done here. |
-| Certificate ↔ private-key association: whether a key is present, whether it is marked exportable, whether it is hardware- or TPM-backed (never the key) | 2 | **core** | Facts about the device's key storage, read from metadata, never from key material (D12). |
+| Certificate ↔ private-key association: whether a key is present, whether it is marked exportable, whether it is hardware- or TPM-backed (never the key) | 2 | **core** | Facts about the device's key storage, read from metadata, never from key material (D6). |
 | Certificate read surface (REST + MCP + dashboard), raw-value rollups, paged per-certificate read | 2 | **core** — D12 | Raw-fact reads under existing confinement and audit. These are also the core capability an engine reads through (ADR-0031 seam B6, D9). |
 | Caller-parameterised filters (e.g. `not_after < T`, `key_bits < N`) and distinct-device counts by raw value | 2 | **core** — D4 | A generic query primitive. The caller supplies the threshold, so the semantics are the caller's, not code-baked. |
 | "Expired / expires in N days" as Yuzu-defined bands, risk scores, default thresholds, Yuzu-chosen expiry notifications (roadmap Issue 18.3 "expiry alerts") | 2 | **UCE** — D4 | Derived against "now" with a threshold Yuzu chooses. Same class as ADR-0024's *effective licence state* (`0024:126-128`), which that ADR sends to the engine. |
@@ -248,7 +257,7 @@ module, not an immediately buildable target. Three things stand in the way:
 No in-server crypto verdict is ever built as an interim measure. That differs from the
 vulnerability vertical, which shipped in-server first and was grandfathered (ADR-1005
 grandfathered surface #2). The difference is timing. In ADR-0024's words, re-scoping is
-"the cleaner outcome Decision 2 points to when the work has not yet shipped"
+"the cleaner outcome Decision 2 [ADR-1005] points to when the work has not yet shipped"
 (`0024:203-205`).
 
 ### D2 — The library-family table is identity resolution, under four conditions [core]
@@ -283,7 +292,8 @@ the list *asserts*:
    - a package name today;
    - for ADR-0028 components, a soname, a VERSIONINFO product name or an install name.
 
-   Matching is exact or prefix, and never uses file contents, version strings or publisher
+   Matching is exact or prefix. It reads nothing from a file beyond its declared-identity
+   record: no code bytes, hashes, embedded strings, version strings or publisher
    heuristics. The table is versioned: `table_version` is on every response and in the
    drill-cursor fingerprint, so a consumer can tell which mapping produced an answer.
 3. **Inclusion is factual, not evaluative.** A family is included because it *is* a
@@ -365,9 +375,11 @@ the second. RFC 5280's `99991231235959Z` no-expiry sentinel and other edge dates
 preserved unclamped. Today's plugin truncates dates to `YYYY-MM-DD`, so the slice-2
 collector must read full precision.
 
-**Core never compares a certificate's dates against the server's own clock.** Every
-comparison takes a time T the caller supplies. That includes "already expired", which is
-a query with T = now, chosen by the caller, not a field or a label.
+**Core's built-in fields and reads never compare a certificate's dates against the server's
+own clock.** Every such comparison takes a time T the caller supplies. That includes
+"already expired", which is a query with T = now, chosen by the caller, not a field or a
+label. Operator-authored policy is the one place a comparison may use "now", because the
+operator wrote it; even then it must name whose clock "now" is (below).
 
 **Core may offer:**
 - filters and counts whose threshold the caller supplies (`not_after` before T, after T,
@@ -416,6 +428,24 @@ conditions:
    On Windows a revocation check can be answered from a *cached* CRL or OCSP response even
    with network retrieval off, so condition 1 alone does not exclude third-party
    revocation data.
+
+   Conditions 1 and 2 together still do not make the result independent of distrust data
+   pushed by the operating system's vendor:
+   - macOS `trustd` applies its locally synced revocation database (Apple's "Valid" data,
+     under `/private/var/protected/trustd/`) and its OCSP cache, whatever policy the caller
+     passes.
+   - Windows maintains a Disallowed store and an untrusted-certificate list that the OS
+     updates in the background.
+
+   That data is already on the device, maintained by the OS. It is part of what the device
+   will in fact trust, so this ADR treats it as **device configuration**, not as a Yuzu join
+   with third-party data, on two conditions:
+   - the chain build triggers no fetch of it;
+   - the result says so: it reports "what this device's OS trust evaluation returns,
+     including OS-vendor distrust data present on the device", never "valid" or "not
+     revoked" in general.
+
+   This reading is part of D5's maintainer ruling.
 3. **AIA, CDP and OCSP URLs are untrusted endpoint input.** A low-privileged user can
    plant a certificate in a per-user store. That would make an agent running as SYSTEM or
    root fetch addresses of the attacker's choosing: request forgery towards internal
@@ -444,13 +474,16 @@ untrusted. The fetcher therefore needs its own security review, with at least:
 **If reversed** (third-party revocation ruled core), that fetcher lands in core, with the
 same review obligations.
 
-**Maintainer ruling requested:** confirm the purpose-based reading of the "CRL" carve-out.
+**Maintainer ruling requested:** confirm the purpose-based reading of the "CRL" carve-out,
+and that OS-vendor distrust data already on the device counts as device configuration under
+the conditions above.
 
 ### D6 — The certificate inventory is read-only and stays apart from Yuzu's own PKI [core]
 
 **1. Read-only by construction.** The inventory is collected by enumeration only. The
 existing `certificates` plugin's `delete` action is Destructive / Irreversible /
-AdminOrApproval (`plugin_action_catalogue_c.hpp`), and it must stay unreachable from the
+AdminOrApproval (`server/core/src/capability_decls/plugin_action_catalogue_c.hpp`), and it
+must stay unreachable from the
 inventory:
 
 - The daily-sync source runs plugin actions in-process through the agent's local
@@ -462,9 +495,14 @@ inventory:
 - No inventory surface may offer a mutation.
 - Lifecycle mutations (roadmap Issue 18.3) are a separate, separately governed capability.
 
-**2. No private keys.** The collector reads certificates and key *metadata* only (D12):
-whether a key is present, exportable, or hardware-backed. It never reads key material. On
-Linux that includes never opening private-key directories or key blocks in PEM files.
+**2. No private keys.** The collector reads certificates and key *metadata* only: whether a
+key is present, exportable, or hardware-backed. It never reads key material, and it never
+acquires or opens a key to find these things out.
+- On Windows the metadata comes from certificate properties only, such as
+  `CERT_KEY_PROV_INFO_PROP_ID`. Calling `CryptAcquireCertificatePrivateKey` or opening a
+  key-storage-provider handle is not allowed: it can touch a smart card or raise a PIN
+  prompt.
+- On Linux the collector never opens private-key directories or key blocks in PEM files.
 
 **3. Separate from `CaStore` and every trust anchor.** Fleet certificates are untrusted
 endpoint reports. `CaStore` (ADR-0053) holds the authority data of Yuzu's own internal CA,
@@ -506,7 +544,8 @@ and its own review. It must also cover the collection gaps found while preparing
   - Other trust stores are not read: `/etc/pki`, local CA directories, Java `cacerts`,
     PKCS#12 and application stores.
 - **macOS:** `System.keychain` and `SystemRootCertificates.keychain` are read in-process,
-  and the console user's login keychain through a privileged helper hop.
+  The console user's login keychain is read by a `security find-certificate` subprocess
+  launched in that user's launchd session through the agent's bounded process runner.
 
 ### D7 — CBOM export is core when it carries facts only [core]
 
@@ -524,7 +563,11 @@ schema version chosen at implementation.
 **The export is an ordinary core read, not a side door:**
 - it has REST + MCP twins (ADR-1005 Decision 1);
 - it is confined by ADR-0017 to the caller's devices and audited per export;
-- it is bounded or paged, and admitted like other `/crypto` reads (D12).
+- it is bounded or paged, and goes through the shared `/crypto` admission gate (D12);
+- each half is gated by its own securable. The library half uses slice 1's gate; the
+  certificate half uses D12's floor. A caller who lacks one half's securable gets an export
+  without that half, and the coverage metadata says it was left out. An omitted half never
+  reads as "no certificates" or "no libraries".
 
 **It must not be mistaken for complete.** Every export carries its coverage (devices
 included, devices reporting), its confinement (fleet-wide or confined) and whether it was
@@ -556,7 +599,16 @@ must decide privacy before any slice-3 code is written. It must at least settle 
   Precedents: ADR-0024 D11's pseudonymised `user_ref`, and `browser_inventory`'s
   Forensics-class, default-off, single-target posture.
 - **Host keys are machine-scope, but only the `.pub` halves are read.** The private host
-  keys sit beside them and are never opened.
+  keys sit beside them and are never opened, and neither are users' private keys
+  (`~/.ssh/id_*` without `.pub`).
+- **Link-safe opens.** A user controls `~/.ssh`. Without these checks they could point
+  `authorized_keys` or a `.pub` file at a root-only file and have a root agent read it.
+  Every per-user file is therefore:
+  - opened without following symlinks (`O_NOFOLLOW`, or the platform equivalent);
+  - required to be a regular file;
+  - owner-checked;
+
+  following the `local_security_policy` plugin's `sudoers` posture.
 - **Fleet-wide versus single-target.** A daily sync is fleet-wide by design. The Forensics
   securable is single-target (`requires_explicit_targets`, `docs/authz-model.md` §4). The
   slice-3 ADR must choose which posture each SSH source takes.
@@ -599,7 +651,7 @@ apply here:
 
 | Cell | When it applies |
 |---|---|
-| (g) derived-state confinement | persisting a cross-run rollup, such as a fleet posture score (ADR-0031 INV-31-2: "before a module persists its first cross-run rollup") |
+| (g) derived-state confinement | persisting any derived state across runs, such as a fleet posture score or cached per-certificate verdicts (ADR-0031 INV-31-2: "before a module persists its first cross-run rollup") |
 | (f) per-action mutability in the plugin ABI | dispatching to agents |
 | (i) outcome correlation + the coverage envelope | every distributed fact read and every effect |
 | (j) generated OpenAPI / `tools/list` | reachability over REST or MCP |
@@ -673,14 +725,30 @@ reviewed. These are constraints, not the design.
 **Read surface.**
 - Reads are ADR-0017 admit-then-filter confined, with REST + MCP twins (ADR-1005
   Decision 1).
-- They are gated by a securable **no broader than `Security:Read`**, which gates the live
-  `certificates.list` action today (`plugin_action_catalogue_c.hpp`), unless the design
-  doc justifies a different one. A synced copy must not widen who can see fleet
-  certificates.
-- Each read is audited with its own verb, recording fleet-wide or confined scope.
-- A degraded read is a 503 with a retry hint, never an empty 200.
-- Reads are admitted through the existing `/crypto` read gate and degrade metric (extend
-  it, never fork it).
+- **Who may read: no wider than live access today, in both RBAC states.** The live
+  `certificates.list` action is `Security:Read`
+  (`server/core/src/capability_decls/plugin_action_catalogue_c.hpp`), but it can be
+  reached only by dispatch. Dispatch needs `Execution:Execute`, which is admin-only while
+  RBAC is off.
+  - RBAC on: the read securable is no broader than `Security:Read`.
+  - RBAC off (the default): the read is admin-only, because the legacy fallback admits
+    every unfloored Read. That is done by extending `authz_topology_floor.hpp` (never
+    forking it), on a dedicated certificate securable or on whichever securable slice 2
+    chooses. The `Forensics:Read` floor used for app-usage is the precedent.
+  - Do not floor `Security:Read` itself. It also gates quarantine and the CA routes, so
+    flooring it would change their behaviour.
+- **Gate and denial text take the securable as a parameter.** Slice 1 hard-codes
+  `"Inventory","Read"` and the denial text "Inventory:Read is required". A synced copy must
+  not widen who can see fleet certificates, and a denial must name the permission actually
+  required. On a page that shows both halves, a denied certificate half says it was denied
+  and never renders as "no certificates".
+- **Audit and degrade.** Each read is audited with its own verb, recording fleet-wide or
+  confined scope. A degraded read is a 503 with a retry hint, never an empty 200.
+- **Admission.** Reads are admitted through the existing `/crypto` read gate and degrade
+  metric. Extend them; never fork them.
+- **Truncation is disclosed on every read.** A read response that is capped (a page limit,
+  a per-device limit, a rollup row ceiling) carries a named truncation flag. It never
+  looks complete, and never looks empty.
 
 **Personal data.**
 - Certificate subjects and SANs can carry personal data: e-mail addresses (`rfc822Name`),
@@ -688,8 +756,13 @@ reviewed. These are constraints, not the design.
 - Per-user stores (a person's Windows certificate store, a macOS login keychain) are
   per-user data. Including them is a privacy decision the design doc makes, following the
   ADR-0024 D11 (`user_ref`) and `browser_inventory` precedents.
-- The design doc also records the DPIA, works-council and retention position for what it
-  collects.
+- The design doc also records three things for what it collects:
+  - the DPIA, works-council and retention position;
+  - the RBAC-off posture above;
+  - the data-processor obligations an engine takes on when it consumes certificate
+    subjects and SANs. The ADR-0024 re-home note is the precedent: the engine becomes a
+    data processor with its own retention and deletion duties, and ADR-1005 Decision 5's
+    review applies to any bulk transfer of that personal data.
 
 **Untrusted input.** Every certificate field is untrusted endpoint input:
 - validated as UTF-8 at ingest, with invalid bytes replaced or the field refused;
@@ -702,6 +775,14 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
 **Honest capture.**
 - A store the collector could not read is reported `unreadable` with a reason token.
 - Its last-known rows are kept per store, not replaced by an empty set.
+- Kept rows must never look fresh.
+  - **Per-store freshness.** Each store records `observed_at`, the time of its last
+    successful read, separately from the source's check-in `last_seen`. Every read
+    exposes each store's status and `observed_at`.
+  - **Bounded retention.** Rows kept from a store that stays unreadable are retained
+    only for a bounded period that the design doc states, and are then removed under the
+    clock-guarded-retention concern. Until then they are shown as last observed at their
+    `observed_at`.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016
@@ -712,28 +793,42 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
 **Identity.**
 - A row is keyed by (device, store/location/path, SHA-256 fingerprint). SHA-1 is display
   only.
+- On Linux, two copies are not two certificates:
+  - the same certificate repeated inside one bundle file is one row;
+  - a certificate reachable through several symlinked paths (the hash links under
+    `/etc/ssl/certs`) is one row, with its real paths listed.
+
+  A per-certificate count never counts duplicates.
 - A fallback read never stands in for LocalMachine.
 - A service account's own store is labelled as such, never as a person's.
-- Per-user rows do not take part in the machine-scope replace.
+- Per-user rows do not take part in the machine-scope replace. They have their own replace
+  scope, per (device, user), so that a certificate removed from a user's store also
+  disappears from the inventory.
 - Every row carries the server-receipt `last_seen` (#1685), and engine-facing reads
   expose it.
 
 **Lifecycle.**
 - The new typed store joins `AgentDecommissionStores` (`agent_decommission.hpp`) and its
   drift guard in the same change.
-- It is added to `typed_inventory_sources.hpp`'s typed set. Otherwise its rows also land
-  in the generic inventory store under a broader securable.
+- It is added to `typed_inventory_sources.hpp`'s typed set, with a test. Otherwise its
+  rows also land in the generic inventory store under a broader securable. That set only
+  stops new writes, so the design doc also states how stray generic-store rows are kept
+  from being read there. App-usage's boot-time purge, and the mixed-version window it
+  accepts, is the precedent.
 - It is covered by `/readyz`.
 - Any new background job is classified in `background_jobs.hpp`, and any prune follows
   the clock-guarded-retention routed concern.
 
-**Chaos.** The slice-2 PR runs the Gate 5 chaos scenarios for this ADR's governance run
-before merge:
-- a failed store read, combined with whole-device replace and per-user churn;
-- a hostile certificate combined with the caps and the render paths;
-- a planted AIA/CDP certificate combined with a chain build, observing zero connections;
-- an offline device combined with an engine read and truncation;
-- clock skew combined with day-boundary and sentinel dates.
+**Chaos.** The slice-2 PR runs these five scenarios before merge. Each is defined by the
+property it must prove; the tools are the design doc's choice.
+
+| ID | Scenario | Must prove |
+|---|---|---|
+| CH-1 | A store read fails during a whole-device replace while a user logs off | Machine rows survive with their original `observed_at`. The failed store reads `unreadable`. The departed user's rows go only through the per-user scope. The blob is never empty. |
+| CH-2 | Hostile certificates: 10k SANs, oversized subjects, script and control characters, invalid UTF-8, e-mail SANs | The caps hit and the certificate is `constrained`. Nothing executes in the dashboard (no CSP page error). Audit details are escaped. Personal data is handled as the design doc decided. |
+| CH-3 | A planted certificate whose AIA/CDP/OCSP URLs point at a listener, plus a pre-seeded cached CRL marking it revoked | The listener receives zero connections. The result does not reflect the cached CRL. It is labelled as the OS's own evaluation (D5). |
+| CH-4 | An offline device, an engine-grain read and a capped read | Every row exposes `observed_at` and `last_seen`. The read completes across pages or fails. The truncation flag is set, and the CBOM carries its coverage metadata. |
+| CH-5 | Agent clock skew; certificates expiring at day boundaries; the year-9999 sentinel; a pre-1970 date | Validity is stored as UTC to the second and never clamped. Core results change only with the caller's T. An agent-side policy discloses its clock offset. |
 
 ## Consequences
 
@@ -750,6 +845,8 @@ before merge:
       separate privacy decision.
     - It says plainly that Yuzu does not label weak cryptography, expiry risk or PQC
       readiness in core, and what an operator can do instead.
+    - It says that operator policy over certificate facts is not available until slice 2
+      ships.
   - The capability-map §41 preamble and roadmap Issue 18.8 widen their list of excluded
     verdicts to match this ADR (expiry bands, EOL status, third-party revocation,
     framework mappings) and cite it.
@@ -797,7 +894,9 @@ carries once that PR merges. Before the merge, the PR is the proposal.
   not accept this ADR.
 - ADR-1005 Decision 2 makes the maintainer the arbiter of boundary disputes. The approval
   is also the ruling on D2, D3, D5 and D7.
-- The approver states each of those four rulings in the review. On merge, the "ruling
-  requested" notes in those decisions record rulings granted by that approval.
+- The approval grants those four rulings as written. Approvers are asked to state each
+  ruling in the review, so that the record shows each one, but the statements are a
+  request, not a separate acceptance gate. On merge, the "ruling requested" notes in those
+  decisions record rulings granted by that approval.
 - A reviewer who disagrees with any one of them blocks on it specifically, so that it can
   be split out rather than accepted silently.
