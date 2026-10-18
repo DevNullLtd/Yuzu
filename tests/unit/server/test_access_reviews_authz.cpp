@@ -232,3 +232,41 @@ TEST_CASE("reviews authz: RBAC on, a Reviewer is admitted and the real Attest pr
     CHECK(res->status == 200);
     CHECK(r.denied_rows() == 0);
 }
+
+TEST_CASE("reviews authz: RBAC on; Read without Attest is admitted and the quiet Attest hint draws no "
+          "controls and writes no row",
+          "[pg][access-reviews][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, reviews_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    // A custom role holding AccessReview:Read and nothing else: the one persona the Reviewer
+    // (Read + Attest) and Administrator cases cannot be, so the production Attest probe is
+    // exercised on its refusing side.
+    REQUIRE(r.rbac.create_role({.name = "ReviewReader", .description = "reads reviews only"}).has_value());
+    REQUIRE(r.rbac.set_permission({"ReviewReader", "AccessReview", "Read", "allow"}).has_value());
+    REQUIRE(r.rbac.assign_role({"user", "bob", "ReviewReader"}).has_value());
+    const auto cookie = r.session("bob", auth::Role::user);
+
+    auto res = r.get(kCampaigns, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("Q4 admin access"));
+    CHECK_THAT(res->body, !ContainsSubstring("data-act=\"ar-open\""));
+    CHECK_THAT(res->body, !ContainsSubstring("data-act=\"ar-close\""));
+
+    res = r.get(r.campaign_path(), cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("alice"));
+    CHECK_THAT(res->body, !ContainsSubstring("data-act=\"ar-attest\""));
+    CHECK_THAT(res->body, !ContainsSubstring("data-act=\"ar-flag\""));
+    CHECK_THAT(res->body, !ContainsSubstring("data-act=\"ar-close\""));
+
+    res = r.get(kGrants, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // The refused Attest probe is a render hint, not a refusal: it leaves no denied row.
+    CHECK(r.denied_rows() == 0);
+    CHECK(r.audit_actions ==
+          std::vector<std::string>{"access_review.list", "access_review.get", "access_review.exported"});
+}
