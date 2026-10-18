@@ -44,7 +44,7 @@
 #        --run-id, --poll-timeout below 1 for a targeted run, --output equal to
 #        --manifest, an --output that is a symlink (POSIX) or not a regular file or
 #        (targeted run) already exists)
-#   130  interrupted (Ctrl-C or SIGTERM)
+#   130  interrupted (Ctrl-C, Ctrl-Break or SIGTERM)
 
 set -uo pipefail
 

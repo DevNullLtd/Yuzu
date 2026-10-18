@@ -1719,6 +1719,56 @@ class DoubleSignal(RunnerCase):
         self.settle()
 
 
+@unittest.skipIf(sys.platform == "win32" or not hasattr(signal, "SIGUSR1"),
+                 "POSIX stand-in for Windows SIGBREAK")
+@unittest.skipUnless(threading.current_thread() is threading.main_thread(), "signals need the main thread")
+class SigbreakRouting(RunnerCase):
+    """SIGBREAK exists on Windows only, so the routing is exercised here with SIGUSR1 standing in
+    for it: the same main() handler loop and the same name lookup in _raise_interrupt."""
+    DEFS = [definition("t.d0", "destructive")]
+
+    def test_a_sigbreak_aborts_with_130_names_it_and_is_restored(self):
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.4)
+        stand_in = signal.SIGUSR1
+        self.addCleanup(signal.signal, stand_in, signal.getsignal(stand_in))
+
+        def send():
+            deadline = time.monotonic() + 5
+            while not self.fake.posts and time.monotonic() < deadline:
+                time.sleep(0.001)
+            os.kill(os.getpid(), stand_in)
+
+        with mock.patch.object(signal, "SIGBREAK", stand_in, create=True):
+            sender = threading.Thread(target=send)
+            sender.start()
+            r = self.run_runner(self.DEFS, overrides={"t.d0": {}})
+            sender.join()
+        self.assertEqual(r.rc, 130, r.err)
+        self.assertEqual(r.summary["aborted"], "SIGBREAK")
+        self.assertTrue(r.outcome("t.d0")["note"].startswith("in_flight_unknown"))
+        self.assertEqual(signal.getsignal(stand_in), signal.SIG_DFL)
+        self.settle()
+
+
+class RecordGuardedAfterTheLoop(RunnerCase):
+    """Once every row is collected a signal must not escape run() before --output is written."""
+
+    def test_the_signal_guard_is_held_when_the_summary_is_built(self):
+        seen = []
+        real = ir._finish
+
+        def spy(*a, **k):
+            seen.append((ir._GUARD._depth, ir._INTERRUPT.get("ignore")))
+            return real(*a, **k)
+
+        with mock.patch.object(ir, "_finish", spy):
+            r = self.run_runner([definition("t.d0", "destructive")], overrides={"t.d0": {}})
+        self.assertEqual(r.rc, 0, r.err)
+        self.assertEqual(seen, [(1, "1")])
+        self.assertEqual(ir._GUARD._depth, 0)   # and let go again once the record is written
+        self.assertNotIn("ignore", ir._INTERRUPT)
+
+
 @unittest.skipUnless(sys.platform == "win32" and hasattr(signal, "CTRL_BREAK_EVENT"),
                      "Windows console control events")
 class WindowsConsoleBreak(RunnerCase):
@@ -1748,10 +1798,16 @@ class WindowsConsoleBreak(RunnerCase):
                                 env=env, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         try:
             deadline = time.monotonic() + 20
-            while not self.fake.posts and time.monotonic() < deadline:
+            while not self.fake.posts and proc.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.05)
-            self.assertTrue(self.fake.posts, "the dispatch never reached the server")
-            proc.send_signal(signal.CTRL_BREAK_EVENT)
+            if not self.fake.posts:
+                proc.kill()
+                self.fail("the dispatch never reached the server; child stderr: "
+                          + proc.communicate()[1])
+            try:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+            except OSError as e:   # GenerateConsoleCtrlEvent needs a console shared with the child
+                self.skipTest(f"no console to deliver CTRL_BREAK_EVENT through: {e}")
             stdout, stderr = proc.communicate(timeout=30)
         finally:
             if proc.poll() is None:

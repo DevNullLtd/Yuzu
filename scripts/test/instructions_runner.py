@@ -67,8 +67,8 @@ all until it finishes. A row passes only if every response row is SUCCESS with n
 row that ends without a verdict from terminal rows (no rows, rows still running, polls failing for
 any reason, or a row the runner does not recognise) fails and stops further dispatch, so a following
 action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED row is a known outcome and does not
-stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop dispatching (exit 130); a dispatch already sent is reported as
-in_flight_unknown.
+stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop dispatching (exit 130); a dispatch
+already sent is reported as in_flight_unknown.
 
 After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a recognised
 pre-dispatch refusal reason (or "no agents reached"), a 202 pending_approval (approval mode always,
@@ -1555,6 +1555,10 @@ def run(args: argparse.Namespace) -> int:
                 pending, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
             for fut in done:
                 collect(fut)
+        # Every row is collected: from here a signal must not escape run() before --output is
+        # written. _finish releases the hold once the record is on disk.
+        _GUARD.enter()
+        abort_hold = True
     except BaseException as e:  # KeyboardInterrupt included: stop further dispatch, keep the record
         control.request_stop()   # first: the worker stops even if a second signal lands next
         _GUARD.enter()           # then: a second signal must not interrupt the abort handler
@@ -1744,8 +1748,8 @@ Destructive and forensic runs (--risks destructive forensic)
   error_detail. A row that ends without a verdict from terminal rows (no rows, rows still running,
   polls failing for any reason, or a row the runner does not recognise) fails and stops further
   dispatch, so a following action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED row is a
-  known outcome and does not stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop dispatching (exit 130); a
-  dispatch already sent is reported as in_flight_unknown.
+  known outcome and does not stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop
+  dispatching (exit 130); a dispatch already sent is reported as in_flight_unknown.
 
   After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a
   recognised pre-dispatch refusal reason (or "no agents reached"), a 202 pending_approval (approval
@@ -1896,9 +1900,9 @@ _INTERRUPT: dict[str, str] = {}   # which signal raised the KeyboardInterrupt, f
 
 
 def _raise_interrupt(signum: int, frame: Any) -> None:
-    """The one handler for SIGINT, SIGTERM and (Windows) SIGBREAK: the first signal raises KeyboardInterrupt in the
-    main thread; every later one is ignored, so a second KeyboardInterrupt can never land inside
-    the abort handler or a lock wait and cost the --output record."""
+    """The one handler for SIGINT, SIGTERM and (Windows) SIGBREAK: the first signal raises
+    KeyboardInterrupt in the main thread; every later one is ignored, so a second KeyboardInterrupt
+    can never land inside the abort handler or a lock wait and cost the --output record."""
     if _INTERRUPT.get("ignore") or _INTERRUPT.get("fired"):
         return
     _INTERRUPT["fired"] = "1"
