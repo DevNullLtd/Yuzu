@@ -8,7 +8,8 @@
   id), and if the agent's Subscribe stream is still open it re-attaches to it,
   waits for that notice to reach the server, registers the same session again
   and announces `CONNECTED`, so commands reach the agent again without a
-  reconnect. If the stream is gone it stops after the `DISCONNECTED` and the
+  reconnect; the agent's heartbeats stay admitted on its connection while that
+  happens. If the stream is gone it stops after the `DISCONNECTED` and the
   agent reconnects by itself. One owner may be restarted 3 times in 60 s; then
   it gives up (one WARN, the session ends). A crash of most owners at once
   (more than `agent_restart_intensity`, default 2000, within

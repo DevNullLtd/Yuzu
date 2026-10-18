@@ -67,9 +67,25 @@
 %%% stream-status notice sent for the session (none | connected | disconnected
 %%% | ending), Restarts the restart times inside the budget window. The row is
 %%% written by start_agent/1 and by the owner, and deleted by the owner when it
-%%% ends for good. It is owned by yuzu_gw_sup (created in its init/1), so it
-%%% outlives a restart of this supervisor; a supervisor started without
-%%% yuzu_gw_sup (tests) creates and owns it itself.
+%%% ends for good. Beside each row, {{session, SessionId}, Key} finds it by
+%%% session (held_session/1).
+%%%
+%%% Heartbeats while an owner is restarted. The registry drops a dead owner's
+%%% session index row at once, and the restarted owner indexes the session again
+%%% only once its predecessor's DISCONNECTED has settled upstream; under a mass
+%%% crash that waits behind the other owners' notices (hundreds of ms at 500
+%%% at once). A heartbeat refused in that gap is NOT_FOUND, and the agent drops
+%%% the very stream the owner is recovering and registers a new session (2 of
+%%% 500 killed owners at 5,000 agents on a 16-core host). So heartbeat
+%%% admission falls back to this table: a session whose row names a dead owner,
+%%% or says a successor is recovering it, is still held by this gateway, on
+%%% the connection the row names (held_session/1). A live owner that holds its
+%%% session but is missing from the registry (the registry restarted) is not:
+%%% those heartbeats fail closed, as before.
+%%%
+%%% The table is owned by yuzu_gw_sup (created in its init/1), so it outlives a
+%%% restart of this supervisor; a supervisor started without yuzu_gw_sup
+%%% (tests) creates and owns it itself.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_agent_sup).
@@ -79,6 +95,8 @@
 -export([init/1]).
 %% The owner table (yuzu_gw_agent, yuzu_gw_sup).
 -export([ensure_owner_table/0, owner_row/1, owner_set/2, owner_delete/1]).
+%% Heartbeat admission while an owner is being restarted (yuzu_gw_heartbeat_admission).
+-export([held_session/1]).
 
 -define(SERVER, ?MODULE).
 -define(OWNERS, yuzu_gw_owner_sessions).
@@ -124,6 +142,7 @@ start_agent(Args) ->
     %% No table means no supervisor (it creates the table if yuzu_gw_sup did
     %% not): the start_child below then fails as for any absent supervisor.
     _ = owner_insert(Key, maps:remove(registered_ack, Args)),
+    _ = index_session(maps:get(session_id, Args, undefined), Key),
     Alias = alias([reply]),
     case yuzu_gw_safe_call:guard(?SERVER,
                                  fun() ->
@@ -182,16 +201,55 @@ owner_set(Key, Fields) ->
         error:badarg -> ok
     end.
 
-%% @doc Delete the row under Key.
+%% @doc Delete the row under Key, and its session entry.
 -spec owner_delete(reference() | undefined) -> ok.
 owner_delete(undefined) ->
     ok;
 owner_delete(Key) ->
-    try ets:delete(?OWNERS, Key) of
-        _ -> ok
+    try ets:lookup(?OWNERS, Key) of
+        [{Key, Args, _, _, _, _, _}] ->
+            _ = ets:delete_object(?OWNERS, {{session, session_of(Args)}, Key}),
+            true = ets:delete(?OWNERS, Key),
+            ok;
+        [] ->
+            ok
     catch
         error:badarg -> ok
     end.
+
+%% @doc The connection key of SessionId while its owner is being restarted:
+%% the row names an owner that is dead (killed, its successor not yet running)
+%% or says `disconnected' (a successor sent the DISCONNECTED and is recovering
+%% the session), and the registry does not route the agent to a live process
+%% under another session. Else `error': no row or table, never announced, being
+%% ended on purpose (`ending'), superseded by a newer registration of the agent,
+%% or a live owner that holds the session as `connected' but is missing from the
+%% registry (the registry restarted and lost its rows: those heartbeats still
+%% fail closed, so the agent registers again). A few ETS lookups; called only
+%% when the registry's session index misses.
+-spec held_session(term()) -> {ok, yuzu_gw_conn:key()} | error.
+held_session(SessionId) when is_binary(SessionId), SessionId =/= <<>> ->
+    try ets:lookup(?OWNERS, {session, SessionId}) of
+        [{_, Key}] ->
+            case owner_row(Key) of
+                {ok, #{announced := A, pid := Owner, args := #{agent_id := AgentId} = Args}}
+                  when A =:= disconnected; A =:= connected ->
+                    Restarting = A =:= disconnected orelse not owner_alive(Owner),
+                    case {Restarting, yuzu_gw_registry:lookup_local_session(AgentId)} of
+                        {false, _}                                     -> error;
+                        {true, {ok, {_Pid, Other}}} when Other =/= SessionId -> error;
+                        {true, _} -> {ok, maps:get(conn_key, Args, undefined)}
+                    end;
+                _ ->
+                    error
+            end;
+        [] ->
+            error
+    catch
+        error:badarg -> error
+    end;
+held_session(_SessionId) ->
+    error.
 
 %%--------------------------------------------------------------------
 %% supervisor callback
@@ -227,6 +285,19 @@ owner_insert(Key, Args) ->
     catch
         error:badarg -> {error, agent_sup_unavailable}
     end.
+
+owner_alive(Pid) when is_pid(Pid) -> is_process_alive(Pid);
+owner_alive(_NoPid)                -> false.
+
+index_session(SessionId, Key) when is_binary(SessionId), SessionId =/= <<>> ->
+    try ets:insert(?OWNERS, {{session, SessionId}, Key})
+    catch error:badarg -> false
+    end;
+index_session(_SessionId, _Key) ->
+    false.
+
+session_of(Args) ->
+    maps:get(session_id, Args, undefined).
 
 position(home)         -> 3;
 position(announced)    -> 4;
