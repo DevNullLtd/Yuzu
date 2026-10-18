@@ -28,6 +28,8 @@
 /// (ADR-0006/ADR-0065). Skips when YUZU_TEST_POSTGRES_DSN is unset, fails
 /// when set but broken.
 
+#include "baseline_store.hpp"        // optional Guardian stores (guardian_stores ctor argument)
+#include "guaranteed_state_store.hpp" // optional Guardian stores (guardian_stores ctor argument)
 #include "mcp_jsonrpc.hpp" // mcp::kApprovalRequired — the ticket-then-recall dance
 #include "mcp_server.hpp"
 #include "mfa_step_up.hpp" // StepUpFn — A1's PUT /api/v1/rbac/enforcement calls it
@@ -88,6 +90,11 @@ private:
 /// independent database (no cross-store transaction requirement with either
 /// store), mirroring test_rest_access_review.cpp's AuthDbPgShared-alongside-
 /// RbacStore composition for that one piece.
+/// Which Guardian stores an RbacRoleHarness wires into its REST routes and MCP handler. The
+/// default `kNone` leaves both null, exactly as every harness user predating the Guardian
+/// policy-generation raise expects.
+enum class GuardianStores { kNone, kBoth, kGuardianOnly };
+
 struct RbacRoleHarness {
     yuzu::server::test::TestRouteSink sink;
 
@@ -96,6 +103,10 @@ struct RbacRoleHarness {
     yuzu::test::AuthDbPg auth_db;
     RbacStoreOnAuthPool rbac{auth_db.pool()};
     yuzu::test::ApprovalManagerPg appr;
+    // Optional Guardian stores on the SAME database as auth_db/rbac, constructed from the
+    // `guardian_stores` argument. Null under the default `kNone`.
+    std::unique_ptr<yuzu::server::GuaranteedStateStore> guardian_store;
+    std::unique_ptr<yuzu::server::BaselineStore> baseline_store;
 
     std::string session_user{"admin"};
     std::string session_token_scope_service;
@@ -123,6 +134,10 @@ struct RbacRoleHarness {
     std::string rest_session_mcp_tier{""};
     bool auth_enabled{true};
     bool audit_allow{true};
+    // When non-empty, an audit row whose result equals this value is not persisted (the audit
+    // function returns false for it) while every other row is. Lets a test drop one stage of a
+    // multi-row sequence, e.g. "attempted" or "success", without `audit_allow`'s all-or-nothing.
+    std::string audit_fail_result;
 
     /// nullptr = always allow — the default every is_rbac_administrator-gated
     /// route in this file relies on (assign_rbac_role/unassign_rbac_role/
@@ -158,10 +173,18 @@ struct RbacRoleHarness {
     bool read_only_mode_{false};
     bool mcp_disabled_{false};
 
-    RbacRoleHarness() {
+    explicit RbacRoleHarness(GuardianStores guardian_stores = GuardianStores::kNone) {
         REQUIRE(rbac->is_open());
         REQUIRE(auth_db->is_open());
         REQUIRE(appr->is_open());
+        if (guardian_stores != GuardianStores::kNone) {
+            guardian_store = std::make_unique<yuzu::server::GuaranteedStateStore>(auth_db.pool());
+            REQUIRE(guardian_store->is_open());
+        }
+        if (guardian_stores == GuardianStores::kBoth) {
+            baseline_store = std::make_unique<yuzu::server::BaselineStore>(auth_db.pool());
+            REQUIRE(baseline_store->is_open());
+        }
 
         // `tier` is the mcp_tier to stamp onto the built session — REST and
         // MCP each pass their OWN member (`rest_session_mcp_tier` /
@@ -205,7 +228,7 @@ struct RbacRoleHarness {
                                const std::string& result, const std::string&,
                                const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
-            return audit_allow;
+            return audit_allow && result != audit_fail_result;
         };
 
         api.register_routes(sink, rest_auth_fn, perm_fn, audit_fn,
@@ -227,7 +250,7 @@ struct RbacRoleHarness {
                             /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr,
                             /*license_store=*/nullptr,
-                            /*guaranteed_state_store=*/nullptr,
+                            /*guaranteed_state_store=*/guardian_store.get(),
                             /*metrics_registry=*/&metrics,
                             /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr,
@@ -244,7 +267,7 @@ struct RbacRoleHarness {
                             /*dex_perf_fn=*/{},
                             /*network_api=*/{},
                             /*lockout_clear_fn=*/{},
-                            /*baseline_store=*/nullptr,
+                            /*baseline_store=*/baseline_store.get(),
                             /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
                             /*response_scope_fn=*/{},
@@ -273,7 +296,7 @@ struct RbacRoleHarness {
                                    const std::string& result, const std::string&,
                                    const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
-            return audit_allow;
+            return audit_allow && result != audit_fail_result;
         };
         auto agents_fn = []() -> nlohmann::json { return nlohmann::json::array(); };
 
@@ -294,7 +317,7 @@ struct RbacRoleHarness {
             /*dispatch_fn=*/nullptr,
             /*ca_store=*/nullptr,
             /*publish_crl_fn=*/nullptr,
-            /*guaranteed_state_store=*/nullptr,
+            /*guaranteed_state_store=*/guardian_store.get(),
             /*dex_perf_fn=*/{},
             /*network_api=*/{},
             /*response_scope_fn=*/{},
@@ -313,6 +336,7 @@ struct RbacRoleHarness {
             /*access_review_store=*/nullptr,
             /*auth_db=*/auth_db.get(),
             /*directory_sync=*/nullptr);
+        mcp.set_baseline_store(baseline_store.get());
     }
 
     /// GET /api/v1/rbac/roles/assignments — the fleet-wide grant-table

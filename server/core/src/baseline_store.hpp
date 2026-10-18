@@ -277,6 +277,10 @@ public:
 
     // ── Counting (metrics / UI) ─────────────────────────────────────────────
     std::size_t baseline_count() const;
+    /// Number of Baselines in the `deployed` lifecycle. Type-distinguishable: an error string on
+    /// a store that is not open, a pool timeout or a failed query, never 0 (a degraded read
+    /// would otherwise report "no Baseline is deployed").
+    std::expected<std::size_t, std::string> deployed_baseline_count_checked() const;
     std::size_t member_count(const std::string& baseline_id) const;
 
 private:

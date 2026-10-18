@@ -61,6 +61,8 @@
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
 #include "service_scope_policy.hpp" // authz::service_scope_may_mutate_tag_key — #3289
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "audited_write.hpp"        // detail::audit_attempted (the `attempted` row written before a mutation)
+#include "guardian_generation_raise.hpp" // parse_raise_request / raise_result_json / kRaiseAuditAction
 #include "password_policy.hpp"       // #5342 — check_password_policy for the password routes
 #include "credential_change_owner.hpp" // #5342 — CredentialChangeRequest/Outcome (the one-transaction write)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
@@ -321,29 +323,31 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
 // TRANSPORT presented the credential, not whether the credential holds
 // authority. A CC7.2 audit-evidence accuracy concern, so this is its own
 // helper with its own audit detail, called BEFORE the predicate (mirrors
-// `deny_engine_session`'s own belt-and-suspenders placement). Used at THREE of
-// the FOUR REST routes gated on `is_rbac_administrator` — the original A2 pair
-// plus A1's enforcement-toggle route, which reuses this helper verbatim. (The
-// fourth, the #5342 admin password reset, refuses EVERY token session —
-// MCP-tier ones included — with its own `token_session` gate first, so it
-// never reaches this belt.) A1 reuses it
+// `deny_engine_session`'s own belt-and-suspenders placement). Used at FOUR of
+// the FIVE REST routes gated on `is_rbac_administrator`: the original A2 pair,
+// A1's enforcement-toggle route, which reuses this helper verbatim, and the
+// Guardian policy-generation raise, which passes its own MCP tool name through
+// `tool_names`. (The fifth, the #5342 admin password reset, refuses EVERY token
+// session, MCP-tier ones included, with its own `token_session` gate first,
+// so it never reaches this belt.) A1 reuses it
 // rather than forking a second one (see rbac_admin_predicate.hpp's own doc
 // comment: this Fable-adjudicated design supersedes an independently-derived
 // narrower A1 fix that predated A2's merge). Returns true (having already
 // written the 403 A4 body) when the caller must stop; false when the session
 // carries no mcp_tier and the route may proceed.
-static bool deny_mcp_token_session(const auth::Session& s, const httplib::Request& req,
-                                   httplib::Response& res, const RestApiV1::AuditFn& audit,
-                                   const char* action, const char* target) {
+static bool deny_mcp_token_session(
+    const auth::Session& s, const httplib::Request& req, httplib::Response& res,
+    const RestApiV1::AuditFn& audit, const char* action, const char* target,
+    const char* tool_names = "assign_rbac_role/unassign_rbac_role/set_rbac_enforcement") {
     if (!s.mcp_tier.empty()) {
         (void)detail::emit_behavioral_audit(
             audit, req, res, action, "denied", target, "",
             "MCP token blocked from admin route (mcp_tier='" + s.mcp_tier + "')");
         res.status = 403;
         res.set_content(
-            detail::a4_error(res, "MCP tokens cannot perform admin operations; use the MCP tool "
-                                  "assign_rbac_role/unassign_rbac_role/set_rbac_enforcement "
-                                  "instead"),
+            detail::a4_error(res, std::string("MCP tokens cannot perform admin operations; use "
+                                              "the MCP tool ") +
+                                      tool_names + " instead"),
             "application/json");
         return true;
     }
@@ -1272,6 +1276,12 @@ const std::string& openapi_spec() {
     },
     "/guaranteed-state/status/{agent_id}": {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in, and a service-scoped token is confined to its own service tag) — same World-A confinement shape as GET /guaranteed-state/device-compliance. errored_rules is REAL (#2298 item 6d), derived from this agent's guardian_agent_rule_status census rows intersected against the live rule catalogue; total_rules is the count of rules with ANY census entry for this agent still present in that catalogue, not the fleet catalogue size. compliant_rules/drifted_rules stay 0 — full status ingest lands in a later rung. Audited as guardian.device.view; FAILS CLOSED (503 + Sec-Audit-Failed) if the audit row cannot persist, parity with GET /dex/devices/{id} and GET /guaranteed-state/device-compliance.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}, "400": {"description": "agent_id exceeds the canonical enrolled-agent-id length ceiling (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "Caller lacks GuaranteedState:Read on this agent's scope — RBAC denial, or a service-scoped token whose own service tag does not match this agent's (an unwired scoped-permission fn is 503, not this) — A4 envelope (require_scoped_permission's denial path is detail::a4_denial, itself error_json_a4)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Either the route is misconfigured (scoped-permission fn/store unwired) OR the guardian.device.view audit row could not persist (FAIL-CLOSED, CC7.2) OR the guaranteed-state store is degraded (A4 envelope)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the read was refused because the audit row could not persist (CC7.2 fail-closed); retry after the audit subsystem recovers."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
+        // Own segment so each raw-string literal stays under MSVC's C2026 cap; adjacent
+        // literals are concatenated at compile time, byte-identical JSON.
+        R"json(,
+    "/guaranteed-state/policy-generation/raise": {
+      "post": {"summary": "Raise the Guardian policy generation (administrator only)", "tags": ["Guaranteed State"], "description": "Raises the fleet-wide Guardian policy generation to target_generation, never lowering it. This is the supported recovery when the stored generation was restored below what agents already hold, so agents treat every server push as stale. Gated on a durable is_rbac_administrator check (not GuaranteedState:Push) plus MFA step-up. Raising the generation converges EVERY agent behind it to the rule set this server holds now, replacing the rules those agents hold under the higher number: the request must carry acknowledge_rule_set_replaced=true. Nothing is pushed: agents converge on their next heartbeat reconcile. target_generation must be an integer from 1 to 9007199254740991 (2^53-1, the ceiling echoed in the response). Idempotent: a target at or below the current generation changes nothing and returns raised=false with 200. The response reports previous_generation, the resulting generation, the rule count and the deployed Baseline count. Audited as guaranteed_state.policy_generation.raise: an attempted row is written first and the change is refused with 503 if it cannot be stored, then an outcome row. MCP twin raise_guardian_policy_generation.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"target_generation": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "acknowledge_rule_set_replaced": {"type": "boolean", "enum": [true]}}, "required": ["target_generation", "acknowledge_rule_set_replaced"]}}}}, "responses": {"200": {"description": "{data:{previous_generation,generation,raised,rules,deployed_baselines,ceiling}}; raised=false when the generation was already at or above the target"}, "400": {"description": "Invalid JSON, target_generation missing, not an integer or outside 1..9007199254740991, or acknowledge_rule_set_replaced missing or not true (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Not authenticated, or MFA step-up required or failed (api_token/mcp_token bearer sessions are exempt) - see meta.challenge_url"}, "403": {"description": "Caller is not a durable Administrator, is a service-scoped or engine session, or presented an MCP-tier bearer token (use the MCP tool instead) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Guardian or Baseline store unavailable or degraded, the admin gate could not confirm authority, or the audit record could not be stored (Sec-Audit-Failed: true). When the attempted row failed nothing was changed; when only the outcome row failed the raise took effect and the response says so. retry_after_ms is set where a retry is safe (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the two
         // guaranteed-state/status route descriptions grew this segment past the
@@ -15782,6 +15792,210 @@ void RestApiV1::register_routes(
                                     .str()),
                         "application/json");
     });
+
+    // POST /policy-generation/raise - raise the fleet-wide Guardian policy generation to a
+    // target the operator names, never lowering it. The supported recovery when the stored
+    // counter was restored below what agents already hold (agents treat a lower server value
+    // as stale and stop converging). Raising it converges EVERY agent behind it to the rule set
+    // this server holds now, so the body must acknowledge that, and nothing is pushed: the
+    // heartbeat reconcile does the converging.
+    //
+    // Gated like A1's PUT /api/v1/rbac/enforcement, not like /push: a durable
+    // is_rbac_administrator check plus MFA step-up, INSTEAD OF perm_fn. GuaranteedState:Push
+    // would let any pusher rewrite what the whole fleet enforces by choosing a number.
+    // Audit order is "no audit row, no mutation": an `attempted` row is written first and a
+    // failure to store it refuses the change; the outcome row follows. The ceiling,
+    // acknowledgement and audit text live in guardian_generation_raise.hpp, shared with the
+    // MCP twin raise_guardian_policy_generation.
+    sink.Post(
+        "/api/v1/guaranteed-state/policy-generation/raise",
+        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, guaranteed_state_store,
+         baseline_store, deny_fleet_wide_service_scoped,
+         metrics_registry](const httplib::Request& req, httplib::Response& res) {
+            const std::string action = guardian::kRaiseAuditAction;
+            const std::string target_type = "GuaranteedState";
+            const std::string target_id = "policy_generation";
+            const auto count = [metrics_registry](const char* result) {
+                if (metrics_registry)
+                    metrics_registry
+                        ->counter("yuzu_server_guardian_policy_generation_raise_total",
+                                 {{"transport", "rest"}, {"result", result}})
+                        .increment();
+            };
+            if (deny_fleet_wide_service_scoped(
+                    req, res, action, target_type,
+                    "service-scoped token blocked from Guardian policy generation raise",
+                    "service-scoped tokens cannot raise the fleet-wide Guardian policy generation",
+                    target_id, ""))
+                return;
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, action.c_str(),
+                                    target_type.c_str()))
+                return;
+            if (deny_mcp_token_session(*session, req, res, audit_fn, action.c_str(),
+                                       target_type.c_str(), "raise_guardian_policy_generation"))
+                return;
+            if (!rbac_store || !rbac_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "service unavailable",
+                        detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                    "application/json");
+                return;
+            }
+            const auto gate =
+                is_rbac_administrator(*session, auth_db, rbac_store, RbacAdminSurface::kRest);
+            if (deny_unless_rbac_administrator(
+                    gate,
+                    [&] {
+                        spdlog::warn("{}: {} (user={})", action,
+                                     kRbacAdminGateUnavailableAuditReason, session->username);
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, action, "denied", target_type, target_id,
+                            std::string(kRbacAdminGateUnavailableAuditReason));
+                        res.status = 503;
+                        res.set_content(
+                            detail::a4_error(
+                                res, kRbacAdminGateUnavailableMessage,
+                                detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                            "application/json");
+                    },
+                    [&] {
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, action, "denied", target_type, target_id,
+                            std::string(kRbacAdminGateDeniedAuditReason));
+                        res.status = 403;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateDeniedMessage),
+                                        "application/json");
+                    }))
+                return;
+            if (step_up_fn &&
+                !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/policy-generation/raise"))
+                return;
+
+            // Checked after the administrator gate so a caller who is not one learns nothing
+            // about the Guardian stores' state.
+            if (!guaranteed_state_store || !guaranteed_state_store->is_open() || !baseline_store ||
+                !baseline_store->is_open()) {
+                count("failed");
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "service unavailable",
+                        detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                    "application/json");
+                return;
+            }
+
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                count("refused");
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, action, "denied",
+                                                    target_type, target_id,
+                                                    "invalid request: body is not valid JSON");
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+                return;
+            }
+            const auto parsed = guardian::parse_raise_request(body);
+            if (!parsed) {
+                count("refused");
+                // The parser's messages are fixed text that never echoes a request value.
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, action, "denied",
+                                                    target_type, target_id,
+                                                    "invalid request: " + parsed.error());
+                res.status = 400;
+                res.set_content(detail::a4_error(res, parsed.error()), "application/json");
+                return;
+            }
+            const std::int64_t target = *parsed;
+
+            // Both counts are read BEFORE the attempted row and the write: they are the
+            // consequence the audit rows record, and a degraded read is never rendered as 0.
+            const auto rule_total = guaranteed_state_store->rule_count_checked();
+            const auto deployed_total = baseline_store->deployed_baseline_count_checked();
+            if (!rule_total || !deployed_total) {
+                count("failed");
+                spdlog::warn("{}: count read failed: {}", action,
+                             ::yuzu::log_key_token(!rule_total ? rule_total.error()
+                                                               : deployed_total.error()));
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, action, "denied", target_type, target_id,
+                    "store degraded: rule or deployed Baseline count unreadable; target=" +
+                        std::to_string(target));
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "Guardian store degraded; the policy generation was not changed",
+                        detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                    "application/json");
+                return;
+            }
+
+            if (!detail::audit_attempted(audit_fn, req, res, action, target_type, target_id,
+                                         "target=" + std::to_string(target) +
+                                             "; rules=" + std::to_string(*rule_total) +
+                                             "; deployed_baselines=" +
+                                             std::to_string(*deployed_total))) {
+                count("failed");
+                return;
+            }
+
+            const auto outcome = guaranteed_state_store->raise_policy_generation(target);
+            if (!outcome) {
+                if (outcome.error() == PolicyGenerationRaiseError::kOutOfRange) {
+                    // The parser already enforces the range; this is the store re-checking.
+                    count("refused");
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, action, "denied", target_type, target_id,
+                        "target out of range; target=" + std::to_string(target));
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "target_generation is out of range"),
+                                    "application/json");
+                    return;
+                }
+                count("failed");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, action, "failure", target_type, target_id,
+                    "policy generation store unavailable; target=" + std::to_string(target));
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "Guardian store unavailable; the policy generation was not changed",
+                        detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                    "application/json");
+                return;
+            }
+
+            count(outcome->raised ? "applied" : "unchanged");
+            // Fail closed: never report a raise whose outcome audit row did not persist.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, action, "success", target_type, target_id,
+                    guardian::raise_audit_detail(target, outcome->previous, outcome->resulting,
+                                                 outcome->raised, *rule_total, *deployed_total))) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res,
+                        outcome->raised
+                            ? "the policy generation was raised but its audit record could not "
+                              "be persisted; treat as unconfirmed and repeat the request, which "
+                              "is idempotent"
+                            : "the policy generation was already at or above the target but the "
+                              "audit record could not be persisted; repeat the request"),
+                    "application/json");
+                return;
+            }
+            res.set_content(ok_json(guardian::raise_result_json(outcome->previous,
+                                                                outcome->resulting,
+                                                                outcome->raised, *rule_total,
+                                                                *deployed_total)
+                                        .dump()),
+                            "application/json");
+        });
 
     // GET /events — query events with optional filters. Mirrors
     // `audit_store` query semantics. Caps `limit` at 1000 at the REST

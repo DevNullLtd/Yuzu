@@ -2153,6 +2153,22 @@ public:
             for (const auto result : {"applied", "unchanged", "refused", "failed"})
                 metrics_.counter("yuzu_server_rbac_enforcement_toggle_total",
                                  {{"transport", transport}, {"result", result}});
+        // Guardian policy-generation raise (POST /api/v1/guaranteed-state/policy-generation/raise
+        // and its MCP twin raise_guardian_policy_generation). Described + zero-seeded up front,
+        // same rationale as the blocks above.
+        metrics_.describe(
+            "yuzu_server_guardian_policy_generation_raise_total",
+            "Outcomes of the Guardian policy-generation raise, by transport (rest/mcp) and "
+            "result (applied/unchanged/refused/failed). applied raised the stored generation; "
+            "unchanged was a target at or below it; refused is a rejected request body or a "
+            "target outside the accepted range; failed is a store read or write failure, or an "
+            "attempted audit row that could not be stored (nothing was changed). Zero-seeded for "
+            "all 8 series so an idle server carries every dimension from boot.",
+            "counter");
+        for (const auto transport : {"rest", "mcp"})
+            for (const auto result : {"applied", "unchanged", "refused", "failed"})
+                metrics_.counter("yuzu_server_guardian_policy_generation_raise_total",
+                                 {{"transport", transport}, {"result", result}});
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
@@ -22316,7 +22332,8 @@ private:
 
     // THE one place that drops the heartbeat reconcile's two caches (#5513). Called by exactly
     // these: the GuaranteedStateStore rule-mutation hook (after a rule create/update/delete
-    // commits and its generation bump was attempted), the BaselineStore baseline-mutation
+    // commits and its generation bump was attempted, and after a policy-generation raise that
+    // increased the stored value commits), the BaselineStore baseline-mutation
     // hook (after a Baseline update, delete or deployed create commits, BEFORE the caller's own
     // bump), and the guardian_push_fn_ fan-out (after its scope parsed, BEFORE it reads the
     // generation, the rules and the deployed set). Both caches go together: the bundle cache's

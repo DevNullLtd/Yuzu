@@ -804,6 +804,24 @@ std::size_t BaselineStore::baseline_count() const {
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
+std::expected<std::size_t, std::string> BaselineStore::deployed_baseline_count_checked() const {
+    if (!open_)
+        return std::unexpected("database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("no database connection: " + pool_.last_error());
+    pg::PgResult res =
+        pg::exec_params(lease.get(),
+                        "SELECT COUNT(*) FROM baseline_store.baselines WHERE lifecycle = $1",
+                        std::vector<std::string>{kBaselineDeployed});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        spdlog::warn("BaselineStore::deployed_baseline_count_checked: query failed: {}",
+                     PQresultErrorMessage(res.get()));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
+    return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
+}
+
 std::size_t BaselineStore::member_count(const std::string& baseline_id) const {
     if (!open_)
         return 0;

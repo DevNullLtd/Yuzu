@@ -41,6 +41,16 @@
 /// anywhere on that path — and uses `is_self_target` (below) for its
 /// self-target refusal. It adds no exception to any rule in this header.
 ///
+/// SCOPE EXTENSION (Guardian policy-generation raise): `POST
+/// /api/v1/guaranteed-state/policy-generation/raise` (`rest_api_v1.cpp`) and its MCP twin
+/// `raise_guardian_policy_generation` (`mcp_server.cpp`) gate on this predicate with
+/// `RbacAdminSurface::kRest` / `kMcp` respectively. Raising the fleet-wide Guardian policy
+/// generation converges every agent behind it to the rule set the server holds at that moment,
+/// replacing the rules those agents hold, so it is a standing fleet-wide authority act and
+/// `GuaranteedState:Push` (which any pusher holds) must not suffice. Neither call site adds an
+/// exception to any rule in this header; the REST route calls `deny_mcp_token_session` before
+/// the predicate, as A1 does.
+///
 /// THE RULE: a caller passes iff they hold a DURABLE `Administrator`
 /// authority right now, re-read fresh from the store rather than trusted
 /// from the session's cached view:

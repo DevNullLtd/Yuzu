@@ -1,6 +1,7 @@
 #include "guaranteed_state_store.hpp"
 
 #include <yuzu/audit_retention_rules.hpp>
+#include "guardian_generation_raise.hpp" // kMaxPolicyGenerationTarget
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -635,6 +636,64 @@ void GuaranteedStateStore::bump_policy_generation() {
         return;
     }
     bump_policy_generation_on(lease.get());
+}
+
+std::expected<PolicyGenerationRaise, PolicyGenerationRaiseError>
+GuaranteedStateStore::raise_policy_generation(std::int64_t target) {
+    if (target < 1 || target > guardian::kMaxPolicyGenerationTarget)
+        return std::unexpected(PolicyGenerationRaiseError::kOutOfRange);
+    if (!open_)
+        return std::unexpected(PolicyGenerationRaiseError::kStoreUnavailable);
+
+    // The row lock taken by the SELECT ... FOR UPDATE is held until COMMIT, so the UPDATE
+    // below sees exactly the value read here, and a concurrent raise or a `value + 1` bump
+    // waits for this transaction. A single UPDATE ... RETURNING could not report the value it
+    // replaced under READ COMMITTED without that lock.
+    PolicyGenerationRaise out;
+    bool have_row = false;
+    const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult cur = pg::exec_params(
+            conn,
+            "SELECT value FROM guaranteed_state_store.guardian_meta "
+            "WHERE key = 'policy_generation' FOR UPDATE",
+            std::vector<std::string>{});
+        if (cur.status() != PGRES_TUPLES_OK) {
+            spdlog::warn("GuaranteedStateStore::raise_policy_generation: read failed: {}",
+                         PQerrorMessage(conn));
+            return false;
+        }
+        if (PQntuples(cur.get()) == 0) {
+            spdlog::warn("GuaranteedStateStore::raise_policy_generation: policy_generation row "
+                         "is missing");
+            return false;
+        }
+        const std::int64_t before = to_i64(PQgetvalue(cur.get(), 0, 0));
+        pg::PgResult upd = pg::exec_params(
+            conn,
+            "UPDATE guaranteed_state_store.guardian_meta SET value = GREATEST(value, $1::bigint) "
+            "WHERE key = 'policy_generation' RETURNING value",
+            std::vector<std::string>{std::to_string(target)});
+        if (upd.status() != PGRES_TUPLES_OK || PQntuples(upd.get()) == 0) {
+            spdlog::warn("GuaranteedStateStore::raise_policy_generation: write failed: {}",
+                         PQerrorMessage(conn));
+            return false;
+        }
+        const std::int64_t after = to_i64(PQgetvalue(upd.get(), 0, 0));
+        // A negative stored value can only come from an out-of-band edit; report it as 0.
+        out.previous = static_cast<uint64_t>(std::max<std::int64_t>(before, 0));
+        out.resulting = static_cast<uint64_t>(std::max<std::int64_t>(after, 0));
+        out.raised = after > before;
+        have_row = true;
+        return true;
+    });
+    if (!committed || !have_row)
+        return std::unexpected(PolicyGenerationRaiseError::kStoreUnavailable);
+
+    // The with_txn_for lease is released, so the hook runs with no lease held (the
+    // set_on_rule_mutation() contract). It is skipped when nothing changed.
+    if (out.raised)
+        notify_rule_mutation();
+    return out;
 }
 
 std::optional<uint64_t> GuaranteedStateStore::current_policy_generation() const {
@@ -2446,6 +2505,37 @@ std::size_t GuaranteedStateStore::rule_count() const {
         lease.get(), "SELECT COUNT(*) FROM guaranteed_state_store.guaranteed_state_rules", std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return 0;
+    return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
+}
+
+std::expected<std::size_t, std::string> GuaranteedStateStore::rule_count_checked() const {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_count_checked: store not open");
+        return std::unexpected("database not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_count_checked: pool acquire timed out");
+        return std::unexpected("no database connection: " + pool_.last_error());
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT COUNT(*) FROM guaranteed_state_store.guaranteed_state_rules",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_count_checked: query failed: {}",
+                         PQresultErrorMessage(res.get()));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 

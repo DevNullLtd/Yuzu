@@ -2198,6 +2198,9 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         {"assign_rbac_role", false},       // additive (INSERT OR IGNORE)
         {"unassign_rbac_role", true},
         {"set_rbac_enforcement", true}, // A1: enabling denies every ungranted operator
+        // Converges every agent behind the new generation to the current rule set,
+        // replacing what that agent holds.
+        {"raise_guardian_policy_generation", true},
         {"open_access_review", false}, // additive
         {"record_attestation", true},      {"close_access_review", true}, // was false-safe
     };
@@ -27316,6 +27319,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
          nlohmann::json::parse(R"({"principal_id":"jane","role":"Operator"})")},
         // A1 — same Security:Write-driven gate as assign/unassign_rbac_role above.
         {"set_rbac_enforcement", nlohmann::json::parse(R"({"enabled":true})")},
+        // Guardian policy-generation raise: Security:Write-driven gate like the rows above.
+        {"raise_guardian_policy_generation",
+         nlohmann::json::parse(
+             R"({"target_generation":5,"acknowledge_rule_set_replaced":true})")},
         // KEK rotation (#2395 track C): both take zero arguments.
         {"rotate_kek", nlohmann::json::parse(R"({})")},
         {"rewrap_secrets", nlohmann::json::parse(R"({})")},
