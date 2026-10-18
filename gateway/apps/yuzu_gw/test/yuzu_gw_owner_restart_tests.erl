@@ -52,7 +52,14 @@ owner_restart_test_() ->
       {timeout, 120, {"a kill during a planned stop: no resurrection, no double DISCONNECTED",
                       fun kill_during_planned_stop/0}},
       {timeout, 60, {"the agent's heartbeats stay admitted while its owner is being restarted",
-                     fun heartbeat_admitted_during_restart/0}}]}.
+                     fun heartbeat_admitted_during_restart/0}},
+      {timeout, 60, {"heartbeats admitted between the kill and the successor's row takeover "
+                     "(the row still names the dead owner)",
+                     fun heartbeat_admitted_before_takeover/0}},
+      {timeout, 60, {"a superseded session's heartbeats stay refused while its restarted owner "
+                     "is mid-recovery", fun superseded_refused_mid_recovery/0}},
+      {timeout, 60, {"an `ending' row with a dead owner admits no heartbeat",
+                     fun ending_row_refused/0}}]}.
 
 setup() ->
     _ = application:stop(yuzu_gw),
@@ -85,9 +92,12 @@ setup() ->
     %% Recorded in the table: the handler runs in the owner process, and the
     %% test body may not run in this process.
     HandlerId = {?MODULE, make_ref()},
+    %% hold_outcome holds the owner here, after its outcome is decided and
+    %% before it stops (and terminate/3 deletes its row).
     ok = telemetry:attach(HandlerId, [yuzu, gw, agent, owner_restart],
                           fun(_E, _M, #{outcome := O}, _) ->
-                                  catch ets:insert(?TAB, {outcome, O})
+                                  catch ets:insert(?TAB, {outcome, O}),
+                                  hold_while(fun() -> held(hold_outcome) end, 10000)
                           end, none),
     {Prev, Httpd, Cookie, HandlerId}.
 
@@ -246,6 +256,102 @@ heartbeat_admitted_during_restart() ->
     ?assertEqual(ok, yuzu_gw_heartbeat_admission:check(Ctx, S)),
     ?assertEqual([recovered], outcomes()).
 
+%% The window between the kill and the successor's row takeover (recover/3):
+%% the registry has dropped the session row, the owner row still says
+%% `connected' and names the dead owner. Held by suspending the agent
+%% supervisor, so the successor is not started until the checks are done.
+heartbeat_admitted_before_takeover() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Id = <<"or-hb-pre">>,
+    #{owner := Owner, session := S, conn := Conn} =
+        start_with_stream(Id, <<Id/binary, "-session">>, fun relay_stream/1, #{bind => true}),
+    Ctx = yuzu_grpc:new_ctx(#{}, Conn, undefined, undefined, undefined),
+    ?assertEqual(ok, yuzu_gw_heartbeat_admission:check(Ctx, S)),
+    Key = owner_key(S),
+    ok = sys:suspend(yuzu_gw_agent_sup),
+    try
+        exit(Owner, kill),
+        ?assertEqual(ok, wait_until(fun() -> yuzu_gw_registry:lookup_session(S) =:= error end,
+                                    ?PROMPT_MS)),
+        ?assertEqual(error, yuzu_gw_registry:lookup_pending_session(S)),
+        ?assertNot(is_process_alive(Owner)),
+        ?assertMatch({ok, #{announced := connected, pid := Owner}},
+                     yuzu_gw_agent_sup:owner_row(Key)),
+        ?assertEqual(ok, yuzu_gw_heartbeat_admission:check(Ctx, S)),
+        Other = spawn(fun() -> receive _ -> ok end end),
+        ets:insert(?TAB, {proc, Other}),
+        ?assertMatch({reject, _},
+                     yuzu_gw_heartbeat_admission:check(
+                       yuzu_grpc:new_ctx(#{}, Other, undefined, undefined, undefined), S))
+    after
+        sys:resume(yuzu_gw_agent_sup)
+    end,
+    ?assertEqual(ok, wait_until(fun() -> length(notices(S, 'CONNECTED')) >= 2 end, ?PROMPT_MS)),
+    ?assertEqual(ok, yuzu_gw_heartbeat_admission:check(Ctx, S)).
+
+%% A superseded session whose owner is killed: its restarted owner has sent the
+%% DISCONNECTED and marked the row `disconnected' (it is "being restarted"),
+%% but the registry routes the agent to the newer session, so the old
+%% session's heartbeats stay refused. Held after the restarted owner gave up
+%% and before it stops (its row is deleted when it does).
+superseded_refused_mid_recovery() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Id = <<"or-super-mid">>,
+    #{owner := Old, session := S1, conn := Conn1} =
+        start_with_stream(Id, <<"or-super-mid-s1">>, fun relay_stream/1, #{bind => true}),
+    #{owner := New, session := S2} =
+        start_with_stream(Id, <<"or-super-mid-s2">>, fun relay_stream/1, #{bind => true}),
+    Ctx1 = yuzu_grpc:new_ctx(#{}, Conn1, undefined, undefined, undefined),
+    Key = owner_key(S1),
+    ets:insert(?TAB, {cfg, hold_outcome, true}),
+    try
+        exit(Old, kill),
+        ?assertEqual(ok, wait_until(fun() -> notices(S1, 'DISCONNECTED') =/= [] end,
+                                    ?PROMPT_MS)),
+        ?assertEqual(ok, wait_until(fun() -> ets:lookup(?TAB, outcome) =/= [] end,
+                                    ?PROMPT_MS)),
+        %% Mid-recovery: the row is `disconnected', owned by the live successor.
+        {ok, #{announced := disconnected, pid := Successor}} =
+            yuzu_gw_agent_sup:owner_row(Key),
+        ?assert(is_process_alive(Successor)),
+        ?assertNotEqual(Old, Successor),
+        ?assertEqual({ok, {New, S2}}, yuzu_gw_registry:lookup_local_session(Id)),
+        ?assertEqual({reject, unknown_session}, yuzu_gw_heartbeat_admission:check(Ctx1, S1)),
+        ?assertEqual(error, yuzu_gw_agent_sup:held_session(S1))
+    after
+        ets:match_delete(?TAB, {cfg, hold_outcome, '_'})
+    end,
+    ?assertEqual(ok, wait_until(fun() -> yuzu_gw_agent_sup:owner_row(Key) =:= none end,
+                                ?PROMPT_MS)),
+    ?assertEqual([disconnected_only], outcomes()),
+    ?assertEqual({reject, unknown_session}, yuzu_gw_heartbeat_admission:check(Ctx1, S1)).
+
+%% A session being ended on purpose (`ending') whose owner is dead, before the
+%% successor takes the row over: no heartbeat is admitted.
+ending_row_refused() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Id = <<"or-ending">>,
+    #{owner := Owner, session := S, conn := Conn} =
+        start_with_stream(Id, <<Id/binary, "-session">>, fun relay_stream/1, #{bind => true}),
+    Ctx = yuzu_grpc:new_ctx(#{}, Conn, undefined, undefined, undefined),
+    Key = owner_key(S),
+    ok = sys:suspend(yuzu_gw_agent_sup),
+    try
+        exit(Owner, kill),
+        ?assertEqual(ok, wait_until(fun() -> yuzu_gw_registry:lookup_session(S) =:= error end,
+                                    ?PROMPT_MS)),
+        ?assertMatch({ok, _}, yuzu_gw_agent_sup:held_session(S)),
+        ok = yuzu_gw_agent_sup:owner_set(Key, [{announced, ending}]),
+        ?assertEqual(error, yuzu_gw_agent_sup:held_session(S)),
+        ?assertEqual({reject, unknown_session}, yuzu_gw_heartbeat_admission:check(Ctx, S))
+    after
+        sys:resume(yuzu_gw_agent_sup)
+    end,
+    %% The successor re-sends the DISCONNECTED and does not recover the session.
+    ?assertEqual(ok, wait_until(fun() -> yuzu_gw_agent_sup:owner_row(Key) =:= none end,
+                                ?PROMPT_MS)),
+    ?assertEqual([disconnected_only], outcomes()).
+
 superseded_owner_crash() ->
     {ok, _} = application:ensure_all_started(yuzu_gw),
     Id = <<"or-super">>,
@@ -299,10 +405,7 @@ mock() ->
                                                    maps:get(stream_home_id, Req),
                                                    erlang:monotonic_time(microsecond)}),
                                  maps:get(event, Req) =:= 'DISCONNECTED' andalso
-                                     hold_while(fun() -> ets:lookup(?TAB, cfg) =/= [] andalso
-                                                         [x || {cfg, hold_disconnected, true}
-                                                                   <- ets:lookup(?TAB, cfg)] =/= []
-                                                end, 10000),
+                                     hold_while(fun() -> held(hold_disconnected) end, 10000),
                                  {ok, #{acknowledged => true}, #{}};
                              <<"ProxyRegister">> ->
                                  [{cfg, register_delay_ms, Delay} | _] =
@@ -323,6 +426,12 @@ mock() ->
                          end
                      end).
 
+%% Whether the test set the hold flag Flag (false once the table is gone).
+held(Flag) ->
+    try [x || {cfg, F, true} <- ets:lookup(?TAB, cfg), F =:= Flag] =/= []
+    catch error:badarg -> false
+    end.
+
 hold_while(Pred, Left) when Left > 0 ->
     case Pred() of
         true  -> timer:sleep(10), hold_while(Pred, Left - 10);
@@ -342,6 +451,11 @@ presented(Agent, Session) ->
 
 pairs([A, B | T]) -> [{A, B} | pairs([B | T])];
 pairs(_) -> [].
+
+%% The owner-table row key of Session.
+owner_key(Session) ->
+    [{_, Key}] = ets:lookup(yuzu_gw_owner_sessions, {session, Session}),
+    Key.
 
 children() ->
     [P || {_, P, _, _} <- supervisor:which_children(yuzu_gw_agent_sup), is_pid(P)].
