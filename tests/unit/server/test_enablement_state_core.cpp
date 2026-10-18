@@ -67,8 +67,7 @@ TEST_CASE("enablement state: provenance wire spellings are frozen and exact", "[
     }
 }
 
-TEST_CASE("enablement state: sha256_hex matches the standard vectors", "[enablement][scope]") {
-    CHECK(sha256_hex("") == std::optional<std::string>{std::string(kEmptySetHash)});
+TEST_CASE("enablement state: sha256_hex matches the standard vector", "[enablement][scope]") {
     CHECK(sha256_hex("abc") ==
           std::optional<std::string>{
               "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"});

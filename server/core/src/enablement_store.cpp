@@ -59,6 +59,10 @@ constexpr const char* kReasonQueryError = "query_error";
 constexpr const char* kMeta = "plugin_config_store.enablement_meta";
 constexpr const char* kRules = "plugin_config_store.enablement_rules";
 constexpr const char* kEndpoints = "plugin_config_store.enablement_endpoints";
+// The rule SELECT list, spelled once: rule_row() reads these columns by position.
+constexpr const char* kRuleCols =
+    "id, array_to_json(units)::text, selector, provenance, actor, audit_ref, active, "
+    "(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint";
 
 constexpr std::size_t kMaxAgentIdBytes = 256;
 
@@ -361,6 +365,25 @@ void EnablementStore::count_read_degrade(const char* reason) const {
     count("yuzu_server_enablement_read_degrade_total", "reason", reason);
 }
 
+pg::PgPool::Lease EnablementStore::read_lease() const {
+    if (!open_) {
+        count_read_degrade(kReasonStoreNotOpen);
+        return {};
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        count_read_degrade(kReasonPoolTimeout);
+    return lease;
+}
+
+// Not counted: a failed write acquire is reported to the caller as Unavailable, and
+// write_degrade_total means "best-effort writes that did not land".
+pg::PgPool::Lease EnablementStore::write_lease() const {
+    if (!open_)
+        return {};
+    return pool_.try_acquire_for(kWriteTimeout);
+}
+
 // -- Rules --------------------------------------------------------------------
 
 namespace {
@@ -461,19 +484,11 @@ std::expected<void, EnablementStore::Error> EnablementStore::deactivate_rule(std
 
 std::expected<std::vector<en::RuleRow>, EnablementStore::Error>
 EnablementStore::list_rules(bool active_only) const {
-    if (!open_) {
-        count_read_degrade(kReasonStoreNotOpen);
+    auto lease = read_lease();
+    if (!lease)
         return std::unexpected(Error::Unavailable);
-    }
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease) {
-        count_read_degrade(kReasonPoolTimeout);
-        return std::unexpected(Error::Unavailable);
-    }
-    const std::string sql =
-        std::string("SELECT id, array_to_json(units)::text, selector, provenance, actor, "
-                    "audit_ref, active, (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint FROM ") +
-        kRules + (active_only ? " WHERE active" : "") + " ORDER BY id";
+    const std::string sql = std::string("SELECT ") + kRuleCols + " FROM " + kRules +
+                            (active_only ? " WHERE active" : "") + " ORDER BY id";
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
         count_read_degrade(kReasonQueryError);
@@ -511,10 +526,8 @@ EnablementStore::load_rules() const {
         version = to_i64(col(v.get(), 0, 0));
         pg::PgResult r = pg::exec_params(
             c,
-            (std::string("SELECT id, array_to_json(units)::text, selector, provenance, actor, "
-                         "audit_ref, active, (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint "
-                         "FROM ") +
-             kRules + " WHERE active ORDER BY id LIMIT $1::bigint")
+            (std::string("SELECT ") + kRuleCols + " FROM " + kRules +
+             " WHERE active ORDER BY id LIMIT $1::bigint")
                 .c_str(),
             std::vector<std::string>{std::to_string(en::kMaxRules + 1)});
         if (r.status() != PGRES_TUPLES_OK)
@@ -639,15 +652,9 @@ void EnablementStore::upsert_on_registration(const std::string& agent_id, const 
 
 std::expected<EnablementStore::EndpointRow, EnablementStore::Error>
 EnablementStore::get_endpoint(std::string_view agent_id) const {
-    if (!open_) {
-        count_read_degrade(kReasonStoreNotOpen);
+    auto lease = read_lease();
+    if (!lease)
         return std::unexpected(Error::Unavailable);
-    }
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease) {
-        count_read_degrade(kReasonPoolTimeout);
-        return std::unexpected(Error::Unavailable);
-    }
     pg::PgResult r = pg::exec_params(
         lease.get(),
         (std::string("SELECT agent_id, hostname, os, arch, agent_version, reg_boot_id, reg_seq, "
@@ -696,14 +703,10 @@ EnablementStore::record_report(std::string_view agent_id, std::int64_t epoch, st
         return std::unexpected(Error::Unavailable);
     if (!en::check_report(epoch, counter, hash))
         return std::unexpected(Error::InvalidInput);
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    auto lease = write_lease();
     if (!lease)
         return std::unexpected(Error::Unavailable);
-    // ONE statement, no read-then-write: the CASE and the WHERE are evaluated
-    // against the row's CURRENT version under its row lock (READ COMMITTED
-    // re-evaluates after waiting on a concurrent set_desired_batch), so a report
-    // equal to the previous desired state can never clear pending_since for a state
-    // issued in between.
+    // See the banner: ONE conditional UPDATE, evaluated under the row lock.
     pg::PgResult r = pg::exec_params(
         lease.get(),
         (std::string("UPDATE ") + kEndpoints +
@@ -869,15 +872,9 @@ EnablementStore::set_desired_batch(const BatchWrite& batch) {
 // -- Meta, continuity, regression ---------------------------------------------
 
 std::expected<EnablementStore::MetaRow, EnablementStore::Error> EnablementStore::get_meta() const {
-    if (!open_) {
-        count_read_degrade(kReasonStoreNotOpen);
+    auto lease = read_lease();
+    if (!lease)
         return std::unexpected(Error::Unavailable);
-    }
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease) {
-        count_read_degrade(kReasonPoolTimeout);
-        return std::unexpected(Error::Unavailable);
-    }
     pg::PgResult r = pg::exec_params(
         lease.get(),
         (std::string("SELECT store_id, epoch, counter, rules_version, overlay_hash, job_cursor, "
@@ -904,9 +901,7 @@ std::expected<EnablementStore::MetaRow, EnablementStore::Error> EnablementStore:
 
 std::expected<bool, EnablementStore::Error>
 EnablementStore::sync_overlay_hash(std::string_view hash) {
-    if (!open_)
-        return std::unexpected(Error::Unavailable);
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    auto lease = write_lease();
     if (!lease)
         return std::unexpected(Error::Unavailable);
     // One conditional statement: atomic across replicas booting together.
@@ -934,20 +929,15 @@ void EnablementStore::apply_regression_cache(bool regressed, std::string reason,
         metrics_->gauge("yuzu_server_enablement_regressed").set(regressed ? 1.0 : 0.0);
 }
 
-std::expected<void, EnablementStore::Error> EnablementStore::set_regressed(std::string_view reason) {
-    if (!open_)
-        return std::unexpected(Error::Unavailable);
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
+std::expected<void, EnablementStore::Error>
+EnablementStore::update_meta_regression(std::string_view set_clause,
+                                        const std::vector<std::string>& params) {
+    auto lease = write_lease();
     if (!lease)
         return std::unexpected(Error::Unavailable);
-    const std::string safe = ::yuzu::log_token(reason.substr(0, 64));
-    // Idempotent: only the first declaration records its time and reason.
     pg::PgResult r = pg::exec_params(
-        lease.get(),
-        (std::string("UPDATE ") + kMeta +
-         " SET regressed_at = now(), regressed_reason = $1 WHERE id = 1 AND regressed_at IS NULL")
-            .c_str(),
-        std::vector<std::string>{safe});
+        lease.get(), (std::string("UPDATE ") + kMeta + " SET " + std::string(set_clause)).c_str(),
+        params);
     if (r.status() != PGRES_COMMAND_OK)
         return std::unexpected(Error::WriteFailed);
     lease.reset();
@@ -955,23 +945,15 @@ std::expected<void, EnablementStore::Error> EnablementStore::set_regressed(std::
     return {};
 }
 
+// Idempotent: only the first declaration records its time and reason.
+std::expected<void, EnablementStore::Error> EnablementStore::set_regressed(std::string_view reason) {
+    return update_meta_regression(
+        "regressed_at = now(), regressed_reason = $1 WHERE id = 1 AND regressed_at IS NULL",
+        {::yuzu::log_token(reason.substr(0, 64))});
+}
+
 std::expected<void, EnablementStore::Error> EnablementStore::resolve_regression() {
-    if (!open_)
-        return std::unexpected(Error::Unavailable);
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected(Error::Unavailable);
-    pg::PgResult r = pg::exec_params(
-        lease.get(),
-        (std::string("UPDATE ") + kMeta +
-         " SET regressed_at = NULL, regressed_reason = '' WHERE id = 1")
-            .c_str(),
-        std::vector<std::string>{});
-    if (r.status() != PGRES_COMMAND_OK)
-        return std::unexpected(Error::WriteFailed);
-    lease.reset();
-    refresh_regression();
-    return {};
+    return update_meta_regression("regressed_at = NULL, regressed_reason = '' WHERE id = 1", {});
 }
 
 void EnablementStore::refresh_regression() {

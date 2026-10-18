@@ -105,12 +105,10 @@
 #include "enablement_resolver.hpp"
 #include "enablement_state_core.hpp"
 #include "enablement_units.hpp"
+#include "pg/pg_pool.hpp"
 
 namespace yuzu {
 class MetricsRegistry;
-}
-namespace yuzu::server::pg {
-class PgPool;
 }
 
 namespace yuzu::server {
@@ -295,6 +293,15 @@ private:
     void count(const char* name, const char* label_key, const char* label_value) const;
     void count_write_degrade(const char* reason) const;
     void count_read_degrade(const char* reason) const;
+    /// A bounded read lease; empty when the store is closed or the pool timed out, and
+    /// the degrade reason is counted.
+    [[nodiscard]] pg::PgPool::Lease read_lease() const;
+    /// The same for a write; empty on the same two causes, not counted (the caller
+    /// returns Unavailable, and write_degrade_total is for best-effort writes).
+    [[nodiscard]] pg::PgPool::Lease write_lease() const;
+    /// set_regressed / resolve_regression: one UPDATE of the meta row, then a cache refresh.
+    [[nodiscard]] std::expected<void, Error>
+    update_meta_regression(std::string_view set_clause, const std::vector<std::string>& params);
     void apply_regression_cache(bool regressed, std::string reason, std::int64_t since_ms);
 
     pg::PgPool& pool_;

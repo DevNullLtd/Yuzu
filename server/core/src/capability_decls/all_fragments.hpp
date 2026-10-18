@@ -1,16 +1,10 @@
 #pragma once
 
 /// @file all_fragments.hpp
-/// The 28 capability fragments, spelled ONCE. A macro because
-/// CommandCapabilityRegistry and enablement::build_unit_overlay both take a
-/// brace-enclosed initializer_list, which a function cannot forward. The server's
-/// dispatch registry (server.cpp capability_registry_), the boot-time unit overlay
-/// (enablement_store construction) and the units test all expand it, so the
-/// registry, the overlay and the test can never drift apart on which fragments
-/// exist. A new fragment is added here and nowhere else.
-///
-/// The order is the registry's (core first). Order is irrelevant to the overlay,
-/// which sorts by unit name.
+/// The 28 capability fragments, spelled ONCE. A macro because CommandCapabilityRegistry and
+/// enablement::build_unit_overlay take a brace-enclosed initializer_list, which a function cannot
+/// forward. A new fragment is added here and nowhere else; the order is the registry's (core
+/// first) and irrelevant to the overlay.
 
 #include "core_dispatch_capabilities.hpp"
 #include "plugin_action_catalogue_a.hpp"

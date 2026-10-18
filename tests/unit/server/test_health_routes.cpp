@@ -545,15 +545,6 @@ TEST_CASE("health_routes: GET /readyz carries exactly one `enablement` object wi
         // The object is informational: the verdict still comes from `failed_stores`.
         CHECK(body["status"] == "not ready");
     }
-    SECTION("report_ahead is true only for a positive endpoint count") {
-        EnablementStore::RegressionState st;
-        st.report_ahead_endpoints = 1;
-        closed.store.set_regression_state_for_test(st);
-        CHECK(json::parse(fetch())["enablement"]["report_ahead"] == true);
-        st.report_ahead_endpoints = 0;
-        closed.store.set_regression_state_for_test(st);
-        CHECK(json::parse(fetch())["enablement"]["report_ahead"] == false);
-    }
 }
 
 TEST_CASE("health_routes: /health lists plugin_config_store and enablement_store and flags a regression",

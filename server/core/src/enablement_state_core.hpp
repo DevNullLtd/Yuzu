@@ -25,6 +25,7 @@
  */
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -223,14 +224,14 @@ namespace detail {
 }
 
 [[nodiscard]] inline std::optional<std::int64_t> parse_decimal(std::string_view s) {
-    if (s.empty() || s.size() > 18)
+    // from_chars refuses leading whitespace and '+', consumes a leading '-' (hence the explicit
+    // refusal, which also rejects "-0"), and the 18-digit cap bounds the file before parsing.
+    if (s.empty() || s.size() > 18 || s[0] == '-')
         return std::nullopt;
     std::int64_t v = 0;
-    for (const char c : s) {
-        if (c < '0' || c > '9')
-            return std::nullopt;
-        v = v * 10 + (c - '0');
-    }
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return std::nullopt;
     return v;
 }
 } // namespace detail
