@@ -1,5 +1,7 @@
 #include "auth_routes.hpp"
+#include "oidc_writer_gate.hpp"
 
+#include <yuzu/log_token.hpp> // log_key_token: the IdP callback error parameters in a log line
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
@@ -2035,6 +2037,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (req.has_param("next"))
             v.next = home_ui::screen_by_key(req.get_param_value("next"));
         {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
             std::shared_lock oidc_lock(oidc_mu_);
             if (oidc_provider_ && oidc_provider_->is_enabled())
                 v.sso_href = "/auth/oidc/start";
@@ -3431,15 +3434,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
     // -- OIDC SSO endpoints ---------------------------------------------------
     sink.Get("/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
-        std::shared_lock oidc_lock(oidc_mu_);
-        if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
-            res.status = 404;
-            res.set_content(detail::a4_error(res, "OIDC not configured"), "application/json");
-            return;
+        // Take a lease on the published provider and copy the settings this request reads,
+        // under the shared lock, then DROP the lock: `start_auth_flow` can run lazy discovery
+        // (network I/O), and a lock held across it makes a Settings save wait for the slowest
+        // in-flight request (#5692). The lease keeps the provider alive after a swap.
+        oidc::OidcProvider::Lease provider;
+        std::string redirect_uri;
+        {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+            std::shared_lock oidc_lock(oidc_mu_);
+            if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "OIDC not configured"), "application/json");
+                return;
+            }
+            redirect_uri = cfg_.oidc_redirect_uri;
+            provider = oidc_provider_->acquire_lease();
         }
         // Use the configured redirect URI only — never derive from the
         // Host header, which can be manipulated for phishing attacks (M3).
-        if (cfg_.oidc_redirect_uri.empty()) {
+        if (redirect_uri.empty()) {
             res.status = 500;
             res.set_content(
                 detail::a4_error(res, "OIDC redirect_uri not configured — set "
@@ -3454,7 +3468,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // answer a plain 500 and set nothing, never a redirect without a binding cookie.
         oidc::OidcProvider::AuthFlowStart flow;
         try {
-            flow = oidc_provider_->start_auth_flow(cfg_.oidc_redirect_uri);
+            flow = provider->start_auth_flow(redirect_uri);
         } catch (const std::exception& e) {
             spdlog::error("OIDC auth flow could not start: {}", e.what());
             res.status = 500;
@@ -3467,22 +3481,36 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     });
 
     sink.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
-        std::shared_lock oidc_lock(oidc_mu_);
-        if (!oidc_provider_) {
-            res.status = 404;
-            res.set_content("OIDC not configured", "text/plain");
-            return;
+        // Lease + settings snapshot under the shared lock, then drop it (see /auth/oidc/start):
+        // `handle_callback` does the token POST and the JWKS fetch, so holding the lock across
+        // it made a Settings save wait behind a sign-in, and every new sign-in behind that save.
+        oidc::OidcProvider::Lease provider;
+        std::string admin_group_setting;
+        std::string scim_link_claim_setting;
+        {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+            std::shared_lock oidc_lock(oidc_mu_);
+            if (!oidc_provider_) {
+                res.status = 404;
+                res.set_content("OIDC not configured", "text/plain");
+                return;
+            }
+            admin_group_setting = cfg_.oidc_admin_group;
+            scim_link_claim_setting = cfg_.oidc_scim_link_claim;
+            provider = oidc_provider_->acquire_lease();
         }
 
         // Check for error response from IdP
         auto error = req.get_param_value("error");
         if (!error.empty()) {
             auto desc = req.get_param_value("error_description");
-            spdlog::warn("OIDC error from IdP: {} - {}", error, desc);
+            spdlog::warn("OIDC error from IdP: {} - {}", ::yuzu::log_key_token(error),
+                         ::yuzu::log_key_token(desc));
             // cons-S1: mirror the SAML ACS early-error branches — emit an
             // audit row, not just a metric bump, so an IdP-side denial shows
             // up in Yuzu's own audit trail.
-            audit_log(req, "auth.oidc_login_failed", "error", {}, {}, "idp error: " + error);
+            audit_log(req, "auth.oidc_login_failed", "error", {}, {},
+                      "idp error: " + detail::sanitize_detail_value(error));
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
             }
@@ -3529,7 +3557,30 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         bool binding_verified = false;
         auto result =
-            oidc_provider_->handle_callback(code, state, binding_secret, &binding_verified);
+            provider->handle_callback(code, state, binding_secret, &binding_verified);
+        // Was the provider replaced by a Settings save while the exchange ran? The settings this
+        // handler copied (admin group, issuer through the provider) belong to the provider it
+        // leased; if a save has since replaced it, minting a session now would map a role under
+        // configuration the operator has already changed. Compare under the shared lock and
+        // WHILE THE LEASE IS STILL HELD: the leased provider then cannot be destroyed, so a
+        // newer provider cannot reuse its address and make the pointers compare equal. This
+        // first check is made before any group, role or session work, so a refusal has no side
+        // effects. The lease is KEPT until the second check, made right after the session is
+        // minted (below): the group sync, the SCIM read and the durable session write between the
+        // two take as long as the database takes (milliseconds when healthy, bounded by the
+        // statement and pool timeouts when it is not), and a save landing in that span would
+        // otherwise leave a session minted under the replaced configuration. A save that lands
+        // after the second check is ordered after this sign-in.
+        bool superseded = false;
+        if (result) {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+            std::shared_lock oidc_lock(oidc_mu_);
+            superseded = oidc_provider_.get() != provider.get();
+        }
+        if (!result || superseded)
+            provider = oidc::OidcProvider::Lease{};
+        else if (after_first_provider_check_for_test_)
+            after_first_provider_check_for_test_();
         // The binding cookie is single-use and is cleared only when THIS visitor's cookie proved
         // a pending flow (a success, or a failure after the match); a success then appends the
         // session cookie after it. A callback that matches no pending flow leaves the cookie in place,
@@ -3568,6 +3619,24 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
+        if (superseded) {
+            // Same generic user-facing shape as every other callback failure; the audit detail
+            // and the analytics event name it by a fixed token so an auditor can tell it from
+            // an IdP failure. No claims are logged: nothing has been decided about this login.
+            spdlog::warn("OIDC callback refused: a Settings save replaced the provider while "
+                         "this sign-in was in flight");
+            audit_log(req, "auth.oidc_login_failed", "failure", {}, {}, "reason=provider_replaced");
+            emit_event("auth.oidc_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "provider_replaced"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}})
+                    .increment();
+            }
+            res.set_redirect("/login?error=sso_failed");
+            return;
+        }
+
         auto& claims = result.value();
         auto email = claims.email.empty() ? claims.preferred_username : claims.email;
         auto display = claims.name.empty() ? email : claims.name;
@@ -3582,14 +3651,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // helper, which is also what AuthManager::create_oidc_session uses,
         // so the two mint sites cannot drift apart.
         const std::string username = oidc::oidc_principal_id(claims.iss, claims.sub);
-        auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
+        const auto& admin_gid = admin_group_setting;
 
         // ADR-2001 §4 — the SAME externalId candidate value link formation
         // uses below (`link_oidc_login_to_scim`) — computed once here so the
         // deny-at-login backstop's reprovision check (governance U1) and
         // link formation can never drift onto different values.
         const std::string link_claim_value =
-            cfg_.oidc_scim_link_claim == "oid" ? claims.oid : claims.sub;
+            scim_link_claim_setting == "oid" ? claims.oid : claims.sub;
 
         // ADR-2001 §4 — deny-at-login backstop, PRIMARY check. Runs before
         // every mutation below (group reconcile, session mint,
@@ -3803,6 +3872,69 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub, claims.iss,
                                                            claims.groups, admin_gid, mfa_at);
+
+        // `create_oidc_session` returns an EMPTY token when the durable session row could not be
+        // persisted (ADR-0007 fail-safe). That is a failed login, not a success: no session
+        // cookie, no `auth.oidc_login` ok row and no ok counter for a session that does not exist.
+        // Same shape as the sibling failure branches above (generic redirect, failure audit row,
+        // error counter); the IdP-controlled username is folded in the log and never put in the
+        // event.
+        if (session_token.empty()) {
+            spdlog::error("OIDC callback: session could not be created for '{}', login refused",
+                          ::yuzu::log_key_token(username));
+            audit_log_for_principal(req, "auth.oidc_login_failed", "failure", username, "user", "",
+                                    "", "reason=session_create_failed");
+            emit_event("auth.oidc_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "session_create_failed"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}})
+                    .increment();
+            }
+            res.set_redirect("/login?error=sso_failed");
+            return;
+        }
+
+        // Second provider check, with the lease still held (see the first check above): a Settings
+        // save that replaced the provider while the group sync and the session write ran must not
+        // leave a usable session behind. The session just minted is invalidated by its own token
+        // (never `invalidate_user_sessions`, which would end the user's unrelated sessions) and no
+        // cookie is set. The group sync that already ran is not undone; it reconciles to the IdP's
+        // current claims and the next sign-in reconciles again. The audit row records whether the
+        // durable delete persisted, as the post-mint SCIM re-check below does.
+        {
+            bool superseded_after_mint = false;
+            {
+                yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+                std::shared_lock oidc_lock(oidc_mu_);
+                superseded_after_mint = oidc_provider_.get() != provider.get();
+            }
+            provider = oidc::OidcProvider::Lease{};
+            if (superseded_after_mint) {
+                const bool persisted = auth_mgr_.invalidate_session(session_token);
+                spdlog::warn("OIDC callback refused after the session was minted: a Settings "
+                             "save replaced the provider while this sign-in was in flight for "
+                             "'{}'{}",
+                             ::yuzu::log_key_token(username),
+                             persisted ? "" : " (the durable session delete failed)");
+                // A session row existed for this principal, so the row names it (as the
+                // session_create_failed refusal above does); `username` is the stable
+                // issuer-scoped id, never an IdP free-text field.
+                audit_log_for_principal(req, "auth.oidc_login_failed", "failure", username, "user",
+                                        "", "",
+                                        std::string("reason=provider_replaced;post_mint=true") +
+                                            (persisted ? "" : ";db_persisted=false"));
+                emit_event("auth.oidc_login_failed", req,
+                           {{"source_ip", req.remote_addr}, {"error", "provider_replaced"}}, {},
+                           Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}})
+                        .increment();
+                }
+                res.set_redirect("/login?error=sso_failed");
+                return;
+            }
+        }
 
         // #1852 — auto-provision a durable auth.db row for this stable
         // principal so JIT admin elevation has something to key on

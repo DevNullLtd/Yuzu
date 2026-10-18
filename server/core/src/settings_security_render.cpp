@@ -195,7 +195,7 @@ std::string render_directory(const DirectoryView& v) {
            "<input class=\"in mono\" id=\"oidc-issuer\" type=\"text\" name=\"issuer\" "
            "autocomplete=\"off\" value=\"" +
            html_escape(v.issuer) +
-           "\" placeholder=\"https://login.microsoftonline.com/{tenant}/v2.0\"></div>"
+           "\" placeholder=\"https://login.microsoftonline.com/&lt;tenant-guid&gt;/v2.0\"></div>"
            "<div class=\"fld\"><label for=\"oidc-client-id\">Client ID</label>"
            "<input class=\"in mono\" id=\"oidc-client-id\" type=\"text\" name=\"client_id\" "
            "autocomplete=\"off\" value=\"" +
@@ -211,7 +211,7 @@ std::string render_directory(const DirectoryView& v) {
            "<input class=\"in mono\" id=\"oidc-redirect\" type=\"text\" name=\"redirect_uri\" "
            "autocomplete=\"off\" value=\"" +
            html_escape(v.redirect_uri) +
-           "\" placeholder=\"(auto-computed from web address)\"></div>"
+           "\" placeholder=\"Required: https://&lt;server&gt;/auth/callback, exactly as registered at the IdP\"></div>"
            "<div class=\"fld\"><label for=\"oidc-admin-group\">Admin group ID</label>"
            "<input class=\"in mono\" id=\"oidc-admin-group\" type=\"text\" name=\"admin_group\" "
            "autocomplete=\"off\" value=\"" +

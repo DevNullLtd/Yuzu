@@ -28,6 +28,7 @@
 #include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
+#include "oidc_writer_gate.hpp" // writer priority for the OIDC lock (#5692 UP-13)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
@@ -135,6 +136,24 @@ std::string url_encode(const std::string& s) {
         }
     }
     return out;
+}
+
+// A refused MFA step-up on an htmx form: `step_up_fn_` has already written the refusal (a 401/403/503
+// A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
+// envelope's own `error.message` (never its `remediation`, which for a SAML session points back at
+// a sign-in that cannot help); fall back to a fixed message if the body is not an envelope.
+void toast_step_up_refusal(httplib::Response& res) {
+    std::string message = "MFA step-up required";
+    try {
+        const auto body = nlohmann::json::parse(res.body, nullptr, false);
+        if (body.is_object() && body.contains("error") && body["error"].is_object() &&
+            body["error"].contains("message") && body["error"]["message"].is_string())
+            message = body["error"]["message"].get<std::string>();
+    } catch (...) {
+        // keep the fixed message
+    }
+    const nlohmann::json toast = {{"showToast", {{"message", message}, {"level", "error"}}}};
+    res.set_header("HX-Trigger", toast.dump());
 }
 
 // #4966: the ONE dashboard answer to a last-Administrator refusal (delete AND demote): 409 with
@@ -2260,6 +2279,7 @@ std::string SettingsRoutes::render_directory_fragment(const std::string& message
     {
         // The save handler reassigns cfg_->oidc_* and the provider under the unique lock; read
         // the form values and the live provider state under the shared one.
+        yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
         std::shared_lock lock(*oidc_mu_);
         view.issuer = cfg_->oidc_issuer;
         view.client_id = cfg_->oidc_client_id;
@@ -3839,12 +3859,64 @@ void SettingsRoutes::register_routes(
         auto admin_group = trimmed("admin_group");
         auto skip_tls_verify = extract_form_value(req.body, "skip_tls_verify");
 
+        // The dashboard's htmx config does not swap a 4xx body (see the 503 branch of the DEX
+        // routing save), so each refusal below also carries a toast: without it Save would show
+        // nothing and nothing would be stored.
         if (issuer.empty() || client_id.empty()) {
             res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Issuer URL and Client ID are required","level":"error"}})");
             res.set_content(render_directory_fragment("Issuer URL and Client ID are required."),
                             "text/html; charset=utf-8");
             return;
         }
+        // A provider without a redirect_uri never fetches discovery and /auth/oidc/start answers
+        // 500, so a blank value is a configuration that cannot sign in: refuse it here rather than
+        // report a saved one. (Only the startup flag path fills in a localhost default.)
+        if (redirect_uri.find_first_not_of(" \t\r\n") == std::string::npos) {
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Redirect URI is required: enter the callback URL registered at the IdP","level":"error"}})");
+            res.set_content(
+                render_directory_fragment("Redirect URI is required: enter the callback URL "
+                                          "registered at the IdP (https://<server>/auth/callback)."),
+                "text/html; charset=utf-8");
+            return;
+        }
+
+        // Retirement of the provider this save replaces. Declared BEFORE the save lock below so
+        // that, destroyed in reverse order, it runs AFTER the lock is released: a retire() that
+        // has to wait (more than kMaxRetired providers each still in a request) then delays only
+        // this reply, never another save's read-modify-write.
+        struct RetireOnExit {
+            std::unique_ptr<oidc::OidcProvider> unpublished;
+            ~RetireOnExit() {
+                // retire() can throw (allocation, a mutex failure) and a destructor is
+                // implicitly noexcept, so an escaping exception would terminate the server. The
+                // provider is owned either by retire()'s by-value parameter (destroyed on
+                // unwind, which waits for its leases and never leaks) or by the retirement list,
+                // so swallowing here cannot lose or double-free it.
+                try {
+                    oidc::OidcProvider::retire(std::move(unpublished));
+                } catch (const std::exception& e) {
+                    // Nothing was lost, but the retirement bound did not run: say so.
+                    try {
+                        spdlog::error("OIDC settings save: retiring the replaced provider failed "
+                                      "({}); the provider is destroyed or kept on the list, "
+                                      "never lost",
+                                      e.what());
+                    } catch (...) {
+                    }
+                } catch (...) {
+                }
+            }
+        } retire_on_exit;
+
+        // One save at a time. Reading the stored secret ("leave it alone" when the field is
+        // blank), building the provider, swapping it in and persisting are one unit: two
+        // interleaved saves could otherwise leave the live provider on one secret and the store
+        // on another, both reporting success. Sign-ins never take this mutex.
+        std::lock_guard save_lock(oidc_save_mu_);
 
         // The redaction placeholder is not a credential. It reaches this handler when an
         // operator copies it out of the startup log or a config.update audit detail -- the
@@ -3866,6 +3938,14 @@ void SettingsRoutes::register_routes(
         // one, and it covers every other caller (PUT /api/config included).
         if (is_exactly_redaction_placeholder(client_secret))
             client_secret.clear();
+        std::string stored_secret;
+        {
+            // No writer-gate pass here: this thread holds `oidc_save_mu_`, and only the holder of
+            // that mutex ever raises a ticket, so none can be outstanding.
+            std::shared_lock oidc_lock(*oidc_mu_);
+            stored_secret = cfg_->oidc_client_secret;
+        }
+        auto effective_secret = client_secret.empty() ? stored_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
 
         // One unique lock covers the read of the stored secret, the provider build and the swap.
@@ -3887,6 +3967,14 @@ void SettingsRoutes::register_routes(
             oidc_cfg.redirect_uri = redirect_uri;
             oidc_cfg.admin_group_id = admin_group;
             oidc_cfg.skip_tls_verify = skip_tls;
+            // OS-level egress switch: copied from the server config, never from the request.
+            oidc_cfg.allow_private_networks = cfg_->oidc_allow_private_networks;
+            // Same for the NAT64 declaration (--oidc-nat64-prefix); validated at startup, so an
+            // unparsable value here can only mean a Config built outside main.cpp: fail closed.
+            if (auto prefixes = oidc::egress::parse_nat64_prefix_list(cfg_->oidc_nat64_prefixes))
+                oidc_cfg.nat64_prefixes = std::move(*prefixes);
+            else
+                throw std::runtime_error("the server's --oidc-nat64-prefix value is invalid");
             // ADR-2001 §1 gap (Task 2 follow-up): this hot-reload path builds its
             // own local OidcConfig and previously left scim_link_claim at its
             // struct default ("sub"), silently reverting an operator's
@@ -3899,40 +3987,41 @@ void SettingsRoutes::register_routes(
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
 
-            auto v2_pos = issuer.rfind("/v2.0");
-            if (v2_pos != std::string::npos) {
-                auto base = issuer.substr(0, v2_pos);
-                oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
-                oidc_cfg.token_endpoint = base + "/oauth2/v2.0/token";
-            } else {
-                oidc_cfg.authorization_endpoint = issuer + "/authorize";
-                oidc_cfg.token_endpoint = issuer + "/token";
-            }
-
-            auto src_script =
-                std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
-            if (std::filesystem::exists(src_script))
-                oidc_cfg.exchange_script = src_script.string();
-
             new_provider = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         } catch (const std::exception& e) {
             lock.unlock(); // render_directory_fragment takes the shared lock
             spdlog::error("OIDC provider reinit failed: {}", e.what());
             res.status = 500;
+            // htmx swaps neither 4xx nor 5xx, so a toast is the only thing the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"OIDC provider could not be initialised; see the server log","level":"error"}})");
             res.set_content(
                 render_directory_fragment(std::string("OIDC init failed: ") + e.what()),
                 "text/html; charset=utf-8");
             return;
         }
 
-        cfg_->oidc_issuer = issuer;
-        cfg_->oidc_client_id = client_id;
-        cfg_->oidc_client_secret = effective_secret;
-        cfg_->oidc_redirect_uri = redirect_uri;
-        cfg_->oidc_admin_group = admin_group;
-        cfg_->oidc_skip_tls_verify = skip_tls;
-        *oidc_provider_ = std::move(new_provider);
-        lock.unlock();
+        // The swap holds the exclusive lock only for these assignments: sign-ins keep the
+        // provider they started with through a lease and run their network I/O without the
+        // lock, so this does not wait for them. The unpublished provider goes to
+        // `retire_on_exit` (declared above, before the save lock), so it is retired when this
+        // handler exits, after the settings are persisted and the response is built and after
+        // the save lock is released; it is destroyed by the first later retirement or drain once
+        // its last in-flight request has finished (releasing the last lease does not destroy it).
+        {
+            // Writer priority (UP-13): readers wait at the gate while this save asks for the lock.
+            yuzu::server::oidc::OidcWriterGate::Ticket writer_ticket;
+            std::unique_lock lock(*oidc_mu_);
+            writer_ticket.release(); // owned: readers may queue on the lock again
+            cfg_->oidc_issuer = issuer;
+            cfg_->oidc_client_id = client_id;
+            cfg_->oidc_client_secret = effective_secret;
+            cfg_->oidc_redirect_uri = redirect_uri;
+            cfg_->oidc_admin_group = admin_group;
+            cfg_->oidc_skip_tls_verify = skip_tls;
+            retire_on_exit.unpublished = std::move(*oidc_provider_);
+            *oidc_provider_ = std::move(new_provider);
+        }
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
 
         std::vector<std::string> persist_errors;
@@ -4012,15 +4101,24 @@ void SettingsRoutes::register_routes(
 
         auto issuer = extract_form_value(req.body, "issuer");
         auto skip_tls_str = extract_form_value(req.body, "skip_tls_verify");
-        bool skip_tls = (skip_tls_str == "true");
+        // Copy the two saved values under the shared lock (a save writes them under the unique
+        // lock); the network I/O below runs without it.
+        bool saved_skip_tls = false;
+        bool allow_private = false; // OS-level egress switch; never read from the form
+        std::string nat64_text;     // OS-level NAT64 declaration; never read from the form
+        std::string saved_issuer;
         {
-            // Same lock as the save handler's write (oidc_mu_), so a concurrent save cannot
-            // tear the stored issuer string or the flag read here.
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
             std::shared_lock lock(*oidc_mu_);
-            skip_tls = skip_tls || cfg_->oidc_skip_tls_verify;
-            if (issuer.empty())
-                issuer = cfg_->oidc_issuer;
+            saved_skip_tls = cfg_->oidc_skip_tls_verify;
+            allow_private = cfg_->oidc_allow_private_networks;
+            nat64_text = cfg_->oidc_nat64_prefixes;
+            saved_issuer = cfg_->oidc_issuer;
         }
+        bool skip_tls = (skip_tls_str == "true") || saved_skip_tls;
+
+        if (issuer.empty())
+            issuer = std::move(saved_issuer);
 
         if (issuer.empty()) {
             res.set_content("<span class=\"feedback-error\">Enter an Issuer URL first.</span>",
@@ -4028,86 +4126,43 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto discovery_url = issuer;
-        if (!discovery_url.ends_with("/"))
-            discovery_url += "/";
-        discovery_url += ".well-known/openid-configuration";
-
         audit_fn_(req, "oidc.test", "attempt", "OidcConfig", issuer, "");
 
-        try {
-            std::string url = discovery_url;
-            std::string scheme;
-            if (url.starts_with("https://")) {
-                scheme = "https://";
-                url = url.substr(8);
-            } else if (url.starts_with("http://")) {
-                scheme = "http://";
-                url = url.substr(7);
-            } else {
-                res.set_content("<span class=\"feedback-error\">Invalid issuer URL scheme (must be "
-                                "http or https).</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            auto slash = url.find('/');
-            auto host = (slash != std::string::npos) ? url.substr(0, slash) : url;
-            auto path = (slash != std::string::npos) ? url.substr(slash) : "/";
-
-            auto client = std::make_unique<httplib::Client>(scheme + host);
-            client->set_connection_timeout(10);
-            client->set_read_timeout(10);
-            client->set_write_timeout(10);
-            client->enable_server_certificate_verification(!skip_tls);
-
-            auto result = client->Get(path);
-
-            int status_code = result ? result->status : 0;
-            std::string body_copy = result ? result->body : "";
-            std::string err_str = result ? "" : httplib::to_string(result.error());
-            client.reset();
-
-            if (status_code == 200) {
-                auto j = nlohmann::json::parse(body_copy);
-                std::string auth_ep = j.value("authorization_endpoint", "");
-                std::string token_ep = j.value("token_endpoint", "");
-                if (!auth_ep.empty() && !token_ep.empty()) {
-                    res.set_content(
-                        "<span class=\"feedback-ok\">"
-                        "Connected &#x2014; discovered authorization and token endpoints</span>",
-                        "text/html; charset=utf-8");
-                } else {
-                    res.set_content(
-                        "<span class=\"feedback-error\">"
-                        "Discovery succeeded but missing authorization/token endpoints.</span>",
-                        "text/html; charset=utf-8");
-                }
-            } else if (status_code == 0) {
-                res.set_content(
-                    "<span class=\"feedback-error\">"
-                    "Discovery failed: " +
-                        html_escape(err_str) + "</span>",
-                    "text/html; charset=utf-8");
-            } else {
-                res.set_content(
-                    "<span class=\"feedback-error\">"
-                    "Discovery failed: HTTP " +
-                        std::to_string(status_code) + "</span>",
-                    "text/html; charset=utf-8");
-            }
-        } catch (const nlohmann::json::exception& e) {
-            res.set_content(
-                "<span class=\"feedback-error\">"
-                "Discovery response is not valid JSON: " +
-                    html_escape(e.what()) + "</span>",
-                "text/html; charset=utf-8");
-        } catch (const std::exception& e) {
-            res.set_content(
-                "<span class=\"feedback-error\">"
-                "Discovery failed: " +
-                    html_escape(e.what()) + "</span>",
-                "text/html; charset=utf-8");
+        // The login's own path: the same bounded GET and the same document validation
+        // (issuer match, absolute endpoints on the issuer's scheme) a login applies.
+        const auto fail = [&res](const std::string& what) {
+            res.set_content("<span class=\"feedback-error\">" + html_escape(what) + "</span>",
+                            "text/html; charset=utf-8");
+        };
+        const auto nat64 = oidc::egress::parse_nat64_prefix_list(nat64_text);
+        if (!nat64) {
+            fail("The server's --oidc-nat64-prefix value is invalid; fix it and restart.");
+            return;
         }
+        auto doc = oidc::OidcProvider::fetch_discovery_document(
+            issuer, skip_tls, allow_private, oidc::OidcProvider::kHttpOperationTimeoutMs, *nat64);
+        if (!doc) {
+            fail("Discovery failed: " + doc.error());
+            return;
+        }
+        auto jwks_body = oidc::OidcProvider::http_get_bounded(
+            doc->jwks_uri, skip_tls, allow_private, oidc::OidcProvider::kHttpOperationTimeoutMs,
+            *nat64);
+        if (!jwks_body) {
+            fail("Discovery succeeded but the JWKS could not be fetched: " + jwks_body.error());
+            return;
+        }
+        auto keys = oidc::OidcProvider::parse_jwks(*jwks_body);
+        if (!keys || keys->empty()) {
+            fail("Discovery succeeded but the JWKS has no usable signing keys" +
+                 (keys ? std::string{} : ": " + keys.error()));
+            return;
+        }
+        res.set_content("<span class=\"feedback-ok\">"
+                        "Connected &#x2014; discovered authorization, token and JWKS endpoints; " +
+                            std::to_string(keys->size()) + " signing key" +
+                            (keys->size() == 1 ? "" : "s") + "</span>",
+                        "text/html; charset=utf-8");
     });
 
     // -- Settings API: User management (admin only, HTMX) ----------------------
@@ -4984,9 +5039,23 @@ void SettingsRoutes::register_routes(
                                                  httplib::Response& res) {
         if (!perm_fn_(req, res, "ApiToken", "Write"))
             return;
+        if (!api_token_store_ || !api_token_store_->is_open()) {
+            res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            return;
+        }
         auto session = auth_fn_(req, res);
         if (!session)
             return;
+        // MFA step-up gate, matching POST /api/v1/tokens: issuing a bearer
+        // credential needs fresh MFA proof. Before any parsing or mutation.
+        if (step_up_fn_ && !step_up_fn_(req, res, *session, "POST /api/settings/api-tokens")) {
+            toast_step_up_refusal(res);
+            return;
+        }
 
         auto name = extract_form_value(req.body, "name");
         auto ttl_s = extract_form_value(req.body, "ttl_hours");
@@ -5033,6 +5102,28 @@ void SettingsRoutes::register_routes(
                 }
             } catch (const std::exception&) {
                 res.set_content("<span class=\"feedback-error\">Invalid TTL value.</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+        }
+
+        // An MCP-tier token needs an expiry of at most 90 days. Refuse here, as POST
+        // /api/v1/tokens does, so a plain input error is not reported below as a CSPRNG failure
+        // (503, a false yuzu_secure_random_failure_total increment and a false csprng_unavailable
+        // audit row).
+        if (!mcp_tier.empty()) {
+            if (expires_at <= 0) {
+                res.set_content("<span class=\"feedback-error\">An MCP-tier token needs a TTL "
+                                "(hours, at most 2160).</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+            if (expires_at - now > 90LL * 24 * 3600) {
+                res.set_content("<span class=\"feedback-error\">An MCP-tier token TTL cannot "
+                                "exceed 90 days.</span>",
                                 "text/html; charset=utf-8");
                 return;
             }
@@ -5125,6 +5216,8 @@ void SettingsRoutes::register_routes(
                                      .action = "api_token.create",
                                      .target_type = "ApiToken",
                                      .target_id = name,
+                                     .detail = "mcp_tier=" +
+                                               (mcp_tier.empty() ? std::string("none") : mcp_tier),
                                      .source_ip = req.remote_addr,
                                      .result = "success"});
         }
@@ -5142,9 +5235,24 @@ void SettingsRoutes::register_routes(
                                                            httplib::Response& res) {
         if (!perm_fn_(req, res, "ApiToken", "Delete"))
             return;
+        if (!api_token_store_ || !api_token_store_->is_open()) {
+            res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            return;
+        }
         auto session = auth_fn_(req, res);
         if (!session)
             return;
+        // MFA step-up gate, matching DELETE /api/v1/tokens/{id}; before the
+        // ownership lookup and any mutation.
+        if (step_up_fn_ &&
+            !step_up_fn_(req, res, *session, "DELETE /api/settings/api-tokens/{id}")) {
+            toast_step_up_refusal(res);
+            return;
+        }
         auto token_id = req.matches[1].str();
 
         // Owner-scoped revocation (fixes the sibling IDOR to #222 on
