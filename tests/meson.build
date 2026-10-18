@@ -3222,12 +3222,13 @@ test('instructions runner explicit target',
 # The destructive/forensic path end to end against an in-process fake Yuzu server on an
 # ephemeral loopback port: override gate, target pre-flight and confirmation, manifest before
 # each POST, proxy bypass, abort and error handling, strict grading. Hermetic; a few tests wait
-# on a 1-2 s timeout, hence the longer limit.
+# on a 1-2 s timeout, hence the longer limit: about 41 s on Linux, 45 s on Windows and 82 s on a
+# loaded macOS arm64 host, so 300 s keeps a slow runner from reading as a hang.
 test('instructions runner hardening',
   _python3_test,
   args: [files('test_instructions_runner_hardening.py')],
   suite: 'docs',
-  timeout: 120,
+  timeout: 300,
 )
 
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;

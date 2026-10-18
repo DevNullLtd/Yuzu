@@ -1719,6 +1719,54 @@ class DoubleSignal(RunnerCase):
         self.settle()
 
 
+@unittest.skipUnless(sys.platform == "win32" and hasattr(signal, "CTRL_BREAK_EVENT"),
+                     "Windows console control events")
+class WindowsConsoleBreak(RunnerCase):
+    """The runner as a real child process, in its own process group, receiving Ctrl-Break.
+
+    os.kill(SIGTERM) terminates a Windows process outright, so the in-process signal tests are
+    skipped here. CTRL_BREAK_EVENT is the one console event that can be aimed at a single process
+    group, and Python delivers it as SIGBREAK; without a handler it ends the process with no
+    --output record.
+    """
+    DEFS = [definition("t.d0", "destructive")]
+
+    def test_ctrl_break_aborts_with_130_and_writes_the_output(self):
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 3.0)
+        content, table = write_content(self.tmp, self.DEFS)
+        overrides = self.tmp / "overrides.json"
+        overrides.write_text(json.dumps({"t.d0": {}}))
+        out = self.tmp / "out.json"
+        argv = [sys.executable, str(ROOT / "scripts" / "test" / "instructions_runner.py"),
+                "--dashboard", self.fake.url, "--password", "p", "--content-dir", str(content),
+                "--risk-table", str(table), "--risks", "destructive", "--output", str(out),
+                "--manifest", self.fake.manifest_path, "--poll-timeout", "10",
+                "--target-agent-id", AGENT, "--confirm-target", HOSTNAME, "--run-id", RUN_ID,
+                "--params-override", str(overrides)]
+        env = dict(os.environ, YUZU_TEST_DB=str(self.tmp / "test-runs.db"))
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env=env, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        try:
+            deadline = time.monotonic() + 20
+            while not self.fake.posts and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(self.fake.posts, "the dispatch never reached the server")
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+            stdout, stderr = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        self.assertEqual(proc.returncode, 130, stderr)
+        summary = json.loads(out.read_text())
+        self.assertEqual(summary["aborted"], "SIGBREAK")
+        self.assertIn("aborted (SIGBREAK)", stderr)
+        # the dispatch was already sent when the break landed: it is reported, never dropped
+        self.assertTrue(summary["outcomes"][0]["note"].startswith("in_flight_unknown"),
+                        summary["outcomes"])
+        self.settle()
+
+
 class RemainingIdsCap(RunnerCase):
     def test_more_than_30_not_started_ids_show_30_and_a_count(self):
         defs = [definition(f"t.d{i:02d}", "destructive") for i in range(33)]

@@ -67,7 +67,7 @@ all until it finishes. A row passes only if every response row is SUCCESS with n
 row that ends without a verdict from terminal rows (no rows, rows still running, polls failing for
 any reason, or a row the runner does not recognise) fails and stops further dispatch, so a following
 action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED row is a known outcome and does not
-stop the run. Ctrl-C and SIGTERM stop dispatching (exit 130); a dispatch already sent is reported as
+stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop dispatching (exit 130); a dispatch already sent is reported as
 in_flight_unknown.
 
 After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a recognised
@@ -85,7 +85,7 @@ errored, the run stopped early, or a targeted run executed nothing (every destru
 skipped or pending approval); 2 a configuration, login or pre-flight error with nothing dispatched,
 including --poll-timeout below 1 (targeted runs only), --output equal to --manifest, an --output
 that is a symlink (POSIX only) or not a regular file, or (targeted runs) an --output that already
-exists; 130 interrupted (Ctrl-C or SIGTERM). A failed write of --output at the end only warns.
+exists; 130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --output at the end only warns.
 
 The manifest is an attempt log, not outcome evidence: the first line is run-start, then a dispatch
 line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
@@ -1344,7 +1344,8 @@ def check_output_writable(path: str, refuse_existing: bool = False) -> str:
 
 
 class _SignalGuard:
-    """Ignore SIGINT/SIGTERM while held, so a second signal cannot cost the --output record.
+    """Ignore SIGINT while held (the handler itself drops SIGTERM and SIGBREAK), so a second
+    signal cannot cost the --output record.
 
     Re-entrant: the abort handler takes it first thing, and the --output write takes it again;
     the handlers are put back only when the last holder lets go.
@@ -1705,7 +1706,7 @@ def _finish(args: argparse.Namespace, outcomes: list[Outcome], skipped: list[Def
     #   1   - one or more fail/error, the run stopped early, or a targeted run executed nothing
     #   2   - infrastructure or configuration failure (login, content-dir empty, opt-in targeting,
     #         --params-override, --run-id, --output, target pre-flight); nothing was dispatched
-    #   130 - interrupted (Ctrl-C or SIGTERM)
+    #   130 - interrupted (Ctrl-C, Ctrl-Break or SIGTERM)
     if interrupted:
         return 130
     if stopped or counts["fail"] > 0 or counts["error"] > 0 or nothing_executed:
@@ -1719,7 +1720,7 @@ errored, the run stopped early, or a targeted run executed nothing (every destru
 skipped or pending approval); 2 a configuration, login or pre-flight error with nothing dispatched,
 including --poll-timeout below 1 (targeted runs only), --output equal to --manifest, an --output
 that is a symlink (POSIX only) or not a regular file, or (targeted runs) an --output that already
-exists; 130 interrupted (Ctrl-C or SIGTERM). A failed write of --output at the end only warns.
+exists; 130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --output at the end only warns.
 
 Destructive and forensic runs (--risks destructive forensic)
   Example, against a dedicated disposable stack on loopback:
@@ -1743,7 +1744,7 @@ Destructive and forensic runs (--risks destructive forensic)
   error_detail. A row that ends without a verdict from terminal rows (no rows, rows still running,
   polls failing for any reason, or a row the runner does not recognise) fails and stops further
   dispatch, so a following action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED row is a
-  known outcome and does not stop the run. Ctrl-C and SIGTERM stop dispatching (exit 130); a
+  known outcome and does not stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop dispatching (exit 130); a
   dispatch already sent is reported as in_flight_unknown.
 
   After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a
@@ -1895,13 +1896,18 @@ _INTERRUPT: dict[str, str] = {}   # which signal raised the KeyboardInterrupt, f
 
 
 def _raise_interrupt(signum: int, frame: Any) -> None:
-    """The one handler for SIGINT and SIGTERM: the first signal raises KeyboardInterrupt in the
+    """The one handler for SIGINT, SIGTERM and (Windows) SIGBREAK: the first signal raises KeyboardInterrupt in the
     main thread; every later one is ignored, so a second KeyboardInterrupt can never land inside
     the abort handler or a lock wait and cost the --output record."""
     if _INTERRUPT.get("ignore") or _INTERRUPT.get("fired"):
         return
     _INTERRUPT["fired"] = "1"
-    _INTERRUPT["signal"] = "SIGTERM" if signum == getattr(signal, "SIGTERM", None) else "SIGINT"
+    for name in ("SIGTERM", "SIGBREAK"):   # SIGBREAK exists on Windows only (Ctrl-Break, CTRL_BREAK_EVENT)
+        if signum == getattr(signal, name, None):
+            _INTERRUPT["signal"] = name
+            break
+    else:
+        _INTERRUPT["signal"] = "SIGINT"
     raise KeyboardInterrupt
 
 
@@ -1913,7 +1919,7 @@ def main(argv: list[str] | None = None) -> int:
     except (AttributeError, ValueError, OSError):
         pass
     previous: dict[int, Any] = {}
-    for name in ("SIGINT", "SIGTERM"):   # both take the same abort path (summary, --output, 130)
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):   # all take the same abort path (summary, --output, 130)
         sig = getattr(signal, name, None)
         try:
             if sig is not None:
