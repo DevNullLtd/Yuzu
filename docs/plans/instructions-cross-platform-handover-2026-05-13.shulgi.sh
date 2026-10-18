@@ -4,10 +4,10 @@
 # Pre-reqs that need to be in place BEFORE this script runs:
 #   - Tailscale up to Shulgi (or any other path that gives you ssh)
 #   - On Shulgi: MSYS2 installed at C:\msys64
-#   - On Shulgi: setup_msvc_env.sh at C:\Users\natha\Yuzu\setup_msvc_env.sh
+#   - On Shulgi: setup_msvc_env.sh at C:\Users\<user>\Yuzu\setup_msvc_env.sh
 #   - On Shulgi: Windows Firewall allow rules for
-#       C:\Users\natha\Yuzu\build-windows\server\core\yuzu-server.exe
-#       C:\Users\natha\Yuzu\build-windows\agents\core\yuzu-agent.exe
+#       C:\Users\<user>\Yuzu\build-windows\server\core\yuzu-server.exe
+#       C:\Users\<user>\Yuzu\build-windows\agents\core\yuzu-agent.exe
 #     (one-time, run by user in admin PowerShell via:
 #        netsh advfirewall firewall add rule name=yuzu-server dir=in
 #            action=allow program=<path> enable=yes)

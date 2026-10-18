@@ -49,7 +49,7 @@ tcp6|::|5357|::|0|LISTEN|4
 tcp6|::|5426|::|0|LISTEN|4
 tcp6|::1|5432|::|0|LISTEN|6436
 tcp6|::|7680|::|0|LISTEN|8948
-tcp6|fd7a:115c:a1e0::1c32:357a|45688|::|0|LISTEN|12984
+tcp6|fd7a:115c:a1e0::77|45688|::|0|LISTEN|12984
 tcp6|::|49664|::|0|LISTEN|1740
 tcp6|::|49665|::|0|LISTEN|1596
 tcp6|::|49666|::|0|LISTEN|2448
@@ -149,7 +149,7 @@ tcp6|::|5357|::|0|LISTEN|4||
 tcp6|::|5426|::|0|LISTEN|4||
 tcp6|::1|5432|::|0|LISTEN|6436|postgres.exe|C:\Program Files\PostgreSQL\18\bin\postgres.exe
 tcp6|::|7680|::|0|LISTEN|8948|svchost.exe|C:\Windows\System32\svchost.exe
-tcp6|fd7a:115c:a1e0::1c32:357a|45688|::|0|LISTEN|12984|tailscaled.exe|C:\Program Files\Tailscale\tailscaled.exe
+tcp6|fd7a:115c:a1e0::77|45688|::|0|LISTEN|12984|tailscaled.exe|C:\Program Files\Tailscale\tailscaled.exe
 tcp6|::|49664|::|0|LISTEN|1740|lsass.exe|C:\Windows\System32\lsass.exe
 tcp6|::|49665|::|0|LISTEN|1596|wininit.exe|C:\Windows\System32\wininit.exe
 tcp6|::|49666|::|0|LISTEN|2448|svchost.exe|C:\Windows\System32\svchost.exe

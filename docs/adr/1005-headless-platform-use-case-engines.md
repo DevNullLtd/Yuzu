@@ -314,7 +314,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (`scripts/ci/check-api-parity.py`'s `BASELINE_UNTWINNED` moved
        265 → 257) and recording the #520 decision nowhere this ADR's own
        exception-ledger mechanism could see it — an adversarial two-model
-       review (`/home/dgr/advrev-4028`) caught the mislabel independently of
+       review (`/home/<user>/advrev-4028`) caught the mislabel independently of
        the credential-leak finding on the same branch. The rows are now
        `status: "exception:#520"`, `BASELINE_UNTWINNED` is restored to 265,
        and this entry is the exception-ledger record ADR-1005's own

@@ -17,7 +17,7 @@ shape as Linux (confirmed) and the opposite of macOS's two-registry shape.
 
 ## Environment
 
-- Rig: weecolin (100.96.108.95), repo `C:\Users\daver\Yuzu`, branch `dev`.
+- Rig: weecolin (100.64.0.96), repo `C:\Users\<user>\Yuzu`, branch `dev`.
 - SHA: **`f7a000fc33da5c715da133988ce986f10b01fc05`** — fast-forwarded from the box's prior HEAD
   (`3c8ac2c0c9ed1a822089a044e98eab6290462dca`, confirmed an ancestor of `origin/dev` before merging)
   via `git fetch origin dev && git merge --ff-only origin/dev`. Verified with
@@ -49,7 +49,7 @@ Instead: a **second, independent build directory** was configured —
 binaries, touching nothing in `build-windows` and never stopping, restarting, or otherwise disturbing
 the live rig (confirmed still running, same PIDs, after this run). This directory is **not** one of
 the three per-OS directories CLAUDE.md names (`build-windows`/`build-linux`/`build-macos`) — it is a
-one-off left on the box at `C:\Users\daver\Yuzu\build-windows-mi1b` for Dave to keep or delete; it
+one-off left on the box at `C:\Users\<user>\Yuzu\build-windows-mi1b` for Dave to keep or delete; it
 was not cleaned up by this run.
 
 The agent-shard test binary (`tests/yuzu_agent_tests.exe`) and its direct build dependencies

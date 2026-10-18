@@ -3118,7 +3118,7 @@ the separate `clickhouse_password` field — a URL with embedded userinfo creden
 strips URL userinfo unconditionally (`settings_model::sanitize_url_userinfo`) before either surface
 ever sees it, and never reads the raw password into a response at all — only a
 `clickhouse_password_set` bool. Fix-round hardening (governance Gate 2-8, three rounds, plus two
-external adversarial-review passes, `/home/dgr/advrev-4028`) found the initial strip itself
+external adversarial-review passes, `/home/<user>/advrev-4028`) found the initial strip itself
 incomplete: an unescaped `@`, `/`, or `?` inside the userinfo let part or all of a credential
 through, and a query-string credential form (`?password=...`, no `@` at all) was not modeled. A
 first attempt tried to locate the authority boundary (the path-starting `/`) and search for `@`

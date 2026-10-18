@@ -166,7 +166,7 @@ worktree's branch was cut from):
 
 **Run executed 2026-08-18 on DGRHP.** Rig: `yuzu-pr3a` scratch worktree (detached at
 `0023efc33`) + a throwaway `postgres:18` container on BigColin
-(`100.74.176.116:5460`, removed after). Server and agent both ran locally on DGRHP
+(`<homeserver>:5460`, removed after). Server and agent both ran locally on DGRHP
 (loopback REST `:8080` / gRPC `:50051`), `--no-tls`/`--no-https`, seeded via the same
 `yuzu-server.cfg` admin-user recipe `scripts/start-UAT.sh` uses.
 

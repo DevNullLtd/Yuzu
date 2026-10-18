@@ -10,9 +10,9 @@
 # same .out file stay distinguishable.
 #
 # Usage from pwsh on the runner:
-#   pwsh C:\Users\natha\Probe-And-Nuke-VcpkgState.ps1 >> C:\Users\natha\Nuke-File.out 2>&1
+#   pwsh $HOME\Probe-And-Nuke-VcpkgState.ps1 >> $HOME\Nuke-File.out 2>&1
 #
-# Run it from an interactive shell (your `natha` user) NOT from a service
+# Run it from an interactive shell (the runner's interactive user) NOT from a service
 # context — the LOCALAPPDATA probe distinguishes interactive-user
 # vs LOCAL SYSTEM profile by hard-coding both paths, but everything else
 # uses absolute paths so it doesn't matter who runs it.
@@ -127,7 +127,7 @@ $SentinelCurrent = Join-Path $VcpkgInstalled '.x64-windows-cachekey.sha256'
 $SentinelLegacy  = Join-Path $VcpkgInstalled '.x64-windows-triplet.sha256'
 
 # Default vcpkg user-archives cache locations (interactive user vs LOCAL SYSTEM)
-$LocalAppdataNatha       = 'C:\Users\natha\AppData\Local\vcpkg'
+$LocalAppdataUser        = Join-Path $env:USERPROFILE 'AppData\Local\vcpkg'
 $LocalAppdataLocalSystem = 'C:\Windows\System32\config\systemprofile\AppData\Local\vcpkg'
 
 $AllPaths = @(
@@ -141,7 +141,7 @@ $AllPaths = @(
     @{ Path = $VcpkgPackages;           Note = 'pre-stage zips (substate)';             Nuke = $true  },
     @{ Path = $VcpkgDownloads;          Note = 'source tarballs (safe to keep, just slows next build)'; Nuke = $false },
     @{ Path = $BinaryCache;             Note = 'runner-tool-cache binary cache zips'; Nuke = $true  },
-    @{ Path = $LocalAppdataNatha;       Note = 'natha-user vcpkg default cache (probably empty)'; Nuke = $true  },
+    @{ Path = $LocalAppdataUser;        Note = 'interactive-user vcpkg default cache (probably empty)'; Nuke = $true  },
     @{ Path = $LocalAppdataLocalSystem; Note = 'LOCAL SYSTEM vcpkg default cache (THIS IS THE INTERESTING ONE)'; Nuke = $true  }
 )
 

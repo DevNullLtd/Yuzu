@@ -581,7 +581,7 @@ SSH on the runner as the `natha` interactive user with output redirected
 to a `.out` file:
 
 ```powershell
-pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> C:\Users\natha\Nuke-File.out 2>&1
+pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> C:\Users\<user>\Nuke-File.out 2>&1
 ```
 
 Outputs structured `KEY: value` inventory before + nuke + after. Preserves
