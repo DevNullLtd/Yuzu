@@ -873,18 +873,18 @@ def strip_cpp_comments(text):
     return _CPP_TOKEN.sub(blank, text)
 
 
-# A preprocessor line: optional leading comments (or the tail `*/` of a block comment that
-# began on an earlier line), then `#` or its digraph `%:`.
-# The comment body cannot hold `*/`, so each comment ends at its first `*/` (one parse; a lazy
-# `.*?` here backtracks exponentially on a long run of comments).
-_PP_LINE = re.compile(r"\s*(?:(?:/\*(?:[^*]|\*(?!/))*\*/|\*/)\s*)*(?:#|%:)")
+# A preprocessor line: `#` or its digraph `%:` first on the line, or right after anything that ends
+# in `*/` (the end of a block comment, possibly one that began on an earlier line). Loose on
+# purpose: it also refuses a raw-string line that happens to read `... */ #`, which fails loudly.
+# Linear: `.*` backtracks over each `*/` once and the tail test is constant.
+_PP_LINE = re.compile(r"\s*(?:#|%:)|.*\*/\s*(?:#|%:)")
 
 
 def refuse_preprocessor_lines(text, what):
     """Raises AnchorError at the first line that is a preprocessor directive. The
     scan does not model #if/#ifdef/#define, so a conditionally compiled entry
     would be counted as served (or hidden); refusing is loud. A directive is a
-    line that starts with `#` or the `%:` digraph, after any leading comments.
+    line that starts with `#` or the `%:` digraph, or has one right after a `*/`.
     kResources[] is comment-stripped first, so a comment may mention one;
     kTools[] is not (its raw string schemas hold `//` and `/*`), so a line
     inside a raw-string schema that starts with `#` fails here too. LIMITS: a
@@ -1866,6 +1866,15 @@ def _selftest():
         kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n/*\n#if 0\n*/\n};\n', encoding="utf-8")
         check(_PP_LINE.match("/**/ " * 3000 + "x") is None and _PP_LINE.match("/*" * 3000 + "x") is None,
               "directive pattern: a long run of comments with no directive must not match (and must not backtrack)")
+        check(_PP_LINE.match(" * b */ #if 0") and _PP_LINE.match("/* a */ /* b */ #if 0") and not _PP_LINE.match("/* a */ x #if 0"),
+              "directive pattern: text before the closing '*/' of a multi-line comment may precede a directive; code after it may not")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n/* a\n b */ #if 0\n    {"b", "d"},\n#endif\n};\n', encoding="utf-8")
+        try:
+            with _patched(MCP_SERVER_CPP=kcpp):
+                extract_mcp_tools()
+            check(False, "tools: a directive after the tail line of a multi-line comment must raise")
+        except AnchorError as e:
+            check("row 4" in str(e), f"tools: the error must give the row of the directive, got {e}")
         check(_PP_LINE.match("/* a */ */ #if 0") and _PP_LINE.match("%:if 0") and not _PP_LINE.match("/* a */ || #"),
               "directive pattern: comments, a comment tail and the %: digraph precede a directive; code does not")
         try:
