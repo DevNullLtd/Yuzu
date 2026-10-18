@@ -870,6 +870,14 @@ def strip_cpp_comments(text):
     return _CPP_TOKEN.sub(blank, text)
 
 
+# `#if 0`, then only comments: closed block comments, one `//` comment, or a final
+# block comment that continues onto the next line. Anything else after the 0 (`|| X`,
+# `+ 1`) is a live condition. The comment body cannot hold `*/`, so each comment ends at
+# its first `*/` and the match has one parse (no backtracking blow-up).
+_IF0_LINE = re.compile(
+    r"#\s*if\s+0\s*(?:(?:/\*(?:[^*]|\*(?!/))*\*/|//.*)\s*)*(?:/\*(?:[^*]|\*(?!/))*)?")
+
+
 def strip_if0_blocks(text, what="the scanned array"):
     """Blanks preprocessor-dead `#if 0 ... #endif` text (nesting-aware; an
     `#else`/`#elif` at the dead block's own level makes the rest live), keeping
@@ -877,7 +885,7 @@ def strip_if0_blocks(text, what="the scanned array"):
     string schemas hold `//` and `/*`), so a `#if 0` line inside a block
     comment or raw string there reads as a directive, which fails loudly when
     it is unterminated. LIMITS: only a line that is `#if 0`, optionally followed
-    by a comment (anything after its `//` or `/*`), opens a dead block; `#if (0)`, `#elif 0`, line
+    by comments only, opens a dead block (`#if 0 /* x */ || Y` is live); `#if (0)`, `#elif 0`, line
     continuations and the dead branch of `#if 1 ... #else` read as live (a
     lexical tripwire, not a preprocessor)."""
     out = []
@@ -886,7 +894,7 @@ def strip_if0_blocks(text, what="the scanned array"):
     for n, line in enumerate(text.split("\n"), 1):
         d = line.strip()
         if dead == 0:
-            if re.fullmatch(r"#\s*if\s+0\s*(?:(?://|/\*).*)?", d):
+            if _IF0_LINE.fullmatch(d):
                 dead = 1
                 opened = n
                 out.append("")
@@ -1899,6 +1907,13 @@ def _selftest():
         with _patched(MCP_SERVER_CPP=kcpp):
             tools_found = extract_mcp_tools()
         check(tools_found == {"live_tool"}, f"tools: any comment after '#if 0' still opens a dead block, got {tools_found}")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n#if 0 /* x */ || Y\n    {"live2", "d"},\n#endif\n'
+                        '#if 0 /* a */ + 1\n    {"live3", "d"},\n#endif\n#if 0 // t\n    {"dead", "d"},\n#else\n    {"live4", "d"},\n#endif\n};\n',
+                        encoding="utf-8")
+        with _patched(MCP_SERVER_CPP=kcpp):
+            tools_found = extract_mcp_tools()
+        check(tools_found == {"live_tool", "live2", "live3", "live4"},
+              f"tools: a condition after the comment makes '#if 0' live, got {tools_found}")
         kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n#if 0\n    {"b", "d"},\n};\n', encoding="utf-8")
         try:
             with _patched(MCP_SERVER_CPP=kcpp):
