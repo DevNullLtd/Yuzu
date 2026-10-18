@@ -354,8 +354,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        and accepted by the maintainer in that change's session, and the
        twelfth row's status text carries the same date from a later ledger
        reconcile; it is not a recorded ruling, and the gate pins and warns on
-       the date but does not check that the re-confirmation happens. #4031 is open but carries
-       no re-confirmation date. The stored-data row
+       the date but does not check that the re-confirmation happens. #4031 is
+       open but carries no re-confirmation date. The stored-data row
        (`get.fragments-hardware-ci-stored-data`) is dated 2027-01-13 from the
        2026-07-13 SLE-erasure entry, and the admin reset 2027-01-04 from the
        2026-10-04 passwords entry (earlier ADR text); neither date is a
@@ -671,11 +671,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `get.fragments-access-audit-retention`; see the #4028 entry) is not
      part of the 2026-10-15 acceptance. The audit-retention row was recorded
      in `scripts/ci/api-parity/other.json` by the Audit page parity ledger
-     rows, before this entry's pin table; its own status text states the
-     no-MCP decision (its REST twin `GET /api/v1/settings/data-retention`)
-     and the 2027-04-30 re-confirmation, and this entry records that fact
-     without ruling on it.
-     As of 2026-10-18 five free-form rows remain in a size-pinned set. None carries a machine-checked dated revisit, and none
+     rows, before this entry's pin table, as a bare `exception:#520` and
+     dated by the later 2026-10-17 ledger reconcile; its status text states
+     the no-MCP decision for its REST twin
+     `GET /api/v1/settings/data-retention` and the 2027-04-30
+     re-confirmation, and this entry records that fact without ruling on it.
+     As of 2026-10-18 five free-form rows remain in a size-pinned set. None
+     carries a machine-checked dated revisit, and none
      has an open tracker that owns a date: the two NVD fragments
      (grandfathered surface #2, 2027-Q1 target, #4099 open); the
      self-service password change (a permanent exception, ADR 2026-10-04);

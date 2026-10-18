@@ -136,8 +136,8 @@ fresh render; a dated exception row that is not pinned, or is pinned to a
 different issue or revisit date (`STRICT_EXCEPTION_PINS` in the script keys
 every dated exception row by `capability_id` to its issue and date, and a pin
 whose row was twinned or retired is stale); and, as a warning only, a revisit
-date at or before today plus 14 days (one aggregated message, never a failure).
-Review-only, never checked by the gate: an issue's existence,
+date at or before today plus 14 days (one aggregated message, never a
+failure). Review-only, never checked by the gate: an issue's existence,
 state or content; whether a revisit was actually done (a date that has
 passed only produces the warning); a route swap behind an unchanged
 capability id, or a rewritten reason, under an unchanged pin; extending the

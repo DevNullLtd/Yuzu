@@ -366,7 +366,7 @@ REVISIT_WARN_DAYS = 14
 # Every strict-shaped `exception:` row is pinned here by capability_id to its (issue, revisit date).
 # A strict row must be a key with exactly that issue and date, and every key must still be a strict
 # row (twinning or retiring an exception forces the pin edit). Adding, relabelling, re-dating or
-# swapping a strict exception is therefore a visible constant edit; a new exception needs its own
+# swapping the id of a strict exception is therefore a visible constant edit; a new exception needs its own
 # recorded ruling, named in ADR-1005. The grandfather set below has no pins: a swap there stays
 # review-enforced.
 STRICT_EXCEPTION_PINS = {
@@ -816,7 +816,8 @@ def _find_unique(text, anchor, label):
     n = text.count(anchor)
     if n > 1:
         raise AnchorError(f"{label} appears {n} times - the scan reads the first copy, "
-                          f"so a stale or commented-out copy would hide the live array")
+                          f"so a stale, commented-out or unrelated second copy of the "
+                          f"declaration text hides the live one: remove or reword it")
     return text.find(anchor)
 
 
@@ -875,8 +876,8 @@ def strip_if0_blocks(text, what="the scanned array"):
     newlines. kResources[] is comment-stripped first; kTools[] is not (its raw
     string schemas hold `//` and `/*`), so a `#if 0` line inside a block
     comment or raw string there reads as a directive, which fails loudly when
-    it is unterminated. LIMITS: only a line that is `#if 0`, with at most one
-    trailing comment, opens a dead block; `#if (0)`, `#elif 0`, line
+    it is unterminated. LIMITS: only a line that is `#if 0`, optionally followed
+    by a comment (anything after its `//` or `/*`), opens a dead block; `#if (0)`, `#elif 0`, line
     continuations and the dead branch of `#if 1 ... #else` read as live (a
     lexical tripwire, not a preprocessor)."""
     out = []
@@ -885,7 +886,7 @@ def strip_if0_blocks(text, what="the scanned array"):
     for n, line in enumerate(text.split("\n"), 1):
         d = line.strip()
         if dead == 0:
-            if re.fullmatch(r"#\s*if\s+0\s*(?://.*|/\*.*?\*/\s*)?", d):
+            if re.fullmatch(r"#\s*if\s+0\s*(?:(?://|/\*).*)?", d):
                 dead = 1
                 opened = n
                 out.append("")
@@ -1473,10 +1474,11 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
                     f"`planned:#2146`, which the gate no longer lets grow: "
                     f"retag the row with a specific `planned:#N` or a strict "
                     f"`exception:#N revisit:YYYY-MM-DD <reason>` (which also needs "
-                    f"its STRICT_EXCEPTION_PINS entry; a retagged bootstrapped row "
-                    f"brings the generic planned count back to its baseline, so "
-                    f"lower BASELINE_GENERIC_PLANNED only for a row it already "
-                    f"counted, and a row written directly as an exception leaves it alone) and raise "
+                    f"its STRICT_EXCEPTION_PINS entry; retagging a row you "
+                    f"just bootstrapped brings the generic planned count back to "
+                    f"its baseline, so lower BASELINE_GENERIC_PLANNED only when you "
+                    f"retag a row the baseline already counted, and a row written "
+                    f"directly as an exception leaves it alone) and raise "
                     f"BASELINE_UNTWINNED unless the row is born twinned")
         ok = False
 
@@ -1862,8 +1864,9 @@ def _selftest():
         '    {"yuzu://b", 0xAB\'CD}, /* {"yuzu://dead2", 1} */ // it\'s\n'
         '    {"yuzu://b2", 0xab\'cd}, /* {"yuzu://dead4", 1} */ // it\'s\n'
         '    {"yuzu://c", \'x\'}, // {"yuzu://dead3", 1}\n'
-        '    {"yuzu://d", u8\'x\'}, // {"yuzu://dead5", 1} it\'s\n};\n')
-    check(res == {"yuzu://a", "yuzu://b", "yuzu://b2", "yuzu://c", "yuzu://d"},
+        '    {"yuzu://d", u8\'x\'}, // {"yuzu://dead5", 1} it\'s\n'
+        '    {"yuzu://e", u8\'a\'}, // {"yuzu://dead6", 1} it\'s\n};\n')
+    check(res == {"yuzu://a", "yuzu://b", "yuzu://b2", "yuzu://c", "yuzu://d", "yuzu://e"},
           f"resources: a digit separator is not a char literal and must not hide the comment after it, got {res}")
     res = parse_mcp_resources(
         'static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n'
@@ -1890,6 +1893,12 @@ def _selftest():
         with _patched(MCP_SERVER_CPP=kcpp):
             tools_found = extract_mcp_tools()
         check(tools_found == {"live_tool"}, f"tools: '#if 0 // note' and '#if 0 /* note */' open a dead block, got {tools_found}")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n#if 0 /* a */ // b\n    {"dead3", "d"},\n'
+                        '#endif\n#if 0 /* a */ /* b */\n    {"dead4", "d"},\n#endif\n#if 0 /* open\n    {"dead5", "d"},\n#endif\n};\n',
+                        encoding="utf-8")
+        with _patched(MCP_SERVER_CPP=kcpp):
+            tools_found = extract_mcp_tools()
+        check(tools_found == {"live_tool"}, f"tools: any comment after '#if 0' still opens a dead block, got {tools_found}")
         kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n#if 0\n    {"b", "d"},\n};\n', encoding="utf-8")
         try:
             with _patched(MCP_SERVER_CPP=kcpp):
