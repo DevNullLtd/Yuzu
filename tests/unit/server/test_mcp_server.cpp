@@ -106,6 +106,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -1256,6 +1257,11 @@ struct McpTestServer {
     /// field (read LIVE at request time via the wiring lambda below).
     DexFleet dex_fleet_for_test;
 
+    /// The score policy for list_dex_apps, read LIVE at request time like
+    /// dex_fleet_for_test. Empty = the shipped defaults, as the factory's empty
+    /// function; a test sets it to return an error to drive the policy-unreadable path.
+    yuzu::server::DexScorePolicyFn dex_policy_fn_for_test;
+
     /// ADR-0031 WS-A4: the DeviceApi double backing list_agents/get_agent_details,
     /// hoisted to a member (was a start()-local) so a test can read its #3564
     /// short-circuit witness `lookup_calls` — asserting an out-of-scope
@@ -1588,7 +1594,12 @@ private:
         // store-unavailable error.
         if (guaranteed_state_store_for_test)
             mcp.set_dex_api(yuzu::server::make_local_dex_api(
-                guaranteed_state_store_for_test, [this]() { return dex_fleet_for_test; }));
+                guaranteed_state_store_for_test, [this]() { return dex_fleet_for_test; },
+                [this]() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+                    if (dex_policy_fn_for_test)
+                        return dex_policy_fn_for_test();
+                    return yuzu::server::DexPolicyInForce{};
+                }));
 
         // ADR-0031 WS-A4 (sixth family): wrap this file's plain dex_perf_fn_for_test
         // (heartbeat-now) + app_perf_providers_for_test (over-time) fn-shaped test
@@ -8429,6 +8440,12 @@ TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregat
         if (a["subject"] == "chrome.exe")
             saw_chrome = true;
     CHECK(saw_chrome);
+    // The policy in force and the per-application profile ride the shared serializer.
+    CHECK(payload["policy"]["source"] == "default");
+    CHECK(payload["policy"]["revision"] == "default");
+    CHECK(payload["policy"]["fault"].is_null());
+    CHECK(payload["policy"]["tiers"].contains("poor"));
+    CHECK(payload["apps"][0]["profile"] == "default");
     // Fleet aggregate — only the generic tool-call audit, never a domain verb.
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|success");
     for (const auto& a : ts.audit_log)
@@ -8481,6 +8498,59 @@ TEST_CASE("MCP DEX: list_dex_apps reports a degraded read as an error, never an 
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|failure");
     for (const auto& a : ts.audit_log)
         CHECK(a != "mcp.list_dex_apps|success");
+}
+
+TEST_CASE("MCP DEX: list_dex_apps names an unreadable score policy in its error",
+          "[pg][mcp][integration][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        return std::unexpected(std::string("store down"));
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":981,"params":{"name":"list_dex_apps","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("(score_policy_unavailable)") !=
+          std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
+    CHECK(ts.audit_log.back() == "mcp.list_dex_apps|failure");
+    CHECK(ts.audit_details.back().find("(score_policy_unavailable)") != std::string::npos);
+}
+
+// The builder's own re-check (defence in depth behind the provider): a policy that fails
+// validation is refused with its own reason token, never scored under.
+TEST_CASE("MCP DEX: list_dex_apps names a policy that fails validation in its error",
+          "[pg][mcp][integration][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        yuzu::server::DexPolicyInForce f;
+        f.policy.tiers.edges.good = f.policy.tiers.edges.excellent; // edges must descend
+        return f;
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":982,"params":{"name":"list_dex_apps","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("(score_policy_invalid)") !=
+          std::string::npos);
+    CHECK(ts.audit_log.back() == "mcp.list_dex_apps|failure");
+    CHECK(ts.audit_details.back().find("(score_policy_invalid)") != std::string::npos);
 }
 
 TEST_CASE("MCP DEX: get_dex_catalogue_group returns the family drill, unknown family -> "
@@ -8612,19 +8682,40 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         if (t["name"] != "list_dex_apps")
             continue;
         found = true;
+        // The description names the policy, the profile marker, the refused-policy
+        // fault and the staleness bound (concept words, so copy edits do not false-fail).
+        const auto desc = t["description"].get<std::string>();
+        for (const char* concept_word : {"policy", "profile", "fault", "staleness bound"})
+            CHECK(desc.find(concept_word) != std::string::npos);
         REQUIRE(t.contains("outputSchema"));
         const auto& out = t["outputSchema"];
         CHECK(out["required"] ==
-              nlohmann::json::array({"window", "apps", "population", "population_basis", "apps_total",
-                                     "apps_truncated"}));
+              nlohmann::json::array({"window", "apps", "policy", "population", "population_basis",
+                                     "apps_total", "apps_truncated"}));
+        const auto& policy = out["properties"]["policy"];
+        CHECK(policy["required"] == nlohmann::json::array({"source", "revision", "fault", "tiers"}));
+        CHECK(policy["properties"]["source"]["enum"] == nlohmann::json::array({"default", "custom"}));
+        CHECK(policy["properties"]["fault"]["type"] == nlohmann::json::array({"string", "null"}));
+        // The tier block is typed, not a bare object: four tiers, each a numeric edge and a string name.
+        const auto& tiers = policy["properties"]["tiers"];
+        CHECK(tiers["required"] == nlohmann::json::array({"excellent", "good", "fair", "poor"}));
+        for (const char* tier : {"excellent", "good", "fair", "poor"}) {
+            const auto& tier_schema = tiers["properties"][tier];
+            CHECK(tier_schema["type"] == "object");
+            CHECK(tier_schema["required"] == nlohmann::json::array({"edge", "name"}));
+            CHECK(tier_schema["properties"]["edge"]["type"] == "number");
+            CHECK(tier_schema["properties"]["name"]["type"] == "string");
+        }
         CHECK(out["properties"]["population"]["type"] == nlohmann::json::array({"integer", "null"}));
         CHECK(out["properties"]["apps_total"]["type"] == "integer");
         CHECK(out["properties"]["apps_truncated"]["type"] == "boolean");
         const auto& row = out["properties"]["apps"]["items"]["properties"];
         for (const char* k : {"share_affected", "rate_per_1000", "score", "versions", "version_count",
-                              "versions_truncated"})
+                              "versions_truncated", "profile"})
             CHECK(row.contains(k));
+        CHECK(row["profile"]["enum"] == nlohmann::json::array({"default", "override"}));
         CHECK(row["versions"]["items"]["properties"].contains("version"));
+        CHECK_FALSE(row["versions"]["items"]["properties"].contains("profile"));
         // The nested objects are always emitted in full: pin their required keys.
         const auto interval_req = nlohmann::json::array({"estimate", "lower", "upper", "reliable"});
         const auto deduction_req = nlohmann::json::array({"name", "points", "assessed"});

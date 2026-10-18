@@ -1613,6 +1613,10 @@ if build_server
       'unit/server/test_compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
       'unit/server/test_device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
       'unit/server/test_dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
+      # pure DEX score policy JSON: parse, canonical, revision, in-force resolution - no store, no I/O, no [pg]
+      'unit/server/test_dex_score_policy_json.cpp',
+      # bounded-refresh score policy provider over injected read/clock fns - no store, no sleeps, no [pg]
+      'unit/server/test_dex_score_policy_provider.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -3605,6 +3609,18 @@ test('gateway-upstream guard registration lexical gate',
   timeout: 30,
 )
 
+# #6016: static lexical gate pinning that only default_certs.cpp mints the server identity URI
+# (`yuzu://<install>/server`) the gateway management plane will admit by: no other file names
+# server_identity_uri() or the "/server" suffix literal, issue_leaf() has one production caller,
+# and sign_csr() has a closed, reviewed set of call sites. Carries its own in-memory mutation
+# self-test. No build required. Suite 'docs' for the same reason as the gateway-upstream gate above.
+test('server identity URI minting lexical gate (#6016)',
+  _python3_test,
+  args: [files('test_server_identity_uri_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #5513: static lexical gate pinning that agent.cpp's heartbeat still calls
 # guardian_->generation_report() and feeds BOTH fields to emit_guardian_generation_heartbeat_tags()
 # (the boot re-arm companion tag) inside a contained try, after journal_maintenance_tick(), and
@@ -3755,6 +3771,21 @@ test('split interlock tripwire selftest',
   args: [files('test_split_interlock_tripwire_selftest.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Personal-data commit guard (scripts/ci/check-personal-data.py) and its
+# self-test. Both also run in .github/workflows/docs-lint.yml on every PR.
+test('personal data guard',
+  _python3_test,
+  args: [files('../scripts/ci/check-personal-data.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+test('personal data guard selftest',
+  _python3_test,
+  args: [files('test_check_personal_data_selftest.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # #1611 tripwire: the TSan suppression in unit/test_runner_main.cpp is honest
