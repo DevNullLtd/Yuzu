@@ -6,16 +6,18 @@ deciders: >-
   maintainer review of the PR that lands this ADR, by an approver who is not the author
   (the acceptance event under docs/agents/domain.md "ADR Acceptance Convention"); ADR-1005
   Decision 2 names the maintainer as the arbiter of boundary disputes, so that review also
-  settles the four rulings flagged "maintainer ruling" below (D2, D3, D5, D7)
+  settles the five rulings flagged "maintainer ruling" below (D2, D3, D5, D7, D13)
 scope: >-
   capability-map Domain 41 (Cryptographic Asset Inventory, roadmap Issue 18.8) — where
   each part is built under ADR-1005: collection, transport, storage, raw-fact reads,
   rollups, the slice-1 library-family table and a fact-only CBOM export (core mechanism,
-  built in-server); weak/deprecated-algorithm and PQC-readiness labels, expiry-risk
-  scoring, library support/EOL status, third-party revocation status, policy and
-  compliance-framework verdicts (use-case engine, behind the ADR-0032 interlock); plus the
-  binding constraints the slice-2 design must meet (D6, D12). Not in scope: the per-slice
-  data designs, and the slice-3 privacy decisions, which are owed by their own ADR
+  built in-server), plus one closed set of built-in weak-key rules and fixed dashboard
+  time windows (core by maintainer ruling, D13); deprecated-algorithm and PQC-readiness
+  labels, expiry-risk scoring, library support/EOL status, third-party revocation status,
+  policy and compliance-framework verdicts (use-case engine, behind the ADR-0032
+  interlock); plus the binding constraints the slice-2 design must meet (D6, D12). Not in
+  scope: the per-slice data designs, and the slice-3 privacy decisions, which are owed by
+  their own ADR
 builds-on: >-
   1005 (headless platform — Decision 2's boundary test and tiebreakers govern every row
   below); 0024 (software licensing — its "Placement under ADR-1005" section is the
@@ -62,15 +64,20 @@ The line, drawn with ADR-1005 Decision 2's boundary test:
   - caller-parameterised filters over raw fields, such as `not_after` before a date the
     caller supplies;
   - operator-authored policy over those facts;
-  - a CBOM export that carries facts only.
+  - a CBOM export that carries facts only;
+  - by maintainer ruling (D13), and as the one exception to the rule below, a closed,
+    versioned set of four weak-key rules (MD5 or SHA-1 signature, RSA under 2048 bits,
+    EC under 224 bits) and fixed dashboard time windows (expiring within, expired, revoked
+    or issued within N days, per-week series, SSH keys observed in use within N days),
+    each computed at read time and shown with its criterion.
 
   The certificate and SSH parts are planned, not committed, and are not available until
   their slices ship.
-- **Use-case engine (UCE; interpretation).** This covers any verdict whose semantics Yuzu
-  would ship in code:
-  - weak, deprecated or broken algorithms and key sizes;
+- **Use-case engine (UCE; interpretation).** This covers any other verdict whose semantics
+  Yuzu would ship in code:
+  - deprecated or broken algorithms and key sizes beyond D13's four rules;
   - post-quantum readiness;
-  - expiry-risk bands and scores;
+  - expiry-risk scores and "at risk" labels;
   - library support and end-of-life status;
   - revocation status fetched from third-party CRL/OCSP endpoints;
   - mappings to NIST, CNSA, PCI or any other framework;
@@ -174,7 +181,7 @@ For cryptography the test reduces to one distinction, which every row below appl
 > Each judgement depends on a standard, a date or a threat model that Yuzu would have to
 > choose and keep current. Facts are core. Judgements are engine territory, unless the
 > operator authors the judgement themselves, as policy content evaluated by a generic
-> engine.
+> engine, or the judgement is one of the closed set D13 rules into core.
 
 A **derived field** is core only if it is a pure function of collected raw facts and a value
 the caller supplies. A field is a verdict, and belongs to the engine, if it reads any clock
@@ -200,6 +207,7 @@ Under that rule:
 | `signature_hash_strength` | no — it grades |
 | a fixed bucketing of key sizes | no — the buckets are Yuzu's |
 | a histogram whose bucket edges the caller supplies | yes |
+| D13's four weak-key rules and fixed time windows, computed at read time, never stored | yes — by maintainer ruling (D13), the only exception to this table's rule |
 
 ## Placement under ADR-1005
 
@@ -225,17 +233,20 @@ classify the work if it is built; they do not promise it.
 | Certificate ↔ private-key association: whether a key is associated with the certificate and, where the platform exposes it without opening the key, whether it is exportable and hardware- or TPM-backed (never the key; an associated key may since have been deleted) | 2 | **core** | Facts about the device's key storage, read from metadata, never from key material (D6). On Windows, export policy needs the key opened, so it is not collected there unless the design doc shows a way that opens no key. |
 | Certificate read surface (REST + MCP + dashboard), raw-value rollups, paged per-certificate read | 2 | **core** — D12 | Raw-fact reads under existing confinement and audit. These are also the core capability an engine reads through (ADR-0031 seam B6, D9). |
 | Caller-parameterised filters (e.g. `not_after < T`, `key_bits < N`) and distinct-device counts by raw value | 2 | **core** — D4 | A generic query primitive. The caller supplies the threshold, so the semantics are the caller's, not code-baked. |
-| "Expired / expires in N days" as Yuzu-defined bands, risk scores, default thresholds, Yuzu-chosen expiry notifications (roadmap Issue 18.3 "expiry alerts") | 2 | **UCE** — D4 | Derived against "now" with a threshold Yuzu chooses. Same class as ADR-0024's *effective licence state* (`0024:126-128`), which that ADR sends to the engine. |
+| Fixed dashboard windows: expiring within 3/7/14/21/30/60 days; expired, revoked within the last 7/30/60/90 days; issued within the last 7 days; issued and revoked per week | 2 | **core** — D13 (maintainer ruling) | Counts over raw dates against the server's clock at read time, each response carrying the `as_of` time it used. A closed, versioned window set ruled into core by the maintainer. |
+| Expiry risk scores, "at risk" labels, Yuzu-chosen expiry notifications (roadmap Issue 18.3 "expiry alerts") | 2 | **UCE** — D4 | Derived against "now" with a threshold Yuzu chooses, beyond D13's closed set. Same class as ADR-0024's *effective licence state* (`0024:126-128`), which that ADR sends to the engine. |
 | Operator-authored policy over certificate facts (e.g. an operator's rule "fail if `not_after` < now + 30d") | 2 | **core** | "operator-authored content evaluated by a generic engine" (ADR-1005:47). The operator owns the semantics. Not available until slice 2 exists (D4). |
 | Chain-to-local-trust-store result computed on the device, with no network retrieval and no revocation check | 2 | **core**, only under D5's conditions; optional, not committed | A deterministic fact about the device's own configuration. A chain build that fetches, or consults revocation data, is a join with third-party data, so engine territory (D5). |
 | Revocation status from third-party CRL/OCSP endpoints | 2 | **UCE** — D5 (maintainer ruling) | A join of fleet data with external, third-party data for a judgement. |
 | Certificate renewal, re-issue, deletion, revocation workflow (roadmap Issue 18.3 lifecycle) | 2+ | out of scope here | These are mutations, not reads. When designed, they go through ADR-0033's Execution Plan and approval primitive. The existing `certificates.delete` action is Destructive/Irreversible and is never part of the inventory path (D6). Renewal against an external CA (ACME, AD CS) is a connector-class join, to be classified against ADR-1005's Decision-2 appendix "Connectors" row once that row exists (PR #5367). |
 | SSH key-at-rest collection: host public keys; `authorized_keys` entries and user public keys (type, size, fingerprint, location; never key content) | 3 | **core** (collection) — privacy owed (D8) | Collection of estate facts. The per-user parts carry privacy obligations the slice-3 ADR must decide. |
 | SSH login evidence (who, from where, with which key type) | 3 | **core** (collection) — privacy owed (D8) | Collection of estate facts, but behavioural personal data. ADR-1005 Decision 5's controls will attach to any engine that consumes it. |
-| "Unused / stale / anomalous key", "key used from an unusual location" | 3 | **UCE** | Semantics baked into code: a judgement about behaviour. |
+| Counts of SSH keys observed in use within 24h/3/7/21/30/60/90/120/180 days, and with no observed use | 3 | **core** — D13 (maintainer ruling), collection still privacy-owed (D8) | Counts over raw observation timestamps at read time. Only once the slice-3 ADR permits the usage evidence these count; D13 rules on the windows, not on the collection. |
+| "Unused / stale / anomalous key", "key used from an unusual location" | 3 | **UCE** | Semantics baked into code: a judgement about behaviour. A D13 count with no observed use is a count, not a "stale" label. |
 | Protocol and configuration settings: enabled TLS/SSH versions; cipher, KEX and MAC lists; system crypto policy | 41.5 | **core** (facts) / **UCE** (verdicts) | The configured list is a fact. "Weak cipher enabled" is a verdict. No collection vehicle is designed; it needs its own design. |
 | CBOM export of the collected inventory | 41.6 | **core**, facts only — D7 (maintainer ruling) | A projection of core facts into a standard format, like ADR-0028's SBOM projection. Verdict-bearing CBOM fields are left empty in core. |
-| Weak / deprecated / broken algorithm and key-size labels; PQC readiness; crypto-agility scoring | all | **UCE** | Semantics baked into code, tied to an external standard and threat model. The canonical engine case. |
+| D13's four weak-key rules: MD5 signature, SHA-1 signature, RSA key under 2048 bits, EC key under 224 bits | 2 | **core** — D13 (maintainer ruling) | Semantics baked into code, ruled into core by the maintainer as a closed, versioned exception. Each rule is shown with its criterion and is reproducible from the raw fields. |
+| Any other weak / deprecated / broken algorithm and key-size label; PQC readiness; crypto-agility scoring | all | **UCE** | Semantics baked into code, tied to an external standard and threat model. The canonical engine case. |
 | Library support / EOL / "out of date" status | 1 | **UCE** — D3 (maintainer ruling) | Domain data about third-party projects, used for a judgement. |
 | CVE matching over crypto-library versions | 1 | **UCE** — the vulnerability module | Already engine territory by name ("vulnerability feeds", ADR-1005:47) and by the execution plan's catalogue-grain design (execution plan Decision 5). Domain 41 does not build a second matcher. |
 | Mapping to frameworks (NIST SP 800-131A, CNSA 2.0, PCI DSS, FIPS 140 status, ...) | all | **UCE** | "compliance-framework mappings" is named engine territory (ADR-1005:47). |
@@ -397,9 +408,10 @@ a typed inventory store exists yet. Any such rule must name the clock it compare
 and an agent-side evaluation discloses the agent's clock offset from the server's receipt
 time. None of this is available until slice 2 exists.
 
-**Core does not ship:**
-- a built-in notion of "expiring soon" (no default 30/60/90-day bands, no "at risk"
-  label, no colour coding of dates);
+**Core does not ship** (except D13's closed window set, which supersedes this list for
+those windows only):
+- a built-in notion of "expiring soon" beyond D13's windows (no "at risk" label, no
+  colour coding of dates);
 - expiry scores;
 - notifications on a Yuzu-chosen threshold (roadmap Issue 18.3's "expiry alerts", when
   Yuzu picks the threshold).
@@ -709,13 +721,17 @@ placement finding, not a style finding.
 **A mechanical guard.** Slice 2 adds a lint over the Domain 41 OpenAPI and MCP schemas
 that rejects verdict-shaped field names: `weak`, `strong`, `risk`, `score`, `expired`,
 `expiring`, `eol`, `supported`, `vulnerable`, `pqc`, `quantum_safe`, `approved`,
-`compliant`, and similar. Review alone does not catch a field added later.
+`compliant`, and similar. Review alone does not catch a field added later. The lint carries
+an explicit allow-list for the field names D13's surfaces need (for example
+`weak_key_rules`, `expiring_within_days`, `expired_within_days`), each entry citing D13;
+any other verdict-shaped name still fails. D13's widgets still render no grading colour or
+icon.
 
 ### D11 — Recording the boundary verdicts [process]
 
 ADR-1005:47 says "verdicts accrete into an examples appendix in this file". As of
 2026-10-18 no appendix exists on `dev`; PR #5367 (unmerged) would create one, with the
-columns `Date | Class | Verdict | Raised by`. When the appendix exists, the four rulings
+columns `Date | Class | Verdict | Raised by`. When the appendix exists, the five rulings
 this ADR requests are added to it as rows. Each binds for the class it names:
 
 | Ruling | Class | The Verdict cell must carry |
@@ -724,6 +740,7 @@ this ADR requests are added to it as rows. Each binds for the class it names:
 | D3 | third-party lifecycle data used to grade estate software | whether OS-version grading is included (D3) |
 | D5 | third-party revocation status | — |
 | D7 | verdict-free standard-format exports | — |
+| D13 | built-in crypto rules and dashboard windows | D13's conditions, and that the exception is closed: it admits only the listed rules and windows, never the class of built-in crypto verdicts |
 
 For each row, Date is the merge date of this ADR's PR, and Raised by is "ADR-0070, PR
 #<n>". This ADR does not edit ADR-1005, to avoid conflicting with #5367's appendix.
@@ -886,8 +903,63 @@ property it must prove; the tools are the design doc's choice.
 | CH-4 | An offline device, an engine-grain read and a capped read | Every row exposes `observed_at` and `last_seen`. The read completes across pages or fails. The truncation flag is set, and the CBOM carries its coverage metadata. |
 | CH-5 | Agent clock skew; certificates expiring at day boundaries; the year-9999 sentinel; a pre-1970 date | Validity is stored as UTC to the second and never clamped. Core results change only with the caller's T. An agent-side policy discloses its clock offset. |
 
+### D13 — A closed set of built-in weak-key rules and dashboard windows ships in core [core, maintainer ruling]
+
+**Ruling requested (owner, 2026-10-18).** The `/crypto` dashboard must answer the questions
+operators ask on day one, "how many weak keys do we have?" and "what expires this month?",
+without waiting for a use-case engine that does not exist and whose ADR-0032 gate is
+closed. The owner rules that the following ship in core, as a deliberate exception to the
+"is, not how good" test and the derived-field rule. It is a maintainer verdict under
+ADR-1005 Decision 2, recorded per D11.
+
+**What is admitted, and nothing else:**
+- **Weak-key rules, version 1** (`crypto_weak_rules` v1), four rules, each counted
+  separately:
+  - `sig_md5` — the signature algorithm uses MD5;
+  - `sig_sha1` — the signature algorithm uses SHA-1;
+  - `rsa_lt_2048` — the key is RSA with a modulus under 2048 bits;
+  - `ec_lt_224` — the key is EC on a curve under 224 bits.
+  A certificate matching several rules counts once in the total and once under each rule
+  it matches.
+- **Fixed time windows**, counted against the server's clock at read time:
+  - expiring within 3, 7, 14, 21, 30 or 60 days;
+  - expired within the last 7, 30, 60 or 90 days;
+  - revoked within the last 7, 30, 60 or 90 days, from device-local or Yuzu-CA revocation
+    facts only (D5 unchanged: no third-party CRL/OCSP fetch);
+  - issued within the last 7 days, and issued and revoked per ISO week;
+  - SSH keys observed in use within 24 hours or 3, 7, 21, 30, 60, 90, 120 or 180 days,
+    and with no observed use (slice 3, and only once its ADR permits the usage evidence;
+    D8's privacy decisions are not touched by this ruling).
+
+**Conditions that keep the exception closed** (a surface failing one is not covered by
+this ruling and is back to the UCE rows):
+1. **Shown with its criterion.** Every count names the rule or window it applies ("RSA key
+   under 2048 bits", "expiring within 30 days"), never a bare "weak" or "at risk". The
+   REST and MCP responses carry the rule id, the threshold and the rule-set version.
+2. **Reproducible from facts.** Each rule and window is a pure function of raw fields core
+   already serves plus the response's `as_of` time, so a caller can recompute it from the
+   per-certificate read. Core still serves the raw fields, and the caller-supplied filters
+   of D4 remain.
+3. **Computed at read, never stored.** No verdict column, no stored `days_remaining`, no
+   verdict written into the CBOM (D7 unchanged). Each response carries `as_of`, the server
+   time it compared against.
+4. **Changed only by a reviewed code change.** Adding, removing or retuning a rule or window
+   is a change to this decision, bumps the rule-set version, and is reviewed as a placement
+   change. Nothing updates the list from an external standard or feed, and no rule is
+   labelled with a framework (no NIST, CNSA, PCI or FIPS mapping).
+5. **No grading presentation.** D10's no-colour, no-icon, no-risk-ordering posture still
+   applies to these widgets.
+
+**What it does not admit.** PQC readiness, deprecated-algorithm lists beyond the four
+rules, risk scores, "at risk" or "stale" labels, Yuzu-chosen expiry notifications and
+framework mappings all stay UCE. If a use-case engine later offers a richer rule set, the
+four rules may stay in core or move to it; either is a fresh placement decision.
+
 ## Consequences
 
+- **The dashboard widgets are buildable in core (D13).** The library widgets and the
+  Yuzu-CA issued/revoked widgets can ship before slice 2. The certificate widgets ship on
+  slice 2's data, and the SSH widgets on slice 3's.
 - **Slice 2 is unblocked to design.** Its design doc must cite this ADR and satisfy D4,
   D5, D6, D7 and D12. It starts after PR #6056 merges.
 - **Slice 3 needs its own ADR first** (D8), with the privacy decisions made by the owner.
@@ -899,8 +971,9 @@ property it must prove; the tools are the design doc's choice.
       audit model". D8 and D12 decide those per slice.
     - The Roadmap qualifies CBOM as facts-only and SSH login evidence as subject to a
       separate privacy decision.
-    - It says plainly that Yuzu does not label weak cryptography, expiry risk or PQC
-      readiness in core, and what an operator can do instead.
+    - It says plainly which built-in rules and windows core applies (D13) and that
+      Yuzu does not label any other weak cryptography, expiry risk or PQC readiness in
+      core, and what an operator can do instead.
     - It says that operator policy over certificate facts is not available until slice 2
       ships.
   - The capability-map §41 preamble and roadmap Issue 18.8 widen their list of excluded
@@ -913,11 +986,12 @@ property it must prove; the tools are the design doc's choice.
 - **A reviewer can now cite a rule instead of an inference.** "Does this field grade
   something?" is the question, the placement table is the precedent, and D10's lint is the
   backstop.
-- **The cost.** Until an engine exists, operators who want "show me weak crypto" or
-  "certificates expiring this month" get only the raw facts and their own policies, and
-  the certificate half only once slice 2 ships. That is ADR-1005's intended trade, and
-  D4's caller thresholds and operator policy cover the most common expiry need without
-  Yuzu choosing the threshold.
+- **The cost.** D13 puts a small amount of interpretation in core that ADR-1005 would
+  otherwise send to an engine: four weak-key rules and a fixed window set Yuzu must keep
+  current by code change. That is the owner's chosen trade for answering "show me weak
+  keys" and "what expires this month" before an engine exists. Anything beyond D13's
+  closed set still gets only the raw facts, D4's caller thresholds and operator policy,
+  and the certificate half only once slice 2 ships.
 
 ## Alternatives considered
 
@@ -931,12 +1005,13 @@ property it must prove; the tools are the design doc's choice.
   exists, contradicting ADR-1005's own placement of collection and inventory stores in
   core, and it misreads identity resolution as grading (D2).
 - **A narrow, "obviously uncontroversial" built-in list**, for example flagging MD5 and
-  SHA-1 signatures only. Rejected. Any built-in list is "semantics baked into code",
-  however short. The line has to be where the semantics come from, not how many there are.
-  An operator can author the same rule as policy (D4).
-- **Label "already expired" as a fact.** Rejected (D4). It depends on the server's clock,
-  the comparison is reproducible from the raw date with T = now, and a label is the first
-  step towards bands.
+  SHA-1 signatures only. Originally rejected: any built-in list is "semantics baked into
+  code", however short. **Superseded in part by D13** (owner ruling, 2026-10-18), which
+  admits exactly four rules as a closed, versioned exception under five conditions. The
+  reasoning still binds everything outside that set.
+- **Label "already expired" as a fact.** Still rejected as a stored field or label (D4).
+  D13 admits "expired within the last N days" only as a read-time count carrying its
+  `as_of` time.
 
 ## Ratification
 
@@ -949,8 +1024,8 @@ carries once that PR merges. Before the merge, the PR is the proposal.
   merge metadata that goes with it, is the change-management evidence. A self-merge does
   not accept this ADR.
 - ADR-1005 Decision 2 makes the maintainer the arbiter of boundary disputes. The approval
-  is also the ruling on D2, D3, D5 and D7.
-- The approval grants those four rulings as written. Approvers are asked to state each
+  is also the ruling on D2, D3, D5, D7 and D13.
+- The approval grants those five rulings as written. Approvers are asked to state each
   ruling in the review, so that the record shows each one, but the statements are a
   request, not a separate acceptance gate. On merge, the "ruling requested" notes in those
   decisions record rulings granted by that approval.
