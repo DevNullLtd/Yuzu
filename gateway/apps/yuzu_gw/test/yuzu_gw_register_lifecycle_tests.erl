@@ -209,7 +209,7 @@ in_conn(Cap, Fun) ->
         Fun()
     after
         meck:unload(yuzu_gw_upstream),
-        [exit(P, kill) || P <- linked_processes(), is_runner(P)],
+        stop_runners(),
         %% The environment goes back BEFORE the registry is made again: it reads
         %% the cap once at start and keeps it in a persistent_term, so a registry
         %% started while the env still says Cap leaves Cap for every later module.
@@ -226,6 +226,30 @@ in_conn(Cap, Fun) ->
 
 restore_env(Key, {ok, V}) -> application:set_env(yuzu_gw, Key, V);
 restore_env(Key, undefined) -> application:unset_env(yuzu_gw, Key).
+
+%% Kill the runners still linked to the test process, and unlink any linked
+%% process already dead (its exit signal may still be on its way), then return
+%% once each is gone, all while exits are still trapped. Each is unlinked
+%% BEFORE it is killed: once unlink/1 has returned, that link can never deliver
+%% its `killed' exit signal. Killing a linked runner and restoring the trap
+%% without that loses a race whenever the runner sits on another scheduler's
+%% run queue: the signal lands after the trap is off and kills the eunit
+%% process that runs every case of this module (the defect
+%% yuzu_grpc_stream_h_tests:in_conn/1 had).
+stop_runners() ->
+    Monitors = [begin
+                    Ref = erlang:monitor(process, P),
+                    true = unlink(P),
+                    exit(P, kill),
+                    {P, Ref}
+                end || P <- linked_processes(), is_runner(P) orelse not is_process_alive(P)],
+    [receive
+         {'DOWN', Ref, process, P, _} -> ok
+     after 5000 ->
+         error({runner_alive_after_kill, P})
+     end || {P, Ref} <- Monitors],
+    ?assertEqual([], [P || P <- linked_processes(), is_runner(P)]),
+    ok.
 
 linked_processes() ->
     {links, Links} = process_info(self(), links),
