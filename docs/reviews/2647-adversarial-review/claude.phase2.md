@@ -1,5 +1,5 @@
 # claude — Phase 2 cross-examination
-Target cb69991f..3cc9f417 @ worktree /home/fraser/Yuzu/.claude/worktrees/gov-followups-2619-2620. Peer: codex.phase1.md (2 findings, both HIGH, verdict BLOCK).
+Target cb69991f..3cc9f417 @ worktree /home/<user>/Yuzu/.claude/worktrees/gov-followups-2619-2620. Peer: codex.phase1.md (2 findings, both HIGH, verdict BLOCK).
 
 ## 1. Cross-examination of codex's findings
 

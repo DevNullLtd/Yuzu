@@ -16,7 +16,7 @@
 # Sequence:
 #   1. Probe preconditions (UAT stack reachable, agent registered)
 #   2. Capture current Claude session UUID from
-#      ~/.claude/projects/-Users-nathan-Yuzu/<uuid>.jsonl by mtime
+#      ~/.claude/projects/-Users-<user>-Yuzu/<uuid>.jsonl by mtime
 #   3. Write ceremony.cfg + initial progress.json to state dir
 #   4. Spawn survivor detached via `setsid nohup ... &` so it survives
 #      this shell exiting
@@ -81,7 +81,7 @@ Optional:
                            /tmp/yuzu-quarantine-test)
 
 Reads:
-  ~/.claude/projects/-Users-nathan-Yuzu/<uuid>.jsonl  (most recent → session id)
+  ~/.claude/projects/-Users-<user>-Yuzu/<uuid>.jsonl  (most recent → session id)
 
 Writes:
   <state-dir>/ceremony.cfg     ─ ceremony configuration
