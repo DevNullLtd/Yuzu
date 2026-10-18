@@ -764,6 +764,10 @@ for a in "\$@"; do [[ "\$prev" == "-C" ]] && dir="\$a"; prev="\$a"; done
 case "\$1" in
     setup) mkdir -p "\$2" ;;
     test)
+        # Record who holds the lock as seen from inside the test run, and the pid
+        # of the gate that launched us, so tests can assert they are the same.
+        echo "LOCK-OWNER \$(readlink "\${dir%/}.lock" 2>/dev/null) GATE-PID \$PPID" >> "$FK_MLOG"
+        [[ -n "\${YUZU_MOCK_PIDFILE:-}" ]] && echo "\$\$" > "\$YUZU_MOCK_PIDFILE"
         mkdir -p "\$dir/meson-logs"
         printf 'ok\n%s\n' "\${YUZU_MOCK_TESTLOG_LINE:-}" > "\$dir/meson-logs/testlog.txt"
         [[ -n "\${YUZU_MOCK_TEST_SLEEP:-}" ]] && sleep "\$YUZU_MOCK_TEST_SLEEP"
@@ -774,10 +778,13 @@ EOF
     cat > "$FK_BIN/gcovr" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$FK_GLOG"
+[[ -n "\${YUZU_MOCK_GCOVR_RC:-}" ]] && exit "\$YUZU_MOCK_GCOVR_RC"
 JSON=""
 while [[ \$# -gt 0 ]]; do
     case "\$1" in --json-summary) JSON="\$2"; shift 2 ;; *) shift ;; esac
 done
+# The lock must still be held by the gate while gcovr runs.
+[[ -n "\$JSON" ]] && echo "LOCK-AT-GCOVR \$(readlink "\$(dirname "\$JSON").lock" 2>/dev/null) GATE-PID \$PPID" >> "$FK_MLOG"
 if [[ -n "\$JSON" ]]; then
     if [[ -n "\${YUZU_MOCK_NO_LINE:-}" ]]; then printf '{"branch_percent":65.5}' > "\$JSON"
     else printf '{"branch_percent":65.5,"line_percent":72.0}' > "\$JSON"; fi
@@ -816,43 +823,63 @@ scenario_CH_19() {
     ch_fixture ch19
     local build="$FK_ROOT/build-ch19" lock="$FK_ROOT/build-ch19.lock"
 
-    # A: a normal run takes the lock and releases it, even when it fails.
+    # A: a normal run holds the lock under its own pid and releases it, even on failure.
     ch_run ch19a "$build" -- YUZU_COVERAGE_TIMEOUT_MULT=
-    if [[ -e "$lock" ]]; then bad "CH-19" "lock left behind after a normal run"
+    local owner_line; owner_line=$(grep "^LOCK-OWNER " "$FK_MLOG" | head -1)
+    local gcovr_line; gcovr_line=$(grep "^LOCK-AT-GCOVR " "$FK_MLOG" | head -1)
+    if [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after a normal run"
+    elif [[ -z "$gcovr_line" || "$(echo "$gcovr_line" | awk '{print $2}')" != "$(echo "$owner_line" | awk '{print $2}')" ]]; then
+        # (gcovr runs in a subshell, so its own parent pid is not the gate's: compare with the owner seen at meson test time)
+        bad "CH-19" "the lock was not held by the same gate while gcovr ran: gcovr='$gcovr_line' test='$owner_line'"
+    elif [[ "$owner_line" != "LOCK-OWNER "[0-9]*" GATE-PID "[0-9]* ]] \
+         || [[ "$(echo "$owner_line" | awk '{print $2}')" != "$(echo "$owner_line" | awk '{print $4}')" ]]; then
+        bad "CH-19" "the running gate did not record its own pid in the lock: '$owner_line'"
     else
         ch_run ch19b "$build" -- YUZU_MOCK_TEST_RC=3
-        if [[ -e "$lock" ]]; then bad "CH-19" "lock left behind after a failing run"
-        else ok "CH-19: lock is released after a normal run and after a failing run"; fi
+        if [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after a failing run"
+        else ok "CH-19: the lock holds the gate's own pid while it runs and is released after a normal and a failing run"; fi
     fi
 
     # B: a lock held by a live process refuses the run before any meson call.
     : > "$FK_MLOG"
-    mkdir -p "$lock"; sleep 30 & local holder=$!; echo "$holder" > "$lock/pid"
+    sleep 30 & local holder=$!; ln -s "$holder" "$lock"
     ch_run ch19c "$build" --
     kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
     if [[ -s "$FK_MLOG" ]]; then bad "CH-19" "run proceeded despite a live lock: $(cat "$FK_MLOG")"
     elif [[ "$(db_gate_status ch19c Coverage)" != "WARN" || "$(db_gate_notes ch19c Coverage)" != *"another coverage-gate run (pid $holder)"* ]]; then
         bad "CH-19" "live-lock refusal not recorded: status=$(db_gate_status ch19c Coverage) notes=$(db_gate_notes ch19c Coverage)"
-    elif [[ ! -d "$lock" ]]; then bad "CH-19" "refused run removed the OTHER run's lock"
+    elif [[ "$(readlink "$lock")" != "$holder" ]]; then bad "CH-19" "refused run disturbed the OTHER run's lock"
     else ok "CH-19: a live lock refuses the run (WARN row names the holder) and is left intact"; fi
-    rm -rf "$lock"
+    rm -f "$lock"
 
-    # C: a lock whose holder is gone is cleared and the run proceeds.
+    # C: a lock whose holder is gone is cleared, the run proceeds under ITS pid.
     : > "$FK_MLOG"
     sleep 0 & local dead=$!; wait "$dead" 2>/dev/null
-    mkdir -p "$lock"; echo "$dead" > "$lock/pid"
+    ln -s "$dead" "$lock"
     ch_run ch19d "$build" --
-    if ! grep -q "^test " "$FK_MLOG"; then bad "CH-19" "stale lock was not cleared: $FK_OUT"
-    elif [[ -e "$lock" ]]; then bad "CH-19" "lock left behind after clearing a stale one"
-    else ok "CH-19: a stale lock (dead holder) is cleared and the run proceeds"; fi
+    owner_line=$(grep "^LOCK-OWNER " "$FK_MLOG" | head -1)
+    if [[ -z "$owner_line" ]]; then bad "CH-19" "stale lock was not cleared: $FK_OUT"
+    elif [[ "$(echo "$owner_line" | awk '{print $2}')" == "$dead" || "$(echo "$owner_line" | awk '{print $2}')" != "$(echo "$owner_line" | awk '{print $4}')" ]]; then
+        bad "CH-19" "after clearing a stale lock the run did not hold the lock itself: '$owner_line'"
+    elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after clearing a stale one"
+    else ok "CH-19: a stale lock (dead holder) is cleared and the run proceeds holding the lock under its own pid"; fi
 
-    # D: real overlap - a second run started while the first is inside meson test.
+    # D: a lock that is not a pid is never treated as stale.
+    : > "$FK_MLOG"
+    ln -s "not-a-pid" "$lock"
+    ch_run ch19g "$build" --
+    if [[ -s "$FK_MLOG" || "$(db_gate_status ch19g Coverage)" != "WARN" ]]; then
+        bad "CH-19" "an unreadable/non-pid lock was cleared or ignored: meson='$(cat "$FK_MLOG")' status=$(db_gate_status ch19g Coverage)"
+    else ok "CH-19: a lock that does not name a pid is refused, not cleared"; fi
+    rm -f "$lock"
+
+    # E: real overlap - a second run started while the first is inside meson test.
     : > "$FK_MLOG"; rm -rf "$build"
     start_run ch19e
     ( env YUZU_MOCK_TEST_SLEEP=4 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19e \
         --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
     local first=$! i
-    for i in $(seq 1 100); do [[ -d "$lock" ]] && grep -q "^test " "$FK_MLOG" && break; sleep 0.1; done
+    for i in $(seq 1 100); do grep -q "^LOCK-OWNER " "$FK_MLOG" && break; sleep 0.1; done
     ch_run ch19f "$build" --report-only --
     local second_calls; second_calls=$(grep -c "^setup \|^compile " "$FK_MLOG")
     wait "$first" 2>/dev/null
@@ -863,6 +890,57 @@ scenario_CH_19() {
     elif [[ "$(db_gate_status ch19e Coverage)" != "PASS" ]]; then
         bad "CH-19" "first run did not finish normally: $(db_gate_status ch19e Coverage)"
     else ok "CH-19: an overlapping second run is refused and never touches the build dir; the first finishes"; fi
+
+    # F: several runs racing to take over the SAME stale lock - never more than one may
+    # win (safety, asserted strictly). A round where every racer refuses is a liveness
+    # hiccup under load, not a safety failure: it is retried (twice) before it counts.
+    local round r winners tries allok=1
+    for round in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        for tries in 1 2 3; do
+            : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+            sleep 0 & dead=$!; wait "$dead" 2>/dev/null
+            ln -s "$dead" "$lock"
+            # Run rows first (sequentially), then launch all racers together, with a test
+            # long enough that a slow-starting racer still overlaps the winner.
+            for r in 1 2 3 4; do start_run "ch19r${round}t${tries}x$r"; done
+            for r in 1 2 3 4; do
+                ( env YUZU_MOCK_TEST_SLEEP=3 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "ch19r${round}t${tries}x$r" \
+                    --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+            done
+            wait
+            winners=$(grep -c "^LOCK-OWNER " "$FK_MLOG")
+            [[ "$winners" != "0" ]] && break
+        done
+        if [[ "$winners" != "1" ]]; then
+            bad "CH-19" "round $round: $winners of 4 racing runs ran meson test against one stale lock (expected exactly 1)"
+            allok=0; break
+        fi
+    done
+    (( allok )) && ok "CH-19: of 4 runs racing for one stale lock exactly one wins, in each of 12 rounds"
+
+    # G: SIGTERM to the gate alone terminates its meson test child before the lock is released.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock"
+    local pidfile="$CHAOS_ROOT/ch19-test.pid"; rm -f "$pidfile"
+    start_run ch19s
+    ( env YUZU_MOCK_TEST_SLEEP=20 YUZU_MOCK_PIDFILE="$pidfile" bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19s \
+        --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    local gate=$!
+    for i in $(seq 1 100); do [[ -s "$pidfile" ]] && break; sleep 0.1; done
+    local mock_pid; mock_pid=$(cat "$pidfile" 2>/dev/null)
+    local gate_real; gate_real=$(readlink "$lock" 2>/dev/null)
+    [[ -n "$gate_real" ]] && kill -TERM "$gate_real" 2>/dev/null
+    for i in $(seq 1 60); do kill -0 "$gate" 2>/dev/null || break; sleep 0.1; done
+    local gate_still=no; kill -0 "$gate" 2>/dev/null && gate_still=yes
+    [[ "$gate_still" == "yes" ]] && kill -TERM "$mock_pid" 2>/dev/null
+    wait "$gate" 2>/dev/null
+    local alive=no; [[ -n "$mock_pid" ]] && kill -0 "$mock_pid" 2>/dev/null && alive=yes
+    if [[ -z "$mock_pid" || -z "$gate_real" ]]; then bad "CH-19" "signal test setup failed (mock pid '$mock_pid', gate pid '$gate_real')"
+    elif [[ "$gate_still" == "yes" ]]; then bad "CH-19" "SIGTERM did not end the gate within 6 s (it waited for its meson test child instead of terminating it)"
+    elif [[ "$alive" == "yes" ]]; then
+        kill "$mock_pid" 2>/dev/null
+        bad "CH-19" "SIGTERM to the gate left its meson test (pid $mock_pid) running"
+    elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after SIGTERM"
+    else ok "CH-19: SIGTERM to the gate ends its meson test child and releases the lock"; fi
 
     export PATH="$FK_SAVED_PATH"
     rm -rf "$FK_ROOT" 2>/dev/null || true
@@ -916,6 +994,26 @@ scenario_CH_20() {
         else ok "CH-20: an unknown line figure is never recorded as 0.0, and capture refuses to anchor it"; fi
     fi
 
+    # G: a clean --capture-baselines still captures (the path whose ordering moved).
+    rm -f "$FK_BASE"
+    ch_run ch20g "$build" --capture-baselines --
+    if [[ "$FK_RC" != "0" || "$(db_gate_status ch20g Coverage)" != "PASS" || ! -s "$FK_BASE" ]] \
+       || ! python3 - "$FK_BASE" <<'PY'
+import json, sys
+b = json.load(open(sys.argv[1]))
+sys.exit(0 if abs(b["branch_percent"] - 65.5) < 0.01 and abs(b["line_percent"] - 72.0) < 0.01 else 1)
+PY
+    then bad "CH-20" "clean capture: rc=$FK_RC status=$(db_gate_status ch20g Coverage) baseline=$(cat "$FK_BASE" 2>/dev/null)"
+    else ok "CH-20: a clean --capture-baselines writes the measured branch and line figures"; fi
+    printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
+
+    # H: when gcovr itself fails on an already-inconclusive run, the WARN row keeps both reasons.
+    ch_run ch20h "$build" -- YUZU_MOCK_TEST_RC=3 YUZU_MOCK_GCOVR_RC=1
+    if [[ "$(db_gate_status ch20h Coverage)" != "WARN" || "$(db_gate_notes ch20h Coverage)" != *"gcovr failed"* \
+          || "$(db_gate_notes ch20h Coverage)" != *"meson test exit=3"* ]]; then
+        bad "CH-20" "gcovr failure dropped the inconclusive reasons: status=$(db_gate_status ch20h Coverage) notes=$(db_gate_notes ch20h Coverage)"
+    else ok "CH-20: a gcovr failure on an inconclusive run still names the test failure"; fi
+
     export PATH="$FK_SAVED_PATH"
     rm -rf "$FK_ROOT" 2>/dev/null || true
 }
@@ -934,12 +1032,29 @@ scenario_CH_21() {
         bad "CH-21" "libgcov error line not treated as inconclusive: status=$(db_gate_status ch21a Coverage) notes=$(db_gate_notes ch21a Coverage)"
     else ok "CH-21: libgcov profiling errors in the test log make the run inconclusive"; fi
 
+    # A2: libgcov writes at exit with no leading newline, and has a second message family.
+    local line n=0
+    for line in "noeolprofiling:/x/y.gcda:Cannot create directory" "libgcov profiling error:/x/y.gcda:Error writing"; do
+        n=$((n+1))
+        ch_run "ch21a$n" "$build" -- "YUZU_MOCK_TESTLOG_LINE=$line"
+        if [[ "$(db_gate_status ch21a$n Coverage)" != "WARN" || "$(db_gate_notes ch21a$n Coverage)" != *"libgcov reported"* ]]; then
+            bad "CH-21" "libgcov line not detected: '$line' -> $(db_gate_notes ch21a$n Coverage)"
+        fi
+    done
+    [[ "$(db_gate_notes ch21a2 Coverage)" == *"libgcov reported"* ]] && ok "CH-21: an unterminated line before the libgcov message, and the 'libgcov profiling error' family, are both detected"
+
     # B: not enough free space after the run -> inconclusive.
     ch_run ch21b "$build" -- YUZU_COVERAGE_MIN_FREE_KB=999999999999
     if [[ "$(db_gate_status ch21b Coverage)" != "WARN" || "$(db_gate_notes ch21b Coverage)" != *"KB free on the build filesystem"* \
           || "$(db_metric ch21b branch_coverage_overall)" != "MISSING" ]]; then
         bad "CH-21" "low free space not treated as inconclusive: status=$(db_gate_status ch21b Coverage) notes=$(db_gate_notes ch21b Coverage)"
     else ok "CH-21: too little free space after the run makes it inconclusive"; fi
+
+    # B2: a leading zero in the threshold is decimal, not octal (and not an arithmetic error).
+    ch_run ch21b2 "$build" -- YUZU_COVERAGE_MIN_FREE_KB=0999999999
+    if [[ "$(db_gate_notes ch21b2 Coverage)" != *"KB free on the build filesystem"* ]]; then
+        bad "CH-21" "a zero-padded threshold was not honoured: $(db_gate_notes ch21b2 Coverage)"
+    else ok "CH-21: a zero-padded YUZU_COVERAGE_MIN_FREE_KB is read as decimal"; fi
 
     # C: bad free-space threshold is refused before any meson call.
     : > "$FK_MLOG"
@@ -950,16 +1065,25 @@ scenario_CH_21() {
 
     # D: a failed metric write, and separately a failed gate-row write, each turn a
     # would-be success into exit 2 with an ERROR (the DB row IS the gate's result).
-    local what
+    local what d_ok=1
     for what in metric gate; do
         start_run "ch21d$what"
         FK_OUT=$(YUZU_MOCK_DB_FAIL=$what bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "ch21d$what" \
             --build-dir "$build" --baseline "$FK_BASE" 2>&1) && FK_RC=0 || FK_RC=$?
         if [[ "$FK_RC" != "2" || "$FK_OUT" != *"ERROR could not record"* ]]; then
             bad "CH-21" "a failed $what DB write did not fail the gate: rc=$FK_RC out=$(printf '%s' "$FK_OUT" | tail -3)"
+            d_ok=0
         fi
     done
-    [[ "$FK_RC" == "2" ]] && ok "CH-21: a failed gate-row or metric DB write is reported and the gate exits 2 instead of 0"
+    (( d_ok )) && ok "CH-21: a failed gate-row or metric DB write is reported and the gate exits 2 instead of 0"
+
+    # D2: a DB write failure never masks a regression: exit 1 stays 1.
+    printf '{"branch_percent":99.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
+    start_run ch21e
+    FK_OUT=$(YUZU_MOCK_DB_FAIL=metric bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch21e \
+        --build-dir "$build" --baseline "$FK_BASE" 2>&1) && FK_RC=0 || FK_RC=$?
+    if [[ "$FK_RC" != "1" ]]; then bad "CH-21" "a regression exit (1) was changed by a DB failure: rc=$FK_RC"
+    else ok "CH-21: a failed DB write does not change a regression's exit code 1"; fi
 
     export PATH="$FK_SAVED_PATH"
     rm -rf "$FK_ROOT" 2>/dev/null || true

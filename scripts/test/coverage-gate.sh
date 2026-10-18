@@ -32,15 +32,21 @@
 #                       262144)
 #
 # One run per build directory: a second concurrent run is refused (WARN row)
-# while the first holds `<build-dir>.lock`. A run whose tests failed or timed
-# out, whose libgcov reported counter-write errors, or that left the disk almost
-# full is INCONCLUSIVE: it is recorded as a WARN gate row, writes no coverage
-# metric, is never compared with the baseline, and cannot capture one.
+# while the first holds the `<build-dir>.lock` symlink. A run whose tests failed
+# or timed out, whose test processes reported libgcov counter-write errors, or
+# that left the build filesystem almost full is INCONCLUSIVE: it is recorded as
+# a WARN gate row, writes no coverage metric, is never compared with the
+# baseline, and cannot capture one. The libgcov and free-space checks are
+# best-effort: they see only the output of processes meson itself ran and a
+# disk reading taken after the run.
 #
 # Exit codes:
-#   0  coverage measured and within tolerance (or --report-only)
-#   1  coverage regressed beyond slack
-#   2  internal failure (build/test/gcovr failed; runs as WARN)
+#   0  coverage measured and within tolerance (or --report-only), or under
+#      --report-only a refusal / inconclusive run (the WARN row is the record)
+#   1  coverage regressed beyond slack, or --capture-baselines was refused
+#   2  environmental refusal (missing tool, bad configuration, another run holds
+#      the build dir), an inconclusive run, a build/gcovr/parse failure, or a
+#      gate/metric DB write that failed (WARN row; also turns an exit 0 into 2)
 #
 # Implementation notes:
 #
@@ -196,17 +202,31 @@ write_metric() {
 # One EXIT handler: release the build-dir lock (if this run holds it) and turn
 # an exit-0 whose DB write failed into exit 2.
 LOCK_HELD=0
-LOCK_DIR=""
+LOCK_PATH=""
+TEST_PID=""
 on_exit() {
     local rc=$?
-    if (( LOCK_HELD )) && [[ -n "$LOCK_DIR" ]]; then
-        rm -rf "$LOCK_DIR" 2>/dev/null || true
+    # An orphaned `meson test` would keep writing counters after the lock is
+    # gone and corrupt the next run. meson terminates its own test children on
+    # SIGTERM, so forward it and wait.
+    if [[ -n "$TEST_PID" ]]; then
+        kill -TERM "$TEST_PID" 2>/dev/null || true
+        wait "$TEST_PID" 2>/dev/null || true
+        TEST_PID=""
+    fi
+    if (( LOCK_HELD )) && [[ -n "$LOCK_PATH" ]]; then
+        rm -f "$LOCK_PATH" 2>/dev/null || true
     fi
     if (( DB_WRITE_FAILED )) && [[ $rc -eq 0 ]]; then
         exit 2
     fi
 }
+# Signals are caught so the EXIT handler runs promptly (bash defers a trap until
+# a foreground child ends; the test run below is a background job we `wait` on).
 trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 tool_check() {
     # Exit code discipline:
@@ -254,33 +274,60 @@ tool_check
 # Two overlapping runs against one build dir race ninja/meson and read each
 # other's gcda files (and the stale-gcda purge below would zero the other run's
 # counters mid-test), producing a number that looks like a measurement but is
-# not. A mkdir lock is portable (macOS has no flock) and atomic. It sits NEXT
-# TO the build dir, never inside it, because the reconfigure-failure path
-# deletes the whole build dir. A lock whose recorded pid is no longer alive is
-# a crashed run's leftover and is cleared. Residual: two runs started in the
-# same instant against the SAME stale lock can both clear it; PID reuse can make
-# a dead holder look alive (the run is then refused with the lock's path so the
-# operator can remove it).
-LOCK_DIR="${BUILD_DIR_ABS}.lock"
+# not. The lock is a SYMLINK named `<build-dir>.lock` whose target text is the
+# holder's pid: `ln -s` creates it atomically WITH its content, so there is no
+# window in which a lock exists without a pid, and it is portable (macOS has no
+# flock). It sits next to the build dir, never inside it, because the
+# reconfigure-failure path deletes the whole build dir. A lock whose holder is
+# gone is a crashed run's leftover; taking it over is serialised by a second
+# short-lived symlink guard so two runs cannot both clear and re-take it. (Both
+# use `ln -s`, not `mkdir`: uutils coreutils' mkdir is not atomic under
+# contention. A guard left by a taker that died inside its few-microsecond
+# critical section refuses runs until `<build-dir>.lock.takeover` is removed.)
+# Residual: a gate killed with SIGKILL leaves its `meson test` running (the
+# next run's lock check sees a dead pid and proceeds); other signals are
+# forwarded to meson and waited for before the lock is released. PID reuse can
+# make a dead holder look alive; the run is then refused, naming the lock path.
+BUILD_DIR_ABS="${BUILD_DIR_ABS%/}"
+LOCK_PATH="${BUILD_DIR_ABS}.lock"
+LOCK_GUARD="${LOCK_PATH}.takeover"
 LOCK_HOLDER=""
+
+pid_alive() {  # kill -0 fails with EPERM for another user's live process; ps -p does not
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$1" 2>/dev/null || ps -p "$1" >/dev/null 2>&1
+}
+
 acquire_build_lock() {
     local holder
-    mkdir "$LOCK_DIR" 2>/dev/null && return 0
-    holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-    if [[ "$holder" =~ ^[0-9]+$ ]] && ! kill -0 "$holder" 2>/dev/null; then
-        echo "coverage-gate: clearing stale lock $LOCK_DIR (holder pid $holder is not running)" | tee -a "$GATE_LOG"
-        rm -rf "$LOCK_DIR"
-        mkdir "$LOCK_DIR" 2>/dev/null && return 0
-        holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    ln -s "$$" "$LOCK_PATH" 2>/dev/null && return 0
+    holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
+    if [[ "$holder" =~ ^[0-9]+$ ]] && ! pid_alive "$holder"; then
+        # Only one contender at a time may judge and clear a stale lock. The guard
+        # is a symlink too (`ln -s` is atomic everywhere we measured; `mkdir` is
+        # NOT under uutils coreutils 0.8.0, Ubuntu 26.04's default, where two
+        # simultaneous mkdirs of one path can both succeed).
+        if ln -s "$$" "$LOCK_GUARD" 2>/dev/null; then
+            holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
+            if [[ "$holder" =~ ^[0-9]+$ ]] && ! pid_alive "$holder"; then
+                echo "coverage-gate: clearing stale lock $LOCK_PATH (holder pid $holder is not running)" | tee -a "$GATE_LOG"
+                rm -f "$LOCK_PATH"
+                if ln -s "$$" "$LOCK_PATH" 2>/dev/null; then
+                    rm -f "$LOCK_GUARD"
+                    return 0
+                fi
+            fi
+            rm -f "$LOCK_GUARD"
+            holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
+        fi
     fi
-    LOCK_HOLDER="${holder:-unknown}"
+    LOCK_HOLDER="${holder:-unreadable}"
     return 1
 }
 if acquire_build_lock; then
     LOCK_HELD=1
-    echo $$ > "$LOCK_DIR/pid"
 else
-    NOTE="refused: another coverage-gate run (pid $LOCK_HOLDER) holds $LOCK_DIR; wait for it, or remove that directory if the run is gone"
+    NOTE="refused: another coverage-gate run (pid $LOCK_HOLDER) holds $LOCK_PATH; wait for it, or remove that file if no such run is active"
     echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
     write_gate WARN 0 "$NOTE"
     exit "$REFUSE_EXIT"
@@ -384,9 +431,9 @@ fi
 
 echo "coverage-gate: running meson test" | tee -a "$GATE_LOG"
 # --no-rebuild because meson compile already covered it.
-# Even a single test failure shouldn't prevent the coverage calculation —
-# partial coverage is still informative. Capture the test exit code
-# separately and note it, but proceed to gcovr regardless.
+# A test failure does not stop the run: the exit code is captured separately and
+# gcovr still runs so the log shows the figure, but a nonzero code makes the run
+# INCONCLUSIVE (see below): no metric, no comparison, no capture.
 TEST_RC=0
 # gcov counters ACCUMULATE across runs in a reused build dir, so a test that
 # ran last time but is skipped, killed or timed out this time would still
@@ -405,9 +452,14 @@ fi
 # local run shares the box. Override with YUZU_COVERAGE_TIMEOUT_MULT, which
 # tool_check() has already validated as a number >= 1.
 echo "coverage-gate: meson test --timeout-multiplier $TIMEOUT_MULT" | tee -a "$GATE_LOG"
+# A background job we `wait` on, so a signal to this script reaches the EXIT
+# handler (which terminates meson) instead of being deferred until meson ends.
 meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
     --timeout-multiplier "$TIMEOUT_MULT" \
-    >> "$GATE_LOG" 2>&1 || TEST_RC=$?
+    >> "$GATE_LOG" 2>&1 &
+TEST_PID=$!
+wait "$TEST_PID" || TEST_RC=$?
+TEST_PID=""
 if [[ $TEST_RC -ne 0 ]]; then
     echo "coverage-gate: meson test exit=$TEST_RC (gcovr still runs so the log shows the figure, but the run is INCONCLUSIVE)" \
         | tee -a "$GATE_LOG"
@@ -425,14 +477,30 @@ if [[ $TEST_RC -ne 0 ]]; then
 fi
 TESTLOG="$BUILD_DIR/meson-logs/testlog.txt"
 if [[ -f "$TESTLOG" ]]; then
-    PROFILING_ERRORS=$(grep -cE '^(profiling:|libgcov profiling error:)' "$TESTLOG" 2>/dev/null || true)
+    # libgcov writes at process exit with no leading newline, so the message can
+    # directly follow a test's last unterminated line: no line anchor. The
+    # patterns are the specific libgcov messages (gcc 15: Cannot create
+    # directory / Cannot open / Skip / exiting after an error, and the
+    # `libgcov profiling error:` family), not the bare word "profiling:".
+    PROFILING_ERRORS=$(grep -cE 'libgcov profiling error:|profiling:exiting after an error|profiling:[^[:space:]]+:(Cannot|Skip)' "$TESTLOG" 2>/dev/null || true)
     if [[ "$PROFILING_ERRORS" =~ ^[0-9]+$ ]] && (( PROFILING_ERRORS > 0 )); then
         INCONCLUSIVE+=("libgcov reported $PROFILING_ERRORS profiling error line(s) in $TESTLOG (counters not written or mismatched)")
     fi
 fi
 FREE_KB_AFTER=$(df -Pk "$BUILD_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
-if [[ "$FREE_KB_AFTER" =~ ^[0-9]+$ ]] && (( FREE_KB_AFTER < MIN_FREE_KB )); then
-    INCONCLUSIVE+=("only ${FREE_KB_AFTER} KB free on the build filesystem after the run (minimum ${MIN_FREE_KB} KB; counters may be truncated)")
+if [[ "$FREE_KB_AFTER" =~ ^[0-9]+$ ]]; then
+    # 10# so a leading zero in either number is not read as octal.
+    if (( 10#$FREE_KB_AFTER < 10#$MIN_FREE_KB )); then
+        INCONCLUSIVE+=("only ${FREE_KB_AFTER} KB free on the build filesystem after the run (minimum ${MIN_FREE_KB} KB; counters may be truncated)")
+    fi
+else
+    INCONCLUSIVE+=("could not read the free space of the build filesystem")
+fi
+
+INC_SUFFIX=""
+if (( ${#INCONCLUSIVE[@]} )); then
+    INC_REASONS=$(printf '%s; ' "${INCONCLUSIVE[@]}")
+    INC_SUFFIX=" (the run was also inconclusive: ${INC_REASONS%; })"
 fi
 
 # ── Run gcovr ──────────────────────────────────────────────────────────
@@ -469,7 +537,7 @@ GCOVR_RC=0
 
 if [[ $GCOVR_RC -ne 0 || ! -f "$GCOVR_JSON" ]]; then
     GATE_DUR=$(( $(date +%s) - GATE_START ))
-    write_gate WARN "$GATE_DUR" "gcovr failed (rc=$GCOVR_RC) — see coverage.log"
+    write_gate WARN "$GATE_DUR" "gcovr failed (rc=$GCOVR_RC) — see coverage.log${INC_SUFFIX}"
     exit 2
 fi
 
@@ -532,7 +600,7 @@ PY
 
 if [[ $PARSE_RC -ne 0 || -z "$COVERAGE_JSON" ]]; then
     GATE_DUR=$(( $(date +%s) - GATE_START ))
-    write_gate WARN "$GATE_DUR" "could not parse gcovr output: $COVERAGE_JSON"
+    write_gate WARN "$GATE_DUR" "could not parse gcovr output: $COVERAGE_JSON${INC_SUFFIX}"
     exit 2
 fi
 
@@ -554,12 +622,12 @@ if (( ${#INCONCLUSIVE[@]} )); then
         # A capture that succeeds on partial data permanently anchors a false
         # low coverage number and silently disables the gate for the audit
         # window. Operator must `--capture-baselines` on a known-clean tree.
-        NOTE="refused --capture-baselines: inconclusive run ($REASONS) — run 'meson test -C $BUILD_DIR' to green before capturing"
+        NOTE="refused --capture-baselines: inconclusive run ($REASONS) — fix the cause listed and re-run on a quiet box; see $GATE_LOG"
         echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
         write_gate FAIL "$GATE_DUR" "$NOTE"
         exit 1
     fi
-    NOTE="inconclusive: $REASONS; ${BRANCH_PCT}% branch measured from incomplete data, not compared with the baseline and not recorded as a metric"
+    NOTE="inconclusive: $REASONS; ${BRANCH_PCT}% branch measured from incomplete data, not compared with the baseline and not recorded as a metric. See $GATE_LOG (meson testlog: $TESTLOG); re-run once the cause is fixed or the box is quiet"
     echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
     write_gate WARN "$GATE_DUR" "$NOTE"
     exit "$REFUSE_EXIT"
