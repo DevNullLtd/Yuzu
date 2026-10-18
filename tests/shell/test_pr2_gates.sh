@@ -616,14 +616,18 @@ scenario_CH_18() {
     cp "$YUZU_ROOT"/scripts/test/{coverage-gate.sh,test-db-write.sh,test_db.py} "$fake/scripts/test/"
     local pkgdir="$fake/vcpkg_installed/$triplet/lib/pkgconfig"
 
+    # Private mock dir, prepended only for this scenario, so the shared
+    # $MOCKBIN mocks (and YUZU_MOCK_MESON_RC support) are left untouched.
+    local bin="$CHAOS_ROOT/ch18bin" saved_path="$PATH"
+    mkdir -p "$bin"
     local mlog="$CHAOS_ROOT/ch18-meson.log" glog="$CHAOS_ROOT/ch18-gcovr.log"
-    cat > "$MOCKBIN/meson" <<EOF
+    cat > "$bin/meson" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$mlog"
 case "\$1" in setup) mkdir -p "\$2" ;; esac
 exit 0
 EOF
-    cat > "$MOCKBIN/gcovr" <<EOF
+    cat > "$bin/gcovr" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$glog"
 JSON=""
@@ -633,20 +637,21 @@ done
 [[ -n "\$JSON" ]] && printf '{"branch_percent":65.5,"line_percent":72.0}' > "\$JSON"
 exit 0
 EOF
-    chmod +x "$MOCKBIN/meson" "$MOCKBIN/gcovr"
+    chmod +x "$bin/meson" "$bin/gcovr"
+    export PATH="$bin:$PATH"
 
     local build="$fake/build-ch18"
-    run_gate() {  # run_id [env assignments...]
-        local rid="$1"; shift
+    run_gate() {  # run_id build_dir [env assignments...]
+        local rid="$1" bd="$2"; shift 2
         start_run "$rid"
         env "$@" bash "$fake/scripts/test/coverage-gate.sh" --run-id "$rid" \
-            --build-dir "$build" --baseline "$CHAOS_ROOT/ch18-baseline.json" \
+            --build-dir "$bd" --baseline "$CHAOS_ROOT/ch18-baseline.json" \
             --report-only >/dev/null 2>&1 || true
     }
 
     # A: fresh dir, default multiplier.
     : > "$mlog"; : > "$glog"; rm -rf "$build"
-    run_gate ch18a YUZU_COVERAGE_TIMEOUT_MULT=
+    run_gate ch18a "$build" YUZU_COVERAGE_TIMEOUT_MULT=
     if ! grep -q "^setup .*-Dpkg_config_path=$pkgdir" "$mlog"; then
         bad "CH-18" "fresh setup did not pass -Dpkg_config_path=$pkgdir: $(cat "$mlog")"
     elif ! grep -q "^test .*--timeout-multiplier 3\( \|$\)" "$mlog"; then
@@ -660,7 +665,7 @@ EOF
     # B: existing dir with a stale gcda, env override.
     : > "$mlog"
     mkdir -p "$build/sub"; echo stale > "$build/sub/old.gcda"
-    run_gate ch18b YUZU_COVERAGE_TIMEOUT_MULT=5
+    run_gate ch18b "$build" YUZU_COVERAGE_TIMEOUT_MULT=5
     if ! grep -q "^setup .*--reconfigure .*-Dpkg_config_path=$pkgdir" "$mlog"; then
         bad "CH-18" "--reconfigure did not pass -Dpkg_config_path: $(cat "$mlog")"
     elif ! grep -q "^test .*--timeout-multiplier 5\( \|$\)" "$mlog"; then
@@ -671,19 +676,49 @@ EOF
         ok "CH-18: --reconfigure carries pkg_config_path; override honoured; stale gcda removed"
     fi
 
-    # C: bad multipliers are refused before any build or test.
-    local v rid n=0 allok=1
-    for v in abc 0 0.0 -1 "1 --foo"; do
-        n=$((n+1)); rid="ch18c$n"
+    # C: a --build-dir that is a symlink still gets its stale gcda removed.
+    : > "$mlog"
+    mkdir -p "$fake/build-ch18real/sub"; echo stale > "$fake/build-ch18real/sub/old.gcda"
+    ln -sfn "$fake/build-ch18real" "$fake/build-ch18link"
+    run_gate ch18s "$fake/build-ch18link" YUZU_COVERAGE_TIMEOUT_MULT=
+    if [[ -e "$fake/build-ch18real/sub/old.gcda" ]]; then
+        bad "CH-18" "stale .gcda survived under a symlinked --build-dir"
+    elif ! grep -q "^test " "$mlog"; then
+        bad "CH-18" "symlinked --build-dir run never reached meson test: $(cat "$mlog")"
+    else
+        ok "CH-18: stale gcda removed under a symlinked --build-dir"
+    fi
+
+    # D: valid decimals reach meson test; bad multipliers are refused before any
+    # meson call AND for the right reason (the gate row says so), not merely
+    # because something else wrote a WARN.
+    local v rid n=0 allok=1 notes
+    for v in 1.5 12 1; do
+        n=$((n+1)); rid="ch18d$n"
         : > "$mlog"
-        run_gate "$rid" "YUZU_COVERAGE_TIMEOUT_MULT=$v"
-        if [[ "$(db_gate_status "$rid" "Coverage")" != "WARN" ]] || [[ -s "$mlog" ]]; then
-            bad "CH-18" "multiplier '$v' not refused up front (status=$(db_gate_status "$rid" "Coverage"), meson calls: $(cat "$mlog"))"
+        run_gate "$rid" "$build" "YUZU_COVERAGE_TIMEOUT_MULT=$v"
+        if ! grep -q "^test .*--timeout-multiplier $v\( \|$\)" "$mlog"; then
+            bad "CH-18" "valid multiplier '$v' did not reach meson test: $(cat "$mlog")"
             allok=0
         fi
     done
-    (( allok )) && ok "CH-18: non-positive / non-numeric multipliers refused before any meson call"
+    (( allok )) && ok "CH-18: valid multipliers 1.5, 12 and 1 are accepted"
 
+    allok=1
+    for v in abc 0 0.0 0.5 -1 1e3 3. .5 1234567 "1 --foo"; do
+        n=$((n+1)); rid="ch18e$n"
+        : > "$mlog"
+        run_gate "$rid" "$build" "YUZU_COVERAGE_TIMEOUT_MULT=$v"
+        notes=$(db_gate_notes "$rid" "Coverage")
+        if [[ -s "$mlog" ]] || [[ "$(db_gate_status "$rid" "Coverage")" != "WARN" ]] \
+           || [[ "$notes" != *"invalid YUZU_COVERAGE_TIMEOUT_MULT"* ]]; then
+            bad "CH-18" "multiplier '$v' not refused up front for the right reason (notes='$notes', meson calls: $(cat "$mlog"))"
+            allok=0
+        fi
+    done
+    (( allok )) && ok "CH-18: invalid multipliers refused before any meson call, with the validation note"
+
+    export PATH="$saved_path"
     rm -rf "$fake" 2>/dev/null || true
 }
 

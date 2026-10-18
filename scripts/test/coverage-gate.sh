@@ -183,11 +183,13 @@ tool_check() {
         exit "$tool_miss_exit"
     fi
     # Refuse a bad multiplier BEFORE the long build. meson rejects a non-number
-    # (zero tests run, then gcovr reads whatever gcda is on disk), and treats
-    # 0 or a negative value as "no timeout at all", so a hung test would hang
-    # the gate with no outer bound.
-    if [[ ! "$TIMEOUT_MULT" =~ ^[0-9]+(\.[0-9]+)?$ || "$TIMEOUT_MULT" =~ ^0+(\.0+)?$ ]]; then
-        echo "coverage-gate: YUZU_COVERAGE_TIMEOUT_MULT='$TIMEOUT_MULT' is not a positive number" | tee -a "$GATE_LOG"
+    # and crashes on a very long digit string (zero tests run, then gcovr reads
+    # an empty tree and reports ~0%), treats 0 or a negative value as "no
+    # timeout at all" (a hung test would hang the gate with no outer bound), and
+    # a value under 1 would shorten every test's budget below its own. Accept
+    # only a number >= 1 with at most 6 digits on each side of the point.
+    if [[ ! "$TIMEOUT_MULT" =~ ^[1-9][0-9]{0,5}(\.[0-9]{1,6})?$ ]]; then
+        echo "coverage-gate: YUZU_COVERAGE_TIMEOUT_MULT='${TIMEOUT_MULT//[^[:print:]]/?}' must be a number >= 1 (digits only, at most 6 before and after the point)" | tee -a "$GATE_LOG"
         write_gate WARN 0 "invalid YUZU_COVERAGE_TIMEOUT_MULT"
         exit "$tool_miss_exit"
     fi
@@ -225,7 +227,7 @@ if [[ -d "$VCPKG_INSTALLED" ]]; then
         VCPKG_MESON_OPTS+=(-Dpkg_config_path="$VCPKG_INSTALLED/lib/pkgconfig")
         echo "coverage-gate: using pkg_config_path=$VCPKG_INSTALLED/lib/pkgconfig" | tee -a "$GATE_LOG"
     else
-        echo "coverage-gate: WARNING $VCPKG_INSTALLED/lib/pkgconfig missing; pkg_config_path not set, expect a late link failure" | tee -a "$GATE_LOG"
+        echo "coverage-gate: WARNING $VCPKG_INSTALLED/lib/pkgconfig missing; pkg_config_path not set; the build may fail to link" | tee -a "$GATE_LOG"
     fi
 else
     echo "coverage-gate: WARNING $VCPKG_INSTALLED missing; neither cmake_prefix_path nor pkg_config_path set" | tee -a "$GATE_LOG"
@@ -301,7 +303,12 @@ TEST_RC=0
 # ran last time but is skipped, killed or timed out this time would still
 # contribute its old counters and the number could not drop for lost tests.
 # Start every run from zero.
-find "$BUILD_DIR" -name '*.gcda' -type f -delete 2>/dev/null || true
+# -H: BUILD_DIR may be a symlink (the path guard above accepts one that resolves
+# under an allowed prefix) and find does not follow a command-line symlink
+# without it. A failed delete is not fatal but must not be silent.
+if ! find -H "$BUILD_DIR" -name '*.gcda' -type f -delete 2>>"$GATE_LOG"; then
+    echo "coverage-gate: WARNING could not delete every stale .gcda under $BUILD_DIR; counters from an earlier run may remain" | tee -a "$GATE_LOG"
+fi
 # Instrumented (-Db_coverage) binaries run slower than the normal build, and a
 # loaded host slower still: the pg shards hit their 700s budget and the 60s/90s
 # smoke tests timed out on a busy box, truncating the gcda data (a test killed
