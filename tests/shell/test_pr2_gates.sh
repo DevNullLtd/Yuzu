@@ -604,7 +604,11 @@ scenario_CH_18() {
     echo "=== CH-18: coverage-gate pkg_config_path, timeout multiplier, stale gcda ==="
     init_db || { bad "CH-18" "db init failed"; return; }
 
-    local fake="$CHAOS_ROOT/ch18root" triplet
+    # Physical path: the gate resolves --build-dir with readlink -f and compares it
+    # to $YUZU_ROOT/build-*, and on macOS /tmp is a symlink to /private/tmp, so a
+    # logical /tmp/... root would be refused as "outside" once the dir exists.
+    local fake triplet
+    fake="$(cd "$CHAOS_ROOT" && pwd -P)/ch18root"
     case "$(uname -s)-$(uname -m)" in
         Linux-x86_64)  triplet="x64-linux" ;;
         Linux-aarch64) triplet="arm64-linux" ;;
